@@ -669,11 +669,12 @@ pass listing unrepaired findings it has not reported in the last hour.
 `--once` runs a single pass and exits 0 when every check passed, 1 otherwise;
 `--check-only` repairs, remounts, and sends nothing.
 
-### Watch agents for prompts, stalls, and silence (Rust edition)
+### Watch agents for finishes, prompts, stalls, and silence (Rust edition)
 
 `agentctl watch` keeps the coordinator's environment alive. `agentctl
-watch-agents` keeps an eye on the agents themselves, so an agent that sits at a
-harness approval prompt for hours is found in minutes:
+watch-agents` keeps an eye on the agents themselves, so a child that finished
+is handed back to its coordinator within a pass, and one that sits at a harness
+approval prompt for hours is found in minutes:
 
 ```sh
 agentctl watch-agents --coordinator coordinator --once --check-only
@@ -690,13 +691,37 @@ coordinator when a condition holds past its threshold:
 
 | condition | threshold | meaning |
 |---|---|---|
+| `child-done` | `--child-done-seconds` (default 0: the pass that sees it) | idle or done, work was delivered and drained, and the agent's last reply has a verdict; timed from the last screen change |
 | `approval-prompt` | `--approval-minutes` (default 5) | a harness approval, permission, or trust prompt at the bottom of the screen |
-| `idle-no-verdict` | `--idle-minutes` (default 15) | idle or done, timed from the last screen change, work was delivered and drained, and no line starts with a `--done-marker` near the bottom of the screen; markers are `DONE:` and `BLOCKED:` unless `--done-marker` is given, which replaces them |
+| `idle-no-verdict` | `--idle-minutes` (default 5) | idle or done, timed from the last screen change, work was delivered and drained, and the last reply has no verdict |
 | `stalled` | `--stall-minutes` (default 30) | marked working, or idle or done while the screen shows work running (a running turn or background work), timed from the last screen change |
 | `dead` | `--dead-minutes` (default 5) | the record says running but the harness cannot be reached |
 
+A verdict is a prose line of the agent's last reply that starts with a
+`--done-marker` once its indentation and any reply bullet are stripped; the
+markers are `DONE:` and `BLOCKED:` unless `--done-marker` is given, which
+replaces them. The last reply runs from the first assistant block after the
+last user turn on screen (Claude Code and Muse echo a turn as `❯ text`, Codex
+as `› text`) to the bottom, so a reply that opens with its verdict is read
+however long it is: Muse draws it as `◆ DONE: ...`, Claude Code as
+`● DONE: ...`, Codex as `• DONE: ...`. A verdict from an earlier turn, above a
+newer prompt, does not count, and neither does a prompt's own text. Nor does
+tool output (the rows under Claude Code's `⎿` or Muse's `└`), so a brief or a
+log the agent printed cannot finish its turn. The verdict is the first marker
+line of the last block that has one, since a reply states its verdict first.
+On a screen that draws none of those bullets, a marker must start one of the
+bottom 30 lines. An idle agent whose bottom rows say a turn is running
+(`esc to interrupt` as a `·`-separated or parenthesized segment, in Claude
+Code's footer or Muse's `◇ ... (30s · esc to interrupt)` row) is held to the
+`stalled` rule instead, since a verdict on screen is not that turn's last word
+yet; background shells or sub-agents left running do not hold back a
+`child-done`. With the default `--child-done-seconds 0` a finish is reported in
+the pass that first sees it; a larger value waits for the screen to hold still
+that long, which debounces a harness whose status says idle while it still
+streams.
+
 An agent that was never sent work, or that still has prompts queued, is never
-reported idle. Idle is timed from the last screen change, since herdr can
+reported idle or finished. Idle is timed from the last screen change, since herdr can
 report a Claude Code agent idle while its output still streams. Nor is an
 agent reported idle while its screen shows work running: Claude Code draws
 `esc to interrupt` in the footer under its input box while a turn runs, and
@@ -709,13 +734,13 @@ While the footer shows such a segment (`esc to interrupt`, `N shell(s)` or
 it is read, because the turn's row still says `still running` after the work
 ends. This reads the screen's text, so a harness that draws no such segment,
 or one worded differently, is still reported idle once its screen holds still.
-A Claude Code pane whose view is scrolled up is neither `stalled` nor
-`idle-no-verdict`, however long it holds still: Claude Code freezes the
+A Claude Code pane whose view is scrolled up is neither `stalled`,
+`idle-no-verdict`, nor `child-done`, however long it holds still: Claude Code freezes the
 transcript there and ends the last row above its input box with
 `16 new messages (ctrl+End) ↓`, and its pane keeps no scrollback, so the
 running turn's timer, the newest output, and any verdict are all out of
 sight. A growing count is a screen change like any other. While the view stays
-scrolled no stall or idle clock runs (an episode already reported is kept, so
+scrolled no stall, idle, or finish clock runs (an episode already reported is kept, so
 it is not reported twice), the pass lists the agent under `scrolled` in its
 JSON and is not `ok`, and scrolling back to the bottom starts the clocks again.
 No notice is sent about the scroll itself, so a view left scrolled up hides a
@@ -725,31 +750,78 @@ server is the problem, and the pass says so instead of calling every harness
 dead; repairing that is `agentctl watch`'s job.
 
 The watcher never answers a prompt and never types into any agent except the
-coordinator. A condition past its threshold becomes **one notice per episode**:
-notices from one pass ride in a single message, messages are at least
-`--min-notice-interval` seconds apart (default 300), and the message goes
-through the same durable queue as `agentctl send`, so a coordinator that is
-busy simply keeps it queued. If the agent recovers before its notice is sent,
+coordinator. A condition past its threshold becomes **one notice per episode**,
+and every message goes through the same durable queue as `agentctl send`,
+delivered even while the coordinator works, so a coordinator that is busy
+simply keeps it queued. A `child-done` notice is a message of its own, sent in
+the pass that makes it due and never held by the rate limit:
+
+```text
+[agentctl watch-agents] cl-x finished its turn:
+- cl-x: finished its turn with a verdict (DONE: #123 some-slug landed as abc1234)
+Read its reply with `agentctl read cl-x`, then give it its next task or stop it.
+```
+
+It is sent once per turn: a new verdict line, or the same one after the agent
+was seen working again, is a new episode. The other conditions batch: notices
+from one pass ride in a single message, and those messages are at least
+`--min-notice-interval` seconds apart (default 300); a `child-done` message
+neither waits for that interval nor restarts it. If the agent recovers before its notice is sent,
 the notice is withdrawn. The notice names the agent, the condition, and
 the proving line or probe error, and points at `agentctl status NAME` and
 `agentctl read NAME`. Episode memory — when each condition was first seen,
 whether it was reported, and notices still owed — is kept in
 `agent-watch-state.json` in `--state-dir` (default
 `$XDG_STATE_HOME/agentctl/agent-watch`), next to the last pass's
-`agent-watch.json`. A batch's queue ID is derived from its notices, so a
+`agent-watch.json`. A reported `child-done` of an agent that is no longer
+listed (it was stopped, usually) is forgotten an hour after it was reported. A batch's queue ID is derived from its notices, so a
 watcher stopped between queueing a batch and recording that fact re-derives
 the same ID after a restart and the coordinator's queue recognises it instead
 of delivering it twice. `--once` runs a single pass, prints it as JSON, and
-exits 0 only when the team could be probed, no episode is reported or due, and
-no view is scrolled up, 1 otherwise; `--check-only` sends nothing and does not consume an episode's
+exits 0 only when the team could be probed, no episode other than `child-done`
+is reported or due, and no view is scrolled up, 1 otherwise (a finished child
+is news for the coordinator, not a fault); `--check-only` sends nothing and does not consume an episode's
 one report.
+
+#### The landing queue
+
+A coordinator that lands one child at a time tells the next ready child to
+hold. `agentctl hold` writes that down, so the go does not wait for the
+coordinator to notice the landing:
+
+```sh
+agentctl hold cl-ingest --after cl-dedupe --note "gate green, ready to push"
+agentctl hold --list
+agentctl hold cl-ingest --release
+```
+
+The queue is `landing-queue.json` in the registry (schema
+`agentctl-landing-queue/v1`), one hold per agent; a new hold replaces the old.
+When `cl-dedupe` finishes its turn with any verdict except one starting
+`BLOCKED` (whatever `--done-marker` says), its `child-done` notice gains a line
+naming every agent still waiting on it, and once that notice is queued for the
+coordinator those holds are marked released by it; a notice that could not be
+queued, or was withdrawn because the child went back to work, releases
+nobody:
+
+```text
+Landing queue: cl-ingest (gate green, ready to push) waited on cl-dedupe and is next.
+```
+
+A chain (B after A, C after B) advances one step per finish. The watcher only
+tells the coordinator; giving `cl-ingest` the go, after checking that
+`cl-dedupe` really landed, stays the coordinator's job. A released hold stays
+in `--list`, with `released_by` and `released_at`, for a day. A landing
+reported only in a message to the coordinator, not as the child's closing
+verdict, does not advance the queue. `hold` prints the queue as JSON;
+`--release` exits 1 when the agent had no hold.
 
 Run it beside `agent-watch.service` under its own user unit. This unit is a
 sample: `install-units` does not write it, and nothing here installs it.
 
 ```ini
 [Unit]
-Description=Tell the coordinator when an agent is at a prompt, idle, stalled, or dead
+Description=Tell the coordinator when an agent finished, is at a prompt, idle, stalled, or dead
 StartLimitIntervalSec=0
 
 [Service]
