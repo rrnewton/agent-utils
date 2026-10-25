@@ -214,8 +214,11 @@ fn detect_harness_in(shell_pid: u32, processes: &[ProcEntry]) -> Option<&'static
     let mut queue = std::collections::VecDeque::from([shell]);
     let mut seen = std::collections::HashSet::from([shell_pid]);
     while let Some(entry) = queue.pop_front() {
+        // With no foreground group to compare against, only the shell
+        // itself (the exec'd-harness case) can be named; treating every
+        // descendant as foreground would promote background jobs.
         let in_foreground =
-            entry.pid == shell_pid || foreground <= 0 || i64::from(entry.pgrp) == foreground;
+            entry.pid == shell_pid || (foreground > 0 && i64::from(entry.pgrp) == foreground);
         if in_foreground {
             if let Some(kind) = entry.harness() {
                 return Some(kind);

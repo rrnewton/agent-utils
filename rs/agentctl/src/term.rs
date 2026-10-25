@@ -328,19 +328,23 @@ fn infer_status(backend: &TmuxBackend, info: &BackendPaneInfo) -> String {
 ///
 /// tmux has no terminal-inside-a-pane identity separate from the pane, but
 /// a pane can be respawned in place with a fresh shell. Naming the pane
-/// plus its shell process generation changes exactly then, which is what
-/// the recorded identity must detect; when the generation cannot be read
-/// the shell pid alone still separates a respawn from the original in
-/// every practical case.
+/// plus its shell's full kernel generation (boot, pid, start time)
+/// changes exactly then, which is what the recorded identity must
+/// detect. When the generation cannot be read the id falls back to the
+/// pane and pid alone; a later successful read then reports a different
+/// id and recipient verification refuses, which is the safe direction.
 fn tmux_terminal_id(info: &BackendPaneInfo) -> Option<String> {
     if let Some(terminal) = &info.terminal_id {
         return Some(terminal.clone());
     }
     let pid = info.pid?;
-    let generation = agent_queue::identity::observe(u64::from(pid))
-        .map(|observed| observed.identity.starttime_ticks)
-        .unwrap_or(0);
-    Some(format!("tmux:{}:{pid}:{generation}", info.id))
+    match agent_queue::identity::observe(u64::from(pid)) {
+        Ok(observed) => Some(format!(
+            "tmux:{}:{pid}:{}:{}",
+            info.id, observed.identity.boot_id, observed.identity.starttime_ticks
+        )),
+        Err(_) => Some(format!("tmux:{}:{pid}", info.id)),
+    }
 }
 
 fn to_agent_pane_info(backend: &TmuxBackend, info: BackendPaneInfo) -> AgentPaneInfo {
@@ -697,11 +701,14 @@ struct TmuxProgram {
     path: PathBuf,
     device: u64,
     inode: u64,
+    /// Shebang interpreter basename for a script program.
+    interpreter: Option<String>,
     _file: fs::File,
 }
 
 fn pin_tmux_program(path: PathBuf) -> Result<TmuxProgram> {
-    let file = fs::File::open(&path).map_err(|error| {
+    use std::io::Read as _;
+    let mut file = fs::File::open(&path).map_err(|error| {
         AdapterError::unavailable(format!(
             "cannot pin harness executable {}: {error}",
             path.display()
@@ -723,12 +730,48 @@ fn pin_tmux_program(path: PathBuf) -> Result<TmuxProgram> {
             path.display()
         )));
     }
+    // A script's kernel image is its interpreter's, so matching a process
+    // to this program needs the interpreter the shebang names — otherwise
+    // any program merely holding the script path as an argument (an
+    // editor, a pager) would look like the harness.
+    let mut head = [0_u8; 256];
+    let read = file.read(&mut head).unwrap_or(0);
+    let interpreter = shebang_interpreter(&head[..read]);
     Ok(TmuxProgram {
         path,
         device,
         inode,
+        interpreter,
         _file: file,
     })
+}
+
+/// The interpreter basename a `#!` line names, resolving `env NAME`.
+fn shebang_interpreter(head: &[u8]) -> Option<String> {
+    let line = head.strip_prefix(b"#!")?;
+    let line = &line[..line
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(line.len())];
+    let mut tokens = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|token| !token.is_empty())
+        .map(|token| String::from_utf8_lossy(token).into_owned());
+    let first = tokens.next()?;
+    let base = |token: &str| {
+        token
+            .rsplit('/')
+            .next()
+            .filter(|base| !base.is_empty())
+            .map(str::to_owned)
+    };
+    if base(&first).as_deref() == Some("env") {
+        tokens
+            .find(|token| !token.starts_with('-'))
+            .and_then(|token| base(&token))
+    } else {
+        base(&first)
+    }
 }
 
 /// The pinned program for `kind`, when its fixed install location resolves.
@@ -744,35 +787,80 @@ fn program_basename_matches(path: &Path, kind: &str) -> bool {
         .is_some_and(|base| base.strip_suffix(".real").unwrap_or(base) == kind)
 }
 
-/// Whether one coherently observed process runs `program` (or, with no
-/// resolved program, a program named `kind`). An interpreter running the
-/// resolved script counts: its image is the interpreter's, but the script
-/// is its first file argument, and the pinned identity is that
-/// interpreter process generation.
-fn process_matches_program(
+/// How a process matched the harness program, strongest first. An exact
+/// image (same device and inode as the resolved program) outranks the
+/// shebang interpreter running the resolved script, which outranks a
+/// mere name match used only when no fixed program resolves.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum MatchClass {
+    Name,
+    Script,
+    Image,
+}
+
+fn exe_basename(path: &Path) -> Option<&str> {
+    path.file_name().and_then(|name| name.to_str())
+}
+
+/// The class at which one observed process runs `program` (or, with no
+/// resolved program, a program named `kind`).
+///
+/// With a resolved program there is no name fallthrough: a different
+/// binary that happens to share the kind's name, a process that set its
+/// argv\[0\] to the kind, or a pager holding the script as an argument
+/// must not pin as the harness. The script case additionally requires
+/// the process image to be the shebang's interpreter.
+fn process_match_class(
     observed: &agent_queue::identity::LiveProcess,
     argv: &[String],
     program: Option<&TmuxProgram>,
     kind: &str,
-) -> bool {
+) -> Option<MatchClass> {
     if let Some(program) = program {
         if observed.identity.executable_device == program.device
             && observed.identity.executable_inode == program.inode
         {
-            return true;
+            return Some(MatchClass::Image);
         }
-        if argv
-            .iter()
-            .take(2)
-            .any(|argument| fs::canonicalize(argument).is_ok_and(|path| path == program.path))
-        {
-            return true;
+        if let Some(interpreter) = &program.interpreter {
+            // The shebang names a command (`python3`); the kernel image
+            // is its resolved target, often versioned (`python3.12`).
+            let runs_script = exe_basename(&observed.executable_path).is_some_and(|base| {
+                base == interpreter
+                    || base.strip_prefix(interpreter.as_str()).is_some_and(|rest| {
+                        rest.starts_with('.') || rest.starts_with(|c: char| c.is_ascii_digit())
+                    })
+            }) && argv
+                .iter()
+                .take(2)
+                .any(|argument| fs::canonicalize(argument).is_ok_and(|path| path == program.path));
+            if runs_script {
+                return Some(MatchClass::Script);
+            }
         }
+        return None;
     }
-    program_basename_matches(&observed.executable_path, kind)
-        || argv
-            .first()
-            .is_some_and(|argv0| program_basename_matches(Path::new(argv0), kind))
+    if program_basename_matches(&observed.executable_path, kind) {
+        return Some(MatchClass::Name);
+    }
+    // An interpreter whose first file argument is named like the kind,
+    // for a wrapped install no fixed location resolves. argv[0] alone
+    // never counts: it is caller-chosen text.
+    let interpreter_like = exe_basename(&observed.executable_path).is_some_and(|base| {
+        base.starts_with("python")
+            || matches!(
+                base,
+                "node" | "ruby" | "perl" | "bash" | "sh" | "deno" | "bun"
+            )
+    });
+    if interpreter_like
+        && argv
+            .get(1)
+            .is_some_and(|script| program_basename_matches(Path::new(script), kind))
+    {
+        return Some(MatchClass::Name);
+    }
+    None
 }
 
 /// Pick the harness to pin among foreground candidates: the only one, or
@@ -815,7 +903,36 @@ fn choose_candidate(candidates: &[u64], processes: &[TmuxProc]) -> Option<u64> {
     }
 }
 
+/// The command line of one pinned process generation, read between two
+/// identity proofs so a recycled pid cannot lend its argv to the pin.
+fn proved_argv(expected: &CustomProcessIdentity) -> Option<Vec<String>> {
+    const LIMIT: usize = 256 << 10;
+    let same =
+        || live_custom_process(expected.pid).is_ok_and(|observed| observed.identity == *expected);
+    if !same() {
+        return None;
+    }
+    let mut raw = fs::read(format!("/proc/{}/cmdline", expected.pid)).ok()?;
+    if !same() || raw.is_empty() || raw.len() > LIMIT {
+        return None;
+    }
+    if raw.last() == Some(&0) {
+        raw.pop();
+    }
+    let argv = raw
+        .split(|byte| *byte == 0)
+        .map(|item| String::from_utf8(item.to_vec()).ok())
+        .collect::<Option<Vec<_>>>()?;
+    (!argv.is_empty() && argv.iter().all(|item| !item.is_empty())).then_some(argv)
+}
+
 /// The pinned harness process in one pane state, when it can be pinned.
+///
+/// Candidates are chosen within the strongest match class present, so a
+/// launcher script that merely started the real binary never outranks
+/// that binary. The chosen process is then re-proved against a fresh,
+/// identity-bracketed argv read: the argv that elected it and the
+/// identity being pinned must still belong to the same generation.
 fn harness_candidate(
     state: &TmuxPaneProcesses,
     processes: &[TmuxProc],
@@ -826,7 +943,7 @@ fn harness_candidate(
         .iter()
         .map(|entry| (entry.pid, entry.argv.as_slice()))
         .collect();
-    let mut observed_by_pid: HashMap<u64, CustomProcessIdentity> = HashMap::new();
+    let mut by_class: HashMap<MatchClass, Vec<(u64, CustomProcessIdentity)>> = HashMap::new();
     for pid in &state.foreground {
         // The shell itself is a candidate only when it exec'd the harness:
         // its image then matches, which the program check decides.
@@ -837,12 +954,40 @@ fn harness_candidate(
             continue;
         }
         let argv = argv_of.get(pid).copied().unwrap_or_default();
-        if process_matches_program(&observed, argv, program, kind) {
-            observed_by_pid.insert(*pid, observed.identity);
+        if let Some(class) = process_match_class(&observed, argv, program, kind) {
+            by_class
+                .entry(class)
+                .or_default()
+                .push((*pid, observed.identity));
         }
     }
-    let candidates: Vec<u64> = observed_by_pid.keys().copied().collect();
-    Ok(choose_candidate(&candidates, processes).and_then(|pid| observed_by_pid.get(&pid).cloned()))
+    for class in [MatchClass::Image, MatchClass::Script, MatchClass::Name] {
+        let Some(candidates) = by_class.get(&class) else {
+            continue;
+        };
+        let pids: Vec<u64> = candidates.iter().map(|(pid, _)| *pid).collect();
+        let Some(pid) = choose_candidate(&pids, processes) else {
+            continue;
+        };
+        let identity = candidates
+            .iter()
+            .find(|(candidate, _)| *candidate == pid)
+            .map(|(_, identity)| identity.clone())
+            .expect("chosen pid came from candidates");
+        let Ok(observed) = live_custom_process(pid) else {
+            continue;
+        };
+        if observed.identity != identity || observed.process_group_id != state.foreground_pgid {
+            continue;
+        }
+        let Some(argv) = proved_argv(&identity) else {
+            continue;
+        };
+        if process_match_class(&observed, &argv, program, kind) == Some(class) {
+            return Ok(Some(identity));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether `expected` is still a foreground process of the pane, in the
@@ -878,6 +1023,22 @@ fn idle_shell_proof(state: &TmuxPaneProcesses) -> Result<Option<PaneShellProof>>
         || confirmed.process_group_id != observed.process_group_id
         || confirmed.executable_path != observed.executable_path
     {
+        return Ok(None);
+    }
+    // The shell's argv[0] must name the same program as its image: a
+    // renamed or substituted argv[0] (a login shell's leading `-` aside)
+    // is not the idle shell the proof claims, matching the Herdr path's
+    // argv-to-image coherence check.
+    let Some(argv) = proved_argv(&observed.identity) else {
+        return Ok(None);
+    };
+    let argv0 = argv[0].trim_start_matches('-');
+    let coherent = if argv0.contains('/') {
+        fs::canonicalize(argv0).is_ok_and(|path| path == observed.executable_path)
+    } else {
+        exe_basename(&observed.executable_path) == Some(argv0)
+    };
+    if !coherent {
         return Ok(None);
     }
     Ok(Some(PaneShellProof {
@@ -1142,7 +1303,11 @@ impl crate::subagents::ManagedApi for TmuxBackend {
     }
 
     fn agent_names(&self) -> Result<BTreeMap<String, String>> {
-        let mut names = BTreeMap::new();
+        // A tmux agent's name is its single-pane window's label. A label
+        // carried by more than one such window (across any sessions) is
+        // ambiguous and names nobody, rather than resolving to whichever
+        // window was listed first.
+        let mut seen: Vec<(String, String)> = Vec::new();
         for workspace in term_err(self.list_workspaces())? {
             let panes = term_err(Multiplexer::list_panes(self, Some(&workspace.id)))?;
             let mut by_tab: HashMap<String, Vec<String>> = HashMap::new();
@@ -1156,11 +1321,18 @@ impl crate::subagents::ManagedApi for TmuxBackend {
             }
             for tab in term_err(Multiplexer::list_tabs(self, &workspace.id))? {
                 if let Some([pane]) = by_tab.get(&tab.id.to_string()).map(Vec::as_slice) {
-                    names.entry(tab.label).or_insert_with(|| pane.clone());
+                    seen.push((tab.label, pane.clone()));
                 }
             }
         }
-        Ok(names)
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (label, _) in &seen {
+            *counts.entry(label.clone()).or_default() += 1;
+        }
+        Ok(seen
+            .into_iter()
+            .filter(|(label, _)| counts[label.as_str()] == 1)
+            .collect())
     }
 
     fn tab_label(&self, tab: &str) -> Result<String> {
@@ -1206,27 +1378,7 @@ impl crate::subagents::ManagedApi for TmuxBackend {
     }
 
     fn process_command_line(&self, expected: &CustomProcessIdentity) -> Option<Vec<String>> {
-        // The same proved-generation command-line read the Herdr client
-        // does: prove the identity before and after reading cmdline.
-        const LIMIT: usize = 256 << 10;
-        let same = || {
-            live_custom_process(expected.pid).is_ok_and(|observed| observed.identity == *expected)
-        };
-        if !same() {
-            return None;
-        }
-        let mut raw = fs::read(format!("/proc/{}/cmdline", expected.pid)).ok()?;
-        if !same() || raw.is_empty() || raw.len() > LIMIT {
-            return None;
-        }
-        if raw.last() == Some(&0) {
-            raw.pop();
-        }
-        let argv = raw
-            .split(|byte| *byte == 0)
-            .map(|item| String::from_utf8(item.to_vec()).ok())
-            .collect::<Option<Vec<_>>>()?;
-        (!argv.is_empty() && argv.iter().all(|item| !item.is_empty())).then_some(argv)
+        proved_argv(expected)
     }
 
     fn verify_custom_harness(
@@ -1460,6 +1612,63 @@ mod tests {
         assert_eq!(choose_candidate(&[202, 200, 201], &processes), Some(200));
         // Two unrelated candidates cannot be pinned.
         assert_eq!(choose_candidate(&[201, 202], &processes), None);
+    }
+
+    #[test]
+    fn shebang_interpreter_resolves_env_and_direct_paths() {
+        assert_eq!(
+            shebang_interpreter(b"#!/usr/bin/env python3\nx").as_deref(),
+            Some("python3")
+        );
+        assert_eq!(
+            shebang_interpreter(b"#!/opt/node/bin/node --flag\n").as_deref(),
+            Some("node")
+        );
+        assert_eq!(shebang_interpreter(b"\x7fELF..."), None);
+        assert_eq!(
+            shebang_interpreter(b"#!/usr/bin/env -S node x\n").as_deref(),
+            Some("node")
+        );
+    }
+
+    #[test]
+    fn a_pager_holding_the_script_never_matches_the_resolved_program() {
+        let directory = std::env::temp_dir().join(format!("agentctl-term-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("claude");
+        std::fs::write(&script, "#!/usr/bin/env python3\n").unwrap();
+        let program = pin_tmux_program(script.clone()).unwrap();
+        let identity = |pid| agent_queue::identity::LiveProcess {
+            identity: agent_queue::identity::ProcessIdentity {
+                version: 1,
+                pid,
+                starttime_ticks: 1,
+                boot_id: "boot".to_owned(),
+                executable_device: 9,
+                executable_inode: 9,
+            },
+            executable_path: PathBuf::from("/usr/bin/less"),
+            process_group_id: pid,
+        };
+        let pager_argv = vec!["less".to_owned(), script.display().to_string()];
+        assert_eq!(
+            process_match_class(&identity(10), &pager_argv, Some(&program), "claude"),
+            None
+        );
+        // The shebang interpreter running the same script does match.
+        let mut interpreter = identity(11);
+        interpreter.executable_path = PathBuf::from("/usr/bin/python3");
+        assert_eq!(
+            process_match_class(&interpreter, &pager_argv, Some(&program), "claude"),
+            Some(MatchClass::Script)
+        );
+        // With a resolved program there is no argv[0] name fallthrough.
+        let spoofed = vec!["claude".to_owned()];
+        assert_eq!(
+            process_match_class(&identity(12), &spoofed, Some(&program), "claude"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

@@ -106,6 +106,9 @@ Differences from Herdr to know before relying on them:
   inferred from the agent's screen and a conversation is recorded only
   when agentctl assigned or was told its ID (new Claude launches still
   receive a generated `--session-id`, which is what revive resumes).
+  A tmux Codex or Muse agent is revivable only once a conversation ID
+  is recorded — from `--resume` at start, or later with `bind-session`;
+  without one revive refuses and says so.
   Harness detection reads the process tree under the pane's shell, so a
   harness started through a wrapper script still reports its kind.
 - agentctl launches the harness executable itself. It resolves Codex,

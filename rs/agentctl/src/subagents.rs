@@ -2112,7 +2112,10 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     fn uses_muse_composer(&self) -> bool {
         self.record.harness == "muse"
-            && matches!(self.record.adapter.as_str(), "herdr-pane" | "herdr-foreign")
+            && matches!(
+                self.record.adapter.as_str(),
+                "herdr-pane" | "herdr-foreign" | "tmux" | "tmux-foreign"
+            )
     }
 
     /// Prove that a pinned Muse pane may take a literal paste now, and return the screen that
@@ -2159,7 +2162,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     "pane {pane_id} does not show an empty Muse editor with one status footer"
                 )));
             }
-            if self.record.adapter == "herdr-foreign" && !muse_auto_review_idle_composer(&before) {
+            if self.record.is_foreign() && !muse_auto_review_idle_composer(&before) {
                 return Err(AdapterError::unavailable(
                     "an adopted Muse pane takes input only at its Auto-review editor",
                 ));
@@ -2223,7 +2226,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                      (a draft, an approval form or a panel may be there)"
                 )));
             }
-            if self.record.adapter == "herdr-foreign"
+            if self.record.is_foreign()
                 && muse_verified_process_footer_mode(&crate::harness_tui::plain(&before))
                     != Some("Auto-review")
             {
@@ -2481,6 +2484,26 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 self.record.custom_process_identity.as_ref(),
                 runtime,
             );
+        }
+        if self.record.adapter == "tmux" {
+            // An owned tmux Muse has no custom-pane identity or foreign
+            // shell to check: its pinned harness process is the proof.
+            if runtime.cancelled() {
+                return Err(AdapterError::cancelled(
+                    "tmux control operation was cancelled",
+                ));
+            }
+            let identity = self.record.harness_anchor().ok_or_else(|| {
+                AdapterError::recipient_changed(
+                    "tmux Muse record has no current foreground harness process anchor",
+                )
+            })?;
+            if !self.client.verify_harness_identity(pane_id, identity)? {
+                return Err(AdapterError::recipient_changed(
+                    "tmux Muse foreground harness process generation changed",
+                ));
+            }
+            return Ok(());
         }
         if runtime.cancelled() {
             return Err(AdapterError::cancelled(
@@ -4952,7 +4975,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.directory(agent_name)?;
         agent::validate_private_directory(&self.registry, "agent registry", false)?;
         self.refuse_pending_rename_with_stop_advice(&[agent_name], recovery)?;
-        self.read_record(agent_name)
+        let record = self.read_record(agent_name)?;
+        self.require_record_backend(&record)?;
+        Ok(record)
+    }
+
+    /// Refuse to drive an interactive record through the wrong terminal
+    /// backend. The other backend's census cannot see its pane, so every
+    /// live check would report it missing — and stop would archive a live
+    /// agent as closed. Headless turn-runner records are exempt: their
+    /// retirement never touches a multiplexer census.
+    fn require_record_backend(&self, record: &AgentRecord) -> Result<()> {
+        if matches!(
+            record.adapter.as_str(),
+            "herdr"
+                | "herdr-pane"
+                | "herdr-foreign"
+                | "herdr-relay"
+                | "tmux"
+                | "tmux-foreign"
+                | "agentcloud"
+        ) && record.backend != self.client.record_backend()
+        {
+            return Err(fail(format!(
+                "agent {:?} uses the {} terminal backend; select it with --term-backend {}",
+                record.name, record.backend, record.backend
+            )));
+        }
+        Ok(())
     }
 
     /// Read and validate one record without consulting rename journals.
@@ -6011,8 +6061,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "pane {pane} is also claimed by registered agent '{owner}'; run `agentctl doctor`"
             )));
         }
-        if record.adapter == "herdr" && self.client.agent_names()?.contains_key(new) {
-            return Err(fail(format!("a Herdr agent is already named '{new}'")));
+        if self.client.agent_names()?.contains_key(new) {
+            return Err(fail(format!("an agent is already named '{new}'")));
         }
         if record.is_owned_native() {
             if let Some(workspace) = record.workspace_id.as_deref() {
@@ -6342,7 +6392,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         for record in &records {
-            let mut findings = if record
+            let mut findings = if self.require_record_backend(record).is_err() {
+                // This census cannot see the other backend's panes; say
+                // that instead of reporting the agent missing.
+                vec!["backend-mismatch"]
+            } else if record
                 .workspace_id
                 .as_deref()
                 .is_some_and(|workspace| missing_workspaces.contains(workspace))
@@ -7033,7 +7087,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .client
                 .harness_identity(&info.pane_id, &options.harness)?
                 .ok_or_else(|| {
-                    fail("adopting Muse requires a pinned sole foreground harness process")
+                    fail("adopting Muse requires a pinned foreground harness process")
                 })?;
             if !identity.valid()
                 || !self
