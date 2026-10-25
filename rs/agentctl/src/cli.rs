@@ -39,6 +39,20 @@ struct Cli {
     /// Herdr executable name on PATH or an explicit path (interactive adapter only)
     #[arg(long, global = true, default_value = "herdr", value_name = "PATH")]
     herdr_bin: PathBuf,
+    /// Terminal multiplexer backend: herdr (default) or tmux. Default:
+    /// $AGENTCTL_TERM_BACKEND when set and nonempty, else the profiles.json
+    /// term_backend key, else herdr when its executable is available, else tmux.
+    /// The tmux backend drives the durable direct-pane transport
+    /// (herdr-agent send/drain/status/read against an explicit pane); agent
+    /// lifecycle commands still require Herdr in this step
+    #[arg(long, global = true, value_parser = ["herdr", "tmux"], value_name = "BACKEND")]
+    term_backend: Option<String>,
+    /// tmux executable name on PATH or an explicit path (tmux backend only)
+    #[arg(long, global = true, default_value = "tmux", value_name = "PATH")]
+    tmux_bin: PathBuf,
+    /// tmux server socket name passed as -L (tmux backend only); default: the default tmux server
+    #[arg(long, global = true, value_name = "NAME")]
+    tmux_socket: Option<String>,
     /// agentcloudctl executable name on PATH or an explicit path (agentcloud agents only)
     #[arg(
         long,
@@ -1548,9 +1562,18 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
     let plugin_inventory = plugin_discovery_required(&command).then(crate::plugins::discover);
     match command {
         Commands::Capabilities => {
+            let selected = crate::term::select_backend(
+                args.term_backend.as_deref(),
+                environment,
+                &args.registry,
+                &args.herdr_bin,
+                &args.tmux_bin,
+            )
+            .map_err(AgentError::from)?;
             write_json(&capabilities_document(
                 args.registry,
                 plugin_inventory.expect("capabilities requires plugin discovery"),
+                selected.as_str(),
             ))
             .map_err(Failure::Output)?;
             return Ok(0);
@@ -1774,6 +1797,22 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return crate::codex_goal::command::run(&value).map_err(Failure::Output);
         }
         _ => {}
+    }
+    let selected_backend = crate::term::select_backend(
+        args.term_backend.as_deref(),
+        environment,
+        &args.registry,
+        &args.herdr_bin,
+        &args.tmux_bin,
+    )
+    .map_err(AgentError::from)?;
+    if selected_backend == term_backend::BackendKind::Tmux {
+        return Err(Failure::Usage(
+            "the tmux terminal backend currently drives only the durable direct-pane transport \
+             (herdr-agent send/drain/status/read --pane PANE); agent lifecycle commands require \
+             Herdr — select it with --term-backend herdr"
+                .to_owned(),
+        ));
     }
     let client =
         HerdrClient::with_executable("direct", &args.herdr_bin).map_err(AgentError::from)?;
@@ -2431,11 +2470,13 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
 fn capabilities_document(
     registry: PathBuf,
     plugins: crate::plugins::PluginInventory,
+    selected_backend: &str,
 ) -> serde_json::Value {
     let not_live = crate::plugins::MaturityStatus::discovered(false);
     json!({
         "interactive": {
-            "backends": ["herdr"],
+            "backends": ["herdr", "tmux"],
+            "selected_backend": selected_backend,
             "harnesses": ["codex", "claude", "muse"]
         },
         "agentcloud": {
@@ -3784,7 +3825,12 @@ mod tests {
                 detail: "fixture refusal".to_owned(),
             }],
         };
-        let document = capabilities_document(PathBuf::from("registry"), plugins);
+        let document = capabilities_document(PathBuf::from("registry"), plugins, "herdr");
+        assert_eq!(
+            document["interactive"]["backends"],
+            json!(["herdr", "tmux"])
+        );
+        assert_eq!(document["interactive"]["selected_backend"], "herdr");
         assert_eq!(document["chat_subscriptions"]["core"]["origin"], "built_in");
         assert_eq!(
             document["chat_subscriptions"]["core"]["protocol_name"],

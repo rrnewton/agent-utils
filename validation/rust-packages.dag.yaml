@@ -10,6 +10,7 @@ steps:
     cmd: >-
       python3 scripts/check_rust_packages.py
       --crate agent-queue
+      --crate term-backend
       --crate chat-subscription
       --crate chat-subscription-plugin
       --crate agentctl

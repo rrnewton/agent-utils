@@ -26,6 +26,7 @@ pub(crate) mod skill_install;
 pub mod stale_composer;
 pub mod subagents;
 pub mod submission;
+pub mod term;
 pub mod tui_prompts;
 pub mod units;
 

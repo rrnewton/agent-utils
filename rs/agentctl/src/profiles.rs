@@ -84,6 +84,8 @@ struct Document {
     workspace: Option<Value>,
     #[serde(default)]
     wrkslots: Option<Value>,
+    #[serde(default)]
+    term_backend: Option<Value>,
     profiles: UniqueMap<RawProfile>,
 }
 
@@ -734,6 +736,7 @@ pub(crate) fn load_configuration(
         .map(|(name, profile)| validate(name.clone(), profile).map(|value| (name, value)))
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     wrkslots_value(document.wrkslots.as_ref())?;
+    backend_value(document.term_backend.as_ref())?;
     Ok((path, profiles, workspace))
 }
 
@@ -830,6 +833,33 @@ pub(crate) fn workspace_for_registry(registry: &Path) -> Result<Option<String>, 
         Some(_) => Err(fail(
             "profile config workspace must be 1-128 bytes, have no surrounding whitespace, and contain no control characters",
         )),
+    }
+}
+
+/// The optional `term_backend` key: `"herdr"` or `"tmux"`.
+fn backend_value(value: Option<&Value>) -> Result<Option<term_backend::BackendKind>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => term_backend::BackendKind::parse(raw)
+            .map(Some)
+            .map_err(|_| {
+                fail(format!(
+                    "profile config term_backend must be \"herdr\" or \"tmux\", got {raw:?}"
+                ))
+            }),
+        Some(_) => Err(fail(
+            "profile config term_backend must be \"herdr\" or \"tmux\"",
+        )),
+    }
+}
+
+/// Read only the configured terminal backend for a conventional project registry.
+pub(crate) fn backend_for_registry(
+    registry: &Path,
+) -> Result<Option<term_backend::BackendKind>, AgentError> {
+    match registry_policy(registry)? {
+        Some(object) => backend_value(object.get("term_backend")),
+        None => Ok(None),
     }
 }
 

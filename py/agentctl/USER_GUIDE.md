@@ -43,6 +43,27 @@ Environment metadata contains names only; values remain in private profiles.
 | Chat service | Provider messages connected to an interactive coordinator | Herdr and either the Python Google Chat transport or a Rust subscription plugin |
 | MCP extension | The same session operations over local MCP stdio | An MCP client |
 
+### Terminal backends
+
+The Rust edition reaches a terminal multiplexer through a backend-neutral
+interface instead of calling one multiplexer everywhere. Two backends exist:
+Herdr (the default, with its native per-agent status) and tmux (sessions act
+as workspaces and windows as tabs; it tracks no per-agent status, so the
+agent's state is inferred from its screen). Select one with
+`--term-backend herdr|tmux`, the `AGENTCTL_TERM_BACKEND` environment
+variable, or the `term_backend` key in `.agentctl/profiles.json` (checked in
+that order). With no selection, Herdr is used when its executable is
+available and tmux when only tmux exists. `--tmux-bin` names the tmux
+executable and `--tmux-socket NAME` addresses a non-default tmux server
+(passed as `-L NAME`). `agentctl capabilities` reports both backends and
+which one is selected.
+
+Today the tmux backend drives the durable direct-pane transport: the
+`herdr-agent` compatibility command's `send`, `drain`, `status`, and `read`
+against an explicit `--pane PANE`, using tmux pane identifiers (for example
+`%1`). Agent lifecycle commands (start, adopt, stop, restore, watch, and
+chat) still require Herdr and refuse clearly when tmux is selected.
+
 ### Rust subscription plugin discovery
 
 The Rust command inspects `~/.agentctl/plugins/` when `agentctl capabilities`,
@@ -212,7 +233,9 @@ subscription. Those reference entries are design inventory, not working inbound
 backends; installed plugin manifests appear separately.
 
 Extension commands are not available in every installation. An interactive
-agent requires Herdr; selecting tmux does not provide interactive agent control.
+agent's lifecycle requires Herdr; selecting tmux provides the direct-pane
+message transport described under "Terminal backends", not agent lifecycle
+control.
 A headless transcript view is not a native interactive harness interface.
 
 ## Names, state, and shared workspaces

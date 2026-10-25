@@ -81,7 +81,7 @@ CRATES: tuple[Crate, ...] = (
 # already-inspected dependency archives, never to the live checkout.
 LOCAL_PACKAGE_PATCHES: dict[str, tuple[str, ...]] = {
     "chat-subscription-plugin": ("chat-subscription",),
-    "agentctl": ("agent-queue", "chat-subscription", "chat-subscription-plugin"),
+    "agentctl": ("agent-queue", "chat-subscription", "chat-subscription-plugin", "term-backend"),
 }
 
 _FOREIGN_DOC_TERMS = re.compile(

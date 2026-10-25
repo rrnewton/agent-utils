@@ -53,7 +53,7 @@ project's own rules, and reports substance back to the owner.
 
 | Layer | Tool | Status | What it does |
 |---|---|---|---|
-| Terminals | [Herdr](https://github.com/herdrdev/herdr) | external dependency | A persistent terminal server. Every agent runs as its native TUI in a Herdr tab, so a person can attach to any of them and take over. |
+| Terminals | [Herdr](https://github.com/herdrdev/herdr) or tmux | external dependency | A persistent terminal server. Every agent runs as its native TUI in a Herdr tab, so a person can attach to any of them and take over. tmux is a first-class second backend for the direct-pane message transport. |
 | Sessions | `agentctl` | core | Starts, messages, reads, and stops named agents across harnesses (Claude, Codex, Muse, and agentcloud workers), with durable prompt delivery and owner-controlled launch profiles. One interface for the owner and the coordinator alike. |
 | Workspaces | `wrkslots` | core | Gives each agent its own Git worktree slot on its own branch, records ownership and handoffs, salvages unpushed work, and removes a slot only after proving nothing uses it. Each slot gets systemd resource limits, optionally lives in its own sparse disk image, and can be boxed into a file-system view where only the slot is writable. |
 | Owner channel | `agentctl chat` | core | Bridges a chat space to the coordinator. Google Chat works today through the Python edition's polling transport. The Rust bridge takes providers through the subscription-plugin protocol; the Slack provider in this repository (`rs/chat-subscription-slack`, built separately, not published) reaches Slack through a separately installed Slack command-line client, because its Web API transport is not implemented yet. |
@@ -92,7 +92,7 @@ state-transition drift.
 | `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |
 | `pr-landing-planner` | Produce advisory, conflict- and CI-aware pull-request landing plans. | `pr-landing-planner` | `pr-landing-planner` |
 | `herdr-run` | Run an allowlisted command in a Herdr pane, outside whatever constrains the caller, with audited, byte-preserving results. An agent whose sandbox blocks the network is one such caller. | `herdr-run` | `herdr-run` |
-| `agentctl` | Start named coding agents, delegate follow-up work, inspect goals, and retain direct terminal access. Interactive control requires Herdr. | `agentctl` (also worker, polling Chat, and MCP extensions) | `agentctl` (interactive core and event-driven plugin Chat service) |
+| `agentctl` | Start named coding agents, delegate follow-up work, inspect goals, and retain direct terminal access. Interactive control requires Herdr or tmux (Herdr for agent lifecycle; tmux also drives the direct-pane transport). | `agentctl` (also worker, polling Chat, and MCP extensions) | `agentctl` (interactive core and event-driven plugin Chat service) |
 
 Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not
