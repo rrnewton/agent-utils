@@ -57,7 +57,7 @@ CHIP_JS = """() => {
     buttonCentre: button.getBoundingClientRect().left + button.getBoundingClientRect().width / 2,
     bar: box(document.getElementById('search-float')),
     first: first ? box(first) : null,
-    tip: {text: tip.textContent, box: box(tip), opacity: tipStyle.opacity, visibility: tipStyle.visibility},
+    tip: {text: tip.textContent, box: box(tip), display: tipStyle.display},
   };
 }"""
 
@@ -134,10 +134,10 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int = 1
         check(box is not None, f"{label}: the author filter has no box to rest on")
         if box is not None:
             page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-            until(page, "() => getComputedStyle(document.getElementById('author-filter-tip')).opacity === '1'",
+            until(page, "() => getComputedStyle(document.getElementById('author-filter-tip')).display === 'block'",
                   f"{label}: resting on the author filter raised no tooltip")
             now = page.evaluate(CHIP_JS)
-            check(now["tip"]["visibility"] == "visible" and now["tip"]["box"] is not None
+            check(now["tip"]["display"] == "block" and now["tip"]["box"] is not None
                   and now["tip"]["box"]["top"] >= now["button"]["bottom"] - 1,
                   f"{label}: the tooltip is not under the button: {now['tip']}")
             check(now["tip"]["text"] == now["title"] and now["tip"]["text"].startswith("Whose messages:"),
@@ -149,7 +149,7 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int = 1
             page.mouse.move(10, 10)
         # ...and keyboard focus raises it too.
         page.focus("#author-filter")
-        until(page, "() => getComputedStyle(document.getElementById('author-filter-tip')).opacity === '1'",
+        until(page, "() => getComputedStyle(document.getElementById('author-filter-tip')).display === 'block'",
               f"{label}: focusing the author filter raised no tooltip")
     return "; ".join(landed)
 

@@ -5069,11 +5069,13 @@ a.search-hit-link {
    the button (the bar stands at the screen's top, so above it there is no room) and takes no room,
    so the bar and the list never move for it. */
 #author-filter .author-tip {
+  display: none;
   position: absolute;
   top: calc(100% + 0.4rem);
   left: 50%;
   transform: translateX(-50%);
-  max-width: 16rem;
+  width: max-content;
+  max-width: min(16rem, calc(100vw - 1rem));
   padding: 0.3rem 0.55rem;
   background: var(--panel);
   color: var(--ink);
@@ -5082,24 +5084,18 @@ a.search-hit-link {
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
   font-size: 0.75rem;
   line-height: 1.3;
-  white-space: nowrap;
   pointer-events: none;
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity 0.15s ease, visibility 0.15s;
   z-index: 30;
 }
 
 #author-filter:hover .author-tip,
 #author-filter:focus-visible .author-tip {
-  opacity: 1;
-  visibility: visible;
+  display: block;
 }
 
 /* While the chip a press left is up it holds the place under the button, so the tooltip waits. */
 #author-filter:has(.author-chip:not([hidden])) .author-tip {
-  opacity: 0;
-  visibility: hidden;
+  display: none;
 }
 
 /* `#520 search-whose-toggle-hint`. The chip a press leaves under the button, naming the state it
@@ -5126,7 +5122,6 @@ a.search-hit-link {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  #author-filter .author-tip,
   #author-filter .author-chip {
     transition: none;
   }

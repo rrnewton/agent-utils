@@ -60321,9 +60321,11 @@ test("`#251 author-filter`: the author filter sits left of Links, only while the
 test("`#520 search-whose-toggle-hint`: the author filter's tooltip and title name what it does and the state it is in, per state", async () => {
   // The tooltip is drawn off the button on hover and on keyboard focus, and floats (no layout shift).
   assert.match(cssBlock("#author-filter .author-tip"), /position:\s*absolute/, "the tooltip does not float");
-  assert.match(cssBlock("#author-filter:hover .author-tip"), /opacity:\s*1/,
+  assert.match(cssBlock("#author-filter .author-tip"), /display:\s*none/,
+    "the tooltip is drawn while nobody is asking for it");
+  assert.match(cssBlock("#author-filter:hover .author-tip"), /display:\s*block/,
     "the tooltip never shows on hover");
-  assert.match(cssBlock("#author-filter:focus-visible .author-tip"), /opacity:\s*1/,
+  assert.match(cssBlock("#author-filter:focus-visible .author-tip"), /display:\s*block/,
     "the tooltip never shows on keyboard focus");
   assert.match(cssBlock("#author-filter .author-tip"), /pointer-events:\s*none/, "the tooltip takes presses");
   const page = newPage();
