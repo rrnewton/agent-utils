@@ -58,6 +58,10 @@
 //! to the inbox; a refusal proven to precede any input moves it back to `inbox/`. A drain that
 //! finds items left in `inflight/` by a crashed drainer quarantines them as
 //! `possibly_submitted` ([`queue::recover_inflight`]): no item is ever replayed automatically.
+//! One exception is provable: a tracking drainer stamps `paste_tracking: true` and its origin
+//! lane as `inflight_from` with the barrier, and `paste_started_at` immediately before its first
+//! terminal input; a tracked item with no `paste_started_at` was never typed, so recovery
+//! returns it to its origin lane (stamps stripped) instead of quarantining it.
 //!
 //! **Queue order** ([`queue::inbox_in_queue_order`]): ascending numeric `queued_at`, then file
 //! name; items without a numeric `queued_at` (or unreadable ones, which the drain quarantines)
@@ -67,7 +71,8 @@
 //! **Item fields.** Required: `text` (nonempty string). Written at enqueue: `id`, `queued_at`
 //! (Unix seconds, fractional) and `delivery_attempts` (0). A drainer may add `delivery_state`
 //! (`pending`, `inflight`, `processed`), `delivery_error`, `delivery_blocked_at`,
-//! `possibly_submitted`, `inflight_at`, `confirmed_at`, `delivery_failed_at`,
+//! `possibly_submitted`, `inflight_at`, `paste_tracking`, `inflight_from`, `paste_started_at`,
+//! `confirmed_at`, `delivery_failed_at`,
 //! `delivery_attempts` and its alias `tui_delivery_attempts`, `misroutes` (array of
 //! `{at, error}`) and `probable_misroute`. A sender may add fields of its own, such as the
 //! original send time of a chat request (`sent_at`, `opening`). Readers ignore fields they do not

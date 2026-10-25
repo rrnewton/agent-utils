@@ -486,6 +486,7 @@ impl AgentApi for TmuxBackend {
                 runtime,
             );
         }
+        runtime.input_started();
         self.run(pane_id, text).map(|()| Submission::Unconfirmed)
     }
 

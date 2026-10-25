@@ -593,11 +593,59 @@ pub fn quarantine_raw(path: &Path, failed: &Path, outcome: &str, error: &str) ->
     message_id_from_path(path)
 }
 
+/// Return an inflight item that provably never reached the terminal to the
+/// pending lane it came from, and say whether that happened. The proof is
+/// two stamps a tracking drainer leaves: `paste_tracking: true` plus the
+/// origin lane (`inflight_from`), written with the at-most-once barrier,
+/// and `paste_started_at`, written immediately before its first terminal
+/// input. Tracked with no paste started means input provably never began,
+/// so the item may be typed by a later drain; anything else (an untracked
+/// item from an older drainer, a paste that started, an unreadable item)
+/// stays quarantined. The false-positive window this closes - a drainer
+/// that died between the barrier and its first input - stranded live
+/// trial messages as `possibly_submitted` although nothing was ever typed.
+fn repend_never_typed(directories: &QueueDirectories, path: &Path) -> Result<bool> {
+    let Ok(mut document) = load_message(path) else {
+        return Ok(false);
+    };
+    if document.get("paste_tracking") != Some(&Value::Bool(true))
+        || document.contains_key("paste_started_at")
+    {
+        return Ok(false);
+    }
+    let lane = match document.get("inflight_from").and_then(Value::as_str) {
+        Some("inbox") => &directories.inbox,
+        Some("inbox.v2") => &directories.inbox_v2,
+        _ => return Ok(false),
+    };
+    if !lane.is_dir() {
+        return Ok(false);
+    }
+    for field in [
+        "possibly_submitted",
+        "inflight_at",
+        "paste_tracking",
+        "inflight_from",
+    ] {
+        document.remove(field);
+    }
+    document.insert("delivery_state".to_owned(), json!("pending"));
+    atomic_json(path, &Value::Object(document))?;
+    let filename = path.file_name().expect("listed path has filename");
+    transition(path, &lane.join(filename))?;
+    Ok(true)
+}
+
 /// Quarantine every item left in `inflight/` as `possibly_submitted`, never replaying it, and
-/// return their identifiers. Only the holder of the delivery lock may call this.
+/// return their identifiers. An item a tracking drainer provably never
+/// typed is returned to its pending lane instead ([`repend_never_typed`])
+/// and is not returned. Only the holder of the delivery lock may call this.
 pub fn recover_inflight(directories: &QueueDirectories) -> Result<Vec<String>> {
     let mut recovered = Vec::new();
     for path in json_paths(&directories.inflight)? {
+        if repend_never_typed(directories, &path)? {
+            continue;
+        }
         let filename = path.file_name().expect("listed path has filename");
         let destination = directories.failed.join(filename);
         transition(&path, &destination)?;
@@ -835,6 +883,9 @@ pub fn set_aside(
     })?;
     document.remove("possibly_submitted");
     document.remove("inflight_at");
+    document.remove("paste_tracking");
+    document.remove("inflight_from");
+    document.remove("paste_started_at");
     document.insert("delivery_state".to_owned(), json!("cancelled"));
     document.insert("cancel_reason".to_owned(), json!(reason));
     document.insert("cancel_detail".to_owned(), json!(detail));
@@ -1274,5 +1325,51 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Duplicate);
+    }
+
+    #[test]
+    fn recovery_repends_tracked_items_that_were_never_typed() {
+        let queue = TestQueue::new();
+        let directories = prepare(&queue.0).unwrap();
+        // A tracked item from inbox.v2 whose paste never started goes back.
+        enqueue_into(
+            &queue.0,
+            Lane::InboxV2,
+            Some("never"),
+            true,
+            &Blocking,
+            |id| plain_item(id, "text"),
+        )
+        .unwrap();
+        let path = directories.inbox_v2.join("never.json");
+        let mut document = load_message(&path).unwrap();
+        document.insert("possibly_submitted".to_owned(), json!(true));
+        document.insert("paste_tracking".to_owned(), json!(true));
+        document.insert("inflight_from".to_owned(), json!("inbox.v2"));
+        atomic_json(&path, &Value::Object(document)).unwrap();
+        transition(&path, &directories.inflight.join("never.json")).unwrap();
+        // A tracked item whose paste started stays quarantined.
+        put(&queue.0, "pasted", true).unwrap();
+        let path = directories.inbox.join("pasted.json");
+        let mut document = load_message(&path).unwrap();
+        document.insert("possibly_submitted".to_owned(), json!(true));
+        document.insert("paste_tracking".to_owned(), json!(true));
+        document.insert("inflight_from".to_owned(), json!("inbox"));
+        document.insert("paste_started_at".to_owned(), json!(1.0));
+        atomic_json(&path, &Value::Object(document)).unwrap();
+        transition(&path, &directories.inflight.join("pasted.json")).unwrap();
+
+        assert_eq!(recover_inflight(&directories).unwrap(), vec!["pasted"]);
+        assert_eq!(
+            message_state(&queue.0, "never").unwrap(),
+            Some(MessageState::Pending)
+        );
+        let back = load_message(&directories.inbox_v2.join("never.json")).unwrap();
+        assert!(back.get("possibly_submitted").is_none(), "{back:?}");
+        assert!(back.get("paste_tracking").is_none(), "{back:?}");
+        assert_eq!(
+            message_state(&queue.0, "pasted").unwrap(),
+            Some(MessageState::Failed)
+        );
     }
 }

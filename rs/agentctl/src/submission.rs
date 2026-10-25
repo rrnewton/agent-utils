@@ -970,6 +970,9 @@ pub fn submit_verified(
         ));
     }
     let placeholders_before = paste_placeholders(&before.composer);
+    // First terminal input of this submission: let the runtime stamp it
+    // (a queue drain records `paste_started_at` for inflight recovery).
+    runtime.input_started();
     terminal.send_text(
         pane_id,
         &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),

@@ -420,6 +420,7 @@ impl AgentApi for HerdrClient {
                 runtime,
             );
         }
+        runtime.input_started();
         HerdrClient::prompt_agent_with_cancellation(self, pane_id, text, &cancelled)
             .map(|()| Submission::Unconfirmed)
     }
@@ -532,6 +533,10 @@ impl AgentRuntime for UntilRuntime<'_> {
     fn cancelled(&self) -> bool {
         self.inner.cancelled() || self.inner.monotonic() >= self.until
     }
+
+    fn input_started(&self) {
+        self.inner.input_started();
+    }
 }
 
 /// Injectable clock used to make readiness polling deterministic in tests and embedders.
@@ -558,6 +563,15 @@ pub trait AgentRuntime {
     fn prompt_printed(&self, message_id: &str) {
         let _ = message_id;
     }
+    /// Note that a submission is about to make its first terminal input
+    /// (its paste). A queue drain uses this to stamp `paste_started_at` on
+    /// the inflight item: an inflight item stamped `paste_tracking` at the
+    /// barrier but never `paste_started_at` was provably never typed, so
+    /// recovery may return it to its inbox lane instead of quarantining it
+    /// as `possibly_submitted` (see `queue::recover_inflight`). Every code
+    /// path that types on behalf of a drain must call this before its
+    /// first input effect. The default ignores the note.
+    fn input_started(&self) {}
     /// Whether a verified submission that the agent never accepts, so that the prompt is still
     /// staged in its composer when the submission deadline passes, should take the prompt back
     /// out of the composer and report it as not typed, rather than leave it there and report the
@@ -626,6 +640,10 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
     fn withdraws_unaccepted(&self, message_id: &str) -> bool {
         message_id == self.message_id || self.inner.withdraws_unaccepted(message_id)
     }
+
+    fn input_started(&self) {
+        self.inner.input_started();
+    }
 }
 
 impl AgentRuntime for WithdrawingRuntime<'_> {
@@ -659,6 +677,75 @@ impl AgentRuntime for WithdrawingRuntime<'_> {
     fn withdraws_unaccepted(&self, message_id: &str) -> bool {
         self.inner.withdraws_unaccepted(message_id)
     }
+
+    fn input_started(&self) {
+        self.inner.input_started();
+    }
+}
+
+/// A runtime that behaves as `inner` and stamps `paste_started_at` on one
+/// inflight queue item the first time its submission reports
+/// [`AgentRuntime::input_started`]. The stamp is best-effort by necessity
+/// (the hook cannot fail the paste), on the same filesystem the barrier
+/// write just succeeded on; if it is lost the item is only ever recovered
+/// when no paste started, because the stamp is written before the input
+/// it reports.
+struct PasteTrackingRuntime<'a> {
+    inner: &'a dyn AgentRuntime,
+    inflight_path: PathBuf,
+    document: std::cell::RefCell<Map<String, Value>>,
+}
+
+impl AgentRuntime for PasteTrackingRuntime<'_> {
+    fn followup_key(&self) -> Option<&'static str> {
+        self.inner.followup_key()
+    }
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        self.inner.delivery_wait_chunk()
+    }
+
+    fn prompt_printed(&self, message_id: &str) {
+        self.inner.prompt_printed(message_id);
+    }
+
+    fn withdraw_unaccepted_prompt(&self) -> bool {
+        self.inner.withdraw_unaccepted_prompt()
+    }
+
+    fn withdraws_unaccepted(&self, message_id: &str) -> bool {
+        self.inner.withdraws_unaccepted(message_id)
+    }
+
+    fn input_started(&self) {
+        let mut document = self.document.borrow_mut();
+        if document.contains_key("paste_started_at") {
+            return;
+        }
+        document.insert("paste_started_at".to_owned(), json!(unix_seconds()));
+        let _ = atomic_json(&self.inflight_path, &Value::Object(document.clone()));
+    }
+}
+
+/// Remove the paste-tracking stamps before an item reaches a terminal
+/// phase: they are recovery evidence for `inflight/` only, and terminal
+/// queue documents must stay identical across editions (the Python
+/// edition writes no such fields).
+fn strip_paste_stamps(document: &mut Map<String, Value>) {
+    document.remove("paste_tracking");
+    document.remove("inflight_from");
+    document.remove("paste_started_at");
 }
 
 /// Production wall-clock runtime for readiness polling.
@@ -1158,6 +1245,18 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             document.insert("possibly_submitted".to_owned(), Value::Bool(true));
             document.insert("delivery_state".to_owned(), json!("inflight"));
             document.insert("inflight_at".to_owned(), json!(unix_seconds()));
+            // Paste tracking: `paste_started_at` is stamped just before the
+            // first terminal input, so recovery can tell an item this drain
+            // provably never typed (return it to its origin lane) from one
+            // it may have typed (quarantine). See `queue::recover_inflight`.
+            document.insert("paste_tracking".to_owned(), Value::Bool(true));
+            let origin_lane = if path.starts_with(&directories.inbox_v2) {
+                "inbox.v2"
+            } else {
+                "inbox"
+            };
+            document.insert("inflight_from".to_owned(), json!(origin_lane));
+            document.remove("paste_started_at");
             atomic_json(&inflight_path, &Value::Object(document.clone()))?;
 
             // Typing into a working pane relies on the agent to queue the prompt; one it never
@@ -1173,12 +1272,18 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 inner: runtime,
                 followup_key,
             };
-            let delivery_runtime: &dyn AgentRuntime =
+            let chosen_runtime: &dyn AgentRuntime =
                 if followup_key.is_some() || runtime.withdraws_unaccepted(&identifier) {
                     &withdrawing
                 } else {
                     runtime
                 };
+            let tracking = PasteTrackingRuntime {
+                inner: chosen_runtime,
+                inflight_path: inflight_path.clone(),
+                document: std::cell::RefCell::new(document.clone()),
+            };
+            let delivery_runtime: &dyn AgentRuntime = &tracking;
             match deliver_one(
                 client,
                 &info,
@@ -1191,6 +1296,9 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     // prompt stays pending. A crash before the rename still quarantines it.
                     document.remove("possibly_submitted");
                     document.remove("inflight_at");
+                    document.remove("paste_tracking");
+                    document.remove("inflight_from");
+                    document.remove("paste_started_at");
                     document.insert("delivery_state".to_owned(), json!("pending"));
                     document.insert("delivery_error".to_owned(), json!(detail));
                     document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
@@ -1218,6 +1326,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         document.insert("delivery_error".to_owned(), json!(detail));
                         document.insert("probable_misroute".to_owned(), Value::Bool(true));
                         document.insert("delivery_failed_at".to_owned(), json!(unix_seconds()));
+                        strip_paste_stamps(&mut document);
                         atomic_json(&inflight_path, &Value::Object(document))?;
                         let failed_path = directories
                             .failed
@@ -1229,6 +1338,9 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     }
                     document.remove("possibly_submitted");
                     document.remove("inflight_at");
+                    document.remove("paste_tracking");
+                    document.remove("inflight_from");
+                    document.remove("paste_started_at");
                     document.insert("delivery_state".to_owned(), json!("pending"));
                     document.insert("delivery_error".to_owned(), json!(detail));
                     atomic_json(&inflight_path, &Value::Object(document))?;
@@ -1239,6 +1351,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     if verified {
                         runtime.prompt_printed(&identifier);
                     }
+                    strip_paste_stamps(&mut document);
                     document.insert("delivery_state".to_owned(), json!("processed"));
                     document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
                     atomic_json(&inflight_path, &Value::Object(document))?;
@@ -1264,6 +1377,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         document.insert("probable_misroute".to_owned(), Value::Bool(true));
                     }
                     document.insert("delivery_failed_at".to_owned(), json!(unix_seconds()));
+                    strip_paste_stamps(&mut document);
                     atomic_json(&inflight_path, &Value::Object(document))?;
                     let failed_path = directories
                         .failed
@@ -4416,6 +4530,28 @@ mod tests {
         assert!(error.to_string().contains("agentctl answer NAME"));
         assert!(matches!(error, AgentError::Pending(_)));
         assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn paste_tracking_runtime_stamps_the_inflight_item_once() {
+        let directory = TestDirectory::new("paste-tracking");
+        let path = directory.path().join("item.json");
+        let mut document = Map::new();
+        document.insert("text".to_owned(), json!("prompt"));
+        document.insert("paste_tracking".to_owned(), json!(true));
+        atomic_json(&path, &Value::Object(document.clone())).unwrap();
+        let runtime = SystemRuntime::default();
+        let tracking = PasteTrackingRuntime {
+            inner: &runtime,
+            inflight_path: path.clone(),
+            document: std::cell::RefCell::new(document),
+        };
+        tracking.input_started();
+        let stamped = load_message(&path).unwrap();
+        let first = stamped["paste_started_at"].as_f64().expect("stamped");
+        tracking.input_started();
+        let restamped = load_message(&path).unwrap();
+        assert_eq!(restamped["paste_started_at"].as_f64(), Some(first));
     }
 
     #[test]
