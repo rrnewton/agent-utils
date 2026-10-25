@@ -261,7 +261,7 @@
                 the bar as the other filters do. Each state draws its own icon: a speech bubble whose
                 tail is on the side the messages it keeps are drawn on.
               -->
-              <button id="author-filter" class="icon-button" type="button" data-author="everyone" aria-pressed="false" aria-label="Everyone's messages. Press for only yours" title="Everyone's messages — press for only yours" hidden>
+              <button id="author-filter" class="icon-button" type="button" data-author="everyone" aria-pressed="false" aria-label="Everyone's messages. Press for only yours" title="Whose messages: Both (everyone's). Press to show only yours." aria-describedby="author-filter-tip" hidden>
                 <svg class="icon author-icon" data-author="everyone" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M4 3.5h8a1.8 1.8 0 0 1 1.8 1.8v4.4A1.8 1.8 0 0 1 12 11.5H8l-3 2.8v-2.8H4a1.8 1.8 0 0 1-1.8-1.8V5.3A1.8 1.8 0 0 1 4 3.5z" />
                   <path d="M16.6 9.5H20a1.8 1.8 0 0 1 1.8 1.8v4.4A1.8 1.8 0 0 1 20 17.5h-1v2.8l-3-2.8h-4a1.8 1.8 0 0 1-1.8-1.8v-1.2" />
@@ -272,6 +272,11 @@
                 <svg class="icon author-icon" data-author="theirs" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M18 4.5H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2v4l4-4h8a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z" />
                 </svg>
+                <!-- `#520 search-whose-toggle-hint`. The hover/focus tooltip and the transient chip that
+                     names the state a press landed on, drawn by web/voice.css and worded by web/voice.js.
+                     Both float off the button, so neither moves the bar or the list. -->
+                <span id="author-filter-tip" class="author-tip" role="tooltip">Whose messages: Both (everyone's). Press to show only yours.</span>
+                <span id="author-filter-chip" class="chip author-chip" role="status" hidden>Both</span>
               </button>
               <!--
                 `#211 link-filter`. The Links filter, immediately beside Pinned and only while the bar
@@ -2620,7 +2625,9 @@
                 shows only your messages — with nothing typed, every prompt you wrote among the
                 messages loaded — then only everyone else's, people and agents alike, then everyone's
                 again; <kbd>Shift</kbd>+<kbd>M</kbd> does the same. Your messages are the ones drawn as
-                yours, on the right. A message has to pass every filter in the bar: the search text,
+                yours, on the right. Resting on the bubble (or focusing it) says whose messages it is
+                showing, and each press leaves a small chip under it — <em>My messages</em>, <em>Their
+                messages</em> or <em>Both</em> — naming the state it landed on. A message has to pass every filter in the bar: the search text,
                 Links, Pinned and whose it is. On a chat service with threads Hide read steps aside
                 while one of them is on, as Fold read does, so your own messages show even when
                 they count as read; on one without, Hide read still applies, and with your own

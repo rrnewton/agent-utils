@@ -7497,10 +7497,24 @@ const AUTHOR_FILTER_LABELS = {
 };
 
 const AUTHOR_FILTER_TITLES = {
-  everyone: "Everyone's messages — press for only yours",
-  mine: "Only your messages — press for only everyone else's",
-  theirs: "Only everyone else's messages — press for everyone's",
+  everyone: "Whose messages: Both (everyone's). Press to show only yours.",
+  mine: "Whose messages: My messages (only yours). Press to show only everyone else's.",
+  theirs: "Whose messages: Their messages (only everyone else's). Press to show everyone's.",
 };
+
+/** `#520 search-whose-toggle-hint`. The chip's words for each state: what a press landed on. */
+const AUTHOR_FILTER_CHIP_LABELS = {
+  everyone: "Both",
+  mine: "My messages",
+  theirs: "Their messages",
+};
+
+/** How long the chip stays up before it fades, in ms. Its fade is web/voice.css's. */
+const AUTHOR_CHIP_MS = 1500;
+
+/** The chip's fade timer and its hide timer; a fresh press restarts both. */
+let authorChipFadeTimer = null;
+let authorChipHideTimer = null;
 
 /** Whose messages the list shows: one of `AUTHOR_FILTERS`. Only while the search bar is open. */
 let authorFilter = "everyone";
@@ -7537,11 +7551,44 @@ function renderAuthorFilter() {
     "data-author": authorFilter,
     "aria-pressed": authorFilter === "everyone" ? "false" : "true",
     "aria-label": AUTHOR_FILTER_LABELS[authorFilter],
+    "aria-describedby": "author-filter-tip",
     title: AUTHOR_FILTER_TITLES[authorFilter],
   };
   for (const [name, value] of Object.entries(said)) {
     if (button.getAttribute(name) !== value) button.setAttribute(name, value);
   }
+  // `#520 search-whose-toggle-hint`. The hover/focus tooltip says the same as the title.
+  const tip = el("author-filter-tip");
+  if (tip.textContent !== AUTHOR_FILTER_TITLES[authorFilter]) {
+    tip.textContent = AUTHOR_FILTER_TITLES[authorFilter];
+  }
+}
+
+/**
+ * `#520 search-whose-toggle-hint`. Leave the chip under the button naming the state a press landed
+ * on, for `AUTHOR_CHIP_MS`, then fade it (web/voice.css; no fade under reduced motion). It floats,
+ * so the bar and the list do not move. A fresh press restarts the wait.
+ */
+function showAuthorChip() {
+  const chip = el("author-filter-chip");
+  const fading = (on) => {
+    const names = String(chip.className).split(/\s+/).filter((name) => name && name !== "author-chip-out");
+    chip.className = on ? [...names, "author-chip-out"].join(" ") : names.join(" ");
+  };
+  chip.textContent = AUTHOR_FILTER_CHIP_LABELS[authorFilter];
+  fading(false);
+  chip.hidden = false;
+  if (authorChipFadeTimer !== null) clearTimeout(authorChipFadeTimer);
+  if (authorChipHideTimer !== null) clearTimeout(authorChipHideTimer);
+  authorChipFadeTimer = setTimeout(() => {
+    authorChipFadeTimer = null;
+    fading(true);
+    authorChipHideTimer = setTimeout(() => {
+      authorChipHideTimer = null;
+      chip.hidden = true;
+      fading(false);
+    }, 400);
+  }, AUTHOR_CHIP_MS);
 }
 
 /**
@@ -7561,9 +7608,10 @@ function setAuthorFilter(mode) {
   requestVisibleSummaries();
 }
 
-/** The button's press: the next state round the cycle. */
+/** The button's press: the next state round the cycle, and the chip naming where it landed. */
 function cycleAuthorFilter() {
   setAuthorFilter(AUTHOR_FILTERS[(AUTHOR_FILTERS.indexOf(authorFilter) + 1) % AUTHOR_FILTERS.length]);
+  showAuthorChip();
 }
 
 /**

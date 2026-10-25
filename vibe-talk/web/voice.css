@@ -5063,6 +5063,85 @@ a.search-hit-link {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 
+/* `#520 search-whose-toggle-hint`. The tooltip over the author filter: what the control does and the
+   state it is in, the same words as its `title`. Shown while a pointer rests on the button or it
+   holds keyboard focus; a touch has neither, so there the chip below is the telling. It floats under
+   the button (the bar stands at the screen's top, so above it there is no room) and takes no room,
+   so the bar and the list never move for it. */
+#author-filter .author-tip {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 16rem;
+  padding: 0.3rem 0.55rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  font-size: 0.75rem;
+  line-height: 1.3;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s;
+  z-index: 30;
+}
+
+#author-filter:hover .author-tip,
+#author-filter:focus-visible .author-tip {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* While the chip a press left is up it holds the place under the button, so the tooltip waits. */
+#author-filter:has(.author-chip:not([hidden])) .author-tip {
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* `#520 search-whose-toggle-hint`. The chip a press leaves under the button, naming the state it
+   landed on in the owner's words (Both, My messages, Their messages). It wears the page's chip
+   dress (`.chip`), floats under the button so nothing shifts, and fades once web/voice.js adds
+   `.author-chip-out`; under reduced motion it simply goes, with no fade. */
+#author-filter .author-chip {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  pointer-events: none;
+  transition: opacity 0.35s ease;
+  z-index: 30;
+}
+
+#author-filter .author-chip[hidden] {
+  display: none;
+}
+
+#author-filter .author-chip.author-chip-out {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #author-filter .author-tip,
+  #author-filter .author-chip {
+    transition: none;
+  }
+}
+
+/* On a narrow phone the button hangs at the bar's left end, where a centred chip would run off the
+   screen: there it starts at the button's own left edge instead. */
+@media (max-width: 400px) {
+  #author-filter .author-chip,
+  #author-filter .author-tip {
+    left: 0;
+    transform: none;
+  }
+}
+
 /* `#211 link-filter`. Links ON in the accent, the colour every other pressed toggle here wears and
    the colour its links are drawn in; gold is the pin's alone. */
 #links-filter[aria-pressed="true"] {

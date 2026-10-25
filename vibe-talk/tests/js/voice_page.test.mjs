@@ -60313,6 +60313,78 @@ test("`#251 author-filter`: the author filter sits left of Links, only while the
   assert.deepStrictEqual(authorState(page), ["everyone", "false"], "Escape left the author filter on");
 });
 
+test("`#520 search-whose-toggle-hint`: the author filter's tooltip and title name what it does and the state it is in, per state", async () => {
+  // The tooltip is drawn off the button on hover and on keyboard focus, and floats (no layout shift).
+  assert.match(cssBlock("#author-filter .author-tip"), /position:\s*absolute/, "the tooltip does not float");
+  assert.match(cssBlock("#author-filter:hover .author-tip"), /opacity:\s*1/,
+    "the tooltip never shows on hover");
+  assert.match(cssBlock("#author-filter:focus-visible .author-tip"), /opacity:\s*1/,
+    "the tooltip never shows on keyboard focus");
+  assert.match(cssBlock("#author-filter .author-tip"), /pointer-events:\s*none/, "the tooltip takes presses");
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, authorChannel());
+  await page.el("search-toggle").click();
+  await page.settle();
+  const filter = page.el("author-filter");
+  const tip = page.el("author-filter-tip");
+  assert.ok(/<button id="author-filter"[^>]*aria-describedby="author-filter-tip"/.test(HTML_CODE),
+    "the button does not name its tooltip");
+  const said = [];
+  for (let presses = 0; presses < 3; presses += 1) {
+    await filter.click();
+    await page.settle();
+    said.push([filter.getAttribute("data-author"), filter.getAttribute("title"), tip.textContent]);
+  }
+  assert.deepStrictEqual(said, [
+    ["mine", "Whose messages: My messages (only yours). Press to show only everyone else's.",
+      "Whose messages: My messages (only yours). Press to show only everyone else's."],
+    ["theirs", "Whose messages: Their messages (only everyone else's). Press to show everyone's.",
+      "Whose messages: Their messages (only everyone else's). Press to show everyone's."],
+    ["everyone", "Whose messages: Both (everyone's). Press to show only yours.",
+      "Whose messages: Both (everyone's). Press to show only yours."],
+  ], "the tooltip and title do not name the control and its state in each state");
+});
+
+test("`#520 search-whose-toggle-hint`: a press leaves a chip under the author filter naming the state it landed on, then it goes", async () => {
+  // The chip wears the page's chip dress, floats under the button, and does not animate under
+  // reduced motion.
+  assert.match(cssBlock("#author-filter .author-chip"), /position:\s*absolute/, "the chip does not float under the button");
+  assert.match(cssBlock("#author-filter .author-chip"), /top:\s*calc\(100%/, "the chip is not under the button");
+  const reduced = [...CSS.matchAll(/@media \(prefers-reduced-motion: reduce\) \{([\s\S]*?)\n\}/g)]
+    .some((m) => m[1].includes(".author-chip") && /transition:\s*none/.test(m[1]));
+  assert.ok(reduced, "the chip still animates under reduced motion");
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, authorChannel());
+  const chip = page.el("author-filter-chip");
+  assert.equal(chip.hidden, true, "the chip is up before any press");
+  assert.match(HTML_CODE, /id="author-filter-chip" class="chip author-chip"/,
+    "the chip does not wear the page's chip style");
+  await page.el("search-toggle").click();
+  await page.settle();
+  const landed = [];
+  for (let presses = 0; presses < 3; presses += 1) {
+    await page.el("author-filter").click();
+    await page.settle();
+    landed.push([chip.hidden, chip.textContent]);
+  }
+  assert.deepStrictEqual(landed, [
+    [false, "My messages"],
+    [false, "Their messages"],
+    [false, "Both"],
+  ], "a press does not leave the chip naming the state it landed on");
+  // It fades after ~1.5 s and is then gone; a fresh press restarts the wait.
+  assert.equal(page.expireTimers(1500), 1, "no timer was armed to fade the chip");
+  assert.ok(chip.className.split(/\s+/).includes("author-chip-out"), "the chip does not fade");
+  assert.equal(page.expireTimers(400), 1, "no timer was armed to take the faded chip away");
+  assert.equal(chip.hidden, true, "the chip never went away");
+  await page.el("author-filter").click();
+  await page.settle();
+  assert.equal(chip.hidden, false, "a fresh press does not bring the chip back");
+  assert.equal(chip.textContent, "My messages");
+});
+
 test("`#251 author-filter`: Mine with nothing typed is every message of the owner's loaded, Theirs every other, counted", async () => {
   const page = newPage();
   await signIn(page);

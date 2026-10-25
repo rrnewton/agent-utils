@@ -1351,6 +1351,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#520 search-whose-toggle-hint` in the browser engine: each press of the author filter leaves a
+  # chip under it naming the state landed on, and hover/focus raises its tooltip, at 393x852 and
+  # 1280x800. Measured on 2026-10-25: about 8s wall (the chip's real 1.5s wait at each size).
+  - group: check
+    job: search-whose-browser
+    desc: the author filter's chip and tooltip name whose messages it shows, in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/search_whose_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#439 search-unmatched-separators` in the browser engine, at 393x852 with a finger and 1280x800
   # with a mouse, over three threads among a channel's own messages: "lantern" leaves its thread's
   # four messages with a counted line in every gap, each line a thumb tall between its rows; a real
