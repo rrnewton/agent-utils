@@ -341,6 +341,13 @@ enabled = true
 # purge. A hosted agent whose prompt was pasted into its console by hand must be given the new
 # prompt (GET /api/v1/voice-agent) whenever this changes.
 # ask_before_send = true
+#
+# Only an explicit ask sends (#511 voice-explicit-send-only). ON by default, whatever
+# ask_before_send says: post_reply must quote, as user_request, the owner's own words asking for
+# the send ("tell the coding agent to ...", "send this to ..."), and the server refuses it unless
+# the voice page heard him say them in the last three minutes. Turn it off only on a deployment
+# where something else stands between the voice agent and the chat.
+# explicit_send_only = true
 
 [storage]
 # Durable state: the app's conversation transcript, how far you have read in each channel,

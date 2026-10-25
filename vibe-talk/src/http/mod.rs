@@ -225,6 +225,13 @@ fn routes(state: AppState) -> Router {
             "/api/v1/voice-end",
             post(api::voice_end).layer(DefaultBodyLimit::max(crate::voice_health::MAX_BODY_BYTES)),
         )
+        // `#511 voice-explicit-send-only`. What the page heard the user say, as each turn grows, so
+        // the voice agent's ask to send can be checked against the user's own words. WRITE scope;
+        // held in memory for minutes, never logged or stored.
+        .route(
+            "/api/v1/voice-heard",
+            post(api::voice_heard).layer(DefaultBodyLimit::max(crate::send_intent::MAX_BODY_BYTES)),
+        )
         .route("/api/v1/channels/{channel_id}/messages", get(api::messages))
         .route(
             "/api/v1/channels/{channel_id}/messages/{message_id}",

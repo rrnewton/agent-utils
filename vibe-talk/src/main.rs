@@ -735,6 +735,7 @@ async fn main() -> anyhow::Result<()> {
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
         post_keys: Arc::new(vibe_talk::post_keys::PostKeys::new()),
+        send_intent: Arc::new(vibe_talk::send_intent::SendIntent::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
         live: Arc::clone(&live),
         summarizer,

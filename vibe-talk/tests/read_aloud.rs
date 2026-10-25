@@ -141,6 +141,7 @@ fn provider(url: &str) -> ConversationSpeech {
         websocket_url: None,
         label: "Test agent".to_owned(),
         ask_before_send: true,
+        explicit_send_only: true,
     };
     ConversationSpeech::new(&config, Some(url))
 }
@@ -166,6 +167,7 @@ async fn conversational_read_aloud_drives_the_provider_neutral_socket_and_return
         websocket_url: Some("ws://127.0.0.1:1/browser-route".to_owned()),
         label: "Test agent".to_owned(),
         ask_before_send: true,
+        explicit_send_only: true,
     };
     let provider = ConversationSpeech::new(&config, Some(&url));
     assert_eq!(provider.describe().label, "Test agent");

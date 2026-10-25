@@ -1077,6 +1077,15 @@ pub struct ConversationConfig {
     /// after a purge. See [`crate::send_approval`].
     #[serde(default = "default_ask_before_send")]
     pub ask_before_send: bool,
+    /// Whether the voice agent's `post_reply` needs the user's own explicit ask. `#511
+    /// voice-explicit-send-only`.
+    ///
+    /// On unless the operator turns it off here, and nothing else can: no setting the owner or a
+    /// model reaches changes it. On, a `post_reply` whose `user_request` does not match an explicit
+    /// ask the user made lately, as the voice page heard it, is refused, in both send modes. See
+    /// [`crate::send_intent`].
+    #[serde(default = "default_explicit_send_only")]
+    pub explicit_send_only: bool,
 }
 
 fn default_conversation_label() -> String {
@@ -1087,6 +1096,10 @@ const fn default_ask_before_send() -> bool {
     true
 }
 
+const fn default_explicit_send_only() -> bool {
+    true
+}
+
 impl Default for ConversationConfig {
     fn default() -> Self {
         Self {
@@ -1094,6 +1107,7 @@ impl Default for ConversationConfig {
             websocket_url: None,
             label: default_conversation_label(),
             ask_before_send: default_ask_before_send(),
+            explicit_send_only: default_explicit_send_only(),
         }
     }
 }
@@ -4951,6 +4965,20 @@ provider = "slack"
         let text = format!("{FULL}\n[conversation]\nask_before_send = false\n");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
         assert!(!cfg.conversation.ask_before_send);
+    }
+
+    #[test]
+    fn an_explicit_ask_to_send_is_required_by_default_whatever_confirmation_says() {
+        // `#511 voice-explicit-send-only`. Independent of `ask_before_send`: turning confirmation
+        // off does not turn this off.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(cfg.conversation.explicit_send_only);
+        let text = format!("{FULL}\n[conversation]\nask_before_send = false\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(cfg.conversation.explicit_send_only);
+        let text = format!("{FULL}\n[conversation]\nexplicit_send_only = false\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(!cfg.conversation.explicit_send_only);
     }
 
     #[test]

@@ -174,6 +174,12 @@ pub enum VoicePost {
         /// The message it answered, if any.
         reply_to: Option<String>,
     },
+    /// Neither proposed nor posted: the user did not explicitly ask for it. `#511
+    /// voice-explicit-send-only`; see [`crate::send_intent`].
+    Refused {
+        /// Why, with the sentence the model is told.
+        refusal: crate::send_intent::Refusal,
+    },
     /// Not posted, because the same words to the same place were sent moments ago, or are still
     /// on their way; see [`crate::post_gate::PostGate::begin_direct`].
     Repeat {
@@ -200,6 +206,13 @@ pub enum VoicePost {
 /// `origin` says which of the two called, and is kept with a direct send in the post gate's send
 /// memory for audit (`#270 voice-transcript-markers`); nothing behaves differently for it.
 ///
+/// `user_request` is the user's own words asking for the send, as the model quotes them. With
+/// `[conversation] explicit_send_only` on — the shipped default — nothing is proposed or posted
+/// unless they name an explicit ask the user made lately and has not spent
+/// ([`crate::send_intent`]); the answer is then [`VoicePost::Refused`]. A direct send spends the
+/// ask as it is checked and gives it back only when certainly nothing was posted. `#511
+/// voice-explicit-send-only`.
+///
 /// # Errors
 ///
 /// Whatever [`ops::propose_reply`] or [`ops::reply`] refuses with — the allowlist, the write
@@ -210,11 +223,40 @@ pub async fn voice_post(
     channel_id: &str,
     text: &str,
     reply_to: Option<&str>,
+    user_request: Option<&str>,
     origin: SendOrigin,
 ) -> Result<VoicePost, OpError> {
     let tagged = crate::post_prefix::apply(&crate::post_prefix::current(state).await, text);
     let text = tagged.text.as_str();
-    match current(state).await {
+    let approval = current(state).await;
+    // A direct send spends its ask in the same step as the check, so two sends at once cannot both
+    // use it; it is given back below when certainly nothing was posted. Proposing spends nothing.
+    let mut license = None;
+    let mut repeat_only = false;
+    if state.config.conversation.explicit_send_only {
+        let binding = Binding {
+            channel_id: channel_id.to_owned(),
+            text: text.to_owned(),
+            reply_to: reply_to.map(str::to_owned),
+        };
+        match asked(state, user_request, approval == Approval::Direct).await {
+            Ok(granted) => license = Some(granted),
+            // A retry of a send already on its way or just made: the post gate answers it as the
+            // repeat it is, and posts nothing. Only that: see `repeat_only` below.
+            Err(crate::send_intent::Refusal::Spent)
+                if approval == Approval::Direct && state.post_gate.knows_direct(&binding) =>
+            {
+                repeat_only = true;
+            }
+            Err(refusal) => return Ok(VoicePost::Refused { refusal }),
+        }
+    }
+    let give_back = |license: &Option<crate::send_intent::License>| {
+        if let Some(license) = license {
+            state.send_intent.release(license);
+        }
+    };
+    match approval {
         Approval::Ask => {
             let (channel, proposal) =
                 ops::propose_reply(state, channel_id, text, &tagged.prefix, reply_to).await?;
@@ -232,8 +274,24 @@ pub async fn voice_post(
                     .post_gate
                     .begin_direct(binding.clone(), origin, channel.clone())
                 {
+                    // Let through as a repeat, and the earlier send lapsed meanwhile: this is a new
+                    // send on a spent ask. Nothing was posted; forget it and refuse.
+                    Ok(ticket) if repeat_only => {
+                        ticket.finish(None);
+                        crate::access::send_intent(
+                            "refused",
+                            Some(crate::send_intent::Refusal::Spent.code()),
+                            user_request.map_or(0, |r| r.trim().chars().count()),
+                            state.send_intent.heard_count(),
+                        );
+                        return Ok(VoicePost::Refused {
+                            refusal: crate::send_intent::Refusal::Spent,
+                        });
+                    }
                     Ok(ticket) => ticket,
                     Err(earlier) => {
+                        // Nothing new is posted, so an ask spent for it is good again.
+                        give_back(&license);
                         crate::access::post_gate(
                             "direct_repeat",
                             Some(earlier.serial),
@@ -257,6 +315,16 @@ pub async fn voice_post(
             let (result, _send_seq) =
                 ops::reply_settled(state, &binding, crate::post_gate::AnyTicket::Direct(ticket))
                     .await;
+            // The ask stays used once anything may have reached the channel: a send, part of one,
+            // or a chat service that failed without saying. A refusal that certainly posted
+            // nothing gives it back, so "try again" can.
+            let may_have_posted = match &result {
+                Ok(_) => true,
+                Err(error) => matches!(error, OpError::PartiallyPosted { .. } | OpError::Chat(_)),
+            };
+            if !may_have_posted {
+                give_back(&license);
+            }
             match result {
                 Ok((channel, _first, parts)) => {
                     crate::access::post_gate(
@@ -294,6 +362,30 @@ pub async fn voice_post(
             }
         }
     }
+}
+
+/// Whether `user_request` names an explicit ask the user made lately, logged without its words.
+/// The names of every channel this server lists count as addressees, alias and label alike.
+async fn asked(
+    state: &AppState,
+    user_request: Option<&str>,
+    spend: bool,
+) -> Result<crate::send_intent::License, crate::send_intent::Refusal> {
+    let targets: Vec<String> = ops::channels(state)
+        .await
+        .into_iter()
+        .flat_map(|channel| [Some(channel.label), channel.alias].into_iter().flatten())
+        .collect();
+    let verdict = state.send_intent.check(user_request, &targets, spend).await;
+    let request_len = user_request.map_or(0, |r| r.trim().chars().count());
+    let heard = state.send_intent.heard_count();
+    match &verdict {
+        Ok(_) => crate::access::send_intent("allowed", None, request_len, heard),
+        Err(refusal) => {
+            crate::access::send_intent("refused", Some(refusal.code()), request_len, heard);
+        }
+    }
+    verdict
 }
 
 /// A channel's name as the owner knows it — alias included — or its id when this server does not
@@ -716,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn asking_proposes_and_posts_nothing() {
         let (state, discord, _store) = testing::state_with_store();
-        let outcome = voice_post(&state, WRITE_CHANNEL, "on it", None, SendOrigin::Mcp)
+        let outcome = voice_post(&state, WRITE_CHANNEL, "on it", None, None, SendOrigin::Mcp)
             .await
             .expect("proposed");
         assert!(matches!(outcome, VoicePost::Proposed { .. }), "{outcome:?}");
@@ -732,6 +824,7 @@ mod tests {
             WRITE_CHANNEL,
             "rebase onto main",
             Some("42"),
+            None,
             SendOrigin::Mcp,
         )
         .await
@@ -771,9 +864,16 @@ mod tests {
     #[tokio::test]
     async fn a_proposal_holds_the_tagged_text_and_says_which_part_is_the_tag() {
         let (state, discord, _store) = testing::state_with_store();
-        let outcome = voice_post(&state, WRITE_CHANNEL, "on it", Some("42"), SendOrigin::Mcp)
-            .await
-            .expect("proposed");
+        let outcome = voice_post(
+            &state,
+            WRITE_CHANNEL,
+            "on it",
+            Some("42"),
+            None,
+            SendOrigin::Mcp,
+        )
+        .await
+        .expect("proposed");
         let VoicePost::Proposed { channel, proposal } = outcome else {
             panic!("asking did not propose: {outcome:?}");
         };
@@ -806,6 +906,7 @@ mod tests {
             WRITE_CHANNEL,
             &format!("{TAG}on it"),
             None,
+            None,
             SendOrigin::Mcp,
         )
         .await
@@ -816,7 +917,7 @@ mod tests {
         assert_eq!(proposal.prefix, TAG);
 
         store.set_ask_before_send(false).await.expect("direct");
-        voice_post(&state, WRITE_CHANNEL, "rebase", None, SendOrigin::Mcp)
+        voice_post(&state, WRITE_CHANNEL, "rebase", None, None, SendOrigin::Mcp)
             .await
             .expect("sent");
         // A retry with the text the model was shown is the same send, not a second post.
@@ -824,6 +925,7 @@ mod tests {
             &state,
             WRITE_CHANNEL,
             &format!("{TAG}rebase"),
+            None,
             None,
             SendOrigin::Mcp,
         )
@@ -841,13 +943,13 @@ mod tests {
         crate::post_prefix::set(&state, Some(""))
             .await
             .expect("saved");
-        voice_post(&state, WRITE_CHANNEL, "plain", None, SendOrigin::Mcp)
+        voice_post(&state, WRITE_CHANNEL, "plain", None, None, SendOrigin::Mcp)
             .await
             .expect("sent");
         crate::post_prefix::set(&state, Some("[voice] "))
             .await
             .expect("saved");
-        voice_post(&state, WRITE_CHANNEL, "tagged", None, SendOrigin::Mcp)
+        voice_post(&state, WRITE_CHANNEL, "tagged", None, None, SendOrigin::Mcp)
             .await
             .expect("sent");
         let posted: Vec<String> = discord.posted().into_iter().map(|p| p.content).collect();
@@ -860,7 +962,7 @@ mod tests {
         for direct in [false, true] {
             store.set_ask_before_send(!direct).await.expect("setting");
             for text in ["", "   ", TAG] {
-                let error = voice_post(&state, WRITE_CHANNEL, text, None, SendOrigin::Mcp)
+                let error = voice_post(&state, WRITE_CHANNEL, text, None, None, SendOrigin::Mcp)
                     .await
                     .expect_err("nothing to post");
                 assert!(error.to_string().contains("empty"), "{text:?}: {error}");

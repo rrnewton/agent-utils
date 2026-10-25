@@ -230,7 +230,14 @@ fn state_pieces_with(
     fake.register_channel(&crate::model::ChannelId(READ_CHANNEL.to_owned()));
     fake.register_channel(&crate::model::ChannelId(WRITE_CHANNEL.to_owned()));
     let elevenlabs = Arc::new(FakeElevenLabs::new());
-    let config = Config::from_toml_and_env(text, &BTreeMap::new()).expect("test config is valid");
+    let mut config =
+        Config::from_toml_and_env(text, &BTreeMap::new()).expect("test config is valid");
+    // `#511 voice-explicit-send-only`. Off in a test server unless its configuration names the
+    // setting: the tests of how a send goes out — splitting, ordering, repeats, the gate — are
+    // not about whether the user asked, and the ones that are turn it on by name.
+    if !text.contains("explicit_send_only") {
+        config.conversation.explicit_send_only = false;
+    }
     let config_for_version = config.summaries.clone();
     let conversation = crate::conversation::provider(
         &config.conversation,
@@ -303,6 +310,7 @@ fn state_pieces_with(
         )),
         post_lanes: Arc::new(crate::post_lanes::PostLanes::new()),
         post_keys: Arc::new(crate::post_keys::PostKeys::new()),
+        send_intent: Arc::new(crate::send_intent::SendIntent::new()),
         reply_reads: Arc::new(crate::reply_read::ReplyReads::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),
         live,

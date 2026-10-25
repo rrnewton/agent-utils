@@ -156,6 +156,13 @@ fn inventory() -> Vec<Route> {
             Write,
             Bytes("{}", vibe_talk::voice_health::MAX_BODY_BYTES),
         ),
+        // `#511 voice-explicit-send-only`.
+        route(
+            "POST",
+            "/api/v1/voice-heard",
+            Write,
+            Bytes("{}", vibe_talk::send_intent::MAX_BODY_BYTES),
+        ),
         route("GET", "/api/v1/channels/{channel_id}/messages", Read, limit),
         route(
             "GET",

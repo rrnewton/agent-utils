@@ -9256,6 +9256,7 @@ function sendUserMessage(text, options) {
   // turn that only appears if the vendor chooses to reflect it is a turn that can silently vanish.
   line("you", said);
   recordTurn("you", said);
+  reportHeard(`typed:${++heardTyped}`, said);
   noteTypedTurn(said);
   if (fromComposer) {
     el("compose-text").value = "";
@@ -16364,6 +16365,79 @@ function setStorageState(text) {
 let recordQueue = Promise.resolve();
 
 /**
+ * `#511 voice-explicit-send-only`. What the page has heard the owner say, told to the server as it
+ * arrives.
+ *
+ * The voice agent sends to the chat only when the owner explicitly asks it to, and the server checks
+ * each send against the owner's own words. It never sees a call's frames, and a spoken turn is filed
+ * in the transcript only when it settles — after the agent's tool call — so the page says what it
+ * heard while the turn is still open: each user turn's whole text so far, never an echo of the
+ * page's own prompt and never the assistant's words. Nothing at all while a turn the page itself
+ * sent is in flight — a relayed message, or the page's word on a card — whose echo could otherwise
+ * pass for the owner's words: the owner speaking over one is a send the server may refuse, never a
+ * chat message taken for his ask. One request per turn at a time, the newest text replacing what
+ * was waiting; a failed one is tried again with the next text, and otherwise dropped, because the
+ * worst it costs is a send the server refuses and the agent asks about.
+ *
+ * Keys name the page (`HEARD_PAGE`) and the voice session (`heardEpoch`, moved on by every session
+ * start), because a reconnected session numbers its turns from one again.
+ */
+const HEARD_PAGE = Math.random().toString(36).slice(2, 10);
+/** The server keeps no more of one turn than this; neither does the page send more. */
+const HEARD_TEXT_MAX = 2000;
+/** How much of the start of a longer turn is sent; the rest is its end, where a closing ask is. */
+const HEARD_HEAD = 500;
+let heardEpoch = 0;
+let heardTyped = 0;
+/** @type {Map<string, {inFlight: boolean, next: string | null, sent: string}>} */
+const heardReports = new Map();
+
+/**
+ * @param {string} key the page's name for the turn, stable while it grows
+ * @param {string} text everything the owner has said in it so far
+ */
+function reportHeard(key, text) {
+  const whole = String(text || "").trim();
+  if (!whole || pageTurnInFlight()) return;
+  const said = whole.length <= HEARD_TEXT_MAX ? whole
+    : `${whole.slice(0, HEARD_HEAD)} … ${whole.slice(whole.length - (HEARD_TEXT_MAX - HEARD_HEAD - 3))}`;
+  const full = `${HEARD_PAGE}:${heardEpoch}:${key}`;
+  let report = heardReports.get(full);
+  if (!report) {
+    report = { inFlight: false, next: null, sent: "" };
+    heardReports.set(full, report);
+    // The server keeps the last few minutes; the page need not remember more turns than that.
+    while (heardReports.size > 64) heardReports.delete(heardReports.keys().next().value);
+  }
+  if (said === report.sent || said === report.next) return;
+  report.next = said;
+  if (!report.inFlight) flushHeard(full, report);
+}
+
+/** Send the turn's newest text, and again when it grew while that request was out. */
+function flushHeard(key, report) {
+  const text = report.next;
+  if (text === null) return;
+  report.next = null;
+  report.inFlight = true;
+  api("/api/v1/voice-heard", { method: "POST", body: { key, text } })
+    .then(() => { report.sent = text; }, () => {})
+    .finally(() => {
+      report.inFlight = false;
+      if (report.next !== null) flushHeard(key, report);
+    });
+}
+
+/**
+ * Whether a turn the page itself sent is in flight: a relayed message or the page's word on a card
+ * on the websocket protocol, or a relayed message on the hosted one, whose echo the vendor may send
+ * back as the owner's words.
+ */
+function pageTurnInFlight() {
+  return (session.turnInFlight !== null && session.turnInFlight.kind !== "typed") || relayAnswerAwaited !== null;
+}
+
+/**
  * @param {string} who
  * @param {string} text
  * @param {{answerOf?: YesHold | null}} [options] `answerOf`: the hold on a user turn that may be a
@@ -18472,6 +18546,7 @@ function handle(socket, message) {
       const meta = message.conversation_initiation_metadata_event || {};
       const previous = session.conversationId;
       noteSessionStartedForSpokenYes();
+      heardEpoch += 1;
       session.conversationId = conversationIdFrom(meta.conversation_id);
       // `#270 voice-transcript-markers`. Before the held message is filed below: the conversation's
       // first record is its start marker.
@@ -18542,6 +18617,7 @@ function handle(socket, message) {
         // This protocol sends no partials: every user transcript is a final turn of its own.
         spokenYes.turns += 1;
         const key = `you:${spokenYes.turns}`;
+        reportHeard(key, said);
         // `#269 approval-card-inline`. Out of sight from the moment it is drawn while it may be a yes
         // to the card, and judged BEFORE it is recorded, so the record knows whether the page acted
         // on it.
@@ -19750,6 +19826,7 @@ function handleVibeTalk(message) {
     case "session_started": {
       markStartup("provider_ready");
       noteSessionStartedForSpokenYes();
+      heardEpoch += 1;
       // A session, first or replacement, starts with no turn open, and numbers its turns afresh.
       // `#268 voice-call-drops`.
       closeSpokenTurn();
@@ -19879,6 +19956,8 @@ function handleVibeTalk(message) {
         markStartup("greeting_text");
       }
       const spoken = upsertSpoken(who, message.turn, said, final, pageEcho);
+      // `#511 voice-explicit-send-only`. The owner's words, never the page's echo of its own prompt.
+      if (who === "you" && !spoken.entry.echo) reportHeard(spoken.key, spokenText(spoken.entry));
       // The turn's whole text so far, as the row shows it, and its number: the number, not the
       // order the frames arrive in, says whether assistant words came before an answer or in reply
       // to it. `#264 voice-send-approval`, `#268 voice-call-drops`.

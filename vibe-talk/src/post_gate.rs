@@ -990,6 +990,18 @@ impl PostGate {
         })
     }
 
+    /// Whether [`Self::begin_direct`] would answer `binding` as a repeat of a send it remembers,
+    /// without numbering or remembering anything. `#511 voice-explicit-send-only`: a retry of a
+    /// send whose ask is spent is answered as the repeat it is, not refused as a new send.
+    #[must_use]
+    pub fn knows_direct(&self, binding: &Binding) -> bool {
+        let now = Instant::now();
+        self.lock()
+            .direct
+            .iter()
+            .any(|send| !send.lapsed(now) && send.binding == *binding)
+    }
+
     fn end_direct(&self, serial: u64, outcome: Option<DirectOutcome>) {
         let now = Instant::now();
         let mut inner = self.lock();

@@ -87,7 +87,7 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 
 /// Bump this whenever any of the five prompt files changes, and update every pinned fingerprint
 /// below to match. The test that compares them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 12;
+pub const PROMPT_VERSION: u32 = 13;
 
 /// The [`fingerprint`] of [`OWNER_INSTRUCTIONS_HEADING`] at [`PROMPT_VERSION`]. It reaches the
 /// agent only with the owner's instructions, so it is pinned on its own rather than inside a
@@ -95,13 +95,13 @@ pub const PROMPT_VERSION: u32 = 12;
 pub const PINNED_OWNER_HEADING_FINGERPRINT: &str = "fnv1a64:946b5fc6e4828976";
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
-pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:d265099fe1644d8c";
+pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:36797a822e9e3fa0";
 
 /// The [`fingerprint`] of the sending prompt that asks first, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:2161fd9a3df1cfb5";
+pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:be1ccd9f3bbff078";
 
 /// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:9fe563e91827207e";
+pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:0a6673bfef76aadb";
 
 /// Which instructions follow the base: what this caller can do, and how the owner wants sends
 /// confirmed.
@@ -605,12 +605,17 @@ mod tests {
     /// The load-bearing phrases of the send rules, in both sending variants. None of them may
     /// reach a read-only caller. The last is `#303 voice-post-prefix`: this server tags every
     /// post the agent makes, so an agent that tagged its own would post the tag twice.
-    const SEND_RULES: [&str; 5] = [
+    const SEND_RULES: [&str; 9] = [
         "only when the user explicitly asks you to",
-        "only when the human explicitly requests it",
         "exact provider mention",
         "You can also send",
         "never add a tag, a signature or a note saying you relayed it",
+        // `#511 voice-explicit-send-only`: in both modes, whatever confirmation says.
+        "with a verb that sends",
+        "never pass on what the user said as a message",
+        "a fragment of speech, a question meant for you",
+        "ask them to say it again",
+        "as user_request, the user's own words",
     ];
 
     /// What only the variant that asks first may say: the read-back, the question, and that the

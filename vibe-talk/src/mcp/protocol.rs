@@ -1486,15 +1486,20 @@ async fn run_post(state: &AppState, args: &Value) -> Result<String, OpError> {
     let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let text = arg_str(args, "text").unwrap_or_default();
     let reply_to = arg_id(args, "reply_to");
+    let user_request = arg_str(args, "user_request");
     match crate::send_approval::voice_post(
         state,
         &channel_id,
         &text,
         reply_to.as_deref(),
+        user_request.as_deref(),
         crate::store::SendOrigin::Mcp,
     )
     .await?
     {
+        // `#511 voice-explicit-send-only`. Not an error a client should retry: an answer that
+        // tells the model what to do instead.
+        crate::send_approval::VoicePost::Refused { refusal } => Ok(refusal.sentence().to_owned()),
         crate::send_approval::VoicePost::Proposed { channel, proposal } => {
             Ok(ops::proposal_notice(&channel, &proposal))
         }
