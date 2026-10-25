@@ -254,6 +254,7 @@ mod tests {
             label: "voice".to_owned(),
             ask_before_send: true,
             explicit_send_only: true,
+            ..ConversationConfig::default()
         }
     }
 

@@ -345,6 +345,10 @@ fn sent_label(detail: Option<&TurnDetail>) -> String {
 /// then the page is told replay is off, because the alternative — a switch that promises "this
 /// server will read the lines above back to it" over a bridge that would refuse the frame, or end
 /// the session over it — is exactly the false claim of continuity this module exists to prevent.
+///
+/// `#512 voice-recap-private-stack`. Or when the operator has said the bridge fetches the
+/// voice-agent profile for every session (`replay.bridge_fetches_profile`): the recap then rides in
+/// that prompt ([`via_profile`]), and each call says whether the bridge took it.
 #[must_use]
 pub fn offered(
     replay: &crate::config::ReplayConfig,
@@ -356,8 +360,27 @@ pub fn offered(
             crate::config::ConversationBackend::ElevenLabs => true,
             crate::config::ConversationBackend::WebSocket => {
                 bridge == crate::voice_bridge::ReplaySupport::Accepted
+                    || replay.bridge_fetches_profile
             }
         }
+}
+
+/// Whether a new call's recap goes in the voice-agent profile the bridge fetches rather than in a
+/// `replay` frame. `#512 voice-recap-private-stack`; see [`crate::voice_recap`].
+///
+/// Only where the frame is not known to be taken: a bridge that listed `replay` is sent the frame,
+/// which it answers. A bridge that lists it after all on a call armed this way is handled by the
+/// page, which then sends the frame only if the profile was not served.
+#[must_use]
+pub fn via_profile(
+    replay: &crate::config::ReplayConfig,
+    conversation: &crate::config::ConversationConfig,
+    bridge: crate::voice_bridge::ReplaySupport,
+) -> bool {
+    replay.enabled
+        && replay.bridge_fetches_profile
+        && conversation.backend == crate::config::ConversationBackend::WebSocket
+        && bridge != crate::voice_bridge::ReplaySupport::Accepted
 }
 
 /// Why replay is reported off although the operator turned it on, or `None`. `#270
@@ -390,7 +413,11 @@ pub fn bridge_support(state: &crate::state::AppState) -> crate::voice_bridge::Re
     if !crate::voice_bridge::needed(&state.config) {
         return crate::voice_bridge::ReplaySupport::Unknown;
     }
-    state.voice_bridge.refresh_if_stale();
+    // `#512 voice-recap-private-stack`. Not while a recap waits for the bridge's fetch: the hello
+    // opens a session of its own, and a call starting meanwhile would find its fetch taken for it.
+    if !state.voice_recap.armed(std::time::Instant::now()) {
+        state.voice_bridge.refresh_if_stale();
+    }
     state.voice_bridge.replay_support()
 }
 
@@ -412,6 +439,60 @@ mod tests {
             enabled,
             ..crate::config::ReplayConfig::default()
         }
+    }
+
+    /// `#512 voice-recap-private-stack`. A bridge the operator says fetches the profile is offered
+    /// Resuming whatever its hello said, through the profile unless it takes the frame; and never
+    /// with replay off, nor on the hosted backend, which has its own transports.
+    #[test]
+    fn a_bridge_that_fetches_the_profile_is_offered_a_recap_there_unless_it_takes_the_frame() {
+        use crate::config::ConversationBackend::{ElevenLabs, WebSocket};
+        use crate::voice_bridge::ReplaySupport::{Accepted, Declined, Unknown};
+        let fetching = |enabled| crate::config::ReplayConfig {
+            enabled,
+            bridge_fetches_profile: true,
+            ..crate::config::ReplayConfig::default()
+        };
+        for bridge in [Declined, Unknown] {
+            assert!(offered(&fetching(true), &voice_backend(WebSocket), bridge));
+            assert!(via_profile(
+                &fetching(true),
+                &voice_backend(WebSocket),
+                bridge
+            ));
+            assert_eq!(
+                unavailable(&fetching(true), &voice_backend(WebSocket), bridge),
+                None
+            );
+            assert!(!offered(
+                &fetching(false),
+                &voice_backend(WebSocket),
+                bridge
+            ));
+            assert!(!via_profile(
+                &fetching(false),
+                &voice_backend(WebSocket),
+                bridge
+            ));
+            assert!(!via_profile(
+                &fetching(true),
+                &voice_backend(ElevenLabs),
+                bridge
+            ));
+            assert!(
+                !via_profile(&replay_switch(true), &voice_backend(WebSocket), bridge),
+                "the profile was used without the operator saying the bridge fetches it"
+            );
+        }
+        assert!(offered(
+            &fetching(true),
+            &voice_backend(WebSocket),
+            Accepted
+        ));
+        assert!(
+            !via_profile(&fetching(true), &voice_backend(WebSocket), Accepted),
+            "a bridge that takes the frame is sent the frame"
+        );
     }
 
     /// A `vibe-talk-v1` bridge takes a replay only once it has said so, so the page must never be

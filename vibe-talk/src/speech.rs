@@ -254,6 +254,9 @@ pub struct ConversationSpeech {
     session: Arc<Mutex<Option<SessionHandle>>>,
     generations: Arc<AtomicU64>,
     first_audio_timeout: Duration,
+    /// `#512 voice-recap-private-stack`. Where each session this opens is counted as one of the
+    /// server's own, so the profile fetch the bridge makes for it is never handed a recap.
+    own_sessions: Option<Arc<crate::voice_recap::OwnSessions>>,
 }
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -348,7 +351,17 @@ impl ConversationSpeech {
             session: Arc::new(Mutex::new(None)),
             generations: Arc::new(AtomicU64::new(0)),
             first_audio_timeout: FIRST_AUDIO_TIMEOUT,
+            own_sessions: None,
         }
+    }
+
+    /// Count each session this opens among the server's own (`#512 voice-recap-private-stack`):
+    /// the bridge fetches the voice-agent profile for a read-aloud session as for a call, and a
+    /// recap armed for the owner's call must not be spent on it.
+    #[must_use]
+    pub fn with_own_sessions(mut self, own: Arc<crate::voice_recap::OwnSessions>) -> Self {
+        self.own_sessions = Some(own);
+        self
     }
 
     /// Replace [`FIRST_AUDIO_TIMEOUT`], the wait for a prompt's first audio before its session is
@@ -403,6 +416,11 @@ struct Begun {
 
 impl ConversationSpeech {
     async fn open_session(&self) -> Result<OpenedSession, SpeechError> {
+        // Counted from before the connection until the session has started or failed.
+        let _own = self
+            .own_sessions
+            .as_deref()
+            .map(crate::voice_recap::OwnSessions::begin);
         let url = self
             .url
             .as_deref()

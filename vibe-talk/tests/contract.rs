@@ -216,6 +216,13 @@ fn client_config(
         // `#270 voice-transcript-markers`. The plain sample is a websocket deployment with replay
         // turned on whose bridge has not said it takes a recap (`#331 resume-on-websocket`).
         replay_unavailable: (!full).then_some(ReplayUnavailable::BridgeUnconfirmed),
+        // `#512 voice-recap-private-stack`. Both present in the full sample, both absent in the
+        // other, as from an older server.
+        replay_via_profile: full,
+        speech_hold: full.then_some(vibe_talk::contract::SpeechHold {
+            level_dbfs: -42,
+            cap_ms: 20_000,
+        }),
         transcript_records_supported: full,
         self_author_id: full.then(|| "9".into()),
         owner_author_id: full.then(|| "7".into()),

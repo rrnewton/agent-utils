@@ -178,8 +178,27 @@ pub struct PromptDescriptor {
     pub system_prompt_edited: bool,
     /// Whether the owner's additional instructions are in `text`.
     pub additional_instructions: bool,
+    /// The recap of the earlier conversation that `text` carries, when it carries one. `#512
+    /// voice-recap-private-stack`; see [`crate::voice_recap`]. Absent from every answer that was not
+    /// handed one, so the shipped prompt and its pinned fingerprint are unchanged there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recap: Option<PromptRecap>,
     /// The full instructions, to be used verbatim as the agent's system prompt.
     pub text: String,
+}
+
+/// What a prompt says of the recap it carries: names and numbers, never the words. `#512
+/// voice-recap-private-stack`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PromptRecap {
+    /// Which recap it is, as `POST /api/v1/voice-recap` numbered it.
+    pub id: u64,
+    /// Words of the lines it holds.
+    pub words: usize,
+    /// How many lines it holds.
+    pub lines: usize,
+    /// How many older lines did not fit the budget.
+    pub dropped: usize,
 }
 
 /// The prompt this build ships for one [`Variant`], with nothing of the owner's in it.
@@ -197,6 +216,20 @@ pub fn prompt(variant: Variant) -> PromptDescriptor {
 /// last thing the agent reads about it. With nothing of his, the text is exactly the shipped one.
 #[must_use]
 pub fn prompt_with(variant: Variant, owner: &OwnerPrompt) -> PromptDescriptor {
+    prompt_with_recap(variant, owner, None)
+}
+
+/// [`prompt_with`], carrying `recap`: the record of the earlier conversation, as
+/// [`crate::replay::build`] fenced it, goes after the owner's words and BEFORE the capability
+/// section. `#512 voice-recap-private-stack`. The section stays the last thing the agent reads
+/// about what it may do, so not even a quoted line of the record comes after it; and the
+/// fingerprint is of the text actually served.
+#[must_use]
+pub fn prompt_with_recap(
+    variant: Variant,
+    owner: &OwnerPrompt,
+    recap: Option<&crate::voice_recap::Served>,
+) -> PromptDescriptor {
     let mut text = match &owner.system_prompt {
         // Ended as the shipped file is, with one newline, so a copy identical to the shipped
         // prompt but for trailing space assembles to the identical text.
@@ -210,6 +243,10 @@ pub fn prompt_with(variant: Variant, owner: &OwnerPrompt) -> PromptDescriptor {
         text.push_str(owner.instructions.trim_end());
         text.push_str("\n\n");
     }
+    if let Some(recap) = recap {
+        text.push_str(recap.text.trim_end());
+        text.push_str("\n\n");
+    }
     text.push_str(variant.section());
     PromptDescriptor {
         id: PROMPT_ID,
@@ -218,6 +255,12 @@ pub fn prompt_with(variant: Variant, owner: &OwnerPrompt) -> PromptDescriptor {
         fingerprint: fingerprint(&text),
         system_prompt_edited: owner.system_prompt.is_some(),
         additional_instructions: !owner.instructions.is_empty(),
+        recap: recap.map(|recap| PromptRecap {
+            id: recap.id,
+            words: recap.words,
+            lines: recap.lines,
+            dropped: recap.dropped,
+        }),
         text,
     }
 }

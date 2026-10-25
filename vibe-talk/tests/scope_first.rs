@@ -138,6 +138,16 @@ fn inventory() -> Vec<Route> {
         ),
         route("GET", "/api/v1/voice-session", Write, Nothing),
         route("GET", "/api/v1/voice-agent", Read, Nothing),
+        // `#512 voice-recap-private-stack`.
+        route(
+            "POST",
+            "/api/v1/voice-recap",
+            Write,
+            Json(r#"{"conversation_id":"conv_a"}"#),
+        ),
+        route("DELETE", "/api/v1/voice-recap", Write, Nothing),
+        route("GET", "/api/v1/voice-recap/{id}", Write, Nothing),
+        route("DELETE", "/api/v1/voice-recap/{id}", Write, Nothing),
         route(
             "POST",
             "/api/v1/voice-timing",

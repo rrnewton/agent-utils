@@ -301,6 +301,10 @@
           ],
           "description": "Why replay is off although the operator turned it on, when that is the reason. `#270\nvoice-transcript-markers`, `#331 resume-on-websocket`.\n\nOnly for a `vibe-talk-v1` bridge, which takes a recap only when it says so: `bridge_declined`\nwhen it answered this server's hello without listing `replay`, `bridge_unconfirmed` when it\nhas not answered one. The page then draws Resuming's switch disabled, with this reason\nbeside it, and marks each new conversation \"recap unsupported\" rather than saying nothing,\nwhich would read as \"nothing to recap\". Absent otherwise: with replay on and the hosted\nbackend, and with replay off, which `replay_enabled: false` says alone."
         },
+        "replay_via_profile": {
+          "description": "Whether a new call's recap goes in the voice-agent profile the `vibe-talk-v1` bridge fetches\nas its session opens, rather than in a `replay` frame. `#512 voice-recap-private-stack`.\n\nTrue only with `replay_enabled`, on a bridge the operator says fetches the profile\n(`replay.bridge_fetches_profile`) and that has not said it takes the frame. The page then\narms the recap with `POST /api/v1/voice-recap` just before it opens the call's socket, or a\nreconnect's, and draws it as taken only once the server says a fetch served it. Absent\notherwise, and from an older server.",
+          "type": "boolean"
+        },
         "replies_in_thread": {
           "description": "Whether a reply to a main-channel message is posted in that message's thread, starting one\nwhen it has none, because the provider has no reply pointer of its own (Slack).\n\n`#252 thread-button-state`. Such a reply already starts the message's thread, so the reply\nscreen offers no separate \"start a new thread\" choice when this is true. Sent only when\ntrue: absent, from this server or an older one, means false.",
           "type": "boolean"
@@ -311,6 +315,17 @@
             "string",
             "null"
           ]
+        },
+        "speech_hold": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpeechHold"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the voice page takes the owner to be speaking although no transcript says so, and how\nlong that may hold the page's own messages. `#512 voice-recap-private-stack`. Absent from an\nolder server, whose page holds nothing for the microphone's level."
         },
         "speech_prep_enabled": {
           "description": "Whether this server rewrites message bodies for speech before anything says them.\n\nHere for the same reason as `replay_enabled`: Settings has to be able to describe what this\ndeployment does, and the page cannot infer this one from any message it holds. An empty\n`spoken_content` means \"the rewrite changed nothing\" just as often as it means \"the pass is\noff\" — deliberately, see [`crate::model::Message::spoken_content`] — so a page guessing from\nthe data would tell the operator the feature was off every time the channel was plain prose.\nThey are flipping this switch to compare two runs; guessing is exactly what they cannot do.",
@@ -1808,6 +1823,27 @@
         "transport",
         "system_prompt_applied",
         "instructions_applied"
+      ],
+      "type": "object"
+    },
+    "SpeechHold": {
+      "description": "How the voice page holds its own messages while the owner is speaking. `#512\nvoice-recap-private-stack`.\n\nA relayed chat message, or the page's word on a send card, is said by closing the microphone's\nsegment with `audio_end`; closed under the owner's speech, the speech service took the message\nand never answered it, and the call was lost. The page judged speech only from transcripts,\nwhich that service may drop. So it also reads the microphone's level, and holds while it is at\nor above `level_dbfs`, or while his transcript grew in the last moments — never longer than\n`cap_ms`.",
+      "properties": {
+        "cap_ms": {
+          "description": "The longest one message is held for his speech, in milliseconds; `0`, never held:\n`conversation.speech_hold_cap_seconds`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "level_dbfs": {
+          "description": "The capture buffer's RMS, in dBFS, at or above which the owner is taken to be speaking:\n`conversation.speech_hold_dbfs`.",
+          "format": "int32",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "level_dbfs",
+        "cap_ms"
       ],
       "type": "object"
     },

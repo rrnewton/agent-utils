@@ -987,6 +987,19 @@ pub async fn client_config(
             &state.config.conversation,
             bridge,
         ),
+        replay_via_profile: crate::replay::via_profile(
+            &state.config.replay,
+            &state.config.conversation,
+            bridge,
+        ),
+        speech_hold: Some(crate::contract::SpeechHold {
+            level_dbfs: state.config.conversation.speech_hold_dbfs,
+            cap_ms: state
+                .config
+                .conversation
+                .speech_hold_cap_seconds
+                .saturating_mul(1000),
+        }),
         transcript_records_supported: true,
         self_author_id: state.chat.self_author_id(),
         owner_author_id: state.chat.owner_author_id(),
@@ -1422,7 +1435,7 @@ pub async fn voice_agent(
     // `#272 voice-agent-instructions`: the owner's words go into the prompt here, which is how a
     // bridge that fetches this as each call opens carries them.
     let owner = crate::voice_prompt::current(&state).await;
-    let profile = crate::voice_agent::profile(
+    let mut profile = crate::voice_agent::profile(
         &manifest,
         scope,
         state.chat.provider_name(),
@@ -1430,7 +1443,150 @@ pub async fn voice_agent(
         approval,
         &owner,
     );
+    // `#512 voice-recap-private-stack`. A recap the page armed for the session the bridge is opening
+    // goes into its prompt, once: only to the write token, which may read a transcript, and never
+    // into the fetch owed to a session this server opened itself (its hello, read-aloud), which
+    // nobody talks to. Every write-scope fetch is counted against those, recap or none.
+    if scope >= Scope::Write {
+        let now = std::time::Instant::now();
+        let owed = state.voice_bridge.own_sessions().take_fetch(now);
+        if let Some(recap) = state.voice_recap.serve(now, owed) {
+            let variant =
+                crate::voice_agent::Variant::for_caller(profile.write_available, approval);
+            profile.prompt = crate::voice_agent::prompt_with_recap(variant, &owner, Some(&recap));
+        }
+    }
     Ok(no_store(Json(profile)))
+}
+
+/// The body of `POST /api/v1/voice-recap`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArmRecapRequest {
+    /// The conversation the new session is to be caught up on.
+    pub conversation_id: String,
+}
+
+/// What `POST /api/v1/voice-recap` armed, described as the replay route describes a record, minus
+/// the record itself: the page draws the counts, and never needs the words.
+#[derive(Debug, Serialize)]
+pub struct ArmRecapResponse {
+    /// The recap's number, for `GET` and `DELETE /api/v1/voice-recap/{id}`; absent when nothing was
+    /// armed because the record holds no line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    /// Whether a recap is now armed for the bridge's next profile fetch.
+    pub armed: bool,
+    /// How many lines it holds.
+    pub included: usize,
+    /// How many older lines did not fit the budget.
+    pub dropped: usize,
+    /// Whether the budget, rather than the transcript running out, is what stopped it.
+    pub truncated: bool,
+    /// Words of the lines it holds.
+    pub words: usize,
+    /// How long it waits for a fetch, in seconds.
+    pub expires_in_seconds: u64,
+}
+
+/// What became of one recap: the answer to `GET` and `DELETE /api/v1/voice-recap/{id}`.
+#[derive(Debug, Serialize)]
+pub struct RecapStateResponse {
+    /// Which recap.
+    pub id: u64,
+    /// `armed`, `served`, `withdrawn`, `expired` or `unknown`.
+    pub state: crate::voice_recap::RecapState,
+}
+
+/// `POST /api/v1/voice-recap` — arm a recap of a conversation for the bridge's next profile fetch.
+/// `#512 voice-recap-private-stack`; see [`crate::voice_recap`].
+///
+/// WRITE scope, like the replay route, because it renders the transcript. Refused with 409 unless
+/// this server hands recaps over that way at all ([`crate::replay::via_profile`]): replay on, the
+/// websocket backend, and a bridge the operator says fetches the profile. Built with the replay
+/// route's own budget, fence and neutralizing; a record with no line in it arms nothing and says
+/// how many lines did not fit, as the replay route does.
+pub async fn arm_voice_recap(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<ArmRecapRequest>,
+) -> Result<Response, ApiError> {
+    let id = ConversationId::parse(&request.conversation_id)?;
+    let bridge = state.voice_bridge.replay_support();
+    if !crate::replay::via_profile(&state.config.replay, &state.config.conversation, bridge) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "recap_unavailable",
+            "this server does not hand a recap over in the voice-agent profile: it needs \
+             replay.enabled and replay.bridge_fetches_profile, the websocket backend, and a bridge \
+             that has not said it takes the replay frame",
+        ));
+    }
+    let turns = state.store.turns(&id).await?;
+    let built = crate::replay::build(&turns, &state.config.replay.policy);
+    // A session this server is opening itself (its hello, read-aloud) is owed the next fetch; armed
+    // after it has started, the call's own fetch is the one that finds the recap. Bounded: a bridge
+    // slow to start one of those delays a call's start by this much at most.
+    let own = state.voice_bridge.own_sessions();
+    for _ in 0..ARM_WAITS_FOR_OWN_SESSION {
+        if !own.opening() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let armed = state.voice_recap.arm(&built, std::time::Instant::now());
+    Ok(no_store(Json(ArmRecapResponse {
+        id: armed,
+        armed: armed.is_some(),
+        included: built.included,
+        dropped: built.dropped,
+        truncated: built.truncated,
+        words: built.words,
+        expires_in_seconds: crate::voice_recap::RECAP_TTL.as_secs(),
+    })))
+}
+
+/// How many tenths of a second arming waits for a session this server is opening itself.
+const ARM_WAITS_FOR_OWN_SESSION: u32 = 50;
+
+/// `DELETE /api/v1/voice-recap` — withdraw whatever recap is armed. `#512
+/// voice-recap-private-stack`: a page starting a call it hands no recap says so first, so a recap
+/// armed by an earlier page — one a reload cut off before it could take it back — is not handed to
+/// this call unasked.
+pub async fn withdraw_any_voice_recap(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+) -> Result<Response, ApiError> {
+    state.voice_recap.withdraw_any(std::time::Instant::now());
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `GET /api/v1/voice-recap/{id}` — what became of a recap. `#512 voice-recap-private-stack`.
+pub async fn voice_recap_state(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(id): Path<u64>,
+) -> Result<Response, ApiError> {
+    let now = std::time::Instant::now();
+    Ok(no_store(Json(RecapStateResponse {
+        id,
+        state: state.voice_recap.state(id, now),
+    })))
+}
+
+/// `DELETE /api/v1/voice-recap/{id}` — withdraw a recap no fetch has taken, and say what it came
+/// to: `served` when one already did, so the page's last word on it cannot race the bridge.
+/// `#512 voice-recap-private-stack`.
+pub async fn withdraw_voice_recap(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(id): Path<u64>,
+) -> Result<Response, ApiError> {
+    let now = std::time::Instant::now();
+    Ok(no_store(Json(RecapStateResponse {
+        id,
+        state: state.voice_recap.withdraw(id, now),
+    })))
 }
 
 /// `POST /api/v1/voice-timing` — record one call's startup phases.
@@ -3734,6 +3890,8 @@ pub async fn forget_conversation(
     // Its sends, still in the post gate's memory, are part of what was forgotten. `#270
     // voice-transcript-markers`.
     state.post_gate.forget_sends_claimed_into(id.as_str());
+    // `#512 voice-recap-private-stack`. A recap waiting for the bridge may be a copy of it.
+    state.voice_recap.forget();
     Ok(no_store(Json(serde_json::json!({ "forgotten": 1 }))))
 }
 
@@ -3750,6 +3908,8 @@ pub async fn forget_conversations(
     state.post_gate.forget_sends();
     // `#511 voice-explicit-send-only`. What the user said lately is part of that record too.
     state.send_intent.forget();
+    // `#512 voice-recap-private-stack`. So is a recap waiting for the bridge's fetch.
+    state.voice_recap.forget();
     Ok(no_store(Json(
         serde_json::json!({ "forgotten": forgotten }),
     )))
@@ -3861,6 +4021,8 @@ pub async fn purge_storage(
     state.post_gate.forget_sends();
     // `#511 voice-explicit-send-only`. What the user said lately is part of that record too.
     state.send_intent.forget();
+    // `#512 voice-recap-private-stack`. So is a recap waiting for the bridge's fetch.
+    state.voice_recap.forget();
     if forgotten > 0 {
         tracing::info!(
             channels = forgotten,

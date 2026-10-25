@@ -44,6 +44,7 @@ import re
 import tempfile
 import threading
 import time
+import wave
 from array import array
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -545,6 +546,22 @@ def call_c(page: Page, api: FakeApi, voice: FakeVoice) -> str:
     return "call C: an error that did not ask to reconnect ended the call as error_frame and opened nothing more"
 
 
+def silent_capture(directory: str) -> str:
+    """A second of digital silence as a WAV in `directory`, for Chromium's fake microphone to loop.
+
+    `#512 voice-recap-private-stack`. The page now holds its own messages while the microphone hears
+    the owner, and Chromium's default fake device beeps, which reads as speech. This walk's owner says
+    nothing aloud, so his microphone is silent, and the page's messages go when the walk expects.
+    """
+    path = Path(directory) / "silence.wav"
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(48000)
+        out.writeframes(bytes(2 * 48000))
+    return str(path)
+
+
 def main() -> int:
     args = arguments()
     try:
@@ -569,6 +586,7 @@ def main() -> int:
                 headless=True,
                 executable_path=args.browser_executable,
                 args=["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
+                      f"--use-file-for-fake-audio-capture={silent_capture(profile)}",
                       "--autoplay-policy=no-user-gesture-required"],
                 user_agent=(
                     "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 "

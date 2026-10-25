@@ -1924,6 +1924,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // `#270 voice-transcript-markers`. Absent unless a test says replay is on where the voice
         // backend cannot carry it.
         replay_unavailable: page.replayUnavailable,
+        // `#512 voice-recap-private-stack`. Both absent unless a test sets them, as an older server
+        // sends neither.
+        replay_via_profile: page.replayViaProfile,
+        speech_hold: page.speechHold,
         // `#270 voice-transcript-markers`. Absent unless a test says the server takes records.
         transcript_records_supported: page.transcriptRecordsSupported,
         speech_prep_enabled: page.speechPrepEnabled,
@@ -2222,6 +2226,23 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     /** `#46 conversation-replay`: every replay fetch, and the knobs that shape the answer. */
     replayCalls: [],
     replayEnabled: true,
+    /**
+     * `#512 voice-recap-private-stack`: client-config's `replay_via_profile` and `speech_hold` (both
+     * absent unless a test sets them); every request to `/api/v1/voice-recap`, as `METHOD path`; and
+     * the recaps armed, by number, with what became of each. `bridgeFetchesProfile()` is the
+     * bridge's fetch: it serves the armed recap, as the server does.
+     */
+    replayViaProfile: undefined,
+    speechHold: undefined,
+    recapCalls: [],
+    /** @type {Map<number, {state: string, conversation: string}>} */
+    recaps: new Map(),
+    recapArmStatus: 200,
+    /** The status `GET` and `DELETE /api/v1/voice-recap/{id}` answer with, when not 200. */
+    recapAnswerStatus: 200,
+    bridgeFetchesProfile: () => {
+      for (const recap of page.recaps.values()) if (recap.state === "armed") recap.state = "served";
+    },
     /** `#270 voice-transcript-markers`: "backend" when replay is on where the backend cannot carry it. */
     replayUnavailable: undefined,
     /**
@@ -3757,6 +3778,43 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       // so "the page sent what the server built" and "the server built it from what was stored"
       // are the same fact here as they are on the wire. Matched BEFORE the conversation route
       // below, whose regex would otherwise claim the path and answer 404.
+      // `#512 voice-recap-private-stack`. The recap armed in the profile, built as the replay is.
+      if (String(path) === "/api/v1/voice-recap" || /^\/api\/v1\/voice-recap\/\d+$/.test(String(path))) {
+        const method = (options && options.method) || "GET";
+        page.recapCalls.push(`${method} ${path}`);
+        if (method === "POST") {
+          if (page.recapArmStatus !== 200) {
+            return json(page.recapArmStatus, { error: "storage_error", detail: "the store is down" });
+          }
+          const asked = JSON.parse((options && options.body) || "{}");
+          const held = page.storedTurns.get(asked.conversation_id) || [];
+          const spoken = held.filter((turn) => turn.speaker !== "note" && turn.speaker !== "marker");
+          const kept = spoken.slice(Math.max(0, spoken.length - page.replayMaxTurns));
+          const words = kept.reduce((sum, turn) => sum + String(turn.text).split(/\s+/).filter(Boolean).length, 0);
+          let id;
+          if (kept.length > 0) {
+            for (const recap of page.recaps.values()) if (recap.state === "armed") recap.state = "replaced";
+            id = page.recaps.size + 1;
+            page.recaps.set(id, { state: "armed", conversation: asked.conversation_id });
+          }
+          return json(200, {
+            id, armed: id !== undefined, included: kept.length, dropped: spoken.length - kept.length,
+            truncated: spoken.length > kept.length, words, expires_in_seconds: 60,
+          });
+        }
+        if (page.recapAnswerStatus !== 200) {
+          return json(page.recapAnswerStatus, { error: "internal", detail: "the server is unwell" });
+        }
+        if (String(path) === "/api/v1/voice-recap") {
+          for (const recap of page.recaps.values()) if (recap.state === "armed") recap.state = "withdrawn";
+          return json(204, null);
+        }
+        const id = Number(String(path).split("/").at(-1));
+        const recap = page.recaps.get(id);
+        const state = !recap ? "unknown" : recap.state === "replaced" ? "unknown" : recap.state;
+        if (method === "DELETE" && recap && recap.state === "armed") recap.state = "withdrawn";
+        return json(200, { id, state: method === "DELETE" && state === "armed" ? "withdrawn" : state });
+      }
       const wantsReplay = /^\/api\/v1\/conversations\/([^/]+)\/replay$/.exec(String(path));
       if (wantsReplay) {
         page.replayCalls.push(String(path));
@@ -5213,6 +5271,41 @@ const TUNING_BANDS = {
     "lower bound here would report a long call's last prompt as more recent than it was"],
   CALL_AUDIO_MAX_MS: [3600000, 3600000,
     "the most queued audio the call-end record sends: the server refuses a record past an hour"],
+  // `#512 voice-recap-private-stack`.
+  SPEECH_HOLDS_MAX: [10000, 10000,
+    "the most held page messages the call-end record sends: the server refuses a record past ten thousand"],
+  SPEECH_HOLD_CAP_MS_DEFAULT: [5000, 60000,
+    "the longest a page message waits for the owner's speech when the server names no cap. Under five " +
+    "seconds a sentence with a pause in it is cut by the message it was meant to hold off; past a " +
+    "minute road noise above the level keeps a relay from going at all"],
+  MIC_SPEECH_HANGOVER_MS: [200, 1500,
+    "how long one loud capture buffer keeps the owner speaking. Under a fifth of a second the gap " +
+    "between two words lets a held message slip out mid-sentence; past a second and a half every " +
+    "cough holds the relays as long as a sentence would"],
+  OWNER_WORDS_HOLD_MS: [500, 3000,
+    "how long after his partial transcript last grew the owner is still speaking. Under half a second " +
+    "the words of a slow talker arrive further apart than this; past three seconds a hypothesis that " +
+    "stopped growing holds a relay long after he fell silent"],
+  SPEECH_HOLD_RECHECK_MS: [100, 1000,
+    "how often a held page message looks again whether the owner stopped. Under a tenth of a second " +
+    "it wakes the page for nothing; past a second the message trails his last word by that long"],
+  PROFILE_RECAP_POLL_MS: [200, 2000,
+    "how often the page asks whether the bridge's fetch took the armed recap. Under a fifth of a " +
+    "second it asks the server for nothing; past two seconds it asks once or twice in the whole wait"],
+  PROFILE_RECAP_WAIT_MS: [1000, 4500,
+    "when, after the session started, the page's last word on an armed recap goes. Under a second a " +
+    "bridge that fetches the profile just after its session starts is said not to have taken it; past " +
+    "four and a half seconds, with a retry and its timeouts, the answer lands after the conversation's " +
+    "first record stopped waiting for it (PROFILE_RECAP_ANSWER_WAIT_MS)"],
+  PROFILE_RECAP_ASK_TIMEOUT_MS: [500, 3000,
+    "how long one question about an armed recap may take. Under half a second an ordinary phone round " +
+    "trip counts as no answer; past three seconds the last word and its retry outlast the wait of the " +
+    "conversation's first record (PROFILE_RECAP_ANSWER_WAIT_MS)"],
+  PROFILE_RECAP_ANSWER_WAIT_MS: [6500, 15000,
+    "how long the conversation's first record waits for the answer about a recap armed in the " +
+    "profile. Under the last word plus its retry and their timeouts the start marker is written as " +
+    "sent before the answer says not taken; past fifteen seconds a page closed early in a call loses " +
+    "every record it held"],
   // `#337 voice-relay-silent`.
   RELAY_TURN_MAX_MESSAGES: [4, 20,
     "the most channel messages one relayed turn carries. Under four, an ordinary burst from a coding " +
@@ -40823,6 +40916,8 @@ test("`#270 voice-transcript-markers`: the recap chip is at most three words and
     { state: "none", why: "too_long", dropped: 3 },
     // `#331 resume-on-websocket`.
     { state: "none", why: "refused", dropped: 0 },
+    // `#512 voice-recap-private-stack`.
+    { state: "none", why: "not_taken", dropped: 0 },
   ]) {
     const said = chip(recap);
     assert.ok(said.length <= 24 && said.split(/\s+/).length <= 3, `"${said}"`);
@@ -40831,7 +40926,7 @@ test("`#270 voice-transcript-markers`: the recap chip is at most three words and
   assert.equal(chip({ state: "none", why: "off", dropped: 0 }), null);
   const table = sourceStringTable("RECAP_DETAILS");
   assert.deepEqual(Object.keys(table).sort(),
-    ["client_data", "dropped", "empty", "failed", "refused", "replaced_session", "sent", "too_long", "unsupported"]);
+    ["client_data", "dropped", "empty", "failed", "not_taken", "refused", "replaced_session", "sent", "too_long", "unsupported"]);
   for (const [state, text] of Object.entries(table)) {
     const spent = words(text);
     assert.ok(spent >= SEAM_DETAIL_MIN_WORDS && spent <= SEAM_DETAIL_MAX_WORDS, `${state}: ${spent} words: "${text}"`);
@@ -76065,11 +76160,13 @@ async function v1Minted() {
  * Start a `vibe-talk-v1` call on a signed-in page, and — unless `started` is false — have its
  * session start listing `capabilities` (none when undefined). Returns the socket.
  */
-async function startV1Call(page, capabilities, { started = true } = {}) {
+async function startV1Call(page, capabilities, { started = true, opened = true } = {}) {
   page.setFetch(v1Minted);
   await page.el("talk").click();
   await page.settle();
   const socket = page.sockets.at(-1);
+  // `#512 voice-recap-private-stack`: `opened` false leaves the socket still connecting.
+  if (!opened) return socket;
   socket.onopen();
   if (started) {
     socket.onmessage({ data: JSON.stringify({
@@ -78191,7 +78288,9 @@ test("`#352 voice-reconnect-on-bridge-error`: the bridge losing a turn keeps the
   assert.equal(seamLabel(seamLine), "reconnected");
   assert.equal(seamDetail(seamLine),
     "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line, and the messages went again.");
-  assert.equal(callRecap(page), "Reconnected after a lost turn: started fresh, as this voice session takes no recap");
+  // `#512 voice-recap-private-stack`. Resuming is off on this device, and the line says so: it said
+  // "this voice session takes no recap", which blamed the bridge for the owner's own switch.
+  assert.equal(callRecap(page), "Reconnected after a lost turn: started fresh, as resuming is off");
   assert.equal(page.el("call-recap").getAttribute("data-reconnected"), "");
   assert.match(page.el("settings-detail").textContent, new RegExp(`reconnected after the voice service lost a turn: ${lostTurnWords(echo)}`));
   await page.settle();
@@ -81854,4 +81953,327 @@ test("`#511 voice-explicit-send-only`: a report the server refused goes again wi
   const sent = page.heardPosts.at(-1).text;
   assert.equal(sent.length, sourceConstant("HEARD_TEXT_MAX"));
   assert.ok(sent.endsWith("send all that to the coding agent"), sent.slice(-80));
+});
+
+// --- `#512 voice-recap-private-stack` ------------------------------------------------------------
+//
+// Two fixes for a call on the deployment-managed bridge. RECAP: that bridge lists no `replay`, but
+// fetches the voice-agent profile as each session opens and uses its prompt verbatim, so where the
+// server says so (`replay_via_profile`) the page arms the recap there just before it opens the
+// socket, and draws it as taken only once the server says a fetch served it. HOLD: its speech
+// service dropped the owner's transcripts, so the page believed nobody was speaking and closed the
+// microphone's segment mid-sentence to deliver a relayed message, and the call was lost; now the
+// microphone's own level, and a partial transcript still growing, hold a page message — capped.
+
+const PROFILE_RECAP_WAIT_MS = sourceConstant("PROFILE_RECAP_WAIT_MS");
+const PROFILE_RECAP_POLL_MS = sourceConstant("PROFILE_RECAP_POLL_MS");
+const MIC_SPEECH_HANGOVER_MS = sourceConstant("MIC_SPEECH_HANGOVER_MS");
+const SPEECH_HOLD_RECHECK_MS = sourceConstant("SPEECH_HOLD_RECHECK_MS");
+const OWNER_WORDS_HOLD_MS = sourceConstant("OWNER_WORDS_HOLD_MS");
+
+/**
+ * A `vibe-talk-v1` call on a page resuming from `conv_earlier` through the profile: the page arms the
+ * recap, the socket opens, the bridge fetches the profile when `fetches` (serving the recap, as the
+ * server does), and the session starts listing nothing. Returns the socket.
+ */
+async function profileRecapCall(page, { fetches = true } = {}) {
+  page.transcriptRecordsSupported = true;
+  page.replayViaProfile = true;
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startV1Call(page, undefined, { started: false });
+  assert.deepEqual(page.recapCalls, ["POST /api/v1/voice-recap"], "the recap was not armed before the socket opened");
+  assert.equal(page.recaps.get(1).conversation, "conv_earlier");
+  if (fetches) page.bridgeFetchesProfile();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  await page.settle();
+  return socket;
+}
+
+test("`#512 voice-recap-private-stack`: a session that lists no replay is caught up through the profile the bridge fetched, and the call, Settings, the line above and the start marker say so", async () => {
+  const page = newPage();
+  const socket = await profileRecapCall(page);
+  assert.deepEqual(replayFrames(socket), [], "a frame went to a session that lists no replay");
+  assert.equal(callRecap(page), "Caught the agent up with 11 words from earlier");
+  assert.equal(page.el("call-recap").getAttribute("data-recap"), "accepted");
+  assert.equal(page.el("resume-state").textContent, "The last call was resumed: the agent took 11 words from earlier.");
+  assert.equal(seamChip(boundaryLines(page).at(-1)), "11-word recap sent");
+  assert.match(page.el("settings-detail").textContent, /the voice service took the recap/);
+  assert.deepEqual(page.recapCalls, ["POST /api/v1/voice-recap", "GET /api/v1/voice-recap/1"]);
+  speech(socket, "user", 1, "is it back now", true);
+  turnDone(socket, 1);
+  await watchTurns(page);
+  const started = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
+  assert.deepEqual(started[1][0].detail, {
+    kind: "conversation_start",
+    recap: { state: "sent", words: 11, lines: 2, dropped: 0, transport: "profile" },
+  });
+});
+
+test("`#512 voice-recap-private-stack`: a recap no fetch took is drawn as a fresh start, never as taken, and is taken back (negative control: a page that draws an armed recap as taken)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const socket = await profileRecapCall(page, { fetches: false });
+    // Asked, and not yet answered: the line says it is being handed, not that it was.
+    assert.equal(callRecap(page), "Handing the agent 11 words from earlier");
+    await passTime(page, PROFILE_RECAP_WAIT_MS + 2 * PROFILE_RECAP_POLL_MS);
+    return { page, socket };
+  };
+  const { page, socket } = await run(SCRIPT);
+  assert.equal(callRecap(page), "Started fresh: the voice service did not take the recap");
+  assert.equal(page.el("call-recap").getAttribute("data-recap"), "fresh");
+  assert.equal(seamChip(boundaryLines(page).at(-1)), "recap not taken");
+  assert.equal(page.el("resume-state").textContent, "The last call was NOT resumed: its voice session took no recap.");
+  assert.equal(page.recapCalls.at(-1), "DELETE /api/v1/voice-recap/1", "the page's last word did not take the recap back");
+  assert.ok(page.recapCalls.filter((call) => call.startsWith("GET")).length >= 2, "the page asked once and gave up");
+  assert.equal(page.recaps.get(1).state, "withdrawn");
+  speech(socket, "user", 1, "is it back now", true);
+  turnDone(socket, 1);
+  await watchTurns(page);
+  const started = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
+  assert.deepEqual(started[1][0].detail.recap, { state: "none", why: "not_taken", dropped: 0 });
+
+  const careless = await run(brokenScript(
+    "if (last) return finish(state === null || state === \"unknown\" ? null : false);", "if (last) return finish(true);"));
+  assert.equal(callRecap(careless.page), "Caught the agent up with 11 words from earlier",
+    "the negative control drew it as not taken too, so the check above proves nothing");
+});
+
+test("`#512 voice-recap-private-stack`: a recap armed for a call that ends before its session starts is taken back, and a server that does not offer the profile is never asked to arm one", async () => {
+  const page = newPage();
+  page.replayViaProfile = true;
+  await withEarlierConversation(page, { resume: true });
+  await startV1Call(page, undefined, { started: false });
+  assert.equal(page.recaps.get(1).state, "armed");
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.recaps.get(1).state, "withdrawn", "an armed recap outlived the call it was for");
+
+  const plain = newPage();
+  await withEarlierConversation(plain, { resume: true });
+  await startV1Call(plain, undefined);
+  assert.deepEqual(plain.recapCalls, [], "a recap was armed on a server that does not take one in the profile");
+  assert.equal(callRecap(plain), "Started fresh: this voice session takes no recap");
+});
+
+test("`#512 voice-recap-private-stack`: a reconnected session that lists no replay is caught up with this call's record through the profile, and a session the bridge fetched nothing for starts fresh, said", async () => {
+  for (const fetches of [true, false]) {
+    const page = newPage();
+    page.transcriptRecordsSupported = true;
+    page.replayViaProfile = true;
+    page.channels = [CHANNEL, OTHER_CHANNEL];
+    await withEarlierConversation(page, { resume: true });
+    const { socket, echo } = await relayInFlight(page, {
+      start: async (p) => {
+        const started = await startV1Call(p, undefined, { started: false });
+        p.bridgeFetchesProfile();
+        started.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+        await p.settle();
+        return started;
+      },
+      owner: "is the release tagged yet",
+    });
+    assert.equal(callRecap(page), "Caught the agent up with 11 words from earlier");
+    loseTurn(socket, echo);
+    for (let step = 0; step < 40 && page.sockets.at(-1) === socket; step += 1) await page.settle();
+    const next = page.sockets.at(-1);
+    assert.notEqual(next, socket, "the reconnect opened no new socket");
+    const armed = [...page.recaps.entries()].at(-1);
+    assert.equal(armed[0], 2, "the reconnect armed no recap of its own");
+    assert.notEqual(armed[1].conversation, "conv_earlier", "the reconnect armed the conversation the call resumed from");
+    next.onopen();
+    if (fetches) page.bridgeFetchesProfile();
+    next.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+    await page.settle();
+    await passTime(page, PROFILE_RECAP_WAIT_MS + 2 * PROFILE_RECAP_POLL_MS);
+    assert.deepEqual(replayFrames(next), []);
+    if (fetches) {
+      assert.equal(callRecap(page), "Reconnected after a lost turn: caught the agent up with 7 words from this call");
+      assert.match(page.el("settings-detail").textContent, /the reconnected session took this call's record/);
+    } else {
+      assert.equal(callRecap(page), "Reconnected after a lost turn: started fresh, as the voice service did not take the recap");
+      assert.equal(page.recaps.get(2).state, "withdrawn");
+      assert.ok(storedTexts(page).some((t) => t.startsWith("note: Reconnected, but the new session did not take this call's record")),
+        storedTexts(page).join("\n"));
+    }
+    // How the call began is unchanged in Settings.
+    assert.match(page.el("resume-state").textContent, /took 11 words from earlier/);
+  }
+});
+
+/** One capture buffer of the microphone at `dbfs` (a constant signal whose RMS is that level). */
+function speakAtLevel(page, dbfs) {
+  const processor = page.processors[page.processors.length - 1];
+  assert.ok(processor && processor.onaudioprocess, "nothing is capturing the microphone");
+  const samples = new Float32Array(4096).fill(10 ** (dbfs / 20));
+  processor.onaudioprocess({ inputBuffer: { getChannelData: () => samples } });
+}
+
+/**
+ * Walk the clock `ms` in 100 ms steps with the microphone at `dbfs` (silence when null) on each, and
+ * answer when `type` was first sent, in ms from the start, or null.
+ */
+async function micFor(page, socket, ms, dbfs, type = "audio_end") {
+  for (let at = 0; at <= ms; at += 100) {
+    if (controlFrames(socket).includes(type)) return at;
+    if (dbfs !== null) speakAtLevel(page, dbfs);
+    else speakInto(page);
+    await passTime(page, 100);
+  }
+  return controlFrames(socket).includes(type) ? ms : null;
+}
+
+test("`#512 voice-recap-private-stack`: a relayed message waits while the microphone hears the owner though no transcript says so, goes once he stops, and the call-end record says how long (negative control: the page that judged speech by transcripts alone)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const socket = await relayingNeutralCall(page);
+    // "Hold on, let me interject…" — every transcript of it dropped by the speech service.
+    speakAtLevel(page, -20);
+    await deliver(page, page.stream(), sseMessage(message({ id: "5120", content: "the deploy finished" })));
+    const during = await micFor(page, socket, RELAY_COALESCE_MS + 4000, -20);
+    return { page, socket, during };
+  };
+  const { page, socket, during } = await run(SCRIPT);
+  assert.equal(during, null, "the relay closed the segment while the microphone heard the owner");
+  assert.equal(page.el("status").textContent, "Waiting for you to finish speaking…");
+  const after = await micFor(page, socket, 3000, null);
+  assert.notEqual(after, null, "the relay never went once he stopped");
+  assert.ok(after <= MIC_SPEECH_HANGOVER_MS + 2 * SPEECH_HOLD_RECHECK_MS + 100,
+    `the relay went ${after} ms after he stopped`);
+  assert.match(page.el("settings-detail").textContent, /a page message waited \d+\.\d s for you to finish speaking/);
+  turnDone(socket, 1);
+  await page.settle();
+  assert.equal(timesRelayed(socket, "the deploy finished"), 1);
+  await page.el("hang-up").click();
+  await page.settle();
+  const end = page.endPosts.at(-1);
+  assert.equal(end.speech_holds, 1);
+  assert.equal(end.speech_hold_capped, 0);
+  assert.ok(end.speech_hold_max_ms >= 4000, `the record says it waited ${end.speech_hold_max_ms} ms`);
+
+  const control = await run(brokenScript(
+    "if (next.kind !== \"typed\" && !typedWaiting && holdForOwnerSpeech()) {", "if (false) {"));
+  assert.notEqual(control.during, null, "the negative control held the relay too, so the check above proves nothing");
+});
+
+test("`#512 voice-recap-private-stack`: noise that never stops holds a page message no longer than the server's cap, and says it went at the cap", async () => {
+  const page = newPage();
+  page.speechHold = { level_dbfs: -50, cap_ms: 5000 };
+  const socket = await relayingNeutralCall(page);
+  await deliver(page, page.stream(), sseMessage(message({ id: "5121", content: "the tag is cut" })));
+  const went = await micFor(page, socket, 12000, -30);
+  assert.notEqual(went, null, "road noise kept the relay from ever going");
+  assert.ok(went <= RELAY_COALESCE_MS + 5000 + 2 * SPEECH_HOLD_RECHECK_MS + 200, `the relay went ${went} ms in, past the 5 s cap`);
+  assert.ok(went >= 5000, `the relay went ${went} ms in, inside the 5 s cap`);
+  assert.match(page.el("settings-detail").textContent, /waited 5 s, the most it may, for you to finish speaking/);
+  turnDone(socket, 1);
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.endPosts.at(-1).speech_hold_capped, 1);
+});
+
+test("`#512 voice-recap-private-stack`: the level is the server's, a cap of 0 holds nothing, and a partial transcript still growing holds a moment", async () => {
+  const goes = async (setup, feed) => {
+    const page = newPage();
+    if (setup.speechHold) page.speechHold = setup.speechHold;
+    const socket = await relayingNeutralCall(page);
+    await deliver(page, page.stream(), sseMessage(message({ id: "5122", content: "the build is red" })));
+    return feed(page, socket);
+  };
+  const atCoalesce = (dbfs) => async (page, socket) => (await micFor(page, socket, RELAY_COALESCE_MS + 1500, dbfs)) !== null &&
+    (await micFor(page, socket, 0, dbfs)) !== null && controlFrames(socket).includes("audio_end");
+  // -30 dBFS is speech at the default level, and not at a level of -20.
+  assert.equal(await goes({}, async (page, socket) => (await micFor(page, socket, RELAY_COALESCE_MS + 1500, -30)) !== null), false);
+  assert.equal(await goes({ speechHold: { level_dbfs: -20, cap_ms: 20000 } }, atCoalesce(-30)), true,
+    "a level below the server's held the relay");
+  assert.equal(await goes({ speechHold: { level_dbfs: -50, cap_ms: 0 } }, atCoalesce(-10)), true, "a cap of 0 still held");
+
+  // His partial words, with the microphone silent: a late hypothesis of a turn the speech service
+  // already completed opens no turn, yet it is his words growing, and a page message waits a moment.
+  const growing = async (script) => {
+    const page = newPage(new Map(), script);
+    const socket = await relayingNeutralCall(page);
+    speech(socket, "user", 1, "hold on", false);
+    turnDone(socket, 1);
+    page.expireTimers(CAPTURE_RESUME_MS);
+    await deliver(page, page.stream(), sseMessage(message({ id: "5123", content: "the build is green" })));
+    await passTime(page, RELAY_COALESCE_MS - 200);
+    speech(socket, "user", 1, "hold on a second", false);
+    return msUntilFrame(page, socket, "audio_end", 10_000);
+  };
+  const went = await growing(SCRIPT);
+  assert.ok(went !== null && went >= OWNER_WORDS_HOLD_MS && went <= OWNER_WORDS_HOLD_MS + 1000,
+    `the relay went ${went} ms after his words last grew`);
+  const control = await growing(brokenScript("session.ownerWordsAt = final ? 0 : Date.now();", "session.ownerWordsAt = 0;"));
+  assert.ok(control !== null && control < OWNER_WORDS_HOLD_MS,
+    `the negative control waited ${control} ms too, so the check above proves nothing`);
+});
+
+test("`#512 voice-recap-private-stack`: a recap armed for a call that ends before its socket opens is taken back (negative control: a page that forgets it)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    page.replayViaProfile = true;
+    await withEarlierConversation(page, { resume: true });
+    await startV1Call(page, undefined, { started: false, opened: false });
+    assert.equal(page.recaps.get(1).state, "armed");
+    await page.el("hang-up").click();
+    await page.settle();
+    return page.recaps.get(1).state;
+  };
+  assert.equal(await run(SCRIPT), "withdrawn", "an armed recap outlived a call that never opened its socket");
+  assert.equal(await run(brokenScript("function withdrawArmedRecap() {\n", "function withdrawArmedRecap() {\n  return;\n")), "armed",
+    "the negative control took it back too, so the check above proves nothing");
+});
+
+test("`#512 voice-recap-private-stack`: when nobody can say whether the recap was taken, the call says it was sent and no more — never caught up, never fresh", async () => {
+  const page = newPage();
+  page.recapAnswerStatus = 500;
+  await profileRecapCall(page);
+  await passTime(page, PROFILE_RECAP_WAIT_MS + 4 * PROFILE_RECAP_POLL_MS + 4000);
+  assert.equal(callRecap(page), "Sent the agent 11 words from earlier");
+  assert.ok(page.recapCalls.filter((call) => call.startsWith("DELETE")).length >= 2, "the last word was not asked again");
+  assert.match(page.el("settings-detail").textContent, /could not learn whether the voice service took the recap/);
+});
+
+test("`#512 voice-recap-private-stack`: a hold for the owner's speech starts afresh after the turn that held the message, so it is not let go at once into his next sentence (negative control: the hold that kept its start)", async () => {
+  const run = async (script) => {
+  const page = newPage(new Map(), script);
+  page.speechHold = { level_dbfs: -42, cap_ms: 5000 };
+  const socket = await relayingNeutralCall(page);
+  speakAtLevel(page, -20);
+  await deliver(page, page.stream(), sseMessage(message({ id: "5124", content: "the canary is green" })));
+  assert.equal(await micFor(page, socket, RELAY_COALESCE_MS + 1000, -20), null);
+  // A transcript gets through and opens a turn, which holds the message far past the cap.
+  speech(socket, "user", 1, "hold on", false);
+  speech(socket, "assistant", 1, "Sure, take your time.", false);
+  for (let at = 0; at < 8000; at += 500) {
+    speech(socket, "assistant", 1, `Sure, take your time.${" ".repeat(at / 500)}`, false);
+    await passTime(page, 500);
+  }
+  turnDone(socket, 1);
+  await page.settle();
+  // His next sentence, its transcripts dropped: the message waits for it rather than going at once.
+  const during = await micFor(page, socket, 2500, -20);
+  return { page, socket, during };
+  };
+  const { page, socket, during } = await run(SCRIPT);
+  assert.equal(during, null, "the old hold's start ran the cap out at once, into his speech");
+  assert.notEqual(await micFor(page, socket, 3000, null), null, "the message never went once he stopped");
+  const control = await run(brokenScript(
+    "  session.speechHold = null;\n  if (held.timer !== null) clearTimeout(held.timer);\n  const waited",
+    "  if (held.timer !== null) clearTimeout(held.timer);\n  const waited"));
+  assert.notEqual(control.during, null, "the negative control held it too, so the check above proves nothing");
+});
+
+test("`#512 voice-recap-private-stack`: the reader's typed message is not held behind a page message waiting for his speech", async () => {
+  const page = newPage();
+  const socket = await relayingNeutralCall(page);
+  speakAtLevel(page, -20);
+  await deliver(page, page.stream(), sseMessage(message({ id: "5125", content: "the deploy finished" })));
+  assert.equal(await micFor(page, socket, RELAY_COALESCE_MS + 1000, -20), null);
+  await compose(page, "and the build?");
+  await page.el("send-text").click();
+  await page.settle();
+  speakAtLevel(page, -20);
+  await passTime(page, SPEECH_HOLD_RECHECK_MS + 50);
+  assert.ok(controlFrames(socket).includes("audio_end"), "a typed message waited behind a held page message");
 });

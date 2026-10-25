@@ -1,6 +1,6 @@
 ---
 title: 'voice-recap-private-stack: hand a reconnected or resumed call its recap on the deployment-managed bridge'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-511: related
 created_at: 2026-10-25T15:36:02.357412382+00:00
-updated_at: 2026-10-25T16:18:08.882753275+00:00
+updated_at: 2026-10-25T17:46:19.100384989+00:00
+closed_at: 2026-10-25T17:46:19.100384849+00:00
 ---
 
 # Description

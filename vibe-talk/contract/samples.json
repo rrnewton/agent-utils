@@ -178,8 +178,13 @@
         "playback": "audio"
       },
       "replay_enabled": true,
+      "replay_via_profile": true,
       "replies_in_thread": true,
       "self_author_id": "9",
+      "speech_hold": {
+        "cap_ms": 20000,
+        "level_dbfs": -42
+      },
       "speech_prep_enabled": true,
       "threading_supported": true,
       "token_scope": "write",

@@ -625,6 +625,16 @@ pub struct ReplayConfig {
     pub policy: crate::replay::ReplayPolicy,
     /// How the payload reaches the vendor.
     pub transport: crate::replay::Transport,
+    /// Whether the `vibe-talk-v1` bridge fetches `GET /api/v1/voice-agent` with the write token
+    /// as each of its sessions opens, reconnects included, and uses `prompt.text` verbatim. `#512
+    /// voice-recap-private-stack`.
+    ///
+    /// The operator's statement of fact about the bridge, because this server cannot learn it the
+    /// way it learns `replay` from the hello. On, and with a bridge that does not list `replay`,
+    /// a new call or a reconnect is handed its recap in that prompt ([`crate::voice_recap`]), and
+    /// the page says per call whether the bridge took it. Off by default: a switch drawn live over
+    /// a bridge that fetches nothing would do nothing on every call. Only the config file sets it.
+    pub bridge_fetches_profile: bool,
 }
 
 impl Default for ReplayConfig {
@@ -636,6 +646,7 @@ impl Default for ReplayConfig {
                 max_turns: DEFAULT_REPLAY_MAX_TURNS,
             },
             transport: crate::replay::Transport::ContextualUpdate,
+            bridge_fetches_profile: false,
         }
     }
 }
@@ -1086,6 +1097,40 @@ pub struct ConversationConfig {
     /// [`crate::send_intent`].
     #[serde(default = "default_explicit_send_only")]
     pub explicit_send_only: bool,
+    /// The microphone level, in dBFS (the RMS of one capture buffer against full scale), at or
+    /// above which the voice page takes the owner to be speaking. `#512 voice-recap-private-stack`.
+    ///
+    /// While it is, the page holds its own messages — a relayed chat message, its word on a send
+    /// card — rather than close the microphone's segment under him to say them: the speech service
+    /// may have dropped his transcript, which is all the page judged speech by before. Between
+    /// [`SPEECH_HOLD_DBFS_RANGE`]'s ends; default [`DEFAULT_SPEECH_HOLD_DBFS`].
+    #[serde(default = "default_speech_hold_dbfs")]
+    pub speech_hold_dbfs: i32,
+    /// The longest the page holds one of its messages for the owner's speech, in seconds, so road
+    /// noise above the level cannot keep a relay from ever going. `0` turns the hold off. At most
+    /// [`SPEECH_HOLD_CAP_SECONDS_MAX`]; default [`DEFAULT_SPEECH_HOLD_CAP_SECONDS`].
+    #[serde(default = "default_speech_hold_cap_seconds")]
+    pub speech_hold_cap_seconds: u32,
+}
+
+/// `conversation.speech_hold_dbfs` when unset. `#512 voice-recap-private-stack`. Speech close to a
+/// phone with the browser's noise suppression and gain control on reads about -30 to -20 dBFS, and
+/// a quiet room under -60; a judgement between them until in-car numbers say otherwise.
+pub const DEFAULT_SPEECH_HOLD_DBFS: i32 = -42;
+/// The levels `conversation.speech_hold_dbfs` may take: quieter than -90 dBFS is every buffer, and
+/// louder than -10 none.
+pub const SPEECH_HOLD_DBFS_RANGE: std::ops::RangeInclusive<i32> = -90..=-10;
+/// `conversation.speech_hold_cap_seconds` when unset.
+pub const DEFAULT_SPEECH_HOLD_CAP_SECONDS: u32 = 20;
+/// The longest `conversation.speech_hold_cap_seconds` may be.
+pub const SPEECH_HOLD_CAP_SECONDS_MAX: u32 = 60;
+
+const fn default_speech_hold_dbfs() -> i32 {
+    DEFAULT_SPEECH_HOLD_DBFS
+}
+
+const fn default_speech_hold_cap_seconds() -> u32 {
+    DEFAULT_SPEECH_HOLD_CAP_SECONDS
 }
 
 fn default_conversation_label() -> String {
@@ -1108,6 +1153,8 @@ impl Default for ConversationConfig {
             label: default_conversation_label(),
             ask_before_send: default_ask_before_send(),
             explicit_send_only: default_explicit_send_only(),
+            speech_hold_dbfs: default_speech_hold_dbfs(),
+            speech_hold_cap_seconds: default_speech_hold_cap_seconds(),
         }
     }
 }
@@ -1206,6 +1253,7 @@ struct FileReplay {
     max_chars: Option<usize>,
     max_turns: Option<usize>,
     transport: Option<String>,
+    bridge_fetches_profile: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1612,6 +1660,7 @@ impl Config {
             get(ENV_SUMMARY_BACKEND),
             file.summaries,
         )?;
+        let conversation = speech_hold_checked(file.conversation)?;
         let replay = replay_config(
             [
                 get(ENV_REPLAY_ENABLED),
@@ -1676,13 +1725,42 @@ impl Config {
                     .map(str::to_owned)
                     .or(file.elevenlabs.voice_id),
             },
-            conversation: file.conversation,
+            conversation,
             storage,
             summaries,
             replay,
             message_cache,
         })
     }
+}
+
+/// Refuse a speech hold outside its bounds. `#512 voice-recap-private-stack`. Refused rather than
+/// clamped, as every other bound here is: a level that silently became another is a hold nobody can
+/// explain.
+fn speech_hold_checked(
+    conversation: ConversationConfig,
+) -> Result<ConversationConfig, ConfigError> {
+    if !SPEECH_HOLD_DBFS_RANGE.contains(&conversation.speech_hold_dbfs) {
+        return Err(ConfigError::Invalid {
+            field: "conversation.speech_hold_dbfs".to_owned(),
+            detail: format!(
+                "{} is outside {} to {} dBFS",
+                conversation.speech_hold_dbfs,
+                SPEECH_HOLD_DBFS_RANGE.start(),
+                SPEECH_HOLD_DBFS_RANGE.end()
+            ),
+        });
+    }
+    if conversation.speech_hold_cap_seconds > SPEECH_HOLD_CAP_SECONDS_MAX {
+        return Err(ConfigError::Invalid {
+            field: "conversation.speech_hold_cap_seconds".to_owned(),
+            detail: format!(
+                "{} is longer than {SPEECH_HOLD_CAP_SECONDS_MAX} seconds; 0 turns the hold off",
+                conversation.speech_hold_cap_seconds
+            ),
+        });
+    }
+    Ok(conversation)
 }
 
 /// Resolve and check `[message_cache]`. `#208 persistent-cache`.
@@ -1901,6 +1979,9 @@ fn replay_config(
             max_turns,
         },
         transport,
+        bridge_fetches_profile: file
+            .bridge_fetches_profile
+            .unwrap_or(defaults.bridge_fetches_profile),
     })
 }
 
@@ -4979,6 +5060,46 @@ provider = "slack"
         let text = format!("{FULL}\n[conversation]\nexplicit_send_only = false\n");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
         assert!(!cfg.conversation.explicit_send_only);
+    }
+
+    /// `#512 voice-recap-private-stack`. The speech hold has defaults, takes the operator's values
+    /// within its bounds, and refuses anything outside them by name; the profile route is off until
+    /// the file says the bridge fetches it.
+    #[test]
+    fn the_speech_hold_and_the_profile_recap_are_read_and_bounded() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.conversation.speech_hold_dbfs, DEFAULT_SPEECH_HOLD_DBFS);
+        assert_eq!(
+            cfg.conversation.speech_hold_cap_seconds,
+            DEFAULT_SPEECH_HOLD_CAP_SECONDS
+        );
+        assert!(!cfg.replay.bridge_fetches_profile);
+
+        let text = format!(
+            "{FULL}\n[conversation]\nspeech_hold_dbfs = -50\nspeech_hold_cap_seconds = 0\n\
+             [replay]\nenabled = true\nbridge_fetches_profile = true\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.conversation.speech_hold_dbfs, -50);
+        assert_eq!(cfg.conversation.speech_hold_cap_seconds, 0);
+        assert!(cfg.replay.bridge_fetches_profile);
+
+        for (setting, field) in [
+            ("speech_hold_dbfs = -91", "conversation.speech_hold_dbfs"),
+            ("speech_hold_dbfs = -9", "conversation.speech_hold_dbfs"),
+            (
+                "speech_hold_cap_seconds = 61",
+                "conversation.speech_hold_cap_seconds",
+            ),
+        ] {
+            let text = format!("{FULL}\n[conversation]\n{setting}\n");
+            match Config::from_toml_and_env(&text, &env(&[])) {
+                Err(ConfigError::Invalid { field: named, .. }) => {
+                    assert_eq!(named, field, "{setting}")
+                }
+                other => panic!("{setting} was not refused: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -490,6 +490,11 @@ pub enum RecapTransport {
     /// A `vibe-talk-v1` `replay` frame, the first the page sent after the session started.
     /// `#331 resume-on-websocket`.
     ReplayFrame,
+    /// In the voice-agent profile a `vibe-talk-v1` bridge fetched as its session opened. `#512
+    /// voice-recap-private-stack`. Filed once the server said a fetch served it, or when the page
+    /// could not learn whether one did; one the server said no fetch took is filed as
+    /// [`RecapNone::NotTaken`].
+    Profile,
 }
 
 impl RecapTransport {
@@ -500,6 +505,7 @@ impl RecapTransport {
             Self::ContextualUpdate => "contextual_update",
             Self::ClientData => "client_data",
             Self::ReplayFrame => "replay_frame",
+            Self::Profile => "profile",
         }
     }
 }
@@ -523,6 +529,9 @@ pub enum RecapNone {
     /// The voice service took the recap and answered that it would not use it: a `vibe-talk-v1`
     /// `replay_ack` with `accepted: false`. `#331 resume-on-websocket`.
     Refused,
+    /// The recap was armed in the voice-agent profile and no fetch of it took the recap before the
+    /// page stopped waiting. `#512 voice-recap-private-stack`.
+    NotTaken,
 }
 
 impl RecapNone {
@@ -538,6 +547,7 @@ impl RecapNone {
             Self::Unsupported => "unsupported",
             Self::ReplacedSession => "replaced_session",
             Self::Refused => "refused",
+            Self::NotTaken => "not_taken",
         }
     }
 }
@@ -3150,12 +3160,14 @@ mod tests {
             RecapTransport::ContextualUpdate,
             RecapTransport::ClientData,
             RecapTransport::ReplayFrame,
+            RecapTransport::Profile,
         ] {
             // A variant added without a place in the list above fails to compile here.
             match transport {
                 RecapTransport::ContextualUpdate
                 | RecapTransport::ClientData
-                | RecapTransport::ReplayFrame => {}
+                | RecapTransport::ReplayFrame
+                | RecapTransport::Profile => {}
             }
             assert_eq!(
                 serde_json::to_value(transport).expect("serializes"),
@@ -3170,6 +3182,7 @@ mod tests {
             RecapNone::Unsupported,
             RecapNone::ReplacedSession,
             RecapNone::Refused,
+            RecapNone::NotTaken,
         ] {
             match why {
                 RecapNone::Off
@@ -3178,7 +3191,8 @@ mod tests {
                 | RecapNone::Failed
                 | RecapNone::Unsupported
                 | RecapNone::ReplacedSession
-                | RecapNone::Refused => {}
+                | RecapNone::Refused
+                | RecapNone::NotTaken => {}
             }
             assert_eq!(serde_json::to_value(why).expect("serializes"), why.as_str());
         }

@@ -85,6 +85,13 @@ pub struct BridgeHello {
     url: Option<String>,
     kept: Mutex<Option<(Hello, Instant)>>,
     asking: AtomicBool,
+    /// The bridge sessions this server opens itself, the hello's among them, each owed one profile
+    /// fetch that is never handed a recap. `#512 voice-recap-private-stack`; see
+    /// [`crate::voice_recap::OwnSessions`].
+    own: Arc<crate::voice_recap::OwnSessions>,
+    /// Whether a recap rides in the profile when the bridge declines the frame
+    /// (`replay.bridge_fetches_profile`), which changes what a decline means for the log.
+    profile_fallback: bool,
 }
 
 impl BridgeHello {
@@ -95,13 +102,18 @@ impl BridgeHello {
             url,
             kept: Mutex::new(None),
             asking: AtomicBool::new(false),
+            own: Arc::new(crate::voice_recap::OwnSessions::new()),
+            profile_fallback: false,
         }
     }
 
     /// Ask at the server's own route to the configured bridge ([`server_url`]).
     #[must_use]
     pub fn for_config(config: &Config) -> Self {
-        Self::new(server_url(config))
+        Self {
+            profile_fallback: config.replay.bridge_fetches_profile,
+            ..Self::new(server_url(config))
+        }
     }
 
     /// The address asked at, when there is one.
@@ -128,13 +140,28 @@ impl BridgeHello {
         }
     }
 
+    /// The bridge sessions this server opens itself: the hello's, and read-aloud's when it is handed
+    /// this ([`crate::speech::ConversationSpeech::with_own_sessions`]). `#512
+    /// voice-recap-private-stack`: the bridge fetches the profile for each of them as it does for a
+    /// call, and a recap armed for the owner's call must not be spent on one.
+    #[must_use]
+    pub fn own_sessions(&self) -> &Arc<crate::voice_recap::OwnSessions> {
+        &self.own
+    }
+
     /// Ask the bridge now, keep what it said, and answer it.
     pub async fn ask(&self) -> Hello {
         let answer = match self.url.as_deref() {
-            Some(url) => match hello(url).await {
-                Ok(capabilities) => Hello::Answered(capabilities),
-                Err(why) => Hello::Failed(why),
-            },
+            Some(url) => {
+                let said = {
+                    let _open = self.own.begin();
+                    hello(url).await
+                };
+                match said {
+                    Ok(capabilities) => Hello::Answered(capabilities),
+                    Err(why) => Hello::Failed(why),
+                }
+            }
             None => Hello::Failed(
                 "this server has no address it can reach the voice bridge at: \
                  conversation.websocket_url is not an absolute ws:// or wss:// URL, and \
@@ -175,7 +202,7 @@ impl BridgeHello {
             // Said when it changes, not on every ask: a bridge that keeps declining is one warning,
             // not one every half hour.
             if before.as_ref() != Some(&answer) {
-                log(&answer);
+                log(&answer, me.profile_fallback);
             }
         });
     }
@@ -209,8 +236,10 @@ pub fn server_url(config: &Config) -> Option<String> {
 }
 
 /// Say what the bridge answered, once per ask: a yes at info, anything else as a warning, because
-/// it is why Resuming is off on a deployment whose operator turned it on.
-pub fn log(answer: &Hello) {
+/// it is why Resuming is off on a deployment whose operator turned it on — unless a recap rides in
+/// the profile the bridge fetches (`profile_fallback`, `#512 voice-recap-private-stack`), when a
+/// decline is only which way the recap goes.
+pub fn log(answer: &Hello, profile_fallback: bool) {
     match answer {
         Hello::Answered(capabilities) if capabilities.iter().any(|c| c == REPLAY) => {
             tracing::info!(
@@ -218,6 +247,11 @@ pub fn log(answer: &Hello) {
                 "the voice bridge takes a recap (it lists replay): Resuming is offered to the page"
             );
         }
+        _ if profile_fallback => tracing::info!(
+            "the voice bridge did not say it takes the replay frame, so a new call's recap rides in \
+             the voice-agent profile it fetches (replay.bridge_fetches_profile), and each call says \
+             whether the bridge took it"
+        ),
         Hello::Answered(capabilities) => tracing::warn!(
             capabilities = %capabilities.join(","),
             "replay.enabled is true, but the voice bridge does not list replay among the frames it \

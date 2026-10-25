@@ -348,6 +348,14 @@ enabled = true
 # the voice page heard him say them in the last three minutes. Turn it off only on a deployment
 # where something else stands between the voice agent and the chat.
 # explicit_send_only = true
+#
+# The page waits for you to stop speaking (#512 voice-recap-private-stack). Before it closes the
+# microphone's segment to say one of its own messages (a relayed chat message, its word on a send
+# card), the page waits while the microphone hears you at or above this level, in dBFS (one capture
+# buffer's RMS, -90 to -10), or your partial transcript is still growing; never longer than the cap,
+# in seconds (at most 60; 0 turns the hold off), so road noise cannot keep a relay from going.
+# speech_hold_dbfs = -42
+# speech_hold_cap_seconds = 20
 
 [storage]
 # Durable state: the app's conversation transcript, how far you have read in each channel,
@@ -596,3 +604,12 @@ enabled = false
 # the billed check can answer, which is why both exist.
 # Environment: VIBE_TALK_REPLAY_TRANSPORT
 # transport = "contextual_update"
+
+# A recap in the profile the bridge fetches (#512 voice-recap-private-stack). Set this when the
+# conversation.backend = "websocket" bridge lists no replay, but fetches GET /api/v1/voice-agent with
+# the write token as each of its sessions opens (reconnects included) and uses prompt.text verbatim.
+# The page then arms the recap (POST /api/v1/voice-recap) just before it opens the socket, the
+# bridge's next fetch takes it into the prompt, once, and each call says whether it did. A bridge
+# that lists replay is sent the replay frame instead. This server cannot learn it from the bridge,
+# so it is your word; only the file sets it.
+# bridge_fetches_profile = false
