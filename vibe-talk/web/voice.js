@@ -690,6 +690,15 @@ const session = {
   answerPlayEndMs: 0,
   // Whether this call's microphone was opened with echo cancellation, read once when it opened.
   echoCancellation: false,
+  // `#523 voice-self-hearing`. Whether the call's opening answer has played out of the speaker, so
+  // that the microphone need no longer wait for it (`micHeldForAgent`).
+  greetingPlayedOut: true,
+  // `#523`. Whether the session said its agent speaks first (`greeting: true`).
+  greetingPromised: false,
+  // `#523`. What the assistant said in its latest turns: `{words, atMs}`, for `isAgentEcho`.
+  agentSaid: new Map(),
+  // `#523`. When the microphone last sent a buffer while the agent was audible; 0 for never.
+  echoExposedAt: 0,
   // How many times the provider said this socket's session started; a second is a replacement.
   sessionStarts: 0,
   // `#331 resume-on-websocket`. On `vibe-talk-v1`, the record fetched for this call and not yet
@@ -18607,6 +18616,12 @@ async function openConversation(options) {
   session.playEndMs = 0;
   session.answerPlayEndMs = 0;
   session.echoCancellation = false;
+  // `#523 voice-self-hearing`. Whatever the agent says first, nobody has heard yet. A
+  // `vibe-talk-v1` session says at `session_started` whether it greets at all.
+  session.greetingPlayedOut = false;
+  session.greetingPromised = false;
+  session.agentSaid = new Map();
+  session.echoExposedAt = 0;
   session.sessionStarts = 0;
   session.lastTextAt = 0;
   session.lastAudioEndAt = 0;
@@ -18666,6 +18681,11 @@ async function openConversation(options) {
     session.stream = await navigator.mediaDevices.getUserMedia(audioConstraints(mic));
     // `#264 voice-send-approval`: a spoken yes is taken only with echo cancellation on, as opened.
     session.echoCancellation = mic.echoCancellation === true && !echoCancellationRefused(session.stream);
+    if (!session.echoCancellation) {
+      // `#523 voice-self-hearing`. Said once, because it changes how the call behaves.
+      addDetail("echo cancellation is off for this call, so the microphone pauses while the assistant " +
+        "speaks: talking over it is not heard");
+    }
     session.audio = new (window.AudioContext || window.webkitAudioContext)();
     await session.audio.resume(); // iOS starts it suspended until a gesture.
     markStartup("microphone_ready");
@@ -19102,6 +19122,7 @@ function handle(socket, message) {
         if (session.health) session.health.turns += 1;
         spokenYes.turns += 1;
         hearAssistantForSpokenYes(`assistant:${spokenYes.turns}`, said);
+        noteAgentSaid(`assistant:${spokenYes.turns}`, said); // `#523 voice-self-hearing`
       }
       break;
     case "user_transcript":
@@ -19112,6 +19133,15 @@ function handle(socket, message) {
         if (isEchoOfTyped(said)) {
           break;
         }
+        // `#523 voice-self-hearing`. Nor is the assistant's own voice, heard through the speaker: not
+        // drawn, filed or reported as his, and never a yes. Said in the connection details.
+        const heardAt = Date.now();
+        if (nearAgentSpeech(heardAt, ECHO_FINAL_GRACE_MS) && isAgentEcho(said, heardAt, agentAudible(heardAt))) {
+          noteAgentEchoHeard(said);
+          break;
+        }
+        // He spoke while the agent was silent: what it says next is an answer, not a greeting.
+        if (!agentAudible()) session.greetingPlayedOut = true;
         const li = line("you", said);
         // This protocol sends no partials: every user transcript is a final turn of its own.
         spokenYes.turns += 1;
@@ -19251,6 +19281,13 @@ function upsertSpoken(who, turn, said, final, pageEcho = false) {
     // A typed prompt reflected back is already on screen; see `isEchoOfTyped`. A relayed one, or the
     // page's own notice, was never the owner's to show. `#353 relay-echo-as-owner`.
     entry.echo = who === "you" && final && (pageEcho || isEchoOfTyped(said));
+    // `#523 voice-self-hearing`. Whether this turn began where the agent's own voice could reach the
+    // microphone: only such a turn is judged for its echo, however long it then grows.
+    entry.pageEcho = entry.echo;
+    entry.agentEcho = false;
+    entry.nearAgent = who === "you" && nearAgentSpeech(entry.atMs, ECHO_PARTIAL_GRACE_MS);
+    entry.audibleAtStart = entry.nearAgent && agentAudible(entry.atMs);
+    entry.undecided = false;
     session.liveTurns.set(key, entry);
   }
   if (final) {
@@ -19259,6 +19296,8 @@ function upsertSpoken(who, turn, said, final, pageEcho = false) {
   } else {
     entry.pending = said;
   }
+  if (who === "assistant") noteAgentSaid(key, spokenText(entry));
+  if (entry.nearAgent) judgeAgentEcho(entry, final);
   if (!entry.echo) {
     drawSpoken(entry);
     if (who === "you") noteYesCandidate(key, spokenText(entry), entry.li);
@@ -19272,6 +19311,34 @@ function upsertSpoken(who, turn, said, final, pageEcho = false) {
     armUnsettledSave();
   }
   return { key, entry };
+}
+
+/**
+ * `#523 voice-self-hearing`. Judge a user turn begun near the agent's speech for its echo, again as
+ * its words grow: an echo is taken off the screen, and a turn that grows into the owner's own words
+ * is drawn as his.
+ */
+function judgeAgentEcho(entry, final) {
+  const text = spokenText(entry);
+  // Begun after the agent fell silent, a turn of fewer than three words cannot be judged yet
+  // (`isAgentEcho`): until it can, or it is final, nothing of it is reported as heard or taken as a
+  // yes, so no echo's opening words reach the server before the turn is found to be one.
+  entry.undecided = !entry.audibleAtStart && !final && answerWords(text).length < 3;
+  const echoed = isAgentEcho(text, entry.atMs, entry.audibleAtStart);
+  if (echoed === entry.agentEcho) return;
+  entry.agentEcho = echoed;
+  entry.echo = echoed || entry.pageEcho;
+  if (!entry.echo) return;
+  if (entry.li) {
+    const pinned = atBottom(el("scroll-area"));
+    if (entry.li.parentNode) entry.li.parentNode.removeChild(entry.li);
+    entry.li = null;
+    followIfPinned(pinned);
+  }
+  // What the spoken yes took from the turn's words so far goes with them.
+  if (spokenYes.answer && spokenYes.answer.key === entry.key) spokenYes.answer = null;
+  const hold = spokenYes.holds.get(entry.key);
+  if (hold) releaseYesHold(hold);
 }
 
 /** Put a spoken turn's row on screen, or redraw the one it has with what it now says. */
@@ -19364,6 +19431,7 @@ function storeSpoken(entry) {
   // `#330 voice-long-turn-drop`. Another page already filed this turn from the copy this page wrote
   // down as it was said, believing this one gone: filing it again would store it twice.
   const filedElsewhere = entry.takenElsewhere || (entry.savedCopy && unsettledTakenElsewhere());
+  if (entry.agentEcho) noteAgentEchoHeard(spokenText(entry));
   if (!entry.echo && !filedElsewhere) {
     // A user turn held for a yes is filed with its hold, which says by the time the request goes —
     // after the handler storing it has judged it — whether the page acted on it. `#269`.
@@ -20434,6 +20502,11 @@ function handleVibeTalk(message) {
         break;
       }
       session.waitingForGreeting = message.greeting === true;
+      // `#523 voice-self-hearing`. Every session, first or reconnected, holds the microphone while
+      // whatever its agent says first plays here, until it has played out, not only until it was
+      // sent: one that does not promise a greeting may still greet (`settleGreetingPlayout`).
+      session.greetingPlayedOut = false;
+      session.greetingPromised = message.greeting === true;
       if (session.waitingForGreeting && session.health) {
         session.health.greetingPending = true;
         armNoReply();
@@ -20501,22 +20574,27 @@ function handleVibeTalk(message) {
         break;
       }
       session.lastTranscriptKey = key;
-      if (who === "assistant") {
-        markStartup("greeting_text");
-      } else if (!pageEcho) {
+      if (who === "assistant") markStartup("greeting_text");
+      const spoken = upsertSpoken(who, message.turn, said, final, pageEcho);
+      // `#523 voice-self-hearing`. Nor the agent's own words coming back through the microphone.
+      if (who === "you" && !pageEcho && !spoken.entry.echo) {
         // `#512 voice-recap-private-stack`. His words are still growing: a page message waits a
         // moment more. A final says he has finished.
         session.ownerWordsAt = final ? 0 : Date.now();
+        // `#523`. He spoke while the agent was silent: what it says next is an answer, which he may
+        // talk over, not a greeting.
+        if (!agentAudible()) session.greetingPlayedOut = true;
       }
-      const spoken = upsertSpoken(who, message.turn, said, final, pageEcho);
-      // `#511 voice-explicit-send-only`. The owner's words, never the page's echo of its own prompt.
-      if (who === "you" && !spoken.entry.echo) reportHeard(spoken.key, spokenText(spoken.entry));
+      // `#511 voice-explicit-send-only`. The owner's words, never the page's echo of its own prompt,
+      // nor the agent's own voice (`#523 voice-self-hearing`), nor words that may yet prove to be it.
+      const owners = !spoken.entry.echo && !spoken.entry.undecided;
+      if (who === "you" && owners) reportHeard(spoken.key, spokenText(spoken.entry));
       // The turn's whole text so far, as the row shows it, and its number: the number, not the
       // order the frames arrive in, says whether assistant words came before an answer or in reply
       // to it. `#264 voice-send-approval`, `#268 voice-call-drops`.
       if (who === "assistant") {
         hearAssistantForSpokenYes(spoken.key, spokenText(spoken.entry), turnNumber);
-      } else if (!spoken.entry.echo) {
+      } else if (owners) {
         hearUserForSpokenYes(spoken.key, spokenText(spoken.entry), final, turnNumber);
         settleYesCandidate(spoken.key);
       }
@@ -20672,6 +20750,178 @@ function deferVoiceCaptureAcrossTurn() {
   }, VOICE_CAPTURE_RESUME_MS);
 }
 
+// --- the assistant's own voice at the microphone (`#523 voice-self-hearing`) ----------------------
+//
+// The owner, 2026-10-25: a new call greeted him, and then answered "let's connect you to your chat"
+// as if he had said it. The phone's speaker plays the agent and its microphone hears it. Echo
+// cancellation is asked for, but it is only as good as the reference it cancels against: this page
+// plays the agent through Web Audio (`playPcmBytes`), which a phone's browser need not hand its echo
+// canceller, and a track can refuse the constraint outright (`echoCancellationRefused`). And the
+// protocol's greeting gate (`greeting: true`) ends at the greeting's `turn_complete`, which a bridge
+// sends when it has finished SENDING the greeting, while this phone may still have seconds of it
+// queued for the speaker; the hosted agent's first message has no gate at all.
+//
+// So three guards, none of which needs the echo canceller to work:
+//   * THE GREETING. Microphone frames are withheld while the call's opening answer is still
+//     audible here: nobody needs to talk over a hello, and it is the one answer that always plays
+//     into an open microphone.
+//   * NO ECHO CANCELLATION. With it off or refused, frames are withheld whenever the agent is
+//     audible: half duplex, so the owner cannot talk over an answer, but the agent cannot answer
+//     itself.
+//   * THE TRANSCRIPT. A user transcript made of the words the assistant has just been saying, begun
+//     while it was audible or a moment after, is taken for its echo: not drawn or filed as the
+//     owner's, not reported as heard (`#511`), never a yes. The voice service has heard it already,
+//     so this cannot stop an answer to it; it stops the page making the echo the owner's words.
+
+/** How long after the last sample leaves the speaker the room may still carry it to the microphone. */
+const ECHO_TAIL_MS = 250;
+/**
+ * How long after the microphone last sent the agent's sound a `vibe-talk-v1` user turn whose first
+ * frame arrives may still be its echo. A streaming recogniser sends a partial within a moment of
+ * the speech it hears, and an echo of three words or more began well before the agent fell silent.
+ */
+const ECHO_PARTIAL_GRACE_MS = 500;
+/** The same for the hosted agent, which sends only a finished turn, after it has ended. */
+const ECHO_FINAL_GRACE_MS = 1500;
+/** How many of the assistant's latest turns a user transcript is compared with. */
+const ECHO_TURNS = 2;
+/** How long after a user turn began an assistant turn's words may arrive and still be its source. */
+const ECHO_TEXT_TRAIL_MS = 1000;
+/** The share of a user transcript's words, in order, that must be the assistant's for an echo. */
+const ECHO_WORD_SHARE = 0.8;
+/** How long the hosted agent's speaker must stay quiet before its first message counts as over. */
+const ECHO_GREETING_QUIET_MS = 2000;
+
+/**
+ * When, by the wall clock, the agent's audio this page has scheduled will have died away: the last
+ * scheduled sample, the output latency the browser reports (the audio clock runs ahead of the
+ * speaker by that much), and the room. 0 when nothing was played in this call.
+ */
+function agentAudibleUntil() {
+  if (!(session.playEndMs > 0)) return 0;
+  const audio = session.audio;
+  const latency = audio ? Number(audio.outputLatency || audio.baseLatency || 0) : 0;
+  const latencyMs = Number.isFinite(latency) ? Math.min(1000, Math.max(0, latency * 1000)) : 0;
+  return session.playEndMs + latencyMs + ECHO_TAIL_MS;
+}
+
+/** @param {number} [now] */
+function agentAudible(now = Date.now()) {
+  return agentAudibleUntil() > now;
+}
+
+/**
+ * Has the call's opening answer played out? Once it was played and has died away: a greeting the
+ * session promised (`greeting: true`) once its `turn_complete` has come too; any other, the hosted
+ * agent's first message included, once the speaker has been quiet longer than a network stall in
+ * the middle of one (ECHO_GREETING_QUIET_MS). The owner speaking while the agent is silent ends it
+ * as well: what the agent says next is an answer, which he may talk over. Settled on every microphone buffer, muted or paused included, so a
+ * greeting nobody could talk over still counts as played.
+ *
+ * @param {number} [now]
+ */
+function settleGreetingPlayout(now = Date.now()) {
+  if (session.greetingPlayedOut || session.waitingForGreeting || !(session.playEndMs > 0)) return;
+  const quietMs = session.greetingPromised ? 0 : ECHO_GREETING_QUIET_MS;
+  if (now >= agentAudibleUntil() + quietMs) session.greetingPlayedOut = true;
+}
+
+/**
+ * Whether microphone frames are withheld now because the agent may be heard by the microphone: its
+ * opening answer still to finish, or any answer while echo cancellation is off.
+ *
+ * @param {number} [now]
+ */
+function micHeldForAgent(now = Date.now()) {
+  if (session.chat) return false;
+  const audible = agentAudible(now);
+  if (!session.greetingPlayedOut) return audible;
+  return audible && session.echoCancellation !== true;
+}
+
+/**
+ * A microphone buffer is going to the voice service: while the agent is audible, its sound may go
+ * with it, so a user turn soon after may be its echo (`nearAgentSpeech`). With nothing sent while
+ * it was audible — the greeting held, half duplex, mute — the service heard no echo to transcribe.
+ *
+ * @param {number} [now]
+ */
+function noteMicSent(now = Date.now()) {
+  if (agentAudible(now)) session.echoExposedAt = now;
+}
+
+/**
+ * Remember what the assistant said in a turn, for `isAgentEcho`. The turn's newest text replaces
+ * what it said before, and only the latest ECHO_TURNS are kept.
+ *
+ * @param {string} key the assistant turn
+ * @param {string} text everything it has said in that turn so far
+ */
+function noteAgentSaid(key, text) {
+  const known = session.agentSaid.get(key);
+  session.agentSaid.delete(key);
+  session.agentSaid.set(key, { words: answerWords(text), atMs: known ? known.atMs : Date.now() });
+  while (session.agentSaid.size > ECHO_TURNS) session.agentSaid.delete(session.agentSaid.keys().next().value);
+}
+
+/**
+ * Whether a user turn begun at `atMs` may be the agent's echo: the microphone sent the agent's sound
+ * a moment before (`noteMicSent`), within `graceMs`.
+ *
+ * @param {number} atMs
+ * @param {number} graceMs ECHO_PARTIAL_GRACE_MS or ECHO_FINAL_GRACE_MS
+ */
+function nearAgentSpeech(atMs, graceMs) {
+  if (session.chat || !(session.echoExposedAt > 0)) return false;
+  return atMs <= session.echoExposedAt + graceMs;
+}
+
+/**
+ * Is `text`, heard as the owner's in a turn that began near the agent's speech (`nearAgentSpeech`),
+ * the assistant's own words coming back through the microphone? It is when nearly all of its words
+ * are, in order, words of one of the assistant's latest turns whose words had arrived by the time it
+ * began: a recogniser mishears an echo as it does anything else.
+ *
+ * A turn begun after the agent fell silent is judged only when it is three words or more and not a
+ * plain yes: a short reply straight after it, a yes or a bare "send it", is the spoken yes's to judge
+ * (`spokenYesRefusal`).
+ *
+ * @param {string} text
+ * @param {number} atMs when the turn began
+ * @param {boolean} audible whether the agent was audible then
+ */
+function isAgentEcho(text, atMs, audible) {
+  const words = answerWords(text);
+  if (words.length === 0) return false;
+  if (!audible) {
+    if (words.length < 3) return false;
+    // A plain yes names nobody to send to, and the spoken yes has guards of its own; a "hint" ("send
+    // it to the coding agent") does name one, and is exactly the echo #511 must never hear as an ask.
+    if (classifySpokenAnswer(text) === "affirmative") return false;
+  }
+  const need = Math.ceil(words.length * ECHO_WORD_SHARE);
+  for (const said of session.agentSaid.values()) {
+    if (said.atMs > atMs + ECHO_TEXT_TRAIL_MS) continue;
+    let at = 0;
+    let matched = 0;
+    for (const word of words) {
+      const found = said.words.indexOf(word, at);
+      if (found < 0) continue;
+      matched += 1;
+      at = found + 1;
+    }
+    if (matched >= need) return true;
+  }
+  return false;
+}
+
+/** @param {string} text */
+function noteAgentEchoHeard(text) {
+  const said = String(text).trim();
+  const shown = said.length > 80 ? `${said.slice(0, 79)}…` : said;
+  addDetail(`the microphone picked up the assistant's own words ("${shown}"); not taken as yours`);
+}
+
 function startCapture(socket) {
   const rate = session.audio.sampleRate;
   // ScriptProcessorNode is deprecated in favour of AudioWorklet, and is still the only capture
@@ -20699,6 +20949,8 @@ function startCapture(socket) {
     //
     // Anyone tidying `stop()` later: `track.stop()` MUST NOT become reachable from here, not even
     // conditionally. It ends the conversation, and with it everything the agent knows.
+    // `#523 voice-self-hearing`. Before mute: a greeting played into a muted microphone is played.
+    settleGreetingPlayout();
     if (session.muted) {
       return;
     }
@@ -20709,6 +20961,11 @@ function startCapture(socket) {
     if (session.capturePaused) {
       return;
     }
+    // `#523 voice-self-hearing`. Nor the agent's own voice, while nothing cancels it.
+    if (micHeldForAgent()) {
+      return;
+    }
+    noteMicSent();
     const pcm = floatToPcm16(downsampleTo(mono, rate, session.inputRate));
     if (session.protocol === "vibe-talk-v1") {
       socket.send(pcm.buffer);
@@ -20790,6 +21047,9 @@ function teardown() {
   session.playEndMs = 0;
   session.answerPlayEndMs = 0;
   session.echoCancellation = false;
+  session.greetingPlayedOut = true;
+  session.agentSaid = new Map();
+  session.echoExposedAt = 0;
   session.sessionStarts = 0;
   // `#352 voice-reconnect-on-bridge-error`. A reconnect in progress stops at its next step.
   // `#512 voice-recap-private-stack`. A recap armed for a session this call no longer has goes back,
