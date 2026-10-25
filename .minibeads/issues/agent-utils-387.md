@@ -6,13 +6,13 @@ issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T22:18:47.668393132+00:00
-updated_at: 2026-10-25T21:47:59.469412276+00:00
+updated_at: 2026-10-25T22:12:05.059870903+00:00
 closed_at: 2026-10-25T21:47:59.469412225+00:00
 ---
 
 # Description
 
-[GPT-6 Codex codex-vibe-discord] Discord attachment/image/embed-only posts had empty content and were hidden by hide-empty-messages (agent-utils-386). Confirmed the fix was absent from origin/main at 9fa6d01a. Adapt attachments and embeds into the existing bounded, escaped Slack file-line formatter; retain names, kinds and safe links without fetching files. Add Discord-shaped JSON tests, malformed-link/name escaping control, a truly-empty control, and a client test with the default empty-message filter enabled. Focused server/client tests pass. Mutation removing attachments and embeds fails the new server regression. Full selected repository validation running before publication.
+[GPT-6 Codex codex-vibe-discord] Fixed Discord attachment/image/embed-only posts hidden by hide-empty-messages (agent-utils-386). The fix was absent from origin/main at 9fa6d01a. Discord attachment/embed fields now reuse the existing bounded, escaped file-line formatter, retaining names, kinds and safe links without fetching files. Discord-shaped JSON and default-filter client regressions pass; removing attachments/embeds fails the server regression. Verification: 2,338 JavaScript tests and the full Rust recheck (2,737 passed, zero failed across 90 binaries), plus the selected browser checks. Aggregate gate failures and their passing focused rechecks are recorded in the coordinator progress artifact.
 
 # Acceptance Criteria
 
