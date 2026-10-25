@@ -155,6 +155,9 @@ pub struct AppState {
     /// replay is on with that backend, and read by client-config to decide whether a new call can
     /// be handed the earlier conversation.
     pub voice_bridge: Arc<crate::voice_bridge::BridgeHello>,
+    /// The recap armed for the bridge's next profile fetch, and what became of the last. `#512
+    /// voice-recap-private-stack`; see [`crate::voice_recap`]. In memory, for a minute at most.
+    pub voice_recap: Arc<crate::voice_recap::VoiceRecaps>,
     /// The handle every message-cache fill goes through. `#208 persistent-cache`; see
     /// [`crate::cache::sink`].
     ///

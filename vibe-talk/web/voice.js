@@ -650,6 +650,26 @@ const session = {
   pageMessageHeldNoted: false,
   // The reader's send just cut the answer short, and the status line says so rather than "Sent.".
   cutForTyped: false,
+  // `#512 voice-recap-private-stack`. When the microphone last heard the owner at or above the
+  // speech level, and when his transcript last grew, by the wall clock, or 0; the page message held
+  // for his speech, from when, with the timer that looks again; and, for the call-end record, how
+  // many were held, the longest wait, and how many went at the cap.
+  micSpeechAt: 0,
+  ownerWordsAt: 0,
+  /** @type {{since: number, timer: ReturnType<typeof setTimeout> | null} | null} */
+  speechHold: null,
+  speechHolds: 0,
+  speechHoldMaxMs: 0,
+  speechHoldCapped: 0,
+  // `#512`. The recap armed in the profile for the session this call opened, while its fate is
+  // being asked: its number, the timer of the next question, and what to do with an answer that
+  // comes after the call let the watch go.
+  /** @type {{id: number, timer: ReturnType<typeof setTimeout> | null, abandoned: (served: boolean | null) => void} | null} */
+  profileRecap: null,
+  // `#512`. The number of a recap this call armed and has not settled or taken back, from the
+  // moment it was armed, so a call that ends before its socket opens takes it back too.
+  /** @type {number | null} */
+  armedRecap: null,
   // When this call last sent a text turn, an `audio_end` and an `interrupt`, by the wall clock, or 0:
   // the call-end record says how long before the end each went (`postCallEnd`).
   lastTextAt: 0,
@@ -8042,6 +8062,11 @@ const RECAP_DETAILS = {
   refused:
     "Nothing was recapped: the voice service refused the recap it was sent, so the agent below " +
     "remembers nothing above.",
+  // `#512 voice-recap-private-stack`. Armed in the instructions the voice service fetches, and not
+  // fetched with them before the page stopped asking.
+  not_taken:
+    "Nothing was recapped: the voice service did not take the recap armed for its instructions, so " +
+    "the agent below remembers nothing above.",
   empty:
     "No recap was sent: the conversation above held nothing said aloud to replay, so the agent " +
     "below starts from nothing.",
@@ -8067,6 +8092,13 @@ const MARKER_NUMBER_MAX = 1000000;
  */
 let replayUnavailable = null;
 
+/**
+ * `#512 voice-recap-private-stack`. Whether a new call's recap rides in the voice-agent profile the
+ * `vibe-talk-v1` bridge fetches as its session opens, rather than in a `replay` frame: client-config's
+ * `replay_via_profile`.
+ */
+let resumeViaProfile = false;
+
 /** How the last call on this page ended, as `noteConversationEnded` saw it; null after a load. */
 let lastEndCause = null;
 
@@ -8084,7 +8116,7 @@ const startMarkers = new Map();
  * (`#331 resume-on-websocket`): it was sent nothing because it could take nothing.
  *
  * @param {any} resume what `fetchResume` answered, null for nothing
- * @param {"contextual_update" | "client_data" | "replay_frame" | null} transport how it went, null when it did not
+ * @param {"contextual_update" | "client_data" | "replay_frame" | "profile" | null} transport how it went, null when it did not
  * @returns {{state: "sent", words: number | null, lines: number, dropped: number, transport: string} | {state: "none", why: string, dropped: number}}
  */
 function recapFor(resume, transport) {
@@ -8125,6 +8157,7 @@ function recapChip(recap) {
     return words === null ? "recap sent" : `${words.toLocaleString("en-US")}-word recap sent`;
   }
   if (recap.why === "unsupported") return "recap unsupported";
+  if (recap.why === "not_taken") return "recap not taken";
   return recap.why === "refused" ? "recap refused" : "no recap sent";
 }
 
@@ -8270,6 +8303,7 @@ const CALL_FRESH = {
   too_long: "the earlier conversation was too long to send",
   failed: "the earlier conversation could not be read",
   refused: "the voice service refused the recap",
+  not_taken: "the voice service did not take the recap",
   replaced_session: "the voice service replaced the session",
 };
 
@@ -8291,7 +8325,7 @@ function callRecapLine(recap, ack) {
     const older = recap.dropped > 0
       ? `; ${recap.dropped} older line${recap.dropped === 1 ? "" : "s"} did not fit`
       : "";
-    return `${ack === "accepted" ? "Caught the agent up with" : "Sent the agent"} ${amount}${older}`;
+    return `${recapVerb(recap, ack, "Caught the agent up with", "Handing the agent", "Sent the agent")} ${amount}${older}`;
   }
   return `Started fresh: ${CALL_FRESH[recap.why] || freshBecause(recap.why)}`;
 }
@@ -8312,10 +8346,26 @@ function reconnectedRecapLine(recap, ack) {
     const older = recap.dropped > 0
       ? `; ${recap.dropped} older line${recap.dropped === 1 ? "" : "s"} did not fit`
       : "";
-    return `Reconnected after a lost turn: ${ack === "accepted" ? "caught the agent up with" : "sent the agent"} ` +
+    return `Reconnected after a lost turn: ${recapVerb(recap, ack, "caught the agent up with", "handing the agent", "sent the agent")} ` +
       `${amount}${older}`;
   }
   return `Reconnected after a lost turn: started fresh, as ${RECONNECT_FRESH[recap.why] || freshBecause(recap.why)}`;
+}
+
+/**
+ * What the line under a call says was done with a recap that went: taken, once the voice service
+ * said so (`accepted`); being handed, while a recap armed in the profile waits to be asked about
+ * (`#512 voice-recap-private-stack`); otherwise sent.
+ *
+ * @param {any} recap
+ * @param {string | null} ack
+ * @param {string} taken
+ * @param {string} handing
+ * @param {string} sent
+ */
+function recapVerb(recap, ack, taken, handing, sent) {
+  if (ack === "accepted") return taken;
+  return recap.transport === "profile" && ack === "waiting" ? handing : sent;
 }
 
 /** Why a call started fresh when it was resuming that was off or unsupported: the server's reason. */
@@ -8360,11 +8410,23 @@ function offerReplayAtSessionStart(message) {
   if (!resume || message.type !== "session_started") return;
   session.pendingResume = null;
   const listed = Array.isArray(message.capabilities) && message.capabilities.includes("replay");
+  const armed = typeof resume.profileRecap === "number" ? resume.profileRecap : null;
   if (listed) {
+    // `#512 voice-recap-private-stack`. A session that lists `replay` after all is sent the frame,
+    // which it answers; the recap armed in the profile is taken back.
+    if (armed !== null) withdrawProfileRecap(armed);
     sendReplayFrame(resume);
     session.recapAck = "waiting";
     awaitReplayAnswer();
     noteCallRecap(recapFor(resume, "replay_frame"));
+  } else if (armed !== null) {
+    // `#512`. Armed in the profile the bridge fetches as its session opens: asked about now, and
+    // drawn as taken only once the server says a fetch served it. The conversation's first record
+    // waits for that answer, as it waits for a `replay_ack`.
+    session.recapAck = "waiting";
+    awaitReplayAnswer(PROFILE_RECAP_ANSWER_WAIT_MS);
+    noteCallRecap(recapFor(resume, "profile"));
+    watchProfileRecap(armed, settleCallProfileRecap, firstRecapAbandoned(session.conversationId));
   } else {
     resumeLast = { ...resumeLast, armed: false, unsupported: true };
     addDetail("this voice session does not list replay, so it was sent no recap");
@@ -8430,24 +8492,275 @@ function noteReplayAck(message) {
     const reason = typeof message.reason === "string" && message.reason.trim() ? message.reason.trim() : "no reason given";
     addDetail(`the voice service refused the recap: ${reason}`);
     resumeLast = { ...resumeLast, armed: false, refused: true };
-    const recap = { state: "none", why: "refused", dropped: 0 };
-    session.recap = recap;
-    // The session that refused it is the one every turn of the call went to, so the line above the
-    // call says so however much has been drawn or filed below it, and so does the conversation's
-    // start marker, which waits for this answer (`replayAnswerWait`). A marker already written,
-    // because that wait ran out before an answer this late, is what a reload draws: the line keeps
-    // it as well, so the two never disagree.
-    const start = unwrittenStartMarker(session.conversationId);
-    const seam = session.recapSeam;
-    if (start) {
-      start.recap = recap;
-      if (seam && seam.parentNode) setSeamRecap(seam, boundaryFor(recap, seam.getAttribute("data-cause")));
-    }
-    renderCallRecap();
+    markRecapNotHanded({ state: "none", why: "refused", dropped: 0 });
   }
   renderResumeState();
   // After the marker has what the answer said: it is written once the records ahead of it are.
   endReplayAnswerWait();
+}
+
+/**
+ * The call's session was handed no recap after all — refused, or not taken from the profile — and
+ * `recap` says which.
+ *
+ * The session is the one every turn of the call went to, so the line above the call says so however
+ * much has been drawn or filed below it, and so does the conversation's start marker, which waits for
+ * this answer (`replayAnswerWait`). A marker already written, because that wait ran out before an
+ * answer this late, is what a reload draws: the line keeps it as well, so the two never disagree.
+ *
+ * @param {{state: "none", why: string, dropped: number}} recap
+ */
+function markRecapNotHanded(recap) {
+  session.recap = recap;
+  const start = unwrittenStartMarker(session.conversationId);
+  const seam = session.recapSeam;
+  if (start) {
+    start.recap = recap;
+    if (seam && seam.parentNode) setSeamRecap(seam, boundaryFor(recap, seam.getAttribute("data-cause")));
+  }
+  renderCallRecap();
+}
+
+// --- a recap in the profile the bridge fetches ------------------------------------------------------
+//
+// `#512 voice-recap-private-stack`. A bridge that lists no `replay` may still fetch the voice-agent
+// profile as each session opens and use its prompt verbatim; the server says so with
+// `replay_via_profile`. Then the page arms the recap (`POST /api/v1/voice-recap`) just before it opens
+// the socket, the bridge's fetch takes it into the prompt, and once the session has started the page
+// asks what became of it — a few times, then a last `DELETE`, which takes it back unless a fetch
+// already served it and answers which. Only a served recap is drawn as one; one never served says the
+// call started fresh because the voice service did not take it. And one the call no longer needs —
+// hung up before its session started, or a session that lost a turn — is taken back, so no later
+// session is handed it unasked.
+
+/** How often the page asks whether the bridge's fetch took the armed recap. */
+const PROFILE_RECAP_POLL_MS = 500;
+
+/**
+ * When, after the session started, the page's last word on an armed recap goes, whatever the answers
+ * before it took: an absolute deadline, so slow answers cannot push it later.
+ */
+const PROFILE_RECAP_WAIT_MS = 3500;
+
+/** How long one question about an armed recap may take before it counts as unanswered. */
+const PROFILE_RECAP_ASK_TIMEOUT_MS = 1500;
+
+/**
+ * How long the conversation's first record waits for the answer about a recap armed in the profile:
+ * past the last word, its one retry and their timeouts, so the start marker is written with what the
+ * answer said.
+ */
+const PROFILE_RECAP_ANSWER_WAIT_MS = 8000;
+
+/**
+ * Arm a recap of `conversationId` for the bridge's next profile fetch. Never throws: answers what was
+ * armed — its number and the counts the server built — or why nothing was: `unavailable` when the
+ * server no longer hands recaps over that way, so a session that lists `replay` can still be sent the
+ * frame.
+ *
+ * @param {string} conversationId
+ * @returns {Promise<{armed: {profileRecap: number, included: number, dropped: number, words: number | null} | null, why: "empty" | "too_long" | "failed" | "unavailable" | null, dropped: number}>}
+ */
+async function armProfileRecap(conversationId) {
+  const count = (value) => Math.min(MARKER_NUMBER_MAX, Math.max(0, Math.round(Number(value) || 0)));
+  try {
+    const answer = await api("/api/v1/voice-recap", { method: "POST", body: { conversation_id: conversationId } });
+    if (answer && answer.armed === true && typeof answer.id === "number") {
+      session.armedRecap = answer.id;
+      return {
+        armed: {
+          profileRecap: answer.id,
+          included: count(answer.included),
+          dropped: count(answer.dropped),
+          words: typeof answer.words === "number" ? count(answer.words) : null,
+        },
+        why: null,
+        dropped: 0,
+      };
+    }
+    const dropped = count(answer && answer.dropped);
+    return { armed: null, why: dropped > 0 ? "too_long" : "empty", dropped };
+  } catch (error) {
+    if (error && error.status === 409) {
+      addDetail("this server no longer hands a recap over in the voice service's instructions");
+      return { armed: null, why: "unavailable", dropped: 0 };
+    }
+    addDetail(`the recap could not be armed for the voice service: ${error.message}`);
+    return { armed: null, why: "failed", dropped: 0 };
+  }
+}
+
+/**
+ * A new call's recap, armed in the profile just before its socket opens: `resume` with the armed
+ * recap's number and the counts the server built; `resume` as it was when the server no longer arms
+ * one (a session that lists `replay` is then sent the frame); or null when nothing could be armed,
+ * which Settings then says as a fetch of the record would have.
+ *
+ * @param {any} resume what `fetchResume` answered
+ */
+async function armRecapForCall(resume) {
+  const conversationId = resumeConversationId;
+  if (!conversationId) return null;
+  const armed = await armProfileRecap(conversationId);
+  if (armed.armed) {
+    resumeLast = {
+      ...resumeLast,
+      dropped: armed.armed.dropped,
+      words: armed.armed.words,
+    };
+    renderResumeState();
+    return { ...resume, ...armed.armed };
+  }
+  if (armed.why === "unavailable") return resume;
+  resumeLast = armed.why === "failed"
+    ? { ...blankResumeLast(), attempted: true, failed: true }
+    : { ...blankResumeLast(), attempted: true, dropped: armed.dropped };
+  renderResumeState();
+  return null;
+}
+
+/**
+ * One question about armed recap `id`: its state, or null when it went unanswered within
+ * PROFILE_RECAP_ASK_TIMEOUT_MS or failed.
+ *
+ * @param {number} id
+ * @param {boolean} last whether this is the page's last word, which takes it back unless served
+ * @returns {Promise<string | null>}
+ */
+async function askAboutRecap(id, last) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), PROFILE_RECAP_ASK_TIMEOUT_MS) : null;
+  try {
+    /** @type {{method?: string, signal?: AbortSignal}} */
+    const options = last ? { method: "DELETE" } : {};
+    if (controller) options.signal = controller.signal;
+    const answer = await api(`/api/v1/voice-recap/${id}`, options);
+    return answer && typeof answer.state === "string" ? answer.state : null;
+  } catch (error) {
+    addDetail(`the page could not ask whether the voice service took the recap: ${error.message}`);
+    return null;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * Ask what became of armed recap `id` until a fetch served it or the deadline passes, then settle it
+ * with a last word that takes it back unless served, asked once more if unanswered, and hand `settle`
+ * the answer: served, not, or null when nobody could say. Stops, saying nothing to `settle`, once the
+ * call has moved to another socket or let the watch go; `abandoned` then gets the answer to the page's
+ * withdrawal instead (`abandonWatchedRecap`).
+ *
+ * @param {number} id
+ * @param {(served: boolean | null) => void} settle
+ * @param {(served: boolean | null) => void} [abandoned]
+ */
+function watchProfileRecap(id, settle, abandoned = () => {}) {
+  const socket = session.socket;
+  const deadline = Date.now() + PROFILE_RECAP_WAIT_MS;
+  session.profileRecap = { id, timer: null, abandoned };
+  const ours = () => session.socket === socket && session.profileRecap !== null && session.profileRecap.id === id;
+  const finish = (/** @type {boolean | null} */ served) => {
+    session.profileRecap = null;
+    if (session.armedRecap === id) session.armedRecap = null;
+    settle(served);
+  };
+  let retried = false;
+  const ask = async () => {
+    if (!ours()) return;
+    const watch = /** @type {{id: number, timer: ReturnType<typeof setTimeout> | null}} */ (session.profileRecap);
+    watch.timer = null;
+    const last = Date.now() >= deadline;
+    const state = await askAboutRecap(id, last);
+    if (!ours()) return;
+    if (state === "served") return finish(true);
+    if (last && state === null && !retried) {
+      retried = true;
+      return void ask();
+    }
+    if (last) return finish(state === null || state === "unknown" ? null : false);
+    if (state === "unknown") return finish(null);
+    if (state !== null && state !== "armed") return finish(false);
+    watch.timer = setTimeout(() => void ask(), Math.max(0, Math.min(PROFILE_RECAP_POLL_MS, deadline - Date.now())));
+  };
+  void ask();
+}
+
+/** Take back armed recap `id`, unasked for an answer: the call no longer needs it. */
+function withdrawProfileRecap(id) {
+  if (session.armedRecap === id) session.armedRecap = null;
+  api(`/api/v1/voice-recap/${id}`, { method: "DELETE" }).catch(() => {});
+}
+
+/**
+ * Stop asking about the recap being watched — the call moved to another session, or ended — and take
+ * it back, handing what the withdrawal answered to the watch's `abandoned`. Answers whether one was
+ * being watched.
+ */
+function abandonWatchedRecap() {
+  const watch = session.profileRecap;
+  if (!watch) return false;
+  session.profileRecap = null;
+  if (session.armedRecap === watch.id) session.armedRecap = null;
+  if (watch.timer !== null) clearTimeout(watch.timer);
+  void askAboutRecap(watch.id, true).then((state) =>
+    watch.abandoned(state === "served" ? true : state === null || state === "unknown" ? null : false));
+  return true;
+}
+
+/** Take back a recap this call armed and has not settled, however far the call got. */
+function withdrawArmedRecap() {
+  if (abandonWatchedRecap()) return;
+  if (session.armedRecap !== null) withdrawProfileRecap(session.armedRecap);
+}
+
+/**
+ * What became of the recap armed in the profile for the session this call opened with: taken, as a
+ * `replay_ack` that accepted it would say; not, as a refusal would, saying why; or unknown, when the
+ * page could not learn it, which leaves it said as sent and no more.
+ *
+ * @param {boolean | null} served
+ */
+function settleCallProfileRecap(served) {
+  if (served === true) {
+    session.recapAck = "accepted";
+    resumeLast = { ...resumeLast, acked: true };
+    addDetail("the voice service took the recap: the instructions it fetched for this session carried it");
+    renderCallRecap();
+  } else if (served === false) {
+    session.recapAck = "not_taken";
+    addDetail("the voice service did not take the recap: no fetch of its instructions carried it before the page stopped asking");
+    resumeLast = { ...resumeLast, armed: false, unsupported: true };
+    markRecapNotHanded({ state: "none", why: "not_taken", dropped: 0 });
+  } else {
+    session.recapAck = null;
+    addDetail("the page could not learn whether the voice service took the recap, so it is said as sent, no more");
+    renderCallRecap();
+  }
+  renderResumeState();
+  endReplayAnswerWait();
+}
+
+/**
+ * The answer about the call's first recap, after the call moved to a new session or ended before the
+ * page stopped asking: only the conversation's start marker, while it is unwritten, and Settings take
+ * it — the line under the call is about the session now running — and the first record goes.
+ *
+ * @param {string | null} conversationId the conversation the call was filed under
+ * @returns {(served: boolean | null) => void}
+ */
+function firstRecapAbandoned(conversationId) {
+  return (served) => {
+    if (served === true) {
+      resumeLast = { ...resumeLast, acked: true };
+    } else if (served === false) {
+      resumeLast = { ...resumeLast, armed: false, unsupported: true };
+      const start = unwrittenStartMarker(conversationId);
+      if (start) start.recap = { state: "none", why: "not_taken", dropped: 0 };
+    }
+    renderResumeState();
+    endReplayAnswerWait();
+  };
 }
 
 /**
@@ -8480,8 +8793,13 @@ let replayAnswerWait = null;
  */
 let startAwaitingAnswer = null;
 
-/** The `replay` frame went: a first record filed from now waits for its answer. */
-function awaitReplayAnswer() {
+/**
+ * The `replay` frame went, or a recap was armed in the profile: a first record filed from now waits
+ * for its answer, `ms` at most.
+ *
+ * @param {number} [ms]
+ */
+function awaitReplayAnswer(ms = REPLAY_ANSWER_WAIT_MS) {
   endReplayAnswerWait();
   /** @type {() => void} */
   let end = () => {};
@@ -8489,7 +8807,7 @@ function awaitReplayAnswer() {
   const done = new Promise((resolve) => {
     end = () => resolve();
   });
-  replayAnswerWait = { done, end, timer: setTimeout(endReplayAnswerWait, REPLAY_ANSWER_WAIT_MS) };
+  replayAnswerWait = { done, end, timer: setTimeout(endReplayAnswerWait, ms) };
 }
 
 /** Stop waiting for the answer: a record held for it goes as soon as those ahead of it have. */
@@ -8811,12 +9129,15 @@ function advanceVibeTalkInput() {
       // `turn_complete` sends it (`vibeTalkTurnComplete`), and a turn that goes quiet without one
       // is let go after SPOKEN_TURN_HOLD_MS, or one that never ends after SPOKEN_TURN_HOLD_CAP_MS
       // (`holdBehindSpokenTurn`) — but never, for a page message, while an answer is still talking.
+      // `#512 voice-recap-private-stack`. A hold for his speech is over: the turn holds it now.
+      endSpeechHold(false);
       holdBehindSpokenTurn();
       return;
     }
     if (next.kind !== "typed" && !answerHeardOut()) {
       // `#330 voice-long-turn-drop`. The answer's turn has completed but its audio is still playing,
       // a minute of it for a long summary: a page message waits until it has been heard to the end.
+      endSpeechHold(false);
       waitForAnswerToPlay();
       return;
     }
@@ -8826,8 +9147,20 @@ function advanceVibeTalkInput() {
       // out, and so does the segment's end. The hand-off's own timer sends it
       // (`deferVoiceCaptureAcrossTurn`). Without this, a message held behind a spoken turn went out
       // as `audio_end` in the same event-loop turn as the `turn_complete` that let it go.
+      endSpeechHold(false);
       return;
     }
+    // Never ahead of the reader's own typed words, which are not held: one waiting behind this
+    // message lets it go too.
+    const typedWaiting = session.pendingPrompts.some((prompt) => prompt.kind === "typed");
+    if (next.kind !== "typed" && !typedWaiting && holdForOwnerSpeech()) {
+      // `#512 voice-recap-private-stack`. No turn is open as far as the transcripts say, but the
+      // microphone hears him, or his words grew a moment ago: the speech service may have dropped
+      // his transcript. Closing the segment under him is how a call was lost; the hold's own timer
+      // tries again (`holdForOwnerSpeech`).
+      return;
+    }
+    endSpeechHold(false);
     session.capturePaused = true;
     session.waitingForAudioEnd = true;
     session.audioSegmentActive = false;
@@ -8881,6 +9214,145 @@ const SPOKEN_TURN_HOLD_CAP_MS = 30000;
  * the message then waits behind.
  */
 const ANSWER_PLAYED_GRACE_MS = 600;
+
+// --- the owner's own speech, heard by the microphone ------------------------------------------
+//
+// `#512 voice-recap-private-stack`. The page judged "the owner is speaking" only from his transcripts.
+// A speech service that drops them — one dropped every transcript of speech begun after a turn
+// completed, until the next turn started — leaves the page believing nobody is talking, and it then
+// closed the microphone's segment mid-sentence to deliver a relayed message: the service took the
+// message and never answered it, and the call was lost. So the page also listens to the microphone
+// itself: the RMS of each capture buffer, against the level the server names (`speech_hold`), and
+// whether his transcript grew in the last moments. While either says he is speaking, a page message
+// — a relayed chat message, the page's word on a send card — waits, never longer than the server's
+// cap, so road noise above the level cannot keep a relay from ever going. The reader's own typed
+// words are not held: he chose to send them.
+
+/** The level and cap when the server names none, as the server's own defaults are. */
+const SPEECH_HOLD_DBFS_DEFAULT = -42;
+const SPEECH_HOLD_CAP_MS_DEFAULT = 20000;
+
+/**
+ * How long one capture buffer at or above the level keeps the owner "speaking": the pause between two
+ * words, so a held message does not slip out between them.
+ */
+const MIC_SPEECH_HANGOVER_MS = 600;
+
+/** How long after a partial transcript of his last grew the owner is still taken to be speaking. */
+const OWNER_WORDS_HOLD_MS = 1500;
+
+/** How often a held message looks again whether he has stopped. */
+const SPEECH_HOLD_RECHECK_MS = 250;
+
+/**
+ * The level at or above which the microphone is taken to hear the owner, in dBFS, and the longest one
+ * page message waits for him, in milliseconds (0: never). From client-config.
+ *
+ * @type {{levelDbfs: number, capMs: number}}
+ */
+let speechHold = { levelDbfs: SPEECH_HOLD_DBFS_DEFAULT, capMs: SPEECH_HOLD_CAP_MS_DEFAULT };
+
+/**
+ * The hold client-config names, or this page's defaults where it names none or something unusable.
+ *
+ * @param {unknown} named client-config's `speech_hold`
+ * @returns {{levelDbfs: number, capMs: number}}
+ */
+function speechHoldFrom(named) {
+  const given = named && typeof named === "object" ? /** @type {{level_dbfs?: unknown, cap_ms?: unknown}} */ (named) : {};
+  const level = Number(given.level_dbfs);
+  const cap = Number(given.cap_ms);
+  return {
+    levelDbfs: Number.isFinite(level) ? Math.min(0, level) : SPEECH_HOLD_DBFS_DEFAULT,
+    capMs: Number.isFinite(cap) && cap >= 0 ? Math.min(cap, 600000) : SPEECH_HOLD_CAP_MS_DEFAULT,
+  };
+}
+
+/**
+ * One capture buffer's level, in dBFS: the RMS of its samples against full scale. -Infinity for
+ * silence.
+ *
+ * @param {Float32Array} samples
+ */
+function bufferDbfs(samples) {
+  let sum = 0;
+  for (let at = 0; at < samples.length; at += 1) sum += samples[at] * samples[at];
+  const rms = samples.length > 0 ? Math.sqrt(sum / samples.length) : 0;
+  return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+}
+
+/**
+ * A capture buffer arrived: note when the microphone last heard the owner at or above the level.
+ *
+ * @param {Float32Array} samples
+ */
+function noteMicLevel(samples) {
+  if (bufferDbfs(samples) >= speechHold.levelDbfs) session.micSpeechAt = Date.now();
+}
+
+/** Does the microphone, or his transcript, say the owner is speaking now? Never while muted. */
+function ownerSpeakingLocally() {
+  if (session.muted) return false;
+  const now = Date.now();
+  return (session.micSpeechAt > 0 && now - session.micSpeechAt < MIC_SPEECH_HANGOVER_MS) ||
+    (session.ownerWordsAt > 0 && now - session.ownerWordsAt < OWNER_WORDS_HOLD_MS);
+}
+
+/**
+ * Hold the page message at the head of the queue while the owner is speaking, up to the cap from when
+ * the hold began. Answers whether it is held; a hold that ends is said by `endSpeechHold`.
+ */
+function holdForOwnerSpeech() {
+  if (speechHold.capMs <= 0 || !ownerSpeakingLocally()) return false;
+  const now = Date.now();
+  const held = session.speechHold;
+  if (held && now - held.since >= speechHold.capMs) {
+    endSpeechHold(true);
+    return false;
+  }
+  const since = held ? held.since : now;
+  if (!held) setStatus("Waiting for you to finish speaking…");
+  if (held && held.timer !== null) clearTimeout(held.timer);
+  const socket = session.socket;
+  const timer = setTimeout(() => {
+    const hold = session.speechHold;
+    if (hold) hold.timer = null;
+    if (session.socket !== socket) return;
+    advanceVibeTalkInput();
+  }, Math.max(1, Math.min(SPEECH_HOLD_RECHECK_MS, since + speechHold.capMs - now)));
+  session.speechHold = { since, timer };
+  return true;
+}
+
+/**
+ * The page message held for the owner's speech goes: count it for the call-end record, and say in the
+ * connection details how long it waited, and whether the cap let it go. Nothing when none was held.
+ *
+ * @param {boolean} capped whether the cap ended the hold with the microphone still hearing him
+ */
+function endSpeechHold(capped) {
+  const held = session.speechHold;
+  if (!held) return;
+  session.speechHold = null;
+  if (held.timer !== null) clearTimeout(held.timer);
+  const waited = Math.max(0, Date.now() - held.since);
+  session.speechHolds += 1;
+  session.speechHoldMaxMs = Math.max(session.speechHoldMaxMs, waited);
+  if (capped) session.speechHoldCapped += 1;
+  addDetail(
+    capped
+      ? `a page message waited ${Math.round(speechHold.capMs / 1000)} s, the most it may, for you to ` +
+        "finish speaking; the microphone still heard speech, so it went anyway"
+      : `a page message waited ${(waited / 1000).toFixed(1)} s for you to finish speaking`
+  );
+}
+
+/** Let a hold go without the message going: the session it was for has ended. */
+function dropSpeechHold() {
+  const held = session.speechHold;
+  if (held && held.timer !== null) clearTimeout(held.timer);
+  session.speechHold = null;
+}
 
 /** Is the assistant's audio still being played? Nothing played on a typed call or with Sound off. */
 function answerAudible() {
@@ -17949,7 +18421,7 @@ function postCallEnd(endedBy, code, reason = "") {
   // Every protocol the server named for the call; its allowlist refuses one it does not know.
   if (session.protocol === "unknown") return;
   const now = Date.now();
-  /** @type {{protocol: string, chat: boolean, ended_by: string, since_open_ms: number, turns: number, close_code?: number, visibility: string, queued_audio_ms: number, last_text_ms?: number, last_audio_end_ms?: number, last_interrupt_ms?: number, reconnects?: number, close_reason?: string}} */
+  /** @type {{protocol: string, chat: boolean, ended_by: string, since_open_ms: number, turns: number, close_code?: number, visibility: string, queued_audio_ms: number, last_text_ms?: number, last_audio_end_ms?: number, last_interrupt_ms?: number, reconnects?: number, speech_holds?: number, speech_hold_max_ms?: number, speech_hold_capped?: number, close_reason?: string}} */
   const body = {
     protocol: session.protocol,
     chat: health.chat,
@@ -17965,6 +18437,16 @@ function postCallEnd(endedBy, code, reason = "") {
   if (session.lastAudioEndAt) body.last_audio_end_ms = ago(session.lastAudioEndAt);
   if (session.lastInterruptAt) body.last_interrupt_ms = ago(session.lastInterruptAt);
   if (session.reconnects > 0) body.reconnects = session.reconnects;
+  // `#512 voice-recap-private-stack`. The page messages this socket held for the owner's speech, and
+  // then counted afresh: each record is its own socket's.
+  if (session.speechHolds > 0) {
+    body.speech_holds = Math.min(SPEECH_HOLDS_MAX, session.speechHolds);
+    body.speech_hold_max_ms = Math.min(CALL_SPAN_MAX_MS, Math.round(session.speechHoldMaxMs));
+    body.speech_hold_capped = Math.min(SPEECH_HOLDS_MAX, session.speechHoldCapped);
+  }
+  session.speechHolds = 0;
+  session.speechHoldMaxMs = 0;
+  session.speechHoldCapped = 0;
   const said = redact(String(reason || "")).replace(/[\u0000-\u001f\u007f]+/gu, " ").replace(/\s+/gu, " ").trim();
   if (said) body.close_reason = Array.from(said).slice(0, CLOSE_REASON_MAX_CHARS).join("");
   // Diagnostics, not the call: a failure here is not worth a word on the screen.
@@ -17975,6 +18457,8 @@ function postCallEnd(endedBy, code, reason = "") {
 const CALL_SPAN_MAX_MS = 86400000;
 /** The most queued audio the server's record accepts: an hour. */
 const CALL_AUDIO_MAX_MS = 3600000;
+/** The most held page messages the server's record accepts. `#512 voice-recap-private-stack`. */
+const SPEECH_HOLDS_MAX = 10000;
 
 /**
  * The words for a call the voice service's side ended while the reader did not hang up, the page
@@ -18127,6 +18611,12 @@ async function openConversation(options) {
   session.lastTextAt = 0;
   session.lastAudioEndAt = 0;
   session.lastInterruptAt = 0;
+  // `#512 voice-recap-private-stack`. Nothing held for the owner's speech, nothing armed, yet.
+  session.speechHolds = 0;
+  session.speechHoldMaxMs = 0;
+  session.speechHoldCapped = 0;
+  session.profileRecap = null;
+  session.armedRecap = null;
   // `#270 voice-transcript-markers`. Nothing recorded and nothing handed over yet in this call —
   // and no conversation named for it. The last call's name outlives its teardown, for the line
   // that ends it; kept into this call, a draft shown before the hosted service names this one
@@ -18146,7 +18636,7 @@ async function openConversation(options) {
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
   // "here is what we said" delivered into the middle of a sentence.
-  const resume = await fetchResume();
+  let resume = await fetchResume();
   const validity = minted.valid_for_seconds
     ? `; session valid for about ${Math.round(minted.valid_for_seconds / 60)} minutes`
     : "";
@@ -18181,6 +18671,15 @@ async function openConversation(options) {
     markStartup("microphone_ready");
   }
 
+  // `#512 voice-recap-private-stack`. Armed last, just before the socket: the bridge fetches the
+  // profile as its session opens, and an armed recap waits for that a minute at most.
+  if (resume && resumeViaProfile && session.protocol === "vibe-talk-v1") {
+    resume = await armRecapForCall(resume);
+  } else if (resumeViaProfile && session.protocol === "vibe-talk-v1") {
+    // A call handed no recap says so, so one an earlier page armed and never took back — a reload
+    // cut it off — is not handed to this call unasked.
+    api("/api/v1/voice-recap", { method: "DELETE" }).catch(() => {});
+  }
   setState("working");
   const socketUrl = voiceSocketUrl(minted.websocket_url);
   const socket = new WebSocket(socketUrl);
@@ -19540,6 +20039,10 @@ function reconnectCall(said, now) {
   }
   session.reconnects += 1;
   session.lastReconnectAt = now;
+  // `#512 voice-recap-private-stack`. A recap still being asked about was the lost session's: taken
+  // back, and the answer to that still settles the call's start marker, which waits for it.
+  const recapAnswerPending = abandonWatchedRecap();
+  if (session.armedRecap !== null) withdrawProfileRecap(session.armedRecap);
   // What the lost session said is settled: an answer still arriving keeps its words, marked cut off.
   if (session.replyArriving) markAnswerCut();
   settleSpoken();
@@ -19570,7 +20073,7 @@ function reconnectCall(said, now) {
   resetVibeTalkTurnState();
   clearNoReply();
   session.sessionStarts = 0;
-  endReplayAnswerWait();
+  if (!recapAnswerPending) endReplayAnswerWait();
   session.connected = false;
   session.cutForTyped = false;
   // The capture graph sends to the socket it was built on, so it is built again on the new one. The
@@ -19661,6 +20164,17 @@ async function continueReconnect(attempt) {
   session.outputRate = minted.output_sample_rate || 16000;
   attempt.recap = await fetchCallRecap();
   if (session.reconnect !== attempt) return;
+  // `#512 voice-recap-private-stack`. Where the bridge takes the recap in the profile it fetches, it
+  // is armed now, just before the new socket opens.
+  if (attempt.recap.resume && resumeViaProfile && session.conversationId) {
+    const armed = await armProfileRecap(session.conversationId);
+    if (session.reconnect !== attempt) {
+      if (armed.armed) withdrawProfileRecap(armed.armed.profileRecap);
+      return;
+    }
+    if (armed.armed) attempt.recap = { resume: { ...attempt.recap.resume, ...armed.armed }, why: null };
+    else if (armed.why !== "unavailable") attempt.recap = { resume: null, why: armed.why || "empty" };
+  }
   const socketUrl = voiceSocketUrl(minted.websocket_url);
   const socket = new WebSocket(socketUrl);
   socket.binaryType = "arraybuffer";
@@ -19735,13 +20249,22 @@ function offerReplayAtReconnect(message, attempt) {
   if (session.recap && session.recap.state === "sent" && !session.recap.reconnected) {
     addDetail("the conversation this call resumed from was not sent again: only this call's record goes");
   }
+  const armed = fetched.resume && typeof fetched.resume.profileRecap === "number" ? fetched.resume.profileRecap : null;
   if (listed && fetched.resume) {
+    if (armed !== null) withdrawProfileRecap(armed);
     sendReplayFrame(fetched.resume);
     session.recapAck = "waiting";
     session.recap = { ...recapFor(fetched.resume, "replay_frame"), reconnected: true };
     addDetail("the reconnected session was sent this call's record");
+  } else if (armed !== null) {
+    // `#512 voice-recap-private-stack`. Armed in the profile the bridge fetched as the session opened.
+    session.recapAck = "waiting";
+    session.recap = { ...recapFor(fetched.resume, "profile"), reconnected: true };
+    addDetail("the reconnected session was handed this call's record in its instructions, if it fetched them");
+    watchProfileRecap(armed, settleReconnectProfileRecap);
   } else {
-    const why = listed ? fetched.why || "empty" : "unsupported";
+    // Resuming off on the server or this device is said as that, not as a session that takes none.
+    const why = listed ? fetched.why || "empty" : fetched.why === "off" ? "off" : "unsupported";
     session.recapAck = null;
     session.recap = { state: "none", why, dropped: 0, reconnected: true };
     addDetail(`the reconnected session was sent no record: ${RECONNECT_FRESH[why] || freshBecause(why)}`);
@@ -19758,6 +20281,32 @@ function offerReplayAtReconnect(message, attempt) {
   } else {
     addDetail("the page's word on the card was not repeated to the new session: it was handed no record of the card");
   }
+}
+
+/**
+ * `#512 voice-recap-private-stack`. What became of this call's record, armed in the profile for the
+ * session a reconnect opened: taken, as a `replay_ack` that accepted it would say, or not, as a
+ * refusal would.
+ *
+ * @param {boolean | null} served
+ */
+function settleReconnectProfileRecap(served) {
+  if (served === null) {
+    session.recapAck = null;
+    addDetail("the page could not learn whether the reconnected session took this call's record");
+    settleNoticeForRecap(false, "nobody could say whether the new session took the record that says what the card was");
+  } else if (served) {
+    session.recapAck = "accepted";
+    addDetail("the reconnected session took this call's record");
+    settleNoticeForRecap(true, "");
+  } else {
+    session.recapAck = "not_taken";
+    session.recap = { state: "none", why: "not_taken", dropped: 0, reconnected: true };
+    addDetail("the reconnected session did not take this call's record: no fetch of its instructions carried it");
+    reconnectedSessionRefused("did not take");
+    settleNoticeForRecap(false, "the new session did not take the record that says what the card was");
+  }
+  renderCallRecap();
 }
 
 /**
@@ -19802,7 +20351,7 @@ function noteReconnected(attempt) {
  * that session has seen nothing above it, and so does a second note in the stored record, whose
  * first note said otherwise.
  */
-function reconnectedSessionRefused() {
+function reconnectedSessionRefused(verb = "refused") {
   const rows = leftEl("transcript").children;
   for (let at = rows.length - 1; at >= 0; at -= 1) {
     const resend = rows[at].getAttribute("data-reconnected");
@@ -19815,7 +20364,7 @@ function reconnectedSessionRefused() {
     body.textContent = detail;
     summary.setAttribute("title", detail);
     followIfPinned(pinned);
-    recordTurn("note", `Reconnected, but the new session refused this call's record: ${detail}`);
+    recordTurn("note", `Reconnected, but the new session ${verb} this call's record: ${detail}`);
     return;
   }
 }
@@ -19954,6 +20503,10 @@ function handleVibeTalk(message) {
       session.lastTranscriptKey = key;
       if (who === "assistant") {
         markStartup("greeting_text");
+      } else if (!pageEcho) {
+        // `#512 voice-recap-private-stack`. His words are still growing: a page message waits a
+        // moment more. A final says he has finished.
+        session.ownerWordsAt = final ? 0 : Date.now();
       }
       const spoken = upsertSpoken(who, message.turn, said, final, pageEcho);
       // `#511 voice-explicit-send-only`. The owner's words, never the page's echo of its own prompt.
@@ -20049,6 +20602,8 @@ function handleVibeTalk(message) {
 function vibeTalkTurnComplete() {
   settleSpoken();
   sendStartupTiming();
+  // `#512 voice-recap-private-stack`. The turn his partial words were part of is over.
+  session.ownerWordsAt = 0;
   if (session.waitingForGreeting) {
     session.waitingForGreeting = false;
     // `#268 voice-call-drops`. The greeting is a turn the backend answered like any other, and its
@@ -20144,10 +20699,16 @@ function startCapture(socket) {
     //
     // Anyone tidying `stop()` later: `track.stop()` MUST NOT become reachable from here, not even
     // conditionally. It ends the conversation, and with it everything the agent knows.
-    if (session.muted || session.capturePaused) {
+    if (session.muted) {
       return;
     }
+    // `#512 voice-recap-private-stack`. Heard even across a hand-off, when no frame goes: the owner
+    // speaking then is still speaking when the next message would close the segment.
     const mono = event.inputBuffer.getChannelData(0);
+    noteMicLevel(mono);
+    if (session.capturePaused) {
+      return;
+    }
     const pcm = floatToPcm16(downsampleTo(mono, rate, session.inputRate));
     if (session.protocol === "vibe-talk-v1") {
       socket.send(pcm.buffer);
@@ -20231,14 +20792,20 @@ function teardown() {
   session.echoCancellation = false;
   session.sessionStarts = 0;
   // `#352 voice-reconnect-on-bridge-error`. A reconnect in progress stops at its next step.
+  // `#512 voice-recap-private-stack`. A recap armed for a session this call no longer has goes back,
+  // so no later session is handed it unasked: one being asked about, one waiting for this call's
+  // first session, and one a reconnect armed for a session that never started.
+  const recapAnswerPending = session.profileRecap !== null;
+  withdrawArmedRecap();
   session.reconnect = null;
   session.reconnects = 0;
   session.lastReconnectAt = 0;
   if (session.noticeAwaitingRecap) clearTimeout(session.noticeAwaitingRecap.timer);
   session.noticeAwaitingRecap = null;
   // `#331 resume-on-websocket`. No answer to the recap can come now: a record held for one goes,
-  // the turn in progress (stored above) included, saying what was known.
-  endReplayAnswerWait();
+  // the turn in progress (stored above) included, saying what was known. `#512`: except the answer
+  // to the page's withdrawal of a recap still being asked about, which ends the wait itself.
+  if (!recapAnswerPending) endReplayAnswerWait();
   // A record still waiting for a `session_started` that never came was never sent: Settings must
   // not say the call was resumed.
   if (session.pendingResume) {
@@ -20293,6 +20860,10 @@ function resetVibeTalkTurnState() {
     clearTimeout(session.playbackWaitTimer);
     session.playbackWaitTimer = null;
   }
+  // `#512 voice-recap-private-stack`. A session not started hears nobody yet.
+  dropSpeechHold();
+  session.micSpeechAt = 0;
+  session.ownerWordsAt = 0;
 }
 
 /** Hang up: the reader's control, and the only way this page ends a call that is working. */
@@ -52526,6 +53097,10 @@ function applyClientConfig(config) {
   // says ("recap unsupported") rather than saying nothing, and Resuming's disabled switch says
   // beside it (`#331 resume-on-websocket`).
   replayUnavailable = typeof config.replay_unavailable === "string" ? config.replay_unavailable : null;
+  // `#512 voice-recap-private-stack`. Whether a new call's recap rides in the profile the bridge
+  // fetches, and how the owner's own speech holds the page's messages.
+  resumeViaProfile = config.replay_via_profile === true;
+  speechHold = speechHoldFrom(config.speech_hold);
   renderResumeState();
   renderSpeechPrepState(config.speech_prep_enabled);
   applyNoiseRules(config.noise_rules);

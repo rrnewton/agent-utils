@@ -59,6 +59,9 @@ pub const MAX_PEAK: u32 = 32_768;
 /// on a new session at most three times (`#352 voice-reconnect-on-bridge-error`); past a thousand the
 /// number is not a count of anything a call did.
 pub const MAX_RECONNECTS: u32 = 1_000;
+/// The most page messages one call-end record may say were held for the owner's speech. `#512
+/// voice-recap-private-stack`.
+pub const MAX_SPEECH_HOLDS: u32 = 10_000;
 
 /// Wire protocols this signal is defined for. Only the provider-neutral one: a hosted vendor's
 /// protocol has error frames of its own.
@@ -321,6 +324,17 @@ pub struct EndReport {
     /// session before this record; absent when it never did.
     #[serde(default)]
     pub reconnects: Option<u32>,
+    /// `#512 voice-recap-private-stack`. How many of the page's own messages — a relayed chat
+    /// message, its word on a send card — waited for the owner's speech, judged by the microphone's
+    /// level or his transcript growing, before closing the segment to be said; absent when none did.
+    #[serde(default)]
+    pub speech_holds: Option<u32>,
+    /// ...the longest of those waits, in milliseconds...
+    #[serde(default)]
+    pub speech_hold_max_ms: Option<u32>,
+    /// ...and how many of them went at the cap, with the microphone still loud.
+    #[serde(default)]
+    pub speech_hold_capped: Option<u32>,
     /// The voice service's own words: its close reason, or its `error`. At most
     /// [`MAX_CLOSE_REASON_CHARS`], with no control characters.
     #[serde(default)]
@@ -360,6 +374,22 @@ impl EndReport {
         if self.reconnects.is_some_and(|count| count > MAX_RECONNECTS) {
             return Err(format!("reconnects is more than {MAX_RECONNECTS}"));
         }
+        for (name, count) in [
+            ("speech_holds", self.speech_holds),
+            ("speech_hold_capped", self.speech_hold_capped),
+        ] {
+            if count.is_some_and(|count| count > MAX_SPEECH_HOLDS) {
+                return Err(format!("{name} is more than {MAX_SPEECH_HOLDS}"));
+            }
+        }
+        if self
+            .speech_hold_max_ms
+            .is_some_and(|ms| ms > MAX_SINCE_OPEN_MS)
+        {
+            return Err(format!(
+                "speech_hold_max_ms is longer than {MAX_SINCE_OPEN_MS} ms"
+            ));
+        }
         if let Some(reason) = &self.close_reason {
             if reason.chars().count() > MAX_CLOSE_REASON_CHARS {
                 return Err(format!(
@@ -384,10 +414,19 @@ impl EndReport {
     #[must_use]
     pub fn log_fields(&self) -> String {
         let number = |value: Option<u32>| value.map_or_else(|| "-".to_owned(), |n| n.to_string());
+        // `#512 voice-recap-private-stack`. Only on a call that held anything for the owner's
+        // speech, so every other call's line reads as it did.
+        let holds = self.speech_holds.map_or_else(String::new, |count| {
+            format!(
+                " speech_holds={count} speech_hold_max_ms={} speech_hold_capped={}",
+                number(self.speech_hold_max_ms),
+                number(self.speech_hold_capped)
+            )
+        });
         format!(
             "protocol={} chat={} ended_by={} close_code={} since_open_ms={} turns={} visibility={} \
              queued_audio_ms={} last_text_ms={} last_audio_end_ms={} last_interrupt_ms={} \
-             reconnects={} close_reason={}",
+             reconnects={}{holds} close_reason={}",
             self.protocol.as_str(),
             self.chat,
             self.ended_by.as_str(),
@@ -564,8 +603,38 @@ mod tests {
             last_audio_end_ms: Some(1_900),
             last_interrupt_ms: None,
             reconnects: None,
+            speech_holds: None,
+            speech_hold_max_ms: None,
+            speech_hold_capped: None,
             close_reason: Some("interrupt boundary timed out; reconnect".to_owned()),
         }
+    }
+
+    #[test]
+    fn a_call_that_held_page_messages_for_the_owners_speech_says_how_many_and_how_long() {
+        // `#512 voice-recap-private-stack`. Numbers only, before the service's reason, and nothing
+        // at all on a call that held none.
+        let held = EndReport {
+            speech_holds: Some(3),
+            speech_hold_max_ms: Some(4_250),
+            speech_hold_capped: Some(1),
+            ..end()
+        };
+        held.validate().expect("valid");
+        assert!(
+            held.log_fields().ends_with(
+                " reconnects=- speech_holds=3 speech_hold_max_ms=4250 speech_hold_capped=1 \
+                 close_reason=\"interrupt boundary timed out; reconnect\""
+            ),
+            "{}",
+            held.log_fields()
+        );
+        assert!(!end().log_fields().contains("speech_hold"));
+        let absurd = EndReport {
+            speech_holds: Some(MAX_SPEECH_HOLDS + 1),
+            ..end()
+        };
+        assert!(absurd.validate().is_err());
     }
 
     #[test]

@@ -324,6 +324,17 @@ declare namespace VibeTalk {
      */
     replay_unavailable?: ReplayUnavailable | null;
     /**
+     * Whether a new call's recap goes in the voice-agent profile the `vibe-talk-v1` bridge fetches
+     * as its session opens, rather than in a `replay` frame. `#512 voice-recap-private-stack`.
+     *
+     * True only with `replay_enabled`, on a bridge the operator says fetches the profile
+     * (`replay.bridge_fetches_profile`) and that has not said it takes the frame. The page then
+     * arms the recap with `POST /api/v1/voice-recap` just before it opens the call's socket, or a
+     * reconnect's, and draws it as taken only once the server says a fetch served it. Absent
+     * otherwise, and from an older server.
+     */
+    replay_via_profile?: boolean;
+    /**
      * Whether a reply to a main-channel message is posted in that message's thread, starting one
      * when it has none, because the provider has no reply pointer of its own (Slack).
      *
@@ -342,6 +353,12 @@ declare namespace VibeTalk {
      * back to learning it the old way.
      */
     self_author_id: string | null;
+    /**
+     * When the voice page takes the owner to be speaking although no transcript says so, and how
+     * long that may hold the page's own messages. `#512 voice-recap-private-stack`. Absent from an
+     * older server, whose page holds nothing for the microphone's level.
+     */
+    speech_hold?: SpeechHold | null;
     /**
      * Whether this server rewrites message bodies for speech before anything says them.
      *
@@ -1596,6 +1613,30 @@ declare namespace VibeTalk {
      * How to hand `text` over.
      */
     transport: PromptTransport;
+  }
+
+  /**
+   * How the voice page holds its own messages while the owner is speaking. `#512
+   * voice-recap-private-stack`.
+   *
+   * A relayed chat message, or the page's word on a send card, is said by closing the microphone's
+   * segment with `audio_end`; closed under the owner's speech, the speech service took the message
+   * and never answered it, and the call was lost. The page judged speech only from transcripts,
+   * which that service may drop. So it also reads the microphone's level, and holds while it is at
+   * or above `level_dbfs`, or while his transcript grew in the last moments — never longer than
+   * `cap_ms`.
+   */
+  interface SpeechHold {
+    /**
+     * The longest one message is held for his speech, in milliseconds; `0`, never held:
+     * `conversation.speech_hold_cap_seconds`.
+     */
+    cap_ms: number;
+    /**
+     * The capture buffer's RMS, in dBFS, at or above which the owner is taken to be speaking:
+     * `conversation.speech_hold_dbfs`.
+     */
+    level_dbfs: number;
   }
 
   /**

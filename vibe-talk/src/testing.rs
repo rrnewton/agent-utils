@@ -244,14 +244,16 @@ fn state_pieces_with(
         elevenlabs.clone(),
         config.elevenlabs.clone(),
     );
+    let voice_bridge = Arc::new(crate::voice_bridge::BridgeHello::for_config(&config));
     let speech: Arc<dyn crate::speech::SpeechProvider> = match config.read_aloud.backend {
         crate::config::ReadAloudBackend::Browser => Arc::new(crate::speech::BrowserSpeech),
-        crate::config::ReadAloudBackend::Conversation => {
-            Arc::new(crate::speech::ConversationSpeech::new(
+        crate::config::ReadAloudBackend::Conversation => Arc::new(
+            crate::speech::ConversationSpeech::new(
                 &config.conversation,
                 config.read_aloud.websocket_url.as_deref(),
-            ))
-        }
+            )
+            .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
+        ),
         crate::config::ReadAloudBackend::ElevenLabs => {
             Arc::new(crate::elevenlabs::speech::ElevenLabsSpeech::new(
                 elevenlabs.clone(),
@@ -275,7 +277,6 @@ fn state_pieces_with(
     live.attach_store(Arc::clone(&store));
     // `#331 resume-on-websocket`. Nothing asked yet: a test that needs the bridge's answer asks for
     // it (`BridgeHello::ask`), so the moment it arrives is the test's, not a background task's.
-    let voice_bridge = Arc::new(crate::voice_bridge::BridgeHello::for_config(&config));
     let state = AppState {
         config: Arc::new(config),
         chat: providers.clone(),
@@ -302,6 +303,7 @@ fn state_pieces_with(
         recent_view_shadow: Arc::new(crate::recent_view::Shadow::new()),
         agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),
         voice_bridge,
+        voice_recap: Arc::new(crate::voice_recap::VoiceRecaps::new()),
         message_cache,
         // Numbered from one, so a test can name the sends it makes; a server numbers from its clock.
         post_gate: Arc::new(crate::post_gate::PostGate::with_ttl_and_numbering(
@@ -1683,11 +1685,24 @@ impl LogCapture {
 /// It keeps every JSON frame each session was sent, in order, so a test can hold what a client
 /// said to it: this server's hello says `quit` and nothing else, and a call that resumes says
 /// `replay` before anything.
+///
+/// `#512 voice-recap-private-stack`. Built with [`FakeVoiceBridge::fetching_profile`], it also does
+/// what the deployment-managed bridge does as each session opens, reconnects and this server's own
+/// hello included: fetch `GET /api/v1/voice-agent` with a token, before `session_started`, and keep
+/// the `prompt.text` it would use verbatim ([`FakeVoiceBridge::prompts`]).
 #[derive(Debug)]
 pub struct FakeVoiceBridge {
     url: String,
     sessions: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+    prompts: Arc<Mutex<Vec<serde_json::Value>>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Where a [`FakeVoiceBridge`] fetches its profile, and with which token.
+#[derive(Clone, Debug)]
+struct ProfileFetch {
+    url: String,
+    token: String,
 }
 
 impl FakeVoiceBridge {
@@ -1697,6 +1712,28 @@ impl FakeVoiceBridge {
     ///
     /// Panics if no loopback port can be bound, which leaves the test nothing to run against.
     pub async fn start(takes_replay: bool) -> Self {
+        Self::listen(takes_replay, None).await
+    }
+
+    /// As [`FakeVoiceBridge::start`], fetching the voice-agent profile at `profile_url` with
+    /// `token` as each session opens, before its `session_started`. `#512
+    /// voice-recap-private-stack`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no loopback port can be bound.
+    pub async fn fetching_profile(takes_replay: bool, profile_url: &str, token: &str) -> Self {
+        Self::listen(
+            takes_replay,
+            Some(ProfileFetch {
+                url: profile_url.to_owned(),
+                token: token.to_owned(),
+            }),
+        )
+        .await
+    }
+
+    async fn listen(takes_replay: bool, profile: Option<ProfileFetch>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port for the fake bridge");
@@ -1705,21 +1742,37 @@ impl FakeVoiceBridge {
             listener.local_addr().expect("the fake bridge's address")
         );
         let sessions = Arc::new(Mutex::new(Vec::new()));
+        let prompts = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&sessions);
+        let fetched = Arc::clone(&prompts);
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 tokio::spawn(serve_fake_bridge_session(
                     stream,
                     takes_replay,
                     Arc::clone(&kept),
+                    profile
+                        .clone()
+                        .map(|profile| (profile, Arc::clone(&fetched))),
                 ));
             }
         });
         Self {
             url,
             sessions,
+            prompts,
             task,
         }
+    }
+
+    /// The `prompt` of every profile fetched so far, one per session that fetched one, in the order
+    /// the fetches were answered. Empty for a bridge that does not fetch.
+    #[must_use]
+    pub fn prompts(&self) -> Vec<serde_json::Value> {
+        self.prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Where it listens, as `ws://127.0.0.1:PORT/voice`.
@@ -1755,11 +1808,13 @@ impl Drop for FakeVoiceBridge {
     }
 }
 
-/// One session on the fake bridge: announce it, then answer `replay` and `quit` until it ends.
+/// One session on the fake bridge: fetch the profile when it is built to, announce the session,
+/// then answer `replay` and `quit` until it ends.
 async fn serve_fake_bridge_session(
     stream: tokio::net::TcpStream,
     takes_replay: bool,
     sessions: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+    profile: Option<(ProfileFetch, Arc<Mutex<Vec<serde_json::Value>>>)>,
 ) {
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::Message;
@@ -1779,6 +1834,31 @@ async fn serve_fake_bridge_session(
     let frame = |frame: &VibeTalkV1ServerFrame| {
         Message::Text(serde_json::to_string(frame).unwrap_or_default().into())
     };
+    if let Some((fetch, prompts)) = profile {
+        // As the deployment-managed bridge does: the session's instructions come from the profile,
+        // fetched before the session is announced.
+        let answer = async {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .ok()?
+                .get(&fetch.url)
+                .bearer_auth(&fetch.token)
+                .send()
+                .await
+                .ok()?
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+        }
+        .await;
+        if let Some(prompt) = answer.and_then(|profile| profile.get("prompt").cloned()) {
+            prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(prompt);
+        }
+    }
     let started = VibeTalkV1ServerFrame::SessionStarted {
         greeting: Some(false),
         session_id: Some(format!("fake-{}", index + 1)),

@@ -2501,6 +2501,9 @@ model provider or a real gateway.
 | Resuming | `replay.enabled` | `VIBE_TALK_REPLAY_ENABLED` | **off by default**; on, every new call re-sends earlier conversation content to the vendor. The ElevenLabs backend always carries it; with `conversation.backend = "websocket"` it is offered only once the bridge lists `replay` in its `session_started`, which this server asks it at startup — until then the page is told replay is off and Settings disables the switch, saying why. See [Resuming on the websocket backend](#resuming-on-the-websocket-backend) |
 | Replay budget | `replay.max_chars` / `replay.max_turns` | `VIBE_TALK_REPLAY_MAX_CHARS` / `_TURNS` | default `6000` / `40`; oldest dropped first; `0` is refused, not "unlimited" |
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
+| Recap in the profile | `replay.bridge_fetches_profile` | — (file only) | **off by default**; on says the `vibe-talk-v1` bridge fetches `GET /api/v1/voice-agent` with the write token as each session opens and uses `prompt.text` verbatim, so a bridge that lists no `replay` is handed its recap there. See [A recap in the profile the bridge fetches](#a-recap-in-the-profile-the-bridge-fetches) |
+| Speech hold level | `conversation.speech_hold_dbfs` | — (file only) | default `-42`, from `-90` to `-10`: the microphone level (one capture buffer's RMS, in dBFS) at or above which the page takes you to be speaking and holds its own messages. See [The page waits for you to stop speaking](#the-page-waits-for-you-to-stop-speaking) |
+| Speech hold cap | `conversation.speech_hold_cap_seconds` | — (file only) | default `20`, at most `60`; the longest one page message waits for your speech; `0` turns the hold off |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
 | Config overlays | — | `VIBE_TALK_CONFIG_OVERLAY` | or `--config-overlay`, repeatable; TOML laid over the config file table by table, see [One config file, two hosts](#one-config-file-two-hosts) |
 | Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see; reads are answered from it only with `serve = true`** (`#208 persistent-cache`, `#384 cache-serve`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `serve` (default `false`: answer a newest timeline page and a fresh newest window from the cache at once, refreshing from the provider in the background; needs `enabled = true`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default: walk each cached channel's newest pages back into the cache while its provider is otherwise idle, see [The backfill](#the-backfill); or `off`), `timeline_fallback_ms` (default `10000`, 1000 to 60000; no effect yet), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false`. Turning it on, the preflight, rollback and what erases it: see [The message cache](#the-message-cache) |
@@ -4699,7 +4702,10 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
 | GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider |
-| GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers" |
+| GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers"; to the write token, once, the recap a page armed (`prompt.recap` says its number and counts, never its words) — see "A recap in the profile the bridge fetches" |
+| POST | `/api/v1/voice-recap` | **write** | `{conversation_id}`: arm a recap of that conversation for the bridge's next profile fetch, built as the replay route builds one; answers `{id, armed, included, dropped, truncated, words, expires_in_seconds}`, never the words; `409 recap_unavailable` unless the server hands recaps over that way — see "A recap in the profile the bridge fetches" |
+| DELETE | `/api/v1/voice-recap` | **write** | withdraw whatever recap is armed (204): a page starting a call it hands no recap |
+| GET, DELETE | `/api/v1/voice-recap/{id}` | **write** | what became of that recap, `{id, state}`: `armed`, `served`, `withdrawn`, `expired` or `unknown`; `DELETE` withdraws one no fetch has taken and answers `served` when a fetch already did |
 | POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
 | POST | `/api/v1/voice-health` | **write** | a content-free "the voice service is not responding" record, logged as `voice_unresponsive` or `voice_recovered`, or that a turn was heard with no text, `voice_text_missing` — see "When the voice service stops answering" |
 | POST | `/api/v1/voice-heard` | **write** | `{key, text}` — the owner's words in one turn of a call, as the voice page heard them so far, held in memory for three minutes for checking the voice agent's ask to send; 204; never stored or logged — see "Only an explicit ask sends" |
@@ -5101,6 +5107,77 @@ voice providers](#conversational-voice-providers)); what matters here is when it
   `replay_ack` changes only what the call says now, never the call's start marker or what Settings
   says about how the call began. On a bridge that lists no `replay`, as the one this was seen on,
   the new session starts with no context.
+
+### A recap in the profile the bridge fetches
+
+`#512 voice-recap-private-stack`. The deployment-managed bridge this was written for lists no
+`replay`, so every new call and every reconnect started fresh. It does, though, fetch
+`GET /api/v1/voice-agent` with the write token as each session opens, reconnects included, and use
+`prompt.text` verbatim as its model's instructions. With `replay.enabled` on and
+`replay.bridge_fetches_profile` set in the file — the operator's word for that, which the server
+cannot learn from the hello — the recap rides there, and the bridge needs no change:
+
+* **Client-config says so.** `replay_enabled` is true and `replay_via_profile` is true, so Resuming's
+  switch is live. Not where the bridge listed `replay`: that bridge is sent the frame, which it
+  answers.
+* **The page arms it last.** Just before it opens a call's socket, or a reconnect's, it posts
+  `POST /api/v1/voice-recap` with the conversation to resume from (a reconnect: the call itself). The
+  server builds the record with the replay route's own budget, fence and neutralizing, and holds ONE
+  for 60 seconds; arming another replaces it.
+* **The bridge's next fetch takes it, once.** The record goes into the prompt after the owner's own
+  instructions and before the capability section, which stays the last thing the agent reads about
+  what it may do; `prompt.fingerprint` is of the text actually served, and `prompt.recap` gives its
+  number and counts. Never to a read token, and never into a fetch owed to a session this server
+  opens itself — its hello, and read-aloud on this backend — which the bridge fetches the profile
+  for as it does for a call: each such session is owed exactly one write-scope fetch, the first
+  that arrives while it opens or within five seconds after, so a call opening beside one is still
+  served. Arming waits (five seconds at most) while one of those is opening, and the hello is not
+  asked while a recap is armed.
+* **The page asks what became of it.** Once the session has started it asks
+  `GET /api/v1/voice-recap/{id}` every half second, and three and a half seconds after the start —
+  a deadline, whatever the answers before took — settles it with `DELETE`, which takes it back unless
+  a fetch already served it, and answers which (asked once more if unanswered; each question gives up
+  after 1.5 s). The conversation's first record waits up to eight seconds for that. Until then the
+  line under the call says "Handing the agent N words from earlier"; served, "Caught the agent up
+  with N words from earlier", and the start marker says `transport: "profile"`; not served, "Started
+  fresh: the voice service did not take the recap", the seam and marker say "recap not taken", and
+  Settings says the last call took no recap; when nobody can say, "Sent the agent N words from
+  earlier" and no more. A reconnect says the same of its own session. A recap a call no longer needs —
+  hung up before its socket opened or its session started, or a session that lost a turn — is taken
+  back, and the answer to that still settles the start marker. A call started with no recap to hand
+  over says so (`DELETE /api/v1/voice-recap`), so one an earlier page armed before a reload is not
+  handed to it.
+* **What "served" proves.** That the bridge fetched a prompt with the record in it while this recap
+  was armed — not which of its sessions the fetch was for. One page talks to one bridge at a time,
+  the hello is excluded, and the window is a minute, so in practice it is the session the page just
+  opened: the same strength as a `replay_ack`.
+
+The log says what happened to each recap by number and counts, never its words: `voice_recap
+event=armed|served|withheld|withdrawn|expired|replaced`. Forgetting the conversations, one or all, or
+the whole store, drops a recap still waiting.
+
+### The page waits for you to stop speaking
+
+`#512 voice-recap-private-stack`. A call was lost when the owner said "Hold on, let me interject…"
+over a long summary: the speech service dropped every transcript of what he said (it drops input
+transcripts that arrive after a turn completed and before the next starts), so the page, which judged
+"he is speaking" only from transcripts, closed the microphone's segment mid-sentence with
+`audio_end` to deliver a relayed chat message. The service took the message and never answered it,
+and the page's guard reconnected ten seconds later.
+
+So the page also listens to the microphone itself. Before it closes the segment to say one of its
+OWN messages — a relayed chat message, or its word on a send card — it waits while either says he is
+speaking: a capture buffer at or above `conversation.speech_hold_dbfs` (the RMS of 4096 samples,
+against full scale) in the last 0.6 seconds, or a partial transcript of his that grew in the last 1.5
+seconds (a final, or the turn completing, ends that at once). It waits no longer than
+`conversation.speech_hold_cap_seconds` from when the hold began, so road noise above the level cannot
+keep a relay from going; it holds nothing while muted, and nothing for a message the reader typed.
+The status says "Waiting for you to finish speaking…", the connection details say how long each
+message waited (or that it went at the cap), and the call-end record counts them
+(`speech_holds`, `speech_hold_max_ms`, `speech_hold_capped`). The default level is a judgement — speech
+close to a phone with the browser's noise suppression and gain control reads about -30 to -20 dBFS,
+a quiet room under -60 — until in-car numbers say otherwise; client-config carries both as
+`speech_hold: {level_dbfs, cap_ms}`.
 
 The privacy note below applies unchanged: on this backend the earlier conversation goes to the
 bridge, and on to whatever model it uses.
@@ -6042,6 +6119,7 @@ still reads:
 | `last_text_ms`, `last_audio_end_ms`, `last_interrupt_ms` | how long before the end the page last sent a text turn, an `audio_end` and an `interrupt` — a bridge may take either of the last two for a cut — and absent for one it never sent. A hang-up's own goodbye is not counted |
 | `close_reason` | the voice SERVICE's own words — its close reason, or its `error` — with the token taken out, folded onto one line and cut to 120 characters; never anything said in the call. For `reconnect_failed` it is instead the page's own account of why no new session came ("its new voice socket did not open within 9 s"), which may quote the server's error. The server refuses one over 123 characters or carrying a control character |
 | `reconnects` | `#352`: how many times the page carried this call on a new session before this record, absent when it never did. `since_open_ms` and `turns` stay the whole call's. The server refuses a count over 1000 |
+| `speech_holds`, `speech_hold_max_ms`, `speech_hold_capped` | `#512`: how many of the page's own messages this socket held for the owner's speech (see "The page waits for you to stop speaking"), the longest wait, and how many went at the cap with the microphone still loud; absent when none was held. Logged after `reconnects` only when present, so every other line reads as before |
 
 Anything else — an unknown field or `ended_by`, a code out of range, an offset over a day, queued
 audio over an hour — is refused with 400 `invalid_end` and logs nothing. It has its own budget of 30

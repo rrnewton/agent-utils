@@ -208,6 +208,17 @@ fn routes(state: AppState) -> Router {
         // the tool list is filtered to the caller's own scope, so it discloses nothing the same
         // credential could not learn from `tools/list`. A private bridge fetches it at session open.
         .route("/api/v1/voice-agent", get(api::voice_agent))
+        // `#512 voice-recap-private-stack`. WRITE scope: a recap is the transcript, rendered. The
+        // page arms one before it opens a call's socket; the bridge's next fetch of the profile
+        // above takes it into the prompt; the page asks what became of it and settles it.
+        .route(
+            "/api/v1/voice-recap",
+            post(api::arm_voice_recap).delete(api::withdraw_any_voice_recap),
+        )
+        .route(
+            "/api/v1/voice-recap/{id}",
+            get(api::voice_recap_state).delete(api::withdraw_voice_recap),
+        )
         // `#11 voice-connect-latency`. Content-free startup phases, one log line per call. WRITE
         // scope, the same credential that opened the session.
         .route("/api/v1/voice-timing", post(api::voice_timing))

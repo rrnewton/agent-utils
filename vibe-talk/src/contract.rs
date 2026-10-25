@@ -89,6 +89,21 @@ pub struct ClientConfigResponse {
     /// backend, and with replay off, which `replay_enabled: false` says alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_unavailable: Option<ReplayUnavailable>,
+    /// Whether a new call's recap goes in the voice-agent profile the `vibe-talk-v1` bridge fetches
+    /// as its session opens, rather than in a `replay` frame. `#512 voice-recap-private-stack`.
+    ///
+    /// True only with `replay_enabled`, on a bridge the operator says fetches the profile
+    /// (`replay.bridge_fetches_profile`) and that has not said it takes the frame. The page then
+    /// arms the recap with `POST /api/v1/voice-recap` just before it opens the call's socket, or a
+    /// reconnect's, and draws it as taken only once the server says a fetch served it. Absent
+    /// otherwise, and from an older server.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replay_via_profile: bool,
+    /// When the voice page takes the owner to be speaking although no transcript says so, and how
+    /// long that may hold the page's own messages. `#512 voice-recap-private-stack`. Absent from an
+    /// older server, whose page holds nothing for the microphone's level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_hold: Option<SpeechHold>,
     /// Whether this server records the voice page's transcript records: a `sent` row for each
     /// message the voice agent posted, markers for a conversation's start and a draft not sent,
     /// and the tag on a spoken yes, read back with `records=1`, and the send memory read with
@@ -275,6 +290,25 @@ pub struct VoicePostPrefix {
     /// Whether this server can keep a change. False with no store configured, and when the store
     /// cannot be read — the server then tags with the default.
     pub changeable: bool,
+}
+
+/// How the voice page holds its own messages while the owner is speaking. `#512
+/// voice-recap-private-stack`.
+///
+/// A relayed chat message, or the page's word on a send card, is said by closing the microphone's
+/// segment with `audio_end`; closed under the owner's speech, the speech service took the message
+/// and never answered it, and the call was lost. The page judged speech only from transcripts,
+/// which that service may drop. So it also reads the microphone's level, and holds while it is at
+/// or above `level_dbfs`, or while his transcript grew in the last moments — never longer than
+/// `cap_ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SpeechHold {
+    /// The capture buffer's RMS, in dBFS, at or above which the owner is taken to be speaking:
+    /// `conversation.speech_hold_dbfs`.
+    pub level_dbfs: i32,
+    /// The longest one message is held for his speech, in milliseconds; `0`, never held:
+    /// `conversation.speech_hold_cap_seconds`.
+    pub cap_ms: u32,
 }
 
 /// Why replay is off although the operator turned it on. `#270 voice-transcript-markers`, `#331

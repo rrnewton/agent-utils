@@ -657,12 +657,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let bind = config.bind;
+    let voice_bridge = Arc::new(vibe_talk::voice_bridge::BridgeHello::for_config(&config));
     let speech: Arc<dyn SpeechProvider> = match config.read_aloud.backend {
         ReadAloudBackend::Browser => Arc::new(vibe_talk::speech::BrowserSpeech),
-        ReadAloudBackend::Conversation => Arc::new(vibe_talk::speech::ConversationSpeech::new(
-            &config.conversation,
-            config.read_aloud.websocket_url.as_deref(),
-        )),
+        ReadAloudBackend::Conversation => Arc::new(
+            vibe_talk::speech::ConversationSpeech::new(
+                &config.conversation,
+                config.read_aloud.websocket_url.as_deref(),
+            )
+            .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
+        ),
         ReadAloudBackend::ElevenLabs => {
             Arc::new(vibe_talk::elevenlabs::speech::ElevenLabsSpeech::new(
                 elevenlabs_client.clone(),
@@ -689,8 +693,16 @@ async fn main() -> anyhow::Result<()> {
     // `#331 resume-on-websocket`. With replay on and a `vibe-talk-v1` bridge, a recap goes only to a
     // bridge that says it takes one; the hello is asked below, once the server is assembled, and
     // its answer is logged when it comes.
-    let voice_bridge = Arc::new(vibe_talk::voice_bridge::BridgeHello::for_config(&config));
-    if vibe_talk::voice_bridge::needed(&config) {
+    if vibe_talk::voice_bridge::needed(&config) && config.replay.bridge_fetches_profile {
+        // `#512 voice-recap-private-stack`.
+        tracing::info!(
+            asking = voice_bridge.url().is_some(),
+            "replay.enabled is true with conversation.backend = \"websocket\" and \
+             replay.bridge_fetches_profile: a new call's recap rides in the voice-agent profile the \
+             bridge fetches, unless the bridge lists replay in its session_started, which this server \
+             asks it (one session, ended with quit, nothing said)"
+        );
+    } else if vibe_talk::voice_bridge::needed(&config) {
         tracing::info!(
             asking = voice_bridge.url().is_some(),
             "replay.enabled is true with conversation.backend = \"websocket\": Resuming is offered \
@@ -731,6 +743,7 @@ async fn main() -> anyhow::Result<()> {
         recent_view_shadow: Arc::new(vibe_talk::recent_view::Shadow::new()),
         agent_override: Arc::new(vibe_talk::voice_prompt::OverrideAnswers::new()),
         voice_bridge,
+        voice_recap: Arc::new(vibe_talk::voice_recap::VoiceRecaps::new()),
         message_cache,
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),

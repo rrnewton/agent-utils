@@ -142,6 +142,7 @@ fn provider(url: &str) -> ConversationSpeech {
         label: "Test agent".to_owned(),
         ask_before_send: true,
         explicit_send_only: true,
+        ..vibe_talk::config::ConversationConfig::default()
     };
     ConversationSpeech::new(&config, Some(url))
 }
@@ -168,6 +169,7 @@ async fn conversational_read_aloud_drives_the_provider_neutral_socket_and_return
         label: "Test agent".to_owned(),
         ask_before_send: true,
         explicit_send_only: true,
+        ..vibe_talk::config::ConversationConfig::default()
     };
     let provider = ConversationSpeech::new(&config, Some(&url));
     assert_eq!(provider.describe().label, "Test agent");
