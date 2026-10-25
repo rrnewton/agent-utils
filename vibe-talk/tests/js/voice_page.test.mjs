@@ -82277,3 +82277,24 @@ test("`#512 voice-recap-private-stack`: the reader's typed message is not held b
   await passTime(page, SPEECH_HOLD_RECHECK_MS + 50);
   assert.ok(controlFrames(socket).includes("audio_end"), "a typed message waited behind a held page message");
 });
+
+
+test("discord-start-thread: a native potential root offers Thread and starts its first reply", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  await signIn(page);
+  const root = { ...backlog(1)[0], thread: { id: "1", root_message_id: "1", is_root: true,
+    reply_count: 0, reply_count_exact: false } };
+  root.id = "1";
+  await showDiscord(page, [root]);
+  const badge = threadBadge(rowWithId(page, "1"));
+  assert.ok(badge, "native potential root has no start-thread tag");
+  assert.equal(badge.textContent, "Thread");
+  await badge.click();
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, false);
+  await page.el("channel-compose-text").setValue("first native reply");
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.at(-1).body.thread_id, "1");
+});

@@ -650,6 +650,68 @@ impl HttpDiscordClient {
         Ok(thread)
     }
 
+    /// A missing native thread can be started only from a verified root in this parent.
+    async fn thread_for_post(
+        &self,
+        channel: &ChannelId,
+        id: &str,
+    ) -> Result<NativeThread, ChatError> {
+        match self.verified_thread(channel, id).await {
+            Ok(thread) => return Ok(thread),
+            Err(error) => match error.cause() {
+                ChatError::Status { status: 404, body }
+                    if serde_json::from_str::<Value>(body)
+                        .ok()
+                        .and_then(|value| value.get("code").and_then(Value::as_u64))
+                        == Some(10_003) => {}
+                _ => return Err(error),
+            },
+        }
+        let root = self
+            .channel_message(channel, &MessageId(id.to_owned()))
+            .await?;
+        let name: String = root
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(100)
+            .collect();
+        let mut request = self.thread_request(
+            "POST",
+            &["channels", channel.as_str(), "messages", id, "threads"],
+            &[],
+        )?;
+        request.body =
+            Some(serde_json::json!({"name": if name.is_empty() { "Thread" } else { &name }}));
+        match self.send(request).await {
+            Ok(value) => {
+                let thread = NativeThread::parse(&value)?;
+                if thread.id != id || thread.parent != channel.as_str() {
+                    return Err(shape(
+                        "thread creation returned a different thread or parent",
+                    ));
+                }
+                Ok(thread)
+            }
+            Err(error) => {
+                if let ChatError::Status { status, body } = error.cause() {
+                    let code = serde_json::from_str::<Value>(body)
+                        .ok()
+                        .and_then(|value| value.get("code").and_then(Value::as_u64));
+                    if code == Some(160_004) {
+                        return self.verified_thread(channel, id).await;
+                    }
+                    if *status == 403 {
+                        return Err(refused("Discord refused to start the thread. The bot needs CREATE_PUBLIC_THREADS and SEND_MESSAGES_IN_THREADS in this channel."));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn thread_root(
         &self,
         channel: &ChannelId,
@@ -766,6 +828,17 @@ impl HttpDiscordClient {
             } else if value.get("type").and_then(Value::as_u64) == Some(21) {
                 // A thread configured as its own top-level channel has no nested child thread.
                 message.thread = None;
+            } else if message.thread.is_none() {
+                // A native thread channel is created only on its first reply. Until then its
+                // root still offers Thread and Reply's start option through the common record.
+                message.thread = Some(MessageThread {
+                    hue: None,
+                    id: message.id.0.clone(),
+                    root_message_id: Some(message.id.clone()),
+                    is_root: true,
+                    reply_count: Some(0),
+                    reply_count_exact: false,
+                });
             }
             messages.push(message);
         }
@@ -1538,7 +1611,7 @@ impl HttpDiscordClient {
                 Ok(message)
             }
             ThreadApi::Native => {
-                let thread = self.verified_thread(channel, id).await?;
+                let thread = self.thread_for_post(channel, id).await?;
                 // The root is context for this destination, not a cross-channel reply reference.
                 let reply_to = reply_to.filter(|message| message.as_str() != id);
                 if let Some(message) = reply_to {
@@ -1876,6 +1949,21 @@ mod tests {
                     }
                     let key = format!("{method} {uri}");
                     captured.lock().expect("seen").push(key.clone());
+                    if key == "GET /channels/201"
+                        && routes.contains_key("POST /channels/100/messages/201/threads")
+                        && !routes.contains_key(&key)
+                    {
+                        let created = captured
+                            .lock()
+                            .expect("seen")
+                            .iter()
+                            .any(|path| path == "POST /channels/100/messages/201/threads");
+                        return if created {
+                            (StatusCode::OK, Json(thread("201", "201", "100"))).into_response()
+                        } else {
+                            (StatusCode::NOT_FOUND, Json(json!({"code":10003}))).into_response()
+                        };
+                    }
                     match routes.get(&key) {
                         Some((status, value)) => (*status, Json(value.clone())).into_response(),
                         None => (
@@ -1960,6 +2048,123 @@ mod tests {
             message("100", "301", "second root"),
         );
         routes
+    }
+
+    #[tokio::test]
+    async fn native_first_reply_creates_thread_then_posts_and_offers_a_root_record() {
+        let mut routes = Replies::new();
+        routes.insert(
+            "GET /channels/201".into(),
+            (StatusCode::NOT_FOUND, json!({"code":10003})),
+        );
+        let title = "🐈".repeat(120);
+        ok(
+            &mut routes,
+            "/channels/100/messages/201",
+            message("100", "201", &title),
+        );
+        ok(
+            &mut routes,
+            "/channels/100/messages?limit=2",
+            json!([message("100", "201", &title)]),
+        );
+        routes.insert(
+            "POST /channels/100/messages/201/threads".into(),
+            (StatusCode::CREATED, thread("201", "201", "100")),
+        );
+        routes.insert(
+            "POST /channels/201/messages".into(),
+            (StatusCode::OK, message("201", "202", "first reply")),
+        );
+        let mock = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        let roots = mock
+            .client
+            .native_messages(&channel, None, None, None, 2)
+            .await
+            .unwrap();
+        let record = roots[0].thread.as_ref().expect("potential thread record");
+        assert_eq!(record.id, "201");
+        assert!(record.is_root);
+        assert_eq!(record.reply_count, Some(0));
+        let posted = mock
+            .client
+            .post_in_thread(
+                &channel,
+                "201",
+                "first reply",
+                Some(&MessageId("201".into())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(posted.channel_id, channel);
+        assert_eq!(posted.thread.as_ref().unwrap().id, "201");
+        let seen = mock.seen.lock().unwrap();
+        assert_eq!(
+            &seen[1..],
+            [
+                "GET /channels/201",
+                "GET /channels/100/messages/201",
+                "POST /channels/100/messages/201/threads",
+                "POST /channels/201/messages"
+            ]
+        );
+        let bodies = mock.bodies.lock().unwrap();
+        assert_eq!(bodies[0]["name"], "🐈".repeat(100));
+        assert_eq!(bodies[1]["content"], "first reply");
+        assert!(bodies[1].get("message_reference").is_none());
+    }
+
+    #[tokio::test]
+    async fn native_thread_creation_reuses_racing_thread_and_explains_missing_permission() {
+        for (status, code) in [
+            (StatusCode::BAD_REQUEST, 160004),
+            (StatusCode::FORBIDDEN, 50013),
+        ] {
+            let mut routes = Replies::new();
+            // To model a thread appearing between verification and creation, the route remains
+            // missing for the first lookup but switches after the start endpoint is called.
+            ok(
+                &mut routes,
+                "/channels/100/messages/201",
+                message("100", "201", "root"),
+            );
+            routes.insert(
+                "POST /channels/100/messages/201/threads".into(),
+                (status, json!({"code":code})),
+            );
+            routes.insert(
+                "POST /channels/201/messages".into(),
+                (StatusCode::OK, message("201", "202", "answer")),
+            );
+            let mock = mock(routes, ThreadApi::Native).await;
+            let result = mock
+                .client
+                .post_in_thread(&ChannelId("100".into()), "201", "answer", None)
+                .await;
+            if code == 160004 {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(
+                    mock.seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|path| *path == "GET /channels/201")
+                        .count(),
+                    2
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("CREATE_PUBLIC_THREADS"), "{error}");
+                assert!(error.contains("SEND_MESSAGES_IN_THREADS"), "{error}");
+                assert!(!mock
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path == "POST /channels/201/messages"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -2055,7 +2260,7 @@ mod tests {
             got.iter()
                 .filter(|message| message.thread.as_ref().is_some_and(|thread| thread.is_root))
                 .count(),
-            2
+            3, // Two existing threads plus the main message's potential thread.
         );
         assert_eq!(
             mock.seen
