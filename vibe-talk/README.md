@@ -35,7 +35,7 @@ threads, and in **Main** — then the whole channel — where it has none, until
 view. The choice belongs to that channel: another channel opens in its own choice or its default,
 and coming back opens this one where you chose, across a reload too (see
 [Reopening where you left off](#reopening-where-you-left-off)). When the backend finds threads,
-four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac):
+four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac), and the call's view on Ctrl+0:
 
 * **Main** shows channel messages, with a reply-count button below each thread root.
 * **All** interleaves channel and thread messages chronologically. Colored **Thread** badges
@@ -7204,7 +7204,8 @@ three on.
 `gchat-thread-selector`. The second picker on the control bar, immediately right of the channel
 picker and always there on the channel view, chooses how to read that channel — since `#281
 view-keys`, one of four views, which Ctrl+1 to Ctrl+4 (Cmd+1 to Cmd+4 on a Mac) choose in the same
-order, from anywhere on the page, a message box or the search included:
+order, from anywhere on the page, a message box or the search included; Ctrl+0 (Cmd+0) goes to the
+call's view, as the view switch does (`#525 cmd-0-voice-view`):
 
 - **Main** (Ctrl+1) — messages posted to the channel itself, with each thread's first message;
 - **All** (Ctrl+2) — every message, threads included, in one history;
@@ -7880,6 +7881,7 @@ from, so it cannot name a key the page does not answer.
 | Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
 | Ctrl+C (Cmd+C) or `y` | Copy the highlighted message, all of its text as written; on a thread card, its first message. With text selected, or in a text box, Ctrl+C is the browser's copy as ever (see below) |
+| Ctrl+0 (Cmd+0 on a Mac) | The voice (call) view, as the view switch goes there — from anywhere, a message box or the search included |
 | Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4 (Cmd on a Mac) | Main, All, the thread list, two columns — from anywhere, a message box or the search included. The bare `1`, `2`, `3` are retired |
 | `u`, `^` | In the Thread list, Unpack in turn (Pack all, Unpack unread, Unpack all); `^` packs the thread of the selected card or message into its card (`#440 thread-card-pack-toggle`) |
 | `h` | Show read, Fold read, Hide read, in turn, as the button in the bar does, in every view, the Threads view's cards included; the status line says which (`#432 read-mode-unify`) |

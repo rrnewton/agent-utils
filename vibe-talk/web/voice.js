@@ -12169,6 +12169,33 @@ const channelOnScreen = () => currentScreen === "main" && currentView === "disco
  * @param {"main" | "flat" | "threads" | "columns"} which
  * @param {boolean} repeat
  */
+/**
+ * Ctrl+0 (Cmd+0 on an Apple keyboard): the voice (call) view, as the view switch goes there.
+ * `#525 cmd-0-voice-view`. The owner, 2026-10-25: "Cmd-0 go to voice view. We have these great
+ * constant time shortcuts to jump to views Cmd-1 thru Cmd-4.. but what about voice channel?
+ * Make that Cmd-0."
+ *
+ * The rules of Ctrl+1 to Ctrl+4, mirrored: a chord, so it fires in a message box and in the
+ * search; from Settings and Help opened over the main screen, which it closes; a held key's
+ * repeats taken but choosing nothing; and where it can choose nothing (the sign-in screen)
+ * it is left to the browser, whose own Ctrl+0 is its zoom reset — kept from the browser only
+ * when the page takes the chord, as 1 to 4 keep its tab switch. No channel need be chosen:
+ * the call's view is not a view of one. Already there, it is taken and stays.
+ *
+ * @param {boolean} repeat
+ */
+function voiceFromKeyboard(repeat) {
+  if (sideActive) return inColumn(columns.main, () => voiceFromKeyboard(repeat));
+  const covering = currentScreen === "settings" || currentScreen === "help";
+  if (!(currentScreen === "main" || (covering && screenBeforeSettings === "main"))) {
+    return false;
+  }
+  if (repeat) return true;
+  if (covering) closeSettings();
+  if (currentView !== "voice") pressViewSwitch();
+  return true;
+}
+
 function viewFromKeyboard(which, repeat) {
   // A view is the page's, whichever column the keys are in.
   if (sideActive) return inColumn(columns.main, () => viewFromKeyboard(which, repeat));
@@ -12796,6 +12823,14 @@ const KEYMAP = [
     controls: ["thread-back"],
     run: () => threadOutFromKeyboard(),
   },
+  // `#525 cmd-0-voice-view`. The call's view, on the digit before the four. It repeats as they
+  // do, each repeat being the browser's zoom reset as well; a repeat chooses nothing.
+  {
+    group: KEYS_VIEW, chords: [{ key: "0", mod: true }], repeats: true,
+    does: "Voice: the call's view, as the view switch goes there. From anywhere, a message box or the search included",
+    controls: ["view-switch"],
+    run: (event) => voiceFromKeyboard(event.repeat),
+  },
   // `#281 view-keys`. The four views, in the picker's order. Each repeats so that a held chord's
   // repeats are taken too, each being the browser's tab switch as well; a repeat chooses nothing.
   {
@@ -13151,7 +13186,10 @@ function chordMatches(chord, event) {
     return Boolean(chord.shift) === Boolean(event.shiftKey) && isLetterKey(event, chord.key);
   }
   const key = typedKey(event);
-  if (chord.key.length === 1 && chord.key !== " ") return key === chord.key || digitByPlace(chord, event) || parenByPlace(chord, event);
+  // A shifted digit is never the digit chord: on the Digit0 key it is the ")" of the collapsed-lines
+  // chord, which `parenByPlace` reads for that chord below — a browser reporting the digit itself
+  // while Shift is held must not hand it to Ctrl+0 (`#525 cmd-0-voice-view`).
+  if (chord.key.length === 1 && chord.key !== " ") return (key === chord.key && !(/^[0-9]$/.test(chord.key) && event.shiftKey)) || digitByPlace(chord, event) || parenByPlace(chord, event);
   return key === chord.key && Boolean(chord.shift) === Boolean(event.shiftKey);
 }
 
