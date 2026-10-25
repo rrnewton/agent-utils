@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "agent-queue"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agent-usage"
 version = "0.1.0"
 dependencies = [
@@ -15,6 +25,7 @@ dependencies = [
 name = "agentctl"
 version = "0.1.0"
 dependencies = [
+ "agent-queue",
  "chat-subscription",
  "chat-subscription-plugin",
  "clap",

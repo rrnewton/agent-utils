@@ -45,6 +45,7 @@ class Crate:
 
 
 CRATES: tuple[Crate, ...] = (
+    Crate("agent-queue", (), "agent_queue", ()),
     Crate("chat-subscription", (), "chat_subscription", ()),
     Crate("chat-subscription-plugin", (), "chat_subscription_plugin", ()),
     Crate(
@@ -79,7 +80,7 @@ CRATES: tuple[Crate, ...] = (
 # already-inspected dependency archives, never to the live checkout.
 LOCAL_PACKAGE_PATCHES: dict[str, tuple[str, ...]] = {
     "chat-subscription-plugin": ("chat-subscription",),
-    "agentctl": ("chat-subscription", "chat-subscription-plugin"),
+    "agentctl": ("agent-queue", "chat-subscription", "chat-subscription-plugin"),
 }
 
 _FOREIGN_DOC_TERMS = re.compile(
