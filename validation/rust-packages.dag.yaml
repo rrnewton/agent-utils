@@ -9,6 +9,7 @@ steps:
     desc: package and smoke the agentctl and chat-subscription Rust crates once
     cmd: >-
       python3 scripts/check_rust_packages.py
+      --crate term-backend
       --crate chat-subscription
       --crate chat-subscription-plugin
       --crate agentctl

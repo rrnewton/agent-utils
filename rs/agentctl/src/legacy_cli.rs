@@ -48,6 +48,9 @@ struct Args {
     max_attempts: u64,
     lines: usize,
     herdr_bin: PathBuf,
+    term_backend: Option<String>,
+    tmux_bin: PathBuf,
+    tmux_socket: Option<String>,
     userguide: bool,
     name: Option<String>,
     registry: PathBuf,
@@ -82,6 +85,9 @@ impl Default for Args {
             max_attempts: 3,
             lines: 500,
             herdr_bin: PathBuf::from("herdr"),
+            term_backend: None,
+            tmux_bin: PathBuf::from("tmux"),
+            tmux_socket: None,
             userguide: false,
             name: None,
             registry: PathBuf::from(".herdr-agents"),
@@ -259,7 +265,6 @@ fn run(args: Args) -> Result<i32, CliError> {
     // Reject an empty target before resolving the environment-dependent Herdr executable.  This
     // keeps a malformed invocation deterministic on hosts that do and do not have Herdr installed.
     agent::validate_target_authority(&target)?;
-    let client = HerdrClient::with_executable("direct", &args.herdr_bin)?;
     let queue = absolute_lexical(&args.queue).map_err(|error| {
         CliError::Usage(format!(
             "cannot resolve queue path {}: {error}",
@@ -272,20 +277,67 @@ fn run(args: Args) -> Result<i32, CliError> {
         max_attempts: args.max_attempts,
         deliver_while_working: false,
     };
+    let lines = args.lines;
+    let backend = crate::term::select_backend(
+        args.term_backend.as_deref(),
+        &|name| std::env::var(name).ok(),
+        &args.registry,
+        &args.herdr_bin,
+        &args.tmux_bin,
+    )?;
+    match backend {
+        term_backend::BackendKind::Herdr => {
+            let client = HerdrClient::with_executable("direct", &args.herdr_bin)?;
+            run_direct(
+                &client,
+                command,
+                &target,
+                &queue,
+                message.as_deref(),
+                options,
+                lines,
+            )
+        }
+        term_backend::BackendKind::Tmux => {
+            let client =
+                term_backend::TmuxBackend::new(args.tmux_bin.clone(), args.tmux_socket.clone());
+            run_direct(
+                &client,
+                command,
+                &target,
+                &queue,
+                message.as_deref(),
+                options,
+                lines,
+            )
+        }
+    }
+}
+
+/// The durable direct-pane transport, generic over the terminal backend.
+fn run_direct<A: agent::AgentApi>(
+    client: &A,
+    command: &str,
+    target: &Target,
+    queue: &Path,
+    message: Option<&str>,
+    options: DrainOptions,
+    lines: usize,
+) -> Result<i32, CliError> {
     match command {
         "send" => {
             let result = agent::send(
-                &client,
-                &target,
-                &queue,
-                message.as_deref().expect("send message was loaded"),
+                client,
+                target,
+                queue,
+                message.expect("send message was loaded"),
                 options,
             )?;
             write_json(&result)?;
             Ok(0)
         }
         "drain" => {
-            let result = agent::drain(&client, &target, &queue, options)?;
+            let result = agent::drain(client, target, queue, options)?;
             let code = if result.blocked.is_some() {
                 75
             } else if result.quarantined.is_empty() {
@@ -297,11 +349,11 @@ fn run(args: Args) -> Result<i32, CliError> {
             Ok(code)
         }
         "status" => {
-            write_json(&agent::status(&client, &target, &queue)?)?;
+            write_json(&agent::status(client, target, queue)?)?;
             Ok(0)
         }
         "read" => {
-            print!("{}", agent::read(&client, &target, args.lines)?);
+            print!("{}", agent::read(client, target, lines)?);
             Ok(0)
         }
         _ => unreachable!("parser restricted commands"),
@@ -309,6 +361,13 @@ fn run(args: Args) -> Result<i32, CliError> {
 }
 
 fn run_managed(args: Args) -> Result<i32, CliError> {
+    if args.term_backend.as_deref() == Some("tmux") {
+        return Err(CliError::Usage(
+            "the tmux terminal backend drives only direct-pane commands (send/drain/status/read \
+             --pane PANE); managed commands require Herdr"
+                .to_owned(),
+        ));
+    }
     let command = args.positional[0].as_str();
     if command != "stop"
         && (args.expected_token.is_some()
@@ -709,6 +768,9 @@ fn value_option(option: &str) -> Option<()> {
             | "--max-attempts"
             | "--lines"
             | "--herdr-bin"
+            | "--term-backend"
+            | "--tmux-bin"
+            | "--tmux-socket"
             | "--name"
             | "--registry"
             | "--workspace-id"
@@ -745,6 +807,9 @@ fn assign(args: &mut Args, option: &str, value: String) -> Result<(), String> {
                 .expect("MAX_COUNT fits every supported usize");
         }
         "--herdr-bin" => args.herdr_bin = PathBuf::from(value),
+        "--term-backend" => args.term_backend = Some(value),
+        "--tmux-bin" => args.tmux_bin = PathBuf::from(value),
+        "--tmux-socket" => args.tmux_socket = Some(value),
         "--name" => args.name = Some(value),
         "--registry" => args.registry = PathBuf::from(value),
         "--workspace-id" => args.workspace_id = Some(value),
@@ -860,7 +925,7 @@ fn usage_line() -> &'static str {
 
 fn print_help() {
     println!(
-        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON\n  --expected-token TOKEN\n  --recover-legacy-adoption\n  --retire-dead-adoption\n  --expected-record-sha256 SHA256\n\nAdoption recovery applies only to stop. Select exactly one recovery flag and supply\n--expected-token TOKEN and the lowercase 64-hex SHA-256 of the raw agent.json bytes.\n--retire-dead-adoption archives a running adopted record with a dead pinned harness\nwithout querying Herdr. Example: herdr-agent stop reviewer --retire-dead-adoption\n  --expected-token TOKEN --expected-record-sha256 SHA256",
+        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --term-backend BACKEND\n  --tmux-bin TMUX_BIN\n  --tmux-socket NAME\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON\n  --expected-token TOKEN\n  --recover-legacy-adoption\n  --retire-dead-adoption\n  --expected-record-sha256 SHA256\n\nAdoption recovery applies only to stop. Select exactly one recovery flag and supply\n--expected-token TOKEN and the lowercase 64-hex SHA-256 of the raw agent.json bytes.\n--retire-dead-adoption archives a running adopted record with a dead pinned harness\nwithout querying Herdr. Example: herdr-agent stop reviewer --retire-dead-adoption\n  --expected-token TOKEN --expected-record-sha256 SHA256",
         usage_line()
     );
 }
