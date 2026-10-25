@@ -1,6 +1,6 @@
 ---
 title: 'agent-queue: shared queue crate, coordinator designation and control tree, queue lanes and cancellation'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-496: related
 created_at: 2026-10-25T12:42:46.234568456+00:00
-updated_at: 2026-10-25T12:42:46.234568456+00:00
+updated_at: 2026-10-25T18:59:44.650965638+00:00
+closed_at: 2026-10-25T18:59:44.650965517+00:00
 ---
 
 # Description
