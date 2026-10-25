@@ -33,7 +33,10 @@ threads), two of Main's messages (220 and 223) the owner's, from one loopback or
    kept; Reply on a main-channel message, Cmd+S: the reply's box, still the Threads view; Main channel off
    -> Cmd+S goes back to the view the list was chosen from (negative control);
 3. Main channel and Unpack msgs on -> 220 (the owner's) centred in the cards' column within 2px, as wide as
-   in All, its left edge at least 16px from the previous thread's last unpacked row's; 203 (the agent's)
+   in All, its left edge clearly apart from the previous thread's last unpacked row's (12px at
+   least: `#501 thread-bridge-gutter` took the unpacked rows to the slim phone gutter, so the
+   step between the two edges is that inset now, not the full gutter it measured when it was
+   16px; centred, in its own colour and bridgeless, it is still no follow-up); 203 (the agent's)
    with the margins it has in All; 220 in All on the owner's side as before (negative controls);
 4. Back and Forward: Ctrl+1 (Main), Ctrl+2 (All), Ctrl+3 (Threads), on a desk Ctrl+4 (two columns), a
    thread opened from the list, Settings -> Cmd+[ walks back through each in turn to where it started,
@@ -362,7 +365,11 @@ def center_walk(desk: Desk) -> None:
     desk.check(isinstance(prior, dict) and prior["thread"] == CANARY, f"the premise: the canary thread's rows before 220: {prior}")
     assert isinstance(prior, dict)
     apart = abs(number(own["left"]) - number(prior["left"]))
-    desk.check(apart >= 16, f"220's left edge is {apart:.1f}px from {prior['id']}'s, the canary thread's last unpacked row")
+    # `#501 thread-bridge-gutter`: on a phone the unpacked rows stand on the slim bridge gutter,
+    # so the step from their left edge to the centred row's is that inset (0.85rem at the default
+    # root size in the cards, more at a desk), where it was a whole gutter when 16px was named.
+    # What `#424` asks is that the two edges are not lined up; 12px keeps that honest.
+    desk.check(apart >= 12, f"220's left edge is {apart:.1f}px from {prior['id']}'s, the canary thread's last unpacked row")
     # Negative controls: the agent's main row has the margins it has in All, and the owner's row in All is on his side.
     desk.check((agent["marginLeft"], agent["marginRight"]) == (agent_all["marginLeft"], agent_all["marginRight"]),
                f"203, the agent's, moved: {agent['marginLeft']}/{agent['marginRight']} against {agent_all['marginLeft']}/{agent_all['marginRight']} in All")
