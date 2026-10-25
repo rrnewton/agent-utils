@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Fake Claude-shaped harness for tmux lifecycle tests."""
+import os
+import select
+import sys
+import termios
+import time
+import tty
+
+RULE = "─" * 40
+IDLE = "  ⏵⏵ auto mode on"
+BUSY = "  ⏵⏵ auto mode on · esc to interrupt"
+
+transcript = ["fake harness ready"]
+composer = ""
+working_until = None
+
+
+def draw():
+    global working_until
+    working = working_until is not None and time.monotonic() < working_until
+    rows = transcript[-10:] + [RULE, "❯ " + composer, RULE, BUSY if working else IDLE]
+    out = "\x1b[H\x1b[2J" + "\r\n".join(rows) + "\r\n"
+    os.write(1, out.encode())
+
+
+def submit(text):
+    global working_until, composer
+    composer = ""
+    if text == "die-now":
+        draw()
+        raise SystemExit(0)
+    transcript.append("❯ " + text)
+    if text == "spawn-child":
+        import subprocess
+
+        command = os.environ.get("FAKE_SPAWN_CMD") or "__SPAWN_CMD__"
+        if command:
+            subprocess.Popen(
+                ["/bin/sh", "-c", command],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        transcript.append("• spawned")
+    elif text.startswith("work:"):
+        seconds = 4.0
+        rest = text[5:].strip()
+        head = rest.split()[0] if rest else ""
+        try:
+            seconds = float(head)
+        except ValueError:
+            pass
+        working_until = time.monotonic() + seconds
+        transcript.append("• Working")
+    elif working_until is not None and time.monotonic() < working_until:
+        transcript.append("queued: " + text)
+    else:
+        transcript.append("• done: " + text)
+    draw()
+
+
+def main():
+    global composer, working_until
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    os.write(1, b"\x1b[?2004h")
+    buf = b""
+    paste = False
+    try:
+        draw()
+        while True:
+            timeout = 0.1
+            ready, _, _ = select.select([fd], [], [], timeout)
+            now = time.monotonic()
+            if working_until is not None and now >= working_until:
+                working_until = None
+                transcript.append("• finished")
+                draw()
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            while buf:
+                if buf.startswith(b"\x1b[200~"):
+                    paste = True
+                    buf = buf[6:]
+                    continue
+                if buf.startswith(b"\x1b[201~"):
+                    paste = False
+                    buf = buf[6:]
+                    draw()
+                    continue
+                if buf.startswith(b"\x1b"):
+                    # Skip one escape sequence - [ up to a final byte.
+                    if len(buf) < 2:
+                        break
+                    if buf[1:2] == b"[":
+                        end = None
+                        for i in range(2, min(len(buf), 16)):
+                            if 0x40 <= buf[i] <= 0x7E:
+                                end = i + 1
+                                break
+                        if end is None:
+                            break
+                        buf = buf[end:]
+                    else:
+                        buf = buf[2:]
+                    continue
+                byte = buf[0]
+                buf = buf[1:]
+                if byte in (13, 10) and not paste:
+                    submit(composer)
+                elif byte in (13, 10) and paste:
+                    composer += " "
+                elif byte == 127 or byte == 8:
+                    composer = composer[:-1]
+                    draw()
+                elif byte == 3:
+                    composer = ""
+                    working_until = None
+                    draw()
+                elif byte >= 32:
+                    # take one utf-8 char
+                    text = bytes([byte])
+                    while True:
+                        try:
+                            char = text.decode()
+                            break
+                        except UnicodeDecodeError:
+                            if not buf:
+                                char = ""
+                                break
+                            text += bytes([buf[0]])
+                            buf = buf[1:]
+                    composer += char
+                    if not paste:
+                        draw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.write(1, b"\x1b[?2004l\r\n")
+
+
+if __name__ == "__main__":
+    main()
