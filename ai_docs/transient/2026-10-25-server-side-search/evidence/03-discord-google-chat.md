@@ -53,10 +53,6 @@ mentions. **No OR between keywords**, no exclusion documented. `page_size` ≤ 1
 `create_time desc` (default) or `relevance` (developer preview); descending only. Query ≤ 1000
 characters.
 
-A vendor CLI on the pilot host also offers a Google Chat search backed by a private index
-(exact 1-gram keywords, optional stemming or vector search), whose own help says keyword-less
-scans "are not guaranteed exhaustive" and points to the list read for exhaustive reads.
-
 ## Summary across providers
 
 | | Exhaustive read (proof) | Text search upstream (hints) | OR | NOT | Phrase | Infix substring | Author by name | Time window |

@@ -3,14 +3,17 @@
 2026-10-25 ~22:10–22:30 UTC, `#521 server-side-search`. All calls were reads, made as the owner
 through a vendor CLI that wraps Slack's Web API (`conversations.history`) and Slack's Real-Time
 Search API (`assistant.search.context`). The private vibe-talk Slack instance reaches Slack the
-same way, through its private shim. Channel A is the owner's "030" channel (evidence 1); channel
+same way, through its private shim. Channel A is the channel of the "112 messages" summary (evidence 1); channel
 B its predecessor; channel C the busiest bridged channel. Ids, host names and message text are
 left out; the scripts are under `scripts/`.
 
 ## 1. Query language (channel A, `--channel-id` narrowing, ground truth from the cache copy)
 
-"Ours" is the page's rule over the same 137 messages: every term a lower-case substring of
-author + text. "Hits" is distinct messages the search returned.
+"Ours" approximates the page's rule over the same 137 messages: the term as a lower-case substring
+of the cache's `search_text` (author + raw content + the renderer's drawn text + link addresses,
+capped at 8 KB). That is a little wider than the page's haystack, which has no raw content, and it
+misses a term past 8 KB; no message here is that long. "Hits" is distinct messages the search
+returned.
 
 | Query | Hits | Ours | Reading |
 |---|---:|---:|---|
@@ -53,8 +56,7 @@ author + text. "Hits" is distinct messages the search returned.
 
 Looking at the 15 misses in the private copy, none is an infix match: they are words the search
 otherwise matches by prefix ("reviewers" for `review`, "coordinator" for `coord`, the latter in a
-38-byte message) and plain whole words ("needs final review", "has landed", most in 1–3.6 KB
-posts). The Real-Time Search
+38-byte message) and plain whole words standing alone (most in 1–3.6 KB posts). The Real-Time Search
 API ranks and trims; it is a candidate generator, **never a proof that a message is absent**.
 (The hit counts in the two tables differ by a few for the same term because the two passes were
 minutes apart and paged differently; the comparison table is the one with exact sets.)
@@ -65,15 +67,18 @@ minutes apart and paged differently; the comparison table is the one with exact 
 
 | Channel | Hits | Pages | Seconds | Reported completeness | Against the cache copy |
 |---|---:|---:|---:|---|---|
-| A | 138 | 14 | 22.4 | `source_complete: true` | 137/137 cached messages present; the 1 extra was posted after the copy |
+| A | 138 | 14 | 22.4 | `source_complete: true` | 137/137 cached messages present; the 1 extra is newer than the copy (its timestamp is after the copy was taken; not confirmed by a later history read) |
 | B | 200 | 21 | 37.2 | `source_complete: false`, "Slack returns at most 20 pages per search query" | (more than 200 messages) |
 
 Pages hold **10** results here (the CLI's help says 20; the service answered `page_size: 10`), and
 a query is cut at **20 pages = 200 results**, flagged by `source_complete: false`. A longer
 channel is read by splitting the window with a created-before bound. This one read returns thread
 replies interleaved by time, which is exactly the "All" order, at about 6 messages a second.
-Unproven: whether a file-only or bot-only message always matches `*` (the CLI's own help says it
-did not check); the bridge app's own posts did match.
+Unproven: this is one channel, two days old. Whether a file-only or bot-only message always
+matches `*` (the CLI's own help says it did not check; the bridge app's own posts did match); how
+soon a new message is indexed; and whether a bot token can make the same call (the pilot ran as
+the owner). Treat it as exhaustive only where
+a cross-check against history agrees, and keep reading the newest end from history.
 
 ## 4. Cost of exhaustive reads (latency per call, p50 over the walk)
 

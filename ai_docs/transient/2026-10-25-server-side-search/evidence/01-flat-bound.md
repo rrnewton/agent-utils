@@ -20,8 +20,8 @@ messages**. A wildcard search listing (evidence 2) returned 138: the same 137 pl
 between the two reads. The private server's message cache held exactly the same 137 (80 in Main,
 57 replies), and its Main coverage reaches back past the channel's first message.
 
-The earlier traffic of the same agent is in a different channel ("channel B", whose alias in the
-owner's page is now "Offline build"): 33 top-level messages and 183 replies from 2026-10-20 to
+The earlier traffic of the same agent is in a different channel ("channel B", under another alias in
+the owner's page): 33 top-level messages and 183 replies from 2026-10-20 to
 2026-10-23. Nothing in channel A is older than 2026-10-23.
 
 ## What All can load: replay of the Flat bound over channel A's real shape

@@ -3,8 +3,9 @@
 2026-10-25, `#521 server-side-search`. **A plan for the owner to decide on. Nothing in it is
 implemented.** Evidence is in `evidence/`, with the scripts that produced it in `evidence/scripts/`.
 Channel ids, host names, the private shim's location and message text are redacted throughout:
-"channel A" is the owner's "030" channel, "channel B" the one before it, "channel C" the busiest
-bridged channel.
+"channel A" is the owner's channel whose summary read "112 messages", "channel B" the one before
+it, "channel C" the busiest bridged channel. Revised once after an adversarial review against the
+code (its findings are folded in; see "Review" at the end).
 
 ## The owner's request, in short
 
@@ -36,15 +37,17 @@ is loaded"* under *"112 messages from <channel A>"*. The owner asked:
   (user auth only) are token-based too, with no OR. So upstream search can only give **hints**,
   which we check again here. Every "searched back to" claim has to rest on an **exhaustive,
   time-windowed read**. ([§2](#2-what-each-chat-service-can-do-upstream), evidence 2–3.)
-- **Slack has an exhaustive read that fits All exactly.** A wildcard search narrowed to one
-  channel and sorted by time lists every message, replies included, in time order: 138/138 for
-  channel A, about 6 messages a second, at most 200 per query (longer channels split by time). It
-  can feed both All and the server's search backfill.
+- **Slack has a read that fits All exactly, and looks exhaustive.** A wildcard search narrowed to
+  one channel and sorted by time listed every message, replies included, in time order: all 137
+  cached messages of channel A (plus one newer), about 6 messages a second, at most 200 per query
+  (longer channels split by time). One young channel is not proof, so the plan cross-checks it
+  against history before trusting it; it can then feed the server's search backfill, and All's
+  older pages.
 - **Recommended single source of truth: one written spec plus a shared conformance corpus**, run
   against a Rust and a JavaScript matcher in CI, with a cross-language differential fuzz. Not WASM.
   The matcher is the small half (~300 lines a side). The large half is *what text is searched*,
   and WASM does not solve that. ([§5](#5-one-matcher-two-languages).)
-- **Plan:** five phases, about **9–13 agent-days**. Phase 0 (honest counts and completeness) is
+- **Plan:** five phases, about **10–15 agent-days**. Phase 0 (honest counts and completeness) is
   under a day and independent of the rest. ([§7](#7-phased-plan).) Ten questions for the owner are
   in [§8](#8-questions-for-the-owner).
 
@@ -53,18 +56,24 @@ is loaded"* under *"112 messages from <channel A>"*. The owner asked:
 ## 1. Diagnosis: "112 messages … all of it is loaded"
 
 **What the numbers mean today.** "112 messages from <channel>" is `channelSummary(count, whole,
-label)` in `web/voice.js`. `count` is the rows loaded in this view, less those hidden as empty;
-the server counts nothing. The page words it as a total ("N messages from X") whenever it believes
-the view reaches the start of the channel, and otherwise as "the most recent messages; older ones
-are not loaded". "Nothing in All matches that search — all of it is loaded" is the empty-search
-sentence (`searchEmptySentence`), shown when `historyReadToStart()` is true.
+label)` in `web/voice.js`. `count` is the messages loaded in this view, less those hidden as empty
+and, under Hide read, those read; All's projection also includes replies of threads the reader
+opened. The server counts nothing. The page words it as a total ("N messages from X") whenever
+`loadedIsWhole()` (which reads only `discordMoreAbove`) says the view reaches the start, and
+otherwise as "the most recent messages; older ones are not loaded". "Nothing in All matches that
+search — all of it is loaded" is the empty-search sentence (`searchEmptySentence`), shown when
+`historyReadToStart()` is true. (On a provider without threads under Hide read the same sentence
+can appear for another reason: that list sets `discordMoreAbove = false` itself.)
 
 **Why the page believed it.**
 
 1. Slack's All (`HttpSlackClient::flat`, `src/slack/timeline.rs`) is Main's page of 50 top-level
    messages plus the replies of at most `FLAT_MAX_THREADS` = 10 of the threads rooted on it (the
    most recently active), and at most 50 replies each. The rest are never read, by this page or by
-   any older one. The bound is reported only as a free-text `notice`.
+   any older one. The bound is reported only as a free-text `notice`. The page does notice it
+   (`allPageAnswersFor` takes `Boolean(payload.notice)` as "bounded", and the store tracks threads
+   whose replies it lacks: `passedOver`, `storeLacksReplies`), but nothing that decides "whole"
+   consults that.
 2. The page's `has_more` and `next_before` are **Main's**. When the step back reaches Main's first
    message, `has_more` is false.
 3. The page sets `discordMoreAbove = false`, and All's cover in the store records `more: false`.
@@ -78,7 +87,8 @@ and 31 threads with 57 replies, 137 real messages. The server's cache holds the 
 replay (`simulate_flat.py`) gives: page 1 has 50 top-level, 21 threads, replies of 10 loaded (19),
 replies of 11 never loaded (23); page 2 has 30 top-level, 10 threads, 15 replies loaded, with
 `has_more` false. That is 114 loaded of 137. The owner saw 112; the 2-message difference is not
-pinned down.
+pinned down (untested candidates: rows hidden as empty or read under Hide read, a reply also sent
+to the channel that Flat holds once and the replay counts twice, or the reads being minutes apart).
 
 **Reproduced** in the server's code against the suite's Slack fake: 80 top-level + 62 replies =
 142, loaded 120, older page `has_more: false` (evidence 1). That test was not committed: it
@@ -88,9 +98,12 @@ asserts today's wrong behaviour. Phase 0 turns it into a test of the fix.
 (33 top-level, 183 replies) and in channel A since. No search of channel A can reach its earlier
 history (question 8).
 
-**The fix (Phase 0)** is not a pure wording change. It touches the page/server contract (a
-structured "replies were bounded" flag in place of reading a free-text notice) and the jump logic
-that relies on `historyReadToStart()`. So it was **not landed** in this pass; see §7.
+**The fix (Phase 0)** needs no server change. All is whole only when its cover says
+`more: false` **and** no thread root in the store lacks replies (`storeLacksReplies`). Unlike "no
+page was bounded", that becomes true once the reader has opened the skipped threads.
+`loadedIsWhole`, `historyReadToStart`, `channelSummary` and `searchEmptySentence` follow it, and
+the summary always says "loaded". It is not a pure wording change: it changes what the jump logic
+treats as the whole view. So it was **not landed** in this pass; see §7.
 
 ## 2. What each chat service can do upstream
 
@@ -132,29 +145,53 @@ Slack measurements (channel A, evidence 2):
   `search_text` (lower-case author + content + rendered text + link addresses, capped at 8 KB).
   `cache/search.rs` holds the queries "exactly as the search milestone will run them": the index
   drives rare terms, a newest-first `instr` scan handles short or common ones, and every candidate
-  is re-matched in Rust with the page's rule. **No route uses them yet.** `search_text` is still
-  built from the `PlainText` source (the body as written), not from the renderer.
+  is re-matched in Rust with the page's rule. **No route uses them yet.** In production
+  `search_text` is already built from the renderer (`render::SearchText`, version `render-1`,
+  passed in `cache/lifecycle.rs`; `PlainText` is only the test default). Two parity gaps remain:
+  `search_text` always includes the raw `content` as well, so the server matches more than the
+  page; and the renderer's `text_content` joins blocks with nothing, where the page's
+  `renderedText` puts a line break at block edges and `<br>` and trims. Both candidate paths read
+  the capped column, so a term only past 8 KB is never found.
 - **Coverage on the private Slack instance (channel A):** Main covered contiguously from the cache's
   age limit to the head, 16 of 31 thread scopes covered, `complete` false everywhere ("reads that
-  may have left a message out", Slack's). `max_days = 14`: nothing older than 14 days is kept.
+  may have left a message out": the server drops Slack rows it cannot show, such as ones with no
+  author). This instance sets `max_days = 14` (the code's default is 90), so nothing older than
+  14 days is kept there; the file also has a size ceiling (`max_megabytes`).
 
 ## 4. The horizon: "searched back to <date>"
 
-**Definition.** A search's horizon is a claim *H as of A*: **every message of this view created at
-or after H, as of time A, was tested against this query.** "The whole channel" is the special
-case where H is the start of the channel's history and something proved it. The line names who
-proved each part.
+**Definition.** A search's horizon is a claim *H as of A*: **every message of this view that the
+server shows, created at or after H and visible upstream at time A, was tested against this
+query.** "The whole channel" is the special case where H is the start of the channel's history and
+something proved it. The line names who proved each part, and says what it does not cover.
+
+**The trap in All (Slack).** All's reads only bring replies of threads whose root is on the page
+read, and at most 10 of those. So a stretch [H, now) of All held by the page or the cache can still
+lack (a) replies of passed-over threads rooted inside it and (b) replies posted since H in threads
+rooted before H. Neither Main's coverage nor the thread list can say which threads those are. So
+on Slack, All's horizon is one of:
+
+- **top-level only:** "top-level messages back to H; replies of N threads not searched", where N
+  is the threads the store or cache knows to be incomplete, and (b) is said as a caveat; or
+- **whole:** only from a read that lists every message by time, replies included: the wildcard
+  listing, recorded as a new "time range" scope in the cache and cross-checked as below.
+
+Main's horizon has no such trap. A bridge's All is its time-ordered whole list, and Discord's
+threads are channels with their own history, read and covered one by one.
 
 | Level | Where H comes from | Proven by |
 |---|---|---|
-| Page (works offline) | the oldest edge of the view's contiguous cover in the page's store (`cover.floor`), or the channel's start when a read proved it **and** the view was not bounded (Phase 0) | the reads the page holds |
-| Server cache | the oldest `t0` of the coverage chain contiguous from the scope's head, for every scope the view spans (for All: Main and every thread active since H; on Slack a "time range" scope filled by the wildcard listing makes this one interval); never past `now − max_days` unless the start is proven | the coverage table, which never claims more than a read saw |
+| Page (works offline) | the oldest edge of the view's contiguous cover in the page's store (`cover.floor`), or the channel's start when a read proved it and no root lacks replies (Phase 0); on Slack All, top-level only unless every thread held is whole | the reads the page holds |
+| Server cache | the oldest `t0` of the coverage chain contiguous from the scope's head, for the view's scope (Main; a bridge's Flat; on Slack All, the new time-range scope); never past `now − max_days` unless the start is proven | the coverage table, which never claims more than a read saw |
 | Upstream | each window of an exhaustive read, written into the cache as coverage (`source = 'range'`) as it completes, so an upstream scan *is* a cache backfill, and H moves back window by window | the provider's own listing: Slack's `source_complete` and paging, Discord's history, Google Chat's list; on Slack, cross-checked against history (every top-level ts in the window is present, and each root's `reply_count` matches the replies found) |
 
-**Combining levels.** Each level's claim is a contiguous stretch ending at the present, so the
-union is one stretch and the effective horizon is the **oldest** of them. The server searches
-everything it holds below the page's horizon, so the page never has to trust the server about rows
-it already holds.
+**Combining levels.** Each level's claim is a contiguous stretch ending at the newest end it
+proved, so where they overlap the union is one stretch and the effective horizon is the **oldest**
+of them. Two edges are not proven and are said, not assumed: the unsettled band at the head (about
+2 minutes, which coverage never enters; the page's live stream covers it), and a cover saved on the
+device that no read has brought up to date. The server searches everything it holds in the
+requested stretch; the page drops hits it already holds, by id, so it never has to trust the server
+about rows it has.
 
 **Monotone, by construction.**
 
@@ -163,14 +200,17 @@ it already holds.
   horizon, and every upstream window read for one search serves every later search.
 - New messages at the head arrive through the page's live stream and poll, and are matched locally
   as they arrive. "As of A" therefore stays true without moving H.
-- Two things can move H forward, and both are said rather than hidden: the cache evicting past
-  `max_days`, and a jump to another view. Within one search, H never moves forward.
+- Several things can move the cache's H forward, and each is said rather than hidden: eviction
+  past `max_days` or the size ceiling, a coverage interval punctured by an erase, and the oldest
+  interval dropped past 512 per scope. A jump to another view starts that view's own claim. Within
+  one search the page never shows a newer H than it has shown; if the server's moved forward, the
+  line says so ("the server no longer holds …").
 
 **What the page says** (wording to be settled in Phase 2):
 
-> Searched everything loaded here, back to Oct 24 · 3 matches
+> Searched everything loaded here, back to Oct 20 · 3 matches
 > Server: back to Oct 11 (its copy) · 2 more further back
-> Slack: the whole channel, back to its first message on Oct 23 · nothing more
+> Slack: the whole channel, back to its first message on Sep 30 · nothing more
 
 and, offline: *"Searched what is loaded, back to Oct 24. The server can't be reached to look further."*
 
@@ -192,15 +232,24 @@ word     := any run of non-space characters that is none of the above
 - **Precedence:** NOT, then AND, then OR. A query that is only negations matches everything not
   excluded.
 - **A term (word or phrase) matches a message** when its normalized text is a **substring** of the
-  message's normalized haystack. That keeps today's behaviour: `coord` finds "coordinator",
-  `andoff` finds "handoff", and a phrase matches across a line break.
-- **Normalization, both sides:** Unicode NFC, then full lower-case mapping (Rust
-  `str::to_lowercase` and JS `String.prototype.toLowerCase` agree on it, final sigma included;
-  the corpus pins the edge cases), then every run of whitespace becomes one space. Diacritic
-  folding (NFD and dropping combining marks, so `cafe` finds "café") is recommended; question 4.
+  message's normalized haystack. That keeps today's core behaviour: `coord` finds "coordinator",
+  and `andoff` finds "handoff".
+- **Behaviour changes from today**, each to be accepted (question 2 and 10): a phrase now matches
+  across a line break (today the drawn text keeps `\n`, so `"hand off"` does not); `-x`, `OR`,
+  `NOT`, `(…)` and `from:`/`in:`/`has:`/`before:`/`after:`/`on:` become syntax where today they
+  are literal substrings; and the unit is the message, not the combined row (below).
+- **Normalization, both sides:** Unicode NFC, then **case folding**, not lower-casing: Rust
+  `str::to_lowercase` and JS `toLowerCase` agree, but both map a final Σ to ς by context, so the
+  query `ΟΣ` (→ `ος`) misses `ΟΣΑ` (→ `οσα`). The fold is lower-casing followed by a small,
+  generated table of the full case-folding differences (ς→σ, ß→ss and the like), one Unicode
+  version for both languages, pinned by the corpus. Then every run of whitespace becomes one space.
+  Diacritic folding (NFD and dropping combining marks, so `cafe` finds "café") is recommended;
+  question 4.
 - **Haystack, per message:** author display name + the drawn text of the body + every link
   address, joined by newlines. "Drawn text" is the text content of the HTML the server already
-  renders for the page, so the server can compute the same string from its own renderer.
+  renders for the page, so the server can compute the same string from its own renderer once
+  `text_content` breaks lines where the page's `renderedText` does, and once the raw content is
+  dropped from the haystack (or the page adds it: either way, one rule).
 - **Fields:** `from:` matches the author's id exactly or the display name as a substring;
   `before:`/`after:`/`on:` are calendar days in the reader's time zone, which the page sends
   (`tz=`), so the server resolves them identically; `in:thread`/`in:main`; `has:link`.
@@ -237,14 +286,17 @@ The server rewrites the query into DNF (OR of ANDs). For each conjunct:
 - **Exhaustive read (proof).** Query-independent: the server reads windows of history into the
   cache and re-runs the cache search over each window. This is the only thing that moves the
   horizon past the cache.
+- **Long messages.** Candidates come from the capped `search_text`; a row whose text was capped
+  (`was_capped`) is always re-matched on its full content, by a scan of the capped rows in the
+  stretch, so the horizon's "every message was tested" holds for long posts too.
 
 ## 6. Sparse catch-up: just the hits
 
 **API** (one new route; the existing ones are unchanged):
 
 ```
-GET /api/v1/channels/{id}/search?q=&tz=&view=main|flat|thread&thread=&below=<instant>&limit=50&cursor=&upstream=none|scan|hints
-→ { hits: [Message, newest first],       // only messages older than `below`
+GET /api/v1/channels/{id}/search?q=&tz=&view=main|flat|thread&thread=&below=<instant>&threads=<ids>&limit=50&cursor=&upstream=none|scan|hints
+→ { hits: [Message, newest first],       // older than `below`, plus any hit in the `threads` the page lacks replies of
     next: cursor | null,                 // more hits in the searched stretch
     horizon: { from_ms, start: bool, as_of_ms, by: "cache" | "upstream" },
     upstream: { state: "idle" | "running" | "done" | "failed", windows_done, eta_s } | null,
@@ -253,21 +305,26 @@ GET /api/v1/channels/{id}/search?q=&tz=&view=main|flat|thread&thread=&below=<ins
 
 `upstream=scan` starts (or joins) a bounded backfill job for the channel. The page polls the same
 route with the cursor; each answer carries the new horizon and any new hits. The bounds are like
-today's walk: a time budget per tap, and Stop. The server matches with FTS5 trigram candidates for
-positive terms of 3 or more characters and a newest-first scan otherwise, then re-matches every
-candidate with the shared matcher on the **full** text, so the 8 KB cap on `search_text` costs
-nothing.
+today's walk: a time budget per tap, and Stop. `below` alone would hide replies the page never
+read inside its own stretch (passed-over threads, and late replies to older threads), so the page
+also names the threads it lacks replies for, and the server searches those whatever their age.
+The server matches with FTS5 trigram candidates for positive terms of 3 or more characters and a
+newest-first scan otherwise, re-matches every candidate with the shared matcher on the full text,
+and re-scans rows whose `search_text` was capped (§5), so the 8 KB cap costs no recall.
 
 **The page.**
 
-- Hits older than the loaded stretch go into the channel's store as *islands*. `projectView`
-  already hides store rows below a view's floor, so the timeline and its read-ahead are unchanged.
+- Hits older than the loaded stretch go into the channel's store as *islands*, with a flag.
+  Today the store counts every reply it holds (`replyTally`: held, and unread unless dealt with)
+  and `projectView` hides rows below a floor only while the cover says `more`. So islands must be
+  kept out of the tally, out of `storeLacksReplies`, and out of the projection explicitly, and it
+  must be decided whether they are saved on the device (proposed: not; they are search results).
 - They are drawn in a "Further back" list above the step-back control: grouped by day, newest
   first, the same row renderer, the same search marks, and a "Show in channel" action. That action
   jumps with an `around` read (Discord `around`, Slack `latest`/`oldest` around the ts), not a walk
   through every page in between.
-- Read state is per message id, as today: Done on an island marks it, and unread counts are not
-  changed by an island arriving.
+- Read state is per message id, as today: Done on an island marks it; with the flag above, an
+  island arriving changes no unread count or "N new" chip.
 - The search count says both parts: "3 here · 2 further back".
 - Offline: the page searches what it holds and says the server could not be asked. Nothing is
   shown as searched that was not.
@@ -276,24 +333,24 @@ nothing.
 
 | Phase | What | Cost (agent-days) |
 |---|---|---|
-| **0. Honest counts** | Server: a structured `replies_bounded` on Slack Flat pages (contract and `contract.d.ts`). Page: All is "whole" only when no page of it was bounded; `historyReadToStart`, `channelSummary` and `searchEmptySentence` follow; the summary always says "N loaded" and names the channel's total only when proven ("112 loaded in All · replies of 11 threads not loaded: open the thread or use Main"). The reproduction above becomes the server test; a page test for the sentence. | 0.5–1 |
-| **0b. All without the bound** (optional) | Read Slack's All via the wildcard listing: time-ordered, replies included, 10 a call. The shim gains one method; Flat's cursor is a time bound. Removes the 10-thread bound and most per-thread calls. | 2–3 |
-| **1. One language** | The spec, a Rust parser/matcher, a JS parser/matcher, the corpus and the differential fuzz in the validation DAG; the page moves to the new matcher (message as the unit); the server's `search_text` built from the renderer's drawn text (a new `SearchTextSource` version, rebuilt in the background). | 2–3 |
+| **0. Honest counts** | Page only: All is "whole" only when its cover says `more: false` and no root in the store lacks replies (`storeLacksReplies`); `loadedIsWhole`, `historyReadToStart`, `channelSummary` and `searchEmptySentence` follow; the summary always says "N loaded" and names a total only when proven ("112 loaded in All · replies of 11 threads not loaded: open them, or use Main"). A page test for the sentence and the summary over a bounded All; the reproduction above becomes a server test that the bound is still reported. | 0.5–1 |
+| **0b. All without the bound** (optional) | Read Slack's All's **older** pages via the wildcard listing: time-ordered, replies included, 10 a call; the newest page stays on history, since how soon search indexes a new message is unmeasured. The shim gains one method; Flat's backward cursor becomes a time bound. Removes the 10-thread bound and most per-thread calls. | 2–3 |
+| **1. One language** | The spec, a Rust parser/matcher, a JS parser/matcher, the corpus and the differential fuzz in the validation DAG; the page moves to the new matcher (message as the unit); the server's `search_text` made to equal the page's haystack: `text_content` breaking lines as `renderedText` does, raw content in or out on both sides (a new `SearchTextSource` version, rebuilt in the background); the fold table generated once for both languages. | 2–3 |
 | **2. Search the server's copy** | The route above with `upstream=none`: cache search below the page's floor, horizon from coverage, the "Further back" list, the horizon line, offline wording. | 2–3 |
-| **3. Search upstream, exhaustively** | The backfill job: Slack wildcard windows (split at 200, cross-checked against history), Discord history plus threads, Google Chat list windows; coverage written as `range`; budget, consent, Stop, a per-channel cost estimate shown before the first tap; the horizon reaching "the whole channel". | 3–4 |
+| **3. Search upstream, exhaustively** | The backfill job: Slack wildcard windows (split at 200, cross-checked against history), Discord history plus threads, Google Chat list windows; coverage written as `range`; on Slack a new time-range scope (the `Scope` enum, `message_scope`, serve rules, race tests); budget, consent, Stop, a per-channel cost estimate shown before the first tap; the horizon reaching "the whole channel". | 4–6 |
 | **4. Upstream hints** (optional) | Slack Real-Time Search, Discord Search Guild Messages, Google Chat `messages:search` (where a user token exists): DNF split, full fetch, exact re-match, shown apart from the horizon. | 1–2 |
 
-Phases 0 and 1 are independent; 2 needs 1; 3 needs 2; 4 needs 2. Total about 9–13 agent-days,
+Phases 0 and 1 are independent; 2 needs 1; 3 needs 2; 4 needs 2. Total about 10–15 agent-days,
 plus 2–3 for 0b.
 
 **Risks.**
 
 - Slack's rate limits are shared by everyone using the same app, so backfill must be paced and
   stop on the first rate limit.
-- The wildcard listing's completeness for file-only messages is unproven, hence the cross-check
-  against history.
-- `max_days` (14) bounds the cache: without question 6, every search past 14 days re-reads
-  upstream.
+- The wildcard listing was seen complete on one young channel only; file-only messages and
+  indexing delay are unproven, hence the cross-check against history and history at the newest end.
+- This instance's `max_days` (14) bounds its cache: without question 6, every search past 14 days
+  re-reads upstream.
 - Changing the match unit from row to message changes what a few searches find today.
 
 ## 8. Questions for the owner
@@ -309,9 +366,10 @@ plus 2–3 for 0b.
 5. **Consent and cost upstream:** start an exhaustive upstream scan only on a tap that shows its
    estimate ("Search Slack further back: about 80 s for this channel"), bounded like today's walk,
    or in the background on every search? *Recommended: on a tap.*
-6. **Keeping history past 14 days:** keep a search-only index (ids, times, `search_text`) beyond
-   `max_days`, keep whole messages longer, or re-read upstream every time? This is a privacy
-   trade-off. *Recommended: a search-only index, 90 days, erased with the channel.*
+6. **Keeping history past 14 days:** the Slack instance keeps 14 days (`max_days = 14`; the code's
+   default is 90). Raise it, add a search-only index (ids, times, `search_text`) kept longer, or
+   re-read upstream every time? A privacy trade-off. *Recommended: raise `max_days` to the default
+   90 first; a separate index only if that is not enough.*
 7. **Upstream hints:** do you want fast far-back hits from the services' own search (Phase 4), shown
    apart because they can never prove absence? Google Chat's needs a user token we do not hold.
    *Recommended: Slack and Discord only, after Phase 3.*
@@ -335,5 +393,25 @@ plus 2–3 for 0b.
   They read only; the vendor CLI is named by the caller through environment variables.
 
 What was not verified: Discord and Google Chat were not called live (no tokens were used); how
-soon Slack indexes a new message; whether Slack's wildcard listing includes file-only messages;
-the 2-message gap between the replay (114) and what the owner saw (112).
+soon Slack indexes a new message; whether Slack's wildcard listing includes file-only messages, or
+is complete beyond one young channel; whether a bot token can make the same calls; the 2-message
+gap between the replay (114) and what the owner saw (112).
+
+## Review
+
+An independent reviewer checked this plan against the code before it landed. It confirmed the
+Flat mechanics, the replay and reproduction numbers, that Slack's All is never served from the
+cache, the description of the page's matcher, and that dropping negations upstream is safe. Its
+corrections are folded in above:
+
+- All's horizon on Slack (passed-over threads and late replies to older threads);
+- `search_text` already coming from the renderer, and the real parity gaps;
+- the 8 KB cap;
+- phrases across line breaks and the other behaviour changes;
+- case folding versus lower-casing;
+- islands versus the reply tally;
+- what else moves a cache horizon forward;
+- Phase 0 needing no server change;
+- the wildcard listing's evidence;
+- `max_days`' default;
+- redactions.
