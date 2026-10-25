@@ -5426,6 +5426,31 @@ const TUNING_BANDS = {
     "how long the chip naming the author filter's new state stays up before it fades. Under most " +
     "of a second it is gone before it is read; past a few seconds it outstays a press's news and " +
     "stands over the messages it names"],
+  // `#523 voice-self-hearing`.
+  ECHO_TAIL_MS: [100, 600,
+    "how long after the agent's last sample leaves the speaker the microphone still waits for the " +
+    "room to fall quiet. Under a tenth of a second a greeting's last word, ringing on, reaches the " +
+    "voice service as the owner's; past six tenths his first word after it is cut off"],
+  ECHO_PARTIAL_GRACE_MS: [200, 1000,
+    "how long after the microphone last sent the agent's sound a vibe-talk-v1 user turn's first " +
+    "frame may still be taken for its echo. Under a fifth of a second a recogniser's partial of " +
+    "the agent's last words is late enough to be the owner's; past a second the owner repeating " +
+    "the agent's question straight after it is taken for an echo and his send ask is lost"],
+  ECHO_FINAL_GRACE_MS: [1000, 3000,
+    "the same for the hosted agent's finished turns, which arrive only after the recogniser has " +
+    "heard the end of the speech: under a second an echo's transcript arrives after it; past three " +
+    "the owner's prompt reply is taken for an echo"],
+  ECHO_TURNS: [1, 3,
+    "how many of the assistant's latest turns a user transcript is compared with. Zero judges " +
+    "nothing; past three the owner quoting something said several turns ago is taken for an echo"],
+  ECHO_TEXT_TRAIL_MS: [300, 2000,
+    "how long after a user turn began the words of the assistant turn it echoes may still arrive " +
+    "(on vibe-talk-v1 its words come alongside its audio). Under three tenths an echo begun with the " +
+    "first word is missed; past two seconds an answer to the owner's words is taken for their source"],
+  ECHO_GREETING_QUIET_MS: [1000, 4000,
+    "how long the hosted agent's speaker must be quiet before its first message counts as over. " +
+    "Under a second a network stall mid-message opens the microphone to the rest of it; past four " +
+    "the owner's first answer is held for the agent's next one too"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -82320,7 +82345,7 @@ test("`#511 voice-explicit-send-only`: the bridge's echo of a relayed prompt is 
     "the relayed prompt's echo was reported as the owner's words");
   // The negative control: a page that reported every user transcript reports the echo.
   const control = newPage(new Map(), brokenScriptEach(
-    ["      if (who === \"you\" && !spoken.entry.echo) reportHeard(spoken.key, spokenText(spoken.entry));",
+    ["      if (who === \"you\" && owners) reportHeard(spoken.key, spokenText(spoken.entry));",
       "      if (who === \"you\") reportHeard(spoken.key, spokenText(spoken.entry));"],
     ["  if (!whole || pageTurnInFlight()) return;", "  if (!whole) return;"]));
   const relayed = await relayInFlight(control);
@@ -82742,4 +82767,244 @@ test("discord-file-posts: attachment and embed lines remain visible with Empty m
   assert.ok(shownIds(page).includes("901"), "attachment-only post hidden");
   assert.ok(shownIds(page).includes("902"), "embed-only post hidden");
   assert.ok(!shownIds(page).includes("903"), "the empty-post control is not hidden");
+});
+
+
+// --- `#523 voice-self-hearing` -------------------------------------------------------------------
+//
+// The owner, 2026-10-25: a new call said "Hello, let's connect you to your chat.", then heard "Let's
+// connect you to your chat" as his and answered it. The phone's microphone hears its speaker. The
+// greeting gate ended when the greeting was SENT, while seconds of it were still to play, and only for
+// a session that promised one; the hosted agent's first message had no gate; and a transcript of the
+// agent's own words was the owner's on screen, in the record and in what the server was told he said
+// (`#511`). Times below: an answer of `seconds` starts after the 0.25 s lead, and is audible
+// ECHO_TAIL_MS after its last sample.
+
+const ECHO_TAIL_MS = sourceConstant("ECHO_TAIL_MS");
+const ECHO_PARTIAL_GRACE_MS = sourceConstant("ECHO_PARTIAL_GRACE_MS");
+const ECHO_GREETING_QUIET_MS = sourceConstant("ECHO_GREETING_QUIET_MS");
+const GREETING = "Hello, let's connect you to your chat.";
+const binaryFramesSent = (socket) => socket.sent.filter((frame) => typeof frame !== "string");
+const shownTexts = (page) => session_lines(page).map((li) => li.text());
+/** The rows not the assistant's that say `words`: a row's text starts with its speaker's label. */
+const ownerRowsSaying = (page, words) =>
+  shownTexts(page).filter((t) => !t.startsWith("assistant") && t.includes(words));
+const MIC_HELD_FOR_AGENT = ["    if (micHeldForAgent()) {\n", "    if (false) {\n"];
+const ECHO_NOT_JUDGED = ["  if (entry.nearAgent) judgeAgentEcho(entry, final);\n", ""];
+/** Move the wall clock and the audio clock on together, as a phone's do. */
+const advance = (page, ms) => {
+  page.setClock(page.clock() + ms);
+  page.audio.currentTime += ms / 1000;
+};
+/** When an answer of `seconds` that starts playing now stops being audible, from now. */
+const audibleMs = (seconds) => 250 + seconds * 1000 + ECHO_TAIL_MS;
+/** `seconds` of the assistant's voice on `vibe-talk-v1` (24 kHz). */
+const v1Voice = (page, socket, seconds) => socket.onmessage({ data: page.pcmFrame(24000 * seconds, SPEECH) });
+/** `seconds` of the assistant's voice on the hosted agent (16 kHz). */
+const hostedVoice = (socket, seconds) =>
+  hosted(socket, { type: "audio", audio_event: { audio_base_64: btoa("\u0000".repeat(32000 * seconds)) } });
+
+/**
+ * A `vibe-talk-v1` call past its opening: the owner spoke first, so the agent's answers may be
+ * talked over, and echo cancellation is on (unless `applied` says the phone refused it).
+ */
+async function talkedV1Call(page, { applied } = {}) {
+  if (applied !== undefined) page.appliedEchoCancellation = applied;
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  speech(socket, "user", 1, "What is new in the chat?", true);
+  await page.settle();
+  return socket;
+}
+
+/**
+ * The agent answers `words` with `seconds` of voice, and the microphone sends a buffer `exposedAt`
+ * ms into it (while it is audible, unless the microphone is held). The clock is left there.
+ */
+function answerHeard(page, socket, turn, words, seconds, exposedAt) {
+  v1Voice(page, socket, seconds);
+  speech(socket, "assistant", turn, words, true);
+  advance(page, exposedAt);
+  speakInto(page);
+}
+
+test("`#523 voice-self-hearing`: the microphone waits for a greeting to finish PLAYING, promised or not, and an answer after it can still be talked over", async () => {
+  for (const greeting of [true, false]) {
+    const run = async (script) => {
+      const page = script ? newPage(new Map(), script) : newPage();
+      const socket = await startNeutralCall(page, { greeting });
+      await page.settle();
+      v1Voice(page, socket, 3);
+      speech(socket, "assistant", 1, GREETING, true);
+      if (greeting) turnDone(socket, 1);
+      await page.settle();
+      page.expireTimers(sourceConstant("VOICE_CAPTURE_RESUME_MS"));
+      advance(page, 1000);
+      speakInto(page);
+      const during = binaryFramesSent(socket).length;
+      advance(page, audibleMs(3) - 1000 + (greeting ? 1 : ECHO_GREETING_QUIET_MS + 1));
+      speakInto(page);
+      return { page, socket, during, after: binaryFramesSent(socket).length };
+    };
+    const { page, socket, during, after } = await run();
+    assert.equal(during, 0, `greeting ${greeting}: the microphone sent the greeting's own sound back while it played`);
+    assert.equal(after, 1, `greeting ${greeting}: the microphone stayed shut after the greeting had played out`);
+    // Echo cancellation is on: the owner talks over the next answer as he always could.
+    v1Voice(page, socket, 2);
+    advance(page, 500);
+    speakInto(page);
+    assert.equal(binaryFramesSent(socket).length, 2, `greeting ${greeting}: an answer after the greeting could not be talked over`);
+
+    const control = await run(brokenScriptEach(MIC_HELD_FOR_AGENT));
+    assert.equal(control.during, 1, "the control held the microphone too: this test cannot see the defect");
+  }
+});
+
+test("`#523 voice-self-hearing`: an answer's words heard back are not the owner's — not drawn, filed or reported as heard — and his own words over it are", async () => {
+  const ANSWER = "Hello, let's connect you to your chat. The coding agent says the build is green.";
+  const run = async (script) => {
+    const page = script ? newPage(new Map(), script) : newPage();
+    const socket = await talkedV1Call(page);
+    answerHeard(page, socket, 2, ANSWER, 4, 2000);
+    // The recogniser's hypotheses of the speaker's sound, the incident's words, while it plays.
+    speech(socket, "user", 3, "Let's", false);
+    speech(socket, "user", 3, "Let's connect you", false);
+    speech(socket, "user", 3, "Let's connect you to your chat.", true);
+    await page.settle();
+    return { page, socket };
+  };
+  const { page, socket } = await run();
+  assert.deepEqual(ownerRowsSaying(page, "connect you"), [], "the agent's own words were drawn as the owner's");
+  assert.ok(!page.heardPosts.some((post) => /connect/i.test(post.text)), "the agent's own words were reported as heard from the owner");
+  // His own words, talked over the same answer, are his.
+  speech(socket, "user", 4, "Stop, read me the last message instead.", true);
+  turnDone(socket, 4);
+  await page.settle();
+  assert.deepEqual([...heardNow(page).values()].filter((t) => !t.startsWith("What is new")), ["Stop, read me the last message instead."]);
+  assert.ok(!storedTexts(page).some((t) => /connect you/.test(t) && t.startsWith("you: ")), storedTexts(page).join(" | "));
+  assert.match(page.el("connection-detail").textContent, /picked up the assistant's own words \("Let's connect you to your chat\."\)/);
+
+  // THE CONTROL: a page that never judges a turn for the agent's echo reports and draws the incident's words.
+  const control = await run(brokenScriptEach(ECHO_NOT_JUDGED));
+  assert.ok(control.page.heardPosts.some((post) => /connect you to your chat/i.test(post.text)),
+    "the control did not report the echo: this test cannot see the defect");
+  assert.equal(ownerRowsSaying(control.page, "connect you").length, 1, "the control did not draw the echo as the owner's");
+});
+
+test("`#523 voice-self-hearing`: the owner answering in the agent's words just after it is his — a send ask, a yes, and anything when the microphone sent none of its sound", async () => {
+  const QUESTION = "Should I send this to the coding agent?";
+  const ASK = "Send this to the coding agent.";
+  const cases = [
+    // Begun after the grace for a partial: his send ask, word for word the question's.
+    ["a send ask after the grace", {}, ASK, audibleMs(2) - 100, ECHO_PARTIAL_GRACE_MS + 100],
+    // Inside the grace, but an answer to the question: the spoken yes judges it.
+    ["a yes inside the grace", {}, "Go ahead and send it.", audibleMs(2) - 100, 300],
+    // Half duplex: no buffer went while the agent was audible, so the service heard no echo.
+    ["half duplex", { applied: false }, ASK, audibleMs(2) - 100, 200],
+  ];
+  for (const [what, options, said, exposedAt, after] of cases) {
+    const page = newPage();
+    const socket = await talkedV1Call(page, options);
+    answerHeard(page, socket, 2, QUESTION, 2, exposedAt);
+    advance(page, after);
+    speech(socket, "user", 3, said.split(" ")[0], false);
+    speech(socket, "user", 3, said, true);
+    await page.settle();
+    assert.ok([...heardNow(page).values()].includes(said), `${what}: the owner's words were not reported as heard`);
+    assert.equal(ownerRowsSaying(page, said).length, 1, `${what}: the owner's words were not drawn as his`);
+  }
+});
+
+test("`#523 voice-self-hearing`: a turn begun just after the agent fell silent reports nothing until it can be judged, so an echo's opening words never reach the server", async () => {
+  const run = async (script) => {
+    const page = script ? newPage(new Map(), script) : newPage();
+    const socket = await talkedV1Call(page);
+    answerHeard(page, socket, 2, "Shall I send it to the coding agent?", 2, audibleMs(2) - 100);
+    advance(page, 300); // no longer audible, inside the grace
+    speech(socket, "user", 3, "send it", false);
+    await page.settle();
+    const early = page.heardPosts.filter((post) => post.text === "send it").length;
+    speech(socket, "user", 3, "send it to the coding agent", false);
+    speech(socket, "user", 3, "send it to the coding agent", true);
+    await page.settle();
+    return { page, early };
+  };
+  const { page, early } = await run();
+  assert.equal(early, 0, "the echo's first two words were reported as heard before the turn could be judged");
+  assert.ok(!page.heardPosts.some((post) => post.text.startsWith("send it")), page.heardPosts.map((post) => post.text).join(" | "));
+  assert.deepEqual(ownerRowsSaying(page, "send it"), [], "the echo was drawn as the owner's");
+  const control = await run(brokenScriptEach(["    const owners = !spoken.entry.echo && !spoken.entry.undecided;\n",
+    "    const owners = !spoken.entry.echo;\n"]));
+  assert.equal(control.early, 1, "the control did not report the opening words: this test cannot see the defect");
+});
+
+test("`#523 voice-self-hearing`: on the hosted agent, the first message is not streamed back while it plays, a stall in it does not end it, and an answer's echo is not the owner's", async () => {
+  const run = async (script) => {
+    const page = script ? newPage(new Map(), script) : newPage();
+    const socket = await startTalking(page);
+    speakInto(page);
+    const before = audioFrames(socket).length;
+    hostedVoice(socket, 2);
+    hostedSays(socket, GREETING);
+    advance(page, 1000);
+    speakInto(page);
+    const during = audioFrames(socket).length - before;
+    // The network stalls for a second and a half after the first part, then the rest arrives.
+    advance(page, audibleMs(2) - 1000 + 1500);
+    speakInto(page); // quiet: nothing to hear, so the microphone sends
+    hostedVoice(socket, 1);
+    advance(page, 300);
+    speakInto(page);
+    const afterStall = audioFrames(socket).length - before - during;
+    return { page, socket, before, during, afterStall };
+  };
+  const { page, socket, before, during, afterStall } = await run();
+  assert.equal(before, 1, "the microphone did not stream before the agent spoke");
+  assert.equal(during, 0, "the first message's own sound was streamed back while it played");
+  assert.equal(afterStall, 1, "the rest of the first message, after a stall, was streamed back while it played");
+  advance(page, audibleMs(1) + ECHO_GREETING_QUIET_MS);
+  speakInto(page);
+  assert.equal(audioFrames(socket).length, 3, "the microphone stayed shut after the first message played out");
+
+  // A later answer is talked over (echo cancellation is on), and its echo is not his.
+  hostedVoice(socket, 3);
+  hostedSays(socket, "The coding agent says the build is green and the deploy finished.");
+  advance(page, 2500);
+  speakInto(page);
+  assert.equal(audioFrames(socket).length, 4, "an answer after the first message could not be talked over");
+  advance(page, 1000);
+  hostedHears(socket, "the build is green and the deploy finished");
+  await page.settle();
+  assert.ok(!page.heardPosts.some((post) => post.text.includes("build is green")), "an answer's echo was reported as heard");
+  assert.deepEqual(ownerRowsSaying(page, "build is green"), [], "an answer's echo was drawn as the owner's");
+  advance(page, 10000);
+  hostedHears(socket, "Ask Claude whether the tests pass.");
+  await page.settle();
+  assert.deepEqual([...heardNow(page).values()], ["Ask Claude whether the tests pass."]);
+
+  const control = await run(brokenScriptEach(MIC_HELD_FOR_AGENT));
+  assert.equal(control.during, 1, "the control held the microphone too: this test cannot see the defect");
+});
+
+test("`#523 voice-self-hearing`: with echo cancellation refused, the microphone pauses whenever the agent is audible, and the call says so", async () => {
+  const run = async (applied) => {
+    const page = newPage();
+    const socket = await talkedV1Call(page, { applied });
+    const sent = binaryFramesSent(socket).length;
+    v1Voice(page, socket, 2);
+    advance(page, 1000);
+    speakInto(page);
+    const during = binaryFramesSent(socket).length - sent;
+    advance(page, audibleMs(2) - 1000 + 1);
+    speakInto(page);
+    return { page, during, after: binaryFramesSent(socket).length - sent };
+  };
+  const refused = await run(false);
+  assert.equal(refused.during, 0, "with nothing cancelling it, the agent's voice was streamed back while it played");
+  assert.equal(refused.after, 1, "the microphone stayed shut after the agent fell silent");
+  assert.match(refused.page.el("connection-detail").textContent, /echo cancellation is off for this call/);
+  // THE CONTROL: applied, the owner talks over an answer, and nothing is said about it.
+  const applied = await run(true);
+  assert.equal(applied.during, 1, "with echo cancellation on, an answer could not be talked over");
+  assert.doesNotMatch(applied.page.el("connection-detail").textContent, /echo cancellation is off/);
 });
