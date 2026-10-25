@@ -120,19 +120,36 @@ fn run_child_verb(mut child: Child, verb: &str, payload: &Value) -> AttemptOutco
     }
 }
 
-/// The built-in `local` route: `serve` as a child of this binary.
+/// The built-in `local` route: `serve` as a child of this binary. It can
+/// only reach this host: for any other target host it is skipped
+/// definitely, so one `teams.json` can name `local` first for every host
+/// (live-trial finding, 2026-10-25: config sync between hosts made the
+/// spoke read the hub's route list and run its own serve, which correctly
+/// route-refused the envelope but wasted the attempt).
 pub struct LocalRoute {
     /// Route name.
     pub name: String,
     /// Binary to run (this executable).
     pub program: PathBuf,
-    /// Extra arguments (`--state-dir` is not a flag; env is inherited).
+    /// This host's key, passed as `--peer`.
     pub peer: String,
+    /// Host this route was built to reach.
+    pub target_host: String,
 }
 
 impl Route for LocalRoute {
     fn name(&self) -> &str {
         &self.name
+    }
+    fn skip_reason(&self, _envelope_bytes: usize) -> Option<String> {
+        if self.target_host == self.peer {
+            None
+        } else {
+            Some(format!(
+                "local route cannot reach host {}",
+                self.target_host
+            ))
+        }
     }
     fn run_verb(&self, verb: &str, payload: &Value) -> AttemptOutcome {
         let child = Command::new(&self.program)
@@ -457,6 +474,7 @@ impl Route for CommandRoute {
 pub fn route_for(
     def: &crate::model::RouteDef,
     this_host: &str,
+    target_host: &str,
     remote_binary: &str,
     links_dir: &std::path::Path,
 ) -> DataResult<Box<dyn Route>> {
@@ -465,6 +483,7 @@ pub fn route_for(
             name: def.name.clone(),
             program: std::env::current_exe()?,
             peer: this_host.to_string(),
+            target_host: target_host.to_string(),
         })),
         "ssh" => Ok(Box::new(SshRoute::from_def(
             &def.name,

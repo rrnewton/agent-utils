@@ -844,6 +844,7 @@ fn routes_for_host(
         out.push(route_for(
             def,
             &globals.host,
+            host_name,
             &remote_binary,
             &globals.links_dir(),
         )?);
@@ -1158,6 +1159,9 @@ fn cmd_outbox(globals: &Globals) -> Result<i32, DataError> {
     let mut rows = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
+            if !crate::ledger::is_entry_file_name(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
                     rows.push(value);
@@ -1194,6 +1198,9 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for file in entries.flatten() {
+            if !crate::ledger::is_entry_file_name(&file.file_name().to_string_lossy()) {
+                continue;
+            }
             let Ok(text) = std::fs::read_to_string(file.path()) else {
                 continue;
             };

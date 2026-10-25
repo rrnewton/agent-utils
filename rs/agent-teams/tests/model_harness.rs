@@ -662,3 +662,103 @@ fn deliverer_accepts_explicit_agent_name() {
         Some(PathBuf::from("/nonexistent-registry/coordinator/queue"))
     );
 }
+
+/// Two-host fake (live-trial regression, 2026-10-25): on the spoke, the
+/// hub's contact lists `local` first in a synced teams file. The local
+/// route must be skipped for the other host (never spawned), the next
+/// route must deliver, and the ID must paste exactly once.
+#[test]
+fn local_route_is_skipped_for_another_host() {
+    use agent_teams::route::LocalRoute;
+    let state = temp_state("two-host-local-skip");
+    declaration_for(&state, "tools", "sim");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = agent_teams::envelope::message_id("sim", "host-b", "tools@host-a", "skip-key");
+    let envelope = build_envelope(
+        &id,
+        "skip-key",
+        "sim",
+        "host-b",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now_ms,
+        now_ms + 7_200_000,
+        None,
+        "via the second route",
+    );
+    let mut entry = write_outbox(&state, &envelope, "tools@host-a", &json!({})).expect("outbox");
+    let team_entry = Entry {
+        host: "host-a".into(),
+        coordinator: None,
+        contacts: vec![Contact::Host],
+    };
+    let host = Host {
+        name: "host-a".into(),
+        routes: vec!["local".into(), "faulty-1".into()],
+        agent_teams: None,
+        services: BTreeMap::new(),
+    };
+    let local = LocalRoute {
+        name: "local".into(),
+        program: PathBuf::from("/nonexistent/agent-teams"),
+        peer: "host-b".into(),
+        target_host: "host-a".into(),
+    };
+    assert!(local.skip_reason(1).is_some());
+    let routes: Vec<Box<dyn Route>> = vec![
+        Box::new(LocalRoute {
+            name: "local".into(),
+            program: PathBuf::from("/nonexistent/agent-teams"),
+            peer: "host-b".into(),
+            target_host: "host-a".into(),
+        }),
+        Box::new(PeerRoute {
+            state: state.clone(),
+        }),
+    ];
+    let result = walk(&state, &mut entry, &team_entry, &host, &routes).expect("walk");
+    assert_eq!(result.state, "accepted", "{result:?}");
+    assert_eq!(paste_count(&state, "tools", &id), 1);
+    let attempts = entry["attempts"].as_array().expect("attempts");
+    assert!(
+        attempts
+            .iter()
+            .any(|a| a["route"] == "local" && a["classification"] == "not-delivered"),
+        "local skip recorded: {attempts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// A route that serves the envelope claiming peer host-b (the sender).
+struct PeerRoute {
+    state: PathBuf,
+}
+
+impl Route for PeerRoute {
+    fn name(&self) -> &str {
+        "peer-route"
+    }
+    fn run_verb(&self, verb: &str, payload: &Value) -> AttemptOutcome {
+        AttemptOutcome::Answered(handle_verb(&self.state, "host-a", "host-b", verb, payload))
+    }
+}
+
+/// Backup files left by atomic rewrites are never walked or listed.
+#[test]
+fn backup_files_are_not_entries() {
+    assert!(agent_teams::ledger::is_entry_file_name(
+        "tm-sim-0123456789abcdef.json"
+    ));
+    assert!(!agent_teams::ledger::is_entry_file_name(
+        "tm-sim-0123456789abcdef.json.1792948390"
+    ));
+    assert!(!agent_teams::ledger::is_entry_file_name(
+        ".tmp-tm-sim-0123456789abcdef-1"
+    ));
+}

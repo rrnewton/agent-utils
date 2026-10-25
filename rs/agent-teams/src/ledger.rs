@@ -21,6 +21,16 @@ pub fn entry_path(state: &Path, team: &str, id: &str) -> PathBuf {
     ledger_dir(state, team).join(format!("{id}.json"))
 }
 
+/// Whether a directory entry name is exactly `<message-id>.json` (not a
+/// backup `<id>.json.<stamp>` left by an atomic rewrite, nor a temp file).
+/// Directory scans must use this: backups parse as stale entries and would
+/// otherwise be walked, listed, or superseded a second time (live-trial
+/// finding, 2026-10-25: pump walked the same outbox entry twice).
+pub fn is_entry_file_name(name: &str) -> bool {
+    name.strip_suffix(".json")
+        .is_some_and(crate::envelope::valid_message_id)
+}
+
 /// Read a ledger entry, if present. A pure read: never recovers (section 9.2).
 pub fn read_entry(state: &Path, team: &str, id: &str) -> Option<Value> {
     let text = fs::read_to_string(entry_path(state, team, id)).ok()?;
@@ -465,6 +475,9 @@ fn newest_on_topic(state: &Path, team: &str, sender: &str, topic: &str) -> Optio
     let entries = fs::read_dir(dir).ok()?;
     let mut newest: Option<(i64, i64)> = None;
     for entry in entries.flatten() {
+        if !is_entry_file_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         let Some(text) = fs::read_to_string(entry.path()).ok() else {
             continue;
         };
@@ -521,6 +534,9 @@ fn apply_supersede(
         return Ok(());
     };
     for entry in entries.flatten() {
+        if !is_entry_file_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         let Ok(text) = fs::read_to_string(entry.path()) else {
             continue;
         };
@@ -658,6 +674,7 @@ pub fn list_entries(state: &Path, team: &str) -> Vec<Value> {
     };
     let mut out: Vec<Value> = entries
         .flatten()
+        .filter(|entry| is_entry_file_name(&entry.file_name().to_string_lossy()))
         .filter_map(|entry| fs::read_to_string(entry.path()).ok())
         .filter_map(|text| serde_json::from_str(&text).ok())
         .collect();

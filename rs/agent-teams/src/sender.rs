@@ -30,6 +30,9 @@ pub fn find_by_key(state: &Path, addressed_to: &str, key: &str) -> Option<Value>
     let dir = outbox_dir(state);
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
+        if !crate::ledger::is_entry_file_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         let Ok(text) = fs::read_to_string(entry.path()) else {
             continue;
         };
@@ -217,15 +220,18 @@ pub fn walk(
             let outcome = route.run_verb("accept", &envelope);
             match outcome {
                 AttemptOutcome::Answered(answer) => {
-                    let answered_state = answer
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .unwrap_or("accepted")
-                        .to_string();
                     let answered_outcome = answer
                         .get("outcome")
                         .and_then(Value::as_str)
                         .unwrap_or("accepted");
+                    // Record what the receiver actually said: a refusal of
+                    // the route carries no state, and must never be logged
+                    // as "accepted" (live-trial finding, 2026-10-25).
+                    let answered_state = answer
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or(answered_outcome)
+                        .to_string();
                     record_attempt(
                         entry_value,
                         &label,
