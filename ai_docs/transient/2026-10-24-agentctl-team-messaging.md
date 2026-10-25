@@ -2247,6 +2247,12 @@ Numbers 1-11 keep revision 1's numbering; 12 onward are new.
   `agent-teams` skill tells agents to use the chat route sparingly; host routes need no such
   restraint (10.7). Still open: one bridge app per team for the shared channel, if it comes back,
   and the questions the DM raises (23, 24, 26).
+- **Chat-DM route (P5) stays off; hub-and-spoke relay (P6) shelved.** Owner, 2026-10-25:
+  "chat-DM route stays off for now, and hub-and-spoke relay is shelved (only two teams matter
+  now; direct routes suffice)". Neither route is implemented; 10.6/10.7 and 11.6 remain design
+  text for review. If either returns, the `agent-teams` skill's restraint rule applies to the
+  chat route (sparingly, tagged, short), and relay acceptance stays gated by
+  `accepts_relay_from`.
 - **17. Private route files.** "Company internal I don't care where exactly. Git ignored
   files." A more durable copy may live in a private repository the owner keeps (2026-10-25;
   quote shortened to leave out a private path). Private routes go in git-ignored

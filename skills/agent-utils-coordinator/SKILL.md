@@ -55,6 +55,13 @@ Start, message, read, and stop agents only through `agentctl`, never with raw te
 commands. If a suite tool fails or lacks a capability, report it (and fix it in agent-utils if
 that is your job) rather than routing around it.
 
+## Message other teams
+
+When work crosses to a coordinator on another host or in another harness, use `agent-teams`
+(the `agent-teams` skill): coordinator-to-coordinator only, exactly once, with the team tag
+grammar and `reply`/`status` verbs that skill documents. Your workers never send cross-team;
+they ask you, and you decide what goes.
+
 ## Supervise
 
 - `agentctl status NAME` and `agentctl read NAME` show progress; the agent's reply in
