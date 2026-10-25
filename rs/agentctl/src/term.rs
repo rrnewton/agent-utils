@@ -1416,6 +1416,52 @@ mod tests {
         )
     }
 
+    fn tproc(pid: u64, ppid: u64, pgrp: u64, tpgid: i64) -> TmuxProc {
+        TmuxProc {
+            pid,
+            ppid,
+            pgrp,
+            tpgid,
+            argv: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pane_processes_scopes_the_foreground_to_the_shells_descendants() {
+        // shell(100, tpgid 200) -> wrapper(200) -> harness(201); a
+        // background job (300) and another session's group member (400,
+        // same numeric group but not a descendant) stay out.
+        let processes = vec![
+            tproc(100, 1, 100, 200),
+            tproc(200, 100, 200, 200),
+            tproc(201, 200, 200, 200),
+            tproc(300, 100, 300, 200),
+            tproc(400, 1, 200, 200),
+        ];
+        let state = tmux_pane_processes(100, &processes).expect("state");
+        assert_eq!(state.foreground_pgid, 200);
+        assert_eq!(state.foreground, vec![200, 201]);
+        assert!(state.descendants.contains(&300));
+        assert!(!state.descendants.contains(&400));
+        assert!(tmux_pane_processes(999, &processes).is_none());
+    }
+
+    #[test]
+    fn choose_candidate_pins_the_launched_process_not_its_same_image_child() {
+        let processes = vec![
+            tproc(100, 1, 100, 200),
+            tproc(200, 100, 200, 200),
+            tproc(201, 200, 200, 200),
+            tproc(202, 200, 200, 200),
+        ];
+        assert_eq!(choose_candidate(&[], &processes), None);
+        assert_eq!(choose_candidate(&[201], &processes), Some(201));
+        // 200 launched 201 and 202: 200 is the pin.
+        assert_eq!(choose_candidate(&[202, 200, 201], &processes), Some(200));
+        // Two unrelated candidates cannot be pinned.
+        assert_eq!(choose_candidate(&[201, 202], &processes), None);
+    }
+
     #[test]
     fn tmux_agent_api_maps_panes_and_infers_unknown_without_a_harness() {
         let backend = tmux(vec![
