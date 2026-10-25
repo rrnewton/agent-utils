@@ -35,6 +35,7 @@ struct Fixture {
     socket: String,
     tmux: PathBuf,
     fake: PathBuf,
+    argv_file: PathBuf,
 }
 
 impl Fixture {
@@ -74,7 +75,14 @@ impl Fixture {
             work.display(),
             root.join("spawn.log").display()
         );
-        fs::write(&fake, FAKE_CLAUDE.replace("__SPAWN_CMD__", &spawn_command)).unwrap();
+        let argv_file = root.join("fake-argv.log");
+        fs::write(
+            &fake,
+            FAKE_CLAUDE
+                .replace("__SPAWN_CMD__", &spawn_command)
+                .replace("__ARGV_FILE__", &argv_file.display().to_string()),
+        )
+        .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
         Some(Self {
             registry,
@@ -83,6 +91,7 @@ impl Fixture {
             socket,
             tmux,
             fake,
+            argv_file,
         })
     }
 
@@ -170,19 +179,27 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
         .expect("anchored harness pid");
     assert!(harness_pid > 0);
 
-    // Send while idle, then while working.
+    // Send while idle, then while working. The work window is long and
+    // polled for, so a loaded host cannot race it shut; the fake ends it
+    // early on the finish-now follow-up.
     let sent = fixture.agentctl_json(&["send", "worker", "hello idle world"]);
     assert_eq!(sent["outcome"], "delivered");
-    let sent = fixture.agentctl_json(&["send", "worker", "work:6 start the long task"]);
+    let sent = fixture.agentctl_json(&["send", "worker", "work:120 start the long task"]);
     assert_eq!(sent["outcome"], "delivered");
-    let status = fixture.agentctl_json(&["status", "worker"]);
-    assert_eq!(status["agent_status"], "working");
+    fixture.wait_for("worker to report working", Duration::from_secs(60), || {
+        let output = fixture.agentctl(&["status", "worker"]);
+        output.status.success()
+            && serde_json::from_slice::<Value>(&output.stdout)
+                .is_ok_and(|status| status["agent_status"] == "working")
+    });
     let sent = fixture.agentctl_json(&[
         "send",
         "worker",
         "followup while busy",
         "--deliver-while-working",
     ]);
+    assert_eq!(sent["outcome"], "delivered");
+    let sent = fixture.agentctl_json(&["send", "worker", "finish-now", "--deliver-while-working"]);
     assert_eq!(sent["outcome"], "delivered");
     let waited = fixture.agentctl_json(&["wait", "worker"]);
     assert_eq!(waited["agent_status"], "idle");
@@ -271,6 +288,20 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
 
     // Revive: kill the worker's harness process, prove the pane is back
     // at its idle shell, and revive the same conversation in a new pane.
+    // Re-verify the pid is still this fixture's fake first: the value was
+    // captured many steps ago and a recycled pid must never be signalled.
+    let fresh = fixture.agentctl_json(&["status", "worker"]);
+    assert_eq!(fresh["harness_identity"]["pid"], json!(harness_pid));
+    let session = fresh["native_session"]["value"]
+        .as_str()
+        .expect("native session")
+        .to_owned();
+    let cmdline =
+        fs::read_to_string(format!("/proc/{harness_pid}/cmdline")).expect("harness cmdline");
+    assert!(
+        cmdline.contains(&fixture.fake.display().to_string()),
+        "pid {harness_pid} is no longer the fake harness"
+    );
     assert!(Command::new("kill")
         .arg(harness_pid.to_string())
         .status()
@@ -298,13 +329,34 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
     assert_eq!(revived["agent_status"], "idle");
     assert_ne!(revived["pane_id"], json!(pane_id));
     assert_eq!(revived["adapter"], "tmux");
+    // The replacement launch must resume the recorded conversation, not
+    // start a new one: the fake logs every invocation's argv.
+    let argv_log = fs::read_to_string(&fixture.argv_file).expect("fake argv log");
+    let invocations: Vec<&str> = argv_log.lines().collect();
+    assert!(
+        invocations.len() >= 2,
+        "expected start and revive launches, got: {argv_log}"
+    );
+    assert!(
+        invocations[0].contains(&format!("--session-id {session}")),
+        "first launch argv: {}",
+        invocations[0]
+    );
+    assert!(
+        invocations
+            .last()
+            .unwrap()
+            .contains(&format!("--resume {session}")),
+        "revive launch argv: {}",
+        invocations.last().unwrap()
+    );
     let sent = fixture.agentctl_json(&["send", "worker", "hello after revive"]);
     assert_eq!(sent["outcome"], "delivered");
 
     // Stop closes the owned pane and archives the record.
     let stopped = fixture.agentctl_json(&["stop", "worker"]);
     assert_eq!(stopped["pane_closed"], json!(true));
-    assert!(!fixture.registry.join("worker.json").exists());
+    assert!(!fixture.registry.join("worker").exists());
     let list = fixture.agentctl(&["list"]);
     assert!(list.status.success());
     assert_eq!(

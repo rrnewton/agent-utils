@@ -31,7 +31,10 @@ def submit(text):
         draw()
         raise SystemExit(0)
     transcript.append("❯ " + text)
-    if text == "spawn-child":
+    if text == "finish-now":
+        working_until = None
+        transcript.append("• finished")
+    elif text == "spawn-child":
         import subprocess
 
         command = os.environ.get("FAKE_SPAWN_CMD") or "__SPAWN_CMD__"
@@ -62,6 +65,10 @@ def submit(text):
 
 def main():
     global composer, working_until
+    argv_file = "__ARGV_FILE__"
+    if not argv_file.startswith("__"):
+        with open(argv_file, "a", encoding="utf-8") as handle:
+            handle.write(" ".join(sys.argv[1:]) + "\n")
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setraw(fd)

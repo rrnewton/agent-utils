@@ -559,7 +559,7 @@ struct Start {
     /// Execution mode; headless workers require an installation with the worker extension
     #[arg(long, value_parser = ["interactive", "headless"])]
     mode: Option<String>,
-    /// Terminal host for the new record: herdr or tmux (default: the selected terminal backend, see --term-backend)
+    /// Terminal host for the new record: herdr or tmux; when given it also selects that terminal backend for this start (default: the backend selected by --term-backend, environment, or profile config)
     #[arg(long, value_parser = ["herdr", "tmux"])]
     backend: Option<String>,
     /// Herdr harness kind; Codex, Claude, and Muse have model presets; agentcloud creates an agentcloud session viewed through agentterm
@@ -1886,6 +1886,22 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
     // environment, or the registry's profile config). When detection
     // merely found no Herdr, fall through so the Herdr client reports its
     // usual not-found error, exactly as before backends were selectable.
+    // A start `--backend` is also an operator selection for that start.
+    let start_backend = match &command {
+        // The flag's value parser admits only these two spellings.
+        Commands::Start(start) => start.backend.as_deref().map(|backend| {
+            if backend == "tmux" {
+                term_backend::BackendKind::Tmux
+            } else {
+                term_backend::BackendKind::Herdr
+            }
+        }),
+        _ => None,
+    };
+    let (selected_backend, backend_explicit) = match start_backend {
+        Some(kind) if !backend_explicit => (kind, true),
+        _ => (selected_backend, backend_explicit),
+    };
     let client: Box<dyn crate::subagents::ManagedApi> = if backend_explicit
         && selected_backend == term_backend::BackendKind::Tmux
     {
@@ -2725,11 +2741,16 @@ fn add_capabilities(value: &mut serde_json::Value) {
                 capabilities.push("anchor");
             }
             // An adopted agent becomes revivable once a launch spec records what it runs.
-            if matches!(
-                adapter,
-                Some("herdr" | "herdr-pane" | "herdr-relay" | "tmux")
-            ) || (matches!(adapter, Some("herdr-foreign" | "tmux-foreign"))
-                && value["launch_spec"].is_object())
+            // On tmux there is also no runtime to report a conversation later,
+            // so revive additionally needs one already recorded.
+            let tmux_conversation =
+                launch["backend"] != "tmux" || value["native_session"].is_object();
+            if tmux_conversation
+                && (matches!(
+                    adapter,
+                    Some("herdr" | "herdr-pane" | "herdr-relay" | "tmux")
+                ) || (matches!(adapter, Some("herdr-foreign" | "tmux-foreign"))
+                    && value["launch_spec"].is_object()))
             {
                 capabilities.push("revive");
             }
