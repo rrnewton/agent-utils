@@ -195,6 +195,9 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # agent-usage is Rust-only for the same reasons as gh-paced, and embeds its guides the same way.
     ("rs/agent-usage/", frozenset({RUST, RUST_WORKSPACE_TESTS})),
     ("common/docs/agent-usage/", frozenset({DOCS, RUST, RUST_WORKSPACE_TESTS})),
+    # agent-teams is Rust-only for the same reasons, and embeds its guides the same way.
+    ("rs/agent-teams/", frozenset({RUST, RUST_WORKSPACE_TESTS})),
+    ("common/docs/agent-teams/", frozenset({DOCS, RUST, RUST_WORKSPACE_TESTS})),
     ("cross/", frozenset({CROSS})),
     ("common/docs/", frozenset({DOCS})),
     ("common/README.md", frozenset()),
@@ -907,6 +910,16 @@ def self_test() -> int:
         ["common/docs/agent-usage/USER_GUIDE.md"],
         {DOCS, RUST, RUST_WORKSPACE_TESTS},
         "agent-usage compiles its guides into the binary, so a guide edit re-tests the crate",
+    )
+    expect(
+        ["rs/agent-teams/src/ledger.rs"],
+        {RUST, RUST_WORKSPACE_TESTS},
+        "the Rust-only agent-teams tool selects the Rust gate and the crate tests, not everything",
+    )
+    expect(
+        ["common/docs/agent-teams/USER_GUIDE.md"],
+        {DOCS, RUST, RUST_WORKSPACE_TESTS},
+        "agent-teams compiles its guides into the binary, so a guide edit re-tests the crate",
     )
     expect(
         ["skills/agentctl/SKILL.md"],

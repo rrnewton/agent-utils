@@ -1,0 +1,47 @@
+{
+  "schema": "agent-teams-teams/v1",
+  "comment": "Owner-level routing hints. Copy to ~/.config/agent-teams/teams.json and edit.",
+  "topology": {
+    "comment": "host-a is reachable from every host and stays up, so it is the hub.",
+    "hubs": ["host-a"],
+    "standby": "on-demand"
+  },
+  "hosts": {
+    "host-a": {
+      "routes": ["local"]
+    },
+    "host-b": {
+      "comment": "host-a may ssh here; host-b cannot reach host-a by ssh, so it dials the hub link itself.",
+      "agent_teams": "~/.local/bin/agent-teams",
+      "routes": ["link-b"],
+      "services": {
+        "tick-hub": {"unit": "tick-hub.service", "comment": "operational alerts"}
+      }
+    }
+  },
+  "teams": {
+    "tools": {
+      "description": "develops the shared tooling",
+      "primary": "host-a",
+      "entries": [
+        {
+          "host": "host-a",
+          "coordinator": "coordinator",
+          "comment": "informational; the host's declaration is authoritative",
+          "contacts": [{"kind": "host"}]
+        }
+      ],
+      "policy_hint": {"accepts_from": ["sim", "service:tick-hub"]}
+    },
+    "sim": {
+      "primary": "host-b",
+      "entries": [
+        {
+          "host": "host-b",
+          "coordinator": "sim-coordinator",
+          "contacts": [{"kind": "host"}]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,31 @@
+[package]
+name = "agent-teams"
+version = "0.1.0"
+description = "Message another team's coordinator, across hosts, exactly once"
+readme = "README.md"
+keywords = ["agents", "messaging", "coordination"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+
+[[bin]]
+name = "agent-teams"
+path = "src/main.rs"
+
+[lib]
+name = "agent_teams"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

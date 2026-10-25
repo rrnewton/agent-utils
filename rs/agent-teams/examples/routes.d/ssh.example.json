@@ -1,0 +1,38 @@
+{
+  "schema": "agent-teams-routes/v1",
+  "comment": "Placeholders only: *.example.json files are never loaded as live routes. Copy to routes.d/ssh.json with real targets; keep company-internal routes in a git-ignored *.private.json.",
+  "routes": {
+    "link-b": {
+      "driver": "ssh",
+      "target": "host-b.example.net",
+      "user": "u",
+      "comment": "The owner's own ssh configuration: allowed permanently, needs no enroll.",
+      "use_user_ssh_config": true,
+      "link": {"mode": "on-demand"},
+      "capabilities": {"max_envelope_bytes": 65536}
+    },
+    "dedicated-b": {
+      "driver": "ssh",
+      "target": "host-b.example.net",
+      "user": "u",
+      "comment": "Dedicated forced-command key from `agent-teams ssh enroll --peer host-b`; optional, stronger attribution.",
+      "identity": "~/.config/agent-teams/ssh/host-a-to-host-b",
+      "known_hosts": "~/.config/agent-teams/ssh/known_hosts",
+      "link": {"mode": "persistent", "ping_seconds": 30, "down_after_failures": 3}
+    },
+    "node-exec-c": {
+      "driver": "command",
+      "mode": "host",
+      "comment": "A runtime's node-exec command, described entirely in data.",
+      "argv": ["{vars.tool}", "node", "exec", "--node", "{host.address}", "--", "{remote...}"],
+      "vars": {"tool": "/usr/local/bin/example-runtimectl"},
+      "interactive": false,
+      "timeout_seconds": 60,
+      "outcome": {
+        "pre_exec_failure": [
+          {"exit": 2, "stderr_regex": "^error: node ", "comment": "checked before dispatch; declare a literal prefix"}
+        ]
+      }
+    }
+  }
+}

@@ -94,3 +94,6 @@ py/tests/js/browser/qa-archive-report.txt
 
 # Agent session registry and bridge state
 .agentctl/
+
+# --- agent-teams private route files (never commit; design 6.3) ---
+*.private.json

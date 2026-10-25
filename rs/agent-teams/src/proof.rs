@@ -1,0 +1,304 @@
+//! Sender proof (design section 8.2) and coordinator resolution over the
+//! control tree.
+//!
+//! Control is a tree: the registry's designated coordinator at the root,
+//! lieutenants below it (`managed_by` = root) managing workers in turn.
+//! Cross-team sending stays with the root coordinator and registered
+//! services: a lieutenant that needs another team asks its coordinator.
+//! The receiving side likewise delivers to the designated coordinator,
+//! never to whoever happened to start the receiver.
+
+use crate::jsonfile::DataResult;
+use crate::model::Designation;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// One process identity: `(boot_id, pid, starttime_ticks)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessIdentity {
+    /// Host boot ID.
+    pub boot_id: String,
+    /// Process ID.
+    pub pid: i64,
+    /// Start ticks from `/proc/<pid>/stat` field 22.
+    pub starttime_ticks: i64,
+}
+
+/// Read a process's start ticks and parent PID from `/proc/<pid>/stat`.
+pub fn stat_of(pid: i64) -> Option<(i64, i64)> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 (comm) may contain spaces and parentheses; split after the last ')'.
+    let close = text.rfind(')')?;
+    let rest: Vec<&str> = text[close + 2..].split_whitespace().collect();
+    // rest[0] is field 3 (state); ppid is field 4, starttime is field 22.
+    let ppid: i64 = rest.get(1)?.parse().ok()?;
+    let starttime: i64 = rest.get(19)?.parse().ok()?;
+    Some((ppid, starttime))
+}
+
+/// Identity of a live process, if it exists.
+pub fn identity_of(pid: i64) -> Option<ProcessIdentity> {
+    let (_, starttime) = stat_of(pid)?;
+    Some(ProcessIdentity {
+        boot_id: crate::timeutil::boot_id(),
+        pid,
+        starttime_ticks: starttime,
+    })
+}
+
+/// Whether a recorded identity still names the same live process.
+pub fn identity_alive(identity: &ProcessIdentity) -> bool {
+    identity.boot_id == crate::timeutil::boot_id()
+        && identity_of(identity.pid)
+            .is_some_and(|live| live.starttime_ticks == identity.starttime_ticks)
+}
+
+/// The ancestor PIDs of this process, nearest first (including self).
+pub fn ancestry() -> Vec<i64> {
+    let mut chain = Vec::new();
+    let mut pid = std::process::id() as i64;
+    for _ in 0..128 {
+        chain.push(pid);
+        match stat_of(pid) {
+            Some((ppid, _)) if ppid > 0 && ppid != pid => pid = ppid,
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Whether any ancestor (or self) has exactly this identity.
+pub fn ancestry_contains(identity: &ProcessIdentity) -> bool {
+    ancestry().iter().any(|pid| {
+        identity_of(*pid).is_some_and(|live| {
+            live.pid == identity.pid
+                && live.starttime_ticks == identity.starttime_ticks
+                && live.boot_id == identity.boot_id
+        })
+    })
+}
+
+/// Read an agentctl registry's coordinator designation
+/// (`REGISTRY/coordinator.json`, `{"name": ...}`).
+pub fn registry_coordinator_name(registry: &Path) -> Option<String> {
+    let value: Value =
+        serde_json::from_str(&std::fs::read_to_string(registry.join("coordinator.json")).ok()?)
+            .ok()?;
+    value.get("name")?.as_str().map(str::to_string)
+}
+
+/// Read one agent record's pinned harness identity, plus its `managed_by`
+/// controller name, when recorded.
+pub fn agent_record(registry: &Path, agent: &str) -> Option<(ProcessIdentity, Option<String>)> {
+    let text = std::fs::read_to_string(registry.join(agent).join("agent.json")).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let identity = value.get("harness_identity")?;
+    let parsed = ProcessIdentity {
+        boot_id: identity.get("boot_id")?.as_str()?.to_string(),
+        pid: identity.get("pid")?.as_i64()?,
+        starttime_ticks: identity.get("starttime_ticks")?.as_i64()?,
+    };
+    let managed_by = value
+        .get("managed_by")
+        .and_then(|m| m.get("agent"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some((parsed, managed_by))
+}
+
+/// The designated coordinator's identity for a registry designation.
+pub fn coordinator_identity(
+    designation: &Designation,
+    registry: Option<&Path>,
+) -> Option<ProcessIdentity> {
+    match designation {
+        Designation::Pinned {
+            boot_id,
+            pid,
+            starttime_ticks,
+        } => Some(ProcessIdentity {
+            boot_id: boot_id.clone(),
+            pid: *pid,
+            starttime_ticks: *starttime_ticks,
+        }),
+        Designation::Registry => {
+            let registry = registry?;
+            let name = registry_coordinator_name(registry)?;
+            agent_record(registry, &name).map(|(identity, _)| identity)
+        }
+    }
+}
+
+/// Walk `managed_by` from `agent` up to the tree root; returns the chain
+/// (agent first, root last). Cycles stop the walk.
+pub fn managed_by_chain(registry: &Path, agent: &str) -> Vec<String> {
+    let mut chain = vec![agent.to_string()];
+    let mut current = agent.to_string();
+    for _ in 0..64 {
+        match agent_record(registry, &current).and_then(|(_, parent)| parent) {
+            Some(parent) if !chain.contains(&parent) => {
+                chain.push(parent.clone());
+                current = parent;
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// How the caller stands to a team's coordinator.
+#[derive(Debug, PartialEq)]
+pub enum SenderStanding {
+    /// The caller is (inside) the designated root coordinator.
+    Coordinator,
+    /// The caller is an agent of the team but not the root coordinator.
+    NotCoordinator {
+        /// The agent the caller proved to be.
+        agent: String,
+        /// Whether that agent manages others (a lieutenant).
+        lieutenant: bool,
+    },
+    /// No agent of this team was found in the ancestry.
+    Unknown,
+}
+
+/// Prove the caller's standing for one declaration on this host.
+pub fn sender_standing(designation: &Designation, registry: Option<&Path>) -> SenderStanding {
+    let Some(coordinator) = coordinator_identity(designation, registry) else {
+        return SenderStanding::Unknown;
+    };
+    if ancestry_contains(&coordinator) {
+        return SenderStanding::Coordinator;
+    }
+    // Not the coordinator: is the caller at least a known agent of the registry?
+    if let (Designation::Registry, Some(registry)) = (designation, registry) {
+        if let Ok(entries) = std::fs::read_dir(registry) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some((identity, _)) = agent_record(registry, &name) {
+                    if ancestry_contains(&identity) {
+                        let lieutenant = std::fs::read_dir(registry)
+                            .map(|all| {
+                                all.flatten().any(|other| {
+                                    agent_record(registry, &other.file_name().to_string_lossy())
+                                        .and_then(|(_, parent)| parent)
+                                        .is_some_and(|parent| parent == name)
+                                })
+                            })
+                            .unwrap_or(false);
+                        return SenderStanding::NotCoordinator {
+                            agent: name,
+                            lieutenant,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    SenderStanding::Unknown
+}
+
+/// Whether this process runs inside the systemd unit `unit` (service proof).
+pub fn inside_unit(unit: &str) -> bool {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .map(|text| {
+            text.lines()
+                .any(|line| line.split('/').any(|component| component == unit))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the ancestry contains any known agent harness process of a registry
+/// (a worker refused as itself cannot retry as a service).
+pub fn ancestry_has_agent(registry: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(registry) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        agent_record(registry, &entry.file_name().to_string_lossy())
+            .is_some_and(|(identity, _)| ancestry_contains(&identity))
+    })
+}
+
+/// The state directory: `$AGENT_TEAMS_STATE_DIR`, else
+/// `$XDG_STATE_HOME/agent-teams`, else `~/.local/state/agent-teams`.
+pub fn state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AGENT_TEAMS_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(xdg).join("agent-teams");
+    }
+    crate::jsonfile::expand_home("~/.local/state/agent-teams")
+}
+
+/// The config directory holding `teams.json` and `routes.d`.
+pub fn config_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg).join("agent-teams");
+    }
+    crate::jsonfile::expand_home("~/.config/agent-teams")
+}
+
+/// This host's key: `$AGENT_TEAMS_HOST`, else the machine hostname's first label.
+pub fn this_host() -> String {
+    if let Ok(host) = std::env::var("AGENT_TEAMS_HOST") {
+        if !host.is_empty() {
+            return host;
+        }
+    }
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| {
+            s.trim()
+                .split('.')
+                .next()
+                .unwrap_or("localhost")
+                .to_string()
+        })
+        .unwrap_or_else(|_| "localhost".to_string())
+}
+
+/// Load every declaration under `<state>/teams.d/*/declaration.json`.
+pub fn load_declarations(
+    state: &Path,
+) -> DataResult<Vec<(String, PathBuf, crate::model::Declaration)>> {
+    let mut out = Vec::new();
+    let dir = state.join("teams.d");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(out);
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path().join("declaration.json"))
+        .filter(|p| p.exists())
+        .collect();
+    paths.sort();
+    for path in paths {
+        let declaration = crate::model::load_declaration(&path)?;
+        out.push((declaration.team.clone(), path, declaration));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_identity_is_alive_and_in_ancestry() {
+        let me = identity_of(std::process::id() as i64).expect("self identity");
+        assert!(identity_alive(&me));
+        assert!(ancestry_contains(&me));
+        let stale = ProcessIdentity {
+            starttime_ticks: me.starttime_ticks + 1,
+            ..me.clone()
+        };
+        assert!(!identity_alive(&stale));
+    }
+
+    #[test]
+    fn stat_parses_parent() {
+        let (ppid, _) = stat_of(std::process::id() as i64).expect("stat");
+        assert!(ppid >= 0);
+    }
+}

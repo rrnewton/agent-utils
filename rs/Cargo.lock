@@ -13,6 +13,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-teams"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "agent-usage"
 version = "0.1.0"
 dependencies = [

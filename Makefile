@@ -2,7 +2,7 @@
 .PHONY: all both py rs check check-workspace check-deps check-test-suite-selector \
 	check-validation-components check-pytest-sharder check-validate-selector check-client-names \
 	check-documented-defaults check-site mypy test cross check-packages check-python-packages \
-	check-rust-packages validate validate-all fmt clean
+	check-rust-packages validate validate-all soak-agent-teams fmt clean
 
 all: both
 
@@ -56,6 +56,14 @@ validate:
 
 validate-all:
 	python3 scripts/validate.py --all
+
+# The agent-teams exactly-once soak (design 9.7): optional, nobody's push waits for it.
+# The gate runs the bounded pass; this sweeps more seeds of the same harness.
+# Usage: make soak-agent-teams SEEDS=20000
+SEEDS ?= 5000
+soak-agent-teams:
+	AGENT_TEAMS_SOAK_SEEDS=$(SEEDS) cargo test --release --manifest-path rs/Cargo.toml \
+		-p agent-teams --test model_harness model_harness_soak -- --ignored --nocapture
 
 # The selector must not be able to silently under-run. Offline, no build, no network.
 check-validate-selector:
