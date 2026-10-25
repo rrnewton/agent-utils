@@ -46,6 +46,7 @@ class Crate:
 
 CRATES: tuple[Crate, ...] = (
     Crate("agent-queue", (), "agent_queue", ()),
+    Crate("term-backend", (), "term_backend", ()),
     Crate("chat-subscription", (), "chat_subscription", ()),
     Crate("chat-subscription-plugin", (), "chat_subscription_plugin", ()),
     Crate(

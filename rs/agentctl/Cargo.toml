@@ -13,6 +13,7 @@ authors.workspace = true
 
 [dependencies]
 agent-queue = { version = "0.1.0", path = "../agent-queue" }
+term-backend = { version = "0.1.0", path = "../term-backend" }
 chat-subscription = { version = "0.1.0", path = "../chat-subscription" }
 chat-subscription-plugin = { version = "0.1.0", path = "../chat-subscription-plugin" }
 clap = { version = "4.5", features = ["derive"] }

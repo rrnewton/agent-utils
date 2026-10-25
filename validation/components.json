@@ -20,6 +20,7 @@
         "rs/chat-subscription-plugin/",
         "rs/chat-subscription-slack/",
         "rs/chat-subscription/",
+        "rs/term-backend/",
         "skills/agentctl/",
         "skills/herdr-agent/"
       ],

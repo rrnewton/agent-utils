@@ -6,6 +6,7 @@ version, license, README, and embedded user guide.
 
 | Crate | Binaries | Purpose |
 |---|---|---|
+| `term-backend` | library | Backend-neutral terminal-multiplexer traits with Herdr, tmux, and fake backends. |
 | `chat-subscription` | library | Model ordered inbound events, replay gaps, and durable acknowledgement boundaries. |
 | `chat-subscription-plugin` | library | Carry the subscription contract over a bounded, versioned process protocol. |
 | `chat-subscription-slack` | `agentctl-slack-plugin`, `agentctl-slack-outbound` | Slack subscription plugin and bot-identity reply helper for `agentctl chat`. |
