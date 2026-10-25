@@ -74,9 +74,46 @@ fn parse_identity(value: &Value) -> Option<ProcessIdentity> {
     })
 }
 
-/// Read an agentctl registry's coordinator designation
-/// (`REGISTRY/coordinator.json`, `{"name": ...}`).
+/// The agentctl binary used for designation reads: `$AGENT_TEAMS_AGENTCTL`,
+/// else `agentctl` on PATH.
+fn agentctl_binary() -> String {
+    std::env::var("AGENT_TEAMS_AGENTCTL").unwrap_or_else(|_| "agentctl".to_string())
+}
+
+/// `agentctl coordinator show` as JSON: the designation as agentctl itself
+/// resolves it (following the designated generation through rename/revive),
+/// rather than the raw file. `None` when the binary is unavailable, predates
+/// the command, or no coordinator is designated (show exits 1 then).
+pub fn coordinator_show(registry: &Path) -> Option<Value> {
+    let output = std::process::Command::new(agentctl_binary())
+        .arg("--registry")
+        .arg(registry)
+        .args(["coordinator", "show"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    let value: Value = serde_json::from_str(&text[start..=end]).ok()?;
+    if value.get("designated").and_then(Value::as_bool) == Some(true) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Read an agentctl registry's designated coordinator name: from
+/// `agentctl coordinator show` first, falling back to the designation file
+/// (`REGISTRY/coordinator.json`, `{"name": ...}`) for older binaries.
 pub fn registry_coordinator_name(registry: &Path) -> Option<String> {
+    if let Some(show) = coordinator_show(registry) {
+        if let Some(name) = show.get("name").and_then(Value::as_str) {
+            return Some(name.to_string());
+        }
+    }
     let value: Value =
         serde_json::from_str(&std::fs::read_to_string(registry.join("coordinator.json")).ok()?)
             .ok()?;
@@ -121,7 +158,16 @@ pub fn coordinator_identity(
         Designation::Registry => {
             let registry = registry?;
             let name = registry_coordinator_name(registry)?;
-            agent_record(registry, &name).map(|(identity, _)| identity)
+            if let Some((identity, _)) = agent_record(registry, &name) {
+                return Some(identity);
+            }
+            // The record carries no pinned identity (for example a session
+            // registered without one): observe the harness process agentctl
+            // itself reports for the designated coordinator, this boot only.
+            let pid = coordinator_show(registry)?
+                .get("harness_pid")
+                .and_then(Value::as_u64)?;
+            identity_of(pid)
         }
     }
 }
@@ -293,6 +339,33 @@ mod tests {
         };
         assert!(!identity_alive(&stale));
         assert!(!ancestry_contains(&stale));
+    }
+
+    #[test]
+    fn coordinator_show_parses_fake_agentctl() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("agent-teams-fake-agentctl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("agentctl");
+        let body = "#!/bin/sh\necho '{\"designated\": true, \"name\": \"coordinator\", \"harness_pid\": PID}'\n"
+            .replace("PID", &std::process::id().to_string());
+        {
+            let mut file = std::fs::File::create(&script).expect("script");
+            file.write_all(body.as_bytes()).expect("script body");
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("script mode");
+        // SAFETY: single-threaded section by construction of this test's own
+        // env use; other tests here never read AGENT_TEAMS_AGENTCTL.
+        unsafe { std::env::set_var("AGENT_TEAMS_AGENTCTL", &script) };
+        let show = coordinator_show(Path::new("/nonexistent-registry"));
+        unsafe { std::env::remove_var("AGENT_TEAMS_AGENTCTL") };
+        let show = show.expect("show JSON");
+        assert_eq!(show["name"], "coordinator");
+        assert_eq!(show["harness_pid"], u64::from(std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

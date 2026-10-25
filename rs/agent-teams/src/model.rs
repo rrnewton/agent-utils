@@ -435,6 +435,7 @@ fn check_private_ignored(file: &Path, warnings: &mut Vec<String>) {
     let status = std::process::Command::new("git")
         .args(["-C", &dir.to_string_lossy(), "check-ignore", "-q", "--"])
         .arg(file)
+        .stderr(std::process::Stdio::null())
         .status();
     match status {
         Ok(s) if s.success() => {}
