@@ -110,11 +110,16 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch --once\n  agentctl --registry ~/project/.agentctl watch --interval 60\n\nConfiguration is REGISTRY/restore.json (herdr_unit, units, timers [{unit, max_age_seconds}],\ncoordinator). health.json goes to --state-dir (default $XDG_STATE_HOME/agentctl/watch). With --once,\nexit 0 when every check passed and 1 otherwise. Without it the watch runs until stopped."
     )]
     Watch(Watch),
-    /// Watch every registered agent and tell the coordinator when one needs a human: at a harness approval or permission prompt, idle without a verdict, stalled with no new output, or dead. One notice per episode, queued durably for the coordinator; never answers a prompt and never types into any other agent
+    /// Watch every registered agent and tell the coordinator when one finished its turn with a verdict or needs a human: at a harness approval or permission prompt, idle without a verdict, stalled with no new output, or dead. One notice per episode, queued durably for the coordinator; never answers a prompt and never types into any other agent
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 15 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued for the coordinator through the same durable path as `agentctl send`, so a\nbusy coordinator loses nothing. A verdict is a line starting with one of --done-marker near the bottom of the agent's screen\n(--done-marker replaces the DONE:/BLOCKED: defaults); an agent that was never sent work, or still has prompts queued, is\nnever reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓` above the input box) is never judged\nstalled or idle until it is back at the bottom. Episode memory lives in --state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a batch's queue ID\nis derived from its notices, so a restart recognises a batch that is already queued instead of sending it twice, and one\nwatcher runs per state directory. With --once, exit 0 only when the team could be probed, no episode is reported or due, and no\nview is scrolled up, 1 otherwise. Without it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 5 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued for the coordinator through the same durable path as `agentctl send`, so a\nbusy coordinator loses nothing. A verdict is a prose line (not tool output) of the agent's last reply (from its first block after the last user turn\non screen) that starts with one of --done-marker once any reply bullet is stripped (--done-marker replaces the DONE:/BLOCKED:\ndefaults). An idle agent with a verdict is reported as child-done after --child-done-seconds (default 0: the pass that sees it),\nin a message of its own that names the verdict line, once per turn, never held by --min-notice-interval; when the registry's\nlanding queue (`agentctl hold`) has agents waiting on it, the same message says who is next. An agent that was never sent\nwork, or still has prompts queued, is never reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓`\nabove the input box) is never judged stalled, idle, or finished until it is back at the bottom. Episode memory lives in\n--state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a message's queue ID is derived from its notices, so a restart\nrecognises a message that is already queued instead of sending it twice, and one watcher runs per state directory. With\n--once, exit 0 only when the team could be probed, no episode other than child-done is reported or due, and no view is\nscrolled up, 1 otherwise.\nWithout it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
     )]
     WatchAgents(WatchAgents),
+    /// Record that an agent lands after another (the landing queue), list the queue, or drop a hold. `watch-agents` reads it: when OTHER finishes its turn with a verdict that does not start with BLOCKED, OTHER's child-done notice to the coordinator says NAME is next, and once that notice is queued the hold is marked released. Nothing is ever sent to NAME
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl hold cl-ingest --after cl-dedupe --note \"gate green, ready to push\"\n  agentctl --registry ~/project/.agentctl hold --list\n  agentctl --registry ~/project/.agentctl hold cl-ingest --release\n\nThe queue is REGISTRY/landing-queue.json (schema agentctl-landing-queue/v1). One hold per NAME: a new hold replaces the old.\nA chain (B after A, C after B) advances one step per finish. A released hold stays listed, with released_by and\nreleased_at, for a day. Prints the queue as JSON; --release exits 1 when NAME had no hold."
+    )]
+    Hold(Hold),
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
@@ -288,9 +293,12 @@ struct WatchAgents {
     /// Minutes an approval or permission prompt may hold before it is reported, from 1 to 1440 (default: 5)
     #[arg(long, default_value = "5", value_parser = watch_minutes, value_name = "MINUTES")]
     approval_minutes: u64,
-    /// Minutes an agent may sit idle without a verdict, with an unchanged screen, before it is reported, from 1 to 1440 (default: 15); an idle agent whose screen shows work running (Claude Code's `esc to interrupt`, or a count of background shells or agents) is held to --stall-minutes instead
-    #[arg(long, default_value = "15", value_parser = watch_minutes, value_name = "MINUTES")]
+    /// Minutes an agent may sit idle without a verdict, with an unchanged screen, before it is reported, from 1 to 1440 (default: 5); an idle agent whose screen shows work running (Claude Code's `esc to interrupt`, or a count of background shells or agents) is held to --stall-minutes instead
+    #[arg(long, default_value = "5", value_parser = watch_minutes, value_name = "MINUTES")]
     idle_minutes: u64,
+    /// Seconds an agent may sit idle with a verdict in its last reply, with an unchanged screen, before it is reported child-done, from 0 to 3600 (default: 0, the pass that first sees it); a child-done notice is its own message, sent at once, never held by --min-notice-interval
+    #[arg(long, default_value = "0", value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
+    child_done_seconds: u64,
     /// Minutes a working agent, or an idle one whose screen shows work running, may show no new output before it is reported stalled, from 1 to 1440 (default: 30)
     #[arg(long, default_value = "30", value_parser = watch_minutes, value_name = "MINUTES")]
     stall_minutes: u64,
@@ -300,12 +308,31 @@ struct WatchAgents {
     /// Line prefix that counts as a verdict; repeatable, and replaces the defaults (default: DONE: and BLOCKED:)
     #[arg(long = "done-marker", value_name = "PREFIX")]
     done_markers: Vec<String>,
-    /// Minimum seconds between two messages to the coordinator; notices batch and wait, from 0 to 86400 (default: 300)
+    /// Minimum seconds between two batched messages to the coordinator; notices other than child-done batch and wait, from 0 to 86400 (default: 300)
     #[arg(long, default_value = "300", value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
     min_notice_interval: u64,
     /// Directory for agent-watch-state.json and agent-watch.json (default: $XDG_STATE_HOME/agentctl/agent-watch)
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct Hold {
+    /// Agent that waits to land (1-32 lowercase letters, digits, and hyphens); required unless --list
+    #[arg(value_name = "NAME", required_unless_present = "list")]
+    name: Option<String>,
+    /// Agent whose finish releases NAME; required to record a hold
+    #[arg(long, value_name = "OTHER", required_unless_present_any = ["list", "release"], conflicts_with_all = ["list", "release"])]
+    after: Option<String>,
+    /// Free text repeated in the release notice, such as what NAME is ready to land (default: empty)
+    #[arg(long, value_name = "TEXT", default_value = "", requires = "after")]
+    note: String,
+    /// Drop NAME's hold, released or not, instead of recording one
+    #[arg(long, conflicts_with = "list")]
+    release: bool,
+    /// Print the landing queue and change nothing
+    #[arg(long, conflicts_with = "name")]
+    list: bool,
 }
 
 #[derive(Args)]
@@ -1542,11 +1569,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 check_only: value.check_only,
                 approval: Duration::from_secs(value.approval_minutes * 60),
                 idle: Duration::from_secs(value.idle_minutes * 60),
+                child_done: Duration::from_secs(value.child_done_seconds),
                 stall: Duration::from_secs(value.stall_minutes * 60),
                 dead: Duration::from_secs(value.dead_minutes * 60),
                 markers,
                 min_notice_interval: Duration::from_secs(value.min_notice_interval),
                 state_dir: value.state_dir,
+                landing_queue: Some(crate::landing_queue::path(&args.registry)),
             };
             let mut probe = crate::agent_watch::ManagedProbe::new(
                 &client,
@@ -1562,6 +1591,28 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             )?;
             write_json(&report).map_err(Failure::Output)?;
             return Ok(if report["ok"] == true { 0 } else { 1 });
+        }
+        Commands::Hold(value) => {
+            let path = crate::landing_queue::path(&args.registry);
+            let now = crate::agent_watch::Clock::now(&crate::agent_watch::SystemClock);
+            let (queue, found) = match (value.list, value.release, value.name, value.after) {
+                (true, ..) => (crate::landing_queue::load(&path)?, true),
+                (false, true, Some(name), _) => {
+                    let (found, queue) = crate::landing_queue::drop_hold(&path, &name, now)?;
+                    (queue, found)
+                }
+                (false, false, Some(name), Some(after)) => (
+                    crate::landing_queue::hold(&path, &name, &after, &value.note, now)?,
+                    true,
+                ),
+                _ => {
+                    return Err(Failure::Usage(
+                        "hold needs NAME --after OTHER, NAME --release, or --list".to_owned(),
+                    ))
+                }
+            };
+            write_json(&queue).map_err(Failure::Output)?;
+            return Ok(i32::from(!found));
         }
         Commands::InstallUnits(value) => {
             let absolute = |path: &Path| {
@@ -1996,7 +2047,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Restore(_)
         | Commands::InstallUnits(_)
         | Commands::Watch(_)
-        | Commands::WatchAgents(_) => {
+        | Commands::WatchAgents(_)
+        | Commands::Hold(_) => {
             unreachable!()
         }
     };

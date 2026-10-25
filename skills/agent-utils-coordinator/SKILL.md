@@ -64,6 +64,8 @@ that is your job) rather than routing around it.
   possibly-submitted prompt automatically.
 - Pause automation (`agentctl pause`) before a human types into the same terminal.
 - Keep a sensible number of agents busy on real tasks; idle agents and idle slots are cost.
+  Where `agentctl watch-agents` runs, a child that ends its turn with a `DONE:` or `BLOCKED:`
+  verdict reaches you at once as a `child-done` notice; act on it rather than waiting for a sweep.
 
 ## Slot lifecycle
 
@@ -82,6 +84,8 @@ that is your job) rather than routing around it.
 - Follow the primary repository's own landing rules: pull requests or direct pushes, required
   reviews, required checks. Do not carry a habit from another repository across that boundary.
 - Validate before you push, using the repository's own validation command.
+- When landings go one at a time, record who is next with `agentctl hold NAME --after OTHER`
+  (not `wrkslots hold`, which preserves a slot); OTHER's `child-done` notice then names NAME.
 - **Never read `$?` after a pipe.** `cmd | tail` reports `tail`'s status. Capture the status first
   (`cmd > out.log 2>&1; rc=$?`) for anything that validates, pushes, or lands.
 - After a push or merge, read the result back from the remote by content. A command's own

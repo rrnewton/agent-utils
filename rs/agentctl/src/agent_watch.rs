@@ -3,9 +3,11 @@
 //! `agentctl watch` keeps the coordinator's environment alive; this watch keeps an eye on
 //! the agents themselves. Every pass it lists the registry, reads each running agent's
 //! visible screen, and classifies the agent as at a harness approval or permission prompt,
-//! idle without a verdict, stalled, dead, or healthy. A condition that holds past its
-//! threshold becomes one notice to the coordinator, sent through the same durable queue
-//! as `agentctl send`, so a busy coordinator loses nothing: the notice waits in its queue.
+//! finished with a verdict, idle without one, stalled, dead, or healthy. A condition that
+//! holds past its threshold becomes one notice to the coordinator, sent through the same
+//! durable queue as `agentctl send`, so a busy coordinator loses nothing: the notice waits in
+//! its queue. A finished child is reported at once, in a message of its own, so the parent can
+//! give it its next task without waiting for its own sweep.
 //!
 //! The watcher never answers a prompt and never types into any agent except the
 //! coordinator. Its episode memory (when each condition was first seen, whether it was
@@ -34,8 +36,12 @@ const SCREEN_LINES: usize = 200;
 /// prompts at the bottom of the screen; scanning the whole transcript would match an
 /// agent merely discussing a prompt.
 const PROMPT_WINDOW_LINES: usize = 12;
-/// Bottom screen lines scanned for a completion marker.
+/// Bottom screen lines scanned for a completion marker on a screen that draws no reply bullets.
 const MARKER_WINDOW_LINES: usize = 30;
+/// Characters kept of a proving line quoted in a notice.
+const QUOTED_LINE_CHARS: usize = 160;
+/// Seconds a reported finish of an agent no longer listed is remembered.
+const FINISHED_MEMORY_SECONDS: f64 = 3600.0;
 /// Seconds the coordinator is given to accept a notice before it simply stays queued.
 const NOTICE_READY_SECONDS: u64 = 10;
 
@@ -60,6 +66,9 @@ pub struct WatchAgentsOptions {
     pub approval: Duration,
     /// How long an agent may sit idle without a verdict before it is reported.
     pub idle: Duration,
+    /// How long an agent may sit idle with a verdict, its screen unchanged, before it is
+    /// reported finished; zero reports it in the pass that first sees it.
+    pub child_done: Duration,
     /// How long a working agent may show no new output before it is reported.
     pub stall: Duration,
     /// How long a running record's harness may be unreachable before it is reported dead.
@@ -71,6 +80,9 @@ pub struct WatchAgentsOptions {
     /// Where `agent-watch-state.json` and `agent-watch.json` are written
     /// (default `$XDG_STATE_HOME/agentctl/agent-watch`).
     pub state_dir: Option<PathBuf>,
+    /// The registry's landing queue (`agentctl hold`), read when a child finishes so its
+    /// notice can say who lands next; `None` leaves notices without that line.
+    pub landing_queue: Option<PathBuf>,
 }
 
 impl WatchAgentsOptions {
@@ -78,6 +90,7 @@ impl WatchAgentsOptions {
         match kind {
             EpisodeKind::ApprovalPrompt => self.approval,
             EpisodeKind::IdleNoVerdict => self.idle,
+            EpisodeKind::ChildDone => self.child_done,
             EpisodeKind::Stalled => self.stall,
             EpisodeKind::Dead => self.dead,
         }
@@ -96,6 +109,8 @@ pub enum EpisodeKind {
     Stalled,
     /// The record says running but the harness cannot be reached.
     Dead,
+    /// The agent went idle or done with a verdict marker in its last reply.
+    ChildDone,
 }
 
 impl EpisodeKind {
@@ -107,6 +122,7 @@ impl EpisodeKind {
             Self::IdleNoVerdict => "idle-no-verdict",
             Self::Stalled => "stalled",
             Self::Dead => "dead",
+            Self::ChildDone => "child-done",
         }
     }
 
@@ -130,6 +146,7 @@ impl EpisodeKind {
                 "unreachable for over {} minutes while its record says running",
                 minutes(options.dead)
             ),
+            Self::ChildDone => "finished its turn with a verdict".to_owned(),
         }
     }
 }
@@ -180,18 +197,93 @@ fn approval_prompt_line(screen: &str) -> Option<String> {
         APPROVAL_PATTERNS
             .iter()
             .any(|pattern| lowered.contains(pattern))
-            .then(|| line.trim().chars().take(160).collect())
+            .then(|| line.trim().chars().take(QUOTED_LINE_CHARS).collect())
     })
 }
 
-/// Whether a verdict marker starts a line near the bottom of `screen`.
-fn has_verdict(screen: &str, markers: &[String]) -> bool {
-    let lines: Vec<&str> = screen.lines().collect();
-    let start = lines.len().saturating_sub(MARKER_WINDOW_LINES);
-    lines[start..].iter().any(|line| {
-        let line = line.trim_start();
-        markers.iter().any(|marker| line.starts_with(marker))
+/// Bullets a harness draws at column 0 to open an assistant block: Claude Code's `●` (`⏺`
+/// in older builds), Muse's `◆`, and Codex's `•`.
+const REPLY_BULLETS: [char; 4] = ['●', '⏺', '◆', '•'];
+
+/// `text` without the reply bullet and spacing that open it, when it has one.
+fn strip_bullet(text: &str) -> &str {
+    text.strip_prefix(REPLY_BULLETS)
+        .map_or(text, |rest| rest.trim_start_matches([' ', '\u{a0}']))
+}
+
+/// Whether `line` opens an assistant block.
+fn is_reply_row(line: &str) -> bool {
+    line.starts_with(REPLY_BULLETS)
+}
+
+/// Whether `line` echoes a user turn in the transcript: Claude Code and Muse draw `❯ text`,
+/// Codex `› text`, and older Claude Code builds `> text`. An empty composer is not one.
+fn is_user_turn(line: &str) -> bool {
+    ['❯', '›', '>'].iter().any(|glyph| {
+        line.strip_prefix(*glyph).is_some_and(|rest| {
+            rest.starts_with([' ', '\u{a0}']) && !rest.trim_matches([' ', '\u{a0}']).is_empty()
+        })
     })
+}
+
+/// Whether `line` opens or continues a tool call's output rather than prose: Claude Code
+/// draws `⎿` under a tool call and Muse `└`; the rows below are that output until the next
+/// block opens.
+fn is_tool_output(line: &str) -> bool {
+    line.trim_start().starts_with(['⎿', '└'])
+}
+
+/// The verdict line of the agent's last reply, trimmed and bounded, when there is one.
+///
+/// The last reply runs from the first assistant block after the last user turn above the
+/// newest block (so the composer under it, even with a draft or Codex's placeholder, is not
+/// taken for a turn) to the bottom of the screen. A verdict is a prose line of that reply that
+/// starts with a marker once its indentation and any reply bullet are stripped: a reply that
+/// opens with `DONE:` reads `◆ DONE: ...` in Muse and `● DONE: ...` in Claude Code, and a long
+/// reply puts that line far above the bottom. Tool output (under `⎿` or `└`) is not prose, so a
+/// brief or a log the agent printed cannot finish its turn. The verdict is the first marker
+/// line of the last block that has one, since a reply states its verdict first. With no user
+/// turn in view the whole screen from the first block on is the last reply. An older turn's
+/// verdict above a newer prompt does not count, and nor does a prompt's own text. A screen that
+/// draws no reply bullet is read the old way: a marker starting a line near the bottom.
+fn verdict_line(screen: &str, markers: &[String]) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let marked = |line: &str| {
+        let text = strip_bullet(line.trim_start());
+        markers
+            .iter()
+            .any(|marker| text.starts_with(marker.as_str()))
+            .then(|| {
+                text.trim_end()
+                    .chars()
+                    .take(QUOTED_LINE_CHARS)
+                    .collect::<String>()
+            })
+    };
+    let Some(newest) = lines.iter().rposition(|line| is_reply_row(line)) else {
+        let start = lines.len().saturating_sub(MARKER_WINDOW_LINES);
+        return lines[start..].iter().rev().find_map(|line| marked(line));
+    };
+    let turn = lines[..newest]
+        .iter()
+        .rposition(|line| is_user_turn(line))
+        .map_or(0, |index| index + 1);
+    let start = turn + lines[turn..].iter().position(|line| is_reply_row(line))?;
+    let mut verdict = None;
+    let mut block_verdict = None;
+    let mut in_tool = false;
+    for line in &lines[start..] {
+        if is_reply_row(line) {
+            verdict = block_verdict.take().or(verdict);
+            in_tool = false;
+        } else if is_tool_output(line) {
+            in_tool = true;
+        }
+        if !in_tool && block_verdict.is_none() {
+            block_verdict = marked(line);
+        }
+    }
+    block_verdict.or(verdict)
 }
 
 /// Bottom screen lines scanned for background work that is still running.
@@ -244,6 +336,20 @@ fn background_count(segment: &str) -> bool {
         && count.bytes().all(|byte| byte.is_ascii_digit())
         && count.parse::<u64>().is_ok_and(|count| count > 0)
         && matches!(noun, "shell" | "shells" | "agent" | "agents")
+}
+
+/// Whether a row near the bottom of `screen` says a turn is running: `esc to interrupt` as a
+/// `·`-separated or parenthesized segment, as in Claude Code's footer
+/// (`⏵⏵ auto mode on · 2 shells · esc to interrupt`) and its spinner row, or Muse's running row
+/// above its composer (`◇ Calling tools (30s · esc to interrupt)`). Prose that merely mentions
+/// the phrase is not a segment.
+fn turn_running(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let start = lines.len().saturating_sub(BACKGROUND_WINDOW_LINES);
+    lines[start..].iter().any(|line| {
+        line.split(['·', '(', ')'])
+            .any(|segment| segment.trim() == "esc to interrupt")
+    })
 }
 
 /// How many new messages Claude Code says wait below its view, when the view is scrolled up.
@@ -305,6 +411,10 @@ struct Episode {
     kind: EpisodeKind,
     since: f64,
     notified: bool,
+    /// For `child-done`, the hash of the verdict line: a different verdict is a new turn,
+    /// and so a new episode, even when no working pass was seen between the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn: Option<u64>,
 }
 
 /// What the watcher remembers about one agent between passes.
@@ -322,6 +432,9 @@ struct PendingNotice {
     kind: EpisodeKind,
     since: f64,
     detail: String,
+    /// For `child-done`, the landing-queue holders this finish releases, as `NAME (NOTE)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    next: Vec<String>,
 }
 
 impl PendingNotice {
@@ -409,27 +522,33 @@ fn classify(
         && !observation.has_pending
         && observation.screen.is_some()
     {
-        let verdict = observation
-            .screen
-            .as_deref()
-            .is_some_and(|screen| has_verdict(screen, &options.markers));
-        if !verdict {
-            // A running turn or its own background work is not idle, whatever Herdr's
-            // status says: the stall rule still reports it if the screen stops changing.
-            if let Some(work) = observation.screen.as_deref().and_then(background_work) {
-                return Some((
-                    EpisodeKind::Stalled,
-                    format!(
-                        "status {} while the screen shows work running ({work}); screen unchanged",
-                        observation.status
-                    ),
-                ));
+        let screen = observation.screen.as_deref().unwrap_or_default();
+        let running = turn_running(screen);
+        let work =
+            background_work(screen).or_else(|| running.then(|| "esc to interrupt".to_owned()));
+        // A running turn means a verdict on screen is not this turn's last word yet, so only
+        // the stall rule applies. Background shells or agents left running do not: a child
+        // that said it is done is done.
+        if !running {
+            if let Some(verdict) = verdict_line(screen, &options.markers) {
+                return Some((EpisodeKind::ChildDone, verdict));
             }
+        }
+        // A running turn or its own background work is not idle, whatever Herdr's
+        // status says: the stall rule still reports it if the screen stops changing.
+        if let Some(work) = work {
             return Some((
-                EpisodeKind::IdleNoVerdict,
-                format!("status {} with no verdict marker", observation.status),
+                EpisodeKind::Stalled,
+                format!(
+                    "status {} while the screen shows work running ({work}); screen unchanged",
+                    observation.status
+                ),
             ));
         }
+        return Some((
+            EpisodeKind::IdleNoVerdict,
+            format!("status {} with no verdict marker", observation.status),
+        ));
     }
     if observation.status == "working" && observation.screen.is_some() {
         return Some((EpisodeKind::Stalled, "screen unchanged".to_owned()));
@@ -437,15 +556,57 @@ fn classify(
     None
 }
 
-/// Withdraw the unsent notice owed for `episode`, if any is still waiting.
+/// Words of a verdict line that identify its turn. Only the leading words count, so a pane
+/// resized between two passes, which rewraps the line, is still the same turn.
+const TURN_WORDS: usize = 8;
+
+/// The turn identity of a verdict line: a hash of its first [`TURN_WORDS`] words.
+fn verdict_turn(verdict: &str) -> u64 {
+    stable_hash(
+        &verdict
+            .split_whitespace()
+            .take(TURN_WORDS)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Withdraw the unsent notice owed for `episode`, if any is still waiting. An agent has one
+/// episode at a time, so any notice of its kind for the agent is that episode's, even one
+/// queued before its clock moved with a screen change.
 fn withdraw_pending(state: &mut WatchState, agent: &str, episode: &Episode) {
-    let key = format!(
-        "{}:{}:{}",
-        agent,
-        episode.kind.as_str(),
-        episode.since as u64
-    );
-    state.pending.retain(|notice| notice.key() != key);
+    state
+        .pending
+        .retain(|notice| notice.agent != agent || notice.kind != episode.kind);
+}
+
+/// The landing-queue holders still waiting on `agent`, as `NAME (NOTE)`, read when its finish
+/// becomes a notice. A `BLOCKED` verdict names nobody. Nothing is released here: the holds are
+/// marked released only once the notice naming them is queued for the coordinator. A queue
+/// that cannot be read costs only this line: the finish is still reported.
+fn waiting_holders(options: &WatchAgentsOptions, agent: &str, verdict: &str) -> Vec<String> {
+    let Some(path) = options.landing_queue.as_deref() else {
+        return Vec::new();
+    };
+    if verdict.starts_with("BLOCKED") {
+        return Vec::new();
+    }
+    match crate::landing_queue::waiting_on(path, agent) {
+        Ok(holds) => holds
+            .iter()
+            .map(|hold| {
+                if hold.note.is_empty() {
+                    hold.name.clone()
+                } else {
+                    format!("{} ({})", hold.name, hold.note)
+                }
+            })
+            .collect(),
+        Err(error) => {
+            eprintln!("agentctl watch-agents: landing queue: {error}");
+            Vec::new()
+        }
+    }
 }
 
 /// The report row for an episode this pass could not judge, left exactly as it was.
@@ -511,14 +672,19 @@ fn update_episode(
     }
     let found = classify(observation, options);
     // A view scrolled up hides whatever would show progress or a verdict, so neither a stall
-    // nor idleness can be judged from it, however long it holds still. No clock runs while it
-    // shows: an episode of the condition it seems to show is kept only once reported, so it is
-    // not reported twice, and any other episode ends here with its unsent notice. Scrolling
-    // back to the bottom changes the screen, so a stall or idle clock starts again from there.
+    // nor idleness nor a finish can be judged from it, however long it holds still. No clock
+    // runs while it shows: an episode of the condition it seems to show is kept only once
+    // reported, so it is not reported twice, and any other episode ends here with its unsent
+    // notice. Scrolling back to the bottom changes the screen, so a stall, idle, or finish
+    // clock starts again from there.
     // A growing count already changed the screen above, which ended any stall. A prompt is
     // still read: it is drawn at the bottom.
     if let Some(below) = observation.screen.as_deref().and_then(scrolled_below) {
-        if let Some((kind @ (EpisodeKind::Stalled | EpisodeKind::IdleNoVerdict), _)) = found {
+        if let Some((
+            kind @ (EpisodeKind::Stalled | EpisodeKind::IdleNoVerdict | EpisodeKind::ChildDone),
+            _,
+        )) = found
+        {
             if let Some(cleared) = memory
                 .episode
                 .take_if(|episode| !(episode.notified && episode.kind == kind))
@@ -552,6 +718,15 @@ fn update_episode(
         state.agents.insert(observation.name.clone(), memory);
         return None;
     };
+    // A finish with a different verdict line is a later turn: the earlier episode ends here,
+    // with its unsent notice, and the new one is reported in its own right.
+    let turn = (kind == EpisodeKind::ChildDone).then(|| verdict_turn(&detail));
+    if let Some(cleared) = memory
+        .episode
+        .take_if(|episode| episode.kind == kind && episode.turn != turn)
+    {
+        withdraw_pending(state, &observation.name, &cleared);
+    }
     // A stall is timed from the last screen change, not from the first working poll:
     // an agent that works for an hour with changing output, then stops changing,
     // has been stalled only since it stopped.
@@ -559,7 +734,7 @@ fn update_episode(
     // idle while its output still streams, and new output is not idleness.
     let since = match kind {
         EpisodeKind::Stalled => memory.screen_changed_at,
-        EpisodeKind::IdleNoVerdict => match &memory.episode {
+        EpisodeKind::IdleNoVerdict | EpisodeKind::ChildDone => match &memory.episode {
             Some(episode) if episode.kind == kind => episode.since.max(memory.screen_changed_at),
             _ => now,
         },
@@ -574,6 +749,7 @@ fn update_episode(
         kind,
         since,
         notified,
+        turn,
     });
     let age = now - since;
     let due = age >= options.threshold(kind).as_secs_f64();
@@ -584,6 +760,11 @@ fn update_episode(
             agent: observation.name.clone(),
             kind,
             since,
+            next: if turn.is_some() {
+                waiting_holders(options, &observation.name, &detail)
+            } else {
+                Vec::new()
+            },
             detail: detail.clone(),
         };
         if !state
@@ -628,8 +809,9 @@ fn flush_notices(
     if options.check_only {
         return json!({"sent": false, "reason": "check only", "waiting": state.pending.len()});
     }
+    let batched = |notice: &PendingNotice| notice.kind != EpisodeKind::ChildDone;
     if state.inflight.is_none() {
-        if state.pending.is_empty() {
+        if !state.pending.iter().any(batched) {
             return json!({"sent": false, "reason": "nothing to report"});
         }
         if state
@@ -641,7 +823,12 @@ fn flush_notices(
         // The batch ID is derived from the notices themselves, so a watcher killed
         // between queueing a batch and persisting that fact re-derives the same ID
         // after a restart and the coordinator's queue recognises it as sent.
-        let keys: Vec<String> = state.pending.iter().map(PendingNotice::key).collect();
+        let keys: Vec<String> = state
+            .pending
+            .iter()
+            .filter(|notice| batched(notice))
+            .map(PendingNotice::key)
+            .collect();
         state.inflight = Some(InflightBatch {
             message_id: format!("agent-watch-{:016x}", stable_hash(&keys.join("\n"))),
             keys,
@@ -688,6 +875,78 @@ fn flush_notices(
     }
 }
 
+/// Send each finished child's notice as a message of its own, every pass: a finish is not
+/// batched with other kinds, held by the rate limit, or counted against it. Each message ID is
+/// derived from its notice, so a retry after a failure or a restart is recognised by the
+/// coordinator's queue instead of delivered twice. Returns one report row per notice tried.
+fn flush_child_done(
+    state: &mut WatchState,
+    notifier: &mut dyn Notifier,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    if options.check_only {
+        return Vec::new();
+    }
+    let due: Vec<PendingNotice> = state
+        .pending
+        .iter()
+        .filter(|notice| notice.kind == EpisodeKind::ChildDone)
+        .cloned()
+        .collect();
+    let mut rows = Vec::new();
+    for notice in due {
+        let key = notice.key();
+        let message_id = format!("agent-watch-done-{:016x}", stable_hash(&key));
+        let mut text = format!(
+            "[agentctl watch-agents] {} finished its turn:\n- {}: {} ({})",
+            notice.agent,
+            notice.agent,
+            notice.kind.describe(options),
+            notice.detail
+        );
+        if !notice.next.is_empty() {
+            text.push_str(&format!(
+                "\nLanding queue: {} waited on {} and is next.",
+                notice.next.join(", "),
+                notice.agent
+            ));
+        }
+        text.push_str(&format!(
+            "\nRead its reply with `agentctl read {}`, then give it its next task or stop it.",
+            notice.agent
+        ));
+        let target = notice_target(options, &notice.agent);
+        match notifier.notify(target, &text, &message_id) {
+            Ok(outcome) => {
+                state.pending.retain(|pending| pending.key() != key);
+                // The holders this notice named have now been told about; a later finish of
+                // the same agent must not name them again.
+                if let (false, Some(path)) =
+                    (notice.next.is_empty(), options.landing_queue.as_deref())
+                {
+                    if let Err(error) =
+                        crate::landing_queue::release_after(path, &notice.agent, &key, now)
+                    {
+                        eprintln!("agentctl watch-agents: landing queue: {error}");
+                    }
+                }
+                rows.push(json!({"agent": notice.agent, "sent": true, "message_id": message_id, "outcome": outcome, "next": notice.next}));
+            }
+            Err(error) => {
+                rows.push(json!({"agent": notice.agent, "sent": false, "message_id": message_id, "reason": error.to_string()}));
+            }
+        }
+    }
+    rows
+}
+
+/// Who is told about `agent`. Every notice goes to the configured coordinator for now; this is
+/// the one place a manager tree would route a child's notice to its nearest manager instead.
+fn notice_target<'a>(options: &'a WatchAgentsOptions, _agent: &str) -> &'a str {
+    &options.coordinator
+}
+
 /// One pass: observe, update episodes, flush due notices, and build the report.
 fn watch_agents_once(
     probe: &mut dyn Probe,
@@ -713,12 +972,20 @@ fn watch_agents_once(
         // pass can neither drop an owed notice nor restart an episode clock.
         // Pending notices are never pruned here: recovery withdraws them, and a
         // notice about an agent that has since stopped is still true.
+        // A reported finish of an agent that is gone (stopped, most often) is dropped an hour
+        // after it was reported, so every child stopped after finishing does not stay in the
+        // state for ever; within that hour an absent pass still cannot repeat its notice.
         state.agents.retain(|name, memory| {
             seen.contains(name)
-                || memory.episode.is_some()
                 || state.pending.iter().any(|notice| &notice.agent == name)
+                || memory.episode.as_ref().is_some_and(|episode| {
+                    !(episode.kind == EpisodeKind::ChildDone
+                        && episode.notified
+                        && now - episode.since > FINISHED_MEMORY_SECONDS)
+                })
         });
     }
+    let child_done = flush_child_done(state, notifier, now, options);
     let notice = flush_notices(state, notifier, now, options);
     // Agents whose view is scrolled up cannot be judged stalled or idle; say which, and do
     // not call the pass ok, so a quiet report is not read as a clean bill.
@@ -735,12 +1002,17 @@ fn watch_agents_once(
         "coordinator": options.coordinator,
         "ok": probe_error.is_null()
             && scrolled.is_empty()
-            && episodes.iter().all(|row| row["reported"] != true && row["due"] != true),
+            && episodes.iter().all(|row| {
+                // A finished child is news for its coordinator, not a fault in the team.
+                row["kind"] == EpisodeKind::ChildDone.as_str()
+                    || (row["reported"] != true && row["due"] != true)
+            }),
         "probe_error": probe_error,
         "agents": seen.len(),
         "episodes": episodes,
         "scrolled": scrolled,
         "notice": notice,
+        "child_done": child_done,
         "waiting": state.pending.len(),
     })
 }
@@ -1071,11 +1343,13 @@ mod tests {
             check_only: false,
             approval: Duration::from_secs(300),
             idle: Duration::from_secs(900),
+            child_done: Duration::ZERO,
             stall: Duration::from_secs(1800),
             dead: Duration::from_secs(300),
             markers: vec!["DONE:".to_owned(), "BLOCKED:".to_owned()],
             min_notice_interval: Duration::ZERO,
             state_dir: None,
+            landing_queue: None,
         }
     }
 
@@ -1270,14 +1544,16 @@ mod tests {
         let mut notifier = RecordingNotifier::default();
         let mut state = WatchState::default();
 
-        // A verdict at the bottom of the screen: never reported.
+        // A verdict in the last reply: reported once as finished, never as idle.
         let mut probe = ScriptedProbe(vec![
             vec![observation("done-agent", "idle", Some(DONE_SCREEN))],
             vec![observation("done-agent", "idle", Some(DONE_SCREEN))],
         ]);
         pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
         let report = pass(&mut probe, &mut notifier, &mut state, 7200.0, &options);
-        assert_eq!(report["episodes"], json!([]), "{report}");
+        assert_eq!(report["episodes"][0]["kind"], "child-done", "{report}");
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+        notifier.sent.clear();
 
         // Never sent work, and work still queued: never reported.
         let mut fresh = observation("fresh", "idle", Some(IDLE_SCREEN));
@@ -1777,8 +2053,13 @@ mod tests {
         let mut state = WatchState::default();
         pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
         let report = pass(&mut probe, &mut notifier, &mut state, 7200.0, &options);
-        assert_eq!(report["episodes"], json!([]), "{report}");
-        assert!(notifier.sent.is_empty());
+        assert_eq!(report["episodes"][0]["kind"], "child-done", "{report}");
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+        assert!(
+            !notifier.sent[0].1.contains("Would you like"),
+            "{}",
+            notifier.sent[0].1
+        );
     }
 
     #[test]
@@ -1938,5 +2219,361 @@ mod tests {
         assert_eq!(attempt_message_id("agent-watch-x", 0), "agent-watch-x");
         assert_eq!(attempt_message_id("agent-watch-x", 1), "agent-watch-x-r1");
         assert_eq!(attempt_message_id("agent-watch-x", 3), "agent-watch-x-r3");
+    }
+
+    const RULE: &str = "────────────────────────────────────────";
+
+    /// A Muse pane after a long closing reply, shaped like the 2026-10-21 case the watcher
+    /// misread: the reply opens with its verdict behind Muse's bullet, far above the bottom.
+    fn muse_long_reply() -> String {
+        let details: String = (1..=60)
+            .map(|index| format!("  - detail line {index} of the closing report\n"))
+            .collect();
+        format!(
+            "  Muse Code 1.4.14\n\n❯ Land both items and report.\n  DONE: is how the reply must start, or BLOCKED:.\n\n◆ Finished · Run the gate · 38m · ctrl+o\n└ validate: OK\n\n◆ DONE: Both items are on main.\n{details}\n◆ Worked for 41m 2s · 11:30 PM · 21/Oct\n\n{RULE}\n❯\n{RULE}\n  model · xhigh · ~/work/project\n"
+        )
+    }
+
+    #[test]
+    fn the_verdict_is_read_from_the_start_of_the_last_reply() {
+        let markers = options().markers;
+        let verdict = |screen: &str| verdict_line(screen, &markers);
+        assert_eq!(
+            verdict(&muse_long_reply()).as_deref(),
+            Some("DONE: Both items are on main.")
+        );
+        let claude = format!(
+            "❯ do it\n\n● Bash(make validate)\n  ⎿  validate: OK\n\n● DONE: landed abc123\n\n  More detail.\n\n✻ Baked for 5m · done 1:00 AM\n\n{RULE}\n❯\u{a0}\n{RULE}\n  ⏵⏵ auto mode on\n"
+        );
+        assert_eq!(verdict(&claude).as_deref(), Some("DONE: landed abc123"));
+        let codex = "› fix the bug\n\n• Edited src/lib.rs (+3 -1)\n\n• BLOCKED: the schema needs the owner's call\n\n› Ask Codex to do anything\n\n  80% context left\n";
+        assert_eq!(
+            verdict(codex).as_deref(),
+            Some("BLOCKED: the schema needs the owner's call")
+        );
+        // A verdict that closes the reply as its own paragraph still counts.
+        assert_eq!(
+            verdict(DONE_SCREEN).as_deref(),
+            Some("DONE: the thing is complete")
+        );
+        // A screen with no reply bullets is read the old way, near the bottom.
+        assert_eq!(
+            verdict("plain output\nDONE: ok\n$ \n").as_deref(),
+            Some("DONE: ok")
+        );
+        // An older turn's verdict above a newer prompt is not this turn's.
+        let older = format!(
+            "● DONE: the first task is finished\n\n❯ also do the second thing\n\n● Which branch should the second change go on?\n\n{RULE}\n❯\u{a0}\n{RULE}\n  ⏵⏵ auto mode on\n"
+        );
+        assert_eq!(verdict(&older), None);
+        // Nor is the prompt's own text, even a line of it that starts with a marker.
+        let brief = format!(
+            "❯ You are a worker.\n  DONE:\n  1. write a handoff\n\n● Read the brief; starting.\n\n{RULE}\n❯\u{a0}\n{RULE}\n"
+        );
+        assert_eq!(verdict(&brief), None);
+        // A draft in the composer is not a user turn that hides the reply above it.
+        let drafted = claude.replace("❯\u{a0}\n", "❯ next: rebase\n");
+        assert_eq!(verdict(&drafted).as_deref(), Some("DONE: landed abc123"));
+    }
+
+    #[test]
+    fn a_long_muse_reply_that_opens_with_its_verdict_is_a_finish_not_silence() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screen = muse_long_reply();
+        for at in [0.0, 900.0, 1800.0] {
+            let mut probe =
+                ScriptedProbe(vec![vec![observation("mu-panettl", "idle", Some(&screen))]]);
+            let report = pass(&mut probe, &mut notifier, &mut state, at, &options);
+            assert_eq!(report["episodes"][0]["kind"], "child-done", "{report}");
+        }
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+        assert!(
+            notifier.sent[0].1.contains("DONE: Both items are on main."),
+            "{}",
+            notifier.sent[0].1
+        );
+    }
+
+    #[test]
+    fn a_finished_child_is_reported_at_once_in_a_message_of_its_own() {
+        let mut options = options();
+        options.min_notice_interval = Duration::from_secs(600);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let asking = || observation("asker", "idle", Some(PROMPT_SCREEN));
+        let finished = || observation("finisher", "idle", Some(DONE_SCREEN));
+        let late = || observation("late-asker", "idle", Some(PROMPT_SCREEN));
+        let mut probe = ScriptedProbe(vec![
+            vec![asking()],
+            vec![asking()],
+            vec![asking(), finished(), late()],
+            vec![asking(), finished(), late()],
+            vec![asking(), finished(), late()],
+        ]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let first = pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+        assert_eq!(first["notice"]["sent"], true, "{first}");
+        // Inside the rate-limit window opened at 300, the finish goes out in its first pass.
+        let done = pass(&mut probe, &mut notifier, &mut state, 360.0, &options);
+        assert_eq!(done["child_done"][0]["sent"], true, "{done}");
+        assert_eq!(done["notice"]["reason"], "nothing to report", "{done}");
+        assert_eq!(notifier.sent.len(), 2);
+        let text = &notifier.sent[1].1;
+        assert!(
+            text.starts_with("[agentctl watch-agents] finisher finished its turn:\n- finisher: finished its turn with a verdict (DONE: the thing is complete)"),
+            "{text}"
+        );
+        assert!(!text.contains("asker"), "{text}");
+        assert_eq!(notifier.sent[1].0, "coordinator");
+        assert!(notifier.sent[1].2.starts_with("agent-watch-done-"));
+        // The finish did not restart the window: `late-asker`, due at 660, goes out at 900.
+        let held = pass(&mut probe, &mut notifier, &mut state, 660.0, &options);
+        assert_eq!(held["notice"]["reason"], "rate limited", "{held}");
+        pass(&mut probe, &mut notifier, &mut state, 900.0, &options);
+        assert_eq!(notifier.sent.len(), 3, "{:?}", notifier.sent);
+        assert!(notifier.sent[2].1.contains("late-asker"));
+        assert!(!notifier.sent[2].1.contains("finisher"));
+    }
+
+    #[test]
+    fn a_finish_is_reported_once_per_turn() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let second = DONE_SCREEN.replace("the thing is complete", "the follow-up is complete");
+        for (at, status, screen, sent) in [
+            (0.0, "idle", DONE_SCREEN, 1),
+            (60.0, "idle", DONE_SCREEN, 1),
+            // A new verdict line is a new turn, even with no working pass seen between.
+            (120.0, "idle", second.as_str(), 2),
+            (180.0, "idle", second.as_str(), 2),
+            (240.0, "working", "◆ working on the next task\n", 2),
+            // The same line again after a working pass is a new turn too.
+            (300.0, "idle", second.as_str(), 3),
+        ] {
+            let mut probe = ScriptedProbe(vec![vec![observation("worker", status, Some(screen))]]);
+            pass(&mut probe, &mut notifier, &mut state, at, &options);
+            assert_eq!(notifier.sent.len(), sent, "at {at}: {:?}", notifier.sent);
+        }
+    }
+
+    #[test]
+    fn a_finish_waits_out_a_running_turn_a_scrolled_view_and_a_failed_send() {
+        let options = options();
+        let mut notifier = RecordingNotifier {
+            fail_attempts: 1,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        // Herdr says idle, but the footer says a turn runs: the stall rule, not a finish.
+        let running = "● DONE: an earlier answer\n\n✽ Orbiting… (5m 38s)\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · esc to interrupt · ↓ to manage\n";
+        // A view scrolled up shows a verdict that may be long superseded below it.
+        let scrolled = scrolled_quiet().replace(
+            "● Bash(python3 - \"$P\" <<'EOF'\n      import sys…)",
+            "● DONE: an old verdict",
+        );
+        assert!(scrolled_below(&scrolled).is_some() && scrolled.contains("● DONE: an old verdict"));
+        let mut probe = ScriptedProbe(vec![vec![
+            observation("running", "idle", Some(running)),
+            observation("scrolled", "idle", Some(&scrolled)),
+            observation("finisher", "idle", Some(DONE_SCREEN)),
+        ]]);
+        let report = pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        assert_eq!(report["episodes"][0]["kind"], "stalled", "{report}");
+        assert_eq!(report["episodes"][1]["kind"], "child-done", "{report}");
+        assert_eq!(report["episodes"].as_array().unwrap().len(), 2, "{report}");
+        assert_eq!(report["child_done"][0]["sent"], false, "{report}");
+        assert!(notifier.sent.is_empty());
+        assert_eq!(state.pending.len(), 1, "the failed finish is kept");
+        let mut probe = ScriptedProbe(vec![vec![observation(
+            "finisher",
+            "idle",
+            Some(DONE_SCREEN),
+        )]]);
+        pass(&mut probe, &mut notifier, &mut state, 60.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
+        assert_eq!(
+            notifier.attempts[0], notifier.attempts[1],
+            "the retry reuses the message ID"
+        );
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn a_finish_names_who_lands_next() {
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-agent-watch-landing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let queue = crate::landing_queue::path(&directory);
+        crate::landing_queue::hold(&queue, "second", "first", "gate green", 0.0).unwrap();
+        crate::landing_queue::hold(&queue, "third", "stuck", "", 0.0).unwrap();
+        let mut options = options();
+        options.landing_queue = Some(queue.clone());
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let blocked = "● BLOCKED: the schema needs a decision\n❯\n";
+        let mut probe = ScriptedProbe(vec![vec![
+            observation("first", "idle", Some(DONE_SCREEN)),
+            observation("stuck", "idle", Some(blocked)),
+        ]]);
+        let report = pass(&mut probe, &mut notifier, &mut state, 10.0, &options);
+        assert_eq!(
+            report["child_done"][0]["next"],
+            json!(["second (gate green)"]),
+            "{report}"
+        );
+        assert_eq!(notifier.sent.len(), 2);
+        assert!(
+            notifier.sent[0]
+                .1
+                .contains("\nLanding queue: second (gate green) waited on first and is next.\n"),
+            "{}",
+            notifier.sent[0].1
+        );
+        assert!(
+            !notifier.sent[1].1.contains("Landing queue"),
+            "{}",
+            notifier.sent[1].1
+        );
+        let holds = crate::landing_queue::load(&queue).unwrap().holds;
+        assert!(holds[0]
+            .released_by
+            .as_deref()
+            .is_some_and(|by| by.starts_with("first:")));
+        assert_eq!(
+            holds[1].released_by, None,
+            "a BLOCKED finish releases nobody"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn tool_output_is_not_a_verdict_and_a_reply_states_its_verdict_first() {
+        let markers = options().markers;
+        let verdict = |screen: &str| verdict_line(screen, &markers);
+        // A brief or a log the agent printed is tool output, not its reply.
+        let claude = format!(
+            "❯ go\n\n● Bash(cat brief.md)\n  ⎿  Finish with a verdict:\n     DONE: what landed\n\n● Which branch should this go on?\n\n{RULE}\n❯\u{a0}\n{RULE}\n"
+        );
+        assert_eq!(verdict(&claude), None);
+        let muse = format!(
+            "❯ go\n\n◆ Finished · Run the script · 3s · ctrl+o\n└ step 1\n  DONE: 12 steps\n\n◆ Which branch should this go on?\n\n{RULE}\n❯\n{RULE}\n"
+        );
+        assert_eq!(verdict(&muse), None);
+        // Within a block the first marker is the verdict; across blocks the last block's.
+        let mixed = "● BLOCKED: the owner must choose\n\n  DONE: the tests written so far\n❯\n";
+        assert_eq!(
+            verdict(mixed).as_deref(),
+            Some("BLOCKED: the owner must choose")
+        );
+        let later = "● BLOCKED: waiting on the gate\n\n● Bash(make validate)\n  ⎿  DONE: not this\n\n● DONE: landed abc123\n  BLOCKED: none\n❯\n";
+        assert_eq!(verdict(later).as_deref(), Some("DONE: landed abc123"));
+        // A rewrapped verdict line is the same turn; a different one is not.
+        assert_eq!(
+            verdict_turn(
+                "DONE: #509 agentctl-child-done-notice landed as abc1234 with the gate green"
+            ),
+            verdict_turn("DONE: #509 agentctl-child-done-notice landed as abc1234 with the")
+        );
+        assert_ne!(verdict_turn("DONE: one"), verdict_turn("DONE: two"));
+    }
+
+    #[test]
+    fn a_running_turn_anywhere_near_the_bottom_holds_back_a_finish() {
+        let options = options();
+        let running = [
+            "● DONE: an earlier answer\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · 2 shells · esc to interrupt · ↓ to manage\n".to_owned(),
+            format!("◆ DONE: an earlier answer\n\n◇ Calling tools (30s · esc to interrupt)\n\n{RULE}\n❯\n{RULE}\n  model · xhigh\n"),
+        ];
+        for screen in &running {
+            assert!(turn_running(screen), "{screen}");
+            let found = classify(&observation("worker", "idle", Some(screen)), &options);
+            assert_eq!(
+                found.map(|(kind, _)| kind),
+                Some(EpisodeKind::Stalled),
+                "{screen}"
+            );
+        }
+        assert!(!turn_running(
+            "● I will press esc to interrupt it later.\n❯\n"
+        ));
+        assert!(!turn_running(QUIET_FOOTER));
+    }
+
+    #[test]
+    fn a_finish_keeps_the_pass_ok_and_is_forgotten_an_hour_after_its_agent_left() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut probe = ScriptedProbe(vec![
+            vec![observation("finisher", "idle", Some(DONE_SCREEN))],
+            vec![],
+            vec![],
+        ]);
+        let report = pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        assert_eq!(report["episodes"][0]["reported"], true, "{report}");
+        assert_eq!(report["ok"], true, "{report}");
+        pass(&mut probe, &mut notifier, &mut state, 600.0, &options);
+        assert!(
+            state.agents.contains_key("finisher"),
+            "an absent pass keeps it"
+        );
+        pass(&mut probe, &mut notifier, &mut state, 3700.0, &options);
+        assert!(!state.agents.contains_key("finisher"), "{:?}", state.agents);
+        assert_eq!(notifier.sent.len(), 1);
+    }
+
+    #[test]
+    fn a_hold_is_released_only_when_its_notice_is_queued() {
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-agent-watch-release-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let queue = crate::landing_queue::path(&directory);
+        crate::landing_queue::hold(&queue, "second", "first", "", 0.0).unwrap();
+        let mut options = options();
+        options.landing_queue = Some(queue.clone());
+        let mut notifier = RecordingNotifier {
+            fail_attempts: 1,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let mut probe = ScriptedProbe(vec![
+            vec![observation("first", "idle", Some(DONE_SCREEN))],
+            vec![observation("first", "working", Some("◆ back at work\n"))],
+        ]);
+        pass(&mut probe, &mut notifier, &mut state, 10.0, &options);
+        assert!(notifier.sent.is_empty());
+        assert_eq!(
+            crate::landing_queue::waiting_on(&queue, "first")
+                .unwrap()
+                .len(),
+            1
+        );
+        // Back at work before the retry: the notice is withdrawn and the hold still waits.
+        pass(&mut probe, &mut notifier, &mut state, 70.0, &options);
+        assert!(state.pending.is_empty());
+        assert_eq!(
+            crate::landing_queue::waiting_on(&queue, "first")
+                .unwrap()
+                .len(),
+            1
+        );
+        let finish = "● DONE: the real landing\n❯\n";
+        let mut probe = ScriptedProbe(vec![vec![observation("first", "idle", Some(finish))]]);
+        pass(&mut probe, &mut notifier, &mut state, 130.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
+        assert!(notifier.sent[0]
+            .1
+            .contains("Landing queue: second waited on first"));
+        assert!(crate::landing_queue::waiting_on(&queue, "first")
+            .unwrap()
+            .is_empty());
+        let _ = fs::remove_dir_all(&directory);
     }
 }
