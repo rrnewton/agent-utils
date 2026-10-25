@@ -364,6 +364,7 @@
         "py/tests/test_timeline_query_schema_3.py",
         "py/tests/test_timeline_query_stats.py",
         "py/tests/test_timeline_render.py",
+        "py/tests/test_timeline_responsiveness.py",
         "py/tests/test_timeline_run_stats.py",
         "py/tests/test_timeline_search_index.py",
         "py/tests/test_timeline_shards.py",
