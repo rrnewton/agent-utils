@@ -610,7 +610,9 @@ def desk_walk(desk: Desk) -> None:
                   " && document.getElementById('side-thread-card').hidden", "the X did not go back to the cards")
     long = open_card(desk, REPLICA)
     long_box = part(long, "box")
-    desk.check(bool(long["clamped"]) and number(long, "lines") == 3, f"the long question is not cut to three lines: {long['lines']}")
+    # Cut by the clamp, or split for the card (`#516 thread-card-max-lines`), its words ending "…".
+    desk.check((bool(long["clamped"]) or str(long["text"]).endswith("…")) and number(long, "lines") == 3,
+               f"the long question is not cut to three lines: {long['lines']}")
     desk.check(number(found, "lines") < 3 and number(long_box, "height") > number(box, "height") + 10,
                f"the card at the top is {long_box['height']}px over the long question and {box['height']}px "
                f"over the {found['lines']}-line one: fitted cards should differ by their lines")

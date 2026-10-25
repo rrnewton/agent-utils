@@ -1503,6 +1503,25 @@ steps:
       resources: {browser: 1}
       est_duration_s: 20
 
+  # `#516 thread-card-max-lines` in the browser engine, at 393x852 by touch and 1280x800 with a
+  # mouse: a long unsummarised first message split for its card, packed under the collapsed
+  # clamp and unpacked at most K = 5 drawn lines ending "…", the rest of it the first row under
+  # the card, starting "…" with exactly the words the card left out and no row buttons; a summary
+  # landing while it is on screen switching it to the summarised layout with the card unmoved;
+  # Thread card lines at 2 holding the card to two lines; the triangle on the continuation still
+  # packing in place; and a link to the first message landing on its card at the head of the list.
+  - group: check
+    job: thread-card-max-lines-browser
+    desc: a long first message split for its thread card at K lines, the rest unpacked as its continuation, the summary layout taking over in place, K from Settings and a link landing on the card, in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/thread_card_max_lines_browser.py
+    jobs_flag: ""
+    timeout: 180
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+
   # `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in the browser engine, at 1280x800 with a mouse and
   # 393x852 by touch: a card packed at the foot of the Threads view by a click, its top the same in every
   # frame, held past the foot in room that a live reply fills and that scrolling up takes away for good; the

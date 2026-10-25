@@ -92,6 +92,17 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   open thread — that first message stands first under the card as its child, however read it is; a
   card that already is the first message gains no second copy (`#404 threads-unpack-all`,
   `#405 root-under-summary`).
+  No card shows more than **Thread card lines** of its first message (`#516 thread-card-max-lines`; 5
+  until you say otherwise, 1 to 12, in Settings under Messages and kept on the server). A line is
+  counted as a phone's card wraps it — word by word at 36 characters, measured in Chromium at 393x852 —
+  by the server and the page alike, so a wider card shows the same words in fewer lines. A first
+  message longer than that is summarised from its first reply, where a short one waits for a third
+  message (`#484 summary-card-threshold`), and goes under its card as above. Until a summary comes —
+  summaries off, failing, or still being written — it is split: the card shows its first lines and
+  **…**, and unpacked, the rest is the first row under the card, starting **…**: the first message's own
+  row, its author and time, with no buttons of its own, so a reply, a reaction or Done from it is the
+  first message's. When the summary arrives the card takes it where it stands. A link to the first
+  message, opened over these cards, lands on its card.
 * **Two columns**, on a desk at least 1000px wide, put Main on the left and the same thread list on
   the right, where a thread chosen from it opens under its own card, moved up to the top of the column,
   still in its colour and still joined by its line to the thread's first message on the left; the

@@ -156,7 +156,7 @@ const ALL_CHANNELS = "*";
 /**
  * @overload
  * @param {"api-token" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
- *   | "collapsed-lines"
+ *   | "card-max-lines" | "collapsed-lines"
  *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "mark-own-read" | "mic-auto-gain"
  *   | "mic-echo-cancellation" | "side-compose-grow"
  *   | "message-cache-enabled"
@@ -186,13 +186,14 @@ const ALL_CHANNELS = "*";
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help"
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-opening-links" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-card-max-lines" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-opening-links" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
  *   | "hang-up"
+ *   | "card-max-lines-larger" | "card-max-lines-smaller"
  *   | "collapsed-lines-larger" | "collapsed-lines-smaller"
- *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias" | "help-link-collapsed-lines"
+ *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-card-max-lines" | "help-link-channel-alias" | "help-link-collapsed-lines"
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar" | "help-link-empty-messages"
  *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
@@ -1765,8 +1766,33 @@ function syncDeepLinkAddress() {
   }
 }
 
-/** Land on the linked message where a row holds it, as the reply arrow lands on its answer. */
+/**
+ * Land on the linked message where a row holds it, as the reply arrow lands on its answer. Over the
+ * Threads view's cards, a thread's first message is its card: a link to it lands on the card, at the
+ * head of the list (`#516 thread-card-max-lines`), never on the hidden column under the cards nor on
+ * the root's row unpacked beneath it — a summarised card's root child, or a split card's continuation.
+ */
 function landOnDeepLink(id) {
+  const cardOf = () => (cardsCycle() ? /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
+    .find((one) => one.hasAttribute("data-card") && /** @type {any} */ (one).cardRoot &&
+      String(/** @type {any} */ (one).cardRoot.id) === String(id)) || null : null);
+  let card = cardOf();
+  if (card) {
+    if (String(card.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
+    // A card folded into a run of read threads: the run opened, which draws the cards anew.
+    openReadRun(card);
+    card = cardOf() || card;
+    if (!rowShown(card)) {
+      setStatus("Hide read is hiding that message.");
+      return true;
+    }
+    const area = leftEl("side-scroll");
+    finishPackSlide();
+    area.scrollTop = headOfList(area, card);
+    renderScrollTools();
+    setStatus("Here is the linked message's card.");
+    return true;
+  }
   const row = rowHolding(id);
   if (!row) return false;
   if (String(row.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
@@ -2085,6 +2111,7 @@ const SETTINGS_FOLDS = [
   "text-size",
   "reading-width",
   "collapsed-lines",
+  "card-max-lines",
   "control-bar",
   "opening-links",
   "typing",
@@ -2195,6 +2222,7 @@ const HELP_TOPICS = [
   "rich-headers",
   "reading-width",
   "collapsed-lines",
+  "card-max-lines",
   "resuming",
   "live-messages",
   "speech-prep",
@@ -17991,6 +18019,254 @@ function stepCollapsedLines(direction) {
   if (held && button.disabled) el("collapsed-lines").focus();
 }
 
+// --- thread card lines (#516 thread-card-max-lines) -----------------------------------------------
+//
+// The owner, 2026-10-25: "I HATE having big thread cards... So if the message-root is bigger than a
+// certain size (let's say K lines, with default K set to 5 lines), let's summarize it even with a
+// single-response and push the root message inward to be the first child. If summarization is
+// broken/disabled then I still want to SPLIT this over-large message. Put only the first K lines in
+// the thread card and append "..." to the end. Then display the remainder of the message as a
+// virtual first child underneath with "..." prepended."
+//
+//   * K IS A SETTING, Thread card lines under Messages, 1 to 12 and 5 until the owner says otherwise,
+//     kept on the server (`#457 settings-server-side`) — which READS it: a root longer than K lines is
+//     named from its first reply there, where a short one waits for a third message (`#484`).
+//   * LINES BY A PROXY, the server's own (src/threads.rs, `CARD_LINE_CHARS`): each line of the
+//     message that is not blank wrapped word by word at 36 characters, what a line of a phone's card
+//     holds (measured in Chromium at 393x852; `wrapCardLine`). The server decides from it, and has no
+//     screen; so the page decides whether a root is long by the same count of the same text — the
+//     message's own `content` — and the two agree on which threads get a summary early. Where the
+//     card is drawn wider, the same words take fewer lines: never more than about K.
+//   * SUMMARISED, the root goes inward as the card's first child, exactly as under any summarised card
+//     (`#405 root-under-summary`): nothing new.
+//   * NOT SUMMARISED — summaries off, failing, or not back yet — THE ROOT IS SPLIT where the card's
+//     own words are (`cardLines`): the card says its first K lines and "…", and unpacked, the rest is
+//     the first row under it, starting "…" (`cardSplit`). Not for one line left over, which the card
+//     shows: a row of its own for one line is less compact than the line. That row is the root's own row, its words cut
+//     to the rest: the same author and time, and no buttons of its own (web/voice.css), so a reply,
+//     a reaction, Done or a receipt from it is the root's. It is kept by Hide read and never folded
+//     into a run, as a summarised card's root child is, and when the summary lands the card simply
+//     says it, the root child taking the continuation's place, the card held where it stands
+//     (`keepingCardPlace`).
+
+/** The device's copy of K, kept on the server for every device (`#457 settings-server-side`). */
+const CARD_MAX_LINES_KEY = "vibe-talk.voice.thread-card-max-lines";
+const MIN_CARD_MAX_LINES = 1;
+const MAX_CARD_MAX_LINES = 12;
+const DEFAULT_CARD_MAX_LINES = 5;
+/** The characters one card line is counted at: src/threads.rs `CARD_LINE_CHARS`, the same proxy. */
+const CARD_LINE_CHARS = 36;
+
+/** K in force; `applyCardMaxLines` is its only writer. */
+let cardMaxLines = DEFAULT_CARD_MAX_LINES;
+
+/** A K this page will apply, read as `clampCollapsedLines` reads its count, and as the server reads it. */
+function clampCardMaxLines(value) {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) return DEFAULT_CARD_MAX_LINES;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return DEFAULT_CARD_MAX_LINES;
+  return Math.min(MAX_CARD_MAX_LINES, Math.max(MIN_CARD_MAX_LINES, Math.round(n)));
+}
+
+/** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
+function storedCardMaxLines() {
+  try {
+    const stored = localStorage.getItem(CARD_MAX_LINES_KEY);
+    return clampCardMaxLines(stored === null ? DEFAULT_CARD_MAX_LINES : stored);
+  } catch (_error) {
+    return DEFAULT_CARD_MAX_LINES;
+  }
+}
+
+/** Put K on the page, and return the one applied: the slider says it, and every card list is drawn again by it. */
+function applyCardMaxLines(value, redraw = true) {
+  const n = clampCardMaxLines(value);
+  const changed = redraw && n !== cardMaxLines;
+  cardMaxLines = n;
+  el("card-max-lines").value = String(n);
+  el("card-max-lines-smaller").disabled = n <= MIN_CARD_MAX_LINES;
+  el("card-max-lines-larger").disabled = n >= MAX_CARD_MAX_LINES;
+  if (changed) {
+    sideCardsDrawn = "";
+    threadCardsDrawn.clear();
+    if (sideColumnUp()) renderSideColumn();
+    if (channelView === "thread") renderThreadHeading();
+    if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineThreads));
+  }
+  return n;
+}
+
+/** Store it, and read it back: private browsing accepts `setItem` and keeps nothing. */
+function persistCardMaxLines(n) {
+  const encoded = String(n);
+  try {
+    localStorage.setItem(CARD_MAX_LINES_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+  return localStorage.getItem(CARD_MAX_LINES_KEY) === encoded;
+}
+
+/** K in words, as Settings says it. */
+const cardMaxLinesWords = (n) => `${n} line${n === 1 ? "" : "s"}`;
+
+/** The slider, or − and +: K applied with the cards held where the reader is, and kept. */
+function cardMaxLinesChanged(value) {
+  let n = DEFAULT_CARD_MAX_LINES;
+  keepingCardPlace(() => { n = applyCardMaxLines(value); });
+  el("card-max-lines-state").textContent = persistCardMaxLines(n)
+    ? `Saved — thread cards show at most ${cardMaxLinesWords(n)} of a first message.`
+    : "This browser refused to store the thread card lines, so they will be forgotten when you " +
+      `reload (private browsing does this). Thread cards show at most ${cardMaxLinesWords(n)} until then.`;
+  return n;
+}
+
+/** One line fewer (-1) or more (+1), as `stepCollapsedLines` steps its count. */
+function stepCardMaxLines(direction) {
+  const button = el(direction > 0 ? "card-max-lines-larger" : "card-max-lines-smaller");
+  const held = document.activeElement === button;
+  cardMaxLinesChanged(clampCardMaxLines(el("card-max-lines").value) + direction);
+  if (held && button.disabled) el("card-max-lines").focus();
+}
+
+/**
+ * One line of a card's words wrapped as src/threads.rs `card_lines` wraps it, word by word at
+ * `CARD_LINE_CHARS` characters: a word that does not fit begins the next line, and one longer than a
+ * whole line is broken across lines. The lines it fills, each with `cut` where it ends inside a word
+ * broken so. Word by word because a browser breaks only between words, and a count that ignored that
+ * would say fewer lines than the card draws.
+ *
+ * @returns {Array<{text: string, cut: boolean}>}
+ */
+function wrapCardLine(line) {
+  /** @type {Array<{text: string, cut: boolean}>} */
+  const lines = [];
+  let open = "";
+  for (const word of line.split(/\s+/).filter(Boolean)) {
+    let chars = [...word];
+    if (open && [...open].length + 1 + chars.length <= CARD_LINE_CHARS) {
+      open += ` ${word}`;
+      continue;
+    }
+    if (open) lines.push({ text: open, cut: false });
+    while (chars.length > CARD_LINE_CHARS) {
+      lines.push({ text: chars.slice(0, CARD_LINE_CHARS).join(""), cut: true });
+      chars = chars.slice(CARD_LINE_CHARS);
+    }
+    open = chars.join("");
+  }
+  if (open) lines.push({ text: open, cut: false });
+  return lines;
+}
+
+/** Wrapped lines put back together: by a space between words, by nothing inside a broken word. */
+const unwrapCardLines = (lines) =>
+  lines.map((line, at) => (at > 0 && !lines[at - 1].cut ? ` ${line.text}` : line.text)).join("");
+
+/** How many card lines `lines` take by the proxy, each wrapped by `wrapCardLine`. */
+function cardProxyLines(lines) {
+  return lines.reduce((sum, line) => sum + wrapCardLine(line).length, 0);
+}
+
+/** `text`'s lines as src/threads.rs `card_lines` counts them: blank ones dropped, white space closed up. */
+const proxyLinesOf = (text) =>
+  String(text).split(/\r?\n/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+
+/** Whether `root` is longer than a card shows: more than K card lines of its text, as the server counts. */
+function rootOverflowsCard(root) {
+  return Boolean(root) && cardProxyLines(proxyLinesOf(rawTextOf(root))) > cardMaxLines;
+}
+
+/**
+ * Each root's split as last worked out, and the K it was worked out at: a card asks for it several
+ * times a pass (its words, its mark, its block's signature and its block). A root read again is a
+ * new object, and is worked out afresh.
+ *
+ * @type {WeakMap<object, {lines: number, split: {head: string, rest: string} | null}>}
+ */
+const cardSplits = new WeakMap();
+
+/**
+ * Thread `choice`'s root split for its card, when it is longer than K lines and the card says no
+ * summary: `head`, the card's words for its first K card lines, and `rest`, the words after them, as
+ * the card draws them (`cardLines`); null otherwise. Lines are wrapped by `wrapCardLine`, so a line
+ * that crosses K is cut where its K-th card line ends: between words, or inside a word too long for
+ * a line. Null too where the drawn words fit after all — a root whose text is long only by markup
+ * the page does not draw — so nothing is split into nothing, and where all the continuation would
+ * hold is one line, which the card shows instead.
+ *
+ * @returns {{head: string, rest: string} | null}
+ */
+function cardSplit(choice) {
+  if (!choice || !choice.root || cardIsSummarized(choice)) return null;
+  const held = cardSplits.get(choice.root);
+  if (held && held.lines === cardMaxLines) return held.split;
+  const split = rootOverflowsCard(choice.root) ? splitForCard(cardLines(choice.root)) : null;
+  cardSplits.set(choice.root, { lines: cardMaxLines, split });
+  return split;
+}
+
+/** `cardSplit`'s work on a root's card lines, `words`, at the K in force. */
+function splitForCard(words) {
+  const lines = words.split("\n").filter(Boolean);
+  /** @type {string[]} */
+  const head = [];
+  /** @type {string[]} */
+  let rest = [];
+  let room = cardMaxLines;
+  // Whether the card stops inside one of the message's lines rather than at its end, and inside a
+  // word broken across card lines there.
+  let inside = false;
+  let midWord = false;
+  for (let at = 0; at < lines.length; at += 1) {
+    const wrapped = wrapCardLine(lines[at]);
+    if (wrapped.length <= room) {
+      head.push(lines[at]);
+      room -= wrapped.length;
+      continue;
+    }
+    // The card's last lines are this line's first ones; the rest of it, and every line after, is the
+    // continuation's.
+    if (room > 0) head.push(unwrapCardLines(wrapped.slice(0, room)));
+    inside = room > 0;
+    midWord = inside && wrapped[room - 1].cut;
+    rest = [unwrapCardLines(wrapped.slice(room)), ...lines.slice(at + 1)];
+    break;
+  }
+  if (!head.length) return null;
+  // The "…" needs room on the card's last line: where that line is full, its last word goes on to the
+  // continuation — or, where the line is one word, its last character — which it then starts: on the
+  // line it was on, or as a line of its own where the card stopped at a line's end.
+  const ending = wrapCardLine(head[head.length - 1]);
+  const last = ending[ending.length - 1].text;
+  if ([...last].length + 1 > CARD_LINE_CHARS) {
+    const space = last.lastIndexOf(" ");
+    const kept = space > 0 ? last.slice(0, space) : [...last].slice(0, -1).join("");
+    const moved = space > 0 ? last.slice(space + 1) : [...last].slice(-1).join("");
+    const before = ending.slice(0, -1);
+    head[head.length - 1] = unwrapCardLines([...before, { text: kept, cut: false }]);
+    // A word moved goes before the rest with a space, unless the card stopped inside it; a character
+    // moved is the end of a word, which the rest goes on with.
+    const glue = space > 0 && !midWord ? " " : "";
+    rest = inside ? [`${moved}${glue}${rest[0]}`, ...rest.slice(1)] : [moved, ...rest];
+  }
+  const after = rest.filter(Boolean).join("\n");
+  // Nor one that would leave the continuation a single line: that line costs the card one line more,
+  // and costs a row of its own under the card, its header and its edges, several.
+  if (cardProxyLines(proxyLinesOf(after)) < 2) return null;
+  return { head: head.join("\n"), rest: after };
+}
+
+/**
+ * The root's row as its continuation under a split card: the root itself, its words cut to what the
+ * card left out, starting "…". The same message — its id, author, time and reactions — so whatever is
+ * done from the row is done to the root; drawn as plain lines, as the card's words are.
+ */
+function continuationOf(root, rest) {
+  return { ...root, content: `…${rest}`, content_html: "", heading: null };
+}
+
 /**
  * Ctrl+( and Ctrl+) (Cmd on a Mac): one collapsed line fewer or more, and the status line says the
  * count it came to. Never in a text field, where the chord is the field's — a bracket typed, and
@@ -25287,8 +25563,9 @@ function threadCard(summary, tally) {
   // `#194 thread-picker-polish`: the name the selector and the heading use, given the card's room.
   title.textContent = threadName(choice, Infinity);
   const said = typeof summary.summary === "string" ? summary.summary.trim() : "";
-  // `#489 card-root-lines`: its lines, as a list card's are.
-  const first = choice.root ? cardLines(choice.root) : "";
+  // `#489 card-root-lines`: its lines, as a list card's are; `#516 thread-card-max-lines`: K of them at most.
+  const split = cardSplit(choice);
+  const first = split ? `${split.head}…` : choice.root ? cardLines(choice.root) : "";
   const about = document.createElement("span");
   about.className = "thread-card-text";
   about.textContent = said || (first.replace(/\s+/g, " ") === title.textContent ? "" : first);
@@ -25776,7 +26053,8 @@ function readFilterKeeps(thread = channelView === "thread" ? openThreadChoice() 
   // `#405 root-under-summary`. Under a summarized card the root is kept however read it is: it is
   // the first child the card's words are about, and Hide read hiding it would leave the summary
   // heading a thread whose first message cannot be seen. A raw card already says the root.
-  const keptRoot = thread && cardIsSummarized(thread)
+  // `#516 thread-card-max-lines`: and under a split card, whose continuation is the root's row.
+  const keptRoot = thread && (cardIsSummarized(thread) || cardSplit(thread))
     ? (channelView === "thread" && thread.id === String(selectedThreadId) ? openThreadRootId()
       : thread.root ? String(thread.root.id) : null) : null;
   /** @type {ReplyTally | null} */
@@ -33355,9 +33633,14 @@ function glideToBridgeTop(row) {
   }
   if (!area) return;
   finishPackSlide();
-  const to = area.scrollTop + drawnTop(top) - floatingClearance(area) - REPLY_LANDING_GAP_PX;
+  const to = headOfList(area, top);
   if (typeof area.scrollTo === "function") area.scrollTo({ top: to, behavior: glideBehavior() });
   else area.scrollTop = to;
+}
+
+/** Where `area` scrolls to put `node` at its head, as a landing is put there: just under the floating line. */
+function headOfList(area, node) {
+  return area.scrollTop + drawnTop(node) - floatingClearance(area) - REPLY_LANDING_GAP_PX;
 }
 
 /**
@@ -45676,6 +45959,9 @@ function sideCardText(choice) {
   const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
   const said = summary && typeof summary.summary === "string" ? summary.summary.trim() : "";
   if (named && said) return `${named}: ${said}`;
+  // `#516 thread-card-max-lines`: a root longer than the card shows, its first lines and "…".
+  const split = cardSplit(choice);
+  if (split) return `${split.head}…`;
   const first = choice.root ? cardLines(choice.root) : "";
   return first || threadName(choice, Infinity);
 }
@@ -46472,7 +46758,9 @@ const cardIsSummarized = (choice) => {
   const summary = choice.summary;
   const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
   const said = summary && typeof summary.summary === "string" ? summary.summary.trim() : "";
-  return Boolean(named && said) || sideCardRootText(choice) !== "";
+  // Exactly when `sideCardText` says the summary. Not "when the card's words are not the root's":
+  // a split card's are not either (`#516 thread-card-max-lines`), and it says no summary.
+  return Boolean(named && said);
 };
 
 /**
@@ -46665,8 +46953,9 @@ function unpackNeedsRead(choice, held) {
 /** What one block would draw, as a signature, so a pass that changes nothing rebuilds nothing. */
 function unpackSignature(choice, held) {
   const opened = openedReadRuns.get(viewKey("thread", choice.id));
+  const split = cardSplit(choice);
   return JSON.stringify([choice.id, readMode, readRunsSuspended(), hideEmptyMessages, combineMessages,
-    cardIsSummarized(choice),
+    cardIsSummarized(choice), split ? split.rest : "",
     held.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
     opened ? [...opened].sort() : [], unpackReads.get(choice.id) || "", nowPlaying ? nowPlaying.id : "", pendingRead]);
 }
@@ -46689,12 +46978,28 @@ function unpackSignature(choice, held) {
 function unpackBlock(choice, tally) {
   const held = unpackHeldMessages(choice);
   const summarized = cardIsSummarized(choice);
-  const messages = unpackMessages(choice, held, summarized);
-  const rows = glom(messages).map((group) => {
+  // `#516 thread-card-max-lines`. Under a split card the root's continuation is the first child: the
+  // root's own row, alone in it, never joined to a reply by the same author.
+  const split = summarized ? null : cardSplit(choice);
+  const messages = unpackMessages(choice, held, summarized || split !== null);
+  const root = split ? messages.find((message) => isThreadRoot(message, choice)) || null : null;
+  const groups = root
+    ? [[continuationOf(root, split.rest)], ...glom(messages.filter((message) => message !== root))]
+    : glom(messages);
+  const rows = groups.map((group, at) => {
     const row = discordNode(group);
     row.setAttribute("data-unpack-thread", choice.id);
     row.className = `${row.className} unpack-row`;
     if (summarized && group.some((message) => isThreadRoot(message, choice))) row.setAttribute("data-root-child", "");
+    if (root && at === 0) {
+      row.setAttribute("data-root-child", "");
+      row.setAttribute("data-root-continuation", "");
+      row.setAttribute("title", "The rest of the first message, continued from its card");
+      // Drawn from its cut words, it acts as the root whole: the row's messages, and the list every
+      // act drawn on it was given, become the root itself — what a copy copies, a reply answers and
+      // reading aloud reads.
+      group.splice(0, 1, root);
+    }
     return row;
   });
   const viewing = String(el("discord-channel").value);
@@ -47208,6 +47513,8 @@ function sideCard({ choice, text, summarized, root, age, replies, unread, read, 
   // `#428 summary-cards-full`. The stylesheet draws such a card's text whole, at every
   // collapsed-lines count: the summary is not raw text and is never clamped.
   if (summarized) row.setAttribute("data-summarised-card", "");
+  // `#516 thread-card-max-lines`. A root split for the card, its words already K card lines and "…".
+  if (cardSplit(choice)) row.setAttribute("data-split-card", "");
   row.style.setProperty("--thread-hue", threadHue(choice.id));
   const button = document.createElement("button");
   button.className = "side-card";
@@ -53442,6 +53749,9 @@ const SYNCED_SETTING_KEYS = [
   "vibe-talk.voice.threads-main",
   "vibe-talk.voice.thread-order",
   "vibe-talk.voice.thread-card-folded",
+  // `#516 thread-card-max-lines`. K, the most lines a thread card shows of its root; the server
+  // reads it too, to name a thread whose root is longer from its first reply.
+  "vibe-talk.voice.thread-card-max-lines",
   // `#488 slack-app-agents`. Who is who: which account is the owner, the coding agent, a person or
   // another bot, chosen once for every device. The census of who spoke where stays local: a cache.
   "vibe-talk.voice.identities",
@@ -53542,6 +53852,7 @@ function applySyncedSetting(key) {
         applyCollapsedLines(storedCollapsedLines());
         refreshElisionLines();
         break;
+      case CARD_MAX_LINES_KEY: keepingCardPlace(() => applyCardMaxLines(storedCardMaxLines())); break;
       case READ_SPEED_KEY: applyReadSpeed(storedReadSpeed()); break;
       case READ_AUDIO_SOURCE_KEY: setReadAudioSource(storedReadAudioSource(), false); break;
       case MIC_SETTINGS_KEY: {
@@ -53967,6 +54278,8 @@ applyMsgScale(storedMsgScale());
 // `#425 collapsed-lines`. Before anything is drawn, for the same reason: a first list folded at
 // three and refolded at the reader's count a moment later is a jump nobody asked for.
 applyCollapsedLines(storedCollapsedLines());
+// Before the first card is drawn: nothing to draw again yet.
+applyCardMaxLines(storedCardMaxLines(), false);
 applyReadSpeed(storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
@@ -54001,6 +54314,9 @@ el("msg-scale-larger").addEventListener("click", () => stepMsgScale(1));
 el("collapsed-lines").addEventListener("input", () => collapsedLinesChanged(el("collapsed-lines").value));
 el("collapsed-lines-smaller").addEventListener("click", () => stepCollapsedLines(-1));
 el("collapsed-lines-larger").addEventListener("click", () => stepCollapsedLines(1));
+el("card-max-lines").addEventListener("input", () => cardMaxLinesChanged(el("card-max-lines").value));
+el("card-max-lines-smaller").addEventListener("click", () => stepCardMaxLines(-1));
+el("card-max-lines-larger").addEventListener("click", () => stepCardMaxLines(1));
 el("width-grip").addEventListener("pointerdown", onGripDown);
 el("width-grip").addEventListener("pointermove", onGripMove);
 el("width-grip").addEventListener("pointerup", onGripUp);

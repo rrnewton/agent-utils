@@ -192,6 +192,11 @@ CARDS_JS = """() => [...document.querySelectorAll('#side-cards > li')].map((row)
 ROWS_JS = """(list) => [...document.querySelectorAll(`#${list} > li[data-id]`)].map((row) => row.getAttribute('data-id'))"""
 
 
+def cut_long(card: Json) -> bool:
+    """Whether a card's words are cut short: by the clamp, or split for the card (`#516`), ending "…"."""
+    return bool(card["clamped"]) or str(card["text"]).endswith("…")
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -444,7 +449,9 @@ def columns_walk(desk: Desk) -> None:
     desk.check(text[CANARY].startswith("Message 215. Thread starts here."),
                f"a thread named but not summed up does not say its first message: {text[CANARY]!r}")
     replica = next(card for card in cards if card["id"] == REPLICA)
-    desk.check(bool(replica["clamped"]) and int(str(replica["lines"])) == 3,
+    # Cut by the clamp, or — longer than the thread card lines, `#516 thread-card-max-lines` — split
+    # for the card, its words already ending "…" within three lines this wide.
+    desk.check(cut_long(replica) and int(str(replica["lines"])) == 3,
                f"the long question is not cut to three lines: {replica}")
     desk.shot("1-list")
     desk.notes.append(f"three cards fitted at {heights}px by their lines, newest at the foot, the long one cut to three lines")
@@ -460,7 +467,7 @@ def columns_walk(desk: Desk) -> None:
                   ".getAttribute('data-selected') === 'true'", "the card under the mouse is not the selected one")
     desk.settled()
     hovered = {str(card["id"]): card for card in desk.cards()}
-    desk.check(bool(hovered[REPLICA]["clamped"]) and int(str(hovered[REPLICA]["lines"])) == 3,
+    desk.check(cut_long(hovered[REPLICA]) and int(str(hovered[REPLICA]["lines"])) == 3,
                f"the card under the mouse grew: {hovered[REPLICA]}")
     page.mouse.click(replica_box["x"] + replica_box["width"] / 2, replica_box["y"] + 12)
     desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\")"
@@ -468,7 +475,9 @@ def columns_walk(desk: Desk) -> None:
     desk.settled()
     desk.check(page.is_visible("#side-list") and not page.is_visible("#side-pane"), "a click on a card entered its thread")
     lit = {str(card["id"]): card for card in desk.cards()}
-    desk.check(not lit[REPLICA]["clamped"] and int(str(lit[REPLICA]["lines"])) > 3,
+    # Whole: unclamped, every word it says drawn — for this question, split for its card (`#516`),
+    # those are its first thread card lines and "…", the rest under the card where it is unpacked.
+    desk.check(not lit[REPLICA]["clamped"] and (int(str(lit[REPLICA]["lines"])) > 3 or str(lit[REPLICA]["text"]).endswith("…")),
                f"the card highlighted does not show its whole text: {lit[REPLICA]}")
     unlit = next(card for card in cards if card["id"] == CANARY)
     desk.check(round(float(str(lit[CANARY]["height"]))) == round(float(str(unlit["height"]))),

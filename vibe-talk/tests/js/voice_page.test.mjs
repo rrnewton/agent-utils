@@ -4798,6 +4798,20 @@ const TUNING_BANDS = {
     "the lines a fold shows until the reader says otherwise, and the count the hidden-word model " +
     "is read against in these tests: the owner's three, and the clamp's property in web/voice.css " +
     "is held to the same number (#425 collapsed-lines, #244 elision-word-count)"],
+  MIN_CARD_MAX_LINES: [1, 1,
+    "the fewest lines a thread card shows of its first message (#516 thread-card-max-lines): at " +
+    "zero a card would have no words to name its thread by"],
+  MAX_CARD_MAX_LINES: [8, 20,
+    "the most lines a thread card may show of its first message (#516 thread-card-max-lines): " +
+    "under the default's neighbourhood the setting stops being adjustable upward, and past a " +
+    "screenful a card is the big card the setting exists to prevent"],
+  DEFAULT_CARD_MAX_LINES: [5, 5,
+    "the lines a thread card shows of its first message until the owner says otherwise: his five, " +
+    "and src/threads.rs DEFAULT_CARD_MAX_LINES (#516 thread-card-max-lines)"],
+  CARD_LINE_CHARS: [36, 36,
+    "how many characters one card line is counted at, the same as src/threads.rs CARD_LINE_CHARS: " +
+    "the server and the page must count a root's lines alike, or a thread is split that the " +
+    "server named early, or left long that it did not (#516 thread-card-max-lines)"],
   ELIDED_MIN_WORDS: [5, 20,
     "the fewest hidden words a fold's label claims: under five the floor is too near nothing to " +
     "say anything is hidden, past twenty a fold over a paragraph says nothing (#244 elision-word-count)"],
@@ -63727,7 +63741,7 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // it decides how much of a message is shown, so the server keeps it for every device,
   // and Screen and keys is the one per-device section.
   assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Empty messages", "Combining messages",
-    "Rich headers", "Collapsed message lines", "Recently dismissed"]);
+    "Rich headers", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -65052,7 +65066,7 @@ function foldProblems(html, css, script) {
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, SCRIPT_CODE), []);
   // 31 since `#481 slack-app-deep-link` added Opening links, counted and checked above.
-  assert.equal(scriptFolds(SCRIPT_CODE).length, 31, "a fold went missing from the list, or one was added unchecked");
+  assert.equal(scriptFolds(SCRIPT_CODE).length, 32, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {
@@ -80618,6 +80632,256 @@ test("`#405 root-under-summary`: in a thread headed by a summarized card the rea
   assert.ok(!rawRows.some((li) => li.hasAttribute("data-root-child")), "a raw card's thread grew a root child");
   assert.ok(!rawRows.flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")).includes("704"),
     "the raw thread kept its read root under Hide read, so the summarized check proves nothing");
+});
+
+// --- a thread card never shows more than K lines of its root (#516 thread-card-max-lines) -------------
+//
+// The owner, 2026-10-25: "I HATE having big thread cards... if the message-root is bigger than a certain
+// size (let's say K lines, with default K set to 5 lines), let's summarize it even with a single-response
+// and push the root message inward to be the first child. If summarization is broken/disabled then I
+// still want to SPLIT this over-large message. Put only the first K lines in the thread card and append
+// "..." to the end. Then display the remainder of the message as a virtual first child underneath with
+// "..." prepended."
+
+const CARD_LINES_STORAGE = "vibe-talk.voice.thread-card-max-lines";
+const BIG = "spaces/A/threads/big";
+const SMALL = "spaces/A/threads/small";
+/** Eight short lines: three past the five a card shows by default. */
+const BIG_ROOT = ["Deploy plan for the cache tier", "1. drain the east pool", "2. upgrade the agents",
+  "3. verify the canaries", "4. undrain the east pool", "5. repeat for the west pool",
+  "6. watch the error budget", "7. close the change"].join("\n");
+
+/**
+ * Two threads of one question and one answer: one opened by `BIG_ROOT`, one by a line; with `late`, a
+ * third after them, so the first two are not the newest card, which no run of read cards takes in.
+ */
+function bigCardData(summarized = false, late = false) {
+  const big = { id: BIG, root_message_id: "800", is_root: true, reply_count: 1, reply_count_exact: true };
+  const small = { id: SMALL, root_message_id: "802", is_root: true, reply_count: 1, reply_count_exact: true };
+  const messages = [
+    message({ id: "800", content: BIG_ROOT, thread: big }),
+    message({ id: "801", content: "on it", thread: { ...big, is_root: false } }),
+    message({ id: "802", content: "is the canary green?", thread: small }),
+    message({ id: "803", content: "yes", thread: { ...small, is_root: false } }),
+  ];
+  const threads = [
+    { id: BIG, root: messages[0], title: "Thread", reply_count: 1, reply_count_exact: true,
+      updated_at: messages[1].timestamp,
+      ...(summarized ? { display_name: "cache-tier-deploy", summary: "The cache tier deploy, pool by pool." } : {}) },
+    { id: SMALL, root: messages[2], title: "Thread", reply_count: 1, reply_count_exact: true,
+      updated_at: messages[3].timestamp },
+  ];
+  if (late) {
+    const record = { id: "spaces/A/threads/late", root_message_id: "804", is_root: true, reply_count: 1, reply_count_exact: true };
+    messages.push(message({ id: "804", content: "and the west pool?", thread: record }),
+      message({ id: "805", content: "done", thread: { ...record, is_root: false } }));
+    threads.push({ id: record.id, root: messages[4], title: "Thread", reply_count: 1, reply_count_exact: true,
+      updated_at: messages[5].timestamp });
+  }
+  return { messages, threads };
+}
+
+async function bigCardPage({ summarized = false, storage = null, read = [], late = false } = {}) {
+  const data = bigCardData(summarized, late);
+  const page = newPage(storage || new Map());
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  for (const id of read) page.dealtWith.add(id);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return { page, server, data };
+}
+
+/** Thread `id` unpacked by a click round its card's states. */
+async function unpackCard(page, id) {
+  for (let press = 0; press < 3 && cardRow(page, id).getAttribute("data-card-state") !== "unpacked"; press += 1) {
+    await cardOf(page, id).click();
+    await page.settle();
+  }
+  assert.equal(cardRow(page, id).getAttribute("data-card-state"), "unpacked", `${id} did not unpack`);
+}
+
+test("`#516 thread-card-max-lines`: a root longer than K lines is split, its first K lines and … on the card and the rest, starting …, as the root's own first child with no controls of its own", async () => {
+  const { page } = await bigCardPage();
+  const head = BIG_ROOT.split("\n").slice(0, 5).join("\n");
+  assert.equal(cardPart(page, BIG, "side-card-text"), `${head}…`, "the card does not say K lines and an ellipsis");
+  assert.ok(cardRow(page, BIG).hasAttribute("data-split-card"), "the split card is not marked for the stylesheet");
+  assert.ok(!cardRow(page, BIG).hasAttribute("data-summarised-card"), "a split card claims to say a summary");
+  // The negative control: a one-line root is its card, whole, and not split.
+  assert.equal(cardPart(page, SMALL, "side-card-text"), "is the canary green?");
+  assert.ok(!cardRow(page, SMALL).hasAttribute("data-split-card"), "a short root was split");
+  await unpackCard(page, BIG);
+  const rows = unpackRows(page, BIG);
+  assert.deepStrictEqual(rows.map((li) => li.getAttribute("data-ids")), ["800", "801"],
+    "the block is not the root's continuation, then its reply");
+  const [rest] = rows;
+  assert.ok(rest.hasAttribute("data-root-continuation") && rest.hasAttribute("data-root-child"),
+    "the continuation is not drawn as the card's first child");
+  const words = bodyOf(rest).text();
+  assert.ok(words.startsWith("…5. repeat for the west pool"), `the continuation does not start with … and the rest: ${words}`);
+  assert.match(words, /7\. close the change/);
+  assert.doesNotMatch(words, /Deploy plan|drain the east pool/, "the continuation repeats what the card says");
+  // The root's own row: its author, and the root's id, so a reply or Done from it is the root's; and
+  // what it acts on is the root whole — a copy of it copies the whole message, not the cut words.
+  assert.equal(rest.getAttribute("data-id"), "800");
+  assert.equal(rest.messages.length, 1);
+  assert.equal(rest.messages[0].content, BIG_ROOT, "the continuation acts on its cut words, not the root");
+  assert.equal(rest.getAttribute("data-author"), "ci-bot", "the continuation is not the root's author's row");
+  assert.match(rest.text(), /ci-bot/, "the continuation does not say who wrote it");
+  // No controls of its own: the stylesheet hides its row's buttons and its replies chip.
+  assert.match(cssBlock("li.discord-message[data-root-continuation] .row-acts"), /display:\s*none/,
+    "the continuation still draws the root's buttons");
+  // The short thread unpacked: its reply alone, as any raw card's (`#405`).
+  await unpackCard(page, SMALL);
+  assert.deepStrictEqual(unpackRows(page, SMALL).map((li) => li.getAttribute("data-ids")), ["803"]);
+  // Shown whole, a split card is not clamped as well: a clamp would hide words that are neither on the
+  // card nor in its continuation, wherever the browser wraps them onto one more line than the proxy.
+  assert.equal(cssRules(CSS_CODE, ".side-card-row[data-split-card]").length, 0, "a split card is clamped");
+});
+
+test("`#516 thread-card-max-lines`: a split root's continuation is kept by Hide read and never folded into a run, as a summarised card's root is", async () => {
+  const { page } = await bigCardPage({ read: ["800", "801", "802", "803"] });
+  await unpackCard(page, BIG);
+  await page.el("todo-filter").click(); // Show -> Collapse
+  await page.settle();
+  assert.equal(unpackRows(page, BIG)[0].getAttribute("data-read-run"), null, "the continuation was folded into a run");
+  await page.el("todo-filter").click(); // Collapse -> Hide
+  await page.settle();
+  assert.deepStrictEqual(unpackRows(page, BIG).map((li) => li.getAttribute("data-ids")), ["800"],
+    "Hide read did not keep the read continuation and leave out the read reply");
+  assert.ok(unpackRows(page, BIG)[0].hasAttribute("data-root-continuation"));
+});
+
+test("`#516 thread-card-max-lines`: summarised, the long root's card says the summary and the root goes inward whole as its first child, not split", async () => {
+  const { page } = await bigCardPage({ summarized: true });
+  assert.equal(cardPart(page, BIG, "side-card-text"), "cache-tier-deploy: The cache tier deploy, pool by pool.");
+  assert.ok(!cardRow(page, BIG).hasAttribute("data-split-card"), "a summarised card is marked split");
+  await unpackCard(page, BIG);
+  const rows = unpackRows(page, BIG);
+  assert.deepStrictEqual(rows.map((li) => li.getAttribute("data-ids")), ["800", "801"]);
+  assert.ok(rows[0].hasAttribute("data-root-child"), "the root is not the card's first child");
+  assert.ok(!rows[0].hasAttribute("data-root-continuation"), "the root under a summary is drawn as a continuation");
+  assert.match(bodyOf(rows[0]).text(), /Deploy plan for the cache tier/, "the root child is not the whole root");
+});
+
+test("`#516 thread-card-max-lines`: a summary landing on a split thread switches it to the summary layout in place", async () => {
+  const { page, server } = await bigCardPage({ storage: new Map([[UNPACK_STORAGE, "all"]]) });
+  assert.ok(unpackRows(page, BIG)[0].hasAttribute("data-root-continuation"), "the premise: split and unpacked");
+  // The summariser names it (the server does so from the first reply, for a root this long).
+  Object.assign(page.threads[0], { display_name: "cache-tier-deploy", summary: "The cache tier deploy, pool by pool." });
+  server.threadChanged.set(BIG, ++server.revision);
+  // Past the thread list's own spacing (`THREAD_DIRECTORY_REFRESH_MS`), so the poll reads it.
+  page.setClock(page.clock() + sourceConstant("THREAD_DIRECTORY_REFRESH_MS"));
+  await pollOnce(page);
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(cardPart(page, BIG, "side-card-text"), "cache-tier-deploy: The cache tier deploy, pool by pool.",
+    "the summary did not reach the card");
+  assert.ok(!cardRow(page, BIG).hasAttribute("data-split-card"));
+  const rows = unpackRows(page, BIG);
+  assert.deepStrictEqual(rows.map((li) => li.getAttribute("data-ids")), ["800", "801"], "the block lost or doubled a row");
+  assert.ok(rows[0].hasAttribute("data-root-child") && !rows[0].hasAttribute("data-root-continuation"),
+    "the continuation did not give way to the whole root");
+  assert.match(bodyOf(rows[0]).text(), /^Deploy plan for the cache tier/);
+});
+
+test("`#516 thread-card-max-lines`: a link to a split thread's first message, over the Threads view, lands on its card, not on the continuation under it", async () => {
+  const data = bigCardData();
+  const page = newPage(new Map([[UNPACK_STORAGE, "all"]]), SCRIPT, (p) => {
+    p.enableHistory();
+    p.setAddress({ search: "?c=1110000000000000001&v=threads&m=discord%3A1110000000000000001%3A800" });
+  });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await untilDeepLink(page, () => /Here is the linked message/.test(statusText(page)));
+  assert.match(statusText(page), /linked message's card/, "the link did not land on the card");
+  assert.ok(unpackRows(page, BIG)[0].hasAttribute("data-root-continuation"), "the premise: split and unpacked");
+});
+
+test("`#516 thread-card-max-lines`: under Fold read a link to a read split thread's root opens the run its card is folded into and lands on the card", async () => {
+  const { page } = await bigCardPage({ read: ["800", "801", "802", "803", "804", "805"], late: true });
+  await page.el("todo-filter").click(); // Show -> Fold
+  await page.settle();
+  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "fold");
+  assert.notEqual(cardRow(page, BIG).getAttribute("data-read-run"), null, "the premise: the read card is in a run");
+  assert.equal(page.pure("landOnDeepLink")("800"), true, "the link found nowhere to land");
+  await page.settle();
+  assert.match(statusText(page), /linked message's card/, "the link did not land on the folded card");
+  assert.equal(cardRow(page, BIG).getAttribute("data-read-run"), null, "the run the card is folded into was not opened");
+});
+
+test("`#516 thread-card-max-lines`: K is Thread card lines in Settings, 1 to 12 and 5 by default, synced, and the cards follow it", async () => {
+  assertMarkupContains("fold-card-max-lines-body", "card-max-lines");
+  assert.match(/<input\s+id="card-max-lines"[^>]*>/.exec(HTML_CODE.replace(/\n\s*/g, " "))[0], /min="1" max="12"/);
+  const { page } = await bigCardPage();
+  assert.ok(page.pure("SYNCED_SETTING_KEYS").includes(CARD_LINES_STORAGE), "K is not kept on the server");
+  assert.equal(page.el("card-max-lines").value, "5", "the default is not five lines");
+  await page.el("card-max-lines").setValue("8");
+  await page.settle();
+  assert.equal(page.storage.get(CARD_LINES_STORAGE), "8", "the choice was not kept");
+  assert.equal(cardPart(page, BIG, "side-card-text"), BIG_ROOT, "eight lines do not fit a card of eight");
+  assert.ok(!cardRow(page, BIG).hasAttribute("data-split-card"));
+  assert.match(page.el("card-max-lines-state").textContent, /at most 8 lines/);
+  await page.el("card-max-lines-smaller").click();
+  await page.settle();
+  assert.equal(page.el("card-max-lines").value, "7");
+  // One line over is not split: a continuation row for one line takes more room than the line.
+  assert.equal(cardPart(page, BIG, "side-card-text"), BIG_ROOT, "one line left over was split off");
+  await page.el("card-max-lines-smaller").click();
+  await page.settle();
+  assert.equal(cardPart(page, BIG, "side-card-text"), `${BIG_ROOT.split("\n").slice(0, 6).join("\n")}…`);
+  await page.el("card-max-lines").setValue("0");
+  await page.settle();
+  assert.equal(page.el("card-max-lines").value, "1", "K went under its one line");
+  assert.equal(page.el("card-max-lines-smaller").disabled, true);
+  assert.equal(cardPart(page, BIG, "side-card-text"), "Deploy plan for the cache tier…");
+});
+
+test("`#516 thread-card-max-lines`: lines are counted by the server's proxy, wrapped word by word at 36 characters, and a long line is cut where its K-th line ends", async () => {
+  // The wrap itself, as src/threads.rs `card_lines` wraps (its unit tests hold the same cases).
+  const wrap = (line) => [...page0.pure("wrapCardLine")(line)].map((piece) => piece.text);
+  const page0 = newPage(new Map());
+  assert.deepStrictEqual(wrap(`${"x".repeat(17)}   ${"y".repeat(18)}`), [`${"x".repeat(17)} ${"y".repeat(18)}`]);
+  assert.deepStrictEqual(wrap(`${"x".repeat(18)} ${"y".repeat(18)}`), ["x".repeat(18), "y".repeat(18)]);
+  assert.deepStrictEqual(wrap("x".repeat(73)), ["x".repeat(36), "x".repeat(36), "x"]);
+  assert.equal(wrap(Array(10).fill("abcdefghijklm").join(" ")).length, 5, "two 13-letter words to a line");
+  assert.equal(sourceConstant("CARD_LINE_CHARS"), 36);
+  assert.match(readFileSync(join(WEB, "..", "src", "threads.rs"), "utf8"), /pub const CARD_LINE_CHARS: usize = 36;/, "the page and the server count lines differently");
+  // One paragraph of 61 four-letter words, 304 characters, seven to a line: nine card lines, so split at five.
+  const words = Array.from({ length: 61 }, (_, at) => `w${String(at).padStart(3, "0")}`).join(" ");
+  const data = bigCardData();
+  data.messages[0].content = words;
+  const page = newPage(new Map());
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  const said = cardPart(page, BIG, "side-card-text");
+  assert.ok(said.endsWith("…"), said);
+  const head = said.slice(0, -1);
+  assert.equal(head.split(" ").length, 35, `the card does not say five lines of seven words: ${head}`);
+  assert.ok(words.startsWith(`${head} `), "the cut was not made at a space");
+  await unpackCard(page, BIG);
+  assert.equal(bodyOf(unpackRows(page, BIG)[0]).text(), `…${words.slice(head.length + 1)}`,
+    "the continuation does not carry on exactly where the card stopped");
+  // A word longer than a line — a link, say — is broken across card lines and joined back without a
+  // space, on the card and in the continuation; and the "…" has room on the card's last line.
+  const link = `https://example.test/${"a".repeat(260)}`;
+  const split = page0.pure("splitForCard")(link);
+  assert.ok(split, "a 281-character link is not split");
+  assert.equal(`${split.head}${split.rest}`, link, "the broken link lost or gained characters");
+  assert.equal([...split.head].length, 4 * 36 + 35, "the card's last line has no room for the ellipsis");
 });
 
 // --- an unpacked row is a message row like any other (#407 unpack-row-parity) ---------------------------

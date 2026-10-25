@@ -1625,6 +1625,51 @@
                     </div>
                   </section>
 
+                  <section class="settings-group">
+                    <div class="group-head">
+                      <h3 title="The most lines a thread card shows of its thread's first message."><button class="fold-toggle" id="fold-card-max-lines" type="button" aria-expanded="false" aria-controls="fold-card-max-lines-body">Thread card lines</button></h3>
+                      <button class="help-link" id="help-link-card-max-lines" type="button" data-help="card-max-lines" aria-label="About thread card lines" title="The most lines a thread card shows of its thread's first message.">?</button>
+                    </div>
+                    <div class="fold-body" id="fold-card-max-lines-body" hidden="until-found">
+                      <!--
+                        `#516 thread-card-max-lines`. K, the most lines a thread card shows of
+                        its thread's first message: 5 until the owner says otherwise, 1 to 12.
+                        Counted by a proxy rather than measured — wrapped word by word at 36
+                        characters, a phone card's line — because the server decides by the same
+                        count whether to name a thread from its first reply (src/threads.rs,
+                        `CARD_LINE_CHARS`). Under Messages and kept on the server for every
+                        device (`#457 settings-server-side`): the server reads it.
+                      -->
+                      <div class="msg-scale-row">
+                        <button
+                          id="card-max-lines-smaller"
+                          class="secondary step-button"
+                          type="button"
+                          aria-label="Fewer thread card lines"
+                          aria-controls="card-max-lines"
+                          title="Fewer thread card lines"
+                        >−</button>
+                        <input
+                          id="card-max-lines"
+                          type="range"
+                          min="1"
+                          max="12"
+                          step="1"
+                          aria-label="thread card lines"
+                        />
+                        <button
+                          id="card-max-lines-larger"
+                          class="secondary step-button"
+                          type="button"
+                          aria-label="More thread card lines"
+                          aria-controls="card-max-lines"
+                          title="More thread card lines"
+                        >+</button>
+                      </div>
+                      <p id="card-max-lines-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </section>
+
                   <section class="settings-group" id="dismissed-group">
                     <div class="group-head">
                       <h3 title="Messages you dismissed from the outbox unsent, kept on this device for a week in case you want one back."><button class="fold-toggle" id="fold-dismissed" type="button" aria-expanded="false" aria-controls="fold-dismissed-body">Recently dismissed</button></h3>
@@ -2917,6 +2962,33 @@
                 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>0</kbd>). The status line says the new
                 count, the message you are on stays where it is, and neither chord types anything
                 in a message box or zooms the page.
+              </p>
+            </details>
+
+            <details id="help-card-max-lines" class="help-entry">
+              <summary><h2>Thread card lines</h2></summary>
+              <p class="hint">
+                A thread card never shows more than <strong>Thread card lines</strong> of the
+                thread's first message — <strong>1 to 12, 5 until you say otherwise</strong>, in
+                Settings under Messages, kept on the server for every device. A line is counted
+                as a phone's card wraps it, about 36 characters, and every line of the message
+                counts at least one; on a wider screen the same words take fewer lines, so a card
+                there is more compact still.
+              </p>
+              <p class="hint">
+                A first message longer than that is <strong>summarised from its first
+                reply</strong>, where a short one waits for the third message: the card says the
+                summary, and the message itself is the first thing under the card when the thread
+                is unpacked, as it is under any summarised card.
+              </p>
+              <p class="hint">
+                Until a summary comes — summaries off, failing, or still being written — the
+                message is <strong>split</strong>: the card shows its first lines and
+                <strong>…</strong>, and unpacked, the rest follows straight under the card,
+                starting <strong>…</strong>. That row is the first message's own continuation,
+                with its author and time, and no buttons of its own: a reply, a reaction or Done
+                from it is the first message's. When the summary arrives the card switches to
+                it where it stands, and the list does not move under you.
               </p>
             </details>
 

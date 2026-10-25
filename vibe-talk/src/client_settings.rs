@@ -43,9 +43,12 @@
 //! duplicated here.
 //!
 //! A key's value is the exact string the page keeps in `localStorage` under that key.
-//! The server never parses it: the page's own `stored…` readers clamp and default
+//! The server stores it unparsed: the page's own `stored…` readers clamp and default
 //! whatever they find, on every device, so a value written by a newer page degrades on
-//! an older one the way a corrupt local entry always has. What the server does decide
+//! an older one the way a corrupt local entry always has. One value is also READ here,
+//! by the same rule: the thread card lines (`#516 thread-card-max-lines`,
+//! [`crate::threads::card_max_lines`]), which decide when a thread is named, and are
+//! never refused for their contents. What the server does decide
 //! is WHICH keys exist ([`SYNCED_KEYS`]) and how large a value may be
 //! ([`MAX_VALUE_BYTES`]): an unknown key is refused, so this cannot become a general
 //! key-value store a caller stuffs channel text into. No MCP tool reaches it, for the
@@ -82,6 +85,10 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.threads-main",
     "vibe-talk.voice.thread-order",
     "vibe-talk.voice.thread-card-folded",
+    // Thread card lines: the most lines a card shows of its root, past which the root is
+    // split or summarised (`#516 thread-card-max-lines`). The one value the server reads
+    // itself ([`crate::threads::card_max_lines`]): it decides when a thread is named.
+    "vibe-talk.voice.thread-card-max-lines",
     // Channels: who is who, the owner's choice of which account is him, the coding agent,
     // a person or another bot. `#488 slack-app-agents`.
     "vibe-talk.voice.identities",

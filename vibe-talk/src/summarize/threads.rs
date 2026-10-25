@@ -11,7 +11,8 @@
 //! summary-card-threshold`), then at 3, 4 and 8 messages and every 10 after — because early on
 //! each message changes what a thread is about and later one more rarely does. Below the
 //! threshold no model call is spent and nothing filed is served: the card says the thread's
-//! real words.
+//! real words. A root too long for its card — more than the owner's K card lines, `#516
+//! thread-card-max-lines` — lowers the threshold to its first reply, for that thread alone.
 //!
 //! # Where it happens
 //!
@@ -109,8 +110,9 @@ use crate::chat::ChatClient;
 use crate::model::{ChannelId, Message, MessageId};
 use crate::store::{StateStore, StoreError, SummaryKey};
 use crate::threads::{
-    thread_summary_due, thread_summary_shown, ThreadSummary, TimelinePage, TimelineRequest,
-    TimelineView, THREAD_SUMMARY_MIN_MESSAGES,
+    card_max_lines, root_overflows_card, thread_summary_due, thread_summary_min_messages,
+    thread_summary_shown, ThreadSummary, TimelinePage, TimelineRequest, TimelineView,
+    CARD_MAX_LINES_KEY, MIN_CARD_MAX_LINES,
 };
 
 /// The instruction a thread is named under.
@@ -501,6 +503,12 @@ pub struct ThreadNames {
     /// The least time between two naming reads in one channel. Zero spaces them not at all; they
     /// are still made one at a time.
     interval: Duration,
+    /// K, the most lines a thread card shows of its root, from the owner's synced setting
+    /// (`#516 thread-card-max-lines`, [`crate::threads::card_max_lines`]); 0 until first read
+    /// from the store. A root longer than that is named from its first reply. Written by the
+    /// settings route as the owner changes it ([`ThreadNames::note_settings`]), so the store is
+    /// read for it once per process, not once per page.
+    card_max_lines: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -821,6 +829,68 @@ impl ThreadNames {
             state: Mutex::new(NamesState::default()),
             turn: tokio::sync::Semaphore::new(1),
             interval,
+            card_max_lines: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// K as the owner set it: read from the store the first time it is wanted, and kept. A store
+    /// that cannot be read gives the default for now and is asked again next time.
+    async fn card_max_lines(&self, deps: &ThreadDeps) -> usize {
+        use std::sync::atomic::Ordering;
+        let held = self.card_max_lines.load(Ordering::Relaxed);
+        if held != 0 {
+            return held;
+        }
+        match deps.store.client_settings().await {
+            Ok(settings) => {
+                let value = settings
+                    .iter()
+                    .find(|setting| setting.key == CARD_MAX_LINES_KEY)
+                    .and_then(|setting| setting.value.as_deref());
+                let lines = card_max_lines(value);
+                // A write that landed while the store was read is newer: it is kept.
+                let _ = self.card_max_lines.compare_exchange(
+                    0,
+                    lines,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                self.card_max_lines.load(Ordering::Relaxed)
+            }
+            Err(_) => card_max_lines(None),
+        }
+    }
+
+    /// K for deciding which of `roots` are too long for their cards: the owner's, unless none of
+    /// them is longer than the fewest lines K can be, when every K finds them all short and the
+    /// store is not asked. Most roots are one line, so most pages never read the setting.
+    async fn card_max_lines_for<'a>(
+        &self,
+        deps: &ThreadDeps,
+        roots: impl IntoIterator<Item = Option<&'a Message>>,
+    ) -> usize {
+        if roots
+            .into_iter()
+            .any(|root| root_overflows_card(root, MIN_CARD_MAX_LINES))
+        {
+            self.card_max_lines(deps).await
+        } else {
+            MIN_CARD_MAX_LINES
+        }
+    }
+
+    /// The owner's synced settings changed: take K from them where it is among them.
+    /// `#516 thread-card-max-lines`.
+    pub fn note_settings(&self, changed: &[crate::client_settings::SyncedSetting]) {
+        if let Some(setting) = changed
+            .iter()
+            .rev()
+            .find(|setting| setting.key == CARD_MAX_LINES_KEY)
+        {
+            self.card_max_lines.store(
+                card_max_lines(setting.value.as_deref()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -927,11 +997,20 @@ impl ThreadNames {
         page: &mut TimelinePage,
         may_write: bool,
     ) {
+        let max_lines = self
+            .card_max_lines_for(
+                deps,
+                page.threads
+                    .iter()
+                    .chain(page.thread.iter())
+                    .map(|summary| summary.root.as_ref()),
+            )
+            .await;
         if !deps.summarizer.names_threads() {
             // Nothing to attach or queue, but a bridge's own name and sentence for a thread
             // known to be under the threshold still do not reach a card (`#484`).
             for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
-                hide_under_threshold(summary);
+                hide_under_threshold(summary, max_lines);
             }
             return;
         }
@@ -943,8 +1022,8 @@ impl ThreadNames {
             answered.insert(summary.id.clone());
             match self.lookup(deps, channel, &summary.id).await {
                 Lookup::Known(record) => {
-                    if !thread_summary_shown(summary.reply_count, summary.reply_count_exact) {
-                        hide_under_threshold(summary);
+                    if !shown(summary, max_lines) {
+                        hide_under_threshold(summary, max_lines);
                     } else if let Some(record) = &record {
                         summary.display_name = Some(record.name.clone());
                         summary.summary = record.sentence.as_ref().map(|sentence| {
@@ -955,7 +1034,7 @@ impl ThreadNames {
                     if !may_write {
                         continue;
                     }
-                    if due(summary, record.as_ref()) {
+                    if due(summary, record.as_ref(), max_lines) {
                         self.enqueue(deps, channel, summary.clone(), record, read_at);
                     } else if let Some(record) = record {
                         if needs_touch(summary, &record, now_seconds()) {
@@ -965,10 +1044,10 @@ impl ThreadNames {
                 }
                 Lookup::Unknown(name) => {
                     // The same threshold as the known record above (`#484 summary-card-threshold`).
-                    if thread_summary_shown(summary.reply_count, summary.reply_count_exact) {
+                    if shown(summary, max_lines) {
                         summary.display_name = name;
                     } else {
-                        hide_under_threshold(summary);
+                        hide_under_threshold(summary, max_lines);
                     }
                     self.refresh_copies(channel, summary);
                 }
@@ -978,8 +1057,12 @@ impl ThreadNames {
             // A thread renamed since the page was read may have shrunk under the threshold
             // while it was being named: its delta copy is served by the same rule (`#484`).
             let mut renamed = self.recently_renamed(channel, &answered);
+            // K for THESE roots: the one worked out above saw only the page's own.
+            let max_lines = self
+                .card_max_lines_for(deps, renamed.iter().map(|summary| summary.root.as_ref()))
+                .await;
             for summary in &mut renamed {
-                hide_under_threshold(summary);
+                hide_under_threshold(summary, max_lines);
             }
             if !renamed.is_empty() {
                 page.threads.extend(renamed);
@@ -1420,6 +1503,22 @@ impl ThreadNames {
                 in_flight.copy = read_copy.clone();
             }
         }
+        // `#516 thread-card-max-lines`: whether the root is too long for its card, by the root
+        // this read returned where it returned one, else by the copy the page showed.
+        let long_root = {
+            let read_root = page
+                .thread
+                .as_ref()
+                .and_then(|thread| thread.root.as_ref())
+                .or_else(|| {
+                    page.messages.iter().find(|message| {
+                        message.thread.as_ref().is_some_and(|thread| thread.is_root)
+                    })
+                })
+                .or(snapshot.root.as_ref());
+            let max_lines = self.card_max_lines_for(deps, [read_root]).await;
+            root_overflows_card(read_root, max_lines)
+        };
         let mut messages: Vec<Message> = Vec::new();
         if let Some(root) = page.thread.and_then(|thread| thread.root) {
             messages.push(root);
@@ -1477,7 +1576,7 @@ impl ThreadNames {
         // still holds never names a thread the list shows under the threshold. Too few is no
         // failure, but the thread is left unqueued for the failure pause rather than re-read
         // at every page until it grows: nothing is filed, and it falls due as it grows.
-        if at < THREAD_SUMMARY_MIN_MESSAGES {
+        if at < thread_summary_min_messages(long_root) {
             tracing::info!(
                 messages = at,
                 "a thread under the summary threshold was not named; no model call was spent"
@@ -1575,22 +1674,35 @@ fn not_older(arriving: &ThreadSummary, held: &ThreadSummary) -> bool {
 /// Serve neither half of a thread known to be under the summary threshold, whoever filed
 /// them (`#484 summary-card-threshold`, [`crate::threads::thread_summary_shown`]). The record
 /// itself is kept and shows again from the third message.
-fn hide_under_threshold(summary: &mut ThreadSummary) {
-    if !thread_summary_shown(summary.reply_count, summary.reply_count_exact) {
+fn hide_under_threshold(summary: &mut ThreadSummary, max_lines: usize) {
+    if !shown(summary, max_lines) {
         summary.display_name = None;
         summary.summary = None;
     }
 }
 
-/// Whether a thread needs a name, or a fresh sentence.
-fn due(summary: &ThreadSummary, record: Option<&ThreadRecord>) -> bool {
+/// Whether a thread's filed name and sentence may be served, by its reported size and whether
+/// its root is too long for a card of `max_lines` lines ([`crate::threads::thread_summary_shown`]).
+fn shown(summary: &ThreadSummary, max_lines: usize) -> bool {
+    thread_summary_shown(
+        summary.reply_count,
+        summary.reply_count_exact,
+        root_overflows_card(summary.root.as_ref(), max_lines),
+    )
+}
+
+/// Whether a thread needs a name, or a fresh sentence. `max_lines` is K, the most lines a card
+/// shows of its root: a root longer than that lowers the threshold to its first reply (`#516
+/// thread-card-max-lines`).
+fn due(summary: &ThreadSummary, record: Option<&ThreadRecord>, max_lines: usize) -> bool {
     let messages = summary.reply_count.map(|replies| replies.saturating_add(1));
+    let long_root = root_overflows_card(summary.root.as_ref(), max_lines);
     // `#484 summary-card-threshold`: a thread known to hold fewer than
-    // `THREAD_SUMMARY_MIN_MESSAGES` is never due, named or not. With no count reported, or an
-    // inexact one, the thread is still queued, and the worker counts what its own read holds
-    // before any model call (`name_turn`).
+    // `THREAD_SUMMARY_MIN_MESSAGES` is never due, named or not — two, under a root too long for
+    // its card (`#516`). With no count reported, or an inexact one, the thread is still queued,
+    // and the worker counts what its own read holds before any model call (`name_turn`).
     if summary.reply_count_exact
-        && matches!(messages, Some(count) if count < THREAD_SUMMARY_MIN_MESSAGES)
+        && matches!(messages, Some(count) if count < thread_summary_min_messages(long_root))
     {
         return false;
     }
@@ -1606,7 +1718,9 @@ fn due(summary: &ThreadSummary, record: Option<&ThreadRecord>) -> bool {
         // Named, but with no sentence under the current policy: a policy change swept it, or it
         // was evicted. The name is kept; only the sentence is asked for again.
         (None, _) => true,
-        (Some(sentence), Some(messages)) => thread_summary_due(messages, Some(sentence.at)),
+        (Some(sentence), Some(messages)) => {
+            thread_summary_due(messages, Some(sentence.at), long_root)
+        }
         // Nothing says the thread grew, so nothing says the sentence is stale.
         (Some(_), None) => false,
     }
@@ -1858,6 +1972,11 @@ mod tests {
             "the oldest replies should be the ones left out"
         );
         assert!(prompt.chars().count() < MAX_PROMPT_TEXT_CHARS + 1_000);
+    }
+
+    /// `due` at the default K, for threads whose root is not known to be long.
+    fn due(summary: &ThreadSummary, record: Option<&ThreadRecord>) -> bool {
+        super::due(summary, record, crate::threads::DEFAULT_CARD_MAX_LINES)
     }
 
     #[test]
