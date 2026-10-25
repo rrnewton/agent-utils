@@ -3032,7 +3032,6 @@ a.search-hit-link {
   opacity: 0.55;
 }
 
-#side-cards .reply-ungather.unpack-pack:hover .unpack-pack-mark,
 #side-cards .reply-ungather.unpack-pack:active .unpack-pack-mark,
 #side-cards .reply-ungather.unpack-pack:focus-visible .unpack-pack-mark {
   opacity: 1;

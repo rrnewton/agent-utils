@@ -13461,7 +13461,7 @@ function renderKeyHints() {
  */
 function viewKeysNote() {
   const mod = modKeyName();
-  return `${mod}+1 to ${mod}+4 work from anywhere, in a message box or the search too, and type nothing there. ` +
+  return `${mod}+0 goes to the voice view, and ${mod}+1 to ${mod}+4 work from anywhere, in a message box or the search too, and type nothing there. ` +
     "1, 2 and 3 on their own no longer change the view. In a browser tab, Chrome and Edge let this page have " +
     `${mod}+1 to ${mod}+4 before their own tab switching; a browser that keeps them for its tabs switches tabs ` +
     "instead, and the view picker in the bar chooses the same four views.";
