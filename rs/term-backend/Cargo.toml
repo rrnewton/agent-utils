@@ -1,0 +1,18 @@
+[package]
+name = "term-backend"
+version = "0.1.0"
+description = "Backend-neutral terminal multiplexer traits with Herdr and tmux backends"
+readme = "README.md"
+keywords = ["terminal", "multiplexer", "tmux", "agents"]
+categories = ["api-bindings", "development-tools"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

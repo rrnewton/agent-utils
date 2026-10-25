@@ -25,6 +25,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
+ "term-backend",
  "unicode-width",
 ]
 
@@ -666,6 +667,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "term-backend"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

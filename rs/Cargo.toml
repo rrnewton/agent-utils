@@ -6,6 +6,7 @@ members = [
     "pr-landing-planner",
     "herdr-run",
     "agentctl",
+    "term-backend",
     "chat-subscription",
     "chat-subscription-plugin",
     "chat-subscription-fake",
