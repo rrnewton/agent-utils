@@ -99,11 +99,27 @@ impl TmuxBackend {
         }
         rest.extend(["-F", PANE_FORMAT]);
         let stdout = self.run_listing(&rest, "tmux list-panes")?;
-        stdout
+        let mut panes: Vec<PaneInfo> = stdout
             .lines()
             .filter(|line| !line.is_empty())
             .map(parse_pane_row)
-            .collect()
+            .collect::<Result<_>>()?;
+        // A pane whose foreground command is a wrapper (a shell script, an
+        // interpreter, a launcher) hides the harness it started. Look under
+        // the pane's shell process for one before reporting no agent.
+        if panes.iter().any(|pane| pane.agent.is_none() && pane.pid.is_some()) {
+            let processes = scan_processes();
+            if !processes.is_empty() {
+                for pane in &mut panes {
+                    if pane.agent.is_none() {
+                        if let Some(pid) = pane.pid {
+                            pane.agent = detect_harness_in(pid, &processes).map(str::to_owned);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(panes)
     }
 }
 
@@ -136,10 +152,163 @@ fn parse_pane_row(line: &str) -> Result<PaneInfo> {
 /// Harness kinds recognisable from a pane's foreground command name.
 fn known_harness(command: &str) -> Option<&str> {
     let base = command.rsplit('/').next().unwrap_or(command);
-    match base {
-        "codex" | "claude" | "muse" => Some(base),
+    harness_basename(base)
+}
+
+/// The harness kind a program basename names, allowing the `.real` suffix a
+/// launcher binary may carry behind its public name.
+fn harness_basename(base: &str) -> Option<&'static str> {
+    match base.strip_suffix(".real").unwrap_or(base) {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "muse" => Some("muse"),
         _ => None,
     }
+}
+
+/// One visible process, as harness detection needs it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcEntry {
+    pid: u32,
+    ppid: u32,
+    pgrp: u32,
+    /// Foreground process group of the process's controlling terminal.
+    tpgid: i64,
+    /// Basename of the kernel executable image, when readable.
+    exe_base: Option<String>,
+    /// First arguments, when readable.
+    argv: Vec<String>,
+}
+
+impl ProcEntry {
+    fn harness(&self) -> Option<&'static str> {
+        if let Some(kind) = self.exe_base.as_deref().and_then(harness_basename) {
+            return Some(kind);
+        }
+        // An interpreter running a harness script names it as its first
+        // file argument, not in argv[0].
+        self.argv.iter().take(2).find_map(|argument| {
+            argument
+                .rsplit('/')
+                .next()
+                .and_then(harness_basename)
+        })
+    }
+}
+
+/// The harness running in a pane whose shell is `shell_pid`: the shallowest
+/// known harness among the shell and its descendants that belong to the
+/// terminal's foreground job. `None` when the pane runs none, or when the
+/// shell is not in `processes`.
+fn detect_harness_in(shell_pid: u32, processes: &[ProcEntry]) -> Option<&'static str> {
+    let shell = processes.iter().find(|entry| entry.pid == shell_pid)?;
+    let foreground = shell.tpgid;
+    let mut children: std::collections::HashMap<u32, Vec<&ProcEntry>> =
+        std::collections::HashMap::new();
+    for entry in processes {
+        children.entry(entry.ppid).or_default().push(entry);
+    }
+    // Breadth-first from the shell, so the program the shell launched wins
+    // over anything that program itself later starts.
+    let mut queue = std::collections::VecDeque::from([shell]);
+    let mut seen = std::collections::HashSet::from([shell_pid]);
+    while let Some(entry) = queue.pop_front() {
+        let in_foreground =
+            entry.pid == shell_pid || foreground <= 0 || i64::from(entry.pgrp) == foreground;
+        if in_foreground {
+            if let Some(kind) = entry.harness() {
+                return Some(kind);
+            }
+        }
+        for child in children.get(&entry.pid).into_iter().flatten() {
+            if seen.insert(child.pid) {
+                queue.push_back(child);
+            }
+        }
+    }
+    None
+}
+
+/// Every visible process from `/proc`; empty where `/proc` is unavailable.
+fn scan_processes() -> Vec<ProcEntry> {
+    #[cfg(target_os = "linux")]
+    {
+        scan_proc()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scan_proc() -> Vec<ProcEntry> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut processes = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        let root = entry.path();
+        let Ok(stat) = std::fs::read(root.join("stat")) else {
+            continue;
+        };
+        let Some((ppid, pgrp, tpgid)) = parse_stat_groups(&stat) else {
+            continue;
+        };
+        let argv = std::fs::read(root.join("cmdline"))
+            .map(|raw| {
+                raw.split(|byte| *byte == 0)
+                    .filter(|part| !part.is_empty())
+                    .take(3)
+                    .map(|part| String::from_utf8_lossy(part).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let exe_base = std::fs::read_link(root.join("exe")).ok().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().trim_end_matches(" (deleted)").to_owned())
+        });
+        processes.push(ProcEntry {
+            pid,
+            ppid,
+            pgrp,
+            tpgid,
+            exe_base,
+            argv,
+        });
+    }
+    processes
+}
+
+/// `(ppid, pgrp, tpgid)` from a `/proc/PID/stat` record, whose command name
+/// is opaque bytes between the first `(` and the last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_stat_groups(stat: &[u8]) -> Option<(u32, u32, i64)> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let fields: Vec<&[u8]> = stat[close + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect();
+    // After the command name: state, ppid, pgrp, session, tty_nr, tpgid.
+    let number = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.parse::<i64>().ok())
+    };
+    Some((
+        u32::try_from(number(1)?).ok()?,
+        u32::try_from(number(2)?).ok()?,
+        number(5)?,
+    ))
 }
 
 impl Multiplexer for TmuxBackend {
@@ -534,6 +703,46 @@ mod tests {
         let panes = backend.list_panes(None).unwrap();
         assert_eq!(panes[0].title.as_deref(), Some("title\twith\ttabs"));
         assert_eq!(panes[0].pid, Some(99));
+    }
+
+    fn proc(pid: u32, ppid: u32, pgrp: u32, exe: Option<&str>, argv: &[&str]) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            pgrp,
+            tpgid: 200,
+            exe_base: exe.map(str::to_owned),
+            argv: argv.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn wrapped_launch_is_detected_under_the_pane_shell() {
+        // shell(100) -> bash wrapper(200, fg leader) -> python script "claude"(201)
+        let processes = vec![
+            proc(100, 1, 100, Some("bash"), &["-bash"]),
+            proc(200, 100, 200, Some("bash"), &["bash", "/opt/wrap.sh"]),
+            proc(201, 200, 200, Some("python3"), &["python3", "/opt/bin/claude"]),
+            // A background descendant in another group is not the pane's job.
+            proc(300, 100, 300, Some("codex"), &["codex"]),
+        ];
+        assert_eq!(detect_harness_in(100, &processes), Some("claude"));
+        // The shallowest foreground harness wins over one it started itself.
+        let nested = vec![
+            proc(100, 1, 100, Some("bash"), &["-bash"]),
+            proc(200, 100, 200, Some("muse.real"), &["/opt/muse.real"]),
+            proc(201, 200, 200, Some("codex"), &["codex"]),
+        ];
+        assert_eq!(detect_harness_in(100, &nested), Some("muse"));
+        assert_eq!(detect_harness_in(999, &nested), None);
+        let idle = vec![proc(100, 1, 100, Some("bash"), &["-bash"])];
+        assert_eq!(detect_harness_in(100, &idle), None);
+    }
+
+    #[test]
+    fn stat_groups_survive_spaces_and_parens_in_the_command_name() {
+        let stat = b"4242 (weird ) name) S 100 200 200 34816 200 4194304 100 0 0 0";
+        assert_eq!(parse_stat_groups(stat), Some((100, 200, 200)));
     }
 
     #[test]
