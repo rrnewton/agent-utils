@@ -1445,15 +1445,15 @@ the UI clearly says the exact body is unavailable and shows an inferred paragrap
 agent's subsequent work. Automatic final answers and each agent's own commentary/final response are
 plaintext; encrypted instruction bodies remain unavailable to the archive.
 
-## Measure parent-child responsiveness (agentctl teams)
+## Measure parent-child responsiveness (persistent-agent teams)
 
 A coordinator keeps its subagents busy only if it learns promptly that one stopped and then acts.
-`wrkviz responsiveness` measures that loop for a team run with agentctl, from records the team
-already writes. It reads only, calls no model, and needs no archive:
+`wrkviz responsiveness` measures that loop for a team run by a persistent-agent manager that keeps
+a registry of agent records and per-agent message queues, from records the team already writes. It reads only, calls no model, and needs no archive:
 
 ```bash
 wrkviz responsiveness \
-  --registry ~/project/.agentctl \
+  --registry ~/project/.agents-registry \
   --coordinator-transcript ~/.claude/projects/-home-me-project/SESSION.jsonl \
   --muse-sessions ~/.local/share/muse/sessions \
   --sweep-marker '[coordinator sweep]' \
@@ -1462,20 +1462,20 @@ wrkviz responsiveness \
 
 Sources:
 
-- **The agentctl registry**: every agent record, live or under `archive/`, and every queue message
-  with `queued_at` (when a sender queued it) and `confirmed_at` (when agentctl saw it accepted).
+- **The agent manager's registry**: every agent record, live or under `archive/`, and every queue message
+  with `queued_at` (when a sender queued it) and `confirmed_at` (when the manager saw it accepted).
   Messages a child sends the coordinator are attributed by the `NAME:` convention: the text starts
-  with the child's registered name. Queue IDs starting `agent-watch-` are `agentctl watch-agents`
-  notices and `chat-` are chat-bridge prompts. A message in a child's own queue is the parent
+  with the child's registered name. Queue IDs starting `agent-watch-` are the manager's
+  watcher notices and `chat-` are chat-bridge prompts. A message in a child's own queue is the parent
   acting on that child, at its `queued_at`.
 - **The coordinator's Claude Code transcript**: a turn runs from the prompt or scheduled-task fire
   that starts it to its `turn_duration` record; prompts absorbed mid-turn are counted as inputs but
   start no turn; a turn the harness never closed (a killed process) ends at its last record. Only
-  Bash tool calls are read, and in them only a simple command that starts with `agentctl VERB NAME`
-  addresses that child: `stop`, `send`, `answer` and `start` count as acting, anything else as
-  looking. A name inside message text or a heredoc is not an action; `for VAR in NAMES; do
-  agentctl VERB $VAR` applies the verb to each name. `wrkslots read-handoff SLOT` and
-  `wrkslots remove SLOT` act on the slot's newest child. Scheduled-task fires are sweeps; with
+  Bash tool calls are read, and in them only a simple command that runs the agent manager's
+  command as `MANAGER VERB NAME` addresses that child: `stop`, `send`, `answer` and `start` count as
+  acting, anything else as looking. A name inside message text or a heredoc is not an action;
+  `for VAR in NAMES; do MANAGER VERB $VAR` applies the verb to each name. The worktree-slot
+  manager's `read-handoff SLOT` and `remove SLOT` act on the slot's newest child. Scheduled-task fires are sweeps; with
   `--sweep-marker` only prompts containing that text are. One transcript is read: a coordinator
   restarted into a new session needs one run per transcript.
 - **Each child's log**: a Claude Code transcript found under `--claude-projects` by the agent's

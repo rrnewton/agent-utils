@@ -1,11 +1,11 @@
-"""Parent-child responsiveness of an agentctl team, measured from its own records.
+"""Parent-child responsiveness of a persistent-agent team, measured from its own records.
 
 A coordinator that delegates to persistent subagents keeps them busy only if it learns
 promptly that a child stopped and then acts. This module rebuilds that loop from the logs
 the team already writes, without calling a model:
 
-* the agentctl registry: every agent record (live and archived) and every queue message,
-  with the times agentctl queued it and confirmed it typed into the target;
+* the agent manager's registry: every agent record (live and archived) and every queue
+  message, with the times the manager queued it and confirmed it typed into the target;
 * the coordinator's Claude Code transcript: its turns, the prompts that started them
   (queued messages, chat-bridge prompts, scheduled-task fires) and the tool calls it made;
 * each child's own log: Claude Code transcripts found by the agent's native session id,
@@ -30,7 +30,7 @@ from pathlib import Path
 import re
 
 
-# Prefixes of queue message IDs that agentctl writes for its own senders.
+# Prefixes of queue message IDs that the agent manager writes for its own senders.
 WATCH_ID_PREFIX = "agent-watch-"
 CHAT_ID_PREFIX = "chat-"
 
@@ -95,7 +95,7 @@ class AgentRecord:
 
 @dataclass(frozen=True)
 class QueueMessage:
-    """One message from any agentctl queue."""
+    """One message from any agent queue in the registry."""
 
     owner: str
     message_id: str
@@ -283,7 +283,7 @@ def load_messages(registry: Path) -> list[QueueMessage]:
 def message_author(text: str, names: Iterable[str]) -> str | None:
     """The child a coordinator message came from, by the ``NAME:`` convention.
 
-    agentctl records no sender, so a child names itself: the message starts with its
+    The queue records no sender, so a child names itself: the message starts with its
     registered name followed by a colon or a space, optionally after ``LANDED (``.
     """
 
@@ -360,7 +360,7 @@ _ASSIGNMENT = re.compile(r"(?:^|[;&|\s])([A-Za-z_]\w*)=([^\s;&|'\"]+)")
 
 def _expand(command: str) -> str:
     """Substitute the command's own plain ``VAR=value`` assignments, so ``WS=.../wrkslots;
-    $WS remove SLOT`` reads as wrkslots. Two passes resolve ``WS=$H/worktrees/wrkslots``."""
+    $WS remove SLOT`` reads as the slot manager. Two passes resolve ``WS=$H/worktrees/wrkslots``."""
 
     values: dict[str, str] = {}
     for match in _ASSIGNMENT.finditer(command):
@@ -677,7 +677,7 @@ def analyze(sources: Sources, since: float | None = None, until: float | None = 
     if not sources.coordinator_transcript.is_file():
         raise ResponsivenessError(f"coordinator transcript not found: {sources.coordinator_transcript}")
     if not sources.registry.is_dir():
-        raise ResponsivenessError(f"agentctl registry not found: {sources.registry}")
+        raise ResponsivenessError(f"agent registry not found: {sources.registry}")
     agents = [agent for agent in load_agents(sources.registry, sources.coordinator)
               if not any(fnmatchcase(agent.name, pattern) for pattern in sources.exclude)]
     names = [agent.name for agent in agents]
@@ -759,7 +759,7 @@ def analyze(sources: Sources, since: float | None = None, until: float | None = 
             delivered: list[tuple[float, str]] = []
             for message, label, input_kind in [(m, "child-message", "child-message") for m in own] + [
                     (m, "watch-notice", "watch") for m in notices]:
-                # agentctl leaves confirmed_at unset when it cannot verify a submission that did
+                # The manager leaves confirmed_at unset when it cannot verify a submission that did
                 # arrive, so the prompt's arrival in the coordinator's transcript also counts.
                 arrival = message.confirmed
                 if arrival is None and message.queued is not None:

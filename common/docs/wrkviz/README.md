@@ -30,7 +30,7 @@ web server.
   prompt ordinals, inclusive ordinal ranges, stable timeline and message references,
   JSON/JSONL/Markdown/text output, time/team filters, relationship traversal, and separate search
   scopes for owner prompts, agent responses, or the complete provider-neutral transcript.
-- A zero-model `responsiveness` report for agentctl teams: how long children waited for the
+- A zero-model `responsiveness` report for persistent-agent teams: how long children waited for the
   coordinator after each turn end, by notification path, harness, and whether the parent was busy.
 - A self-contained static website served by a built-in loopback server, with backwards-compatible
   range-sharded timeline loading, deterministic gzip sidecars, immutable digest URLs, strong
