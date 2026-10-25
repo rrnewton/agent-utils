@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-516-cc4c6dcb520",
+    "issue_id": "agent-utils-516",
+    "author": "WinGamingPC",
+    "body": "[GPT-6 Codex codex-vibe-discord] Local implementation: d2b55906 creates native threads on first reply, reuses a racing thread after 160004, explains missing permissions, and gives main messages potential-root records for the shared client badge/reply path. The Discord HTTP/thread suite passed 114 tests. Bypassing creation fails the new regression with unknown-channel 10003; native-root client test passes. Full selected validation runs before publication. Local analysis belongs in comments because mirrored descriptions are guarded against edits.",
+    "created_at": "2026-10-25T21:47:59.573464797Z",
+    "updated_at": "2026-10-25T21:47:59.573464797Z"
+  }
+]
