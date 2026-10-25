@@ -56,7 +56,7 @@ that order). With no selection, Herdr is used when its executable is
 available and tmux when only tmux exists. `--tmux-bin` names the tmux
 executable and `--tmux-socket NAME` addresses a non-default tmux server
 (passed as `-L NAME`). `agentctl capabilities` reports both backends and
-which one is selected.
+which one is selected under `term_backends`.
 
 Today the tmux backend drives the durable direct-pane transport: the
 `herdr-agent` compatibility command's `send`, `drain`, `status`, and `read`

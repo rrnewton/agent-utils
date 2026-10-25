@@ -2511,9 +2511,12 @@ fn capabilities_document(
     let not_live = crate::plugins::MaturityStatus::discovered(false);
     json!({
         "interactive": {
-            "backends": ["herdr", "tmux"],
-            "selected_backend": selected_backend,
+            "backends": ["herdr"],
             "harnesses": ["codex", "claude", "muse"]
+        },
+        "term_backends": {
+            "available": ["herdr", "tmux"],
+            "selected": selected_backend
         },
         "agentcloud": {
             "drivers": crate::subagents::CLOUD_DRIVERS,
@@ -3862,11 +3865,12 @@ mod tests {
             }],
         };
         let document = capabilities_document(PathBuf::from("registry"), plugins, "herdr");
+        assert_eq!(document["interactive"]["backends"], json!(["herdr"]));
         assert_eq!(
-            document["interactive"]["backends"],
+            document["term_backends"]["available"],
             json!(["herdr", "tmux"])
         );
-        assert_eq!(document["interactive"]["selected_backend"], "herdr");
+        assert_eq!(document["term_backends"]["selected"], "herdr");
         assert_eq!(document["chat_subscriptions"]["core"]["origin"], "built_in");
         assert_eq!(
             document["chat_subscriptions"]["core"]["protocol_name"],
