@@ -340,6 +340,7 @@ def _doc_violations(crate: Crate, text: str, *, document_name: str | None = None
             "AGENTCTL_TERM_BACKEND",
             "--term-backend",
             "`term_backend`",
+            "`term_backends`",
         )
     elif crate.name == "chat-subscription-plugin":
         machine_values = ("agentctl-chat-subscription",)
