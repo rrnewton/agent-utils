@@ -410,6 +410,13 @@ fn ask_receipt(
 ) -> Option<Value> {
     let payload = json!({"id": id, "team": team});
     for route in routes {
+        // A skipped route is not this contact's authority: its ledger (for
+        // example this host's own, via a skipped local route) answering
+        // "unknown" must never license a resend (live-trial finding,
+        // 2026-10-25). The walk's accept loop already honours skips.
+        if route.skip_reason(0).is_some() {
+            continue;
+        }
         match route.run_verb("receipt", &payload) {
             AttemptOutcome::Answered(answer) => {
                 record_attempt(

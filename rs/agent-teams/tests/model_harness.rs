@@ -762,3 +762,84 @@ fn backup_files_are_not_entries() {
         ".tmp-tm-sim-0123456789abcdef-1"
     ));
 }
+
+/// A route that is skipped for accept but would answer "unknown" to a
+/// receipt: the ask must not consult it (live-trial regression, step 3).
+struct SkippedUnknownRoute;
+
+impl Route for SkippedUnknownRoute {
+    fn name(&self) -> &str {
+        "skipped-local"
+    }
+    fn skip_reason(&self, _envelope_bytes: usize) -> Option<String> {
+        Some("local route cannot reach host host-a".to_string())
+    }
+    fn run_verb(&self, verb: &str, _payload: &Value) -> AttemptOutcome {
+        assert_eq!(verb, "receipt", "skipped route must never be run");
+        AttemptOutcome::Answered(json!({"known": false, "state": "unknown"}))
+    }
+}
+
+/// Lost answer + a skipped route that would say "unknown": the walk must
+/// ask the real contact, settle accepted, and never resend.
+#[test]
+fn receipt_ask_never_consults_skipped_routes() {
+    let state = temp_state("ask-skip");
+    declaration_for(&state, "tools", "sim");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = agent_teams::envelope::message_id("sim", "host-a", "tools@host-a", "ask-key");
+    let envelope = build_envelope(
+        &id,
+        "ask-key",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now_ms,
+        now_ms + 7_200_000,
+        None,
+        "ask body",
+    );
+    let mut entry = write_outbox(&state, &envelope, "tools@host-a", &json!({})).expect("outbox");
+    let team_entry = Entry {
+        host: "host-a".into(),
+        coordinator: None,
+        contacts: vec![Contact::Host],
+    };
+    let host = Host {
+        name: "host-a".into(),
+        routes: vec!["skipped-local".into(), "loses-answers".into()],
+        agent_teams: None,
+        services: BTreeMap::new(),
+    };
+    let routes: Vec<Box<dyn Route>> = vec![
+        Box::new(SkippedUnknownRoute),
+        Box::new(FaultyRoute {
+            name: "loses-answers".into(),
+            state: state.clone(),
+            host: "host-a".into(),
+            seed: Mutex::new(1),
+            history: Mutex::new(Vec::new()),
+            forced: Some(Fault::AnswerLost),
+        }),
+    ];
+    let result = walk(&state, &mut entry, &team_entry, &host, &routes).expect("walk");
+    assert_eq!(result.state, "accepted");
+    assert_eq!(paste_count(&state, "tools", &id), 1);
+    let attempts = entry["attempts"].as_array().expect("attempts");
+    let resends = attempts
+        .iter()
+        .filter(|a| a["detail"] == "resend after unknown")
+        .count();
+    assert_eq!(
+        resends, 0,
+        "no resend licensed by a skipped route: {attempts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&state);
+}
