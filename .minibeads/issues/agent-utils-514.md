@@ -1,10 +1,11 @@
 ---
 title: 'tmux-agent-lifecycle: run and manage agents entirely under tmux with no Herdr'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-25T17:17:41.953023265+00:00
-updated_at: 2026-10-25T17:17:41.953023265+00:00
+updated_at: 2026-10-25T19:17:38.428058205+00:00
+closed_at: 2026-10-25T19:17:38.428058094+00:00
 ---
 
 # Description
