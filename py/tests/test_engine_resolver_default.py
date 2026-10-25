@@ -133,6 +133,18 @@ def test_explicit_rust_for_python_only_tool_refuses(tmp_path: Path) -> None:
     assert "Refusing to silently fall back" in result.stderr
 
 
+def test_damaged_rust_launcher_fails_closed(tmp_path: Path) -> None:
+    """A non-executable tracked Rust link refuses; Python must not quietly run."""
+    root = _build_sandbox(tmp_path)
+    launcher = root / "rs" / "bin" / PAIRED
+    launcher.chmod(launcher.stat().st_mode & ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    result = _run(root, PAIRED)
+    assert result.returncode == 127
+    assert result.stdout == ""
+    assert "not executable" in result.stderr
+    assert "Refusing to silently fall back" in result.stderr
+
+
 def test_invalid_engine_values_refuse(tmp_path: Path) -> None:
     root = _build_sandbox(tmp_path)
     for variable in ("DAGRUN_ENGINE", "AGENT_UTILS_ENGINE"):

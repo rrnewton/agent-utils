@@ -1277,8 +1277,20 @@ fn python_only_command(arguments: &[OsString]) -> Option<String> {
     fn next_command(arguments: &[OsString], mut index: usize) -> Option<(&str, usize)> {
         while index < arguments.len() {
             let token = arguments[index].to_str()?;
+            if token == "--" {
+                // Clap reads the next word in the (sub)command position.
+                index += 1;
+                return arguments
+                    .get(index)
+                    .and_then(|word| word.to_str())
+                    .map(|word| (word, index));
+            }
             if let Some(option) = token.strip_prefix("--") {
-                if option.contains('=') || matches!(option, "userguide" | "version" | "help") {
+                if matches!(option, "help" | "version") {
+                    // Clap answers these itself and never reaches a subcommand.
+                    return None;
+                }
+                if option.contains('=') || option == "userguide" {
                     index += 1;
                 } else if GLOBAL_VALUE_OPTIONS.contains(&token) {
                     index += 2;
@@ -1295,13 +1307,33 @@ fn python_only_command(arguments: &[OsString]) -> Option<String> {
     }
 
     let (command, index) = next_command(arguments, 1)?;
+    if command == "help" {
+        // `agentctl help <command>`: the word after `help` names the command.
+        let (target, target_index) = next_command(arguments, index + 1)?;
+        if PYTHON_ONLY_COMMANDS.contains(&target) {
+            return Some(target.to_owned());
+        }
+        if target == "chat" {
+            let (subcommand, _) = next_command(arguments, target_index + 1)?;
+            if PYTHON_ONLY_CHAT_COMMANDS.contains(&subcommand) {
+                return Some(format!("chat {subcommand}"));
+            }
+        }
+        return None;
+    }
     if PYTHON_ONLY_COMMANDS.contains(&command) {
         return Some(command.to_owned());
     }
     if command == "chat" {
-        let (subcommand, _) = next_command(arguments, index + 1)?;
+        let (subcommand, subcommand_index) = next_command(arguments, index + 1)?;
         if PYTHON_ONLY_CHAT_COMMANDS.contains(&subcommand) {
             return Some(format!("chat {subcommand}"));
+        }
+        if subcommand == "help" {
+            let (target, _) = next_command(arguments, subcommand_index + 1)?;
+            if PYTHON_ONLY_CHAT_COMMANDS.contains(&target) {
+                return Some(format!("chat {target}"));
+            }
         }
     }
     None
@@ -1915,7 +1947,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 return Ok(0);
             }
             if !matches!(value.output.as_str(), "tail" | "all") || value.since_turn.is_some() {
-                return Err(Failure::Usage("interactive agents expose terminal snapshots; last/since_turn require headless transcripts".to_owned()));
+                return Err(Failure::Usage("interactive agents expose terminal snapshots; last/since_turn require headless transcripts (read a headless worker with the Python edition; for example DAGRUN_ENGINE=python)".to_owned()));
             }
             print!("{}", manager.read(&value.agent.name, value.lines as usize)?);
             return Ok(0);
@@ -2379,8 +2411,18 @@ mod tests {
                 Some("chat history"),
             ),
             (&["agentctl", "chat", "context"], Some("chat context")),
+            (&["agentctl", "--", "mcp"], Some("mcp")),
+            (&["agentctl", "chat", "--", "launch"], Some("chat launch")),
+            (&["agentctl", "help", "mcp"], Some("mcp")),
+            (&["agentctl", "help", "chat", "launch"], Some("chat launch")),
+            (&["agentctl", "chat", "help", "launch"], Some("chat launch")),
             (&["agentctl", "chat", "status"], None),
             (&["agentctl", "chat", "--help"], None),
+            (&["agentctl", "chat", "--help", "launch"], None),
+            (&["agentctl", "--help", "mcp"], None),
+            (&["agentctl", "--version", "mcp"], None),
+            (&["agentctl", "help", "list"], None),
+            (&["agentctl", "help", "chat", "status"], None),
             (&["agentctl", "list"], None),
             (&["agentctl", "--registry", "mcp", "list"], None),
             (&["agentctl", "send", "reviewer", "mcp"], None),
