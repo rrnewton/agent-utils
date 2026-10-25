@@ -10015,9 +10015,11 @@ its drain would type first, so it was not queued",
             || record.mode != "interactive"
             || record.backend != self.client.record_backend()
         {
-            return Err(fail(
-                "managed-dead retirement requires a running owned interactive record on this backend",
-            ));
+            return Err(fail(format!(
+                "managed-dead retirement requires a running {} record in interactive/{} mode",
+                self.client.record_backend(),
+                self.client.record_backend()
+            )));
         }
         let before = self.dead_pane_proof(record, "retire dead managed agent")?;
         let text = self.bounded_terminal_text(&before.info.pane_id)?;
@@ -10382,9 +10384,10 @@ its drain would type first, so it was not queued",
                 .collect();
             if recorded.len() == 1 && self.client.pane_info(&recorded[0].pane_id)?.agent.is_none() {
                 if record.lifecycle != "running" {
-                    return Err(fail(
-                        "managed-dead retirement requires a running owned record",
-                    ));
+                    return Err(fail(format!(
+                        "managed-dead retirement requires a running {} record",
+                        record.backend
+                    )));
                 }
                 let _pane_lock = self.pane_lock(&recorded[0].pane_id)?;
                 let pinned = self.pinned_agent_directory(agent_name)?;
