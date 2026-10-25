@@ -32727,7 +32727,13 @@ function bridgePiece(row) {
   bridge.addEventListener("click", (event) => {
     // The row's own tap would fold the reply or read it aloud; this tap is the line's.
     if (event) event.stopPropagation();
-    // ...unless it is the end of the taps on an arrow that put the bridge here, as with the X.
+    // ...unless it is the click behind a gesture on the row that already acted, a hold or a
+    // swipe, whose claim the row's own tap would honour (`tapRow`): one act per finger.
+    if (suppressNextRowClick) {
+      suppressNextRowClick = false;
+      return;
+    }
+    // ...or the end of the taps on an arrow that put the bridge here, as with the X.
     if (replyTapsSettling !== null) return;
     const holder = bridge.parentNode || row;
     if (holder) glideToBridgeTop(holder);
@@ -36105,6 +36111,13 @@ function swipeable(li, messages) {
     // `#215 reply-coalesce`. Nor on the X beside the bridge of gathered replies, for the same reason.
     const ungather = childByClass(li, "reply-ungather");
     if (ungather && nodeWithin(ungather, event.target)) {
+      return;
+    }
+    // `#501 thread-bridge-gutter`. Nor on the bridge itself, whose tap glides back to what the
+    // stack hangs from: a finger resting on the line, or sliding off it, is pressing that, not
+    // archiving the reply or opening its details — one act per finger, as with the X.
+    const bridge = childByClass(li, "reply-bridge");
+    if (bridge && nodeWithin(bridge, event.target)) {
       return;
     }
     // `#420 bookmark-clear`. Nor on the bookmark line's X; the line itself takes no taps.

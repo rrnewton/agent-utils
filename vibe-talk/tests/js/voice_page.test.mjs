@@ -79999,6 +79999,17 @@ test("`#501 thread-bridge-gutter`: on a phone the bridge hugs the left edge, and
     assert.match(phone(`${list} .reply-bridge`), /width:\s*calc\(0\.55rem \+ var\(--reply-stroke\) \/ 2\)/,
       `${list}: a phone's bridge still reaches 0.9rem into its row`);
   }
+  assert.match(phone("#discord-log li.discord-message[data-stack-under=\"coder\"][data-who]"),
+    /margin-left:\s*calc\(1\.6875rem - env\(safe-area-inset-left\)\)/,
+    "a stack under the agent's edge-to-edge tile does not keep just the room its disc fits in");
+  assert.match(phone("#discord-log .reply-ungather-mark"),
+    /left:\s*calc\(2\.25rem - 0\.55rem - 0\.09375rem - 0\.25rem - 1\.2rem\)/,
+    "the X's disc is not set in its slim button by the branch, the gap and its own width");
+  assert.match(phone("#side-cards .unpack-pack-mark"), /left:\s*0\.05625rem/,
+    "the triangle is not centred where the disc's centre was, in its slim button");
+  assert.match(phone('#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge'),
+    /width:\s*calc\(0\.55rem \+ var\(--reply-stroke\) \/ 2 \+ min\(15cqw, 6rem\) \/ 2\)/,
+    "the owner's unpacked rows do not reach back across their extra inset to the one spine");
   const target = phone("#side-cards .reply-ungather.unpack-pack");
   assert.match(target, /width:\s*2\.25rem/, "the triangle's target is not the slim phone width");
   assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /min-width:\s*2rem/, "the triangle's target lost its 32px floor");
@@ -80050,6 +80061,20 @@ test("`#501 thread-bridge-gutter`: on a phone the bridge hugs the left edge, and
   await gatherChip(gathered, "601").click();
   await gathered.settle();
   const listArea = gathered.el("scroll-area");
+  // A finger on the line is pressing the line, not the row, as one on the arrow or the X is:
+  // resting there arms no press-and-hold, and sliding off it archives nothing.
+  const lastRow = rowWithId(gathered, "607");
+  const onLine = gutterChild(lastRow, "reply-bridge");
+  const commit = sourceConstant("SWIPE_COMMIT_PX") + 10;
+  const touchOn = (x) => ({ pointerId: 1, pointerType: "touch", clientX: x, clientY: 10, target: onLine });
+  await lastRow.dispatch("pointerdown", touchOn(10));
+  assert.equal(gathered.expireTimers(HOLD_MS), 0, "a finger resting on the bridge armed the row's press-and-hold");
+  await lastRow.dispatch("pointermove", touchOn(10 + commit));
+  assert.ok(!lastRow.style.transform, "the row followed a finger that came down on its bridge");
+  await lastRow.dispatch("pointerup", touchOn(10 + commit));
+  await gathered.settle();
+  assert.deepEqual(gathered.dismissCalls, [], "a drag that began on the bridge archived the reply");
+  assert.ok(!lastRow.descendants().some((node) => node.hasClass("msg-details")), "the bridge opened the row's details");
   listArea.scrollTop = listArea.scrollHeight;
   await listArea.dispatch("scroll");
   await gutterChild(rowWithId(gathered, "607"), "reply-bridge").click();
