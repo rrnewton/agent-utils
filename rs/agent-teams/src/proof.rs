@@ -76,8 +76,34 @@ fn parse_identity(value: &Value) -> Option<ProcessIdentity> {
 
 /// The agentctl binary used for designation reads: `$AGENT_TEAMS_AGENTCTL`,
 /// else `agentctl` on PATH.
-pub(crate) fn agentctl_binary() -> String {
-    std::env::var("AGENT_TEAMS_AGENTCTL").unwrap_or_else(|_| "agentctl".to_string())
+/// First executable named `name` on the `:`-separated `path_var`, if any.
+fn find_on_path(name: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The agentctl binary to shell out to: `$AGENT_TEAMS_AGENTCTL`, else
+/// `agentctl` on PATH, else the per-user install locations. The PATH step
+/// matters because serve usually runs under a non-login ssh whose PATH
+/// lacks `~/bin` and `~/.local/bin` - the first helper-process auto-drain
+/// died exactly there (live trial 5b, 2026-10-25).
+pub(crate) fn agentctl_binary() -> PathBuf {
+    if let Some(chosen) = std::env::var_os("AGENT_TEAMS_AGENTCTL") {
+        return PathBuf::from(chosen);
+    }
+    if let Some(path) = std::env::var_os("PATH").and_then(|paths| find_on_path("agentctl", &paths))
+    {
+        return path;
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for candidate in [home.join(".local/bin/agentctl"), home.join("bin/agentctl")] {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("agentctl")
 }
 
 /// `agentctl coordinator show` as JSON: the designation as agentctl itself
@@ -416,6 +442,19 @@ mod record_tests {
         let found =
             coordinator_identity(&Designation::Registry, Some(&dir)).expect("coordinator identity");
         assert_eq!(found.pid, me.pid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_on_path_finds_executables() {
+        let dir = std::env::temp_dir().join(format!("at-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("agentctl");
+        std::fs::write(&file, "#!/bin/sh\n").expect("file");
+        let joined =
+            std::env::join_paths([PathBuf::from("/nonexistent"), dir.clone()]).expect("join");
+        assert_eq!(find_on_path("agentctl", &joined), Some(file));
+        assert_eq!(find_on_path("nope", &joined), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -368,8 +368,12 @@ pub fn run_auto_drain(
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
-        Err(_) => {
-            log("spawn-failed");
+        Err(error) => {
+            crate::sender::log_event(
+                state,
+                &json!({"event": "auto-drain", "id": id, "agent": agent,
+                        "outcome": "spawn-failed", "error": error.to_string()}),
+            );
             return;
         }
     };
