@@ -45887,8 +45887,8 @@ function renderSideCards() {
  * moved going to the foot, the cards filtered, the line over them coming or going. `#261
  * two-column-connectors`. As a list of messages keeps its reader (`keepingFilterPlace`, whose rules
  * these are): the reader on the foot follows it; else the highlighted card while it shows (`#277
- * thread-card-focus`), else the selected one, else the first card showing, stays at its height. Null
- * with the cards not on screen, and while they are being opened, which places the reader itself
+ * thread-card-focus`), else the selected one, else the first card showing, stays at its height. With
+ * every card off screen inside unpacked replies, keep the scroll offset. Null with the cards not on screen, and while they are being opened, which places the reader itself
  * (`placeOpenedCards`).
  *
  * @returns {{newest: boolean, id: string | null, offset: number} | null}
@@ -45909,7 +45909,9 @@ function cardAnchor() {
   const card = (/** @type {string | null} */ id) => (id === null ? undefined : rows.find((one) => one.getAttribute("data-id") === id));
   const row = [card(litCard()), card(mark && mark.card !== false ? mark.id : null)].find((one) => one && seen(one)) ||
     rows.find(seen);
-  if (!row) return null;
+  // Deep inside an unpacked thread, every card can be above the viewport. Keep the scroll
+  // offset then: rebuilding those rows must still restore the reader after their nodes go.
+  if (!row) return { newest: false, id: null, offset: area.scrollTop };
   return { newest: false, id: String(row.getAttribute("data-id")), offset: row.getBoundingClientRect().top - top };
 }
 
@@ -45925,6 +45927,10 @@ function placeCardAnchor(anchor) {
   const area = leftEl("side-scroll");
   if (anchor.newest) {
     followFoot(area);
+    return true;
+  }
+  if (anchor.id === null) {
+    area.scrollTop = anchor.offset;
     return true;
   }
   const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
