@@ -298,6 +298,12 @@ fn send_by_team_name_through_the_host_index() {
         serde_json::to_string_pretty(&recipient).unwrap(),
     )
     .expect("recipient index entry");
+    // Index readers require the named registries to still hold their
+    // designations (see hostindex::load).
+    for registry in [world.root.join("reg-sim"), world.root.join("reg-tools")] {
+        std::fs::create_dir_all(&registry).expect("registry dir");
+        std::fs::write(registry.join("coordinator.json"), "{}").expect("designation");
+    }
     world.index = Some(index);
 
     let pid = std::process::id().to_string();

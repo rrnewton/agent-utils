@@ -42,8 +42,9 @@ pub fn index_dir() -> PathBuf {
     home.join(".local/state/agentctl/coordinators")
 }
 
-/// Every readable index entry, ordered by team then name. Unreadable or
-/// malformed files are skipped: discovery must never fail a command.
+/// Every readable index entry naming a registry that still has a
+/// designation, ordered by team then name. Unreadable or malformed
+/// files are skipped: discovery must never fail a command.
 pub fn load() -> Vec<HostCoordinator> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(index_dir()) else {
@@ -60,7 +61,15 @@ pub fn load() -> Vec<HostCoordinator> {
         let Ok(document) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        out.push(parse(&document));
+        let parsed = parse(&document);
+        // An index entry outlives nothing: when the registry or its
+        // designation is gone (a cleared designation whose removal was
+        // lost, a test fixture's scratch registry), the row is not
+        // stale, it is not a coordinator at all, and is not listed.
+        if !parsed.registry.is_dir() || !parsed.registry.join("coordinator.json").exists() {
+            continue;
+        }
+        out.push(parsed);
     }
     out.sort_by(|a, b| {
         a.team

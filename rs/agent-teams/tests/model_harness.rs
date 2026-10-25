@@ -1174,9 +1174,12 @@ fn same_host_designated_coordinators_are_accepted_by_default() {
     let identity = agent_queue::identity::observe(u64::from(std::process::id()))
         .expect("observe self")
         .identity;
+    let registry = state.join("reg-alpha");
+    std::fs::create_dir_all(&registry).expect("registry dir");
+    std::fs::write(registry.join("coordinator.json"), "{}").expect("designation");
     let entry = json!({
         "schema": "agentctl-coordinator-index/v1",
-        "registry": "/elsewhere/.agentctl",
+        "registry": registry.to_string_lossy(),
         "name": "coordinator",
         "token": "alpha-generation",
         "harness_cwd": "/elsewhere",
