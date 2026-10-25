@@ -851,25 +851,36 @@ fn receipt_ask_never_consults_skipped_routes() {
     let _ = std::fs::remove_dir_all(&state);
 }
 
-/// Delivery on arrival: a successful enqueue starts one bounded drain
-/// (fake agentctl records its argv); disabled in the declaration, it does
-/// not. The drain runs in a detached thread, so poll for its record.
+/// Delivery on arrival: a successful enqueue spawns the detached
+/// `drain-one` helper (recorded by a fake self binary), and the helper's
+/// guts (`run_auto_drain`) invoke one bounded `agentctl drain
+/// --deliver-while-working` through a fake agentctl. Disabled, neither
+/// happens. Helper processes, not threads: serve is one-shot.
 #[test]
-fn auto_drain_starts_one_bounded_drain() {
-    use agent_teams::deliver::{AgentctlQueueDeliverer, AutoDrain, Deliverer, Handover};
+fn auto_drain_spawns_bounded_helper() {
+    use agent_teams::deliver::{
+        run_auto_drain, AgentctlQueueDeliverer, AutoDrain, Deliverer, Handover,
+    };
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let state = temp_state("auto-drain");
-    let record = state.join("drain-argv.txt");
-    let script = state.join("fake-agentctl");
-    {
+    let helper_record = state.join("helper-argv.txt");
+    let drain_record = state.join("drain-argv.txt");
+    let write_script = |name: &str, record: &PathBuf| {
+        let script = state.join(name);
         let mut file = std::fs::File::create(&script).expect("script");
         writeln!(file, "#!/bin/sh").expect("script");
         writeln!(file, "echo \"$@\" >> {}", record.display()).expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        script
+    };
+    let fake_self = write_script("fake-self", &helper_record);
+    let fake_agentctl = write_script("fake-agentctl", &drain_record);
+    // Only this test uses these variables in this test binary.
+    unsafe {
+        std::env::set_var("AGENT_TEAMS_SELF_BIN", &fake_self);
+        std::env::set_var("AGENT_TEAMS_AGENTCTL", &fake_agentctl);
     }
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
-    // Only this test reads AGENT_TEAMS_AGENTCTL in this test binary.
-    unsafe { std::env::set_var("AGENT_TEAMS_AGENTCTL", &script) };
 
     let queue_dir = state.join("queue");
     let now_ms = agent_teams::timeutil::now_unix_ms();
@@ -893,56 +904,58 @@ fn auto_drain_starts_one_bounded_drain() {
             "body",
         )
     };
-    let enabled = AgentctlQueueDeliverer {
+    let base = |enabled: bool| AgentctlQueueDeliverer {
         queue_dir: queue_dir.clone(),
         ledger_path: state.join("ledger.json"),
         registry: state.clone(),
         agent: "coordinator".into(),
-        auto_drain: AutoDrain::default(),
+        auto_drain: AutoDrain {
+            enabled,
+            ..Default::default()
+        },
         drain_state_dir: Some(state.clone()),
     };
     let id1 = "tm-sim-1111111111111111";
     assert_eq!(
-        enabled.handover(id1, &make(id1), "rendered"),
+        base(true).handover(id1, &make(id1), "rendered"),
         Handover::Accepted
     );
     let mut seen = String::new();
     for _ in 0..50 {
-        if let Ok(text) = std::fs::read_to_string(&record) {
+        if let Ok(text) = std::fs::read_to_string(&helper_record) {
             seen = text;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(
-        seen.contains("drain coordinator") && seen.contains("--deliver-while-working"),
-        "drain argv recorded: {seen}"
+        seen.starts_with("drain-one") && seen.contains(id1),
+        "helper spawned with drain-one argv: {seen}"
     );
-    // Content-free log line, no body.
     let log = std::fs::read_to_string(state.join("team-log.jsonl")).unwrap_or_default();
     assert!(log.contains("auto-drain"), "log: {log}");
     assert!(!log.contains("rendered"), "log must be content-free: {log}");
 
-    // Disabled: no drain is started for a second item.
-    let _ = std::fs::remove_file(&record);
-    let disabled = AgentctlQueueDeliverer {
-        queue_dir: queue_dir.clone(),
-        ledger_path: state.join("ledger.json"),
-        registry: state.clone(),
-        agent: "coordinator".into(),
-        auto_drain: AutoDrain {
-            enabled: false,
-            ..Default::default()
-        },
-        drain_state_dir: Some(state.clone()),
-    };
+    // The helper itself: one bounded agentctl drain for the queued item.
+    run_auto_drain(&state, &queue_dir, &state, "coordinator", id1, 5);
+    let drained = std::fs::read_to_string(&drain_record).expect("drain argv");
+    assert!(
+        drained.contains("drain coordinator") && drained.contains("--deliver-while-working"),
+        "drain argv: {drained}"
+    );
+
+    // Disabled: no helper is spawned for a second item.
+    let _ = std::fs::remove_file(&helper_record);
     let id2 = "tm-sim-2222222222222222";
     assert_eq!(
-        disabled.handover(id2, &make(id2), "rendered"),
+        base(false).handover(id2, &make(id2), "rendered"),
         Handover::Accepted
     );
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    assert!(!record.exists(), "no drain when disabled");
-    unsafe { std::env::remove_var("AGENT_TEAMS_AGENTCTL") };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!helper_record.exists(), "no helper when disabled");
+    unsafe {
+        std::env::remove_var("AGENT_TEAMS_SELF_BIN");
+        std::env::remove_var("AGENT_TEAMS_AGENTCTL");
+    }
     let _ = std::fs::remove_dir_all(&state);
 }

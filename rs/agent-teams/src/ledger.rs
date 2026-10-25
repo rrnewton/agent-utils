@@ -253,6 +253,12 @@ pub fn accept(
             let recovered = recover_claim(ctx, envelope, deliverer, &existing)?;
             return Ok(recovered);
         }
+        // A retry of an accepted-but-maybe-undrained item nudges delivery:
+        // the first hand-over's drain may have died with its serve process
+        // or never run (live-trial step 3/5 finding).
+        if recorded_state == "accepted" {
+            deliverer.nudge(&id);
+        }
         return Ok(AcceptAnswer {
             outcome: if recorded_state == "refused" || recorded_state == "fenced" {
                 "refused".to_string()

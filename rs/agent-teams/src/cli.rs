@@ -69,6 +69,8 @@ RECEIVING HOST (run by routes, not by hand)
   accept --protocol 1 [--team T] (--envelope - | --envelope-base64 B)
   receipt ID [--team T]                Pure read of the ledger.
   fence ID --team T --not-after TIME   Bar an ID before it arrives.
+  drain-one --queue-dir D --registry R --agent A --id ID --ready-timeout S
+                                       Bounded delivery-on-arrival helper.
 
 SSH AND LINKS
   ssh enroll --peer HOST [--from ADDR] Make a key; print the authorized_keys line.
@@ -211,6 +213,7 @@ fn run_inner(args: &[String]) -> Result<i32, DataError> {
         "resolve" => cmd_resolve(&globals, cmd_args),
         "hook" => cmd_hook(&globals, cmd_args),
         "serve" => cmd_serve(&globals, cmd_args),
+        "drain-one" => cmd_drain_one(&globals, cmd_args),
         "accept" => cmd_accept(&globals, cmd_args),
         "receipt" => cmd_receipt(&globals, cmd_args),
         "fence" => cmd_fence(&globals, cmd_args),
@@ -285,6 +288,10 @@ fn positional(args: &[String]) -> Vec<String> {
         "--route",
         "--in-reply-to",
         "--jump-to",
+        "--queue-dir",
+        "--ready-timeout",
+        "--id",
+        "--agent",
     ];
     let mut out = Vec::new();
     let mut i = 0;
@@ -1416,6 +1423,28 @@ fn cmd_hook(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         }
     }
     let _ = printed_any;
+    Ok(0)
+}
+
+/// `drain-one`: the detached delivery-on-arrival helper. Spawned by the
+/// agentctl-queue deliverer on the receiving host; runs one bounded
+/// `agentctl drain` under the per-agent lock. Outcomes land in
+/// `team-log.jsonl`, never in message state.
+fn cmd_drain_one(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let need = |flag: &str| {
+        flag_value(args, flag).ok_or_else(|| err("usage", format!("drain-one needs {flag}")))
+    };
+    let queue_dir = PathBuf::from(need("--queue-dir")?);
+    let registry = PathBuf::from(need("--registry")?);
+    let agent = need("--agent")?;
+    let id = need("--id")?;
+    let ready_timeout: u64 = need("--ready-timeout")?
+        .parse()
+        .map_err(|_| err("usage", "--ready-timeout must be seconds"))?;
+    let state = flag_value(args, "--state-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| globals.state.clone());
+    crate::deliver::run_auto_drain(&state, &queue_dir, &registry, &agent, &id, ready_timeout);
     Ok(0)
 }
 

@@ -50,6 +50,17 @@ pub trait Deliverer {
     fn wakes_idle(&self) -> bool {
         true
     }
+    /// Nudge delivery of an already-accepted ID that may still be waiting
+    /// (a retry's known-accepted answer, recovery). Default: nothing.
+    fn nudge(&self, _id: &str) {}
+}
+
+/// This binary's path for spawning our own helper processes
+/// (`$AGENT_TEAMS_SELF_BIN`, else the running executable).
+pub fn self_binary() -> PathBuf {
+    std::env::var_os("AGENT_TEAMS_SELF_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent-teams")))
 }
 
 /// Write `<dir>/<id>.json` by temp file plus `link()`; fails if present.
@@ -133,7 +144,8 @@ impl Deliverer for HookInboxDeliverer {
 
 /// Delivery on arrival for the `agentctl-queue` deliverer: after a
 /// successful enqueue, start one bounded `agentctl drain` (in a detached
-/// thread, so `accept` never waits for typing) instead of leaving the item
+/// helper process, so `accept` never waits for typing and the drain
+/// survives the one-shot serve process) instead of leaving the item
 /// for some later drain. On by default; a declaration turns it off with
 /// `"auto_drain": false`.
 #[derive(Debug, Clone, PartialEq)]
@@ -206,9 +218,9 @@ impl AgentctlQueueDeliverer {
     }
 
     /// Start the bounded delivery-on-arrival drain for this item, if
-    /// enabled. Runs in a detached thread holding a per-agent lock, so
-    /// there is never more than one of our drains per queue; a drain that
-    /// finds the item already processed does nothing. Logs are
+    /// enabled, as a detached `drain-one` helper process holding a
+    /// per-agent lock (never more than one of our drains per queue). A
+    /// drain that finds the item already processed does nothing. Logs are
     /// content-free (IDs and outcomes only).
     fn start_drain(&self, id: &str) {
         if !self.auto_drain.enabled {
@@ -217,14 +229,39 @@ impl AgentctlQueueDeliverer {
         let Some(state) = self.drain_state_dir.clone() else {
             return;
         };
-        let queue_dir = self.queue_dir.clone();
-        let registry = self.registry.clone();
-        let agent = self.agent.clone();
-        let id = id.to_string();
-        let ready_timeout = self.auto_drain.ready_timeout_seconds;
-        std::thread::spawn(move || {
-            run_auto_drain(&state, &queue_dir, &registry, &agent, &id, ready_timeout);
-        });
+        // A detached helper PROCESS, not a thread: serve is one-shot and
+        // exits right after answering, which would kill a thread mid-drain
+        // (live-trial finding, 2026-10-25). The helper (`drain-one`)
+        // survives us, holds the per-agent lock, and logs content-free.
+        let spawned = std::process::Command::new(self_binary())
+            .args([
+                "drain-one",
+                "--queue-dir",
+                &self.queue_dir.to_string_lossy(),
+                "--registry",
+                &self.registry.to_string_lossy(),
+                "--agent",
+                &self.agent,
+                "--id",
+                id,
+                "--ready-timeout",
+                &self.auto_drain.ready_timeout_seconds.to_string(),
+                "--state-dir",
+                &state.to_string_lossy(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let outcome = if spawned.is_ok() {
+            "spawned"
+        } else {
+            "spawn-failed"
+        };
+        crate::sender::log_event(
+            &state,
+            &json!({"event": "auto-drain", "id": id, "agent": self.agent, "outcome": outcome}),
+        );
     }
 
     /// Whether the item already in the queue under `id` is this envelope.
@@ -265,13 +302,21 @@ impl Deliverer for AgentctlQueueDeliverer {
     fn contains(&self, id: &str) -> Option<bool> {
         self.queue_contains(id)
     }
+    fn nudge(&self, id: &str) {
+        // Only a queued, not-yet-processed item needs a drain; the helper
+        // re-checks under its lock before typing anything.
+        if self.queue_contains(id) == Some(true) {
+            self.start_drain(id);
+        }
+    }
 }
 
-/// One bounded delivery-on-arrival drain (runs in the detached thread
-/// `start_drain` spawned). Holds the per-agent drain lock for its whole
-/// run, so our drains never overlap on one queue; the queue's own delivery
-/// lock inside `agentctl drain` remains the typing serialization.
-fn run_auto_drain(
+/// One bounded delivery-on-arrival drain, run by the detached
+/// `drain-one` helper process `start_drain` spawns. Holds the per-agent
+/// drain lock for its whole run, so our drains never overlap on one queue;
+/// the queue's own delivery lock inside `agentctl drain` remains the
+/// typing serialization.
+pub fn run_auto_drain(
     state: &Path,
     queue_dir: &Path,
     registry: &Path,

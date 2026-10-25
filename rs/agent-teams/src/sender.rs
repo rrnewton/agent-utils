@@ -476,6 +476,8 @@ pub fn log_event(state: &Path, event: &Value) {
         .append(true)
         .open(state.join("team-log.jsonl"))
     {
-        let _ = writeln!(file, "{}", event);
+        // One formatted buffer, one write: a short-lived serve process
+        // must never leave a torn line behind.
+        let _ = file.write_all(format!("{event}\n").as_bytes());
     }
 }
