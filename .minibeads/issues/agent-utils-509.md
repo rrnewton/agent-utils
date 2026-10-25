@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-child-done-notice: tell the coordinator the moment a child finishes, and advance the landing queue'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-10-25T15:01:25.042769164+00:00
-updated_at: 2026-10-25T15:01:25.042769164+00:00
+updated_at: 2026-10-25T15:47:32.990197589+00:00
+closed_at: 2026-10-25T15:47:32.990197098+00:00
 ---
 
 # Description
