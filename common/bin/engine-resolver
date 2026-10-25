@@ -16,9 +16,9 @@
 #     workspace cache and provenance before executing, building on first use. Without Cargo the
 #     launcher refuses and names the Python opt-in below; it never silently falls back.
 #   * Overrides: DAGRUN_ENGINE (historical name; wins when set) and AGENT_UTILS_ENGINE (the clearer
-#     name, consulted when DAGRUN_ENGINE is unset) accept `rust`/`rs` or `python`/`py`. An explicit
-#     request for an edition a tool does not have refuses (exit 127); anything else is a usage
-#     error (exit 2).
+#     name, consulted when DAGRUN_ENGINE is unset) accept `rust`/`rs` or `python`/`py`. An empty
+#     value counts as unset, as it always has. An explicit request for an edition a tool does not
+#     have refuses (exit 127); anything else is a usage error (exit 2).
 #   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
 #     exact path are always visible in logs.
 #
@@ -39,7 +39,9 @@ if [[ "$TOOL" == "engine-resolver" ]]; then
 fi
 
 # Engine selection: an explicit override wins; otherwise Rust for a tool with a tracked Rust
-# launcher, Python for a Python-only tool.
+# launcher, Python for a Python-only tool. Pairing is decided by the tracked link's PRESENCE, not
+# its executability: a damaged (dangling or non-executable) link must fail closed in the Rust leg
+# below, never quietly run Python instead.
 ENGINE=""
 ENGINE_VAR=""
 if [[ -n "${DAGRUN_ENGINE:-}" ]]; then
@@ -48,7 +50,7 @@ if [[ -n "${DAGRUN_ENGINE:-}" ]]; then
 elif [[ -n "${AGENT_UTILS_ENGINE:-}" ]]; then
     ENGINE="$AGENT_UTILS_ENGINE"
     ENGINE_VAR="AGENT_UTILS_ENGINE"
-elif [[ -x "$ROOT/rs/bin/$TOOL" ]]; then
+elif [[ -e "$ROOT/rs/bin/$TOOL" || -L "$ROOT/rs/bin/$TOOL" ]]; then
     ENGINE="rust"
 else
     ENGINE="python"
@@ -70,7 +72,11 @@ case "$ENGINE" in
         # before exec. Never fall back to Python silently; that would re-hide an engine mismatch.
         TARGET="$ROOT/rs/bin/$TOOL"
         if [[ ! -x "$TARGET" ]]; then
-            echo "[$TOOL] engine=rust requested but no tracked launcher exists at rs/bin/$TOOL. Refusing to silently fall back to Python. $TOOL is Python-only: run it with no override or with ${ENGINE_VAR:-DAGRUN_ENGINE}=python." >&2
+            if [[ -e "$TARGET" || -L "$TARGET" ]]; then
+                echo "[$TOOL] engine=rust but the tracked launcher at rs/bin/$TOOL is not executable. Refusing to silently fall back to Python. Fix the checkout (it must be the tracked symlink to cargo-runner), or run the Python edition with ${ENGINE_VAR:-DAGRUN_ENGINE}=python." >&2
+            else
+                echo "[$TOOL] engine=rust requested but no tracked launcher exists at rs/bin/$TOOL. Refusing to silently fall back to Python. $TOOL is Python-only: run it with no override or with ${ENGINE_VAR:-DAGRUN_ENGINE}=python." >&2
+            fi
             exit 127
         fi
         echo "[$TOOL] engine=rust (tracked Cargo launcher: ${TARGET#"$ROOT"/})" >&2

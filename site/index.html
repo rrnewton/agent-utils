@@ -76,7 +76,7 @@
 <a class="button button-secondary" href="https://github.com/rrnewton/agent-utils">Source</a>
 </div>
 <ul class="facts" aria-label="At a glance">
-<li>Core tools: Linux only, Python 3.10+, nothing to build</li>
+<li>Core tools: Linux only, Python 3.10+ and a Rust toolchain; nothing to install (Cargo builds on first use)</li>
 <li>Needs Herdr, a separate terminal server</li>
 <li>Pre-1.0; the session tool, agentctl, is beta</li>
 </ul>
@@ -330,7 +330,7 @@
 </li>
 <li>
 <h3>It detects</h3>
-<p>The project (remote, default branch, uncommitted changes, worktrees, submodules), the agent CLIs on your <code>PATH</code>, and what the host offers: Git, Python, Herdr, a user systemd manager and cgroup v2, passwordless sudo or <code>fuse2fs</code> for disk-image slots, user namespaces, and optionally <code>cargo</code>, <code>podman</code> and <code>gh</code>. It always shows you this dependency table before it asks anything.</p>
+<p>The project (remote, default branch, uncommitted changes, worktrees, submodules), the agent CLIs on your <code>PATH</code>, and what the host offers: Git, Python, <code>cargo</code>, Herdr, a user systemd manager and cgroup v2, passwordless sudo or <code>fuse2fs</code> for disk-image slots, user namespaces, and optionally <code>podman</code> and <code>gh</code>. It always shows you this dependency table before it asks anything.</p>
 </li>
 <li>
 <h3>It asks</h3>
