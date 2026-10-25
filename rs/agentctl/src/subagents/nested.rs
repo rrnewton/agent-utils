@@ -214,22 +214,26 @@ fn normalize(
     };
     let ownership = field("runtime_ownership").as_str();
     let profile = field("profile");
+    let backend_matches = match adapter {
+        "herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay" => {
+            field("backend").as_str() == Some("herdr")
+        }
+        "tmux" | "tmux-foreign" => field("backend").as_str() == Some("tmux"),
+        _ => false,
+    };
     if !kind_pattern(harness)
         || !absolute(field("cwd"))
-        || !matches!(
-            adapter,
-            "herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay"
-        )
+        || !backend_matches
         || field("mode").as_str() != Some("interactive")
-        || field("backend").as_str() != Some("herdr")
         || (!profile.is_null() && !nonempty_text(profile))
         || !field("permission_mode").is_null()
         || !field("runtime_home").is_null()
     {
         return Err(contract());
     }
-    if (adapter == "herdr-foreign" && ownership != Some("foreign"))
-        || (adapter != "herdr-foreign" && ownership != Some("owned"))
+    let foreign = matches!(adapter, "herdr-foreign" | "tmux-foreign");
+    if (foreign && ownership != Some("foreign"))
+        || (!foreign && ownership != Some("owned"))
         || (adapter == "herdr-pane" && harness != "muse")
         || (adapter == "herdr-relay" && !RELAY_HARNESSES.contains(&harness))
     {
@@ -276,12 +280,10 @@ fn normalize(
         .get("path")
         .and_then(Value::as_str)
         .unwrap_or(harness);
-    if (adapter == "herdr-foreign" && !argv.is_empty())
-        || (adapter != "herdr-foreign" && argv.first() != Some(&expected_program))
-    {
+    if (foreign && !argv.is_empty()) || (!foreign && argv.first() != Some(&expected_program)) {
         return Err(invalid("invalid agent record launch argv"));
     }
-    if matches!(adapter, "herdr" | "herdr-pane" | "herdr-relay") {
+    if matches!(adapter, "herdr" | "herdr-pane" | "herdr-relay" | "tmux") {
         let structured = harness_arguments(
             harness,
             field("model").as_str(),

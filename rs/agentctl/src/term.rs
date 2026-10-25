@@ -3,12 +3,17 @@
 //!
 //! Herdr remains the default backend. Its existing client keeps its exact
 //! Herdr CLI behaviour; this module only re-expresses it through the
-//! backend-neutral multiplexer and pane-terminal traits, and gives the tmux backend an
-//! [`AgentApi`] so the durable direct-pane transport (send/drain/status/
-//! read against an explicit pane) runs on either multiplexer. Agent
-//! lifecycle management (`ManagedApi`: start/adopt/stop and the process
-//! proofs behind them) is still Herdr-backed in this step.
+//! backend-neutral multiplexer and pane-terminal traits, and gives the tmux
+//! backend both an [`AgentApi`] (the durable direct-pane transport:
+//! send/drain/status/read against an explicit pane) and a
+//! [`ManagedApi`](crate::subagents::ManagedApi) (agent lifecycle:
+//! start/adopt/stop/revive and the process proofs behind them), so a
+//! registry can run entirely under tmux with no Herdr installed.
 
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,9 +24,13 @@ use term_backend::{
 };
 
 use crate::agent::{AgentApi, AgentRuntime};
-use crate::client::{AgentPaneInfo, HerdrClient, Pane};
+use crate::client::{
+    live_custom_process, process_has_no_descendants, resolve_harness_executable, shell_join,
+    supported_shell_process, AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
+    Pane, PaneShellProof, ProcessLiveness,
+};
 use crate::error::{AdapterError, Result};
-use crate::submission::{PromptTerminal, Submission, SubmitTimeouts};
+use crate::submission::{GuardedInput, GuardedPrompt, PromptTerminal, Submission, SubmitTimeouts};
 
 /// Environment variable selecting the terminal backend when no flag or
 /// profile configuration names one.
@@ -297,7 +306,9 @@ impl PaneTerminal for HerdrClient {
 /// Infer a wire agent status from a tmux pane's screen: tmux tracks none,
 /// so the same TUI classification used for status-less panes decides.
 fn infer_status(backend: &TmuxBackend, info: &BackendPaneInfo) -> String {
-    let Some(adapter) = crate::harness_tui::harness_tui(info.agent.as_deref()) else {
+    // `followup_tui` is `harness_tui` plus Muse, whose editor forms the
+    // status classification also reads.
+    let Some(adapter) = crate::harness_tui::followup_tui(info.agent.as_deref()) else {
         return "unknown".to_owned();
     };
     let Ok(screen) = backend.read_screen(&info.id, ScreenRead::visible()) else {
@@ -313,8 +324,28 @@ fn infer_status(backend: &TmuxBackend, info: &BackendPaneInfo) -> String {
     }
 }
 
+/// The terminal identity agentctl records for a tmux pane.
+///
+/// tmux has no terminal-inside-a-pane identity separate from the pane, but
+/// a pane can be respawned in place with a fresh shell. Naming the pane
+/// plus its shell process generation changes exactly then, which is what
+/// the recorded identity must detect; when the generation cannot be read
+/// the shell pid alone still separates a respawn from the original in
+/// every practical case.
+fn tmux_terminal_id(info: &BackendPaneInfo) -> Option<String> {
+    if let Some(terminal) = &info.terminal_id {
+        return Some(terminal.clone());
+    }
+    let pid = info.pid?;
+    let generation = agent_queue::identity::observe(u64::from(pid))
+        .map(|observed| observed.identity.starttime_ticks)
+        .unwrap_or(0);
+    Some(format!("tmux:{}:{pid}:{generation}", info.id))
+}
+
 fn to_agent_pane_info(backend: &TmuxBackend, info: BackendPaneInfo) -> AgentPaneInfo {
     let status = infer_status(backend, &info);
+    let terminal_id = tmux_terminal_id(&info);
     AgentPaneInfo {
         pane_id: info.id.to_string(),
         workspace_id: info
@@ -330,7 +361,7 @@ fn to_agent_pane_info(backend: &TmuxBackend, info: BackendPaneInfo) -> AgentPane
         session_agent: None,
         session_value: None,
         scroll: None,
-        terminal_id: info.terminal_id,
+        terminal_id,
         tab_id: info.tab_id.map(|id| id.to_string()),
     }
 }
@@ -488,6 +519,854 @@ impl AgentApi for TmuxBackend {
             &PaneId::from(pane_id),
             read,
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tmux backend as a full agent lifecycle client (`ManagedApi`).
+//
+// Herdr reports a pane's shell pid, foreground process group, and
+// foreground processes; tmux reports only the pane's shell pid
+// (`#{pane_pid}`). The same facts are in `/proc`: the shell's stat names
+// its terminal's foreground group, and the process table names which of
+// the shell's descendants belong to that group. Every proof below is the
+// Herdr path's proof re-derived from those two sources, with one widening:
+// where Herdr pins only a *sole* foreground process, tmux pins the unique
+// harness-matching process in the foreground group (or the one such
+// process the others descend from), because a wrapped launch — the case
+// this backend exists for — always has the wrapper in the group too.
+
+/// One visible process, as the pane proofs need it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TmuxProc {
+    pid: u64,
+    ppid: u64,
+    pgrp: u64,
+    tpgid: i64,
+    argv: Vec<String>,
+}
+
+/// A tmux pane's process state, the analogue of Herdr's process-info.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TmuxPaneProcesses {
+    shell_pid: u64,
+    foreground_pgid: u64,
+    /// The shell and its descendants in the foreground group, ascending.
+    foreground: Vec<u64>,
+    /// Every descendant of the shell, foreground or not.
+    descendants: HashSet<u64>,
+}
+
+/// `(ppid, pgrp, tpgid)` from a `/proc/PID/stat` record.
+fn parse_tmux_stat(stat: &[u8]) -> Option<(u64, u64, i64)> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let fields: Vec<&[u8]> = stat[close + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect();
+    let number = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.parse::<i64>().ok())
+    };
+    Some((
+        u64::try_from(number(1)?).ok()?,
+        u64::try_from(number(2)?).ok()?,
+        number(5)?,
+    ))
+}
+
+fn scan_tmux_processes() -> Result<Vec<TmuxProc>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(AdapterError::unavailable(
+            "tmux process proofs require Linux /proc",
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let entries = fs::read_dir("/proc").map_err(|error| {
+            AdapterError::unavailable(format!("cannot enumerate process table: {error}"))
+        })?;
+        let mut processes = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                AdapterError::unavailable(format!("cannot inspect process table: {error}"))
+            })?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u64>().ok())
+                .filter(|pid| *pid > 0 && *pid <= i32::MAX as u64)
+            else {
+                continue;
+            };
+            let root = entry.path();
+            // A process that exits mid-scan is simply absent from it; the
+            // callers re-observe the exact pids they rely on.
+            let Ok(stat) = fs::read(root.join("stat")) else {
+                continue;
+            };
+            let Some((ppid, pgrp, tpgid)) = parse_tmux_stat(&stat) else {
+                continue;
+            };
+            let argv = fs::read(root.join("cmdline"))
+                .map(|raw| {
+                    raw.split(|byte| *byte == 0)
+                        .filter(|part| !part.is_empty())
+                        .take(3)
+                        .map(|part| String::from_utf8_lossy(part).into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            processes.push(TmuxProc {
+                pid,
+                ppid,
+                pgrp,
+                tpgid,
+                argv,
+            });
+        }
+        Ok(processes)
+    }
+}
+
+/// The pane process state for `shell_pid` within one process-table scan.
+fn tmux_pane_processes(shell_pid: u64, processes: &[TmuxProc]) -> Option<TmuxPaneProcesses> {
+    let shell = processes.iter().find(|entry| entry.pid == shell_pid)?;
+    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+    for entry in processes {
+        children.entry(entry.ppid).or_default().push(entry.pid);
+    }
+    let mut descendants = HashSet::new();
+    let mut queue = VecDeque::from([shell_pid]);
+    while let Some(pid) = queue.pop_front() {
+        for child in children.get(&pid).into_iter().flatten() {
+            if descendants.insert(*child) {
+                queue.push_back(*child);
+            }
+        }
+    }
+    let foreground_pgid = if shell.tpgid > 0 {
+        shell.tpgid as u64
+    } else {
+        shell.pgrp
+    };
+    let mut foreground: Vec<u64> = processes
+        .iter()
+        .filter(|entry| {
+            entry.pgrp == foreground_pgid
+                && (entry.pid == shell_pid || descendants.contains(&entry.pid))
+        })
+        .map(|entry| entry.pid)
+        .collect();
+    foreground.sort_unstable();
+    Some(TmuxPaneProcesses {
+        shell_pid,
+        foreground_pgid,
+        foreground,
+        descendants,
+    })
+}
+
+fn pane_processes(backend: &TmuxBackend, pane_id: &str) -> Result<TmuxPaneProcesses> {
+    Ok(pane_state_and_processes(backend, pane_id)?.0)
+}
+
+fn pane_state_and_processes(
+    backend: &TmuxBackend,
+    pane_id: &str,
+) -> Result<(TmuxPaneProcesses, Vec<TmuxProc>)> {
+    let info = term_err(PaneTerminal::pane_info(backend, &PaneId::from(pane_id)))?;
+    let shell_pid = info.pid.map(u64::from).ok_or_else(|| {
+        AdapterError::unavailable(format!("tmux pane {pane_id} reports no pane_pid"))
+    })?;
+    let processes = scan_tmux_processes()?;
+    let state = tmux_pane_processes(shell_pid, &processes).ok_or_else(|| {
+        AdapterError::unavailable(format!(
+            "tmux pane {pane_id} shell process {shell_pid} is not in the process table"
+        ))
+    })?;
+    Ok((state, processes))
+}
+
+/// A harness program held open so its image identity cannot change under
+/// the comparison: the resolved path plus its device and inode.
+struct TmuxProgram {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    _file: fs::File,
+}
+
+fn pin_tmux_program(path: PathBuf) -> Result<TmuxProgram> {
+    let file = fs::File::open(&path).map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot pin harness executable {}: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot inspect harness executable {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(target_os = "linux")]
+    let (device, inode) = (metadata.dev(), metadata.ino());
+    #[cfg(not(target_os = "linux"))]
+    let (device, inode) = (0, 0);
+    if !metadata.is_file() || device == 0 || inode == 0 {
+        return Err(AdapterError::unavailable(format!(
+            "harness executable {} has no pin-able image identity",
+            path.display()
+        )));
+    }
+    Ok(TmuxProgram {
+        path,
+        device,
+        inode,
+        _file: file,
+    })
+}
+
+/// The pinned program for `kind`, when its fixed install location resolves.
+fn program_for_kind(kind: &str) -> Option<TmuxProgram> {
+    resolve_harness_executable(kind)
+        .ok()
+        .and_then(|path| pin_tmux_program(path).ok())
+}
+
+fn program_basename_matches(path: &Path, kind: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|base| base.strip_suffix(".real").unwrap_or(base) == kind)
+}
+
+/// Whether one coherently observed process runs `program` (or, with no
+/// resolved program, a program named `kind`). An interpreter running the
+/// resolved script counts: its image is the interpreter's, but the script
+/// is its first file argument, and the pinned identity is that
+/// interpreter process generation.
+fn process_matches_program(
+    observed: &agent_queue::identity::LiveProcess,
+    argv: &[String],
+    program: Option<&TmuxProgram>,
+    kind: &str,
+) -> bool {
+    if let Some(program) = program {
+        if observed.identity.executable_device == program.device
+            && observed.identity.executable_inode == program.inode
+        {
+            return true;
+        }
+        if argv
+            .iter()
+            .take(2)
+            .any(|argument| fs::canonicalize(argument).is_ok_and(|path| path == program.path))
+        {
+            return true;
+        }
+    }
+    program_basename_matches(&observed.executable_path, kind)
+        || argv
+            .first()
+            .is_some_and(|argv0| program_basename_matches(Path::new(argv0), kind))
+}
+
+/// Pick the harness to pin among foreground candidates: the only one, or
+/// the only one no other candidate descends from (the launched program,
+/// not a same-image child it started).
+fn choose_candidate(candidates: &[u64], processes: &[TmuxProc]) -> Option<u64> {
+    match candidates {
+        [] => None,
+        [only] => Some(*only),
+        _ => {
+            let parents: HashMap<u64, u64> = processes
+                .iter()
+                .map(|entry| (entry.pid, entry.ppid))
+                .collect();
+            let is_descendant = |pid: u64, ancestor: u64| {
+                let mut current = pid;
+                for _ in 0..processes.len() + 1 {
+                    match parents.get(&current) {
+                        Some(&parent) if parent == ancestor => return true,
+                        Some(&parent) if parent != current && parent != 0 => current = parent,
+                        _ => return false,
+                    }
+                }
+                false
+            };
+            let roots: Vec<u64> = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    !candidates
+                        .iter()
+                        .any(|other| other != candidate && is_descendant(*candidate, *other))
+                })
+                .collect();
+            match roots.as_slice() {
+                [root] => Some(*root),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The pinned harness process in one pane state, when it can be pinned.
+fn harness_candidate(
+    state: &TmuxPaneProcesses,
+    processes: &[TmuxProc],
+    kind: &str,
+    program: Option<&TmuxProgram>,
+) -> Result<Option<CustomProcessIdentity>> {
+    let argv_of: HashMap<u64, &[String]> = processes
+        .iter()
+        .map(|entry| (entry.pid, entry.argv.as_slice()))
+        .collect();
+    let mut observed_by_pid: HashMap<u64, CustomProcessIdentity> = HashMap::new();
+    for pid in &state.foreground {
+        // The shell itself is a candidate only when it exec'd the harness:
+        // its image then matches, which the program check decides.
+        let Ok(observed) = live_custom_process(*pid) else {
+            continue;
+        };
+        if observed.process_group_id != state.foreground_pgid {
+            continue;
+        }
+        let argv = argv_of.get(pid).copied().unwrap_or_default();
+        if process_matches_program(&observed, argv, program, kind) {
+            observed_by_pid.insert(*pid, observed.identity);
+        }
+    }
+    let candidates: Vec<u64> = observed_by_pid.keys().copied().collect();
+    Ok(choose_candidate(&candidates, processes).and_then(|pid| observed_by_pid.get(&pid).cloned()))
+}
+
+/// Whether `expected` is still a foreground process of the pane, in the
+/// same kernel generation and image.
+fn verify_foreground_identity(
+    state: &TmuxPaneProcesses,
+    expected: &CustomProcessIdentity,
+) -> Result<bool> {
+    if !expected.valid() || !state.foreground.contains(&expected.pid) {
+        return Ok(false);
+    }
+    let Ok(observed) = live_custom_process(expected.pid) else {
+        return Ok(false);
+    };
+    Ok(observed.process_group_id == state.foreground_pgid && observed.identity == *expected)
+}
+
+fn idle_shell_proof(state: &TmuxPaneProcesses) -> Result<Option<PaneShellProof>> {
+    if state.foreground_pgid != state.shell_pid || state.foreground != [state.shell_pid] {
+        return Ok(None);
+    }
+    let Some(observed) = supported_shell_process(state.shell_pid)? else {
+        return Ok(None);
+    };
+    if observed.process_group_id != state.shell_pid || !process_has_no_descendants(state.shell_pid)?
+    {
+        return Ok(None);
+    }
+    let Some(confirmed) = supported_shell_process(state.shell_pid)? else {
+        return Ok(None);
+    };
+    if confirmed.identity != observed.identity
+        || confirmed.process_group_id != observed.process_group_id
+        || confirmed.executable_path != observed.executable_path
+    {
+        return Ok(None);
+    }
+    Ok(Some(PaneShellProof {
+        identity: observed.identity,
+        executable_path: observed.executable_path,
+    }))
+}
+
+fn pane_idle_shell_proof(backend: &TmuxBackend, pane_id: &str) -> Result<Option<PaneShellProof>> {
+    let before = pane_processes(backend, pane_id)?;
+    let Some(proof) = idle_shell_proof(&before)? else {
+        return Ok(None);
+    };
+    let after = pane_processes(backend, pane_id)?;
+    if after != before || idle_shell_proof(&after)?.as_ref() != Some(&proof) {
+        return Ok(None);
+    }
+    Ok(Some(proof))
+}
+
+/// Run one program in a fresh shell pane and pin its foreground process.
+///
+/// Readiness is the pinned process plus, for a harness with a screen
+/// model, a recognisable composer screen (idle, working, or blocked all
+/// prove the TUI is up). A workspace-trust prompt is refused, never
+/// answered, exactly as on the Herdr custom-pane path.
+fn tmux_run_program(
+    backend: &TmuxBackend,
+    pane_id: &str,
+    kind: &str,
+    program: &TmuxProgram,
+    arguments: &[String],
+    timeout: Duration,
+) -> Result<CustomProcessIdentity> {
+    if timeout.is_zero() || timeout > Duration::from_secs(300) {
+        return Err(AdapterError::unavailable(
+            "agent startup timeout must be between 0 and 300 seconds",
+        ));
+    }
+    let mut command = vec![program.path.display().to_string()];
+    command.extend_from_slice(arguments);
+    let line = shell_join(&command)?;
+    term_err(PaneTerminal::prompt(backend, &PaneId::from(pane_id), &line))?;
+    let deadline = Instant::now() + timeout;
+    let mut pinned: Option<CustomProcessIdentity> = None;
+    loop {
+        let (state, processes) = pane_state_and_processes(backend, pane_id)?;
+        let candidate = harness_candidate(&state, &processes, kind, Some(program))?;
+        if let Some(identity) = candidate {
+            pinned = Some(identity.clone());
+            let screen = AgentApi::read(backend, pane_id, "visible", Some(200))?;
+            if crate::client::relay_trust_prompt(&screen) {
+                return Err(AdapterError::unavailable(format!(
+                    "{kind} workspace trust prompt requires human attention; no input was submitted"
+                )));
+            }
+            let ready = match crate::harness_tui::followup_tui(Some(kind)) {
+                Some(adapter) => {
+                    adapter.classify(&screen).state != crate::harness_tui::State::Unknown
+                }
+                None => true,
+            };
+            if ready {
+                let (state, _) = pane_state_and_processes(backend, pane_id)?;
+                if verify_foreground_identity(&state, &identity)? {
+                    return Ok(identity);
+                }
+                pinned = None;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(AdapterError::unavailable(if pinned.is_some() {
+                format!(
+                    "harness {kind:?} did not reach a recognisable composer in pane {pane_id} after {}s; read the pane for its error",
+                    timeout.as_secs()
+                )
+            } else {
+                format!(
+                    "{} was not the foreground process in pane {pane_id} after {}s; read the pane for its error",
+                    program.path.display(),
+                    timeout.as_secs()
+                )
+            }));
+        }
+        std::thread::sleep(
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+impl crate::subagents::ManagedApi for TmuxBackend {
+    fn record_backend(&self) -> &'static str {
+        "tmux"
+    }
+
+    fn start_adapter(&self, _harness: &str, _relay: bool) -> String {
+        "tmux".to_owned()
+    }
+
+    fn adopt_adapter(&self) -> String {
+        "tmux-foreign".to_owned()
+    }
+
+    fn inherited_workspace(&self) -> Option<String> {
+        // Inside tmux, `$TMUX_PANE` names this process's own pane; its
+        // session is the workspace a bare start belongs in. A Herdr
+        // workspace id from the environment means nothing here.
+        let pane = std::env::var("TMUX_PANE")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        PaneTerminal::pane_info(self, &PaneId::from(pane.as_str()))
+            .ok()?
+            .workspace_id
+            .map(|id| id.to_string())
+    }
+
+    fn process_liveness(&self, expected: &CustomProcessIdentity) -> ProcessLiveness {
+        agent_queue::identity::liveness(expected)
+    }
+
+    fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
+        let matches: Vec<String> = term_err(self.list_workspaces())?
+            .into_iter()
+            .filter(|workspace| workspace.label == label)
+            .map(|workspace| workspace.id.to_string())
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some(only.clone())),
+            _ => Err(AdapterError::unavailable(format!(
+                "tmux session label {label:?} is ambiguous"
+            ))),
+        }
+    }
+
+    fn create_workspace(
+        &self,
+        label: &str,
+        cwd: &str,
+        environment: &[String],
+    ) -> Result<(String, String, String)> {
+        let created: CreatedPane = term_err(Multiplexer::create_workspace(
+            self,
+            label,
+            Path::new(cwd),
+            environment,
+        ))?;
+        Ok((
+            created.workspace_id.to_string(),
+            created.tab_id.to_string(),
+            created.pane_id.to_string(),
+        ))
+    }
+
+    fn create_tab(
+        &self,
+        workspace: &str,
+        label: &str,
+        cwd: &str,
+        environment: &[String],
+    ) -> Result<String> {
+        Ok(self
+            .create_tab_with_pane(workspace, label, cwd, environment)?
+            .0)
+    }
+
+    fn create_tab_with_pane(
+        &self,
+        workspace: &str,
+        label: &str,
+        cwd: &str,
+        environment: &[String],
+    ) -> Result<(String, String)> {
+        let created: CreatedPane = term_err(Multiplexer::create_tab(
+            self,
+            &WorkspaceId::from(workspace),
+            label,
+            Path::new(cwd),
+            environment,
+        ))?;
+        Ok((created.tab_id.to_string(), created.pane_id.to_string()))
+    }
+
+    fn close_pane(&self, pane: &str) -> Result<()> {
+        term_err(Multiplexer::close_pane(self, &PaneId::from(pane)))
+    }
+
+    fn focus_pane(&self, pane: &str) -> Result<()> {
+        term_err(Multiplexer::focus_pane(self, &PaneId::from(pane)))
+    }
+
+    fn rename_tab(&self, tab: &str, label: &str) -> Result<()> {
+        term_err(Multiplexer::rename_tab(self, &TabId::from(tab), label))
+    }
+
+    fn close_tab(&self, tab: &str) -> Result<()> {
+        term_err(Multiplexer::close_tab(self, &TabId::from(tab)))
+    }
+
+    fn start_agent(
+        &self,
+        _name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
+        // tmux has no agent registry to start a kind by name: agentctl
+        // runs the harness executable itself in the fresh pane and pins
+        // the process it proves, exactly as the caller then anchors.
+        let program = pin_tmux_program(resolve_harness_executable(harness)?)?;
+        tmux_run_program(self, pane, harness, &program, args, timeout)?;
+        Ok(())
+    }
+
+    fn send_keys(&self, pane: &str, key: &str) -> Result<()> {
+        term_err(PaneTerminal::send_keys(self, &PaneId::from(pane), key))
+    }
+
+    fn send_text(&self, pane: &str, text: &str) -> Result<()> {
+        term_err(PaneTerminal::paste_text(self, &PaneId::from(pane), text))
+    }
+
+    fn agent_pane(&self, name: &str) -> Result<String> {
+        self.agent_names()?.get(name).cloned().ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "no tmux tab is labelled {name:?}; tmux agent names are tab labels"
+            ))
+        })
+    }
+
+    fn report_agent_session(
+        &self,
+        _name: &str,
+        _pane: &str,
+        _kind: &str,
+        _session: &str,
+    ) -> Result<()> {
+        Err(AdapterError::unavailable(
+            "tmux has no native session registry to report to; agentctl records sessions in its own registry",
+        ))
+    }
+
+    fn agent_identity(&self, name: &str) -> Result<AgentIdentity> {
+        let pane_id = self.agent_pane(name)?;
+        let info = AgentApi::pane_info(self, &pane_id)?;
+        Ok(AgentIdentity {
+            name: name.to_owned(),
+            pane_id,
+            tab_id: info.tab_id,
+            terminal_id: info.terminal_id,
+        })
+    }
+
+    fn rename_agent(&self, pane: &str, name: &str) -> Result<()> {
+        // A tmux agent's name is its tab label.
+        let info = term_err(PaneTerminal::pane_info(self, &PaneId::from(pane)))?;
+        let tab = info.tab_id.ok_or_else(|| {
+            AdapterError::unavailable(format!("tmux pane {pane} reports no window"))
+        })?;
+        term_err(Multiplexer::rename_tab(self, &tab, name))
+    }
+
+    fn agent_names(&self) -> Result<BTreeMap<String, String>> {
+        let mut names = BTreeMap::new();
+        for workspace in term_err(self.list_workspaces())? {
+            let panes = term_err(Multiplexer::list_panes(self, Some(&workspace.id)))?;
+            let mut by_tab: HashMap<String, Vec<String>> = HashMap::new();
+            for pane in &panes {
+                if let Some(tab) = &pane.tab_id {
+                    by_tab
+                        .entry(tab.to_string())
+                        .or_default()
+                        .push(pane.id.to_string());
+                }
+            }
+            for tab in term_err(Multiplexer::list_tabs(self, &workspace.id))? {
+                if let Some([pane]) = by_tab.get(&tab.id.to_string()).map(Vec::as_slice) {
+                    names.entry(tab.label).or_insert_with(|| pane.clone());
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    fn tab_label(&self, tab: &str) -> Result<String> {
+        for workspace in term_err(self.list_workspaces())? {
+            if let Some(found) = term_err(Multiplexer::list_tabs(self, &workspace.id))?
+                .into_iter()
+                .find(|entry| entry.id.as_str() == tab)
+            {
+                return Ok(found.label);
+            }
+        }
+        Err(AdapterError::unavailable(format!(
+            "tmux window {tab:?} not found"
+        )))
+    }
+
+    fn tab_labels(&self, workspace: &str) -> Result<BTreeMap<String, String>> {
+        Ok(
+            term_err(Multiplexer::list_tabs(self, &WorkspaceId::from(workspace)))?
+                .into_iter()
+                .map(|tab| (tab.id.to_string(), tab.label))
+                .collect(),
+        )
+    }
+
+    fn explain_agent(&self, pane: &str) -> Result<(Option<String>, String)> {
+        let info = AgentApi::pane_info(self, pane)?;
+        Ok((info.agent, info.status))
+    }
+
+    fn harness_identity(&self, pane: &str, kind: &str) -> Result<Option<CustomProcessIdentity>> {
+        let (state, processes) = pane_state_and_processes(self, pane)?;
+        let program = program_for_kind(kind);
+        harness_candidate(&state, &processes, kind, program.as_ref())
+    }
+
+    fn verify_harness_identity(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+    ) -> Result<bool> {
+        verify_foreground_identity(&pane_processes(self, pane)?, expected)
+    }
+
+    fn process_command_line(&self, expected: &CustomProcessIdentity) -> Option<Vec<String>> {
+        // The same proved-generation command-line read the Herdr client
+        // does: prove the identity before and after reading cmdline.
+        const LIMIT: usize = 256 << 10;
+        let same = || {
+            live_custom_process(expected.pid).is_ok_and(|observed| observed.identity == *expected)
+        };
+        if !same() {
+            return None;
+        }
+        let mut raw = fs::read(format!("/proc/{}/cmdline", expected.pid)).ok()?;
+        if !same() || raw.is_empty() || raw.len() > LIMIT {
+            return None;
+        }
+        if raw.last() == Some(&0) {
+            raw.pop();
+        }
+        let argv = raw
+            .split(|byte| *byte == 0)
+            .map(|item| String::from_utf8(item.to_vec()).ok())
+            .collect::<Option<Vec<_>>>()?;
+        (!argv.is_empty() && argv.iter().all(|item| !item.is_empty())).then_some(argv)
+    }
+
+    fn verify_custom_harness(
+        &self,
+        pane: &str,
+        harness: &str,
+        identity: Option<&CustomProcessIdentity>,
+    ) -> Result<()> {
+        let (state, processes) = pane_state_and_processes(self, pane)?;
+        let observed = match identity {
+            Some(identity) => verify_foreground_identity(&state, identity)?,
+            None => {
+                let program = program_for_kind(harness);
+                harness_candidate(&state, &processes, harness, program.as_ref())?.is_some()
+            }
+        };
+        if !observed {
+            return Err(AdapterError::unavailable(format!(
+                "custom harness {harness:?} is not the foreground process in pane {pane}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn pane_runs_command(&self, pane: &str, identity: &CustomProcessIdentity) -> Result<bool> {
+        verify_foreground_identity(&pane_processes(self, pane)?, identity)
+    }
+
+    fn start_pane_command(
+        &self,
+        pane: &str,
+        executable: &Path,
+        arguments: &[String],
+        timeout: Duration,
+    ) -> Result<CustomProcessIdentity> {
+        let canonical = fs::canonicalize(executable).map_err(|error| {
+            AdapterError::unavailable(format!(
+                "cannot resolve pane command {}: {error}",
+                executable.display()
+            ))
+        })?;
+        let kind = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let program = pin_tmux_program(canonical)?;
+        tmux_run_program(self, pane, &kind, &program, arguments, timeout)
+    }
+
+    fn pane_is_idle_shell(&self, pane: &str) -> Result<bool> {
+        Ok(pane_idle_shell_proof(self, pane)?.is_some())
+    }
+
+    fn pane_shell_identity(&self, pane: &str) -> Result<CustomProcessIdentity> {
+        let state = pane_processes(self, pane)?;
+        supported_shell_process(state.shell_pid)?
+            .filter(|observed| observed.process_group_id == state.shell_pid)
+            .map(|observed| observed.identity)
+            .ok_or_else(|| {
+                AdapterError::unavailable(format!(
+                    "cannot capture a supported identity-bound shell process for pane {pane}"
+                ))
+            })
+    }
+
+    fn pane_is_same_idle_shell(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+    ) -> Result<bool> {
+        if !expected.valid() {
+            return Err(AdapterError::unavailable(
+                "recorded pane shell identity is invalid",
+            ));
+        }
+        Ok(pane_idle_shell_proof(self, pane)?.is_some_and(|proof| proof.identity == *expected))
+    }
+
+    fn pane_idle_shell_identity(&self, pane: &str) -> Result<Option<PaneShellProof>> {
+        pane_idle_shell_proof(self, pane)
+    }
+
+    fn read_screen_with_runtime(&self, pane: &str, _runtime: &dyn AgentRuntime) -> Result<String> {
+        term_err(PaneTerminal::read_screen(
+            self,
+            &PaneId::from(pane),
+            ScreenRead {
+                scrollback_lines: Some(0),
+                ansi: true,
+            },
+        ))
+    }
+
+    fn prompt_guarded(
+        &self,
+        pane: &str,
+        text: &str,
+        terminal: &dyn GuardedInput,
+        runtime: &dyn AgentRuntime,
+    ) -> Result<Submission> {
+        let harness = match PaneTerminal::pane_info(self, &PaneId::from(pane)) {
+            Ok(info) => info.agent.unwrap_or_default(),
+            Err(error) => {
+                return Ok(Submission::NotStaged(format!(
+                    "pane {pane}: harness lookup failed before typing: {error}"
+                )))
+            }
+        };
+        if crate::submission::verifies(&harness, text) {
+            return crate::submission::submit_verified(
+                &GuardedPrompt(terminal),
+                pane,
+                &harness,
+                text,
+                SubmitTimeouts::default(),
+                runtime,
+            );
+        }
+        terminal
+            .native_prompt(pane, text)
+            .map(|()| Submission::Unconfirmed)
+    }
+
+    fn submit_guarded(
+        &self,
+        pane: &str,
+        harness: &str,
+        text: &str,
+        terminal: &dyn GuardedInput,
+        runtime: &dyn AgentRuntime,
+    ) -> Result<Submission> {
+        crate::submission::submit_verified(
+            &GuardedPrompt(terminal),
+            pane,
+            harness,
+            text,
+            SubmitTimeouts::default(),
+            runtime,
+        )
     }
 }
 

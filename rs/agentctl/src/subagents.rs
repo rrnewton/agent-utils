@@ -654,7 +654,7 @@ impl RenameJournal {
             || !name_pattern(old)
             || !name_pattern(new)
             || old == new
-            || !matches!(adapter, "herdr" | "herdr-foreign")
+            || !matches!(adapter, "herdr" | "herdr-foreign" | "tmux" | "tmux-foreign")
             || pane_id.is_empty()
             || tab_id.is_empty()
             || !journal_id_pattern(journal_id)
@@ -864,6 +864,30 @@ pub fn environment_entries(values: &[String]) -> Result<Vec<String>> {
 
 /// Lifecycle operations in addition to the existing interactive messaging API.
 pub trait ManagedApi: AgentApi {
+    /// The `backend` spelling records this client creates carry.
+    fn record_backend(&self) -> &'static str {
+        "herdr"
+    }
+    /// The `adapter` spelling for an agent this client starts itself.
+    fn start_adapter(&self, harness: &str, relay: bool) -> String {
+        if relay {
+            "herdr-relay".to_owned()
+        } else if harness == "muse" {
+            "herdr-pane".to_owned()
+        } else {
+            "herdr".to_owned()
+        }
+    }
+    /// The `adapter` spelling for an agent this client adopts.
+    fn adopt_adapter(&self) -> String {
+        "herdr-foreign".to_owned()
+    }
+    /// The workspace this client's own process runs in, when it knows one.
+    fn inherited_workspace(&self) -> Option<String> {
+        std::env::var("HERDR_WORKSPACE_ID")
+            .ok()
+            .filter(|value| !value.is_empty())
+    }
     /// Read kernel evidence for one pinned process generation; unavailable evidence is unknown.
     fn process_liveness(&self, _expected: &CustomProcessIdentity) -> ProcessLiveness {
         ProcessLiveness::Unknown
@@ -1817,6 +1841,25 @@ fn interactive_mode() -> String {
 }
 
 impl AgentRecord {
+    /// An adopted agent whose pane agentctl does not own, on either backend.
+    fn is_foreign(&self) -> bool {
+        matches!(self.adapter.as_str(), "herdr-foreign" | "tmux-foreign")
+    }
+
+    /// An agent agentctl itself launched through the backend's native path.
+    fn is_owned_native(&self) -> bool {
+        matches!(self.adapter.as_str(), "herdr" | "tmux")
+    }
+
+    /// Records whose runtime anchor is the pinned harness process, as
+    /// opposed to a custom-pane or relay process identity.
+    fn anchors_with_harness_identity(&self) -> bool {
+        matches!(
+            self.adapter.as_str(),
+            "herdr" | "herdr-foreign" | "tmux" | "tmux-foreign"
+        )
+    }
+
     /// The pinned harness process, if the current pinning rule produced it.
     fn harness_anchor(&self) -> Option<&CustomProcessIdentity> {
         if self.anchor_rule == Some(ANCHOR_RULE) {
@@ -1905,7 +1948,7 @@ impl AgentRecord {
                 .foreign_shell_identity
                 .as_ref()
                 .is_some_and(|identity| {
-                    self.adapter != "herdr-foreign"
+                    !self.is_foreign()
                         || self.pane_id.as_deref().is_none_or(str::is_empty)
                         || !identity.valid()
                 })
@@ -2002,12 +2045,12 @@ impl AgentRecord {
                 self.name, self.name
             )));
         }
-        if !matches!(
-            self.adapter.as_str(),
-            "herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay"
-        ) || self.mode != "interactive"
-            || self.backend != "herdr"
-        {
+        let backend_matches = match self.adapter.as_str() {
+            "herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay" => self.backend == "herdr",
+            "tmux" | "tmux-foreign" => self.backend == "tmux",
+            _ => false,
+        };
+        if !backend_matches || self.mode != "interactive" {
             return Err(fail(turn_runner::unsupported_message(self)));
         }
         Ok(())
@@ -2627,7 +2670,7 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
                 repr(record.terminal_id.as_deref())
             ));
         }
-        if record.adapter != "herdr-foreign" {
+        if !record.is_foreign() {
             if let Some(recorded_tab) = record.tab_id.as_deref() {
                 if info
                     .tab_id
@@ -2994,14 +3037,29 @@ pub const MISROUTE_NOTE: &str =
     "Ignore the previous message: it was sent to the wrong agent by agentctl.";
 const NOTE_HARNESSES: [&str; 3] = ["claude", "codex", "muse"];
 
-/// The doctor finding for a Herdr refusal naming a closed workspace, tab, or pane.
+/// The doctor finding for a backend refusal naming a closed workspace, tab, or pane.
 fn missing_target(error: &impl std::fmt::Display) -> Option<&'static str> {
-    match crate::client::herdr_error_code(&error.to_string())?.as_str() {
-        "workspace_not_found" => Some("workspace-missing"),
-        "tab_not_found" => Some("tab-missing"),
-        "pane_not_found" => Some("pane-missing"),
-        _ => None,
+    let detail = error.to_string();
+    if let Some(code) = crate::client::herdr_error_code(&detail) {
+        return match code.as_str() {
+            "workspace_not_found" => Some("workspace-missing"),
+            "tab_not_found" => Some("tab-missing"),
+            "pane_not_found" => Some("pane-missing"),
+            _ => None,
+        };
     }
+    // The tmux backend's own not-found spellings, from its pane census and
+    // session/window lookups.
+    if detail.contains("tmux pane ") && detail.contains("not found") {
+        return Some("pane-missing");
+    }
+    if detail.contains("tmux window ") && detail.contains("not found") {
+        return Some("tab-missing");
+    }
+    if detail.contains("tmux session ") && detail.contains("not found") {
+        return Some("workspace-missing");
+    }
+    None
 }
 
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
@@ -4134,7 +4192,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     ) -> crate::error::Result<Submission> {
         if !matches!(
             self.record.adapter.as_str(),
-            "herdr" | "herdr-foreign" | "herdr-relay"
+            "herdr" | "herdr-foreign" | "herdr-relay" | "tmux" | "tmux-foreign"
         ) {
             return self.submit_unchecked(pane_id, text, runtime);
         }
@@ -4515,9 +4573,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .map_err(|error| fail(error.to_string()))?
                 .join(registry)
         };
-        let inherited_workspace = std::env::var("HERDR_WORKSPACE_ID")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let inherited_workspace = client.inherited_workspace();
         Ok(Self {
             client,
             registry,
@@ -5259,7 +5315,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// intended recipient rather than whatever is visible now.
     fn anchor_fresh(&self, record: &mut AgentRecord, terminal_id: Option<String>) -> Result<()> {
         record.terminal_id = terminal_id;
-        if matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
+        if record.anchors_with_harness_identity() {
             if let Some(pane) = record.pane_id.clone() {
                 record.harness_identity = self.client.harness_identity(&pane, &record.harness)?;
                 record.anchor_rule = record.harness_identity.as_ref().map(|_| ANCHOR_RULE);
@@ -5566,9 +5622,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay") {
             return self.anchor_custom_spec(record, session, migrated_from);
         }
-        if !matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
+        if !record.anchors_with_harness_identity() {
             return Err(fail(
-                "anchor applies to native, adopted, and custom-pane Herdr agents",
+                "anchor applies to native, adopted, and custom-pane Herdr agents and to native and adopted tmux agents",
             ));
         }
         let Some(pane) = record.pane_id.clone() else {
@@ -5773,13 +5829,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 record.lifecycle
             )));
         }
-        if !matches!(record.adapter.as_str(), "herdr" | "herdr-relay")
+        if !(matches!(record.adapter.as_str(), "herdr" | "herdr-relay")
+            && record.backend == "herdr"
+            || record.adapter == "tmux" && record.backend == "tmux")
             || record.mode != "interactive"
-            || record.backend != "herdr"
             || record.nested.is_some()
         {
             return Err(fail(
-                "promote applies to native and root-slot-relay interactive Herdr launches",
+                "promote applies to native and root-slot-relay interactive Herdr launches and native tmux launches",
             ));
         }
         if record.adapter == "herdr-relay" {
@@ -5820,7 +5877,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         if self.client.agent_pane(agent_name)? != pane {
             return Err(fail(format!(
-                "Herdr agent name {agent_name:?} points to another pane"
+                "agent name {agent_name:?} points to another pane"
             )));
         }
         let Some(identity) = self.client.harness_identity(&pane, &record.harness)? else {
@@ -5904,11 +5961,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let record = self.load(old)?;
         record.refuse_nested_rename()?;
-        if !matches!(record.adapter.as_str(), "herdr" | "herdr-foreign")
-            || record.lifecycle != "running"
-        {
+        if !record.anchors_with_harness_identity() || record.lifecycle != "running" {
             return Err(fail(
-                "rename supports running native and adopted Herdr agents",
+                "rename supports running native and adopted Herdr and tmux agents",
             ));
         }
         let (Some(pane), Some(tab)) = (record.pane_id.clone(), record.tab_id.clone()) else {
@@ -5956,10 +6011,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "pane {pane} is also claimed by registered agent '{owner}'; run `agentctl doctor`"
             )));
         }
-        if self.client.agent_names()?.contains_key(new) {
+        if record.adapter == "herdr" && self.client.agent_names()?.contains_key(new) {
             return Err(fail(format!("a Herdr agent is already named '{new}'")));
         }
-        if record.adapter == "herdr" {
+        if record.is_owned_native() {
             if let Some(workspace) = record.workspace_id.as_deref() {
                 if self
                     .client
@@ -6056,6 +6111,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     }
                     self.client.rename_agent(pane, new)?;
                 }
+                let label = self.client.tab_label(tab)?;
+                if label != new {
+                    if label != old {
+                        return Err(fail(format!(
+                            "tab {tab} is labelled '{label}', neither '{old}' nor '{new}'; refusing"
+                        )));
+                    }
+                    self.client.rename_tab(tab, new)?;
+                }
+            }
+            if journal.adapter == "tmux" {
+                // A tmux agent's name is only its tab label.
                 let label = self.client.tab_label(tab)?;
                 if label != new {
                     if label != old {
@@ -6387,7 +6454,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if record.terminal_id.is_some() && info.terminal_id != record.terminal_id {
             findings.push("terminal-mismatch");
         }
-        if record.adapter != "herdr-foreign" {
+        if !record.is_foreign() {
             if let Some(tab) = record.tab_id.as_deref() {
                 if panes[pane].tab_id != tab {
                     findings.push("tab-moved");
@@ -6414,7 +6481,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             if !self.client.verify_harness_identity(pane, identity)? {
                 findings.push("harness-replaced");
             }
-        } else if matches!(record.adapter.as_str(), "herdr" | "herdr-foreign")
+        } else if record.anchors_with_harness_identity()
             && record.observed_session_value().is_none()
         {
             findings.push("unanchored");
@@ -6653,6 +6720,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut slot_project = None;
         let mut slot_isolation = None;
         let mut launch_extra = BTreeMap::new();
+        if options.slot.is_some() && self.client.record_backend() != "herdr" {
+            return Err(fail(
+                "--slot boxing requires Herdr; the tmux terminal backend does not support slot launches",
+            ));
+        }
         let (cwd, slot_command) = match options.slot.as_ref() {
             Some(launch) => {
                 if !valid_metadata_text(&launch.slot) {
@@ -6754,15 +6826,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut record = AgentRecord {
             storage_directory: None,
             nested: None,
-            adapter: if relay_command.is_some() {
-                "herdr-relay".to_owned()
-            } else if options.harness == "muse" {
-                "herdr-pane".to_owned()
-            } else {
-                herdr_adapter()
-            },
+            adapter: self
+                .client
+                .start_adapter(&options.harness, relay_command.is_some()),
             mode: interactive_mode(),
-            backend: herdr_adapter(),
+            backend: self.client.record_backend().to_owned(),
             paused: false,
             runtime_home: None,
             pane_reported_by_agentctl: false,
@@ -7139,9 +7207,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut record = AgentRecord {
             storage_directory: None,
             nested: None,
-            adapter: "herdr-foreign".to_owned(),
+            adapter: self.client.adopt_adapter(),
             mode: interactive_mode(),
-            backend: herdr_adapter(),
+            backend: self.client.record_backend().to_owned(),
             paused: false,
             runtime_home: None,
             pane_reported_by_agentctl: false,
@@ -9967,13 +10035,13 @@ its drain would type first, so it was not queued",
             )));
         }
         let record = &initial.record;
-        if record.adapter != "herdr"
+        if !record.is_owned_native()
             || record.lifecycle != "running"
             || record.mode != "interactive"
-            || record.backend != "herdr"
+            || record.backend != self.client.record_backend()
         {
             return Err(fail(
-                "managed-dead retirement requires a running herdr record in interactive/herdr mode",
+                "managed-dead retirement requires a running owned interactive record on this backend",
             ));
         }
         let before = self.dead_pane_proof(record, "retire dead managed agent")?;
@@ -10237,7 +10305,7 @@ its drain would type first, so it was not queued",
                 "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption",
             ));
         }
-        if record.adapter == "herdr-foreign" {
+        if record.is_foreign() {
             if let Some((pinned, queue)) = retirement.as_ref() {
                 if let Some(action) = self
                     .dead_adoption_stop_recovery(&record, pinned, queue)
@@ -10329,7 +10397,7 @@ its drain would type first, so it was not queued",
             }));
         }
         let panes = self.client.panes()?;
-        if record.adapter == "herdr"
+        if record.is_owned_native()
             && matches!(record.lifecycle.as_str(), "running" | "stopping")
             && record.pane_id.is_some()
         {
@@ -10340,7 +10408,7 @@ its drain would type first, so it was not queued",
             if recorded.len() == 1 && self.client.pane_info(&recorded[0].pane_id)?.agent.is_none() {
                 if record.lifecycle != "running" {
                     return Err(fail(
-                        "managed-dead retirement requires a running herdr record",
+                        "managed-dead retirement requires a running owned record",
                     ));
                 }
                 let _pane_lock = self.pane_lock(&recorded[0].pane_id)?;

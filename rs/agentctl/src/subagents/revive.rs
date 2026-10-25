@@ -623,10 +623,10 @@ fn revive_conversation(record: &AgentRecord) -> Result<NativeSession> {
 
 /// agentctl launches the replacement itself, so a revived adopted agent is owned.
 fn revived_adapter(record: &AgentRecord) -> &str {
-    if record.adapter == "herdr-foreign" {
-        "herdr"
-    } else {
-        &record.adapter
+    match record.adapter.as_str() {
+        "herdr-foreign" => "herdr",
+        "tmux-foreign" => "tmux",
+        _ => &record.adapter,
     }
 }
 
@@ -686,7 +686,7 @@ fn validate_census(panes: &[Pane]) -> Result<()> {
             || !valid_metadata_text(&pane.workspace_id)
             || !ids.insert(pane.pane_id.as_str())
     }) {
-        return Err(fail("Herdr pane census is incomplete or ambiguous"));
+        return Err(fail("pane census is incomplete or ambiguous"));
     }
     Ok(())
 }
@@ -754,10 +754,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Err(fail("record lifecycle is not running"));
         }
         if record.mode != "interactive"
-            || record.backend != "herdr"
+            || record.backend != self.client.record_backend()
             || !matches!(
                 record.adapter.as_str(),
-                "herdr" | "herdr-pane" | "herdr-relay" | "herdr-foreign"
+                "herdr" | "herdr-pane" | "herdr-relay" | "herdr-foreign" | "tmux" | "tmux-foreign"
             )
             || !matches!(record.harness.as_str(), "claude" | "codex" | "muse")
         {
@@ -765,7 +765,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "revive requires a local interactive Claude, Codex, or Muse agent",
             ));
         }
-        if record.adapter == "herdr-foreign" && record.launch_spec.is_none() {
+        if record.is_foreign() && record.launch_spec.is_none() {
             return Err(fail(format!(
                 "adopted record has no launch spec; while its harness runs, capture one with `agentctl anchor {} --replace`",
                 record.name
@@ -1063,7 +1063,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 
     fn revive_liveness(&self, record: &AgentRecord) -> ProcessLiveness {
-        let identity = if matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
+        let identity = if record.anchors_with_harness_identity() {
             record.harness_anchor()
         } else {
             record.custom_process_identity.as_ref()
@@ -1104,7 +1104,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                         .any(|item| item.pane_id == pane || item.tab_id == tab)
                     {
                         return Err(fail(
-                            "missing pane or its recorded tab still appears in Herdr census",
+                            "missing pane or its recorded tab still appears in the pane census",
                         ));
                     }
                     match self.client.pane_info(pane) {
@@ -1271,8 +1271,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .terminal_id
                 .as_deref()
                 .is_none_or(|terminal| !valid_metadata_text(terminal))
-            || (record.adapter == "herdr" && record.harness_anchor().is_none())
-            || (record.adapter != "herdr" && record.custom_process_identity.is_none())
+            || (record.anchors_with_harness_identity() && record.harness_anchor().is_none())
+            || (!record.anchors_with_harness_identity() && record.custom_process_identity.is_none())
         {
             return Err(fail(
                 "resumed candidate has no independently pinned runtime",
@@ -2047,7 +2047,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         let current = self.revive_proof(old)?;
         // An adopted agent's pane was never agentctl's to close, even as an idle shell.
-        let keep_pane = old.adapter == "herdr-foreign" && current.kind != "missing";
+        let keep_pane = old.is_foreign() && current.kind != "missing";
         if current.kind != "missing" && !keep_pane {
             if current != journal.proof {
                 return Err(fail(
