@@ -107,7 +107,10 @@ impl TmuxBackend {
         // A pane whose foreground command is a wrapper (a shell script, an
         // interpreter, a launcher) hides the harness it started. Look under
         // the pane's shell process for one before reporting no agent.
-        if panes.iter().any(|pane| pane.agent.is_none() && pane.pid.is_some()) {
+        if panes
+            .iter()
+            .any(|pane| pane.agent.is_none() && pane.pid.is_some())
+        {
             let processes = scan_processes();
             if !processes.is_empty() {
                 for pane in &mut panes {
@@ -187,12 +190,10 @@ impl ProcEntry {
         }
         // An interpreter running a harness script names it as its first
         // file argument, not in argv[0].
-        self.argv.iter().take(2).find_map(|argument| {
-            argument
-                .rsplit('/')
-                .next()
-                .and_then(harness_basename)
-        })
+        self.argv
+            .iter()
+            .take(2)
+            .find_map(|argument| argument.rsplit('/').next().and_then(harness_basename))
     }
 }
 
@@ -273,8 +274,11 @@ fn scan_proc() -> Vec<ProcEntry> {
             })
             .unwrap_or_default();
         let exe_base = std::fs::read_link(root.join("exe")).ok().and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().trim_end_matches(" (deleted)").to_owned())
+            path.file_name().map(|name| {
+                name.to_string_lossy()
+                    .trim_end_matches(" (deleted)")
+                    .to_owned()
+            })
         });
         processes.push(ProcEntry {
             pid,
@@ -722,7 +726,13 @@ mod tests {
         let processes = vec![
             proc(100, 1, 100, Some("bash"), &["-bash"]),
             proc(200, 100, 200, Some("bash"), &["bash", "/opt/wrap.sh"]),
-            proc(201, 200, 200, Some("python3"), &["python3", "/opt/bin/claude"]),
+            proc(
+                201,
+                200,
+                200,
+                Some("python3"),
+                &["python3", "/opt/bin/claude"],
+            ),
             // A background descendant in another group is not the pane's job.
             proc(300, 100, 300, Some("codex"), &["codex"]),
         ];
