@@ -61,8 +61,13 @@ which one is selected.
 Today the tmux backend drives the durable direct-pane transport: the
 `herdr-agent` compatibility command's `send`, `drain`, `status`, and `read`
 against an explicit `--pane PANE`, using tmux pane identifiers (for example
-`%1`). Agent lifecycle commands (start, adopt, stop, restore, watch, and
-chat) still require Herdr and refuse clearly when tmux is selected.
+`%1`). Agent lifecycle commands (start, adopt, stop, and the other managed
+session commands) still require Herdr and refuse clearly when an operator
+has selected tmux. The long-running Herdr services (chat, inbox, restore,
+watch, watch-agents, install-units) are Herdr-only by design: passing
+`--term-backend tmux` to them is refused, and they otherwise always use
+Herdr. When no backend is selected anywhere and Herdr is simply absent,
+lifecycle commands keep reporting Herdr's own not-found error, as before.
 
 ### Rust subscription plugin discovery
 

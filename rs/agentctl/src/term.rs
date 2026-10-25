@@ -35,31 +35,38 @@ fn client_err<T>(result: Result<T>) -> term_backend::Result<T> {
     result.map_err(|error| TermError::failed(error.to_string()))
 }
 
-/// Resolve which terminal backend this invocation uses.
+/// Resolve which terminal backend this invocation uses, and whether an
+/// operator selected it (flag, environment, or profile key) rather than
+/// detection picking it.
 ///
 /// Precedence: an explicit flag value, then `$AGENTCTL_TERM_BACKEND`, then
 /// the project profile configuration beside the registry, then detection
-/// (Herdr when its executable is available, else tmux). Detection failure
-/// falls back to Herdr so the Herdr client's own "not found" error fires.
+/// (Herdr when its executable is available, else tmux). The profile read
+/// is best-effort: commands that never loaded profile policy before must
+/// not start failing on its file permissions just to pick a backend, so
+/// an unreadable profile config simply selects nothing here (commands
+/// that do load profiles still enforce that policy in full). Detection
+/// failure falls back to Herdr so the Herdr client's own "not found"
+/// error fires, exactly as before backends were selectable.
 pub fn select_backend(
     explicit: Option<&str>,
     environment: &dyn Fn(&str) -> Option<String>,
     registry: &Path,
     herdr_bin: &Path,
     tmux_bin: &Path,
-) -> std::result::Result<BackendKind, AdapterError> {
+) -> std::result::Result<(BackendKind, bool), AdapterError> {
     if let Some(raw) = explicit {
         return BackendKind::parse(raw)
+            .map(|kind| (kind, true))
             .map_err(|error| AdapterError::unavailable(error.to_string()));
     }
     if let Some(raw) = environment(BACKEND_ENV).filter(|value| !value.is_empty()) {
         return BackendKind::parse(&raw)
+            .map(|kind| (kind, true))
             .map_err(|error| AdapterError::unavailable(format!("${BACKEND_ENV}: {error}")));
     }
-    if let Some(kind) = crate::profiles::backend_for_registry(registry)
-        .map_err(|error| AdapterError::unavailable(error.to_string()))?
-    {
-        return Ok(kind);
+    if let Ok(Some(kind)) = crate::profiles::backend_for_registry(registry) {
+        return Ok((kind, true));
     }
     let config = BackendConfig {
         kind: None,
@@ -67,7 +74,10 @@ pub fn select_backend(
         tmux_bin: tmux_bin.to_path_buf(),
         tmux_socket: None,
     };
-    Ok(term_backend::detect_kind(&config).unwrap_or(BackendKind::Herdr))
+    Ok((
+        term_backend::detect_kind(&config).unwrap_or(BackendKind::Herdr),
+        false,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +253,12 @@ impl PaneTerminal for HerdrClient {
             Some(0) => ("visible", None),
             other => ("recent", other),
         };
-        if read.ansi && source == "visible" {
+        if read.ansi && source != "visible" {
+            return Err(TermError::unsupported(
+                "styled (ansi) reads are visible-screen only through this Herdr client view",
+            ));
+        }
+        if read.ansi {
             return client_err(self.read_screen_with_cancellation(pane.as_str(), &|| false));
         }
         client_err(HerdrClient::read(self, pane.as_str(), source, lines))
@@ -344,6 +359,39 @@ impl PromptTerminal for BackendPromptTerminal<'_> {
     }
 }
 
+/// Poll a tmux pane's screen-inferred status until it matches, the
+/// deadline passes, or the caller cancels. tmux has no native status.
+fn wait_inferred_status(
+    backend: &TmuxBackend,
+    pane_id: &str,
+    status: &str,
+    timeout_ms: u64,
+    cancelled: &dyn Fn() -> bool,
+    sleep: &dyn Fn(Duration),
+) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+    loop {
+        if cancelled() {
+            return Err(AdapterError::cancelled(
+                "terminal control operation was cancelled",
+            ));
+        }
+        let info = AgentApi::pane_info(backend, pane_id)?;
+        if info.status == status {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(AdapterError::unavailable(format!(
+                "wait for pane {pane_id} status {status}: timed out; last inferred status={}",
+                info.status
+            )));
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
 impl AgentApi for TmuxBackend {
     fn panes(&self) -> Result<Vec<Pane>> {
         Ok(term_err(Multiplexer::list_panes(self, None))?
@@ -407,21 +455,26 @@ impl AgentApi for TmuxBackend {
     }
 
     fn wait_agent_status(&self, pane_id: &str, status: &str, timeout_ms: u64) -> Result<()> {
-        // No native status exists to wait on; poll the screen-inferred one.
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
-            let info = AgentApi::pane_info(self, pane_id)?;
-            if info.status == status {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(AdapterError::unavailable(format!(
-                    "wait for pane {pane_id} status {status}: timed out; last inferred status={}",
-                    info.status
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        wait_inferred_status(self, pane_id, status, timeout_ms, &|| false, &|pause| {
+            std::thread::sleep(pause)
+        })
+    }
+
+    fn wait_agent_status_with_runtime(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout_ms: u64,
+        runtime: &dyn AgentRuntime,
+    ) -> Result<()> {
+        wait_inferred_status(
+            self,
+            pane_id,
+            status,
+            timeout_ms,
+            &|| runtime.cancelled(),
+            &|pause| runtime.sleep(pause),
+        )
     }
 
     fn read(&self, pane_id: &str, source: &str, lines: Option<usize>) -> Result<String> {
@@ -500,7 +553,7 @@ mod tests {
 
     #[test]
     fn explicit_backend_beats_environment_and_detection() {
-        let kind = select_backend(
+        let (kind, explicit) = select_backend(
             Some("tmux"),
             &|_| Some("herdr".to_owned()),
             Path::new("/nonexistent/.agentctl"),
@@ -509,11 +562,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kind, BackendKind::Tmux);
+        assert!(explicit);
     }
 
     #[test]
     fn environment_backend_beats_detection_and_is_validated() {
-        let kind = select_backend(
+        let (kind, explicit) = select_backend(
             None,
             &|name| (name == BACKEND_ENV).then(|| "tmux".to_owned()),
             Path::new("/nonexistent/.agentctl"),
@@ -522,6 +576,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kind, BackendKind::Tmux);
+        assert!(explicit);
         assert!(select_backend(
             Some("screen"),
             &|_| None,

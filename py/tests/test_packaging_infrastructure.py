@@ -198,12 +198,14 @@ def test_rust_package_selectors_resolve_dependency_archive_closure() -> None:
     assert [crate.name for crate in selected] == ["agentctl"]
     assert [crate.name for crate in work] == [
         "agent-queue",
+        "term-backend",
         "chat-subscription",
         "chat-subscription-plugin",
         "agentctl",
     ]
     assert reasons == {
         "agent-queue": ("agentctl",),
+        "term-backend": ("agentctl",),
         "chat-subscription": ("agentctl",),
         "chat-subscription-plugin": ("agentctl",),
     }
@@ -278,6 +280,7 @@ def test_rust_package_main_globally_checks_topology_but_only_smokes_selection(
         ("rustdoc", "agentctl"),
         ("missing-docs", "agentctl"),
         ("verify", "agent-queue"),
+        ("verify", "term-backend"),
         ("verify", "chat-subscription"),
         ("verify", "chat-subscription-plugin"),
         ("verify", "agentctl"),
@@ -399,7 +402,7 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 53
+    assert len(docs.PACKAGE_LINKS) == 55
     assert {
         "rs/chat-subscription/README.md",
         "rs/chat-subscription/LICENSE",

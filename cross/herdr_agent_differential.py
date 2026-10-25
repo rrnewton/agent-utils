@@ -789,6 +789,9 @@ def without_ambient_executables(environment: dict[str, str]) -> dict[str, str]:
     """Drop every caller-supplied host executable override from an edition's environment."""
     for variable in AMBIENT_EXECUTABLE_OVERRIDES:
         environment.pop(variable, None)
+    # The Rust edition's terminal-backend selector: left ambient, it could
+    # redirect a case to a real tmux server the harness never stubbed.
+    environment.pop("AGENTCTL_TERM_BACKEND", None)
     return environment
 
 
@@ -854,7 +857,8 @@ HERDR_FREE_COMMANDS = frozenset((
 # which add the agentcloud ones. A test reads both parsers so that a new one cannot hide the
 # command from herdr_refusal. Their other options before the command are in HERDR_FREE_COMMANDS.
 _GLOBAL_VALUE_OPTIONS = (
-    "--registry", "--state", "--herdr-bin", "--agentcloudctl-bin", "--agentterm-bin",
+    "--registry", "--state", "--herdr-bin", "--term-backend", "--tmux-bin", "--tmux-socket",
+    "--agentcloudctl-bin", "--agentterm-bin",
     "--agentcloud-url", "--from-session",
 )
 # Options whose value an edition executes, with the program each one names. The Rust edition
@@ -862,7 +866,8 @@ _GLOBAL_VALUE_OPTIONS = (
 # and `chat run` take and run as `claude agents --json`: the Python edition rejects them as
 # unknown, but the Rust edition may already have run the program by then.
 EXECUTABLE_OPTIONS = {
-    "--herdr-bin": "herdr", "--agentcloudctl-bin": "agentcloudctl", "--agentterm-bin": "agentterm",
+    "--herdr-bin": "herdr", "--tmux-bin": "tmux",
+    "--agentcloudctl-bin": "agentcloudctl", "--agentterm-bin": "agentterm",
     "--claude-bin": "claude",
 }
 # The native goal transport: a JSON array that an edition runs as an argv, its first element

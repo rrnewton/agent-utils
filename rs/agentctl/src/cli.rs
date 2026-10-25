@@ -18,6 +18,16 @@ use crate::subagents::{
 
 const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
 
+/// Validate a `--term-backend` value at parse time.
+fn parse_term_backend(raw: &str) -> std::result::Result<String, String> {
+    match raw {
+        "herdr" | "tmux" => Ok(raw.to_owned()),
+        other => Err(format!(
+            "unknown terminal backend {other:?}; expected herdr or tmux"
+        )),
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "agentctl",
@@ -45,7 +55,7 @@ struct Cli {
     /// The tmux backend drives the durable direct-pane transport
     /// (herdr-agent send/drain/status/read against an explicit pane); agent
     /// lifecycle commands still require Herdr in this step
-    #[arg(long, global = true, value_parser = ["herdr", "tmux"], value_name = "BACKEND")]
+    #[arg(long, global = true, value_parser = parse_term_backend, value_name = "BACKEND")]
     term_backend: Option<String>,
     /// tmux executable name on PATH or an explicit path (tmux backend only)
     #[arg(long, global = true, default_value = "tmux", value_name = "PATH")]
@@ -1560,9 +1570,26 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
     // Directory and manifest I/O is lazy. Session-control commands never inspect the user plugin
     // home; capability inspection and an actual plugin runtime startup own discovery.
     let plugin_inventory = plugin_discovery_required(&command).then(crate::plugins::discover);
+    if args.term_backend.as_deref() == Some("tmux")
+        && matches!(
+            command,
+            Commands::Chat(_)
+                | Commands::Inbox(_)
+                | Commands::Restore(_)
+                | Commands::Watch(_)
+                | Commands::WatchAgents(_)
+                | Commands::InstallUnits(_)
+        )
+    {
+        return Err(Failure::Usage(
+            "this command is a Herdr service and does not run on the tmux terminal backend; \
+             select Herdr with --term-backend herdr"
+                .to_owned(),
+        ));
+    }
     match command {
         Commands::Capabilities => {
-            let selected = crate::term::select_backend(
+            let (selected, _explicit) = crate::term::select_backend(
                 args.term_backend.as_deref(),
                 environment,
                 &args.registry,
@@ -1765,13 +1792,16 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Skill(value) => {
             if args.registry != Path::new(".agentctl")
                 || args.herdr_bin != Path::new("herdr")
+                || args.term_backend.is_some()
+                || args.tmux_bin != Path::new("tmux")
+                || args.tmux_socket.is_some()
                 || args.agentcloudctl_bin != Path::new("agentcloudctl")
                 || args.agentterm_bin != Path::new("agentterm")
                 || args.from_session.is_some()
                 || args.agentcloud_url.is_some()
             {
                 return Err(Failure::Usage(
-                    "--registry, --herdr-bin, --agentcloudctl-bin, --agentterm-bin, --agentcloud-url, and --from-session do not apply to skill install".to_owned(),
+                    "--registry, --herdr-bin, --term-backend, --tmux-bin, --tmux-socket, --agentcloudctl-bin, --agentterm-bin, --agentcloud-url, and --from-session do not apply to skill install".to_owned(),
                 ));
             }
             let SkillCommand::Install(install) = value.command;
@@ -1785,20 +1815,23 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::CodexGoal(value) => {
             if args.registry != Path::new(".agentctl")
                 || args.herdr_bin != Path::new("herdr")
+                || args.term_backend.is_some()
+                || args.tmux_bin != Path::new("tmux")
+                || args.tmux_socket.is_some()
                 || args.agentcloudctl_bin != Path::new("agentcloudctl")
                 || args.agentterm_bin != Path::new("agentterm")
                 || args.from_session.is_some()
                 || args.agentcloud_url.is_some()
             {
                 return Err(Failure::Usage(
-                    "--registry, --herdr-bin, --agentcloudctl-bin, --agentterm-bin, --agentcloud-url, and --from-session do not apply to codex-goal".to_owned(),
+                    "--registry, --herdr-bin, --term-backend, --tmux-bin, --tmux-socket, --agentcloudctl-bin, --agentterm-bin, --agentcloud-url, and --from-session do not apply to codex-goal".to_owned(),
                 ));
             }
             return crate::codex_goal::command::run(&value).map_err(Failure::Output);
         }
         _ => {}
     }
-    let selected_backend = crate::term::select_backend(
+    let (selected_backend, backend_explicit) = crate::term::select_backend(
         args.term_backend.as_deref(),
         environment,
         &args.registry,
@@ -1806,7 +1839,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         &args.tmux_bin,
     )
     .map_err(AgentError::from)?;
-    if selected_backend == term_backend::BackendKind::Tmux {
+    // Only an operator-selected tmux backend refuses here. When detection
+    // merely found no Herdr, fall through so the Herdr client reports its
+    // usual not-found error, exactly as before backends were selectable.
+    if backend_explicit && selected_backend == term_backend::BackendKind::Tmux {
         return Err(Failure::Usage(
             "the tmux terminal backend currently drives only the durable direct-pane transport \
              (herdr-agent send/drain/status/read --pane PANE); agent lifecycle commands require \

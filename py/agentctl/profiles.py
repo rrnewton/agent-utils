@@ -474,6 +474,19 @@ def _workspace(value: object) -> str | None:
     return value
 
 
+def _term_backend(value: object) -> str | None:
+    # Shared with the Rust edition, which selects its terminal backend from
+    # this key. This edition's interactive adapter is Herdr-only, so the key
+    # is validated for the shared file and otherwise ignored here.
+    if value is None:
+        return None
+    if value not in ("herdr", "tmux"):
+        raise AgentDeliveryError(
+            f'profile config term_backend must be "herdr" or "tmux", got {value!r}'
+        )
+    return cast(str, value)
+
+
 def _wrkslots(value: object) -> str | None:
     if value is None:
         return None
@@ -522,14 +535,15 @@ def load_configuration(
         raise AgentDeliveryError(f"cannot read profile config {path}: {exc}") from exc
     if (not isinstance(raw, dict)
             or not {"schema", "profiles"}.issubset(raw)
-            or set(raw) - {"schema", "profiles", "workspace", "wrkslots"}):
+            or set(raw) - {"schema", "profiles", "workspace", "wrkslots", "term_backend"}):
         raise AgentDeliveryError(
-            "profile config must contain schema and profiles, with optional workspace and wrkslots"
+            "profile config must contain schema and profiles, with optional workspace, wrkslots and term_backend"
         )
     if raw.get("schema") != SCHEMA or not isinstance(raw.get("profiles"), dict):
         raise AgentDeliveryError(f"profile config must use schema {SCHEMA!r} and an object of profiles")
     profiles = {name: _profile(name, value) for name, value in cast(dict[str, object], raw["profiles"]).items()}
     _wrkslots(raw.get("wrkslots"))
+    _term_backend(raw.get("term_backend"))
     return path, dict(sorted(profiles.items())), _workspace(raw.get("workspace"))
 
 
