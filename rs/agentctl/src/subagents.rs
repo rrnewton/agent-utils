@@ -6376,7 +6376,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 && findings
                     .iter()
                     .all(|finding| matches!(*finding, "label-mismatch" | "herdr-name-mismatch"))
-                && record.adapter == "herdr"
+                && record.is_owned_native()
                 && journals.is_empty()
             {
                 row["repaired"] = json!(self.repair_presentation(&record.name)?);
