@@ -1,12 +1,13 @@
 ---
 title: 'thread-bridge-gutter: on a phone the bridge hugs the left edge and a tap on it goes back to the thread''s card'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-25T11:45:32.694247698+00:00
-updated_at: 2026-10-25T11:45:32.694247698+00:00
+updated_at: 2026-10-25T15:23:33.702878646+00:00
+closed_at: 2026-10-25T15:23:33.702878526+00:00
 ---
 
 # Description
