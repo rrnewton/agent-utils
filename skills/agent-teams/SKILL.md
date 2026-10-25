@@ -45,6 +45,25 @@ The installed command is the authority for its own usage:
   durable belongs in the project's issues and docs, with the message pointing
   at it.
 
+## Finding the other coordinator
+
+Run `agent-teams coordinators` before guessing: it lists every designated
+coordinator on this host from the host index (team, live or stale,
+harness directory, repository origin), plus the teams file's remote
+entries and their routes. `agent-teams send TEAM` resolves a team that
+is missing from teams.json through a live index entry on this host, so
+messaging a neighbouring harness's coordinator is just:
+
+```bash
+agent-teams send their-team --text "..."
+```
+
+New team on this host: `agent-teams join TEAM --registry <registry>`
+writes the declaration and the teams.json entry in one step. Senders
+with no explicit `accepts_from` rule who are designated coordinators on
+the same host are accepted by default (same user, same host trust);
+an explicit rule always wins.
+
 ## Send, reply, track
 
 ```bash

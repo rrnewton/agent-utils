@@ -67,6 +67,43 @@ directory sits under a config tree.
   reads another host's panes.
 - `import --coordinators-file FILE --team NAME` — converts a per-host
   coordinators file into proposed `teams.json` and routes. Prints only.
+- `coordinators [--json]` — who coordinates what on this host, from the
+  per-host coordinator index `agentctl` maintains (below), plus the teams
+  file's entries on other hosts with their routes. This is the answer to
+  "which team-lead coordinators are active here, in what directories,
+  and how do I message one": each row names the team, the coordinator,
+  live or stale, the harness working directory, and the repository
+  origin when one was found.
+- `join TEAM --registry R [--accepts-from SENDER]...` — one-step team
+  setup on this host: writes the declaration like `init`, then adds this
+  host's entry to teams.json when it is not there yet.
+
+### The host coordinator index
+
+Designating a coordinator (`agentctl coordinator set`, or an
+adopt/attach with `--as-coordinator`) registers it in a per-host index:
+one file per registry under `$XDG_STATE_HOME/agentctl/coordinators`
+(else `~/.local/state/agentctl/coordinators`; `$AGENTCTL_COORDINATOR_INDEX_DIR`
+overrides). An entry holds the registry path, coordinator name and
+token, harness working directory, harness identity, git origin URLs of
+the harness's checkout(s) found by reading `.git` configs, and the
+agent-teams team whose declaration names that registry when one does.
+No secrets; written atomically; `coordinator clear` removes the entry.
+It lives in host state, never in synced config. The registry's own
+`coordinator.json` remains the authority - the index is a discovery
+cache, so readers treat dead harnesses and changed boots as stale rows,
+and `send TEAM` can fall back to it: a team missing from teams.json
+resolves through a live index entry on this host, addressed at its
+designated coordinator over the local route.
+
+**Same-host trust.** A sender with no explicit `accepts_from` rule is
+accepted by default when it is another team's designated coordinator
+on this same host, ancestry-proved, sending from its own host. Same
+user, same host: such a coordinator could already act in this harness
+directly, and the ledger claim, size, TTL and rate limits all still
+apply. An explicit rule for that sender always wins - including one
+that lists other kinds only - and cross-host senders always need an
+explicit rule.
 
 ### Messaging
 

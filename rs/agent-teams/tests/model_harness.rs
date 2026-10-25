@@ -1161,3 +1161,139 @@ fn pruning_keeps_everything_but_old_terminal_entries() {
     }
     let _ = std::fs::remove_dir_all(&state);
 }
+
+/// Same-host default acceptance: with no explicit rule, a sender whose
+/// team names a live designated coordinator in this host's index (and
+/// whose envelope is ancestry-proved from this host) is accepted; an
+/// explicit rule for that sender listing other kinds still refuses.
+#[test]
+fn same_host_designated_coordinators_are_accepted_by_default() {
+    let state = temp_state("same-host-default");
+    let index = state.join("index");
+    std::fs::create_dir_all(&index).expect("index");
+    let identity = agent_queue::identity::observe(u64::from(std::process::id()))
+        .expect("observe self")
+        .identity;
+    let entry = json!({
+        "schema": "agentctl-coordinator-index/v1",
+        "registry": "/elsewhere/.agentctl",
+        "name": "coordinator",
+        "token": "alpha-generation",
+        "harness_cwd": "/elsewhere",
+        "harness_identity": serde_json::to_value(&identity).expect("identity"),
+        "repo_origins": [],
+        "team": "alpha",
+        "updated_at": 0,
+    });
+    std::fs::write(
+        index.join("alpha.json"),
+        serde_json::to_string_pretty(&entry).unwrap(),
+    )
+    .expect("index entry");
+    // This test binary consults the index only on this path.
+    unsafe {
+        std::env::set_var("AGENTCTL_COORDINATOR_INDEX_DIR", &index);
+    }
+
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let attempt = |accepts_from: &Value| {
+        let declaration = agent_teams::model::parse_declaration(json!({
+            "schema": "agent-teams-declaration/v1",
+            "team": "tools",
+            "deliverer": {"kind": "hook-inbox"},
+            "coordinator": {"designation": "pinned", "harness_identity": {"boot_id": "x", "pid": 1, "starttime_ticks": 1}},
+            "accepts_from": accepts_from,
+            "limits": {"max_bytes": 8192, "max_ttl_seconds": 604800},
+            "default_ttl_seconds": 7200,
+        }))
+        .expect("declaration");
+        let ctx = AcceptContext {
+            state: &state,
+            this_host: "host-a",
+            declaration: &declaration,
+            via: "test",
+            proof_note: "proved",
+            relayed_by: None,
+            peer_host: "host-a",
+        };
+        let fake = FakeDeliverer::default();
+        let id = format!(
+            "tm-alpha-{:016x}",
+            now_ms as u64 + accepts_from.to_string().len() as u64
+        );
+        let envelope = build_envelope(
+            &id,
+            "k",
+            "alpha",
+            "host-a",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            now_ms,
+            now_ms + 7_200_000,
+            None,
+            "body",
+        );
+        accept(&ctx, &envelope, &fake).expect("accept")
+    };
+    // No rule for alpha at all: same-host default accepts.
+    let answer = attempt(&json!([]));
+    assert_eq!(answer.state.as_deref(), Some("accepted"), "{answer:?}");
+    // A rule for another sender does not count as explicit for alpha.
+    let answer = attempt(&json!([{"sender": "other", "kinds": ["info"]}]));
+    assert_eq!(answer.state.as_deref(), Some("accepted"), "{answer:?}");
+    // An explicit rule for alpha wins: it lists only `hold`, so info refuses.
+    let state2 = temp_state("same-host-explicit");
+    let answer = {
+        let declaration = agent_teams::model::parse_declaration(json!({
+            "schema": "agent-teams-declaration/v1",
+            "team": "tools",
+            "deliverer": {"kind": "hook-inbox"},
+            "coordinator": {"designation": "pinned", "harness_identity": {"boot_id": "x", "pid": 1, "starttime_ticks": 1}},
+            "accepts_from": [{"sender": "alpha", "kinds": ["hold"]}],
+            "limits": {"max_bytes": 8192, "max_ttl_seconds": 604800},
+            "default_ttl_seconds": 7200,
+        }))
+        .expect("declaration");
+        let ctx = AcceptContext {
+            state: &state2,
+            this_host: "host-a",
+            declaration: &declaration,
+            via: "test",
+            proof_note: "proved",
+            relayed_by: None,
+            peer_host: "host-a",
+        };
+        let fake = FakeDeliverer::default();
+        let envelope = build_envelope(
+            "tm-alpha-fedcba9876543210",
+            "k",
+            "alpha",
+            "host-a",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            now_ms,
+            now_ms + 7_200_000,
+            None,
+            "body",
+        );
+        accept(&ctx, &envelope, &fake).expect("accept")
+    };
+    assert_eq!(answer.state.as_deref(), Some("refused"), "{answer:?}");
+    unsafe {
+        std::env::remove_var("AGENTCTL_COORDINATOR_INDEX_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&state);
+    let _ = std::fs::remove_dir_all(&state2);
+}

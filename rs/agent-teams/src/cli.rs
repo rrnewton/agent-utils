@@ -46,6 +46,9 @@ READ-ONLY MODEL
   probe [--json]                       What this host's own tools say (for peers).
   import --coordinators-file FILE --team NAME [--json]
                                        Convert a per-host coordinators file; prints only.
+  coordinators [--json]                Designated coordinators on this host, plus remote entries.
+  join TEAM --registry R [--accepts-from S]...
+                                       One-step team setup: declaration plus teams.json entry.
 
 MESSAGING
   init TEAM (--registry R | --coordinator-self [--coordinator-pid PID])
@@ -200,6 +203,8 @@ fn run_inner(args: &[String]) -> Result<i32, DataError> {
         "userguide" => Ok(print_text(USERGUIDE)),
         "help" => Ok(print_text(HELP)),
         "show" => cmd_show(&globals, cmd_args),
+        "coordinators" => cmd_coordinators(&globals, cmd_args),
+        "join" => cmd_join(&globals, cmd_args),
         "check" => cmd_check(&globals, cmd_args),
         "probe" => cmd_probe(&globals),
         "import" => cmd_import(&globals, cmd_args),
@@ -552,6 +557,161 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         );
     }
     Ok(if problems.is_empty() { 0 } else { 1 })
+}
+
+/// `coordinators`: who coordinates what on this host (the per-host index
+/// `agentctl` maintains at `coordinator set`/`clear`), plus the teams
+/// file's entries on other hosts. Answers the owner's "which team-lead
+/// coordinators are active here, in what directories, and how do I
+/// message one" without scanning harnesses.
+fn cmd_coordinators(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    // A missing/unreadable teams file lists nothing remotely; the local
+    // index below is the primary source anyway.
+    let teams = globals
+        .load_teams()
+        .unwrap_or_else(|_| crate::model::TeamsFile {
+            raw: Value::Null,
+            hosts: Default::default(),
+            teams: Default::default(),
+            hubs: Vec::new(),
+            warnings: Vec::new(),
+        });
+    let local: Vec<Value> = crate::hostindex::load()
+        .iter()
+        .map(|entry| {
+            json!({
+                "team": entry.team,
+                "coordinator": entry.name,
+                "registry": entry.registry.to_string_lossy(),
+                "harness_cwd": entry.harness_cwd.to_string_lossy(),
+                "repo_origins": entry.repo_origins,
+                "where": globals.host,
+                "live": crate::hostindex::live(entry),
+            })
+        })
+        .collect();
+    let mut remote: Vec<Value> = Vec::new();
+    for (name, team) in &teams.teams {
+        for entry in &team.entries {
+            if entry.host != globals.host {
+                remote.push(json!({
+                    "team": name,
+                    "coordinator": entry.coordinator,
+                    "where": entry.host,
+                    "routes": teams.hosts.get(&entry.host).map(|host| host.routes.clone()).unwrap_or_default(),
+                }));
+            }
+        }
+    }
+    if globals.json || has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "host": globals.host, "local": local, "remote": remote,
+            }))?
+        );
+        return Ok(0);
+    }
+    if local.is_empty() && remote.is_empty() {
+        println!(
+            "no coordinators known on {} (no host index entries, no remote teams)",
+            globals.host
+        );
+        return Ok(0);
+    }
+    for row in &local {
+        let state = if row["live"].as_bool() == Some(true) {
+            "live"
+        } else {
+            "stale"
+        };
+        let team = row["team"].as_str().unwrap_or("(no team declared)");
+        let repo = row["repo_origins"]
+            .as_array()
+            .filter(|list| !list.is_empty())
+            .map(|list| format!(" repo {}", list[0].as_str().unwrap_or_default()))
+            .unwrap_or_default();
+        println!(
+            "{team} @{}: coordinator {} ({state}) in {}{repo} - message: agent-teams send {team}",
+            globals.host,
+            row["coordinator"].as_str().unwrap_or("?"),
+            row["harness_cwd"].as_str().unwrap_or("?"),
+        );
+    }
+    for row in &remote {
+        println!(
+            "{} @{}: coordinator {} via routes [{}] - message: agent-teams send {}@{}",
+            row["team"].as_str().unwrap_or("?"),
+            row["where"].as_str().unwrap_or("?"),
+            row["coordinator"].as_str().unwrap_or("(per declaration)"),
+            row["routes"]
+                .as_array()
+                .map(|list| list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default(),
+            row["team"].as_str().unwrap_or("?"),
+            row["where"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(0)
+}
+
+/// `join TEAM --registry R ...`: one-step team setup on this host - the
+/// declaration `init` writes, plus this host's entry in teams.json when
+/// it is not there yet.
+fn cmd_join(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let team = positional(args)
+        .into_iter()
+        .next()
+        .ok_or_else(|| err("usage", "join needs a TEAM name"))?;
+    let rc = cmd_init(globals, args)?;
+    if rc != 0 {
+        return Ok(rc);
+    }
+    // Add the entry to the teams file unless one for this host exists.
+    let mut raw = globals
+        .load_teams()
+        .map(|teams| teams.raw)
+        .unwrap_or_else(|_| json!({"schema": "agent-teams-teams/v1", "hosts": {}, "teams": {}}));
+    let coordinator = crate::hostindex::live_coordinator_for_team(&team).map(|entry| entry.name);
+    let teams_map = raw
+        .get_mut("teams")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| err("config", "teams.json has no teams object"))?;
+    let team_obj = teams_map.entry(team.clone()).or_insert_with(|| json!({}));
+    let entries = team_obj
+        .as_object_mut()
+        .ok_or_else(|| err("config", format!("team {team} is not an object")))?
+        .entry("entries")
+        .or_insert_with(|| json!([]));
+    let list = entries
+        .as_array_mut()
+        .ok_or_else(|| err("config", format!("team {team} entries is not a list")))?;
+    if list
+        .iter()
+        .any(|entry| entry.get("host").and_then(Value::as_str) == Some(globals.host.as_str()))
+    {
+        println!("join: team {team} already has an entry on {}", globals.host);
+        return Ok(0);
+    }
+    let mut entry = json!({"host": globals.host, "contacts": [{"kind": "host"}]});
+    if let Some(name) = coordinator {
+        entry["coordinator"] = json!(name);
+    }
+    // Entry ordering contract: local entry first (hosts skip their own
+    // local route for the other entries; see model.rs).
+    list.insert(0, entry);
+    let path = globals.teams_file();
+    crate::jsonfile::write_json_atomic(&path, &raw)?;
+    println!(
+        "join: added {team}@{} to {} (declaration written by init)",
+        globals.host,
+        path.display()
+    );
+    Ok(0)
 }
 
 fn cmd_probe(globals: &Globals) -> Result<i32, DataError> {
@@ -924,9 +1084,31 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .strip_prefix("service:")
         .map(|name| format!("svc.{name}"))
         .unwrap_or_else(|| sender.clone());
-    let entry = teams
-        .pick_entry(&to_team, to_host_arg.as_deref(), &globals.host)?
-        .clone();
+    let entry = match teams.pick_entry(&to_team, to_host_arg.as_deref(), &globals.host) {
+        Ok(entry) => entry.clone(),
+        Err(error) => {
+            // Not in the teams file: the host coordinator index may know
+            // the team on this host (another harness's coordinator). Same
+            // user, same host: address it at its designated coordinator
+            // through the local route.
+            let local = if to_host_arg
+                .as_deref()
+                .is_none_or(|host| host == globals.host)
+            {
+                crate::hostindex::live_coordinator_for_team(&to_team)
+            } else {
+                None
+            };
+            match local {
+                Some(found) => crate::model::Entry {
+                    host: globals.host.clone(),
+                    coordinator: Some(found.name.clone()),
+                    contacts: vec![crate::model::Contact::Host],
+                },
+                None => return Err(error),
+            }
+        }
+    };
     let to_host = entry.host.clone();
     let addressed_to = if to_host_arg.is_some() || entry.host != globals.host {
         format!("{to_team}@{to_host}")

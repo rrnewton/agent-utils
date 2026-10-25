@@ -296,11 +296,30 @@ pub fn accept(
         })
     };
     if !ctx.declaration.accepts(&sender, kind) {
-        return refuse(
-            "refused",
-            format!("sender {sender} may not send kind {kind} to team {team}"),
-            lock,
-        );
+        // Same-host default: a sender with no explicit rule is accepted
+        // when it is another team's designated coordinator on THIS host,
+        // proved by harness ancestry, at its own registered address.
+        // Trust model: same user, same host - such a coordinator could
+        // already type into this pane by hand; the ledger still claims
+        // the ID and every other policy (size, ttl, rate) still applies.
+        // An explicit rule for the sender always wins, including one
+        // that lists other kinds only.
+        let explicit = ctx
+            .declaration
+            .accepts_from
+            .iter()
+            .any(|rule| rule.sender == sender);
+        let same_host_coordinator = !explicit
+            && envelope["from"]["proof"].as_str() == Some("harness-ancestry")
+            && envelope["from"]["host"].as_str() == Some(ctx.this_host)
+            && crate::hostindex::live_coordinator_for_team(&sender).is_some();
+        if !same_host_coordinator {
+            return refuse(
+                "refused",
+                format!("sender {sender} may not send kind {kind} to team {team}"),
+                lock,
+            );
+        }
     }
     if body.len() > ctx.declaration.max_bytes {
         return refuse(
