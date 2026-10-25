@@ -1,6 +1,6 @@
 ---
 title: 'search-whose-toggle-hint: say whose messages the search toggle shows, on hover and on press'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -8,7 +8,8 @@ labels:
 - ui
 - search
 created_at: 2026-10-25T21:58:49.931042104+00:00
-updated_at: 2026-10-25T21:58:49.931042104+00:00
+updated_at: 2026-10-25T22:55:12.740972974+00:00
+closed_at: 2026-10-25T22:55:12.740972864+00:00
 ---
 
 # Description
