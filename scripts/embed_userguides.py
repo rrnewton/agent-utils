@@ -174,6 +174,12 @@ class PackageLink:
 
 STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
     StandaloneDocument(
+        tool="term-backend",
+        document="README",
+        language="rust",
+        source="common/docs/term-backend/README.md",
+    ),
+    StandaloneDocument(
         tool="chat-subscription",
         document="README",
         language="rust",
@@ -297,6 +303,11 @@ def _package_links() -> tuple[PackageLink, ...]:
         )
     links.extend(
         (
+            PackageLink(
+                "rs/term-backend/README.md",
+                "common/docs/term-backend/README.md",
+            ),
+            PackageLink("rs/term-backend/LICENSE", "LICENSE"),
             PackageLink(
                 "rs/chat-subscription/README.md",
                 "common/docs/chat-subscription/README.md",

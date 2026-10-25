@@ -41,7 +41,7 @@ struct Cli {
     herdr_bin: PathBuf,
     /// Terminal multiplexer backend: herdr (default) or tmux. Default:
     /// $AGENTCTL_TERM_BACKEND when set and nonempty, else the profiles.json
-    /// term_backend key, else herdr when its executable is available, else tmux.
+    /// `term_backend` key, else herdr when its executable is available, else tmux.
     /// The tmux backend drives the durable direct-pane transport
     /// (herdr-agent send/drain/status/read against an explicit pane); agent
     /// lifecycle commands still require Herdr in this step

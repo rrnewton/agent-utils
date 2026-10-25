@@ -334,6 +334,11 @@ def _doc_violations(crate: Crate, text: str, *, document_name: str | None = None
             "chat-subscription.google-chat.polling",
             "agentctl-chat-subscription",
             "https://docs.rs/chat-subscription-plugin/0.1.0/chat_subscription_plugin/",
+            # The terminal-backend selection spellings (flag, environment
+            # variable, profile key) are operator-facing machine values.
+            "AGENTCTL_TERM_BACKEND",
+            "--term-backend",
+            "`term_backend`",
         )
     elif crate.name == "chat-subscription-plugin":
         machine_values = ("agentctl-chat-subscription",)
