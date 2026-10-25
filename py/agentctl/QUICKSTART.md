@@ -14,7 +14,8 @@ while keeping their terminals available for direct inspection.
    Muse skills are installed through Muse's native user-scope skill manager;
    Codex and Claude receive the same bundled file in their skill roots.
 
-   No Herdr? The Rust edition can run the same lifecycle under tmux
+   No Herdr? Where `agentctl capabilities` lists the tmux terminal
+   backend for interactive sessions, the same lifecycle runs under tmux
    instead: select it once per registry with `"term_backend": "tmux"` in
    `.agentctl/profiles.json`, or per command, and everything below works
    the same way (sessions are workspaces, windows are tabs):

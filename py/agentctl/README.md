@@ -12,9 +12,10 @@ agentctl attach reviewer
 ```
 
 Interactive sessions keep the native Codex, Claude, or Muse terminal running in
-[Herdr](https://github.com/herdrdev/herdr), installed separately — or, in the
-Rust edition with `--term-backend tmux`, entirely under tmux with no Herdr
-at all (see "Running under tmux" in `agentctl userguide`). Authenticate
+[Herdr](https://github.com/herdrdev/herdr), installed separately. Some
+installations can instead run the same lifecycle entirely under tmux, with
+no Herdr at all, when the tmux terminal backend is selected (see "Running
+under tmux" in `agentctl userguide`). Authenticate
 and install the chosen harness separately too. The command stores session
 identity and durable delivery state locally; it needs no hosted account or
 always-running manager process.
