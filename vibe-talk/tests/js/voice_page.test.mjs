@@ -24668,7 +24668,9 @@ test("the text size takes no key of its own: Ctrl or Cmd with = or - is the brow
   // key: the − and + are a Tab away on Settings (`,`), and the slider between them steps on arrows.
   const page = await keyboardPage();
   const before = scaleOf(page);
-  for (const key of ["=", "-", "+", "0"]) {
+  // Ctrl+0 is the voice view since `#525 cmd-0-voice-view`; the zoom chords that remain the
+  // browser's are = and - (and + where a layout types it).
+  for (const key of ["=", "-", "+"]) {
     for (const mod of ["ctrlKey", "metaKey"]) {
       const event = await press(page, page.el("scroll-area"), key, { [mod]: true });
       assert.equal(event.defaulted, true, `${mod} with ${JSON.stringify(key)} was taken from the browser's zoom`);

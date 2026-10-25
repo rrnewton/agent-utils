@@ -13186,10 +13186,11 @@ function chordMatches(chord, event) {
     return Boolean(chord.shift) === Boolean(event.shiftKey) && isLetterKey(event, chord.key);
   }
   const key = typedKey(event);
-  // A shifted digit is never the digit chord: on the Digit0 key it is the ")" of the collapsed-lines
+  // A shifted 0 is never the Ctrl+0 chord: on the Digit0 key it is the ")" of the collapsed-lines
   // chord, which `parenByPlace` reads for that chord below — a browser reporting the digit itself
-  // while Shift is held must not hand it to Ctrl+0 (`#525 cmd-0-voice-view`).
-  if (chord.key.length === 1 && chord.key !== " ") return (key === chord.key && !(/^[0-9]$/.test(chord.key) && event.shiftKey)) || digitByPlace(chord, event) || parenByPlace(chord, event);
+  // while Shift is held must not hand it to Ctrl+0 (`#525 cmd-0-voice-view`). (Shifted digits 1 to 4
+  // keep matching: on AZERTY Shift is what types the digit, and the view chords read it as such.)
+  if (chord.key.length === 1 && chord.key !== " ") return (key === chord.key && !(chord.key === "0" && event.shiftKey)) || digitByPlace(chord, event) || parenByPlace(chord, event);
   return key === chord.key && Boolean(chord.shift) === Boolean(event.shiftKey);
 }
 
