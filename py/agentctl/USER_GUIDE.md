@@ -76,8 +76,8 @@ reporting Herdr's own not-found error, as before.
 #### Running under tmux
 
 Select tmux once per registry, then use the ordinary lifecycle commands.
-Either pass `--term-backend tmux` on each command, or put
-`"term_backend": "tmux"` in the registry's `.agentctl/profiles.json`:
+Either pass `--term-backend tmux` on each command, or set the
+`term_backend` key to `tmux` in the registry's `.agentctl/profiles.json`:
 
 ```sh
 agentctl --term-backend tmux start reviewer --harness claude --cwd . \

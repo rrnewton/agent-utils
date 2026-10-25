@@ -16,9 +16,10 @@ while keeping their terminals available for direct inspection.
 
    No Herdr? Where `agentctl capabilities` lists the tmux terminal
    backend for interactive sessions, the same lifecycle runs under tmux
-   instead: select it once per registry with `"term_backend": "tmux"` in
-   `.agentctl/profiles.json`, or per command, and everything below works
-   the same way (sessions are workspaces, windows are tabs):
+   instead: select it once per registry by setting the `term_backend`
+   key to `tmux` in `.agentctl/profiles.json`, or per command, and
+   everything below works the same way (sessions are workspaces, windows
+   are tabs):
 
    ```sh
    agentctl --term-backend tmux start reviewer --harness claude --cwd . \
