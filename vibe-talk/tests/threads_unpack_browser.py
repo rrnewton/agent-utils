@@ -142,6 +142,7 @@ STATE_JS = """(threadId) => {
         const run = li.querySelector('.read-run');
         return {ids: (li.getAttribute('data-ids') || '').split(' ').filter(Boolean),
                 rootChild: li.hasAttribute('data-root-child'),
+                continuation: li.hasAttribute('data-root-continuation'),
                 coalesce: li.getAttribute('data-coalesce'),
                 hidden: li.hidden, box: box(li),
                 bridge: bridge ? {...box(bridge), color: getComputedStyle(bridge).color,
@@ -264,9 +265,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     desk.check(max(spines) - min(spines) <= 2, f"the bridge spine wanders: {spines}")
     desk.check(all(row["bridge"]["left"] < row["box"]["left"] + 40 for row in runner),
                "a bridge is not in its row's gutter")
-    desk.check("209" not in ids_of(desk, REPLICA), "the raw block duplicates the root on its card")
-    desk.check(not any(row["rootChild"] for row in page.evaluate(STATE_JS, REPLICA)),
-               "a raw card grew a root child")
+    # The long question is split for its card (`#522 thread-card-max-lines`): its first row is the
+    # rest of it, the root's own row, and no other row repeats the root.
+    replica = page.evaluate(STATE_JS, REPLICA)
+    desk.check(replica[0]["ids"] == ["209"] and bool(replica[0]["continuation"]),
+               f"the split question's block does not start with its continuation: {replica[0]}")
+    desk.check("209" not in [one for row in replica[1:] for one in row["ids"]], "the raw block duplicates the root on its card")
+    desk.check(not any(row["rootChild"] for row in replica[1:]), "a raw card grew a root child")
     desk.check(len(ids_of(desk, CANARY)) == 2, "the third thread did not unpack its replies")
     desk.shot("2-unpacked-show")
 

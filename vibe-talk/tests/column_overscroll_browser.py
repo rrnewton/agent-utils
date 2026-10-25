@@ -82,6 +82,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, check, said
 from scroll_stability_browser import SUMMARY, Reader, StabilityApi, handler, thread_record, view_key
+from two_column_browser import UNSPLIT_CARDS_JS
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -367,6 +368,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 errors: list[str] = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 reader = Reader(page, api, args.screenshots, label, False)
+                # The last card cut by the clamp and grown by a press (HIGHLIGHT): under K (`#522`).
+                context.add_init_script(UNSPLIT_CARDS_JS)
                 page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
                 open_columns(reader)
                 cards_walk(reader, rest_ms)

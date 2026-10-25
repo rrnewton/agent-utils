@@ -246,6 +246,8 @@ struct Threads {
     thread_reads: Mutex<Vec<String>>,
     /// When set, every thread's `updated_at`.
     updated: Mutex<Option<String>>,
+    /// When set, a thread's root says this rather than its one short line (`#522`).
+    roots: Mutex<[Option<String>; 2]>,
 }
 
 impl Default for Threads {
@@ -254,6 +256,7 @@ impl Default for Threads {
             replies: Mutex::new([2, 2]),
             thread_reads: Mutex::default(),
             updated: Mutex::default(),
+            roots: Mutex::default(),
         }
     }
 }
@@ -293,7 +296,9 @@ impl Threads {
             id: THREADS[n].to_owned(),
             root: Some(message(
                 &format!("root-{n}"),
-                &format!("thread {n} starts here"),
+                &self.roots.lock().unwrap()[n]
+                    .clone()
+                    .unwrap_or_else(|| format!("thread {n} starts here")),
             )),
             title: format!("thread {n} starts here"),
             reply_count: Some(self.replies.lock().unwrap()[n]),
@@ -311,6 +316,10 @@ impl Threads {
 
     fn grow(&self, n: usize, to: u64) {
         self.replies.lock().unwrap()[n] = to;
+    }
+
+    fn root_says(&self, n: usize, text: &str) {
+        self.roots.lock().unwrap()[n] = Some(text.to_owned());
     }
 }
 
@@ -624,6 +633,134 @@ async fn a_thread_is_not_named_or_shown_named_before_its_third_message() {
         named,
         [THREADS[0]],
         "only the grown thread is named: {second}"
+    );
+}
+
+/// A root of six short lines: one more than the five a card shows by default (`#522`).
+const SIX_LINE_ROOT: &str = "Deploy plan\n1. drain\n2. upgrade\n3. verify\n4. undrain\n5. watch";
+
+async fn put_setting(h: &Harness, key: &str, value: &str) {
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/client-settings")
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "set": [{ "key": key, "value": value, "updated_ms": 0 }] }).to_string(),
+        ))
+        .unwrap();
+    let response = h.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "the setting was refused");
+}
+
+#[tokio::test]
+async fn a_root_too_long_for_its_card_is_named_from_its_first_reply() {
+    // `#522 thread-card-max-lines`: one question and one response is still left alone (`#484`),
+    // unless the question is longer than a card shows; that one is named at two messages, and
+    // the page is served its name and sentence.
+    let h = harness();
+    h.threads.root_says(0, SIX_LINE_ROOT);
+    h.threads.grow(0, 1);
+    h.threads.grow(1, 1);
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 1).await;
+    let (_, body) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let named: Vec<_> = names_of(&body)
+        .into_iter()
+        .filter(|(_, name, sentence)| name.is_some() && sentence.is_some())
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(
+        named,
+        [THREADS[0]],
+        "only the long root's thread is named: {body}"
+    );
+    assert_eq!(
+        h.summarizer.thread_prompts().len(),
+        1,
+        "the short one cost a model call"
+    );
+    let filed = h
+        .store
+        .cached_summary(&sentence_key(
+            &h.state.summary_version,
+            &channel(),
+            THREADS[0],
+        ))
+        .await
+        .unwrap()
+        .expect("a sentence filed");
+    let sentence: FiledSentence = serde_json::from_str(&filed.text).unwrap();
+    assert_eq!(sentence.at, 2, "filed at the root and its one reply");
+}
+
+#[tokio::test]
+async fn the_owners_card_lines_decide_which_roots_are_too_long() {
+    // `#522 thread-card-max-lines`: K is the owner's synced setting, read by the server.
+    let h = harness();
+    put_setting(&h, "vibe-talk.voice.thread-card-max-lines", "8").await;
+    h.threads.root_says(0, SIX_LINE_ROOT);
+    h.threads.grow(0, 1);
+    h.threads.grow(1, 1);
+    let (_, body) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.names.pending() + h.names.named(),
+        0,
+        "six lines fit a card of eight"
+    );
+    for (id, name, sentence) in names_of(&body) {
+        assert_eq!(
+            (name, sentence),
+            (None, None),
+            "{id} was served a name: {body}"
+        );
+    }
+    put_setting(&h, "vibe-talk.voice.thread-card-max-lines", "3").await;
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 1).await;
+    assert_eq!(
+        h.threads.thread_reads.lock().unwrap().as_slice(),
+        [THREADS[0]]
+    );
+}
+
+#[tokio::test]
+async fn a_renamed_thread_on_a_delta_is_judged_by_the_owners_card_lines_too() {
+    // `#522 thread-card-max-lines`: a delta that carries only a thread renamed since the page was
+    // read is served its name by the same rule as a page: a root that fits the owner's card lines
+    // waits for its third message, though its name was filed while it did not fit.
+    let h = harness();
+    h.threads.root_says(0, SIX_LINE_ROOT);
+    h.threads.grow(0, 1);
+    h.threads.grow(1, 1);
+    let (_, first) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let after = first["next_after"]
+        .as_str()
+        .expect("a forward cursor")
+        .to_owned();
+    until_named(&h.names, 1).await;
+    put_setting(&h, "vibe-talk.voice.thread-card-max-lines", "8").await;
+    let (status, delta) = call(
+        &h.app,
+        &format!("{THREAD_LIST}&after={}", urlencode(&after)),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{delta}");
+    let renamed: Vec<_> = names_of(&delta)
+        .into_iter()
+        .filter(|(id, _, _)| id == THREADS[0])
+        .collect();
+    assert_eq!(
+        renamed.len(),
+        1,
+        "the renamed thread is not on the delta: {delta}"
+    );
+    assert_eq!(
+        (renamed[0].1.clone(), renamed[0].2.clone()),
+        (None, None),
+        "a two-message thread whose root fits a card of eight was served its name: {delta}"
     );
 }
 

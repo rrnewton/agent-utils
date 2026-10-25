@@ -61,7 +61,7 @@ from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for
-from two_column_browser import CANARY, REPLICA, THREAD_ROWS, ColumnsApi, Desk
+from two_column_browser import CANARY, REPLICA, THREAD_ROWS, UNSPLIT_CARDS_JS, ColumnsApi, Desk
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -200,6 +200,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, label, width, height)
+            # The long card cut by the clamp and grown by the highlight: under K (`#522`).
+            context.add_init_script(UNSPLIT_CARDS_JS)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             if phone:
                 phone_walk(desk)

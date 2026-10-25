@@ -8736,6 +8736,16 @@ li.discord-message[data-root-child] > .reply-bridge {
   box-shadow: inset 3px 0 hsl(var(--thread-hue, 210) 55% 50%);
 }
 
+/* `#522 thread-card-max-lines`. The rest of a root split for its card, unpacked as the card's first
+   child (`data-root-continuation`, `cardSplit` in web/voice.js): the root's own row, its author and
+   time, starting "…". It has no controls of its own — Reply, Done, the thread tag and ⋯ are the
+   root's, and the root is the card — so none are drawn; the row's own keys and tap still act on the
+   root, whose row it is. */
+li.discord-message[data-root-continuation] .row-acts,
+li.discord-message[data-root-continuation] > .thread-replies {
+  display: none;
+}
+
 /* `#231 two-column-polish`. The right column's freshness: the pill's words, the pill's size and its
    warning colour, but a line of the column rather than a pill floating over it — quiet, and never
    over a row. Centred under the heading, cut with an ellipsis rather than wrapped. */

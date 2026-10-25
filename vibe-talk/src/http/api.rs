@@ -1238,6 +1238,8 @@ pub async fn set_client_settings(
         .filter_map(|(k, v)| v.map(|v| (k, v)))
         .collect();
     let (settings, changed) = state.store.apply_client_settings(&set, &seed).await?;
+    // `#522 thread-card-max-lines`: the one synced setting the server itself acts on.
+    state.thread_names.note_settings(&changed);
     state.live.publish_settings(changed);
     Ok(no_store(Json(crate::contract::ClientSettings { settings })))
 }
