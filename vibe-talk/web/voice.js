@@ -31164,24 +31164,7 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   row.setAttribute("data-archived", isArchived ? "true" : "false");
   // `#245 done-feedback`. The moment of a Done, on whichever row now stands for the message.
   drawDoneFlash(row);
-  // `#206 pin-message`. Pinned when ANY message the row stands for is — the `every` reading would
-  // hide a pin behind its row's unpinned half — and Unpin then acts on every one of them. The
-  // chip says it in words, and says when what is shown is the copy the pin kept.
-  const isPinned = ids.some(isPinnedId);
-  row.setAttribute("data-pinned", isPinned ? "true" : "false");
-  const chip = childByClass(row, "pin-chip");
-  if (chip) {
-    chip.hidden = !isPinned;
-    chip.setAttribute(
-      "title",
-      rowMessages(row).some((message) => keptByPin.has(message))
-        ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
-            "than what is loaded."
-        : "Pinned on this server, for every device. The chat service's own pins are not changed."
-    );
-  }
-  const pinItem = childByClass(row, "row-pin-button");
-  if (pinItem) pinItem.textContent = isPinned ? "Unpin message" : "Pin message";
+  drawRowPin(row);
   // `#196 auto-read-noise`. Read automatically, by the server's verdict on EVERY constituent —
   // `joinsGroup` keeps a placeholder out of a real message's row, so a mixed row is not one the
   // reader should be told is noise. Dimmed, never hidden, here: hiding is Hide read's job, and
@@ -41795,12 +41778,39 @@ function applyPinsList(payload) {
 }
 
 /** Every row's chip and Pin item, and the filter's list, re-derived from `pins`. */
+/** Draw pin state on any message row, including rows held among the thread cards. */
+function drawRowPin(row) {
+  // `#206 pin-message`. Pinned when ANY message the row stands for is — the `every` reading would
+  // hide a pin behind its row's unpinned half — and Unpin then acts on every one of them. The
+  // chip says it in words, and says when what is shown is the copy the pin kept.
+  const isPinned = idsOf(row).some(isPinnedId);
+  row.setAttribute("data-pinned", isPinned ? "true" : "false");
+  const chip = childByClass(row, "pin-chip");
+  if (chip) {
+    chip.hidden = !isPinned;
+    chip.setAttribute(
+      "title",
+      rowMessages(row).some((message) => keptByPin.has(message))
+        ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
+            "than what is loaded."
+        : "Pinned on this server, for every device. The chat service's own pins are not changed."
+    );
+  }
+  const pinItem = childByClass(row, "row-pin-button");
+  if (pinItem) pinItem.textContent = isPinned ? "Unpin message" : "Pin message";
+}
+
 function renderPins() {
   // In every column: a pin is the message's. `#229 desktop-two-column`.
   eachColumn(() => {
     preservingScroll(renderChannelRows);
     renderScrollTools();
   });
+  // The cards keep their message rows across ordinary channel redraws. Dress their pins from
+  // the same optimistic store immediately, including rollback, without replacing the rows.
+  for (const row of leftEl("side-cards").children) {
+    if (row.hasAttribute("data-main-row") || row.hasAttribute("data-unpack-thread")) drawRowPin(row);
+  }
   // Pins landing under a Pinned filter turned on before they had: the pin nearest the message the
   // reader was on is put in its place now. `#243 filter-keeps-selection`.
   if (pinnedOnly) settlePendingFilterPlace();

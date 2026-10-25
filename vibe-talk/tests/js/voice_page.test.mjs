@@ -82298,3 +82298,23 @@ test("discord-start-thread: a native potential root offers Thread and starts its
   await page.settle();
   assert.equal(page.repliesPosted.at(-1).body.thread_id, "1");
 });
+
+
+test("pin-badge-lag: main rows among thread cards update before PUT and roll back on refusal", async () => {
+  const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+  const row = () => page.el("side-cards").children.find((li) => li.getAttribute("data-id") === "210");
+  assert.ok(row(), "the main row is among the thread cards");
+  page.holdPinWrites = true;
+  await tapPin(page, row());
+  assert.equal(page.pendingPinWrites.length, 1, "the PUT is held on the wire");
+  assert.equal(page.pinned.size, 0, "the fake server has not saved the pin");
+  assert.equal(row().getAttribute("data-pinned"), "true", "the main row waited for a sync");
+  assert.equal(pinChip(row()).hidden, false, "the badge waited for a sync");
+  page.pinFailure = { status: 500, error: "store_error", detail: "pin refused" };
+  page.pendingPinWrites.splice(0).forEach((release) => release());
+  await page.settle();
+  await page.settle();
+  assert.equal(row().getAttribute("data-pinned"), "false", "failed pin did not roll back");
+  assert.equal(pinChip(row()).hidden, true);
+  assert.match(page.el("status").textContent, /pin refused/);
+});
