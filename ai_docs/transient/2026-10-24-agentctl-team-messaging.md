@@ -10,6 +10,16 @@ company-internal channels, and an opportunistic chat relay); exactly-once delive
 first-class section; only the receiving host's own agentctl touches its panes; and team
 messaging is factored as its own tool. Section 20 records what each revision changed.
 
+**Revision 3** (2026-10-25) folds in the owner's answers to questions 12 (second half), 13, 14,
+15 and 17-20, and the coordinator's Rust-only proposal for question 11. It adds a topology: a star of persistent links that spokes dial out to, instead of a link
+per host pair; a store-and-forward relay at the hub that keeps section 9's guarantees, limited to
+one relay; and the `jump` option for ssh routes (11.5-11.7). It adds a related-work comparison
+with Gas Town and other public systems (19, and a draft
+[`RELATED_WORK.md`](2026-10-24-agentctl-team-messaging/RELATED_WORK.md)). It defines one
+machine-parsable team tag used on every route (8.1), and makes a direct message to the other
+coordinator's chat conversation the first chat route, with the shared coordinator channel
+deferred (10.6, 10.7).
+
 Code references are to `main` at `8efb7191` unless marked with `2a9d8012`.
 
 ## 0. Summary
@@ -22,10 +32,10 @@ that registry, and whether the chat bridge that shares its queue is still the on
 knowledge goes stale, and every incident in section 1 is a delivery made on stale knowledge or a
 retry that delivered twice.
 
-The proposal, in seven parts:
+The proposal, in eight parts:
 
-1. **A separate, à la carte tool** (working name `agent-teams`), not more subcommands of
-   agentctl. It shares one small library with agentctl (queue format, ledger primitives,
+1. **A separate, à la carte tool**, `agent-teams` (the owner's name for now, 2026-10-25), not
+   more subcommands of agentctl. It shares one small library with agentctl (queue format, ledger primitives,
    harness identity) and integrates with agentctl, chat bridges and transports through data and
    commands, so each piece works alone (section 4).
 2. **A sparse teams file** (`teams.json`), one owner-level routing hint: which teams exist, on
@@ -48,8 +58,15 @@ The proposal, in seven parts:
    supersede and retract, as lock-free tombstones re-checked just before the paste (section 12).
 7. **Routes as data.** Each route names a driver built into the code (`local`, `ssh`,
    `command`) and is otherwise described in data: targets, keys, command templates, capability
-   flags, idempotency semantics, attribution. A chat relay is opportunistic and never required
-   (sections 10, 11).
+   flags, idempotency semantics, attribution. A chat route (first, a direct message to the other
+   coordinator's conversation) is opportunistic, never required, and used sparingly, because the
+   owner reads it (sections 10, 11). Every message carries one fixed team tag,
+   `[sim host-b -> tools host-a tm-…]`, on every route (8.1).
+8. **A star, not a mesh.** Persistent links run from each host to a hub named in data, dialled
+   by the spoke, so one-way-reachable hosts work and n hosts need n-1 links. Spoke-to-spoke
+   messages go direct when an on-demand route exists, through the hub as an ssh jump, or through
+   a store-and-forward relay at the hub that holds custody without deciding anything. One relay
+   at most; a general multi-hop mesh is not worth building (11.5-11.7).
 
 ## 1. Incidents this design must prevent
 
@@ -275,7 +292,8 @@ nothing to do with Herdr or subagents.
   host, even one with no agentctl.
 
 Name: `agent-teams` (descriptive, matches `agent-usage`); `teamctl` is shorter but reads as
-another controller of agents. The owner decides (question 13).
+another controller of agents. **Decided** (question 13, 2026-10-25): option B, named
+`agent-teams` for now.
 
 ### 4.3 Dependency graph (option B)
 
@@ -355,10 +373,10 @@ Nothing in that path touches Herdr. If they later adopt agentctl, they change th
 Option B: a separate `agent-teams` tool, with the queue format, ledger claim and harness
 identity extracted into a shared crate that agentctl also uses; agentctl gains only generic queue
 features and no team commands; the chat bridge gains only a generic relay-channel hook;
-integration is by data and commands. The rest of this document uses `agent-teams`; if the owner
-prefers subcommands, `agent-teams X` maps one-to-one to `agentctl team X` and nothing else in
-the design changes. The extraction is the first implementation step (section 17), and it also gives the
-Python edition one documented queue format to follow.
+integration is by data and commands. The owner accepted this on 2026-10-25 ("Yes and let's just
+name it agent-teams for now"). The extraction is the first implementation step (section 17); it
+also documents the queue format, which the Python edition of agentctl only has to recognise well
+enough to refuse the new lanes (question 11).
 
 ### 4.7 Relation to the suite factoring audit
 
@@ -372,7 +390,7 @@ explicitly versioned registry and queue format.
 is normal); the on-disk queue format, versioned, is the contract between binaries; a build
 without the feature refuses team commands with exit 2.
 
-**Where this section goes further, for the owner to weigh (question 13):**
+**Where this section goes further** (the owner chose the separate binary, question 13):
 
 - **The library team messaging depends on can be narrower than `agentctl-core`.** It needs the
   queue format, the ledger claim and harness identity (4.1), not the Herdr client, harness TUIs
@@ -531,9 +549,27 @@ Default `${XDG_CONFIG_HOME:-~/.config}/agent-teams/teams.json`; `--teams FILE` o
 ### 6.3 `routes.d/*.json`
 
 `${XDG_CONFIG_HOME:-~/.config}/agent-teams/routes.d/`, every `*.json` file read in name order;
-a route name defined twice is an error. Splitting routes out of `teams.json` lets a private
-file (for a company-internal channel) live in a private dotfiles repository while `teams.json`
+a route name defined twice is an error. Splitting routes out of `teams.json` lets private
+definitions (for a company-internal channel) stay out of anything published while `teams.json`
 and the public code stay generic. The formats are in section 10.
+
+**Private route files** (question 17, decided 2026-10-25). Company-internal routes go in files
+named `*.private.json`, in the same `routes.d/` or in extra directories, and are never committed
+where they could be published:
+
+- **Ignored by name.** Any repository that holds a `routes.d/` (a dotfiles repository, a harness)
+  ignores `*.private.json`; agent-utils' own `.gitignore` gets the same line when the tool lands,
+  so an example directory in the tree cannot pick one up. `teams check` warns when a
+  `*.private.json` file it loaded sits inside a Git working tree and `git check-ignore` does not
+  report it ignored.
+- **Found by search path.** agent-teams reads `routes.d/` first, then each directory in
+  `AGENT_TEAMS_ROUTES_PATH` (colon-separated) and each `--routes DIR` (repeatable), all `*.json`
+  files in name order, with one namespace: a route defined twice is still an error. A durable
+  copy of the private files may live in a private repository the owner keeps; pointing
+  `AGENT_TEAMS_ROUTES_PATH` at that checkout uses it in place.
+- **Placeholders only in public.** The public repository ships `*.example.json` route files with
+  invented commands (`example-runtimectl`) and `example.net` addresses, which the loader refuses
+  to use as live routes.
 
 ### 6.4 `declaration.json` (receiving host)
 
@@ -649,16 +685,44 @@ runs the route walk (11). The envelope:
 - **What is typed.** The receiver renders the envelope on its own host:
 
   ```
-  [team message tm-sim-6f1d0c2a9b7e4d31 from sim (coordinator, proved on host-b, via link-b) to tools; kind hold; topic ci-hold; expires 15:00Z]
+  [sim host-b -> tools host-a tm-sim-6f1d0c2a9b7e4d31]
+  [team message: kind hold; topic ci-hold; expires 15:00Z; sender proved on host-b; via link-b]
   Please hold landing to main until the mirror is repaired.
   [reply: agent-teams reply tm-sim-6f1d0c2a9b7e4d31 --file FILE]
   ```
 
-  The header is generated by the receiver from the verified envelope, including how the sender
-  was proved and which route carried it. Body lines that begin with `[team message` or `[reply:`,
-  and lines that look like a chat bridge's reply markers, are indented by two spaces, so a body
-  can neither forge a header nor be posted by a bridge reading a long idle pane (2.5). The typed
-  text never starts with `/`.
+  The first line is the team tag (below). The second is generated by the receiver from the
+  verified envelope, including how the sender was proved and which route carried it (for a
+  relayed message, also the relay: `via link-b, relayed by hub-a`). Body lines that match the tag
+  grammar or begin with `[team message` or `[reply:`, and lines that look like a chat bridge's
+  reply markers, are indented by two spaces, so a body can neither forge a header nor be posted
+  by a bridge reading a long idle pane (2.5). The typed text never starts with `/`.
+
+- **The team tag: one grammar, every route.** The owner (2026-10-25): "for starters I want just
+  dms to other coordinators with clear tagging ... The agents seem to usually want to label their
+  inter agent messages but are inconsistent in how they do it." So the label is not left to the
+  agent. agent-teams writes exactly one tag, from the envelope, as the first line of everything a
+  person or an agent sees: the rendered paste, the hook's print, a session-route body, a chat
+  post (10.6, 10.7), and the subject of `team-log.jsonl` records. Agents never write it; a body
+  that starts with something tag-like has it indented as above.
+
+  ```
+  tag      = "[" endpoint " -> " endpoint " " id "]"
+  endpoint = sender " " host
+  sender   = team / "service:" team      ; a team name stands for that team's coordinator (8.2)
+  team     = 1*32( %x61-7A / DIGIT / "-" )                     ; ^[a-z0-9-]{1,32}$, as in 5
+  host     = ( %x61-7A / DIGIT ) 0*62( %x61-7A / DIGIT / "-" / "." )  ; a teams.json host key
+  id       = "tm-" ( team / "svc." team ) "-" 16( DIGIT / %x61-66 )  ; the ID rule above
+  ```
+
+  One line, single spaces, ASCII `->`, no other text inside the brackets. The left endpoint is
+  the sender as proved and the sending host; the right is the addressed team and its entry host
+  (`to.team`, `to.host`). Only coordinators and registered services send or receive (8.2), so no
+  agent name appears; the owner's example names the two coordinators by team and host the same
+  way (`[<team-1 coordinator> <host-1> -> <team-2 coordinator> <host-2>]`, host names redacted).
+  The receiving `accept` re-derives the tag from the envelope and refuses a chat post whose tag
+  does not match its envelope (10.7). Host keys in `teams.json` must fit `host`; `teams check`
+  reports any that do not.
 
 ### 8.2 Who may send: coordinators and registered services only
 
@@ -754,6 +818,7 @@ the session route before and after delivery (10.5). Section 11.4 tabulates what 
 | `ambiguous` | sender-side only: a hand-over may have happened; awaiting a receipt | never resent blind (9.3) |
 | `ambiguous-expired` | sender-side only: still ambiguous when `not_after` passed | **never**; a human resolves it (question 19) |
 | `awaiting-pull` | sender-side only: the only route to the contact is the receiver pulling (10.3), or a reply waits for the original sender to collect it (8.5) | the puller takes it |
+| `in-custody` | sender-side only: a hub relay has taken custody (11.6); the final host has not answered yet. Not delivered | the hub forwards it; the sender asks; pinned to the contact |
 | `journaled` / `journaled-halted` | session contact: in the session's journal; `-halted` when the runtime shows it will not run | no |
 
 Receipts read the ledger and list queue directories without taking the delivery lock, so
@@ -987,10 +1052,50 @@ from the seed of any failure, in the style of property-based stateful testing):
   long enough before `not_after`, `delivered`.
 - **Real-process cases** for the same faults at the seams a simulation cannot see: `kill -9`
   of `accept` and `drain` at named failpoints, an ssh connection cut with the remote command
-  running, and an old drainer binary beside a new one (12.4), in both editions where the queue
-  is concerned.
+  running, an old drainer binary beside a new one (12.4), and the Python edition's refusal of a
+  queue that uses the new lanes (question 11), checked by the cross-edition differential.
 - **Regression cases named for the incidents:** a slow multi-part relay post retried by the
   sender (I5), and two bridges sharing a pane with the coordinator replying (I2).
+- **Relay faults (revision 3, for the hub of 11.6).** The model gains one or two hub hosts with
+  real spool code, spokes that reach the hub only by pull, and jump routes. Faults: the hub
+  crashing before the custody write, after it but before answering, and after a forward attempt
+  started; the custody answer lost, so the sender resubmits to the same hub, then to the final
+  host directly; the hub's spool lost or restored from an old copy (a new spool epoch); the hub
+  partitioned from the final host for longer than `not_after`; a forwarded copy arriving after
+  the final host fenced the ID or after the sender's direct resend was accepted; a withdrawal
+  racing a forward; a spoke's pull taking an entry and dying before its ack; a relayed envelope
+  submitted to a second hub, or back to a hub, or by one hub to another; a hub forwarding to the
+  wrong host; a trace edited in transit; the hub's clock ahead of or behind the final host's; a
+  jump route whose hub drops the forwarding channel after the envelope was written. Invariants
+  added: no envelope is relayed twice (at most one hub in any trace, and never hub to hub); a
+  hub answers `withdrawn` only if no forward attempt of that ID reached `sent`; a hub never runs
+  `accept` for a team on another host and never writes another host's ledger; at most one
+  custody copy is outstanding per message unless the earlier one is proved withdrawn; custody
+  records outlive `not_after` (9.2's retention rule, applied at the hub); and every message that
+  entered custody ends terminal at the final host, `withdrawn`, or `ambiguous-expired`, each
+  visible in a receipt.
+- **Live trials before reliance.** The owner (2026-10-25), on routes using the owner's own ssh
+  configuration: "Sure and no. But good to test any other mechanism we propose." Every mechanism
+  other than `use_user_ssh_config` (dedicated forced-command keys, persistent and pull links, jump
+  keys, the hub relay, command routes, session routes, the chat route) is relied on only after
+  its tests pass **and** a live trial between two of the owner's hosts has exercised it with the
+  faults above that can be induced for real (a link killed mid-attempt, the hub stopped holding a
+  message, a spoke rebooted), recorded under `ai_docs/transient/` with the commit tested. The
+  owner's `teams.json` lists the trials it accepts (`"trials": {"jump": {"record": "<path>",
+  "commit": "<sha>"}}`); until a mechanism is listed, `teams check` labels routes using it
+  `untrialled` and `send` prints that label. `use_user_ssh_config` needs no trial entry.
+- **Budget: the repository's usual split** (question 20, decided 2026-10-25: "repeat the split
+  of regression tests plus optional or nightly soak"). The regular gate (`make validate`, when
+  agent-teams or the queue library changed) runs a bounded harness pass under one minute: a fixed
+  list of seeds that once failed, kept as regression cases forever, plus a few hundred seeds
+  derived from the commit being tested, so successive commits explore different schedules and
+  every failure is reproducible from the commit and seed printed. The soak is a separate,
+  optional target (`make soak-agent-teams SEEDS=… MINUTES=…`) that nobody's push waits for; the
+  nightly workflow (`.github/workflows/nightly-all.yml`) runs it for a fixed time after the
+  portable contract, uploads each failing seed with its replay command and trace as an artifact
+  (90-day retention, as the benchmark series is kept), and reports a red soak through the same
+  single open `nightly` issue. A seed that failed in a soak joins the gate's fixed list with the
+  fix.
 
 ## 10. Routes: a pluggable layer described in data
 
@@ -1073,9 +1178,17 @@ nothing ambient:
   options: `BatchMode=yes` (never prompt), `IdentitiesOnly=yes` with the route's key,
   `IdentityAgent=none`, `StrictHostKeyChecking=yes` with a known-hosts file of its own (filled at
   enrollment from a fingerprint the owner confirms), `ForwardAgent=no`, `ClearAllForwardings=yes`,
-  `ConnectTimeout`, `ServerAliveInterval` and `ServerAliveCountMax`. A route may opt into the
-  user's own configuration and agent (`"use_user_ssh_config": true`, for example to inherit a jump
-  host), which is labelled in `teams show`.
+  `ConnectTimeout`, `ServerAliveInterval` and `ServerAliveCountMax`.
+- **The owner's own ssh configuration: allowed, permanently.** A route may set
+  `"use_user_ssh_config": true` to run OpenSSH with the user's configuration and agent (for
+  example to inherit a jump host or a host alias). The owner (2026-10-25), asked whether routes
+  may do so during migration and whether that should expire: "Sure and no." It is therefore a
+  supported mode, not a migration step, and never expires. What changes is attribution: without
+  a forced command bound to a key, the remote side runs `agent-teams serve --stdio --peer
+  <sender's host>` through an ordinary shell, so `--peer` is the sender's own claim. The receiver
+  records it as `peer asserted (owner ssh)`, renders "asserted by host-b over owner ssh", and
+  `teams show` labels the route. Dedicated per-pair keys remain the stronger option and stay
+  optional (question 12).
 - **Attribution gets better, not worse.** Because the key is bound to a peer, the receiver knows
   which host's agent-teams handed it the envelope: "proved on host-b, via the host-b key".
 - **A host key mismatch** disables that route (never `accept-new` after enrollment) and is
@@ -1138,7 +1251,21 @@ connection from host-b and the same restricted key. A reverse port forward (`ssh
 socket, with a listener on host-b) would also work, but adds a listening service and a
 `permitlisten` grant for no gain; it is not proposed.
 
-**Hosts where ssh is refused** get no ssh route: a `command` route (10.4), a chat relay (10.6),
+**Through a hub: the `jump` option.** An ssh route may name another ssh route as its jump:
+`"jump": "link-hub"`. The driver then reaches the target with OpenSSH's `ProxyJump`, carried
+over the jump route's control socket when that route has a link (a forwarding channel on the
+existing master), so the session to the target is end to end: the target's own forced-command
+key authenticates the sender's host, the hub forwards encrypted bytes and reads nothing, and the
+exactly-once rules are those of a direct ssh route, because it is one. The hub needs a jump-only
+grant for the spoke's key, `restrict,port-forwarding,permitopen="host-c:22",command="/bin/false"`
+(`sshd(8)`: `restrict` turns forwarding off, `port-forwarding` turns it back on, `permitopen`
+limits the destination); under `use_user_ssh_config` the owner's own `ProxyJump` setting does
+the same. A jump works only when the target accepts ssh from the hub and both are up at once;
+otherwise the hub relay (11.6) is the route. That forwarding channels are not subject to the
+forced command is recalled OpenSSH behaviour, and is one of the things the jump's live trial
+(9.7) must show.
+
+**Hosts where ssh is refused** get no ssh route: a `command` route (10.4), a chat route (10.6, 10.7),
 pull from the other side if that host can ssh out, or a session contact. With none, `teams
 check` reports `no-route` for the entry.
 
@@ -1273,6 +1400,13 @@ The owner: "explore whether any chat bridge could be used as another route betwe
 but it would have to be opportunistic, because we need to make sure our components can be used
 individually."
 
+**Deferred (revision 3).** Asked whether a shared coordinator channel is wanted, the owner
+(2026-10-25): "Not yet. I'll review the design if it's in there. But for starters I want just
+dms to other coordinators with clear tagging." The shared-channel design below is kept for that
+review and is not in the phased plan. The first chat route is the direct message of 10.7, which
+reuses this section's machinery (`relay-in`, peer-to-team binding, receipts in the thread, no
+retry over chat) in a conversation with exactly two coordinators in it.
+
 **Shape.** Both teams' coordinators already have chat bridges. The owner creates a shared
 channel (say `#coord-relay`) and marks it as a **relay channel** in each bridge's configuration.
 A message travels:
@@ -1354,7 +1488,93 @@ waits in the channel and may be read after `not_after`, in which case `accept` r
   or with a host route for receipts and fences: a fence written over ssh also bars a relay post
   the bridge has not read yet (9.4).
 
-## 11. Route selection, fallback and failure reporting
+### 10.7 The chat DM route: a direct message to the other coordinator
+
+The owner (2026-10-25): "for starters I want just dms to other coordinators with clear tagging."
+This is the first chat route. It is a `command` route in relay mode whose conversation has
+exactly two coordinators in it, and it is as optional as 10.6: no bridge needs it and agent-teams
+works without it.
+
+**Where it posts.** Into a conversation the **receiving** coordinator's bridge already watches
+and the sending bridge's app can post in. Normally that is the receiving coordinator's own bridge
+channel, so the owner sees the message where they already talk to that coordinator. Where that
+conversation is a one-to-one direct message between the owner and the receiving app, which a
+third app cannot join, the route names a conversation made for the pair (the owner and the two
+bridge apps). Never a conversation with a third team's bridge. The route data names the
+conversation; whether the provider lets the sending app join or post there, and with what
+subtype its posts arrive, is unverified and recorded by the enrollment probe.
+
+**What it posts.** One post per envelope, never split:
+
+````
+[sim host-b -> tools host-a tm-sim-6f1d0c2a9b7e4d31]
+Please hold landing to main until the mirror is repaired.
+```agent-teams-envelope
+{"schema":"agent-teams-message/v1","id":"tm-sim-6f1d0c2a9b7e4d31", ...}
+```
+````
+
+The first line is the team tag (8.1). The body follows for the owner to read; the code block
+carries the full envelope, which is authoritative (a provider may rewrite visible text, for
+example by escaping `<`, `>` and `&`, so the body hash is checked on the envelope's copy). The
+sending agent writes neither the tag nor the block; `agent-teams` renders both.
+
+**What has to change in the bridge.** Two things block this today, and the route is not offered
+until both are fixed:
+
+- **The inbound stream never carries the peer's posts.** The provider client's tail drops posts
+  authored by bots before they reach the bridge (an upstream bot-author filter in the provider's
+  client, reported on 2026-10-25; it is not in this repository and was not re-read for this
+  revision). The bridge's rescan lists each channel's history every `rescan_interval_seconds` (90
+  by default) and does see them (`rs/chat-subscription-slack/src/plugin.rs:62-77`), so a DM
+  arrives up to about 90 s plus the rescan's grace late unless the upstream filter gains an
+  exception for listed peer IDs. That latency is acceptable for a last-resort route.
+- **Admission refuses them.** Stream and rescan apply one admission, which drops `bot_message`
+  subtypes and every sender outside `allowed_senders` (2.5). Adding the peer to
+  `allowed_senders` would give it the owner's authority. The bridge needs a **coordinator-peer**
+  admission class, generic and per conversation: `peer_senders: {<bot user id>: <team>}` and one
+  `command`. A post from a listed peer ID, in that conversation only (and with the `bot_message`
+  subtype only if that is how the provider delivers it), is admitted to that class and nothing
+  else: it is **never typed raw** and never becomes a prompt; its text and poster ID go on stdin
+  to `agent-teams relay-in --route R --peer-sender ID`. `relay-in` parses the tag and the
+  envelope, refuses the post if the tag is malformed or differs from the tag derived from the
+  envelope, if `from.team` is not the team mapped to the poster, or if `to.host` is not this
+  host, and otherwise runs `accept --via relay:R` as for any route. The coordinator sees only
+  what its deliverer types: the receiver's own rendering (8.1), never the post.
+
+Owner posts in that conversation keep their meaning. In the receiving coordinator's own channel
+they are owner requests as today: admission splits by sender ID, and the sending bridge does not
+watch that channel, so no second bridge can type the same owner message (I2). In a pair
+conversation both bridges might watch, so owner posts there are refused, as in 10.6, until the
+owner says otherwise (question 23).
+
+**Receipts.** The receiver posts one line as a thread reply to the message, through its own
+outbound helper: the message's tag followed by `receipt: accepted 13:00:12Z` (or the refusal).
+The sender reads it by listing the thread with its own helper, the listing that helper already
+does after an uncertain outcome (2.5), or asks over a host route. A receipt never draws a
+receipt. As in 10.6, the operation UUID is derived from the ID, so the route cannot retry; an
+ambiguous post is settled by a receipt, and a resend after "unknown" goes over another route to
+the same contact (the receiver's ledger absorbs the post if it is read later).
+
+**Sparingly.** The owner reads every post in that conversation, so a chat message costs the
+owner's attention where a host route costs nothing. The route therefore:
+
+- comes last in route order (11.2) and is never first unless it is the only route;
+- carries `"visible_to_owner": true` in its data, so `send` prints "this message will be posted
+  where the owner reads it" when the walk reaches it, and `--no-chat` leaves it out;
+- has a per-route rate limit in data (`"limits": {"per_hour": 6}` by default); over the limit it
+  is a definite skip and the message waits for another route as `deferred`.
+
+The `agent-teams` skill, written with the tool, must say the same to agents: when the only route
+is chat, send only what the other coordinator needs to act on, combine several points in one
+message, do not send acknowledgements, thanks or progress chatter, and prefer waiting for a host
+route when nothing is urgent. Host routes (`local`, `ssh`, `command`, the hub relay) need no such
+restraint. Agents never label team messages by hand; the tag is agent-teams' job. The last
+sentence of the owner's answer ("If going to an underlying this with the human on the chat it
+doesn't matter so much") was garbled in transcription; this rule follows the reading above, and
+question 24 asks.
+
+## 11. Route selection, topology, relaying and failure reporting
 
 ### 11.1 The walk
 
@@ -1388,9 +1608,12 @@ attempt record is written before the route runs (the helper's rule in 2.3).
 ### 11.2 Default order
 
 The owner's file orders routes per host; the recommended default puts the cheapest verified route
-first: `local`, then a persistent ssh link, then plain ssh, then a host-mode command route, then
-a relay. Session contacts come after host contacts. A relay is never first unless it is the only
-route, because its latency is two bridges and its receipts are slower.
+first: `local`, then a persistent ssh link (for a spoke, its link to the hub when the target is
+the hub), then plain or on-demand ssh direct to the target, then an ssh jump through the hub
+(10.3), then the hub relay (11.6), then a host-mode command route, then a chat route (10.7, and
+10.6 if it is ever enabled). Session contacts come after host contacts. A chat route is never
+first unless it is the only route, because the owner reads it, its latency is two bridges (and a
+rescan), and its receipts are slower.
 
 ### 11.3 Failure reporting
 
@@ -1412,8 +1635,212 @@ route, because its latency is two bridges and its receipts are slower.
 | `ssh` (with or without link) | the receiving host's agent-teams and agentctl | "proved on host-b, via the host-b key" | `receipt` over any route; `fence` | tombstone |
 | `ssh` pull | the puller's own agent-teams and agentctl | "pulled from host-a's outbox over link-a" | re-offer of the same ID; ack | tombstone |
 | `command`, host mode | the receiving host's agent-teams and agentctl | "proved on host-c, via node-exec-c" | `receipt` over any route; `fence` | tombstone |
+| `ssh` with `jump` | the receiving host's agent-teams and agentctl | as plain `ssh`; the hub is named in the route only | `receipt` over any route; `fence` | tombstone |
+| hub relay (11.6) | the final host's agent-teams and agentctl, never the hub | "proved on host-b, relayed by hub-a (host-b authenticated to hub-a by its key)" | the hub's custody state, then `receipt` at the final host; `fence` at the final host, or `relay-withdraw` at the hub | tombstone |
 | `command`, relay mode | the receiving host's agent-teams and agentctl, invoked by its bridge | "asserted by sim's bridge in #coord-relay" | receipt in thread, or over a host route; `fence` over a host route | tombstone |
+| `command`, relay mode, DM (10.7) | the receiving host's agent-teams and agentctl, invoked by its bridge | "asserted by sim's bridge (app user U0PEER) in tools' conversation" | receipt in thread, or over a host route; `fence` over a host route | tombstone |
 | `command`, session mode | the runtime's own `inspect`, before and after | the runtime's attribution, or "asserted" | the route's `status` operation if declared; else pinned | none (runtime has no expiry or cancel) |
+
+### 11.5 Topology: a star of persistent links
+
+The owner (2026-10-25): "I think probably a star topology of persistent links could work. We
+don't want n squared persistent links surely. Not sure if our message later can route through a
+star or any other multi hop topology." Section 19 compares how other systems do it: Gas Town,
+AutoGen and MCP Agent Mail are stars around one host or server; Ruflo's federation is pairwise
+with no relay; NATS uses a full mesh only inside a cluster and acyclic trees of dialled-out leaf
+nodes between sites.
+
+**Counting.** With n hosts there are n(n-1)/2 pairs. Persistent links for every pair, one
+supervisor per direction where both can dial, is up to n(n-1) supervised connections: 20 for five
+hosts, 90 for ten, each a unit to install, a key to enroll and a health state to watch. A star is
+n-1.
+
+**The recommendation.**
+
+- **One hub, named in data.** `teams.json` gains a `topology` object:
+
+  ```json
+  "topology": {
+    "comment": "hub-a is reachable from every host and stays up; hub-b is the standby.",
+    "hubs": ["hub-a", "hub-b"],
+    "standby": "on-demand"
+  }
+  ```
+
+  The first hub is the hub; the rest are standbys in order. The hub is chosen for reachability
+  (every spoke can open a connection to it) and uptime, not because any team lives there,
+  although one may. `teams check` verifies that every spoke has a working link to the first hub
+  and reports a spoke without one as `no-hub-link`. Without a `topology` object nothing changes:
+  routes are as in section 10.
+- **Spokes dial the hub.** Each spoke runs one persistent link to the hub (10.3's `persistent`
+  mode, a user unit the owner installs), opened by the spoke, as NATS leaf nodes and AutoGen
+  workers dial their hub. Over that one link the spoke **pushes** to the hub and **pulls** from
+  it (10.3's pull, a long poll that returns as soon as the hub holds something for that spoke).
+  So a spoke needs only outbound reachability to the hub, the hub needs no key for any spoke,
+  and a spoke that can be reached in neither direction from other spokes still takes part. Where
+  the hub can also reach a spoke, a hub-to-spoke push route may be added; it is not needed.
+- **Spoke to hub, hub to spoke** messages are ordinary single-hop deliveries over that link. The
+  hub host's own teams are reached directly.
+- **Spoke to spoke**, in route order (11.2): a direct route if one is configured and up (an
+  on-demand ssh connection, a command route); else an ssh **jump** through the hub (10.3), when
+  the target accepts ssh from the hub; else the **hub relay** (11.6), which also serves a target
+  that is down or reachable only by its own pull.
+
+**When on-demand direct connections still make sense.** Between a pair that exchanges messages
+often, or large ones (no hub hop, no hub storage); when the hub is down; for `--private`
+messages if the owner decides they must not rest on the hub (question 22); and for discovery and
+checks (`probe`), which are cheap and need no custody. "On-demand" is 10.3's mode: a ControlMaster
+opened at first use and closed after `ControlPersist`, so nothing lingers and no unit is
+installed. On-demand routes are not counted against the star: they exist only while used.
+
+**Hub failure.** The spokes' link supervisors mark their links `down` (10.3) within
+`ping_seconds × down_after_failures`. The walk skips hub routes as definite skips and moves to
+the next route: direct on-demand routes, then a standby hub. A standby is `on-demand` by default
+(a spoke opens a ControlMaster to it only when the walk needs it) or `persistent` when the owner
+asks for two links per spoke (2(n-1) links, still linear). Messages already **in custody** at the
+failed hub do not fail over by themselves: each is pinned to its contact (9.4, 11.6). The sender
+may resend the same ID directly to the final host after asking it (9.3), and the final ledger
+absorbs the hub's copy if the hub forwards it later; moving to a different contact needs a fence
+at the final host or a withdrawal at the hub, as for any ambiguity. Nothing is promoted
+automatically: which host is the hub changes only when the owner edits `teams.json`.
+
+**Fewer keys, too.** With dedicated keys (10.3), a star needs one key per spoke on the hub
+(forced command `serve --stdio --peer <spoke>`, plus a `permitopen` grant per jump target where
+jumps are used), instead of one per ordered pair. A jump to a target also needs the sender's key
+on the target, which is per pair again; the hub relay does not (the hub forwards with its own
+link or the target's pull).
+
+### 11.6 Relaying through the hub: store and forward, exactly once
+
+The question is whether a message can go spoke → hub → spoke and keep section 9's guarantees.
+It can, because section 9 never relied on the route: every guarantee rests on one ID fixed at
+send and one durable seen-set at the **final** receiving host. A relay is one more route to the
+same contact. What a hub adds is a place where a copy can wait, so the work is in saying what
+custody means and how a sender learns where its copy is.
+
+**Shape.** The sender runs `serve relay` on the hub, over its link, with the envelope unchanged:
+same ID, same `to` (the final host), same sender proof. The hub's `agent-teams`:
+
+1. checks its relay policy (a `relay.json` beside its declarations: which spokes it relays for,
+   to which hosts, size and rate limits, `max_spool_bytes`), and that the envelope's `to.host`
+   is a host it relays to and not itself (a message for the hub's own teams goes to `accept`);
+2. refuses an envelope that already carries a relay trace (`refused: hop-limit`): **one relay
+   at most**, and never hub to hub (11.7);
+3. **takes custody**: creates `relay/<id>.json` in its spool by exclusive create under the
+   spool lock, recording the envelope, the authenticated spoke (from the key's forced command,
+   or `asserted` under `use_user_ssh_config`), the time and the spool's **epoch** (a random ID
+   written when the spool directory is created), and answers `in-custody`. A second submission
+   of the same ID returns the entry's current state; the same ID with a different body is a
+   `conflict`;
+4. forwards it as a sender would, with its own attempt records written before each attempt: an
+   `accept` over the hub's own route to the final host, or, for a spoke that only pulls, an
+   offer on that spoke's `serve pull --for <host>` (10.3); the final host's answer is recorded in
+   the spool entry (`forwarded: accepted`, `forwarded: refused`, a known state);
+5. appends one trace record to the envelope it forwards, outside the hashed body: `{"relay":
+   "hub-a", "from_peer": "host-b", "peer_auth": "key|asserted", "received_at": …, "epoch": …}`.
+
+**The final host decides everything.** `accept` on the final host verifies the coordinator,
+applies its own policy and claims the ID in its own ledger exactly as for a direct route (8.3,
+9.2). The hub never runs `accept` for another host, never writes another host's ledger, never
+applies a team's `accepts_from`, and never renders the message. The final host additionally
+checks the relay: its declaration lists the relays it accepts (`"accepts_relay_from":
+["hub-a"]`), the hop came from that hub's authenticated link, and the trace has exactly one
+record. It renders "proved on host-b, relayed by hub-a", because the claim that the envelope came
+from host-b is the hub's (the hub authenticated host-b's key; the final host authenticated the
+hub's). An optional end-to-end signature would remove that trust (question 22).
+
+**Two kinds of receipt.**
+
+| Receipt | From | Says | Is it delivery? |
+|---|---|---|---|
+| custody | the hub | `in-custody` (since, epoch), `forwarding` (last attempt, reason), `forwarded: <final answer>`, `withdrawn` | no; only `forwarded: accepted` or later tells the sender the final host has it |
+| end to end | the final host's ledger | the states of 8.4 | yes |
+
+The sender records `in-custody` (8.4), which is **not delivered** and exits 75 (not settled).
+`pump` then asks the hub (`serve relay-status ID`), which reports the custody state and caches
+the final host's answer once it has one, and may ask the final host directly over any route. As
+with SMTP's accepted responsibility, custody is a promise to try or to report, never a claim of
+delivery.
+
+**Ambiguity across hops.** The rules of 9.3 and 9.4 apply unchanged, with the final host as the
+contact and the hub as one of its routes; three additions keep the state small:
+
+- **An ambiguous submission to the hub** (the link dropped after the envelope was written) is
+  resolved by asking the hub `relay-status`, then the final host `receipt`. If both answer
+  unknown, the sender resends with the same ID to the same contact, over any route, the hub
+  included; any late copy is absorbed by the final ledger.
+- **At most one custody copy outstanding.** After an ambiguous or `in-custody` submission to one
+  hub, the sender submits that message to another hub only after the first answers a definite
+  state that proves its copy cannot be forwarded (`withdrawn`, or unknown together with a
+  withdrawal that bars the ID there). Two hubs both holding a copy would still deliver once,
+  because the final ledger decides, but two copies waiting in two spools are two things for a
+  person to chase; never two routes in flight after ambiguity.
+- **Proof of non-delivery comes from the final host, or from a hub that never sent.** A fence at
+  the final host (9.4) bars every copy, including one in a spool, which is then refused when it
+  arrives (`forwarded: refused (fenced)`). Where the final host cannot be reached, which is when
+  copies wait at a hub, `serve relay-withdraw ID` asks the hub instead: under the spool lock, if
+  the ID is unknown it writes a `withdrawn` entry (so a later submission is refused), and if it
+  is in custody and **every forward attempt so far was definite not-delivered** (no attempt
+  reached `sent`, and no pull offer was recorded), it marks it `withdrawn` and never forwards it.
+  Otherwise it answers `withdraw-refused: forwarded-or-ambiguous`, and the contact stays pinned.
+  A hub whose spool epoch differs from the one the sender recorded (the spool was lost or
+  restored) answers `epoch-changed`, which proves nothing; the contact stays pinned. A withdrawal
+  releases the contact under 9.4 only if the sender's own attempts to that contact over other
+  routes were all definite.
+
+**What "delivered" means when the hub holds it.** Nothing new: a message is delivered when the
+final host's ledger says so. A message held by a hub until `not_after` passes can no longer be
+delivered, because the final `accept` refuses an expired envelope. If any of the hub's forward
+attempts, or any of the sender's own attempts to that contact, was ambiguous, the sender ends
+`ambiguous-expired` (question 19's `resolve` settles it); if none was, the hub reports
+`expired-in-custody` and the sender ends `expired`. The hub's custody
+entries follow 9.2's retention rule (kept until 30 days past the envelope's own `not_after`), so
+the hub can never forget a `withdrawn` or `forwarded` ID while a copy could still be in flight.
+Once the final answer is recorded, the hub drops the body and keeps the metadata.
+
+**What the hub can read.** A store-and-forward hub holds the whole envelope, body included, in
+its spool (0700, under the owner's account, the same account as every other host here). A jump
+(10.3) holds nothing and reads nothing. By default `--private` messages do not take the hub relay
+(the relay route declares `"exposes_body": true`, which the walk skips for `--private`, 11.1),
+and a jump or direct route carries them. Encrypting bodies to the final host, so that a hub
+holds only ciphertext, is possible with the hosts' ssh keys but is not proposed now (question
+22).
+
+**The hub's own authentication.** A spoke's link to the hub uses a dedicated key with the forced
+command `agent-teams serve --stdio --peer <spoke>` (10.3), which binds every custody record to
+the spoke that handed it over; or the owner's ssh configuration (`use_user_ssh_config`, allowed
+permanently since 2026-10-25), in which case the hub records the peer as `asserted` and the final
+host renders it so. The hub forwards over its own route to the final host (its own key there) or
+by the final host's pull over that host's link to the hub (the puller's key on the hub), so the
+final host always authenticates the hub, never the original spoke.
+
+**Verbs and commands.** `serve` gains `relay`, `relay-status` and `relay-withdraw` (pure read
+for `relay-status`; the other two take the spool lock). On the hub, `agent-teams relay show
+[ID]` lists the spool and `agent-teams relay pump` runs forwarding (a timer or the link
+supervisor runs it). The sender's route is an ssh (or command) route with `"via_hub": true`,
+listed in each target's `routes` like any other.
+
+### 11.7 Why one relay, and not a general mesh
+
+A mesh in which any host forwards to any other, over several hops, would keep the exactly-once
+guarantee (the final ledger still decides) but is not worth building here:
+
+- **It buys nothing at this scale.** With a hub every spoke reaches, every pair has a path of at
+  most two hops, and a standby hub covers the hub's failure. A third hop helps only a host that
+  cannot reach any hub, which is a configuration to fix, not to route around.
+- **Every hop is another place a copy can wait.** The custody, withdrawal and epoch rules above
+  would apply at each hop, and a sender would need every hop's answer to prove non-delivery
+  before moving on; with two hops it needs one.
+- **Multi-hop needs a routing protocol.** Paths would have to be computed (or written by hand,
+  as UUCP bang paths were), kept current and protected against loops; netnews uses a `Path:`
+  history and SMTP counts `Received:` fields up to about a hundred (19). A hard one-relay rule,
+  as NATS's one-hop forwarding within a cluster, makes loops impossible instead of detected.
+- **Debugging stays local.** A message's whereabouts is one of: the sender's outbox, one hub's
+  spool, the final ledger.
+
+If the owner's hosts ever outgrow one star (sites with their own hubs), the extension is hubs
+that peer with each other as gateways do in NATS, still with a fixed, short hop limit; it is not
+designed here.
 
 ## 12. Agents that only take input when idle
 
@@ -1465,7 +1892,8 @@ bounds (`--deadline`, `--lock-timeout`, `--max-items`, the flags the helper in 2
 to agentctl as a prerequisite), types only `tm-*` items, and only while the head of the queue is
 one; with a chat prompt ahead, it leaves the queue to the bridge and reports
 `waiting-behind-chat`. Whether this local typing should live in `agent-teams drain` or only in
-`agentctl drain --only-prefix tm-` is question 13's second half; either way it is the receiving
+`agentctl drain --only-prefix tm-` is question 21 (left open when question 13 was decided; the
+default is `agent-teams drain`); either way it is the receiving
 host's own process (principle 1).
 
 ### 12.4 Older drainers must not see what they cannot honour
@@ -1476,11 +1904,17 @@ therefore go to a new lane, `queue/inbox.v2/`, which binaries before phase 2 nev
 drainers merge `inbox/` and `inbox.v2/` in enqueue order. Until a queue's drainers are new, its
 `inbox.v2/` items are typed only by the bounded team drain, and `accept` says so in the receipt
 when it finds a running drainer whose binary predates the lane (`agentctl capabilities` on that
-path). Every consumer that hardcodes the four phases must learn `inbox.v2/`, `cancel/` and
-`cancelled/`: agentctl's enqueue duplicate check and `message_state` (`agent.rs:1422`, `1839`) in
-both editions; the Python chat runtime's re-enqueue of a `received` item it cannot find
-(`py/agentctl/chat_runtime.py:784-797`); and the helper in 2.3. Local `agentctl send
---expires/--topic/--supersedes` is enabled only after that inventory covers every writer.
+path). Every Rust consumer that hardcodes the four phases must learn `inbox.v2/`, `cancel/` and
+`cancelled/`: agentctl's enqueue duplicate check and `message_state` (`agent.rs:1422`, `1839`),
+and the helper in 2.3 (or it becomes the wrapper of 15.1). The Python edition of agentctl gets no
+port of these features (question 11, proposed): it gets a **guard** instead. When a queue has an
+`inbox.v2/`, `cancel/` or `cancelled/` directory, or an item carries `not_after`, the Python
+edition refuses to drain, deliver or re-enqueue in that queue, and says to use the Rust edition.
+The guard has to cover the Python chat runtime's re-enqueue of a `received` item it cannot find
+(`py/agentctl/chat_runtime.py:784-797`), which would otherwise re-enqueue an item that had moved
+to a new lane, a duplicate. The cross-edition differential checks exactly that refusal. Local
+`agentctl send --expires/--topic/--supersedes` is enabled only after that inventory covers every
+writer.
 
 ## 13. Safety
 
@@ -1532,7 +1966,7 @@ The file in 2.3 maps onto `teams.json` as one team with one entry per host:
 | coordinators/v1 | teams.json |
 |---|---|
 | `hosts.<short>` | `hosts.<short>` and an entry `{host: <short>}` in the project's team |
-| `fqdn`, `ssh` | an `ssh` route in `routes.d` (with `use_user_ssh_config: true` until `ssh enroll` has run); a `command` route by hand where ssh is refused |
+| `fqdn`, `ssh` | an `ssh` route in `routes.d` (with `use_user_ssh_config: true`, which may stay; `ssh enroll` is optional, 10.3); a `command` route by hand where ssh is refused |
 | `herdr` | dropped: agent-teams never calls Herdr; the receiving host's agentctl knows its own |
 | `coordinator.name` | the entry's `coordinator` (informational) |
 | `coordinator.harness` | dropped; the declaration designates the coordinator |
@@ -1580,20 +2014,22 @@ agent-teams import --coordinators-file FILE --team NAME # convert, print only
 
 agent-teams init TEAM (--registry R | --coordinator-self) [--deliver agentctl-queue|hook-inbox|command]
 agent-teams send TEAM[@HOST] (--file F | --text T) [--key K] [--topic T] [--supersedes K]... [--ttl D | --expires TIME]
-    [--kind K] [--private] [--mirror-to-chat ROUTE] [--from-service NAME] [--allow-undeclared] [--allow-unexpiring] [--wait S] [--json]
+    [--kind K] [--private] [--no-chat] [--mirror-to-chat ROUTE] [--from-service NAME] [--allow-undeclared] [--allow-unexpiring] [--wait S] [--json]
 agent-teams reply ID --file F [--key K]
 agent-teams retract ID
 agent-teams status ID | outbox | pump [--retry-refused] | pull --for TEAM
-agent-teams relay-in --route R --peer-sender ID              # (target) the relay channel's one command: envelopes and receipts
+agent-teams relay-in --route R --peer-sender ID              # (target) a chat route's one command (DM or channel): envelopes and receipts
 agent-teams seen ID                                           # local ledger: has this ID been delivered here?
 agent-teams redeliver ID                                      # human only: show a delivered message again, marked as such
+agent-teams resolve ID (--fence | --mark-delivered)           # human only, on the receiving host: settle an ambiguous-expired message
 agent-teams hook                                              # harness hook for the hook-inbox deliverer
 agent-teams drain [--deadline S] [--lock-timeout S] [--max-items N]   # (target) types tm-* only
 
-agent-teams ssh enroll --peer HOST                            # make a key; print the authorized_keys line
+agent-teams ssh enroll --peer HOST [--jump-to TARGET]...      # make a key; print the authorized_keys line (a jump-only grant per TARGET on a hub)
+agent-teams relay show [ID] | pump                            # (hub) list the relay spool; forward what it holds
 agent-teams link run ROUTE | up ROUTE | down ROUTE | status [ROUTE]
 
-agent-teams serve --stdio --peer HOST                         # (target) forced command: accept, receipt, fence, probe, ping, pull, ack
+agent-teams serve --stdio --peer HOST                         # (target) forced command: accept, receipt, fence, probe, ping, pull, ack, relay, relay-status, relay-withdraw
 agent-teams accept --protocol 1 [--team T] [--via relay:ROUTE --peer-sender ID] (--envelope - | --envelope-base64 B)
 agent-teams receipt ID | fence ID | probe --json              # (target) receipt and probe are pure reads; fence takes the ledger lock
 
@@ -1601,7 +2037,8 @@ agentctl send NAME --file F [--expires TIME] [--topic T] [--supersedes ID]   # g
 ```
 
 Global: `--teams FILE` (default `$AGENT_TEAMS_FILE`, then
-`$XDG_CONFIG_HOME/agent-teams/teams.json`) and `--routes DIR`.
+`$XDG_CONFIG_HOME/agent-teams/teams.json`) and `--routes DIR` (repeatable; added after `routes.d/` and
+`$AGENT_TEAMS_ROUTES_PATH`, 6.3).
 
 Exit status extends `agentctl send`'s 0, 75 and 76 with 65 for terminal non-delivery, which
 `agentctl send` does not need:
@@ -1609,7 +2046,7 @@ Exit status extends `agentctl send`'s 0, 75 and 76 with 65 for terminal non-deli
 | Exit | Meaning | Safe to re-run the same command? |
 |---|---|---|
 | 0 | `delivered`, or `journaled` for a session contact | yes; it reports the same state |
-| 75 | not settled: `accepted`, `deferred`, `awaiting-pull`, or `--wait` ended first | yes; the ID makes it a retry |
+| 75 | not settled: `accepted`, `deferred`, `awaiting-pull`, `in-custody`, or `--wait` ended first | yes; the ID makes it a retry |
 | 76 | uncertain: `ambiguous`, `ambiguous-expired`, `possibly_submitted`, `lost` | yes; it asks, it never resends blind |
 | 65 | terminal and undelivered: `expired`, `superseded`, `retracted`, `refused` (including every contact refused or fenced), `journaled-halted`, retract too late | yes; nothing new is sent |
 | 2 | usage or configuration | n/a |
@@ -1618,28 +2055,41 @@ Exit status extends `agentctl send`'s 0, 75 and 76 with 65 for terminal non-deli
 
 1. **P0: extract the shared library.** Queue format, enqueue duplicate check, harness identity
    and ancestry into `agent-queue`, with agentctl switched to it and no behaviour change; the
-   Python edition documented against the same format. (Coordinated with the suite-factoring
-   lane's audit.)
+   queue format documented with the crate. (Coordinated with the suite-factoring lane's
+   audit.)
 2. **P1: read-only model.** `teams.json` and `routes.d` parsers with schema and comment handling,
    `teams show`, `probe`, `check`, `discover` (proposal only), `import`. Surfaces I1, I2 and I4
    with no change to delivery.
-3. **P2: queue lanes and cancellation** in the library and both agentctl editions: `inbox.v2/`,
+3. **P2: queue lanes and cancellation** in the library and the Rust agentctl: `inbox.v2/`,
    `cancel/`, `cancelled/`, `not_after`, the pre-paste re-check, bounded drain flags, the 12.4
-   inventory, with cross-edition differential cases.
+   inventory; in the Python edition only the guard that refuses queues using the new lanes
+   (question 11), with cross-edition differential cases for that refusal.
 4. **P3: exactly-once core and local delivery.** Declarations, ledger with claim, fence and
    recovery; `accept`, `receipt`, `fence`, `serve`; deliverers `agentctl-queue` and
    `hook-inbox`; `send`, outbox, the walk, `status`, `pump`, `retract`; sender proof
    (coordinator, service) with a test per mode; the `local` route. **The model-based harness of
    9.7 lands in this phase, before any network route.**
-5. **P4: network routes.** The `ssh` driver with `enroll`, the restricted forced command and its
-   own known-hosts; links (`on-demand`, `persistent`) and pull; the `command` driver in host and
-   session modes; route health; the harness extended with each driver's fault model.
-6. **P5: replies, policy, migration, relay.** `reply`, `pull`, `accepts_from` with kinds,
-   operator grants, limits, retention; the helper in 2.3 as a wrapper; the bridge's generic
-   relay-channel admission and the relay route; the shared-pane range check in `chat run`.
+5. **P4: network routes and the star.** The `ssh` driver with `use_user_ssh_config` first (it
+   needs no trial), then `enroll`, the restricted forced command and its own known-hosts; links
+   (`on-demand`, `persistent`) and pull; the `topology` object, spoke links to the hub and
+   `no-hub-link` checks; the `jump` option and jump-only grants; the `command` driver in host and
+   session modes; route health; the harness extended with each driver's fault model. **Live
+   trials** (9.7) of dedicated keys, persistent and pull links, and jumps, each recorded before
+   the owner lists it in `trials`.
+6. **P5: replies, policy, migration, chat DM.** `reply`, `pull`, `accepts_from` with kinds,
+   operator grants, limits, retention, `resolve`; the helper in 2.3 as a wrapper; the bridge's
+   generic coordinator-peer admission class and the chat DM route (10.7), with its rate limit
+   and `--no-chat`; the upstream bot-author filter's exception for listed peers, if the owner of
+   that client agrees (otherwise the rescan carries DMs); the `agent-teams` skill with the
+   sparing-use rule; the shared-pane range check in `chat run`; a live trial of the DM route.
+7. **P6: the hub relay** (11.6). The spool with custody, epoch and withdrawal; `serve relay`,
+   `relay-status`, `relay-withdraw`; forwarding by push and by the target's pull; the final
+   host's `accepts_relay_from` and trace check; `in-custody` on the sender. The harness's relay
+   faults (9.7) land first, then a live trial with the hub stopped while holding a message.
 
 P1 and P2 are independent of each other once P0 is done. Fixing I3 for ordinary local sends waits
-for P2 and its inventory.
+for P2 and its inventory. P6 needs P4's links and pull, not P5. The shared coordinator channel of
+10.6 is in no phase until the owner has reviewed it.
 
 ## 18. Questions for the owner
 
@@ -1651,13 +2101,47 @@ Numbers 1-11 keep revision 1's numbering; 12 onward are new.
   (6.1). Owner, 2026-10-24.
 - **8. Workers as senders:** only coordinators, plus registered services, which this design keeps
   explicitly for operational alerts (8.2). Workers neither send nor receive. Owner, 2026-10-24.
+- **12, second half. The owner's own ssh configuration.** Asked "May routes use your own ssh
+  config during migration, and should that expire?", the owner answered "Sure and no. But good
+  to test any other mechanism we propose." (2026-10-25). `use_user_ssh_config` is allowed and
+  never expires: a permanent mode, not a migration step (10.3). Every other mechanism is relied on
+  only after tests and a recorded live trial (9.7). The first half (dedicated keys) stays open.
+- **13. Where it lives.** "Yes and let's just name it agent-teams for now." (2026-10-25): a
+  separate `agent-teams` binary on an extracted `agent-queue` crate (4). Its sub-question, where
+  bounded local typing lives, is open as question 21.
+- **15, partly. Chat between coordinators.** "Not yet. I'll review the design if it's in there.
+  But for starters I want just dms to other coordinators with clear tagging. [Coord1 <host> ->
+  coord 2 <host>]. The agents seem to usually want to label their inter agent messages but are
+  inconsistent in how they do it. Our agent team skill needs to emphasize to be use it sparingly
+  if using the chat based channel. If going to an underlying this with the human on the chat it
+  doesn't matter so much." (2026-10-25; host names redacted). No shared coordinator channel for
+  now: 10.6 is kept for review and is in no phase. The first chat route is a direct message to
+  the other coordinator's conversation (10.7). Every route carries one fixed team tag (8.1). The
+  `agent-teams` skill tells agents to use the chat route sparingly; host routes need no such
+  restraint (10.7). Still open: one bridge app per team for the shared channel, if it comes back,
+  and the questions the DM raises (23, 24, 26).
+- **17. Private route files.** "Company internal I don't care where exactly. Git ignored
+  files." A more durable copy may live in a private repository the owner keeps (2026-10-25;
+  quote shortened to leave out a private path). Private routes go in git-ignored
+  `*.private.json` files, found through `routes.d/`, `AGENT_TEAMS_ROUTES_PATH` and `--routes`;
+  the public repository ships placeholders only (6.3).
+- **18. Hook-only teams.** "18 yes." (2026-10-25): the `hook-inbox` deliverer is accepted for
+  teams without agentctl, with its limit that it never wakes an idle agent (4.4).
+- **19. Unresolvable ambiguity.** "uh sure whatever you recommend. Don't care." (2026-10-25):
+  the recommendation stands. A human-only `agent-teams resolve ID (--fence | --mark-delivered)`,
+  run on the receiving host when it is reachable again, settles an `ambiguous-expired` message
+  (16).
+- **20. Test budget.** "I think it makes sense to repeat the split of regression tests plus
+  optional or nightly soak" (2026-10-25): a bounded harness pass in the regular gate, under a
+  minute, and a soak as an optional target that the nightly workflow runs, with failing seeds
+  kept as artifacts and added to the gate's fixed list (9.7).
 
 **Open**
 
 1. **Where do `teams.json` and `routes.d` live across hosts?** Recommendation: a copy of
    `teams.json` and the public routes on every host from a dotfiles repository; private route
-   files (question 17) from a private one. Senders work from their local copy; staleness is handled by
-   the checks.
+   files as decided under question 17. Senders work from their local copy; staleness is handled
+   by the checks.
 2. **Default entry** for `send proj` when a team has entries on several hosts. Recommendation:
    the sender's own host, then `primary`, then refuse.
 3. **May `accept` ever type?** Principle 1 would allow it (it runs on the receiving host), but
@@ -1675,32 +2159,83 @@ Numbers 1-11 keep revision 1's numbering; 12 onward are new.
    never reopen an ID)? And should this work also prune agentctl's `processed/`?
 10. **Clock skew.** A 2 s cross-host tolerance for topic order, or require one sending host per
     topic?
-11. **Editions.** `agent-teams` in Rust only; the queue changes of P2 in both agentctl editions.
-12. **ssh access.** A dedicated key per host pair, restricted by a forced command to the
-    protocol, installed by you by hand (recommended)? May routes opt into your own ssh
-    configuration and agent during migration (`use_user_ssh_config`), and should that opt-in
-    expire?
-13. **Where it lives.** A separate `agent-teams` binary sharing an extracted `agent-queue` crate
-    (recommended, section 4), or subcommands of agentctl? Which name? And should the bounded
-    local typing of team items be `agent-teams drain` or `agentctl drain --only-prefix tm-`?
-14. **Links.** Which host pairs get a persistent link (a user unit you install) versus on-demand
-    connections? For pairs reachable in one direction only, is the pull link (10.3) acceptable?
-15. **Chat relay.** Do you want a shared coordinator channel at all? If so: one bridge app (or
-    bot user) per team, so the poster identifies the team; and the bridge change of 10.6 (a
-    relay-channel admission class, separate from `allowed_senders`, whose posts are never typed).
-16. **Bodies in a channel.** May non-private message bodies appear in a relay channel, or should
-    the relay carry only the ID, with the body fetched over a host route?
-17. **Private route files.** Where should company-internal route definitions live, and should the
-    public repository ship only placeholder examples (recommended)?
-18. **Hook-only teams.** Is the `hook-inbox` deliverer acceptable for teams without agentctl,
-    given that it never wakes an idle agent (4.4)?
-19. **Unresolvable ambiguity.** A message pinned to a contact that never answers ends
-    `ambiguous-expired`. Should a human-only `agent-teams resolve ID (--fence | --mark-delivered)`
-    exist, run on the receiving host when it is reachable again?
-20. **Test budget.** How many seeds of the model-based harness per gate run (a bounded run,
-    under a minute), with a longer soak where?
+11. **Editions** (proposed by the coordinator on 2026-10-25, awaiting your OK). You asked: "Wait
+    I thought we were staying. All rust or rust by default. Why do we need to write python for
+    this?" Proposal: `agent-teams` in Rust only, with no feature port to the Python edition of
+    agentctl. In P2 the Python edition gets only a guard: it refuses to drain, deliver or
+    re-enqueue in a queue that uses the new lanes (`inbox.v2/`, `cancel/`, `not_after`) and
+    points to the Rust edition; the cross-edition differential checks just that refusal (12.4).
+    Whether the repository as a whole goes Rust by default is out of scope here.
+12. **Dedicated keys** (first half). A dedicated key per host pair (per spoke, in the star),
+    restricted by a forced command to the protocol, installed by you by hand? Recommendation:
+    keep them **optional**. `use_user_ssh_config` is a permanent supported mode (resolved above),
+    and dedicated keys are offered where stronger attribution or least access is wanted, once
+    their live trial is recorded.
+14. **Topology.** Your answer pointed at a star of persistent links and asked whether messages can
+    route through it. Recommendation (11.5-11.7): one hub named in `teams.json`; every spoke
+    dials one persistent link to it (n-1 links; one-way-reachable spokes work by pull over their
+    own link); spoke to spoke goes direct when an on-demand route exists, else by an ssh jump
+    through the hub, else by a store-and-forward relay at the hub that keeps the exactly-once
+    rules with the final host as the only authority; one relay at most, no general mesh. Do you
+    accept the star with one relay, and the hub relay as phase P6?
+16. **Bodies in a shared channel** (deferred with 10.6). If the shared channel comes back, may
+    non-private bodies appear in it, or should it carry only the ID, with the body fetched over a
+    host route? (In the DM route, bodies are visible to you by design; `--private` messages never
+    take a chat route.)
+21. **Bounded local typing** (from question 13). `agent-teams drain` (the default here, calling
+    the shared crate) or `agentctl drain --only-prefix tm-` (12.3)?
+22. **What the hub may hold.** The hub relay stores whole envelopes, bodies included, until the
+    final answer (then metadata only). Recommendation: accept that for non-private messages (the
+    hub runs under your account, as every host does); keep `--private` messages off the hub (a
+    jump or a direct route carries them); and add, later and optionally, an end-to-end signature
+    by the origin host (`ssh-keygen -Y sign`, verified at the final host) so the final host need
+    not trust the hub's claim of origin. Encrypting bodies for the final host is not proposed.
+23. **Your posts in a pair conversation.** Where a DM route needs a conversation made for the
+    pair (10.7), both bridges may watch it. Should your posts there be refused (the default, to
+    rule out two bridges typing one message, I2), or be requests to one coordinator, and which?
+24. **The last sentence of your question-15 answer** ("If going to an underlying this with the
+    human on the chat it doesn't matter so much") was garbled in transcription. The design reads
+    it as: use the chat route sparingly because you read it; host routes need no such restraint.
+    Is that the meaning, or did you mean that messages going into a conversation you are already
+    in need less restraint?
+25. **Which host is the hub, and is the standby persistent?** Recommendation: the host every other
+    host can reach and that stays up; one standby, `on-demand` (2(n-1) links only if you want the
+    standby kept open).
+26. **The bot-author filter.** The provider client's tail drops bot-authored posts, so DMs arrive
+    only through the bridge's rescan (up to about 90 s late). Ask that client's maintainers for an
+    exception for listed peer IDs, or accept the rescan latency for a last-resort route
+    (recommended to start)?
 
-## 19. Related designs
+## 19. Related work
+
+### 19.1 Cross-host agent messaging and topology (revision 3)
+
+The owner asked how Gas Town and others manage cross-host messaging and which pairs get standing
+connections. The full comparison, with sources, commits read, and what was read versus recalled,
+is the draft [`RELATED_WORK.md`](2026-10-24-agentctl-team-messaging/RELATED_WORK.md) for the
+future tool. In short:
+
+| System | Cross-host shape | Standing connections | Relay | Duplicate control |
+|---|---|---|---|---|
+| Gas Town | agents live on one town host; remote workers call it through an mTLS proxy that injects their certificate identity; towns share state through a Dolt hub, with no town-to-town messages yet | star | none for messages | idempotent two-phase acks; sends not idempotent |
+| MCP Agent Mail | one HTTP server every agent calls | star | none | none found for sends |
+| Ruflo (Claude Flow) federation | peer-to-peer WebSocket sessions; "no DERP-equivalent relay" | pairwise | none | new envelope ID per send |
+| AutoGen distributed runtime | workers dial a host servicer over gRPC | star | the host, in memory only | none; cancelled on disconnect |
+| A2A | direct HTTPS calls to an advertised endpoint | none | none | `messageId` dedupe optional |
+| NATS | full mesh in a cluster with a one-hop rule; dialled-out leaf nodes in acyclic trees | mesh, then tree | one hop | `Nats-Msg-Id` window |
+| Matrix | servers push directly, per-pair `txnId`, no new txn until the last is acknowledged | none | none | per-hop txn + end-to-end event ID |
+| ssh `ProxyJump`, Tailscale DERP | ciphertext through a jump host or relay | optional | transport only | n/a |
+| SMTP, UUCP, netnews | store and forward with trace headers | none | many hops | netnews `Message-ID` history; mail loop counts |
+
+What the design takes: the star whose spokes dial out (AutoGen, Gas Town's proxy, NATS leaf
+nodes); a hard one-relay limit instead of loop detection (NATS); custody as a promise distinct
+from delivery, and a trace of hops (SMTP); an end-to-end ID checked against a durable history at
+the receiver only (netnews, JetStream); per-hop answers before moving on (Matrix); a
+transport-only relay where it suffices (`ProxyJump`, DERP); and credentials that name the peer
+(Gas Town's proxy certificates, forced-command keys). What none of them has is the terminal
+composer at the end, typed into by one local program only when the agent is idle.
+
+### 19.2 Designs behind sections 8-12
 
 Store-and-forward mail (an outbox, per-hop receipts, delivery status notifications) is the closest
 analogy for the outbox and receipt states; message expiry plays the role of a delivery deadline.
@@ -1717,8 +2252,8 @@ hook drains at the next turn boundary, the model for the hook deliverer; CLI Age
 marks a message delivered before the paste so a crash cannot deliver twice, the same choice as
 agentctl's `inflight/` rename (`common/docs/agentctl/RELATED_WORK.md:123-140`). None of them has
 the constraint that shapes this design: the final hop is a terminal composer that only one local
-program may type into, and only when the agent behind it is idle. A `RELATED_WORK.md` for
-`agent-teams` is required when the tool is created.
+program may type into, and only when the agent behind it is idle. The `RELATED_WORK.md` the tool
+needs starts from the draft named in 19.1.
 
 ## 20. Review record
 
@@ -1769,3 +2304,32 @@ exit codes were aligned with `agentctl send`.
   uncertain `presented` state (9.5); the worker restriction's limit under cgroup-only isolation is
   stated (8.2); topic supersede counts only messages taken for delivery (12.1); the state table,
   exit table and CLI were completed (8.4, 16).
+
+**Revision 3** (2026-10-25, owner answers, then one adversarial review):
+
+- Resolved with the owner's words: question 12's second half (`use_user_ssh_config` allowed and
+  never expiring; every other mechanism needs tests and a recorded live trial, 9.7, 10.3), 13
+  (`agent-teams`, a separate binary on `agent-queue`), 15 in part (no shared channel yet; a
+  direct-message chat route; one tag; sparing use), 17 (git-ignored `*.private.json` route files
+  on a search path, 6.3), 18 (`hook-inbox` accepted), 19 (`resolve` as recommended) and 20 (gate
+  pass plus nightly soak, 9.7). Question 11 rewritten as a Rust-only proposal awaiting the
+  owner: the Python edition only refuses queues that use the new lanes (12.4, 17).
+- Topology (11.5): a star of persistent links named in `teams.json`'s `topology`, dialled by the
+  spokes, with pull for the reverse direction, on-demand direct routes where they pay, a standby
+  hub, and no automatic failover of messages in custody.
+- Relay (11.6, 11.7): the `jump` option for ssh routes (`ProxyJump` through the hub, end to end);
+  a store-and-forward hub relay with custody receipts distinct from end-to-end receipts, spool
+  epochs, `relay-withdraw` as the only hub-side proof of non-delivery, at most one custody copy
+  outstanding, one relay at most, the final host as the only authority, and a statement of what
+  the hub can read; why a general mesh is not worth it. New sender state `in-custody` (8.4, 16);
+  phase P6 (17).
+- One machine-parsable team tag, `[sender host -> team host id]`, defined once and written by
+  agent-teams on every route and in the rendered paste (8.1).
+- The chat DM route (10.7), with the two bridge blockers (the upstream bot-author filter, so only
+  the rescan sees peer posts; admission limited to `allowed_senders`) and the coordinator-peer
+  admission class that fixes them; the shared channel of 10.6 deferred pending the owner's
+  review.
+- Related work (19.1 and a draft `RELATED_WORK.md`): Gas Town, MCP Agent Mail, Ruflo, AutoGen,
+  A2A, NATS, Mosquitto, Matrix, Tailscale DERP, OpenSSH, and SMTP, UUCP and netnews (the last
+  three recalled, because every fetch of the RFCs was refused).
+- Model-harness relay faults and invariants (9.7); new questions 21-26 (18).
