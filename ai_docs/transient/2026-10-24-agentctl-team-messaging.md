@@ -154,6 +154,15 @@ answered by sending again.
   the caller's own session in a registry (`embedded_userguide.md:1175-1190`).
 - **No caller identity variable.** agentctl sets no environment variable naming the agent a
   process belongs to; identity has to be proved (section 8.2).
+- **No coordinator designation of its own, and no parent edges** (revision 3, checked at
+  `e707ba70`). An agent record carries no `started_by`, parent or spawner field: nothing records
+  which agent started which. "The coordinator" exists only in scattered, per-consumer places:
+  the optional `coordinator` key of `REGISTRY/restore.json`, read by `restore` alone
+  (`embedded_userguide.md:578, 611`); the `--coordinator NAME` argument each `watch-agents`
+  invocation is given (`cli.rs:278`); the one agent a chat bridge's `chat.json` routes to; and
+  wrkslots' per-slot coordinator process ID (2.2), which the caller supplies. They can disagree,
+  and none is kept current by `rename` or `adopt`. A user of agentctl alone, without team
+  messaging, has no one place that says which agent is the coordinator.
 - **No ssh.** agentctl itself never runs ssh today.
 
 ### 2.2 wrkslots
@@ -164,8 +173,9 @@ process ancestry may stop at the box's relay.
 
 ### 2.3 A consuming project's per-host coordinators file
 
-One consuming project keeps a file (schema `<project>/coordinators/v1`) that answers "where do
-operational alerts go?" per host: a name and optional ssh target, an optional Herdr binary, and
+One consuming project keeps a file (schema `<project>/coordinators/v1`; it belongs to that
+project, and neither agentctl nor this design owns it) that answers "where do operational alerts
+go?" per host: a name and optional ssh target, an optional Herdr binary, and
 a `coordinator` with ordered `contacts`: `agentcloud` (a session, delivered with `agentcloudctl
 notify` in its default mode, so alerts arrive as `[operator]` system reminders), `agentctl`
 (`agent`, `registry`, `bin`, `herdr_bin`, optional `bridge_unit`), and `herdr` (refused since
@@ -268,7 +278,7 @@ Reading revision 1 for every agentctl dependency gives a short list:
 | The queue directory format, enqueue with duplicate check, the new lane, tombstones and `not_after` | no: it is the delivery queue | a shared library |
 | The pre-paste re-check of tombstones and expiry | no, but it runs inside the drain | the drain (agentctl), via the library |
 | Harness identity: `(boot_id, pid, starttime_ticks)`, ancestry walk, pinning | no: it is process identity | the shared library |
-| "Who is this registry's coordinator?" | yes, a fact agentctl owns | agentctl writes it; teams read it |
+| "Who is this registry's coordinator?" | yes, a fact agentctl owns | agentctl's registry-level designation (P0b, 17); teams read it |
 | Record liveness (lifecycle, pane resolves) | yes | agentctl, as `agentctl status --json` |
 | Typing into a pane | yes | agentctl only (principle 1) |
 
@@ -322,8 +332,8 @@ another controller of agents. **Decided** (question 13, 2026-10-25): option B, n
   (the `inbox.v2/` lane with a lock-free enqueue, `not_after`, `cancel/` tombstones,
   `cancelled/`, and an optional **external delivery record**: a file path an item may carry,
   which the drain updates before and after the paste and which makes `withdraw` refuse the
-  item; 9.2, 9.5), useful to local sends too, and a generic "coordinator designation" it
-  already half has (`restore.json`'s `coordinator`).
+  item; 9.2, 9.5), useful to local sends too, and the registry-level coordinator designation of
+  P0b (17), which agentctl needs for itself (2.1) and team messaging only reads.
 - The chat bridge knows nothing about teams. It gains one optional, generic feature: a channel
   marked as a relay channel, whose admitted peer posts are piped to a configured command instead
   of being typed (section 10.6).
@@ -2057,37 +2067,57 @@ Exit status extends `agentctl send`'s 0, 75 and 76 with 65 for terminal non-deli
    and ancestry into `agent-queue`, with agentctl switched to it and no behaviour change; the
    queue format documented with the crate. (Coordinated with the suite-factoring lane's
    audit.)
-2. **P1: read-only model.** `teams.json` and `routes.d` parsers with schema and comment handling,
+2. **P0b: the coordinator designation in agentctl** (revision 3; proposed, question 27). An
+   agentctl feature in its own right, useful without team messaging, closing the gap in 2.1:
+   - **One designation per registry**, `REGISTRY/coordinator.json` (`{"schema":
+     "agentctl-coordinator/v1", "name", "token", "set_at", "set_by"}`), set with `agentctl
+     coordinator set NAME`, read with `agentctl coordinator show [--json]`, removed with
+     `coordinator clear`. `adopt --as-coordinator` and `attach-self --as-coordinator` set it in
+     the same step; `rename` carries it to the new name; `stop` of the designated agent leaves
+     it naming an archived record, which `show` and `status` report as `coordinator-stopped`.
+   - **Its consumers read it**: `restore` (whose `restore.json` `coordinator` becomes optional
+     and must agree with it when present), `watch-agents` (`--coordinator` defaults to it),
+     `chat run` (its target agent, when `chat.json` names none, and a warning when it names
+     another), and wrkslots, which can take the designated record's pinned harness process ID
+     instead of a caller-supplied `--coordinator-pid`.
+   - **A `started_by` edge on every record**, written by `agentctl start` from the caller's
+     proved identity: the ancestry walk of 8.2 finds the harness of a registered record
+     (`{"agent", "registry", "token", "proof": "harness-ancestry"}`), or else the record says
+     `unproved` (a human at a shell, a timer). It is informational: `status` and `list --tree`
+     show who started whom, and nothing grants authority from it.
+   - agent-teams reads the designation (6.4's `"designation": "registry"`) and never writes it.
+3. **P1: read-only model.** `teams.json` and `routes.d` parsers with schema and comment handling,
    `teams show`, `probe`, `check`, `discover` (proposal only), `import`. Surfaces I1, I2 and I4
    with no change to delivery.
-3. **P2: queue lanes and cancellation** in the library and the Rust agentctl: `inbox.v2/`,
+4. **P2: queue lanes and cancellation** in the library and the Rust agentctl: `inbox.v2/`,
    `cancel/`, `cancelled/`, `not_after`, the pre-paste re-check, bounded drain flags, the 12.4
    inventory; in the Python edition only the guard that refuses queues using the new lanes
    (question 11), with cross-edition differential cases for that refusal.
-4. **P3: exactly-once core and local delivery.** Declarations, ledger with claim, fence and
+5. **P3: exactly-once core and local delivery.** Declarations, ledger with claim, fence and
    recovery; `accept`, `receipt`, `fence`, `serve`; deliverers `agentctl-queue` and
    `hook-inbox`; `send`, outbox, the walk, `status`, `pump`, `retract`; sender proof
    (coordinator, service) with a test per mode; the `local` route. **The model-based harness of
    9.7 lands in this phase, before any network route.**
-5. **P4: network routes and the star.** The `ssh` driver with `use_user_ssh_config` first (it
+6. **P4: network routes and the star.** The `ssh` driver with `use_user_ssh_config` first (it
    needs no trial), then `enroll`, the restricted forced command and its own known-hosts; links
    (`on-demand`, `persistent`) and pull; the `topology` object, spoke links to the hub and
    `no-hub-link` checks; the `jump` option and jump-only grants; the `command` driver in host and
    session modes; route health; the harness extended with each driver's fault model. **Live
    trials** (9.7) of dedicated keys, persistent and pull links, and jumps, each recorded before
    the owner lists it in `trials`.
-6. **P5: replies, policy, migration, chat DM.** `reply`, `pull`, `accepts_from` with kinds,
+7. **P5: replies, policy, migration, chat DM.** `reply`, `pull`, `accepts_from` with kinds,
    operator grants, limits, retention, `resolve`; the helper in 2.3 as a wrapper; the bridge's
    generic coordinator-peer admission class and the chat DM route (10.7), with its rate limit
    and `--no-chat`; the upstream bot-author filter's exception for listed peers, if the owner of
    that client agrees (otherwise the rescan carries DMs); the `agent-teams` skill with the
    sparing-use rule; the shared-pane range check in `chat run`; a live trial of the DM route.
-7. **P6: the hub relay** (11.6). The spool with custody, epoch and withdrawal; `serve relay`,
+8. **P6: the hub relay** (11.6). The spool with custody, epoch and withdrawal; `serve relay`,
    `relay-status`, `relay-withdraw`; forwarding by push and by the target's pull; the final
    host's `accepts_relay_from` and trace check; `in-custody` on the sender. The harness's relay
    faults (9.7) land first, then a live trial with the hub stopped while holding a message.
 
-P1 and P2 are independent of each other once P0 is done. Fixing I3 for ordinary local sends waits
+P1 and P2 are independent of each other once P0 is done. P0b needs nothing else and is needed
+by P3, whose declarations read the designation. Fixing I3 for ordinary local sends waits
 for P2 and its inventory. P6 needs P4's links and pull, not P5. The shared coordinator channel of
 10.6 is in no phase until the owner has reviewed it.
 
@@ -2205,6 +2235,13 @@ Numbers 1-11 keep revision 1's numbering; 12 onward are new.
     only through the bridge's rescan (up to about 90 s late). Ask that client's maintainers for an
     exception for listed peer IDs, or accept the rescan latency for a last-resort route
     (recommended to start)?
+27. **The coordinator as an agentctl concept** (P0b, 17). You asked whether, without agent-teams,
+    you still get to know which agent is the coordinator, or only pairs of panes. Today agentctl
+    has no parent edges and no single designation (2.1). Proposal: a registry-level coordinator
+    designation (`agentctl coordinator set|show|clear`) that `restore`, `watch-agents`, the chat
+    bridge and wrkslots read, plus an informational `started_by` edge on every record written by
+    `agentctl start` from the caller's proved identity; agent-teams only reads the designation.
+    Do you confirm, and should it land before team messaging starts?
 
 ## 19. Related work
 
@@ -2332,4 +2369,7 @@ exit codes were aligned with `agentctl send`.
 - Related work (19.1 and a draft `RELATED_WORK.md`): Gas Town, MCP Agent Mail, Ruflo, AutoGen,
   A2A, NATS, Mosquitto, Matrix, Tailscale DERP, OpenSSH, and SMTP, UUCP and netnews (the last
   three recalled, because every fetch of the RFCs was refused).
-- Model-harness relay faults and invariants (9.7); new questions 21-26 (18).
+- The coordinator designation as an agentctl feature independent of teams (P0b): the gap stated
+  in 2.1, a registry-level designation its own consumers read, and an informational
+  `started_by` edge (17, question 27).
+- Model-harness relay faults and invariants (9.7); new questions 21-27 (18).
