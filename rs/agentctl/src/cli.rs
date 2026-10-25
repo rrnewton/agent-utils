@@ -52,9 +52,8 @@ struct Cli {
     /// Terminal multiplexer backend: herdr (default) or tmux. Default:
     /// $AGENTCTL_TERM_BACKEND when set and nonempty, else the profiles.json
     /// `term_backend` key, else herdr when its executable is available, else tmux.
-    /// The tmux backend drives the durable direct-pane transport
-    /// (herdr-agent send/drain/status/read against an explicit pane); agent
-    /// lifecycle commands still require Herdr in this step
+    /// Both backends run the full agent lifecycle and the durable direct-pane
+    /// transport; the chat, inbox, restore, and watch services remain Herdr-only
     #[arg(long, global = true, value_parser = parse_term_backend, value_name = "BACKEND")]
     term_backend: Option<String>,
     /// tmux executable name on PATH or an explicit path (tmux backend only)
@@ -102,9 +101,9 @@ enum Commands {
     Profiles(Profiles),
     /// Install the bundled agentctl harness skill
     Skill(Skill),
-    /// Register an existing Herdr agent without taking ownership of its runtime; Muse requires a pinned foreground process
+    /// Register an existing agent in a Herdr or tmux pane without taking ownership of its runtime; Muse requires a pinned foreground process
     #[command(
-        after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
+        after_help = "Examples:\n  agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex\n  agentctl --term-backend tmux adopt reviewer --pane %2 --workspace project --cwd /work/project --harness claude"
     )]
     Adopt(Adopt),
     /// Show, set, or clear this registry's designated coordinator: the root of the control tree, the agent watch-agents and restore notify when no nearer manager is recorded
@@ -552,9 +551,9 @@ struct Start {
     /// Execution mode; headless workers require an installation with the worker extension
     #[arg(long, value_parser = ["interactive", "headless"])]
     mode: Option<String>,
-    /// Terminal host; interactive Rust agents require Herdr
-    #[arg(long, default_value = "herdr", value_parser = ["herdr", "tmux"])]
-    backend: String,
+    /// Terminal host for the new record: herdr or tmux (default: the selected terminal backend, see --term-backend)
+    #[arg(long, value_parser = ["herdr", "tmux"])]
+    backend: Option<String>,
     /// Herdr harness kind; Codex, Claude, and Muse have model presets; agentcloud creates an agentcloud session viewed through agentterm
     #[arg(long)]
     harness: Option<String>,
@@ -672,16 +671,16 @@ struct SkillInstall {
 struct Adopt {
     #[command(flatten)]
     agent: Named,
-    /// Exact live Herdr pane containing the agent (required)
+    /// Exact live pane containing the agent, in the selected backend's spelling (required)
     #[arg(long, value_name = "ID")]
     pane: String,
-    /// Expected live Herdr workspace label; a mismatch is refused (required)
+    /// Expected live workspace (tmux session) label; a mismatch is refused (required)
     #[arg(long, value_name = "LABEL")]
     workspace: String,
     /// Expected live agent working directory; compared canonically (required)
     #[arg(long, value_name = "DIR")]
     cwd: PathBuf,
-    /// Expected live Herdr harness kind, such as codex, claude, or muse (required)
+    /// Expected live harness kind, such as codex, claude, or muse (required)
     #[arg(long, value_name = "KIND")]
     harness: String,
     /// Stable native conversation ID already reported by this exact pane
@@ -1570,22 +1569,34 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
     // Directory and manifest I/O is lazy. Session-control commands never inspect the user plugin
     // home; capability inspection and an actual plugin runtime startup own discovery.
     let plugin_inventory = plugin_discovery_required(&command).then(crate::plugins::discover);
-    if args.term_backend.as_deref() == Some("tmux")
-        && matches!(
-            command,
-            Commands::Chat(_)
-                | Commands::Inbox(_)
-                | Commands::Restore(_)
-                | Commands::Watch(_)
-                | Commands::WatchAgents(_)
-                | Commands::InstallUnits(_)
+    if matches!(
+        command,
+        Commands::Chat(_)
+            | Commands::Inbox(_)
+            | Commands::Restore(_)
+            | Commands::Watch(_)
+            | Commands::WatchAgents(_)
+            | Commands::InstallUnits(_)
+    ) {
+        // These remain Herdr services on the tmux backend too; refuse an
+        // explicitly selected tmux here rather than silently driving Herdr.
+        // A merely detected tmux (no Herdr installed) falls through so the
+        // Herdr client reports its usual not-found error.
+        let (selected, explicit) = crate::term::select_backend(
+            args.term_backend.as_deref(),
+            environment,
+            &args.registry,
+            &args.herdr_bin,
+            &args.tmux_bin,
         )
-    {
-        return Err(Failure::Usage(
-            "this command is a Herdr service and does not run on the tmux terminal backend; \
-             select Herdr with --term-backend herdr"
-                .to_owned(),
-        ));
+        .map_err(AgentError::from)?;
+        if explicit && selected == term_backend::BackendKind::Tmux {
+            return Err(Failure::Usage(
+                "this command is a Herdr service and does not run on the tmux terminal backend; \
+                 select Herdr with --term-backend herdr"
+                    .to_owned(),
+            ));
+        }
     }
     match command {
         Commands::Capabilities => {
@@ -1831,7 +1842,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         }
         _ => {}
     }
-    let (selected_backend, backend_explicit) = crate::term::select_backend(
+    let (selected_backend, _backend_explicit) = crate::term::select_backend(
         args.term_backend.as_deref(),
         environment,
         &args.registry,
@@ -1839,21 +1850,18 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         &args.tmux_bin,
     )
     .map_err(AgentError::from)?;
-    // Only an operator-selected tmux backend refuses here. When detection
-    // merely found no Herdr, fall through so the Herdr client reports its
-    // usual not-found error, exactly as before backends were selectable.
-    if backend_explicit && selected_backend == term_backend::BackendKind::Tmux {
-        return Err(Failure::Usage(
-            "the tmux terminal backend currently drives only the durable direct-pane transport \
-             (herdr-agent send/drain/status/read --pane PANE); agent lifecycle commands require \
-             Herdr — select it with --term-backend herdr"
-                .to_owned(),
-        ));
-    }
-    let client =
-        HerdrClient::with_executable("direct", &args.herdr_bin).map_err(AgentError::from)?;
+    let client: Box<dyn crate::subagents::ManagedApi> = match selected_backend {
+        term_backend::BackendKind::Herdr => Box::new(
+            HerdrClient::with_executable("direct", &args.herdr_bin).map_err(AgentError::from)?,
+        ),
+        term_backend::BackendKind::Tmux => Box::new(term_backend::TmuxBackend::new(
+            args.tmux_bin.clone(),
+            args.tmux_socket.clone(),
+        )),
+    };
+    let client: &dyn crate::subagents::ManagedApi = &*client;
     let from_environment = CloudTools::from_environment(environment);
-    let manager = ManagedAgents::new(&client, &args.registry)?.with_cloud_tools(CloudTools {
+    let manager = ManagedAgents::new(client, &args.registry)?.with_cloud_tools(CloudTools {
         agentcloudctl: args.agentcloudctl_bin,
         agentterm: args.agentterm_bin,
         caller_session: caller_session(args.from_session, from_environment.caller_session),
@@ -1965,8 +1973,20 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         cloud,
                     )
                 };
-            if mode != "interactive" || value.backend != "herdr" {
-                return Err(Failure::Usage("Rust agentctl supports interactive Herdr sessions; use agentctl with the worker extension for headless workers (the Python edition; for example DAGRUN_ENGINE=python)".to_owned()));
+            if mode != "interactive" {
+                return Err(Failure::Usage("Rust agentctl supports interactive sessions; use agentctl with the worker extension for headless workers (the Python edition; for example DAGRUN_ENGINE=python)".to_owned()));
+            }
+            if value
+                .backend
+                .as_deref()
+                .is_some_and(|backend| backend != selected_backend.as_str())
+            {
+                return Err(Failure::Usage(format!(
+                    "start --backend {} does not match the selected terminal backend {}; \
+                     pass a matching --term-backend or drop --backend",
+                    value.backend.as_deref().unwrap_or_default(),
+                    selected_backend.as_str()
+                )));
             }
             let brief = match value.file {
                 Some(path) => Some(
@@ -2593,14 +2613,17 @@ fn add_capabilities(value: &mut serde_json::Value) {
         } else {
             &value["launch"]
         };
-        let interactive = launch["mode"] == "interactive" && launch["backend"] == "herdr";
+        let interactive = launch["mode"] == "interactive"
+            && (launch["backend"] == "herdr" || launch["backend"] == "tmux");
         let adapter = launch["adapter"].as_str().map(str::to_owned);
         let adapter = adapter.as_deref();
         value["capabilities"] = if adapter == Some("agentcloud") {
             json!(CLOUD_CAPABILITIES)
         } else if matches!(
             adapter,
-            Some("herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay")
+            Some(
+                "herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay" | "tmux" | "tmux-foreign"
+            )
         ) && interactive
         {
             let mut capabilities = vec![
@@ -2624,15 +2647,21 @@ fn add_capabilities(value: &mut serde_json::Value) {
             if adapter == Some("herdr") {
                 capabilities.push("move");
             }
-            if matches!(adapter, Some("herdr" | "herdr-foreign")) {
+            if matches!(
+                adapter,
+                Some("herdr" | "herdr-foreign" | "tmux" | "tmux-foreign")
+            ) {
                 capabilities.extend(["anchor", "rename"]);
             } else if matches!(adapter, Some("herdr-pane" | "herdr-relay")) {
                 // A custom pane's anchor only records the launch spec of its pinned process.
                 capabilities.push("anchor");
             }
             // An adopted agent becomes revivable once a launch spec records what it runs.
-            if matches!(adapter, Some("herdr" | "herdr-pane" | "herdr-relay"))
-                || (adapter == Some("herdr-foreign") && value["launch_spec"].is_object())
+            if matches!(
+                adapter,
+                Some("herdr" | "herdr-pane" | "herdr-relay" | "tmux")
+            ) || (matches!(adapter, Some("herdr-foreign" | "tmux-foreign"))
+                && value["launch_spec"].is_object())
             {
                 capabilities.push("revive");
             }

@@ -361,20 +361,13 @@ fn run_direct<A: agent::AgentApi>(
 }
 
 fn run_managed(args: Args) -> Result<i32, CliError> {
-    let (backend, backend_explicit) = crate::term::select_backend(
+    let (backend, _backend_explicit) = crate::term::select_backend(
         args.term_backend.as_deref(),
         &|name| std::env::var(name).ok(),
         &args.registry,
         &args.herdr_bin,
         &args.tmux_bin,
     )?;
-    if backend_explicit && backend == term_backend::BackendKind::Tmux {
-        return Err(CliError::Usage(
-            "the tmux terminal backend drives only direct-pane commands (send/drain/status/read \
-             --pane PANE); managed commands require Herdr"
-                .to_owned(),
-        ));
-    }
     let command = args.positional[0].as_str();
     if command != "stop"
         && (args.expected_token.is_some()
@@ -451,9 +444,17 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
             Ok(command)
         })
         .transpose()?;
-    let client = HerdrClient::with_executable("direct", &args.herdr_bin)?;
+    let client: Box<dyn crate::subagents::ManagedApi> = match backend {
+        term_backend::BackendKind::Herdr => {
+            Box::new(HerdrClient::with_executable("direct", &args.herdr_bin)?)
+        }
+        term_backend::BackendKind::Tmux => Box::new(term_backend::TmuxBackend::new(
+            args.tmux_bin.clone(),
+            args.tmux_socket.clone(),
+        )),
+    };
     let manager = ManagedAgents::new(
-        &client,
+        &*client,
         &absolute_lexical(&args.registry).map_err(CliError::Output)?,
     )?;
     let delivery = DrainOptions {

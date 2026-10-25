@@ -607,6 +607,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         mut options: StartOptions,
         reasoning_effort: Option<&str>,
     ) -> Result<Value> {
+        if self.client.record_backend() != "herdr" {
+            return Err(fail(
+                "agentcloud sessions are viewed through a Herdr pane; select Herdr with --term-backend herdr",
+            ));
+        }
         let cwd_text = cwd.display().to_string();
         let launch = options.cloud.clone().unwrap_or_default().expand(
             "agentcloud launch",
@@ -844,6 +849,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         cwd: &Path,
         options: StartOptions,
     ) -> Result<Value> {
+        if self.client.record_backend() != "herdr" {
+            return Err(fail(
+                "attach-self presents the session through a Herdr tab; select Herdr with --term-backend herdr",
+            ));
+        }
         name(agent_name)?;
         let cwd = fs::canonicalize(cwd)
             .ok()

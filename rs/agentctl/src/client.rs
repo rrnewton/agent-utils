@@ -183,7 +183,7 @@ fn parse_process_stat(value: &[u8], expected_pid: u64) -> Result<LinuxProcessSta
     agent_queue::identity::parse_process_stat(value, expected_pid).map_err(identity_error)
 }
 
-fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
+pub(crate) fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
     agent_queue::identity::observe(pid).map_err(identity_error)
 }
 
@@ -197,7 +197,7 @@ fn supported_shell_name(path: &Path) -> bool {
     SUPPORTED_PANE_SHELLS.contains(&name)
 }
 
-fn supported_shell_process(pid: u64) -> Result<Option<LiveCustomProcess>> {
+pub(crate) fn supported_shell_process(pid: u64) -> Result<Option<LiveCustomProcess>> {
     let observed = live_custom_process(pid)?;
     Ok(supported_shell_name(&observed.executable_path).then_some(observed))
 }
@@ -242,7 +242,7 @@ fn process_task_ids(pid: u64) -> Result<Vec<String>> {
     Ok(tasks)
 }
 
-fn process_has_no_descendants(pid: u64) -> Result<bool> {
+pub(crate) fn process_has_no_descendants(pid: u64) -> Result<bool> {
     let before = process_task_ids(pid)?;
     let mut children_supported = true;
     for task in &before {
@@ -2745,37 +2745,43 @@ pub(crate) fn resolve_harness_executable(kind: &str) -> Result<PathBuf> {
             "custom harness name must contain lowercase ASCII letters, digits, or hyphens",
         ));
     }
-    if kind == "muse" {
-        if let Some(configured) = std::env::var_os("AGENTCTL_MUSE_BIN") {
-            let path = PathBuf::from(configured);
-            if !path.is_absolute() {
-                return Err(AdapterError::unavailable(
-                    "AGENTCTL_MUSE_BIN must be an absolute path",
-                ));
-            }
-            let resolved = fs::canonicalize(&path).map_err(|error| {
-                AdapterError::unavailable(format!(
-                    "cannot inspect muse executable {}: {error}",
-                    path.display()
-                ))
-            })?;
-            let metadata = fs::metadata(&resolved).map_err(|error| {
-                AdapterError::unavailable(format!(
-                    "cannot inspect muse executable {}: {error}",
-                    resolved.display()
-                ))
-            })?;
-            if !metadata.is_file()
-                || metadata.permissions().mode() & 0o111 == 0
-                || metadata.permissions().mode() & 0o022 != 0
-            {
-                return Err(AdapterError::unavailable(format!(
-                    "refusing unsafe muse executable: {}",
-                    resolved.display()
-                )));
-            }
-            return Ok(resolved);
+    // An operator may name any harness's fixed install location with
+    // `AGENTCTL_<KIND>_BIN` (kind uppercased, `-` as `_`); the tmux backend
+    // launches harnesses itself, so it needs the same override Herdr's
+    // custom-pane path has long had for Muse.
+    let override_name = format!(
+        "AGENTCTL_{}_BIN",
+        kind.to_ascii_uppercase().replace('-', "_")
+    );
+    if let Some(configured) = std::env::var_os(&override_name) {
+        let path = PathBuf::from(configured);
+        if !path.is_absolute() {
+            return Err(AdapterError::unavailable(format!(
+                "{override_name} must be an absolute path"
+            )));
         }
+        let resolved = fs::canonicalize(&path).map_err(|error| {
+            AdapterError::unavailable(format!(
+                "cannot inspect {kind} executable {}: {error}",
+                path.display()
+            ))
+        })?;
+        let metadata = fs::metadata(&resolved).map_err(|error| {
+            AdapterError::unavailable(format!(
+                "cannot inspect {kind} executable {}: {error}",
+                resolved.display()
+            ))
+        })?;
+        if !metadata.is_file()
+            || metadata.permissions().mode() & 0o111 == 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(AdapterError::unavailable(format!(
+                "refusing unsafe {kind} executable: {}",
+                resolved.display()
+            )));
+        }
+        return Ok(resolved);
     }
     let home = account_home()?;
     let candidates = [
@@ -2803,7 +2809,7 @@ pub(crate) fn resolve_harness_executable(kind: &str) -> Result<PathBuf> {
     )))
 }
 
-fn shell_join(arguments: &[String]) -> Result<String> {
+pub(crate) fn shell_join(arguments: &[String]) -> Result<String> {
     let mut quoted = Vec::with_capacity(arguments.len());
     for value in arguments {
         if value.contains('\0') {
