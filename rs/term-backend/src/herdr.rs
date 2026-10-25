@@ -1,5 +1,5 @@
 //! The Herdr backend: the Herdr CLI driven with the argument shapes
-//! agentctl's own client has always used, so existing behaviour is
+//! the existing Herdr clients have always used, so existing behaviour is
 //! unchanged byte-for-byte where tests pin it.
 
 use std::path::PathBuf;

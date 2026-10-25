@@ -1,10 +1,9 @@
-//! Terminal-backend selection and the bridges between `term_backend`
-//! traits and agentctl's own transport traits.
+//! Terminal-backend selection and the bridges between the
+//! backend-neutral multiplexer traits and this crate's own transport traits.
 //!
 //! Herdr remains the default backend. Its existing client keeps its exact
 //! Herdr CLI behaviour; this module only re-expresses it through the
-//! backend-neutral [`term_backend::Multiplexer`] and
-//! [`term_backend::PaneTerminal`] traits, and gives the tmux backend an
+//! backend-neutral multiplexer and pane-terminal traits, and gives the tmux backend an
 //! [`AgentApi`] so the durable direct-pane transport (send/drain/status/
 //! read against an explicit pane) runs on either multiplexer. Agent
 //! lifecycle management (`ManagedApi`: start/adopt/stop and the process

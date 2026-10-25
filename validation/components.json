@@ -5,6 +5,7 @@
       "source_prefixes": [
         "common/docs/agent-queue/",
         "common/docs/agentctl/",
+        "common/docs/term-backend/",
         "common/docs/chat-subscription-plugin/",
         "common/docs/chat-subscription/",
         "py/agentctl/",

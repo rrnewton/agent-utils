@@ -289,7 +289,7 @@ pub trait Multiplexer: Send + Sync {
 
 /// The surface of one pane: reading its screen and typing into it.
 ///
-/// This is the same seam agentctl's verified-submission layer already
+/// This is the same seam a verified-submission layer already
 /// drives through its `PromptTerminal`/`GuardedInput` traits; a
 /// `PaneTerminal` supplies the primitives those traits guard.
 pub trait PaneTerminal: Send + Sync {
