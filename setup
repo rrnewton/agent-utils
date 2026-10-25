@@ -9,8 +9,9 @@
 #   ./setup rs --clean remove the Rust cache first, then rebuild every launcher
 #
 # Every mode wires ./bin at the TRACKED engine resolver (common/bin). The resolver runs the tracked
-# Python entrypoint by default and the tracked Cargo-backed Rust launcher only on explicit
-# DAGRUN_ENGINE=rust, logging which engine won on every invocation.
+# Cargo-backed Rust launcher by default for paired tools and the tracked Python entrypoint for
+# Python-only tools; DAGRUN_ENGINE=python (or AGENT_UTILS_ENGINE=python) selects Python explicitly.
+# It logs which engine won on every invocation and never falls back silently.
 #
 # `make` just calls `./setup`.
 set -euo pipefail
@@ -70,7 +71,7 @@ setup_rs() {
   local runner legacy unexpected launcher tool target
   local -a rust_tools=(dagrun cpuset-alloc tick-hub pr-landing-planner herdr-run herdr-agent agentctl)
   echo "==> [rs] verify/build tracked Cargo-backed launchers"
-  command -v cargo >/dev/null || { echo "rs: cargo not found" >&2; return 1; }
+  command -v cargo >/dev/null || { echo "rs: cargo not found. Install the Rust toolchain (https://rustup.rs), or run ./setup py and use paired tools with DAGRUN_ENGINE=python." >&2; return 1; }
   command -v flock >/dev/null || { echo "rs: flock not found" >&2; return 1; }
   local lock_root="$ROOT/rs/.agent-utils-locks"
   mkdir -p "$lock_root"
@@ -126,12 +127,16 @@ case "$WHAT" in
   both) setup_py; setup_rs ;;
 esac
 # Wire ./bin at the TRACKED, deterministic engine resolver (common/bin) regardless of what was
-# built. The resolver defaults to the tracked Python entrypoint and runs Rust ONLY on explicit
-# DAGRUN_ENGINE=rust (never a silent fallback), logging which engine won on every run. This replaces
-# the old footgun where `both` wired ./bin straight at the UNTRACKED rs/bin, letting a stale
-# locally-built Rust binary silently beat the tracked entrypoint.
+# built. The resolver defaults paired tools to their tracked Rust launcher (Cargo-backed, built on
+# first use) and Python-only tools to their tracked Python entrypoint, logging which engine won on
+# every run and never falling back silently. This replaces the old footgun where `both` wired
+# ./bin straight at the UNTRACKED rs/bin, letting a stale locally-built Rust binary silently beat
+# the tracked entrypoint.
 wire_bin "common/bin"
+if [ "$WHAT" = py ]; then
+  echo "==> note: paired tools run Rust by default and build through Cargo on first use; run ./setup rs to prebuild, or use DAGRUN_ENGINE=python ./bin/<tool>"
+fi
 if [ "$WHAT" = rs ]; then
-  echo "==> note: run Rust via DAGRUN_ENGINE=rust ./bin/dagrun (default is tracked Python; rs/bin is Cargo-backed)"
+  echo "==> note: Rust is the default for paired tools; run the Python edition via DAGRUN_ENGINE=python ./bin/<tool>"
 fi
 echo "setup: done ($WHAT)"

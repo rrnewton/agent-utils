@@ -67,7 +67,7 @@
 <p class="eyebrow">Tools</p>
 <h1>The tools</h1>
 <p class="lead">Each tool below starts with the problem it solves, then what you get and what it needs. Status and editions are stated as the repository's own documents state them. A tool's own <code>quickstart</code>, user guide and <code>--help</code> stay the authority for how to use it.</p>
-<p>Several tools exist twice, as independent Python and Rust implementations called <em>editions</em>; the badge on each tool says which it has. Paired editions follow a two-edition contract: they share their core commands and output, and each one's extras are listed. A harness runs the Python edition unless you ask for Rust.</p>
+<p>Several tools exist twice, as independent Python and Rust implementations called <em>editions</em>; the badge on each tool says which it has. Paired editions follow a two-edition contract: they share their core commands and output, and each one's extras are listed. A harness runs the Rust edition unless you ask for Python.</p>
 <nav class="toc" aria-label="Tools on this page">
 <div>
 <p class="toc-label">Core</p>
@@ -772,7 +772,7 @@
 <div class="wrap">
 <h2 id="install-title">Installing a tool on its own</h2>
 <div class="prose">
-<p>In a harness the core tools need no installing: the commands in <code>agent-utils/bin</code> run straight from the checkout on the Python edition. The exceptions are gh-paced and agent-usage, which are built with <code>cargo</code>, and vibe-talk, which is deployed separately. To use one tool outside a harness, install it from a checkout of this repository:</p>
+<p>In a harness the core tools need no installing: the commands in <code>agent-utils/bin</code> run straight from the checkout — paired tools on their Rust edition, built through <code>cargo</code> on first use, and Python-only tools on Python. gh-paced and agent-usage are likewise built with <code>cargo</code>, and vibe-talk is deployed separately. To use one tool outside a harness, install it from a checkout of this repository:</p>
 <pre tabindex="0" role="region" aria-label="Installing one tool from a checkout"><code>python3 -m pip install ./py/wrkslots      # a Python distribution
 cargo install --path rs/agentctl          # a Rust crate</code></pre>
 <p>Every paired tool and every Python-only tool has its own installable distribution; gh-paced and agent-usage are built from <code>rs/</code>. This site does not claim that any of them is published to a package index. See the <a href="https://github.com/rrnewton/agent-utils/blob/main/py/README.md">Python distributions</a> and <a href="https://github.com/rrnewton/agent-utils/blob/main/rs/README.md">Rust crates</a> for the full lists.</p>

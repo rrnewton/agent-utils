@@ -360,7 +360,7 @@
   .claude/skills -&gt; ../.agents/skills
   .agentctl/profiles.json  <span class="c">launch profiles; private</span>
   .wrkslots.yml            <span class="c">slot policy, commented</span></code></pre>
-<p>The harness is its own small, local Git repository, and your primary checkout stays an independent repository inside it. The core tools need no build: they run from the agent-utils checkout on their Python edition. gh-paced and agent-usage are built with <code>cargo</code>, and vibe-talk is deployed separately. Later changes ("connect this to Google Chat", "add dagrun for our tests") are requests to the coordinator, which records each one in <code>AGENTS.md</code>.</p>
+<p>The harness is its own small, local Git repository, and your primary checkout stays an independent repository inside it. The core tools need no installing: they run from the agent-utils checkout, paired tools on their Rust edition (built through <code>cargo</code> on first use) and Python-only tools on Python. gh-paced and agent-usage are likewise built with <code>cargo</code>, and vibe-talk is deployed separately. Later changes ("connect this to Google Chat", "add dagrun for our tests") are requests to the coordinator, which records each one in <code>AGENTS.md</code>.</p>
 <p><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">The quickstart</a> walks through one recorded run on a one-commit repository, including the deviations it discloses. The <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md">setup skill</a> is the procedure itself.</p>
 </div>
 </div>

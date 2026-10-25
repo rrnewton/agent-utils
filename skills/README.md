@@ -60,7 +60,9 @@ Codex and Claude skill directories and uses Muse's native managed skill installe
 divergent content unless explicitly forced.
 
 Tool commands must be reachable: in a source checkout, the tracked dispatchers in `common/bin/` run
-the Python engine with no build step. `./setup` builds and checks both editions for development and
-links them as `./bin`; a consumer that skips the build can create that link itself
-(`ln -s common/bin bin`). Landing operations additionally require authorization from the consuming
-repository's own rules.
+each paired tool's Rust engine by default, building it through Cargo on first use (so `cargo` must
+be on `PATH` wherever the tools run, including timer services), and the Python-only tools on
+Python. `DAGRUN_ENGINE=python` selects a paired tool's Python edition explicitly. `./setup` builds
+and checks both editions for development and links the dispatchers as `./bin`; a consumer that
+skips the build can create that link itself (`ln -s common/bin bin`). Landing operations
+additionally require authorization from the consuming repository's own rules.

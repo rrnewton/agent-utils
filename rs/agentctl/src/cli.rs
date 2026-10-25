@@ -1185,6 +1185,13 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
     let arguments: Vec<OsString> = std::iter::once(OsString::from("agentctl"))
         .chain(arguments)
         .collect();
+    if let Some(command) = python_only_command(&arguments) {
+        eprintln!(
+            "agentctl: {command} is implemented only by the Python edition of agentctl; \
+             run it with the Python agentctl (for example DAGRUN_ENGINE=python)"
+        );
+        return 2;
+    }
     let args = match Cli::try_parse_from(arguments.iter().cloned()) {
         Ok(args) => args,
         Err(error) => {
@@ -1246,6 +1253,58 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
             error.exit_code()
         }
     }
+}
+
+/// Commands only the Python edition implements: the MCP server, the headless-worker operations,
+/// and the polling Chat launcher and its history/context readers. This edition refuses them with
+/// exit status 2 and names the Python opt-in, instead of Clap's unrecognised-subcommand error.
+const PYTHON_ONLY_COMMANDS: [&str; 4] = ["mcp", "migrate", "reset", "repair"];
+const PYTHON_ONLY_CHAT_COMMANDS: [&str; 3] = ["launch", "history", "context"];
+/// Global options whose value is the following argument.
+const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
+    "--registry",
+    "--state",
+    "--herdr-bin",
+    "--agentcloudctl-bin",
+    "--agentterm-bin",
+    "--agentcloud-url",
+    "--from-session",
+];
+
+/// The display name of the Python-only command in `arguments` (program name first), if any.
+/// Anything the scan does not recognise is left for Clap to judge.
+fn python_only_command(arguments: &[OsString]) -> Option<String> {
+    fn next_command(arguments: &[OsString], mut index: usize) -> Option<(&str, usize)> {
+        while index < arguments.len() {
+            let token = arguments[index].to_str()?;
+            if let Some(option) = token.strip_prefix("--") {
+                if option.contains('=') || matches!(option, "userguide" | "version" | "help") {
+                    index += 1;
+                } else if GLOBAL_VALUE_OPTIONS.contains(&token) {
+                    index += 2;
+                } else {
+                    return None;
+                }
+            } else if token.starts_with('-') && token != "-" {
+                return None;
+            } else {
+                return Some((token, index));
+            }
+        }
+        None
+    }
+
+    let (command, index) = next_command(arguments, 1)?;
+    if PYTHON_ONLY_COMMANDS.contains(&command) {
+        return Some(command.to_owned());
+    }
+    if command == "chat" {
+        let (subcommand, _) = next_command(arguments, index + 1)?;
+        if PYTHON_ONLY_CHAT_COMMANDS.contains(&subcommand) {
+            return Some(format!("chat {subcommand}"));
+        }
+    }
+    None
 }
 
 fn partial_stop_context(arguments: &[OsString]) -> Option<StopContext> {
@@ -1669,7 +1728,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     )
                 };
             if mode != "interactive" || value.backend != "herdr" {
-                return Err(Failure::Usage("Rust agentctl supports interactive Herdr sessions; use agentctl with the worker extension for headless workers".to_owned()));
+                return Err(Failure::Usage("Rust agentctl supports interactive Herdr sessions; use agentctl with the worker extension for headless workers (the Python edition; for example DAGRUN_ENGINE=python)".to_owned()));
             }
             let brief = match value.file {
                 Some(path) => Some(
@@ -1813,7 +1872,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Send(value) => {
             if value.model.is_some() {
                 return Err(Failure::Usage(
-                    "--model on send requires a headless worker and an installation with the worker extension"
+                    "--model on send requires a headless worker and an installation with the worker extension (the Python edition; for example DAGRUN_ENGINE=python)"
                         .to_owned(),
                 ));
             }
@@ -2297,6 +2356,43 @@ mod tests {
             "--profile=reviewer".into(),
             "--resume=saved-conversation".into(),
         ]
+    }
+
+    #[test]
+    fn python_only_commands_are_detected_behind_global_options() {
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&["agentctl", "mcp"], Some("mcp")),
+            (
+                &["agentctl", "--registry", "/tmp/r", "migrate"],
+                Some("migrate"),
+            ),
+            (
+                &["agentctl", "--herdr-bin=/bin/herdr", "reset"],
+                Some("reset"),
+            ),
+            (
+                &["agentctl", "chat", "launch", "--config", "c.json"],
+                Some("chat launch"),
+            ),
+            (
+                &["agentctl", "--state=/tmp/r", "chat", "history"],
+                Some("chat history"),
+            ),
+            (&["agentctl", "chat", "context"], Some("chat context")),
+            (&["agentctl", "chat", "status"], None),
+            (&["agentctl", "chat", "--help"], None),
+            (&["agentctl", "list"], None),
+            (&["agentctl", "--registry", "mcp", "list"], None),
+            (&["agentctl", "send", "reviewer", "mcp"], None),
+        ];
+        for (argv, expected) in cases {
+            let arguments: Vec<OsString> = argv.iter().map(OsString::from).collect();
+            assert_eq!(
+                python_only_command(&arguments).as_deref(),
+                *expected,
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]
