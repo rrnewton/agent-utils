@@ -84,12 +84,12 @@ installs; never change host configuration.
 | Dependency | Needed for | Hint (verify upstream first) |
 |---|---|---|
 | Git | everything | Distribution package. |
-| Python 3.10 or newer | the tools' default Python engine; no build step | Distribution package. |
+| Python 3.10 or newer | the Python-only tools (wrkslots, wrkviz, parallel-experiment-runner) and the Python editions | Distribution package. |
 | Herdr | agentctl, the chat bridge, herdr-run: every agent runs in a Herdr tab | On Linux and macOS, try the upstream installer, `curl -fsSL https://herdr.dev/install.sh \| sh` (installs to `~/.local/bin`; `HERDR_INSTALL_DIR` overrides), or `brew install herdr`, or a release binary. Confirm against the install section of https://github.com/herdrdev/herdr or https://herdr.dev/docs/ first. agent-utils was last tested with Herdr 0.8; if a newer Herdr misbehaves, report the version. |
 | An authenticated agent harness | the coordinator and subagents | Claude Code, Codex, or Muse, per their own install docs. |
 | A user systemd manager and cgroup v2 | wrkslots per-slot limits and boxes; dagrun | Present on most current Linux distributions. |
 | Passwordless `sudo`, or `/dev/fuse` with `fuse2fs` | disk-image slots (`kernel` or `fuse` backend) | `fuse2fs` is in the e2fsprogs packages of most distributions. |
-| Rust toolchain (`cargo`) | optional: Rust editions, `gh-paced`, building `vibe-talk` | https://rustup.rs |
+| Rust toolchain (`cargo`) | the paired tools' default Rust engine (built through Cargo on first use), `gh-paced`, building `vibe-talk`. Without it, paired tools refuse and name the `DAGRUN_ENGINE=python` opt-in | https://rustup.rs |
 | `podman` or another container runtime | optional: the `vibe-talk` container image (a native build works too) | Distribution package. |
 | `gh` | optional: GitHub operations by agents | https://cli.github.com |
 
@@ -141,10 +141,12 @@ Ask as one or two batches:
    project's `.gitignore` and build files; ask the owner to confirm.
 10. **Chat bridge.** Connect chat now, or later? The working inbound transport is Google Chat
     (`agentctl chat launch`, polling), which needs a space ID, the owner's user ID for the
-    allow-list, and an OAuth access token or a command that prints one. Run `agentctl chat
-    quickstart` for the current requirements. Other providers need an installed subscription
-    plugin (`agentctl chat --help`). Without chat, the owner talks to the coordinator in its
-    Herdr tab.
+    allow-list, and an OAuth access token or a command that prints one. The polling bridge and
+    its launcher are Python-edition only: run its commands — including `chat quickstart`, which
+    lists the current requirements — with `DAGRUN_ENGINE=python`, since the dispatchers default
+    to Rust and the Rust edition refuses them with that instruction. Other providers need an
+    installed subscription plugin (`agentctl chat --help`). Without chat, the owner talks to the
+    coordinator in its Herdr tab.
 
 Then present the optional tools in one short list and ask which, if any, to set up now (default:
 none; each can be added later by asking):
@@ -187,10 +189,13 @@ Your own working directory moved with the checkout: it is now `$H/$PRIMARY`. Kee
 absolute paths; the coordinator will later start in `$H`.
 
 **5.2 agent-utils.** `git clone "$AU_SRC" "$H/agent-utils"`; for a local source, then
-`git -C "$H/agent-utils" remote set-url origin <public or fork URL>`. No build is needed: the
-tracked dispatchers in `agent-utils/common/bin/` run the Python engine (each prints one `engine=`
-line on stderr). Link them as `agent-utils/bin`, which is what agent-utils' own `./setup` does
-after its development build and checks:
+`git -C "$H/agent-utils" remote set-url origin <public or fork URL>`. The tracked dispatchers in
+`agent-utils/common/bin/` run each paired tool's Rust engine by default (each prints one `engine=`
+line on stderr), building it through Cargo on first use — so the first command below can take a
+minute, and `cargo` must stay on `PATH` wherever the tools run, including timer services.
+Python-only tools (wrkslots and friends) run Python. `DAGRUN_ENGINE=python` selects a paired
+tool's Python edition explicitly. Link the dispatchers as `agent-utils/bin`, which is what
+agent-utils' own `./setup` does after its development build and checks:
 
 ```sh
 ln -s common/bin "$H/agent-utils/bin"     # agent-utils ignores this path
@@ -323,12 +328,14 @@ Sandbox on (`userns` or `root`):
   questions. The coordinator stops you and removes the slot after its time-to-live.
 ```
 
-**5.8 Chat bridge (if chosen now).** Write the configuration `agentctl chat quickstart` describes
-to `$H/chat.json` with mode 0600; it is ignored by the harness repository. The token stays in an
-environment variable or a token command, never in a tracked file. The coordinator is then
-launched with `agentctl chat launch --config chat.json --harness <claude|codex>` from a Herdr
-shell tab in `$H` (phase 7). Note the default poll interval in `agentctl chat launch --help` and
-ask the owner whether to shorten it.
+**5.8 Chat bridge (if chosen now).** Write the configuration `DAGRUN_ENGINE=python agentctl chat
+quickstart` describes to `$H/chat.json` with mode 0600; it is ignored by the harness repository.
+The token stays in an environment variable or a token command, never in a tracked file. The
+coordinator is then launched with `DAGRUN_ENGINE=python agentctl chat launch --config chat.json
+--harness <claude|codex>` from a Herdr shell tab in `$H` (phase 7); the polling launcher is
+Python-edition only, and the Rust default refuses it with that instruction. Note the default
+poll interval in `DAGRUN_ENGINE=python agentctl chat launch --help` and ask the owner whether to
+shorten it.
 
 **5.9 Optional tools.** Follow "Add a tool later" for each one chosen.
 
@@ -402,11 +409,12 @@ addressable: tick-hub deliveries, other agents, and the owner's scripts reach it
 starts by hand in some terminal is not registered, so nothing can deliver to it.
 
 With chat configured, keep the coordinator registered: start it as above, then point the bridge at
-it with `agentctl chat run`, using the pane and workspace identity `agentctl status coordinator`
-reports (the agentctl chat guide's Setup section). `agentctl chat launch --config chat.json
---harness <harness>`, run from a Herdr shell tab in `$H`, is shorter, but the coordinator it starts
-in that pane is not an agentctl session, so `agentctl send coordinator` (and so tick-hub delivery)
-cannot reach it; if the owner prefers it anyway, say so and record it in the harness `AGENTS.md`.
+it with `DAGRUN_ENGINE=python agentctl chat run` (the polling bridge is Python-edition only),
+using the pane and workspace identity `agentctl status coordinator` reports (the agentctl chat
+guide's Setup section). `DAGRUN_ENGINE=python agentctl chat launch --config chat.json --harness
+<harness>`, run from a Herdr shell tab in `$H`, is shorter, but the coordinator it starts in that
+pane is not an agentctl session, so `agentctl send coordinator` (and so tick-hub delivery) cannot
+reach it; if the owner prefers it anyway, say so and record it in the harness `AGENTS.md`.
 
 If the owner instead asks you to "attach yourself to Herdr", follow the agentctl skill's section
 of that name: a session that can be viewed remotely registers itself with `agentctl attach-self`

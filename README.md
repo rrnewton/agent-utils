@@ -98,6 +98,18 @@ Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not
 need this source tree or knowledge of the sibling implementation.
 
+From a source checkout, the tracked dispatchers in `common/bin/` (linked as
+`bin/` by `./setup`, or by hand with `ln -s common/bin bin`) run the Rust
+edition of every paired tool by default. The Rust launcher is Cargo-backed: it
+builds on first use and verifies its cache on every run, so the default needs
+a Rust toolchain on `PATH` — including in timer services that call the tools.
+Without one, the launcher refuses and names the way back: prefix the command
+with `DAGRUN_ENGINE=python` (or `AGENT_UTILS_ENGINE=python`; `DAGRUN_ENGINE`
+wins when both are set) to run the Python edition explicitly. Python-only
+tools always run their Python entrypoint unless Rust is explicitly requested,
+which refuses. Every invocation logs the engine that won on standard error;
+there is never a silent fallback.
+
 ### Python-only tools
 
 | Command | Purpose | Python distribution |

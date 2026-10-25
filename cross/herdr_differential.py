@@ -352,13 +352,14 @@ class Harness:
         *,
         cwd: str = ".",
         extra_env: Mapping[str, str | None] | None = None,
+        python_env: Mapping[str, str | None] | None = None,
         rust_env: Mapping[str, str | None] | None = None,
         mode: str = "capture",
         account: bool = False,
     ) -> tuple[Outcome, Outcome]:
         outcomes: list[Outcome] = []
         for command, root, own_env in (
-            (python_command, case.python_root, None),
+            (python_command, case.python_root, python_env),
             (rust_command, case.rust_root, rust_env),
         ):
             working = root / cwd
@@ -419,6 +420,7 @@ def _environment(home: Path, extra: Mapping[str, str | None] | None) -> dict[str
         }
     )
     environment.pop("DAGRUN_ENGINE", None)
+    environment.pop("AGENT_UTILS_ENGINE", None)
     # A development interpreter may have declared dependencies in its normal user site.  Changing
     # HOME for deterministic tilde expansion must not make that already-installed site disappear,
     # and the Rust launcher's toolchain must stay where the developer installed it.
@@ -3092,6 +3094,7 @@ def _launchers(harness: Harness, report: Report) -> None:
             command,
             command,
             args,
+            python_env={"DAGRUN_ENGINE": "python"},
             rust_env={"DAGRUN_ENGINE": "rust"},
         )
         python_body, python_lines = _strip_launcher_lines(python)

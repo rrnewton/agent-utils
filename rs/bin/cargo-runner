@@ -49,6 +49,9 @@ esac
 for required in cargo cp flock mktemp sha256sum; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "[$TOOL] Rust source launcher requires '$required'" >&2
+    if [[ "$required" == "cargo" ]]; then
+      echo "[$TOOL] install the Rust toolchain (https://rustup.rs), or run the Python edition through the repository dispatcher with DAGRUN_ENGINE=python" >&2
+    fi
     exit 127
   fi
 done
@@ -73,6 +76,7 @@ CARGO_BIN="$(absolute_command_path cargo)" || {
 RUSTC_REQUESTED="${RUSTC:-rustc}"
 RUSTC_BIN="$(absolute_command_path "$RUSTC_REQUESTED")" || {
   echo "[$TOOL] Rust source launcher requires Rust compiler '$RUSTC_REQUESTED'" >&2
+  echo "[$TOOL] install the Rust toolchain (https://rustup.rs), or run the Python edition through the repository dispatcher with DAGRUN_ENGINE=python" >&2
   exit 127
 }
 if [[ -n "${RUSTC:-}" ]]; then

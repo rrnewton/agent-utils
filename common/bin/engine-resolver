@@ -2,15 +2,23 @@
 # TRACKED, deterministic engine resolver for repository-local tool commands.
 #
 # The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`, `pr-landing-planner`, `herdr-run`, `herdr-agent`, and `agentctl`) have tracked Python and Cargo-backed Rust launchers under their respective `*/bin`
-# directories. `wrkviz`, `parallel-experiment-runner`, and `wrkslots` are intentionally Python-only.
+# directories. `wrkviz`, `parallel-experiment-runner`, `wrkslots`, `herdr-chat`, and
+# `herdr-subagents` are intentionally Python-only.
 # Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
 # one consistent command surface after any setup mode.
 #
 # Contract enforced here
 # ----------------------
-#   * DETERMINISTIC + TRACKED default: with no override, ALWAYS the tracked Python entrypoint.
-#   * Rust is opt-in ONLY, via DAGRUN_ENGINE=rust. Its tracked launcher asks Cargo to validate the
-#     workspace cache and provenance before executing; it never silently falls back.
+#   * DETERMINISTIC + TRACKED default: with no override, a tool that has a tracked Rust launcher
+#     ALWAYS runs it; a Python-only tool ALWAYS runs its tracked Python entrypoint. No probe of the
+#     host decides the engine — the tracked `rs/bin` link does.
+#   * The Rust default needs a Rust toolchain: its tracked launcher asks Cargo to validate the
+#     workspace cache and provenance before executing, building on first use. Without Cargo the
+#     launcher refuses and names the Python opt-in below; it never silently falls back.
+#   * Overrides: DAGRUN_ENGINE (historical name; wins when set) and AGENT_UTILS_ENGINE (the clearer
+#     name, consulted when DAGRUN_ENGINE is unset) accept `rust`/`rs` or `python`/`py`. An explicit
+#     request for an edition a tool does not have refuses (exit 127); anything else is a usage
+#     error (exit 2).
 #   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
 #     exact path are always visible in logs.
 #
@@ -30,14 +38,27 @@ if [[ "$TOOL" == "engine-resolver" ]]; then
     exit 2
 fi
 
-# Deterministic default: the TRACKED Python entrypoint. Rust is explicit opt-in only.
-ENGINE="${DAGRUN_ENGINE:-python}"
+# Engine selection: an explicit override wins; otherwise Rust for a tool with a tracked Rust
+# launcher, Python for a Python-only tool.
+ENGINE=""
+ENGINE_VAR=""
+if [[ -n "${DAGRUN_ENGINE:-}" ]]; then
+    ENGINE="$DAGRUN_ENGINE"
+    ENGINE_VAR="DAGRUN_ENGINE"
+elif [[ -n "${AGENT_UTILS_ENGINE:-}" ]]; then
+    ENGINE="$AGENT_UTILS_ENGINE"
+    ENGINE_VAR="AGENT_UTILS_ENGINE"
+elif [[ -x "$ROOT/rs/bin/$TOOL" ]]; then
+    ENGINE="rust"
+else
+    ENGINE="python"
+fi
 
 case "$ENGINE" in
     python|py)
         TARGET="$ROOT/py/bin/$TOOL"
         if [[ ! -e "$TARGET" ]]; then
-            echo "[$TOOL] engine=python: no tracked entrypoint at py/bin/$TOOL" >&2
+            echo "[$TOOL] engine=python: no tracked entrypoint at py/bin/$TOOL. Refusing to silently fall back to Rust; run it with ${ENGINE_VAR:-DAGRUN_ENGINE}=rust or no override." >&2
             exit 127
         fi
         echo "[$TOOL] engine=python (tracked entrypoint: py/bin/$TOOL)" >&2
@@ -49,7 +70,7 @@ case "$ENGINE" in
         # before exec. Never fall back to Python silently; that would re-hide an engine mismatch.
         TARGET="$ROOT/rs/bin/$TOOL"
         if [[ ! -x "$TARGET" ]]; then
-            echo "[$TOOL] engine=rust requested but no tracked launcher exists at rs/bin/$TOOL. Refusing to silently fall back to Python." >&2
+            echo "[$TOOL] engine=rust requested but no tracked launcher exists at rs/bin/$TOOL. Refusing to silently fall back to Python. $TOOL is Python-only: run it with no override or with ${ENGINE_VAR:-DAGRUN_ENGINE}=python." >&2
             exit 127
         fi
         echo "[$TOOL] engine=rust (tracked Cargo launcher: ${TARGET#"$ROOT"/})" >&2
@@ -57,7 +78,7 @@ case "$ENGINE" in
         exec "$TARGET" "$@"
         ;;
     *)
-        echo "[$TOOL] DAGRUN_ENGINE='$ENGINE' is invalid (want 'python' or 'rust')" >&2
+        echo "[$TOOL] $ENGINE_VAR='$ENGINE' is invalid (want 'python' or 'rust')" >&2
         exit 2
         ;;
 esac

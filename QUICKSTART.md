@@ -12,11 +12,15 @@ together, see [the suite](README.md#the-suite) or the
 - A Linux machine.
 - A coding agent harness you are logged in to: Claude Code, Codex, or Muse.
 - Git and Python 3.10 or newer.
+- A Rust toolchain (`cargo`). The paired tools run their Rust edition by default and build it
+  through Cargo on first use. Without one they refuse and name the Python opt-in,
+  `DAGRUN_ENGINE=python`.
 - [Herdr](https://github.com/herdrdev/herdr), the terminal server every agent runs in. If it is
   missing, the setup agent offers to install it; start it once with `herdr`.
 
-Nothing has to be built. The suite tools run from an agent-utils checkout on their Python
-engine.
+Nothing has to be installed. The suite tools run from an agent-utils checkout: paired tools on
+their Rust engine (built through Cargo the first time), Python-only tools such as wrkslots on
+Python.
 
 ## 1. The project
 
@@ -55,13 +59,14 @@ dependency table:
 | Dependency | Needed for | Found |
 |---|---|---|
 | Git | everything | 2.53.0 |
-| Python 3.10+ | the tools themselves | 3.12.14 |
+| Python 3.10+ | the Python-only tools (wrkslots and friends) | 3.12.14 |
+| `cargo` | the paired tools' default Rust engine | present |
 | Herdr | agentctl and the chat bridge (agents run in Herdr tabs) | 0.8.0 |
 | Agent harness | the coordinator and subagents | claude, codex, muse |
 | User systemd and cgroup v2 | per-slot resource limits, dagrun | yes |
 | Passwordless sudo, or `/dev/fuse` with `fuse2fs` | disk-image slots | both |
 | Unprivileged user namespaces | the optional file-system sandbox | yes |
-| `cargo`, `podman`, `gh` | optional tools | all present |
+| `podman`, `gh` | optional tools | all present |
 
 Nothing was missing, so nothing was installed. When something is missing, the agent says what
 needs it, suggests how to install it (checking the upstream instructions first), and installs it
@@ -191,7 +196,8 @@ and it answered with a status summary. It then recorded tick-hub in `AGENTS.md` 
 the harness. Other requests work the same way:
 
 - "Connect this to Google Chat." (It needs a space ID, your user ID, and an OAuth token or a
-  command that prints one; `agentctl chat quickstart` lists the details.)
+  command that prints one; `DAGRUN_ENGINE=python agentctl chat quickstart` lists the details —
+  the polling bridge is Python-edition only.)
 - "Turn on the file-system sandbox for subagents."
 - "Add dagrun for our test suite."
 - "Update agent-utils."
