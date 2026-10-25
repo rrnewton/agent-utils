@@ -57,6 +57,148 @@ pub(crate) struct Designation {
     set_by: Option<Edge>,
 }
 
+/// The per-host coordinator index (schema `agentctl-coordinator-index/v1`):
+/// directory holding one index file per designated registry, under the
+/// host state home (`$XDG_STATE_HOME/agentctl/coordinators`, else
+/// `~/.local/state/agentctl/coordinators`; `$AGENTCTL_COORDINATOR_INDEX_DIR`
+/// overrides). Per-host state, never under a synced config directory: it
+/// lets other tools on this machine (`agent-teams coordinators`) discover
+/// who coordinates what, where, without scanning every harness.
+pub(crate) fn host_index_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AGENTCTL_COORDINATOR_INDEX_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(state).join("agentctl/coordinators");
+    }
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("~"), PathBuf::from);
+    home.join(".local/state/agentctl/coordinators")
+}
+
+/// The index file for one registry: the SHA-256 of its absolute path, so
+/// two harnesses never collide and no path needs escaping.
+pub(crate) fn host_index_path(directory: &Path, registry: &str) -> PathBuf {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(registry.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    directory.join(format!("{hex}.json"))
+}
+
+/// The `origin` URL from a git config file's first `[remote "origin"]`
+/// section, or `None`. A plain text read: no git subprocess, no network.
+fn git_origin_url(config: &Path) -> Option<String> {
+    let text = fs::read_to_string(config).ok()?;
+    let mut in_origin = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_origin = trimmed == "[remote \"origin\"]";
+            continue;
+        }
+        if in_origin {
+            if let Some(url) = trimmed.strip_prefix("url =") {
+                return Some(url.trim().to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Origin URLs of the git checkouts at `harness_cwd` itself and its
+/// immediate children (sorted, at most eight): where the harness's
+/// primary checkout lives is a layout fact this cheap scan covers.
+pub(crate) fn harness_repo_origins(harness_cwd: &Path) -> Vec<String> {
+    let mut candidates = vec![harness_cwd.to_path_buf()];
+    if let Ok(entries) = fs::read_dir(harness_cwd) {
+        let mut children: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        children.sort();
+        candidates.extend(children);
+    }
+    let mut origins = Vec::new();
+    for candidate in candidates.into_iter().take(9) {
+        let dotgit = candidate.join(".git");
+        let config = if dotgit.is_dir() {
+            dotgit.join("config")
+        } else if let Ok(pointer) = fs::read_to_string(&dotgit) {
+            // A worktree's `.git` file points at its gitdir; its config is
+            // the gitdir's own or the shared one its commondir names.
+            let Some(gitdir) = pointer.trim().strip_prefix("gitdir:") else {
+                continue;
+            };
+            let gitdir = PathBuf::from(gitdir.trim());
+            if gitdir.join("config").exists() {
+                gitdir.join("config")
+            } else if let Ok(common) = fs::read_to_string(gitdir.join("commondir")) {
+                let common = common.trim();
+                let base = if Path::new(common).is_absolute() {
+                    PathBuf::from(common)
+                } else {
+                    gitdir.join(common)
+                };
+                base.join("config")
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+        if let Some(url) = git_origin_url(&config) {
+            if !origins.contains(&url) {
+                origins.push(url);
+            }
+        }
+    }
+    origins
+}
+
+/// The team whose `agent-teams` declaration names `registry` as its
+/// queue deliverer, if any. Reads the agent-teams state layout
+/// (`teams.d/<team>/declaration.json` under `$AGENT_TEAMS_STATE_DIR`,
+/// `$XDG_STATE_HOME/agent-teams`, or `~/.local/state/agent-teams`)
+/// best-effort: a discovery hint, never an authority.
+pub(crate) fn declared_team_for_registry(registry: &str) -> Option<String> {
+    let state = if let Some(dir) = std::env::var_os("AGENT_TEAMS_STATE_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        PathBuf::from(xdg).join("agent-teams")
+    } else {
+        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("~"), PathBuf::from);
+        home.join(".local/state/agent-teams")
+    };
+    let teams = fs::read_dir(state.join("teams.d")).ok()?;
+    let home =
+        std::env::var_os("HOME").map_or_else(String::new, |h| h.to_string_lossy().into_owned());
+    for entry in teams.flatten() {
+        let Ok(text) = fs::read_to_string(entry.path().join("declaration.json")) else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let declared = document
+            .get("deliverer")
+            .and_then(|deliverer| deliverer.get("registry"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expanded = if let Some(rest) = declared.strip_prefix("~/") {
+            format!("{home}/{rest}")
+        } else {
+            declared.to_owned()
+        };
+        if expanded == registry {
+            return document
+                .get("team")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
 /// How `agentctl manage` changes an agent's controller.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManageAction {
@@ -471,7 +613,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             &self.registry.join(DESIGNATION_FILE),
             &serde_json::to_value(&designation).map_err(|error| fail(error.to_string()))?,
         )?;
-        self.coordinator_show()
+        let mut report = self.coordinator_show()?;
+        report["host_index"] = match self.host_index_refresh() {
+            Ok(path) => json!({"registered": true, "path": path.to_string_lossy()}),
+            Err(error) => json!({"registered": false, "error": error.to_string()}),
+        };
+        Ok(report)
     }
 
     /// Report the designation and the state of the agent it names.
@@ -524,7 +671,56 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .map_err(|error| fail(format!("cannot remove {}: {error}", path.display())))?;
             agent::sync_directory(&self.registry)?;
         }
+        self.host_index_remove();
         Ok(json!({"cleared": previous.is_some(), "previous": previous}))
+    }
+
+    /// Refresh this registry's host-index entry from its current
+    /// designated record. Best-effort by design: the designation file is
+    /// the authority, the index only a discovery cache, so a failure
+    /// here is reported to the caller but never fails a designation.
+    pub(crate) fn host_index_refresh(&self) -> std::result::Result<PathBuf, String> {
+        let records = self.readable_records().map_err(|error| error.to_string())?;
+        let Some((designation, current)) = self
+            .designated_record(&records)
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("no coordinator designated".to_owned());
+        };
+        let Some(record) = current else {
+            return Err("designated coordinator has no live record".to_owned());
+        };
+        let registry = self.registry_text();
+        let harness_cwd = PathBuf::from(&registry)
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let entry = json!({
+            "schema": "agentctl-coordinator-index/v1",
+            "registry": registry,
+            "name": record.name,
+            "token": designation.token,
+            "harness_cwd": harness_cwd,
+            "harness_identity": record.acting_process().map(|identity| {
+                serde_json::to_value(identity).unwrap_or(Value::Null)
+            }),
+            "repo_origins": harness_repo_origins(Path::new(&harness_cwd)),
+            "team": declared_team_for_registry(&registry),
+            "set_at": designation.set_at,
+            "updated_at": now_seconds(),
+        });
+        let directory = host_index_dir();
+        agent::create_private_directory(&directory, "coordinator index", true, true)
+            .map_err(|error| error.to_string())?;
+        let path = host_index_path(&directory, &registry);
+        agent::atomic_json(&path, &entry).map_err(|error| error.to_string())?;
+        Ok(path)
+    }
+
+    /// Drop this registry's host-index entry, if any.
+    pub(crate) fn host_index_remove(&self) {
+        let path = host_index_path(&host_index_dir(), &self.registry_text());
+        let _ = fs::remove_file(path);
     }
 
     /// Designate `agent_name` when `as_coordinator` asks for it, after an adopt or attach-self.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::subagents::control::{harness_repo_origins, host_index_path};
 use agent_queue::identity::{Ancestor, Ancestry};
 
 const FAKE_BOOT: &str = "22222222-3333-4444-5555-666666666666";
@@ -347,4 +348,41 @@ fn restore_follows_the_designation_and_keeps_its_own_coordinator_on_a_conflict()
         excluding.coordinator, None,
         "an excluded designation is not taken"
     );
+}
+
+#[test]
+fn host_index_names_one_file_per_registry() {
+    let dir = PathBuf::from("/tmp/index");
+    let a = host_index_path(&dir, "/home/u/work/one/.agentctl");
+    let b = host_index_path(&dir, "/home/u/work/two/.agentctl");
+    assert_ne!(a, b);
+    assert_eq!(
+        a,
+        host_index_path(&dir, "/home/u/work/one/.agentctl"),
+        "same registry, same file"
+    );
+    assert!(a.extension().is_some_and(|ext| ext == "json"));
+}
+
+#[test]
+fn harness_repo_origins_reads_dotgit_configs() {
+    let root = std::env::temp_dir().join(format!(
+        "agentctl-origins-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let checkout = root.join("agent-utils");
+    fs::create_dir_all(checkout.join(".git")).unwrap();
+    fs::write(
+        checkout.join(".git/config"),
+        "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://example.invalid/org/repo\n[remote \"upstream\"]\n\turl = https://example.invalid/other/repo\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("plain")).unwrap();
+    assert_eq!(
+        harness_repo_origins(&root),
+        vec!["https://example.invalid/org/repo".to_string()]
+    );
+    let _ = fs::remove_dir_all(&root);
 }
