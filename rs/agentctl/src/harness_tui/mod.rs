@@ -3,6 +3,7 @@ use serde::Serialize;
 
 mod claude;
 mod codex;
+pub(crate) mod muse;
 
 /// What input the visible screen currently accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -111,6 +112,15 @@ pub fn harness_tui(harness: Option<&str>) -> Option<&'static dyn HarnessTui> {
         Some("codex") => Some(&codex::CodexTui),
         Some("claude") => Some(&claude::ClaudeTui),
         _ => None,
+    }
+}
+
+/// Adapters a queue drain may use to type an ordinary follow-up into a working pane: those of
+/// [`harness_tui`], plus Muse, whose forms agentctl does not answer.
+pub fn followup_tui(harness: Option<&str>) -> Option<&'static dyn HarnessTui> {
+    match harness {
+        Some("muse") => Some(&muse::MuseTui),
+        _ => harness_tui(harness),
     }
 }
 

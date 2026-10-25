@@ -1,0 +1,24 @@
+◆ First loop (60 ticks): ran tick 1-35 then cancelled — it did not finish. ALPHA BETA GAMMA
+
+  Second loop (12 ticks): ran t1-t12, exit 0, FINISHED — DONE-TWO
+
+  Queued follow-up: EPSILON
+
+  Third command (sleep 40; echo SLEPT): completed, output SLEPT, exit 0 — OK-THREE
+
+  Fourth loop (24 ticks): ran r1-r24, exit 0, completed — DONE-FOUR KAPPA LAMBDA
+
+◆ Worked for 2m 26s · 5:41 AM · 25/Oct
+
+❯ Run in the foreground and wait: sleep 60; echo SLEPT-FIVE. Then reply DONE-FIVE.
+
+◇ Running command · Run sleep sixty foreground — running (4s · esc to interrupt)
+└ (ctrl+b to send to background)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ wrap-probe: please keep working on the current task, and afterwards summarise in one paragraph what you did, including the exact command lines you
+  ran, their exit statuses, whether anything printed to stderr, and supercalifragilisticexpialidocious-hyphenated-compound-words-that/might/break/at/odd/
+  places plus a URL https://example.com/a/very/long/path/that/keeps/going/and/going/without/any/spaces/at/all/whatsoever/to/force/a/hard/character/wrap
+  END
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  watermelon-full-preview · xhigh · ~/work/project · Launch overrides

@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Default)]
-struct Clock(Mutex<Duration>);
+pub(super) struct Clock(Mutex<Duration>);
 
 impl agent::AgentRuntime for Clock {
     fn monotonic(&self) -> Duration {
@@ -23,6 +23,17 @@ pub(super) struct MuseEditor {
     /// Pastes longer than this many characters show only as Muse 1.4's placeholder, and the
     /// footer line carries its paste hint while one is staged.
     collapse_over: Option<usize>,
+    /// A turn is running: Muse 1.4.14's progress row sits above the editor, and Enter steers
+    /// the turn, printing the prompt as a user turn above that row (#505
+    /// agentctl-muse-followup).
+    pub(super) busy: bool,
+    /// Enter leaves the staged prompt where it is, as from a Muse that never accepts it.
+    pub(super) ignore_enter: bool,
+    /// A command approval form takes the editor's place.
+    pub(super) approval: bool,
+    /// A staged paste draws with its last character missing, so it never shows as the exact
+    /// prompt, as a wrap the proof cannot read once did.
+    pub(super) garble: bool,
 }
 
 impl Default for MuseEditor {
@@ -33,6 +44,10 @@ impl Default for MuseEditor {
             history: Vec::new(),
             header: true,
             collapse_over: None,
+            busy: false,
+            ignore_enter: false,
+            approval: false,
+            garble: false,
         }
     }
 }
@@ -55,9 +70,20 @@ impl MuseEditor {
             .as_deref()
             .filter(|text| self.collapse_over.is_some_and(|limit| length(text) > limit));
         let editor = match (collapsed, self.staged.as_ref()) {
+            _ if self.approval => "Would you like to run the following command?\n  $ date\n\
+                                   ⟩ 1. Allow this stage once (y)\n  2. Abort the entire command (esc)"
+                .to_owned(),
             (Some(text), _) => format!("❯ [Pasted Content {} chars]", length(text)),
+            (None, Some(text)) if self.garble => {
+                format!("❯ {}", &text[..text.len().saturating_sub(1)])
+            }
             (None, Some(text)) => format!("❯ {text}"),
             (None, None) => "❯".to_owned(),
+        };
+        let progress = if self.busy {
+            "\n◇ Calling tools (3s · esc to interrupt)"
+        } else {
+            ""
         };
         let header = if self.header { "Muse Code 1.3.0\n" } else { "" };
         let mode = if self.mode.is_empty() {
@@ -71,7 +97,7 @@ impl MuseEditor {
             ""
         };
         format!(
-            "{header}{}\n────────────\n{editor}\n────────────\nwatermelon-preview · xhigh · /work/project{mode}{notice}\n",
+            "{header}{}{progress}\n────────────\n{editor}\n────────────\nwatermelon-preview · xhigh · /work/project{mode}{notice}\n",
             self.history.join("\n")
         )
     }
@@ -85,9 +111,33 @@ impl MuseEditor {
     }
 
     pub(super) fn enter(&mut self) -> Option<String> {
+        if self.ignore_enter || self.approval {
+            return None;
+        }
         let prompt = self.staged.take()?;
-        self.history.push(format!("❯ {prompt}\n◆ response"));
+        if self.busy {
+            self.history.push(format!("❯ {prompt}"));
+        } else {
+            self.history.push(format!("❯ {prompt}\n◆ response"));
+        }
         Some(prompt)
+    }
+
+    /// `ctrl+u` deletes the editor's one row of text; `backspace` on an empty row does nothing.
+    pub(super) fn key(&mut self, key: &str) {
+        if key == "ctrl+u" && !self.approval {
+            self.staged = None;
+        }
+    }
+
+    /// Stage text as an operator typing into the editor would.
+    pub(super) fn draft(&mut self, text: &str) {
+        self.staged = Some(text.to_owned());
+    }
+
+    /// The staged editor text, if any.
+    pub(super) fn staged(&self) -> Option<&str> {
+        self.staged.as_deref()
     }
 }
 

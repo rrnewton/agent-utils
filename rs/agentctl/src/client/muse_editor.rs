@@ -332,9 +332,10 @@ fn muse_editor_segments(editor: &str) -> Option<Vec<String>> {
 
 /// Match a logical prompt against one conservatively rendered Muse editor.
 ///
-/// Each rendered line joins the previous one with a space, or with nothing after a line that ends
-/// in a hyphen, because Muse may wrap a hyphenated word there. `exact` requires the whole editor
-/// to be the prompt; otherwise the editor need only start with it as whole words.
+/// Each rendered line joins the previous one with a space or with nothing: Muse 1.4.14 wraps a
+/// long line at any character, inside a word or path (`abcde` / `fghij`, `odd/` / `places`), as
+/// well as after a hyphen, and the screen does not say which it did. `exact` requires the whole
+/// editor to be the prompt; otherwise the editor need only start with it as whole words.
 fn muse_editor_matches(editor: &str, text: &str, exact: bool) -> bool {
     let wanted = normalize(text);
     let segments = muse_editor_segments(editor);
@@ -343,15 +344,8 @@ fn muse_editor_matches(editor: &str, text: &str, exact: bool) -> bool {
     };
     let wanted_word = format!("{wanted} ");
     let mut prefixes = BTreeSet::from([String::new()]);
-    let mut previous = "";
     for (index, segment) in segments.iter().enumerate() {
-        let separators: &[&str] = if index == 0 {
-            &[""]
-        } else if previous.ends_with('-') {
-            &[" ", ""]
-        } else {
-            &[" "]
-        };
+        let separators: &[&str] = if index == 0 { &[""] } else { &[" ", ""] };
         let mut next_prefixes = BTreeSet::new();
         for prefix in &prefixes {
             for separator in separators {
@@ -368,7 +362,6 @@ fn muse_editor_matches(editor: &str, text: &str, exact: bool) -> bool {
             return false;
         }
         prefixes = next_prefixes;
-        previous = segment;
     }
     prefixes.contains(&wanted)
 }
@@ -519,6 +512,66 @@ pub(crate) fn muse_prompt_transcript_count(screen: &str, text: &str) -> usize {
 pub(crate) fn muse_verified_process_prompt_transcript_count(screen: &str, text: &str) -> usize {
     muse_composer_regions(screen, false).map_or(0, |(transcript, _)| {
         muse_transcript_prompt_count(&transcript, text)
+    })
+}
+
+// Rust-only helpers for follow-ups typed into a running Muse turn (#505 agentctl-muse-followup).
+// The Python edition still waits for an idle editor, so nothing in py/agentctl mirrors them.
+
+/// Transcript rows above the editor searched for Muse's running-turn row.
+const FOLLOWUP_PROGRESS_ROWS: usize = 16;
+
+/// The rows of Muse's editor as drawn, each without trailing blanks, after live-Muse process
+/// verification; `None` when the screen shows no ruled region whose first row starts with a
+/// prompt marker, above exactly one status footer.
+///
+/// An approval form or a panel can take the ruled region or the footer's place, and then this
+/// is `None`.
+pub(crate) fn muse_verified_process_editor_rows(screen: &str) -> Option<String> {
+    let (_, editor) = muse_composer_regions(screen, false)?;
+    muse_editor_segments(&editor)?;
+    Some(
+        splitlines(&editor)
+            .into_iter()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Whether `rows` from [`muse_verified_process_editor_rows`] hold nothing but the prompt marker.
+pub(crate) fn muse_editor_rows_empty(rows: &str) -> bool {
+    muse_editor_segments(rows).is_some_and(|segments| segments.is_empty())
+}
+
+/// The mode of the one status footer below Muse's editor, after live-Muse process verification.
+pub(crate) fn muse_verified_process_footer_mode(screen: &str) -> Option<&'static str> {
+    muse_composer_regions(screen, false)?;
+    let lines = splitlines(screen);
+    let bottom = lines.iter().rposition(|line| is_divider(line))?;
+    match muse_footer_modes(&lines[bottom + 1..]).as_slice() {
+        [mode] => Some(mode),
+        _ => None,
+    }
+}
+
+/// Whether the rows above Muse's editor show its running-turn row anywhere near the bottom.
+///
+/// Unlike [`muse_verified_process_turn_running`], which reads only the last transcript row, this
+/// also finds the row when Muse 1.4.14 draws more below it while it works: command output
+/// (`└ tick 2 (ctrl+b to send to background)`), a `◆ Queued input` block, or the row in its
+/// `◆` animation phase (`◆ Calling tools (26s · esc to interrupt)`).
+pub(crate) fn muse_verified_process_turn_in_progress(screen: &str) -> bool {
+    muse_composer_regions(screen, false).is_some_and(|(transcript, _)| {
+        splitlines(&transcript)
+            .into_iter()
+            .map(strip)
+            .filter(|line| !line.is_empty())
+            .rev()
+            .take(FOLLOWUP_PROGRESS_ROWS)
+            .any(|line| {
+                starts_with_marker(line, &["◆", "◇", "◈"]) && line.contains("esc to interrupt)")
+            })
     })
 }
 
@@ -863,10 +916,15 @@ mod tests {
             &frame("❯ keep the self-\n  contained   proof"),
             prompt
         ));
-        // Only a hyphen allows the unspaced join.
+        // Muse 1.4.14 also wraps inside a word or a path, so any row break may join unspaced
+        // (captured in testdata/muse-busy/muse-wrapped-draft.txt); the words must still match.
+        assert!(muse_prompt_is_exact_composer(
+            &frame("❯ keep the self\ncontained proof"),
+            "keep the selfcontained proof"
+        ));
         assert!(!muse_prompt_is_exact_composer(
             &frame("❯ keep the self\ncontained proof"),
-            prompt
+            "keep the self contained proofs"
         ));
         // A spaced join of the hyphenated line is still the literal text.
         assert!(muse_prompt_is_exact_composer(&frame("❯ a -\nb"), "a - b"));

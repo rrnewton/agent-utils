@@ -313,6 +313,12 @@ pub trait AgentApi: Send + Sync {
     ) -> crate::error::Result<bool> {
         Ok(false)
     }
+    /// Whether this client types a follow-up into a working Muse pane only through Muse's
+    /// verified editor path (#505 agentctl-muse-followup). A client that would fall back to
+    /// Herdr's native prompt, with no empty-editor proof, leaves a working Muse waiting.
+    fn verifies_muse_followups(&self) -> bool {
+        false
+    }
 }
 
 impl AgentApi for HerdrClient {
@@ -476,8 +482,9 @@ pub struct DrainOptions {
     /// Also type into a Claude Code pane that Herdr reports `working`, and let Claude Code
     /// queue the prompt behind its current turn. The submission must still be verified against
     /// the composer, which must be empty before typing; a prompt Claude Code never accepts is
-    /// taken back out of the composer and stays pending. Codex ordinary follow-ups are accepted while working by default. Slash commands and unsupported
-    /// harnesses still wait for `idle` or `done`. Off by default for Claude.
+    /// taken back out of the composer and stays pending. Codex and Muse ordinary follow-ups are
+    /// accepted while working by default (Muse steers its running turn with them). Slash commands
+    /// and unsupported harnesses still wait for `idle` or `done`. Off by default for Claude.
     pub deliver_while_working: bool,
 }
 
@@ -1027,7 +1034,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             // accepts is taken back out of the composer so that it stays safely pending. So is a
             // prompt whose sender asked for that, wherever it is typed.
             let followup_key = if info.status == "working" {
-                crate::harness_tui::harness_tui(info.agent.as_deref())
+                crate::harness_tui::followup_tui(info.agent.as_deref())
                     .map(|adapter| adapter.working_submit_key())
             } else {
                 None
@@ -1599,15 +1606,20 @@ fn wait_ready<A: AgentApi + ?Sized>(
             return Ok(info);
         }
         let adapter = crate::harness_tui::harness_tui(info.agent.as_deref());
+        let followup = crate::harness_tui::followup_tui(info.agent.as_deref());
+        // Codex and managed Muse panes take ordinary follow-ups while working by default; Claude
+        // Code only with `deliver_while_working`.
         if allow_followups
-            && (allow_working_claude || info.agent.as_deref() == Some("codex"))
+            && (allow_working_claude
+                || info.agent.as_deref() == Some("codex")
+                || (info.agent.as_deref() == Some("muse") && client.verifies_muse_followups()))
             && info.status == "working"
-            && adapter.is_some_and(|a| a.working_followups())
+            && followup.is_some_and(|a| a.working_followups())
         {
             if info.agent.as_deref() == Some("claude") {
                 return Ok(info);
             }
-            let view = adapter
+            let view = followup
                 .expect("supported adapter")
                 .classify(&client.read_with_runtime(
                     &info.pane_id,
@@ -3229,6 +3241,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        /// What a read of the visible screen returns when the fake draws no composer.
+        visible: Option<String>,
         infos: BTreeMap<String, AgentPaneInfo>,
         states: VecDeque<String>,
         last_state: String,
@@ -3430,6 +3444,9 @@ mod tests {
             }
             let mut state = self.state.lock().expect("fake state");
             state.reads.push(source.to_owned());
+            if let Some(visible) = state.visible.clone().filter(|_| source == "visible") {
+                return Ok(visible);
+            }
             if source == "recent-unwrapped" && state.unwrapped_empty {
                 Ok(String::new())
             } else {
@@ -3643,6 +3660,51 @@ mod tests {
                 assert_eq!(document["delivery_state"], "pending");
             }
         }
+    }
+
+    #[test]
+    fn a_working_muse_waits_unless_the_client_verifies_muse_followups() {
+        // #505 agentctl-muse-followup: a raw Herdr client would fall back to the native prompt,
+        // with no empty-editor proof, so it never types into a working Muse, even one whose
+        // screen shows an empty editor below a running turn.
+        let directory = TestDirectory::new("while-working-muse-raw");
+        let fake = FakeAgent::new(&["working"]);
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.visible = Some(
+                "◇ Thinking (3s · esc to interrupt)\n────────\n❯\n────────\n\
+                 model · xhigh · /work · Launch overrides\n"
+                    .to_owned(),
+            );
+            let info = state.infos.get_mut("w1:p1").unwrap();
+            info.agent = Some("muse".to_owned());
+            info.session_agent = Some("muse".to_owned());
+        }
+        assert_eq!(
+            crate::harness_tui::followup_tui(Some("muse"))
+                .unwrap()
+                .classify(fake.state.lock().unwrap().visible.as_deref().unwrap())
+                .state,
+            crate::harness_tui::State::Working
+        );
+        let mut target = target();
+        target.expected_agent = Some("muse".to_owned());
+        target.session_agent = Some("muse".to_owned());
+        enqueue(directory.path(), "one prompt", Some("once")).unwrap();
+        let result = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert!(result.delivered.is_empty());
+        assert_eq!(result.pending, ["once"]);
+        assert!(fake.runs().is_empty());
     }
 
     #[test]
