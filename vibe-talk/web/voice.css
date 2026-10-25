@@ -2862,6 +2862,12 @@ a.search-hit-link {
  * line into the box as `::after`, level with the meta line, where an arrow's leg leaves a box. The
  * next reply's part starts where this one ends, so the spine is one line however tall each reply
  * is, folded or open, and at any type size: every length is the rows' own or in `rem`.
+ *
+ * `#501 thread-bridge-gutter`. The line takes a tap of its own: back to what the stack hangs from
+ * (web/voice.js, `bridgePiece`), over the thumb's width `::before` keeps along it, left of the
+ * spine and across the branch to the box, but never into the box, whose left edge — its thread
+ * strip, its marker — keeps its own taps. The X and the pack triangle stand over that room in
+ * the first reply's gutter, and keep theirs.
  */
 #side-log .reply-bridge,
 #side-cards .reply-bridge,
@@ -2876,7 +2882,20 @@ a.search-hit-link {
   width: calc(0.9rem + var(--reply-stroke) / 2);
   border-left: var(--reply-stroke) solid currentColor;
   color: var(--accent);
-  pointer-events: none;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#side-log .reply-bridge::before,
+#side-cards .reply-bridge::before,
+#discord-log .reply-bridge::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -1.1rem;
+  right: 0;
 }
 
 #side-log .reply-bridge::after,
@@ -2917,12 +2936,14 @@ a.search-hit-link {
  * THE X, which puts the replies back in time order: a touch target square, the first reply's whole
  * gutter, with its X drawn in a disc LEFT of the spine and level with the first line into a box —
  * "floating to the left of the bridge connection", in the owner's words. Over the spine, the square
- * is still the X's: the bridge takes no taps.
+ * is still the X's: it stands over the bridge's own tap room (`#501 thread-bridge-gutter`), as does
+ * the pack triangle it dresses in the cards, so a press there packs or puts back, and never glides.
  */
 #side-log .reply-ungather,
 #side-cards .reply-ungather,
 #discord-log .reply-ungather {
   position: absolute;
+  z-index: 1;
   top: 0;
   right: 100%;
   width: var(--reply-gutter);
@@ -9598,5 +9619,98 @@ li.discord-message[data-root-child] > .reply-bridge {
 @supports (anchor-name: --a) {
   #side-list:has(> #side-cards > li.unpack-row[data-inline-reply]) > #side-reply[data-anchored] {
     left: calc(anchor(--inline-reply-list left) + var(--unpack-row-left));
+  }
+}
+
+/*
+ * `#501 thread-bridge-gutter`. ON A PHONE the bridge hugs the left edge. The owner, 2026-10-25:
+ * "In mobile we waste too much space on this connector bridge. I would like to push it left so
+ * that the triangle is almost touching the left screen edge." A stack hung a whole touch target
+ * (2.75rem) in from what it hangs from, because the X's disc, a gap, the spine and a 0.9rem
+ * branch were laid out across that gutter; on a 393px phone an unpacked thread's rows began
+ * 68px from the edge and the triangle's ink 29px.
+ *
+ * Here a stack hangs 0.85rem in instead, on a 0.55rem branch: the spine still comes out of the
+ * foot of what the replies hang from and each row still begins visibly inside its parent — an
+ * unpacked thread's rows 1.6rem in from their card's face, the third speaker's half inset and
+ * the 0.85rem together — while the mark left of the spine takes the room
+ * the parent itself does not use, out to a few pixels from the screen's edge, notch room
+ * included where the list keeps it. The agent's tile is the one parent with no such room: it
+ * runs edge to edge, so a stack under it keeps the least room the disc, its gap, the spine and
+ * the branch fit in, which is what it nearly had. The mark's button is 2.25rem wide here —
+ * still a thumb's target, and never under the 2rem floor the triangle states for itself; its
+ * height is the gutter it always was.
+ *
+ * Every list the bridge is drawn in, restated from the stack's own rules above as a desk
+ * restates them in its block; a desk keeps the room it has, and a reply's arrow keeps its whole
+ * gutter everywhere — only what hangs on a bridge moves.
+ */
+@media (max-width: 599.98px) {
+  #side-log li.discord-message[data-stack-under="coder"][data-who],
+  #side-cards li.discord-message[data-stack-under="coder"][data-who],
+  #discord-log li.discord-message[data-stack-under="coder"][data-who] {
+    margin-left: calc(1.6875rem - env(safe-area-inset-left));
+  }
+  #side-log li.discord-message[data-stack-under="me"][data-who],
+  #side-cards li.discord-message[data-stack-under="me"][data-who],
+  #discord-log li.discord-message[data-stack-under="me"][data-who] {
+    margin-left: calc(var(--speaker-inset) + 0.85rem);
+  }
+  #side-log li.discord-message[data-stack-under="third"][data-who],
+  #side-cards li.discord-message[data-stack-under="third"][data-who],
+  #discord-log li.discord-message[data-stack-under="third"][data-who] {
+    margin-left: calc(var(--speaker-inset) / 2 + 0.85rem);
+  }
+  #side-log li.discord-message[data-stack-under="reply"][data-who],
+  #side-cards li.discord-message[data-stack-under="reply"][data-who],
+  #discord-log li.discord-message[data-stack-under="reply"][data-who],
+  #side-log li.discord-message[data-stack-under="me-reply"][data-who],
+  #side-cards li.discord-message[data-stack-under="me-reply"][data-who],
+  #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
+    margin-left: calc(var(--reply-gutter) + 0.85rem);
+  }
+
+  #side-log .reply-bridge,
+  #side-cards .reply-bridge,
+  #discord-log .reply-bridge {
+    width: calc(0.55rem + var(--reply-stroke) / 2);
+  }
+
+  #side-log .reply-ungather,
+  #side-cards .reply-ungather,
+  #discord-log .reply-ungather {
+    width: 2.25rem;
+  }
+
+  #side-cards .reply-ungather.unpack-pack {
+    width: 2.25rem;
+  }
+
+  /* The disc and the triangle in their slim button, by the arithmetic their own rules state: the
+     button's width, less the branch, half the spine, the gap to it, and the mark itself. */
+  #side-log .reply-ungather-mark,
+  #side-cards .reply-ungather-mark,
+  #discord-log .reply-ungather-mark {
+    left: calc(2.25rem - 0.55rem - 0.09375rem - 0.25rem - 1.2rem);
+  }
+
+  #side-cards .unpack-pack-mark {
+    left: 0.05625rem;
+  }
+
+  /* A collapsed run's line in an unpacked thread keeps the stack's slim indent, as above. */
+  #side-cards li.discord-message[data-read-run="head"][data-stack-under="third"] {
+    margin-left: calc(var(--speaker-inset) / 2 + 0.85rem) !important;
+  }
+
+  /* `#492 threads-row-widths`, restated: the owner's unpacked rows stand half their old
+     difference further in than this, and a reply opened under one is as wide as they are. */
+  #side-list {
+    --unpack-row-left: calc(var(--speaker-inset) / 2 + 0.85rem);
+    --unpack-row-left-cqw: calc(var(--speaker-inset) / 2 + 0.85rem);
+  }
+
+  #side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge {
+    width: calc(0.55rem + var(--reply-stroke) / 2 + min(15cqw, 6rem) / 2);
   }
 }

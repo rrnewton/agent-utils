@@ -32669,11 +32669,69 @@ function gutterPiece(row, name, wanted, make) {
   else if (!wanted && held) row.removeChild(held);
 }
 
-/** The bridge's part in one gathered reply's gutter: drawn by web/voice.css, and only drawn. */
-function bridgePiece() {
+/**
+ * `#501 thread-bridge-gutter`. What `row`'s bridge hangs from, drawn: a row unpacked under its
+ * card, that thread's card; a gathered reply, the first row above the stack that is not of it —
+ * the message the replies were gathered under, which the stack's own drawing puts there. Null
+ * where neither stands, as for a row a redraw has taken out of its list.
+ */
+function bridgeTop(row) {
+  const thread = row.getAttribute("data-unpack-thread");
+  if (thread) return cardRow(thread);
+  const list = row.parentNode;
+  if (!list) return null;
+  const rows = [...list.children];
+  for (let at = rows.indexOf(row) - 1; at >= 0; at -= 1) {
+    if (!rows[at].hasAttribute("data-stack-under")) return rows[at];
+  }
+  return null;
+}
+
+/**
+ * `#501 thread-bridge-gutter`. Glide the list holding `row` back to what its bridge hangs from
+ * (`bridgeTop`), at its head as a landing is put there (`revealRow`): just under the floating
+ * line, so the card stands wholly below the heading wherever the list can scroll to it. A glide,
+ * smoothly or at once as the stylesheet says for this reader (`glideBehavior`), and measured
+ * with every pack slide finished, where the rows are laid out rather than where a slide moment
+ * ago drew them (`#460 pack-gap-slide`). Nothing is packed, folded or marked: the stack stays
+ * hanging where it was, under its card again.
+ */
+function glideToBridgeTop(row) {
+  const top = bridgeTop(row);
+  if (!top || top === row) return;
+  let area = /** @type {HTMLElement | null} */ (row.parentNode);
+  while (area && area.id !== "side-scroll" && area.id !== "scroll-area") {
+    area = /** @type {HTMLElement | null} */ (area.parentNode);
+  }
+  if (!area) return;
+  finishPackSlide();
+  const to = area.scrollTop + drawnTop(top) - floatingClearance(area) - REPLY_LANDING_GAP_PX;
+  if (typeof area.scrollTo === "function") area.scrollTo({ top: to, behavior: glideBehavior() });
+  else area.scrollTop = to;
+}
+
+/**
+ * The bridge's part in one gathered reply's gutter: drawn by web/voice.css, and, since
+ * `#501 thread-bridge-gutter`, the way back up it: a tap on the line itself glides to what the
+ * stack hangs from (`glideToBridgeTop`), where the X beside the first part of it — and the pack
+ * triangle the cards dress that X as — keeps the square over the spine for its own press. No
+ * control of its own for the keyboard or a screen reader, which reach the card and the parent
+ * as rows of the list; the line stays decoration to them, as it was.
+ */
+function bridgePiece(row) {
   const bridge = document.createElement("span");
   bridge.className = "reply-bridge";
   bridge.setAttribute("aria-hidden", "true");
+  bridge.setAttribute("title", row && row.hasAttribute("data-unpack-thread")
+    ? "Back to this thread's card" : "Back to the message these replies hang from");
+  bridge.addEventListener("click", (event) => {
+    // The row's own tap would fold the reply or read it aloud; this tap is the line's.
+    if (event) event.stopPropagation();
+    // ...unless it is the end of the taps on an arrow that put the bridge here, as with the X.
+    if (replyTapsSettling !== null) return;
+    const holder = bridge.parentNode || row;
+    if (holder) glideToBridgeTop(holder);
+  });
   return bridge;
 }
 
@@ -45986,7 +46044,7 @@ function unpackBlock(choice, tally) {
     row.style.setProperty("--thread-hue", threadHue(choice.id));
     // `#440 thread-card-pack-toggle`. The first row's gutter holds the triangle that packs the thread,
     // where All's bridge holds its X.
-    row.replaceChildren(...(at === 0 ? [packButton(choice.id)] : []), bridgePiece(), ...row.children);
+    row.replaceChildren(...(at === 0 ? [packButton(choice.id)] : []), bridgePiece(row), ...row.children);
   });
   const unpackForced = foldedOneIds(viewKey("thread", choice.id));
   const placed = (readMode === "fold" || unpackForced.size > 0) && !readRunsSuspended()
