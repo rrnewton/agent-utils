@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-const FAKE_CLAUDE: &str = include_str!("fixtures/fake_claude.py");
+const FAKE_CLAUDE: &str = include_str!("fixtures/fake_claude.txt");
 
 fn executable(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
