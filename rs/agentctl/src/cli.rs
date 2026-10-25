@@ -1255,12 +1255,12 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
     }
 }
 
-/// Commands only the Python edition implements: the MCP server, the headless-worker operations,
-/// and the polling Chat launcher and its history/context readers. This edition refuses them with
-/// exit status 2 and names the Python opt-in, instead of Clap's unrecognised-subcommand error.
+// Commands only the Python edition implements: the MCP server, the headless-worker operations,
+// and the polling Chat launcher and its history/context readers. This edition refuses them with
+// exit status 2 and names the Python opt-in, instead of Clap's unrecognised-subcommand error.
 const PYTHON_ONLY_COMMANDS: [&str; 4] = ["mcp", "migrate", "reset", "repair"];
 const PYTHON_ONLY_CHAT_COMMANDS: [&str; 3] = ["launch", "history", "context"];
-/// Global options whose value is the following argument.
+// Global options whose value is the following argument.
 const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
     "--registry",
     "--state",
@@ -1271,8 +1271,8 @@ const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
     "--from-session",
 ];
 
-/// The display name of the Python-only command in `arguments` (program name first), if any.
-/// Anything the scan does not recognise is left for Clap to judge.
+// The display name of the Python-only command in `arguments` (program name first), if any.
+// Anything the scan does not recognise is left for Clap to judge.
 fn python_only_command(arguments: &[OsString]) -> Option<String> {
     fn next_command(arguments: &[OsString], mut index: usize) -> Option<(&str, usize)> {
         while index < arguments.len() {
