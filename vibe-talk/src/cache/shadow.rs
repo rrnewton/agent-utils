@@ -1206,6 +1206,84 @@ struct Tally {
     newer_rows: AtomicU64,
     extra_rows: AtomicU64,
     content_differs: AtomicU64,
+    timings: Timings,
+}
+
+/// How a reader's read was answered, for its latency. `#502 cache-serve-coverage`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// From the cache: from the ask until the cache's answer was ready to hand back.
+    Cache,
+    /// From upstream: from the ask until upstream's answer arrived, a serve's wait included.
+    Upstream,
+    /// Not from the cache, though the rule would have served it: from the ask until the
+    /// evaluation had read the cache, what answering from it would have taken.
+    Would,
+}
+
+impl Answered {
+    /// Every way, in the order the report lists them.
+    pub const ALL: [Self; 3] = [Self::Cache, Self::Upstream, Self::Would];
+
+    /// The name the report and the log use.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Upstream => "upstream",
+            Self::Would => "would",
+        }
+    }
+}
+
+/// The smallest latency [`Timings`] tells apart, in microseconds: a read answered from the cache
+/// takes a fraction of a millisecond.
+const TIMING_FLOOR_US: u64 = 10;
+/// Powers of two above [`TIMING_FLOOR_US`] that [`Timings`] tells apart: up to about 168 s.
+const TIMING_OCTAVES: u32 = 24;
+
+/// One consumer's read latencies, one histogram per [`Answered`], in microseconds.
+#[derive(Debug)]
+struct Timings(std::sync::Mutex<[crate::upstream_profile::Histogram; 3]>);
+
+impl Default for Timings {
+    fn default() -> Self {
+        let histogram = || crate::upstream_profile::Histogram::new(TIMING_FLOOR_US, TIMING_OCTAVES);
+        Self(std::sync::Mutex::new([
+            histogram(),
+            histogram(),
+            histogram(),
+        ]))
+    }
+}
+
+impl Timings {
+    fn lock(&self) -> std::sync::MutexGuard<'_, [crate::upstream_profile::Histogram; 3]> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn summary(&self) -> ReadLatency {
+        let histograms = self.lock();
+        let summary = |answered: Answered| {
+            let histogram = &histograms[answered as usize];
+            // A histogram's quantile is a non-negative bucket midpoint, kept within what was seen.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let us = |q: f64| histogram.quantile(q).round() as u64;
+            LatencySummary {
+                n: histogram.count(),
+                p50_us: us(0.5),
+                p90_us: us(0.9),
+                p99_us: us(0.99),
+            }
+        };
+        ReadLatency {
+            cache: summary(Answered::Cache),
+            upstream: summary(Answered::Upstream),
+            would: summary(Answered::Would),
+        }
+    }
 }
 
 /// What the shadow has counted since the process started, per consumer. Memory only.
@@ -1265,6 +1343,12 @@ impl Tallies {
         bump(&tally.content_differs, widen(comparison.differs));
     }
 
+    /// Time one reader's read for `consumer`, answered as `answered`, which took `took`.
+    pub fn timed(&self, consumer: Consumer, answered: Answered, took: Duration) {
+        let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        self.tally(consumer).timings.lock()[answered as usize].record(us);
+    }
+
     /// Every consumer's counts, in [`Consumer::ALL`]'s order.
     #[must_use]
     pub fn report(&self) -> Vec<ConsumerCounts> {
@@ -1296,6 +1380,7 @@ impl Tallies {
                     newer_rows: read(&tally.newer_rows),
                     extra_rows: read(&tally.extra_rows),
                     content_differs: read(&tally.content_differs),
+                    latency: tally.timings.summary(),
                 }
             })
             .collect()
@@ -1338,6 +1423,49 @@ pub struct ConsumerCounts {
     pub extra_rows: u64,
     /// Messages both listed whose text differed.
     pub content_differs: u64,
+    /// How long its readers' reads took, by how they were answered. `#502
+    /// cache-serve-coverage`.
+    pub latency: ReadLatency,
+}
+
+/// One consumer's read latencies since the process started, by how each read was answered (see
+/// [`Answered`]). Numbers only. `#502 cache-serve-coverage`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ReadLatency {
+    /// Answered from the cache.
+    pub cache: LatencySummary,
+    /// Answered by upstream.
+    pub upstream: LatencySummary,
+    /// Answered by upstream though the rule would have served them: how long the cache took to
+    /// have its answer.
+    pub would: LatencySummary,
+}
+
+impl ReadLatency {
+    /// The summary of reads answered as `answered`.
+    #[must_use]
+    pub const fn of(&self, answered: Answered) -> &LatencySummary {
+        match answered {
+            Answered::Cache => &self.cache,
+            Answered::Upstream => &self.upstream,
+            Answered::Would => &self.would,
+        }
+    }
+}
+
+/// How many reads were timed, and the latency below which half, nine in ten and ninety-nine in a
+/// hundred of them fell, in microseconds, read off a histogram whose buckets are an eighth of a
+/// power of two wide. All 0 when none was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct LatencySummary {
+    /// Reads timed.
+    pub n: u64,
+    /// The median.
+    pub p50_us: u64,
+    /// The 90th percentile.
+    pub p90_us: u64,
+    /// The 99th percentile.
+    pub p99_us: u64,
 }
 
 impl ConsumerCounts {
@@ -1367,6 +1495,8 @@ impl ConsumerCounts {
             newer_rows: self.newer_rows + other.newer_rows,
             extra_rows: self.extra_rows + other.extra_rows,
             content_differs: self.content_differs + other.content_differs,
+            // Percentiles do not add: the sum says nothing of latency.
+            latency: ReadLatency::default(),
         }
     }
 }

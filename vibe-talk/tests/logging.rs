@@ -1851,6 +1851,12 @@ async fn the_hourly_message_cache_line_is_numbers_and_never_an_id_or_a_word() {
         "shadow_asked=2",
         "shadow_would_serve=1",
         "shadow_extra_rows=0",
+        // `#502 cache-serve-coverage`: the first window found nothing held, the second would
+        // have been served; and both readers waited for upstream, timed by consumer.
+        "shadow_miss_gap=1",
+        "shadow_miss_suspect=0",
+        "read_timings=\"messages upstream n=2 p50_ms=",
+        "; messages would n=1 p50_ms=",
     ] {
         assert!(
             line.contains(field),

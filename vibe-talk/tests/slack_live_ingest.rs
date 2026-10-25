@@ -1025,6 +1025,25 @@ mod measure {
         state
     }
 
+    /// [`history`], with every `every`th message a system event the client never shows: a
+    /// channel's history as Slack lists it, so that a page of `limit` entries holds fewer
+    /// messages than that.
+    fn history_with_joins(count: i64, newest_ago: i64, every: i64) -> FakeState {
+        let mut state = history(count, newest_ago);
+        for (i, entry) in state
+            .history
+            .get_mut(CH)
+            .expect("history")
+            .iter_mut()
+            .enumerate()
+        {
+            if i64::try_from(i).expect("small") % every == every - 1 {
+                entry["subtype"] = json!("channel_join");
+            }
+        }
+        state
+    }
+
     fn config(fake: &Fake, cache_table: &str, poll_seconds: u64) -> String {
         format!(
             r#"
@@ -1193,6 +1212,37 @@ mod measure {
         assert_eq!(off_fake.calls("conversations.history"), calls);
     }
 
+    /// `#502 cache-serve-coverage`. A walk that is over, whose channel the cache has erased since
+    /// it began, proved nothing that is still held: it walks again at once, not six hours on.
+    #[tokio::test]
+    async fn a_walk_over_before_an_erase_of_its_channel_walks_again() {
+        let fake = Fake::start(history(60, 60), 20).await;
+        let (state, _clock, _dir) = cached(
+            &fake,
+            "backfill-erased",
+            "\n[message_cache]\nbackfill = \"adaptive\"\n",
+        )
+        .await;
+        let mut backfill = Backfill::new();
+        while backfill.step(&state, LIMIT, Duration::ZERO).await == BackfillStep::Read {}
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Idle
+        );
+        let cache = state.message_cache.cache().expect("a cache");
+        let chan = state.message_cache.chan_key(&channel()).expect("routed");
+        cache.erase_channels(std::slice::from_ref(&chan));
+        assert!(cache.quiesce_blocking(WAIT));
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Read,
+            "the erased channel's walk starts over"
+        );
+        while backfill.step(&state, LIMIT, Duration::ZERO).await == BackfillStep::Read {}
+        assert!(cache.quiesce_blocking(WAIT));
+        assert_eq!(held(&state), 60, "the walk filled the channel again");
+    }
+
     #[tokio::test]
     async fn the_backfill_yields_while_anything_else_reads_the_provider() {
         let mut fixture = history(10, 60);
@@ -1355,6 +1405,157 @@ mod measure {
             settled(&state).await;
         }
         timeline_counts(&state)
+    }
+
+    /// The rows the server's own readers ask for: `[chat] default_fetch_limit`, which a deployment
+    /// may set below the page's own [`LIMIT`].
+    const SERVER_LIMIT: u16 = 40;
+
+    /// One round of [`servable`]'s workload with the relist reading [`SERVER_LIMIT`] rows: a
+    /// message arrives through the stream, the relist reads the channel, and a reader asks for the
+    /// newest Main page of [`LIMIT`] (with the read token, so the ask's own read writes nothing),
+    /// then fills the cache as a page's read does.
+    async fn relisted_round(state: &AppState, fake: &Fake, clock: &ManualClock, round: usize) {
+        clock.advance(30_000);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let ts = arrive(fake, round, 100 + i64::try_from(round).expect("small"));
+        let status = request(
+            state,
+            "POST",
+            "/api/v1/live/tail",
+            INGEST_TOKEN,
+            &record(
+                u64::try_from(round).expect("small") + 1,
+                &ts,
+                &format!("arrival {round}"),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{status}");
+        clock.advance(1_000);
+        vibe_talk::relist::relist_once(
+            state,
+            None,
+            RelistOptions {
+                limit: SERVER_LIMIT,
+                threads: 4,
+                interval: Duration::from_secs(60),
+                settle: Duration::ZERO,
+            },
+            wall_secs() * 1_000,
+        )
+        .await;
+        settled(state).await;
+        clock.advance(1_000);
+        let timeline = format!("/api/v1/channels/{CH}/timeline?view=main&limit={LIMIT}");
+        assert_eq!(
+            request(state, "GET", &timeline, READ_TOKEN, &Value::Null).await,
+            StatusCode::OK
+        );
+        settled(state).await;
+        page_fill(state).await;
+        settled(state).await;
+    }
+
+    /// The backfill's whole walk, at [`SERVER_LIMIT`] rows a page.
+    async fn backfill_walk(state: &AppState, walk: &mut Backfill) {
+        while walk.step(state, SERVER_LIMIT, Duration::ZERO).await == BackfillStep::Read {}
+    }
+
+    /// A server starting on the cache file in `dir` as `main` starts one: the backfill's first step
+    /// comes before the provider's account has been checked against the file, and the poller's
+    /// first tick waits for that check ([`vibe_talk::cache::Sink::first_checks`]); the walk then
+    /// goes on to its end.
+    async fn started(fake: &Fake, dir: &TempDir, clock: &Arc<ManualClock>) -> AppState {
+        let table = "\n[message_cache]\nbackfill = \"adaptive\"\n";
+        let state = testing::with_message_cache_unverified(
+            deployment(fake, table, 3600),
+            dir.path(),
+            clock.clone(),
+        );
+        let mut walk = Backfill::new();
+        // Before the check: a read now would write nothing, and a walk begun now would prove
+        // nothing, however it ended, and would not be walked again for six hours.
+        assert_eq!(
+            walk.step(&state, SERVER_LIMIT, Duration::ZERO).await,
+            BackfillStep::Unchecked
+        );
+        state.message_cache.first_checks(WAIT).await;
+        assert!(
+            state
+                .message_cache
+                .identities_verified(Duration::ZERO)
+                .await
+        );
+        let mut cursor = None;
+        vibe_talk::live::poll_once(
+            state.chat.as_ref(),
+            &state.live,
+            &channel(),
+            SERVER_LIMIT,
+            &mut cursor,
+        )
+        .await
+        .expect("the first tick");
+        let began_ms = clock.now();
+        backfill_walk(&state, &mut walk).await;
+        settled(&state).await;
+        // The walk proved its span in this process: what lies under the relist's shorter pages.
+        let cache = state.message_cache.cache().expect("a cache");
+        let chan = state.message_cache.chan_key(&channel()).expect("routed");
+        let covered = cache
+            .coverage(&chan, &vibe_talk::cache::Scope::Main)
+            .served()
+            .expect("coverage");
+        assert!(
+            covered.iter().any(|interval| {
+                interval.source == vibe_talk::cache::coverage::Source::Walk
+                    && interval.listed_ms >= began_ms
+            }),
+            "the walk's listing was written: {covered:?}"
+        );
+        state
+    }
+
+    /// `#502 cache-serve-coverage`. A start must not cost the newest page its servability for
+    /// longer than a relist. `main` starts the backfill, the poller and the relist before the
+    /// provider's account has been checked against the file, so the first reads they begin are
+    /// left out of it and leave the channel in doubt; and the server's readers ask for fewer rows
+    /// than the page does, so what lies under their pages is proven only by the backfill's walk.
+    #[tokio::test]
+    async fn the_newest_page_is_servable_soon_after_a_start_and_a_restart() {
+        let fake = Fake::start(history_with_joins(200, 3_600, 7), 100).await;
+        let dir = TempDir::new("restart-coverage");
+        let clock = ManualClock::at(wall_secs() * 1_000);
+        let before = {
+            let state = started(&fake, &dir, &clock).await;
+            for round in 0..3 {
+                relisted_round(&state, &fake, &clock, round).await;
+            }
+            let counts = timeline_counts(&state);
+            if let Some(cache) = state.message_cache.uninstall() {
+                assert!(cache.quiesce_blocking(WAIT));
+            }
+            counts
+        };
+        clock.advance(5_000);
+        let state = started(&fake, &dir, &clock).await;
+        for round in 3..6 {
+            relisted_round(&state, &fake, &clock, round).await;
+        }
+        let after = timeline_counts(&state);
+        for counts in [&before, &after] {
+            assert_eq!(
+                (
+                    counts.asked,
+                    counts.would_serve,
+                    counts.missing_rows,
+                    counts.extra_rows
+                ),
+                (3, 3, 0, 0),
+                "servable from the first relist after a start: {before:?} then {after:?}"
+            );
+        }
     }
 
     #[tokio::test]

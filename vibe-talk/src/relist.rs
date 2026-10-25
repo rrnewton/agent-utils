@@ -286,6 +286,10 @@ struct Walk {
     done: bool,
     /// Not before this instant, after a failure.
     retry_at: Option<tokio::time::Instant>,
+    /// Where the walk's listing may land, as the cache stamped it when the walk began: an erase of
+    /// the channel, its provider or the file since then drops what the walk offers, so the walk,
+    /// over or not, is walked again from its newest page. `#502 cache-serve-coverage`.
+    stamp: Option<crate::cache::Stamp>,
 }
 
 /// The `[message_cache]` table, when it asks for the backfill.
@@ -306,6 +310,10 @@ pub enum BackfillStep {
     Failed,
     /// The provider of the next channel is busy.
     Busy,
+    /// Every channel left to walk is of a provider whose account has not been checked against
+    /// the cache file yet, so nothing read now would be written: their walks wait, from their
+    /// newest pages.
+    Unchecked,
     /// Every channel's walk is over, or waiting after a failure.
     Idle,
     /// The backfill is off, or there is no cache to fill.
@@ -346,18 +354,44 @@ impl Backfill {
             .filter(|channel| state.message_cache.chan_key(channel).is_some())
             .collect();
         let listed: BTreeSet<&ChannelId> = channels.iter().collect();
-        self.walks.retain(|channel, _| listed.contains(channel));
+        // A walk whose listing an erase has made stale since it began proves nothing however it
+        // ends, nor one that is over: it walks again (`#502 cache-serve-coverage`).
+        self.walks.retain(|channel, walk| {
+            listed.contains(channel)
+                && walk.stamp.is_none_or(|stamp| {
+                    state
+                        .message_cache
+                        .chan_key(channel)
+                        .is_some_and(|chan| cache.stamp(&chan) == stamp)
+                })
+        });
         let now = tokio::time::Instant::now();
         let ready = |walk: Option<&Walk>| {
             walk.is_none_or(|walk| !walk.done && walk.retry_at.is_none_or(|at| at <= now))
         };
+        // A channel whose provider's account has not been checked against the file is not walked
+        // yet: nothing read would be written. It holds back no other provider's channels, nor
+        // their walks again every BACKFILL_REWALK: with nothing else to walk, the step says so.
+        let checked = |channel: &ChannelId| {
+            state.providers.key_for(channel).is_some_and(|key| {
+                state.message_cache.verification(&key) == crate::cache::sink::Verification::Verified
+            })
+        };
         let count = channels.len();
-        let Some(channel) = (0..count)
+        let waiting: Vec<&ChannelId> = (0..count)
             .map(|offset| &channels[(self.turn + offset) % count.max(1)])
-            .find(|channel| ready(self.walks.get(*channel)))
-            .cloned()
+            .filter(|channel| ready(self.walks.get(*channel)))
+            .collect();
+        let Some(channel) = waiting
+            .iter()
+            .find(|channel| checked(channel))
+            .map(|channel| (*channel).clone())
         else {
-            return BackfillStep::Idle;
+            return if waiting.is_empty() {
+                BackfillStep::Idle
+            } else {
+                BackfillStep::Unchecked
+            };
         };
         let busy = state
             .providers
@@ -370,10 +404,36 @@ impl Backfill {
         if busy {
             return BackfillStep::Busy;
         }
+        let before = self
+            .walks
+            .get(&channel)
+            .and_then(|walk| walk.before.clone());
+        let fill = state
+            .message_cache
+            .begin(&FillGrant::server(ServerFill::Backfill), &channel);
+        let listing = before.is_none().then(|| {
+            state
+                .message_cache
+                .begin(&FillGrant::server(ServerFill::Backfill), &channel)
+        });
+        // `#502 cache-serve-coverage`. A fill begun before the provider's account was checked
+        // against the file writes no rows, and its offer leaves the channel in doubt: a page read
+        // then is spent for nothing, and a walk whose listing began then proves nothing however
+        // it ends. `main` starts the backfill with the server, before the check has answered, and
+        // a walk that is over waits six hours to walk again; so the walk waits for the check, and
+        // one that loses it (a suspension, an erase of the file) starts over from its newest page.
+        if fill
+            .iter()
+            .chain(listing.iter().flatten())
+            .any(|fill| !fill.writes_rows())
+        {
+            self.walks.remove(&channel);
+            return BackfillStep::Unchecked;
+        }
         let walk = self.walks.entry(channel.clone()).or_default();
         let request = TimelineRequest {
             view: TimelineView::Main,
-            before: walk.before.clone(),
+            before,
             limit,
             ..TimelineRequest::default()
         };
@@ -382,13 +442,9 @@ impl Backfill {
         } else {
             TimelineRead::Newest
         };
-        let fill = state
-            .message_cache
-            .begin(&FillGrant::server(ServerFill::Backfill), &channel);
-        if walk.before.is_none() {
-            walk.listing = state
-                .message_cache
-                .begin(&FillGrant::server(ServerFill::Backfill), &channel);
+        if let Some(listing) = listing {
+            walk.stamp = listing.as_ref().map(crate::cache::Fill::stamp);
+            walk.listing = listing;
             walk.read.clear();
             walk.unproven = false;
         }
@@ -449,6 +505,16 @@ pub async fn backfill_forever(state: AppState, limit: u16) {
             }
             BackfillStep::Busy => {
                 idle_since = None;
+                tokio::time::sleep(BACKFILL_SPACING).await;
+            }
+            // Nothing to walk but channels of a provider not checked yet: idle for the rewalk,
+            // and looked at again soon, since a check usually answers in a second or two.
+            BackfillStep::Unchecked => {
+                let since = *idle_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= BACKFILL_REWALK {
+                    backfill.rewalk();
+                    idle_since = None;
+                }
                 tokio::time::sleep(BACKFILL_SPACING).await;
             }
             // The owner turned the cache off, or it is not open yet: look again in a while.

@@ -4407,6 +4407,12 @@ summary is of, `/page`, `/count` — is **shadowed** whether or not it is served
    upstream as before);
 3. once upstream has answered, the two answers are compared.
 
+Only a reader's read is asked: a page's, a tool's, a route's. The server's own reads — the live
+poller's, the relist's, the backfill's — fill the cache and are never asked, so `asked` stays
+where it is while nobody reads, however many reads the upstream timings count. And of a page's
+timeline reads only a newest page is asked (a step back, the changes since a cursor and the thread
+list are not), in a view the cache could answer: on Slack, Main and one thread's page, never Flat.
+
 The shadow never writes. Read-scope requests are shadowed as well, and those write nothing
 either. Counts are kept per consumer, in memory, from the moment the process starts:
 
@@ -4430,7 +4436,20 @@ either. Counts are kept per consumer, in memory, from the moment the process sta
     difference at all;
   * `extra_rows`, messages the cache would have shown that the provider no longer lists. Each one
     would have brought a deleted message back;
-  * `content_differs`.
+  * `content_differs`;
+* `latency`: how long each reader waited, by how the read was answered (`#502
+  cache-serve-coverage`), as `n` and the 50th, 90th and 99th percentiles in microseconds:
+  * `cache`: answered from the cache, timed from the ask to the cache's answer being ready;
+  * `upstream`: answered by the provider, timed from the ask to the provider's answer, a serve's
+    wait of up to 300 ms included. A served answer's refresh, which no reader waits for, is not
+    timed;
+  * `would`: answered by the provider though the rule would have served it, timed from the ask to
+    the cache's answer being ready: what answering from the cache would have taken, where serving
+    is off, the read is one this build only measures, or a serve did not go ahead (its evaluation
+    took longer than 300 ms, or the view still owed the provider's own page).
+
+  A read that failed is not timed, nor one counted `off` or `blocked` before the cache was read, so
+  `n` may be less than `asked`.
 
   A comparison that finds any of these writes one log line: a warning for a difference, an `info`
   line when it found only stale or newer messages, at most thirty of each an hour (the next says
@@ -4463,7 +4482,14 @@ the pages reach `max_days`, or 20 pages have been read; the whole walk is then o
 listing of the channel's own timeline as of when it began, which is what proves the span its older
 pages cover (a walk with any page from an older copy, or with a notice, offers its rows only). It
 walks again every six hours, which also
-keeps what it holds revalidated. It reads one page at a time, at least a second apart, and only
+keeps what it holds revalidated. It begins no walk until the channel's provider has said which
+account it is and the file agrees, and a walk that loses that check part way (a suspension, an
+erase of the file) starts over from its newest page, as does a walk, over or not, whose channel,
+provider or file has been erased since it began: a walk begun before the check, or before such an
+erase, would write nothing, and prove nothing, and the next would not come for six hours (`#502
+cache-serve-coverage`). A provider whose account is never checked holds back no other provider's
+walks. For the same reason the live poller and the relist wait for every
+provider's check, up to 15 seconds, before their first read. It reads one page at a time, at least a second apart, and only
 while the provider has had nothing else running for two seconds: a page, the poller and a voice
 call always go first. Its reads are counted under the read reason `backfill`. `backfill = "off"`
 makes none.
@@ -4518,7 +4544,10 @@ path:
       "misses": { "off": 0, "blocked": 0, "suspect": 0, "gap": 30, "incomplete": 0,
                   "stale_head": 260, "barrier": 0 },
       "late": 0, "compared": 120, "agreed": 118, "missing_rows": 2, "stale_rows": 1,
-      "newer_rows": 1, "extra_rows": 0, "content_differs": 0 }
+      "newer_rows": 1, "extra_rows": 0, "content_differs": 0,
+      "latency": { "cache":    { "n": 0,   "p50_us": 0,       "p90_us": 0,       "p99_us": 0 },
+                   "upstream": { "n": 410, "p50_us": 1601000, "p90_us": 2205000, "p99_us": 5480000 },
+                   "would":    { "n": 120, "p50_us": 410,     "p90_us": 900,     "p99_us": 2100 } } }
   ]
 }
 ```
@@ -4537,11 +4566,16 @@ What the fields mean:
 * **Memory only.** The figures restart from zero with the process.
 
 **Every hour, one `info` line** gives the same figures, as totals since the process started, with
-the shadow summed over consumers:
+the shadow's counts and misses summed over consumers, and its latencies per consumer in
+`read_timings`, one entry for each consumer and way of answering that timed a read (`none` when
+none did), in milliseconds:
 
 ```text
-INFO vibe_talk::cache::sink: message cache figures since this process started available=true enabled=true bytes=18874368 messages=6120 channels=9 covered_days=31.5 ops_applied=15210 ops_dropped=0 … batch_p99_us=24000 orphans_dropped=0 providers_verified=1 providers_suspended=0 blocked=0 shadow_asked=410 shadow_would_serve=120 … shadow_extra_rows=0 shadow_content_differs=0
+INFO vibe_talk::cache::sink: message cache figures since this process started available=true enabled=true bytes=18874368 messages=6120 channels=9 covered_days=31.5 ops_applied=15210 ops_dropped=0 … batch_p99_us=24000 orphans_dropped=0 providers_verified=1 providers_suspended=0 blocked=0 shadow_asked=410 shadow_would_serve=120 … shadow_extra_rows=0 shadow_content_differs=0 shadow_miss_off=0 shadow_miss_blocked=0 shadow_miss_suspect=0 shadow_miss_gap=30 shadow_miss_incomplete=0 shadow_miss_stale_head=260 shadow_miss_barrier=0 read_timings="timeline_fallback cache n=81 p50_ms=0.6 p90_ms=1.4 p99_ms=3.2; timeline_fallback upstream n=182 p50_ms=2650.1 p90_ms=4352 p99_ms=9216; messages upstream n=410 p50_ms=1601 p90_ms=2205 p99_ms=5480; messages would n=120 p50_ms=0.4 p90_ms=0.9 p99_ms=2.1"
 ```
+
+So how answering from the cache changes a read's latency is read off one consumer's entries: its
+`cache` (or, where nothing is served, `would`) percentiles against its `upstream` ones.
 
 **What is never logged.** No log line about the cache, at any level, carries message text, a
 content hash or a summary key. None carries a message or channel id either, with one exception:

@@ -239,6 +239,19 @@ async fn a_reload_behind_a_provider_that_has_not_answered_shows_the_held_message
         timeline.compared >= 1 && timeline.agreed == timeline.compared,
         "the served answer was checked against upstream, and agreed: {timeline:?}"
     );
+    // `#502 cache-serve-coverage`: the reader's wait is timed as answered from the cache, and
+    // the refresh behind it, which no reader waited for, is not timed at all: the one read timed
+    // upstream is the fill's, before serving was on.
+    let latency = timeline.latency;
+    assert_eq!(
+        (latency.cache.n, latency.upstream.n, latency.would.n),
+        (1, 1, 0),
+        "{latency:?}"
+    );
+    assert!(
+        latency.cache.p50_us <= u64::try_from(elapsed.as_micros()).expect("small"),
+        "timed from the ask to the cache's answer, within the request: {latency:?} {elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -476,7 +489,23 @@ async fn with_serving_off_a_reload_waits_for_the_provider() {
         ]
     );
     settled(&d.state).await;
-    assert_eq!(counts(&d.state, "timeline_fallback").served, 0);
+    let timeline = counts(&d.state, "timeline_fallback");
+    assert_eq!(timeline.served, 0);
+    // `#502 cache-serve-coverage`: the reader waited for upstream, held past a second (the other
+    // read timed upstream is the fill's); the cache would have had its answer far sooner, and
+    // says how soon.
+    let latency = timeline.latency;
+    assert_eq!(
+        (latency.cache.n, latency.upstream.n, latency.would.n),
+        (0, 2, 1),
+        "{latency:?}"
+    );
+    assert!(
+        // Within the histogram's resolution, an eighth of a power of two.
+        latency.upstream.p99_us >= u64::try_from(AT_ONCE.as_micros()).expect("small") * 7 / 8
+            && latency.would.p99_us < latency.upstream.p99_us,
+        "{latency:?}"
+    );
 }
 
 #[tokio::test]

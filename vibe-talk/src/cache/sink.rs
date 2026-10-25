@@ -775,6 +775,11 @@ struct ShadowTask {
     /// [`MessageCache::fed_since_ms`] when the ask was made.
     fed_since_ms: Option<i64>,
     asked_ms: i64,
+    /// When the request asked, by the monotonic clock, and how its reader was answered and how
+    /// long after that: noted when the answer is ready, timed when the evaluation is counted.
+    /// `#502 cache-serve-coverage`.
+    began: Instant,
+    answered: Option<(shadow::Answered, Duration)>,
     /// The evaluation reading the cache on the blocking pool, until awaited: by the counting
     /// task, or on the request's own path by [`Sink::try_serve`], which must know the verdict
     /// before it answers.
@@ -794,6 +799,8 @@ struct Evaluated {
     dropped_ms: Option<i64>,
     /// The highest sequence number applied once it had read.
     applied_after: u64,
+    /// How long after the ask it had read: what an answer from the cache would have waited.
+    read_took: Duration,
 }
 
 impl Evaluated {
@@ -804,6 +811,7 @@ impl Evaluated {
             barrier: false,
             dropped_ms: None,
             applied_after: 0,
+            read_took: Duration::ZERO,
         }
     }
 }
@@ -816,7 +824,8 @@ impl Shadowed {
     /// read: what was queued by then is noted, and an evaluation that read past it may have read
     /// the request's own write, so it is counted `late`, with no verdict.
     pub fn compare(mut self, upstream: Upstream) {
-        if let Some(task) = self.task.take() {
+        if let Some(mut task) = self.task.take() {
+            task.answered_by(shadow::Answered::Upstream);
             let enqueued = task.cache.upgrade().map(|cache| cache.enqueued_seq());
             (*task).settle(Some((upstream, enqueued)));
         }
@@ -869,7 +878,8 @@ pub struct HeldShadow {
 impl HeldShadow {
     /// The request answered with what it found elsewhere: compare with that.
     pub fn found(mut self, upstream: Upstream) {
-        if let Some(task) = self.task.take() {
+        if let Some(mut task) = self.task.take() {
+            task.answered_by(shadow::Answered::Upstream);
             (*task).settle(Some((upstream, self.enqueued)));
         }
     }
@@ -877,7 +887,8 @@ impl HeldShadow {
     /// The request found nothing more: compare with upstream's first answer, as
     /// [`Shadowed::compare`] would have.
     pub fn nothing_more(mut self) {
-        if let (Some(task), Some(first)) = (self.task.take(), self.first.take()) {
+        if let (Some(mut task), Some(first)) = (self.task.take(), self.first.take()) {
+            task.answered_by(shadow::Answered::Upstream);
             (*task).settle(Some((first, self.enqueued)));
         }
     }
@@ -945,6 +956,13 @@ impl Drop for PendingServe {
 }
 
 impl ShadowTask {
+    /// Note that the request's reader has its answer now, `answered` so; the first note stands.
+    fn answered_by(&mut self, answered: shadow::Answered) {
+        if self.answered.is_none() {
+            self.answered = Some((answered, self.began.elapsed()));
+        }
+    }
+
     /// Await the evaluation's read of the cache, once: what counting decides on.
     async fn evaluate(&mut self) {
         if self.evaluated.is_none() {
@@ -1001,17 +1019,22 @@ impl ShadowTask {
             live_fed,
             fed_since_ms,
             asked_ms,
+            answered,
             evaluated,
             progress,
             cache,
             ..
         } = self;
         let consumer = ask.consumer();
+        if let Some((answered, took)) = answered {
+            progress.tallies.timed(consumer, answered, took);
+        }
         if let Some(Evaluated {
             read,
             barrier,
             dropped_ms,
             applied_after,
+            read_took,
         }) = evaluated
         {
             let (decision, view) = match read {
@@ -1040,6 +1063,12 @@ impl ShadowTask {
                 }
             };
             progress.tallies.decided(consumer, decision);
+            // Timed only beside an upstream answer, as the reads it is set against are.
+            if decision == Decision::Serve && !served && upstream.is_some() {
+                progress
+                    .tallies
+                    .timed(consumer, shadow::Answered::Would, read_took);
+            }
             if let (Decision::Serve, Some(view), Some((upstream, _))) = (decision, &view, &upstream)
             {
                 if let Some((comparison, detail)) =
@@ -1310,6 +1339,40 @@ async fn note(
              what it claims (stale: before the ask; newer: after it); times are offsets from the \
              ask"
         ),
+    }
+}
+
+/// Every consumer's read latencies, one `;`-separated entry per consumer and way of answering
+/// that timed any read: `timeline_fallback cache n=53 p50_ms=0.4 p90_ms=0.9 p99_ms=2.1`. `none`
+/// when nothing was timed. Names and numbers only. `#502 cache-serve-coverage`.
+#[must_use]
+pub fn read_timings(consumers: &[shadow::ConsumerCounts]) -> String {
+    // Microseconds to milliseconds with one decimal, as a figure to read.
+    #[allow(clippy::cast_precision_loss)]
+    let ms = |us: u64| (us as f64 / 100.0).round() / 10.0;
+    let entries: Vec<String> = consumers
+        .iter()
+        .flat_map(|counts| {
+            shadow::Answered::ALL.iter().filter_map(move |&answered| {
+                let summary = counts.latency.of(answered);
+                (summary.n > 0).then(|| {
+                    format!(
+                        "{} {} n={} p50_ms={} p90_ms={} p99_ms={}",
+                        counts.consumer,
+                        answered.label(),
+                        summary.n,
+                        ms(summary.p50_us),
+                        ms(summary.p90_us),
+                        ms(summary.p99_us)
+                    )
+                })
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        "none".to_owned()
+    } else {
+        entries.join("; ")
     }
 }
 
@@ -1700,6 +1763,7 @@ impl Sink {
         progress.begun.fetch_add(1, Ordering::SeqCst);
         let reading = Arc::clone(progress);
         let reads = weak.clone();
+        let began = Instant::now();
         let evaluated = runtime.spawn_blocking(move || {
             let barrier = barrier(&reads, target, shadow::BARRIER);
             let evaluated = reads.upgrade().map_or_else(Evaluated::off, |cache| {
@@ -1710,6 +1774,7 @@ impl Sink {
                     barrier,
                     dropped_ms,
                     applied_after: cache.applied_seq(),
+                    read_took: began.elapsed(),
                 }
             });
             reading.read.fetch_add(1, Ordering::SeqCst);
@@ -1727,6 +1792,8 @@ impl Sink {
                 live_fed,
                 fed_since_ms,
                 asked_ms,
+                began,
+                answered: None,
                 reading: Some(evaluated),
                 evaluated: None,
                 progress: Arc::clone(progress),
@@ -1820,6 +1887,7 @@ impl Sink {
             }
         };
         task.served = true;
+        task.answered_by(shadow::Answered::Cache);
         if let Ask::Timeline { view, thread, .. } = &ask {
             lock(&self.state.cursor_owed)
                 .insert((channel.clone(), cursor_owed_words(*view, thread.as_deref())));
@@ -2003,6 +2071,14 @@ impl Sink {
             shadow_newer_rows = shadow.newer_rows,
             shadow_extra_rows = shadow.extra_rows,
             shadow_content_differs = shadow.content_differs,
+            shadow_miss_off = shadow.misses.off,
+            shadow_miss_blocked = shadow.misses.blocked,
+            shadow_miss_suspect = shadow.misses.suspect,
+            shadow_miss_gap = shadow.misses.gap,
+            shadow_miss_incomplete = shadow.misses.incomplete,
+            shadow_miss_stale_head = shadow.misses.stale_head,
+            shadow_miss_barrier = shadow.misses.barrier,
+            read_timings = read_timings(&report.shadow).as_str(),
             "message cache figures since this process started"
         );
     }
@@ -2041,6 +2117,18 @@ impl Sink {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// Wait, up to `timeout`, for a server that has just started to have checked every provider's
+    /// account against its cache file, before a background reader's first read: a fill begun
+    /// before then writes no rows and leaves its channel in doubt until later reads see each row
+    /// again. At once when no cache is open or the sink is not armed, since then no check is
+    /// coming. `#502 cache-serve-coverage`.
+    pub async fn first_checks(&self, timeout: Duration) {
+        if self.cache().is_none_or(|cache| !cache.is_open()) || !self.is_armed() {
+            return;
+        }
+        let _ = self.identities_verified(timeout).await;
     }
 
     /// Wait, up to `timeout`, until the summaries task has followed every event the cache behind
@@ -2936,6 +3024,8 @@ mod tests {
             live_fed: false,
             fed_since_ms: None,
             asked_ms: 0,
+            began: Instant::now(),
+            answered: None,
             reading: Some(reading),
             evaluated: None,
             progress: Arc::clone(&progress),
