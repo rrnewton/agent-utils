@@ -3001,22 +3001,41 @@ a.search-hit-link {
    triangle, larger than the one the disc held, in the thread's own colour as its card's left edge and
    its bridge are (`--thread-hue`, `#427`), never the accent the button above rests in. The button is
    still the gutter square, an invisible target of 44px at the page's root size and never under 32px;
-   only the triangle is ink. Centred where the disc's centre was (its 1.2rem box at the same left and
-   top arithmetic, this box 1.4rem), so the bridge and the rows do not move. */
+   only the triangle is ink.
+ *
+ * `#526 pack-triangle-dim`. The owner, 2026-10-25: "let's dim those up arrows... I want to keep
+ * them the same hue but DIM them some, and move them a bit up and left. They should be close to
+ * touching the bottom of the message. When I hover them they appear as a colored rounded
+ * rectangle. The arrow/triangle should be horizontally centered in that rectangle." So the
+ * button stands half a rem higher, over the gap to the card above, and the mark at its head:
+ * the triangle's tip a few px below that card's bottom edge. The mark is centred across the
+ * button, so the triangle is centred in the rounded rectangle its hover wash draws, and it
+ * rests dimmed in the same hue — full strength under a resting pointer, on a press, and
+ * under the keyboard's ring, where its states are drawn below. */
 #side-cards .reply-ungather.unpack-pack {
   color: hsl(var(--thread-hue, 210) 55% 50%);
   min-width: 2rem;
   min-height: 2rem;
+  top: -0.55rem;
+  transform: translateX(-0.375rem);
 }
 
 #side-cards .unpack-pack-mark {
-  top: 0.55625rem;
-  left: calc(var(--reply-gutter) - 2.54375rem);
+  top: 0.125rem;
+  left: 50%;
+  transform: translateX(-50%);
   width: 1.4rem;
   height: 1.4rem;
   border: none;
   border-radius: 0;
   background: none;
+  opacity: 0.55;
+}
+
+#side-cards .reply-ungather.unpack-pack:hover .unpack-pack-mark,
+#side-cards .reply-ungather.unpack-pack:active .unpack-pack-mark,
+#side-cards .reply-ungather.unpack-pack:focus-visible .unpack-pack-mark {
+  opacity: 1;
 }
 
 #side-cards .unpack-pack-mark::before {
@@ -6048,6 +6067,12 @@ a.search-hit-link {
   /* `#450 pack-triangle-hue`: the pack triangle's hover wash, in its own colour as its press is. */
   :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover {
     background: color-mix(in srgb, currentColor 18%, transparent);
+  }
+
+  /* `#526 pack-triangle-dim`: and the triangle itself comes to full strength with that wash,
+     under the same gate, so nothing brightens it that the wash would not light. */
+  :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover .unpack-pack-mark {
+    opacity: 1;
   }
 
   :root:not([data-input="keys"]) #side-log .reply-marker:hover::before,
@@ -9658,8 +9683,10 @@ li.discord-message[data-root-continuation] > .thread-replies {
  * indented on their left edge, good. But why does the right edge need to come in!!?" and "My messages
  * should be the shorter ones. And I think the difference in their width could be HALF what it is now."
  * So every row of the thread reaches the card's right edge; each begins at the thread's indent (the
- * stack's, above), the owner's own half the old difference further in, `min(15%, 6rem) / 2`; and a reply
- * opened under one of them is as wide as the thread's rows, where the reply will be drawn.
+ * stack's, above), the owner's own narrower by half the old difference, `min(15%, 6rem) / 2` — since
+ * `#524 thread-bridge-even-connectors` that room is on their right, so they begin where the rest
+ * begin; and a reply opened under one of them is as wide as the thread's rows, where the reply will
+ * be drawn.
  *
  * `--unpack-row-left` is that indent, stated on the list holding the cards and the reply's box, so both
  * read it; a phone's and a desk's, as the stack's own rules state it.
@@ -9685,19 +9712,22 @@ li.discord-message[data-root-continuation] > .thread-replies {
 
 /* A run's line keeps the stack's indent (`#407 unpack-row-parity`, above): it stands for rows, not for one
    speaker. */
+/* `#524 thread-bridge-even-connectors`. The owner, 2026-10-25: "I don't like the variable
+   length thread bridge connectors. Right now we've made MY messages less wide and
+   right-indented them. Let's have them left-justified so the colored line is the SAME
+   length. We already have a color distinction for mine/theirs messages, and if we keep
+   the current width for my messages we'll have a ragged edge on the right, but at least
+   we won't have these variable length connectors." So the owner's unpacked rows begin
+   where the thread's other rows begin, at `--unpack-row-left`, and keep the narrower
+   width `#492 threads-row-widths` gave them: the half inset they used to begin further
+   in is now the room they stop short on the right. Every bridge piece is the one width
+   again, the spine one line down the thread, and the Pack triangle stands in the
+   thread's gutter whoever wrote the first row. Their colour still tells them apart. */
 #side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) {
-  margin-left: calc(var(--unpack-row-left) + min(15%, 6rem) / 2);
-  --row-inset-left: calc(var(--unpack-row-left-cqw) + min(15cqw, 6rem) / 2);
-}
-
-/* Its part of the bridge reaches back across the extra inset, so the spine stays one line down the
-   thread, and the Pack triangle stays in the thread's gutter where the first row is the owner's. */
-#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge {
-  width: calc(0.9rem + var(--reply-stroke) / 2 + min(15cqw, 6rem) / 2);
-}
-
-#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-ungather {
-  right: calc(100% + min(15cqw, 6rem) / 2);
+  margin-left: var(--unpack-row-left);
+  margin-right: calc(min(15%, 6rem) / 2);
+  --row-inset-left: var(--unpack-row-left-cqw);
+  --row-inset-right: calc(min(15cqw, 6rem) / 2);
 }
 
 @supports (anchor-name: --a) {
@@ -9719,7 +9749,7 @@ li.discord-message[data-root-continuation] > .thread-replies {
  * parent, while the mark left of the spine takes the room the parent itself does not use, out
  * to a few pixels from the screen's edge, notch room included where the list keeps it. How far
  * in is set by what stands at the first row's gutter. Under a card that is the pack triangle,
- * whose target may go to 2.25rem here — still a thumb's, and never under the 2rem floor it
+ * whose target may go to 2rem here — still a thumb's, at the 2rem floor it
  * states for itself — so an unpacked thread's rows hang 0.85rem in past the third speaker's
  * half inset, 1.6rem in from their card's face altogether. In a channel list it is the X, which
  * keeps its whole gutter square (its target has always been the full 2.75rem, every point of
@@ -9765,8 +9795,10 @@ li.discord-message[data-root-continuation] > .thread-replies {
     width: calc(0.55rem + var(--reply-stroke) / 2);
   }
 
+  /* `#526 pack-triangle-dim`: at its 32px floor, so centred in the button (and shifted a
+     touch left with it, above) its ink still sits a few px from the screen's edge. */
   #side-cards .reply-ungather.unpack-pack {
-    width: 2.25rem;
+    width: 2rem;
   }
 
   /* The disc in its whole square, and the triangle in its slim one, by the arithmetic their own
@@ -9778,8 +9810,9 @@ li.discord-message[data-root-continuation] > .thread-replies {
     left: calc(var(--reply-gutter) - 0.55rem - 0.09375rem - 0.25rem - 1.2rem);
   }
 
+  /* The pack triangle is centred across its button at every width (`#526`, above). */
   #side-cards .unpack-pack-mark {
-    left: 0.05625rem;
+    left: 50%;
   }
 
   /* A collapsed run's line in an unpacked thread keeps the stack's slim indent, as above. */
@@ -9787,14 +9820,12 @@ li.discord-message[data-root-continuation] > .thread-replies {
     margin-left: calc(var(--speaker-inset) / 2 + 0.85rem) !important;
   }
 
-  /* `#492 threads-row-widths`, restated: the owner's unpacked rows stand half their old
-     difference further in than this, and a reply opened under one is as wide as they are. */
+  /* `#492 threads-row-widths`, restated: this is the one left edge every unpacked row
+     begins at, the owner's included (`#524 thread-bridge-even-connectors`); a reply opened
+     under one is as wide as the thread's rows are. */
   #side-list {
     --unpack-row-left: calc(var(--speaker-inset) / 2 + 0.85rem);
     --unpack-row-left-cqw: calc(var(--speaker-inset) / 2 + 0.85rem);
   }
 
-  #side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge {
-    width: calc(0.55rem + var(--reply-stroke) / 2 + min(15cqw, 6rem) / 2);
-  }
 }

@@ -27194,6 +27194,58 @@ test("`#281 view-keys`: CTRL+1 TO CTRL+4 choose Main, All, the thread list and t
   assert.ok(shut() > 0, ": typed on Dvorak's KeyZ did not collapse them again");
 });
 
+test("`#525 cmd-0-voice-view`: CTRL+0 (CMD+0) goes to the voice view from anywhere, and CTRL+1 comes back", async () => {
+  const page = await threadPage();
+  page.wideDesk = true;
+  const voiceUp = () => page.el("pane-voice").hidden === false && page.el("pane-discord").hidden === true;
+  assert.equal(voiceUp(), false, "the premise: the channel is up");
+  assert.ok(page.el("keyboard-keys").text().includes("Voice: the call's view"), "the ? help does not list Ctrl+0");
+  // From the list, from the message box with a draft, and from the search: taken, nothing typed.
+  await page.el("channel-compose-text").setValue("a draft");
+  for (const [target, fields] of [["scroll-area", { ctrlKey: true }], ["channel-compose-text", { metaKey: true }]]) {
+    const event = await press(page, page.el(target), "0", fields);
+    await page.settle();
+    assert.equal(event.defaulted, false, `Ctrl+0 in #${target} was left to the browser's zoom reset`);
+    assert.equal(voiceUp(), true, `Ctrl+0 in #${target} did not show the voice view`);
+    // Already there: taken, and it stays (it is not the switch's toggle).
+    const again = await press(page, page.el("scroll-area"), "0", { ctrlKey: true });
+    await page.settle();
+    assert.equal(again.defaulted, false, "Ctrl+0 on the voice view was left to the browser");
+    assert.equal(voiceUp(), true, "Ctrl+0 on the voice view left it");
+    // A held key's repeat is taken and chooses nothing.
+    const held = await press(page, page.el("scroll-area"), "0", { ctrlKey: true, repeat: true });
+    assert.equal(held.defaulted, false, "a held Ctrl+0's repeat was left to the browser");
+    assert.equal(voiceUp(), true, "a held Ctrl+0's repeat left the voice view");
+    // Ctrl+1 comes back to the channel, and the draft survived both ways.
+    const back = await press(page, page.el("scroll-area"), "1", { ctrlKey: true });
+    await page.settle();
+    assert.equal(back.defaulted, false);
+    assert.equal(voiceUp(), false, "Ctrl+1 from the voice view did not return to the channel");
+    assert.equal(page.el("thread-select").value, "main", "Ctrl+1 from the voice view did not choose Main");
+  }
+  assert.equal(page.el("channel-compose-text").value, "a draft", "a view key typed into the message box");
+  // From Settings over the main screen: Settings closes and the voice view is up.
+  await page.el("open-settings").click();
+  await page.settle();
+  const fromSettings = await press(page, page.el("scroll-area"), "0", { ctrlKey: true });
+  await page.settle();
+  assert.equal(fromSettings.defaulted, false, "Ctrl+0 over Settings was left to the browser");
+  assert.equal(voiceUp(), true, "Ctrl+0 over Settings did not show the voice view");
+  // Shift+Ctrl+0 is the collapsed-lines bracket, not the voice view.
+  await press(page, page.el("scroll-area"), "1", { ctrlKey: true });
+  await page.settle();
+  const bracket = await press(page, page.el("scroll-area"), ")", { code: "Digit0", ctrlKey: true, shiftKey: true });
+  await page.settle();
+  assert.equal(voiceUp(), false, "Ctrl+Shift+0 went to the voice view");
+  assert.equal(bracket.defaulted, false, "the collapsed-lines chord was left alone");
+  // ...and where the browser reports the digit itself while Shift is held, the same: the
+  // collapsed-lines chord's place, never Ctrl+0 (the `#425` case the page already had).
+  const digit = await press(page, page.el("scroll-area"), "0", { code: "Digit0", metaKey: true, shiftKey: true });
+  await page.settle();
+  assert.equal(voiceUp(), false, "Cmd+Shift+0 reporting a digit went to the voice view");
+  assert.equal(digit.defaulted, false, "Cmd+Shift+0 reporting a digit was left alone");
+});
+
 // --- `#301 semicolon-expand-cycle` ------------------------------------------------------------------
 //
 // The owner, 2026-10-14: ; goes round (1) expand all, (2) expand every unread message and collapse
@@ -80159,6 +80211,12 @@ test("`#440 thread-card-pack-toggle`: the triangle in the first unpacked row's g
   const markRule = cssBlock("#side-cards .unpack-pack-mark");
   assert.match(markRule, /border:\s*none;/, "the disc's ring is still drawn behind the triangle");
   assert.match(markRule, /background:\s*none;/, "the disc is still filled behind the triangle");
+  // `#526 pack-triangle-dim`: dimmed at rest in the same hue, up against the card above, and
+  // centred across the button whose hover wash is its rounded rectangle.
+  assert.match(markRule, /opacity:\s*0\.55;/, "the triangle does not rest dimmed");
+  assert.match(markRule, /transform:\s*translateX\(-50%\);/, "the triangle is not centred across its button");
+  assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /top:\s*-0\.55rem;/,
+    "the triangle does not stand up against the message above it");
   assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /color:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\);/,
     "the triangle is not in its thread's colour");
   assert.match(cssBlock('#side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] + li[data-unpack-thread] .unpack-pack'),
@@ -80221,13 +80279,16 @@ test("`#501 thread-bridge-gutter`: on a phone the bridge hugs the left edge, and
   assert.match(phone("#discord-log .reply-ungather-mark"),
     /left:\s*calc\(var\(--reply-gutter\) - 0\.55rem - 0\.09375rem - 0\.25rem - 1\.2rem\)/,
     "the X's disc is not set in its whole square by the branch, the gap and its own width");
-  assert.match(phone("#side-cards .unpack-pack-mark"), /left:\s*0\.05625rem/,
-    "the triangle is not centred where the disc's centre was, in its slim button");
-  assert.match(phone('#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge'),
-    /width:\s*calc\(0\.55rem \+ var\(--reply-stroke\) \/ 2 \+ min\(15cqw, 6rem\) \/ 2\)/,
-    "the owner's unpacked rows do not reach back across their extra inset to the one spine");
+  // `#526 pack-triangle-dim`: the triangle is centred across its button at every width, so the
+  // rounded rectangle its hover wash draws has it in the middle; no phone exception remains.
+  assert.match(phone("#side-cards .unpack-pack-mark"), /left:\s*50%;/,
+    "a phone still sets the triangle off-centre in its slim button");
+  assert.match(cssBlock("#side-cards .unpack-pack-mark"), /left:\s*50%;/,
+    "the triangle is not centred across its button");
+  assert.equal(cssRules(mediaBodyOf(tail, PHONE), '#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge').length,
+    0, "the owner's unpacked rows do not reach back across their extra inset to the one spine");
   const target = phone("#side-cards .reply-ungather.unpack-pack");
-  assert.match(target, /width:\s*2\.25rem/, "the triangle's target is not the slim phone width");
+  assert.match(target, /width:\s*2rem/, "the triangle's target is not the slim phone width");
   assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /min-width:\s*2rem/, "the triangle's target lost its 32px floor");
   assert.match(phone("#side-list"), /--unpack-row-left:\s*calc\(var\(--speaker-inset\) \/ 2 \+ 0\.85rem\)/,
     "the owner's unpacked rows and the reply opened under them keep the wide indent");
@@ -81450,16 +81511,20 @@ test("`#492 threads-row-widths`: an unpacked thread's rows reach the card's righ
   assert.match(rows, /margin-right:\s*0;/, "an unpacked row keeps a right inset");
   assert.match(rows, /--row-inset-right:\s*0px/, "a line on an unpacked row stops short of the list's right edge");
   const own = cssBlock('#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"])');
-  assert.match(own, /margin-left:\s*calc\(var\(--unpack-row-left\) \+ min\(15%, 6rem\) \/ 2\)/,
+  // `#524 thread-bridge-even-connectors`: the owner's rows begin at the thread's one left edge,
+  // their narrowness the room they stop short on the right, so every connector is one length.
+  assert.match(own, /margin-left:\s*var\(--unpack-row-left\);/,
+    "the owner's unpacked rows do not begin at the thread's left edge");
+  assert.match(own, /margin-right:\s*calc\(min\(15%, 6rem\) \/ 2\);/,
     "the owner's unpacked rows are not half the old inset narrower");
   assert.match(cssBlock("#side-list"), /--unpack-row-left:\s*calc\(var\(--speaker-inset\) \/ 2 \+ var\(--reply-gutter\)\)/,
     "the thread's indent is not the stack's own");
   assert.match(cssBlock("#side-list:has(> #side-cards > li.unpack-row[data-inline-reply]) > #side-reply[data-anchored]"),
     /left:\s*calc\(anchor\(--inline-reply-list left\) \+ var\(--unpack-row-left\)\)/,
     "a reply under an unpacked row is not as wide as the thread's rows");
-  // The spine stays one line past the owner's narrower rows.
-  assert.match(cssBlock('#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge'),
-    /width:\s*calc\(0\.9rem \+ var\(--reply-stroke\) \/ 2 \+ min\(15cqw, 6rem\) \/ 2\)/);
+  // The spine stays one line, and no bridge piece reaches further for the owner's rows.
+  assert.equal(cssRules(CSS, '#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge').length,
+    0, "the owner's unpacked rows still carry a wider bridge piece");
 });
 
 test("`#407 unpack-row-parity`: n goes to the next unread message over unpacked cards, a card standing for its unread replies", async () => {

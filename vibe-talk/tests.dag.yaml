@@ -1508,6 +1508,23 @@ steps:
   # branch; on the desk the wider indent it always had; scrolled to a thread's foot, a tap on
   # the bridge's spine gliding back to its card, wholly at the head of the list, the thread
   # still unpacked, and under reduced motion still landing there; the triangle packing as ever.
+  # `#524 thread-bridge-even-connectors` and `#526 pack-triangle-dim` in the browser engine:
+  # an unpacked thread holding the owner's and others' rows, every row at one left edge and
+  # every bridge connector one length, the owner's narrower and ragged on the right; the pack
+  # triangle dimmed at rest, its tip against the card above, centred in its hover rectangle;
+  # gathered replies in All even too; the triangle still packing.
+  - group: check
+    job: bridge-even-browser
+    desc: even bridge connectors with the owner's rows left-justified, and the dimmed pack triangle centred against its card, in current Chromium at 393x852, 412x915 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/bridge_even_browser.py
+    jobs_flag: ""
+    timeout: 180
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+
   - group: check
     job: bridge-gutter-browser
     desc: on a phone the bridge hugging the left edge with the rows wider for it, a tap on the spine gliding back to the thread's card, and the triangle still packing in place, in current Chromium at 393x852, 412x915 and 1280x800
