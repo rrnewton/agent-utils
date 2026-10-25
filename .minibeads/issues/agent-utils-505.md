@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-muse-followup: deliver to a busy Muse by steering its running turn instead of waiting for idle'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - agentctl
 - muse
 created_at: 2026-10-25T12:36:50.467107347+00:00
-updated_at: 2026-10-25T12:36:50.467107347+00:00
+updated_at: 2026-10-25T14:27:30.180806008+00:00
+closed_at: 2026-10-25T14:27:30.180805868+00:00
 ---
 
 # Description
