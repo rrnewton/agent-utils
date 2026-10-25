@@ -38,7 +38,7 @@ Environment metadata contains names only; values remain in private profiles.
 
 | Mode or service | What it controls | Additional dependency |
 | --- | --- | --- |
-| Interactive | A native Codex, Claude, or Muse TUI that remains directly accessible | Herdr |
+| Interactive | A native Codex, Claude, or Muse TUI that remains directly accessible | Herdr, or tmux in the Rust edition |
 | Headless worker extension | Resumable Codex, AGY, or Muse structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
 | Chat service | Provider messages connected to an interactive coordinator | Herdr and either the Python Google Chat transport or a Rust subscription plugin |
 | MCP extension | The same session operations over local MCP stdio | An MCP client |
@@ -58,16 +58,68 @@ executable and `--tmux-socket NAME` addresses a non-default tmux server
 (passed as `-L NAME`). `agentctl capabilities` reports both backends and
 which one is selected under `term_backends`.
 
-Today the tmux backend drives the durable direct-pane transport: the
-`herdr-agent` compatibility command's `send`, `drain`, `status`, and `read`
-against an explicit `--pane PANE`, using tmux pane identifiers (for example
-`%1`). Agent lifecycle commands (start, adopt, stop, and the other managed
-session commands) still require Herdr and refuse clearly when an operator
-has selected tmux. The long-running Herdr services (chat, inbox, restore,
-watch, watch-agents, install-units) are Herdr-only by design: passing
-`--term-backend tmux` to them is refused, and they otherwise always use
-Herdr. When no backend is selected anywhere and Herdr is simply absent,
-lifecycle commands keep reporting Herdr's own not-found error, as before.
+In the Rust edition the tmux backend runs the full agent lifecycle —
+start, adopt, send (including deliver-while-working), read, wait, rename,
+anchor, promote, doctor, revive, and stop — plus the durable direct-pane
+transport (the `herdr-agent` compatibility command's `send`, `drain`,
+`status`, and `read` against an explicit `--pane PANE`, using tmux pane
+identifiers such as `%1`). No Herdr installation is needed. The Python
+edition drives only the direct-pane transport on tmux and refuses
+lifecycle commands. The long-running Herdr services (chat, inbox,
+restore, watch, watch-agents, install-units) are Herdr-only by design in
+every edition: selecting tmux for them is refused, and they otherwise
+always use Herdr. Lifecycle runs on tmux only when an operator selected
+it (flag, environment, or the registry's profile config); when no backend
+is selected anywhere and Herdr is simply absent, lifecycle commands keep
+reporting Herdr's own not-found error, as before.
+
+#### Running under tmux
+
+Select tmux once per registry, then use the ordinary lifecycle commands.
+Either pass `--term-backend tmux` on each command, or put
+`"term_backend": "tmux"` in the registry's `.agentctl/profiles.json`:
+
+```sh
+agentctl --term-backend tmux start reviewer --harness claude --cwd . \
+  --brief 'Review the current changes and report concrete problems'
+agentctl --term-backend tmux send reviewer 'Check restart behavior too'
+agentctl --term-backend tmux wait reviewer
+agentctl --term-backend tmux read reviewer
+agentctl --term-backend tmux stop reviewer
+```
+
+Workspaces are tmux sessions, tabs are windows, and an owned agent's name
+is its window label. Attach with `tmux attach` (or
+`tmux -L NAME attach` with `--tmux-socket NAME`) to watch or take over.
+Adopting works against a pane you started yourself, with the session name
+as the workspace label:
+
+```sh
+tmux list-panes -a -F '#{pane_id} #{session_name} #{pane_current_path}'
+agentctl --term-backend tmux adopt reviewer --pane %2 --workspace project \
+  --cwd /work/project --harness claude
+```
+
+Differences from Herdr to know before relying on them:
+
+- tmux tracks no per-agent status or native conversation, so status is
+  inferred from the agent's screen and a conversation is recorded only
+  when agentctl assigned or was told its ID (new Claude launches still
+  receive a generated `--session-id`, which is what revive resumes).
+  Harness detection reads the process tree under the pane's shell, so a
+  harness started through a wrapper script still reports its kind.
+- agentctl launches the harness executable itself. It resolves Codex,
+  Claude, and Muse from fixed install locations, or from
+  `AGENTCTL_CODEX_BIN`, `AGENTCTL_CLAUDE_BIN`, or `AGENTCTL_MUSE_BIN`
+  when those absolute paths are set.
+- The process proofs behind send, adopt, stop, and revive read `/proc`
+  (Linux): the harness is pinned by kernel process generation in the
+  pane's foreground job, exactly as the Herdr path pins it from Herdr's
+  process report.
+- Not available on tmux: `--slot` boxing, `move`, agentcloud sessions
+  (their viewer opens in a Herdr tab), `attach-self`, and the Herdr
+  services listed above. Each refuses with that reason instead of
+  guessing.
 
 ### Rust subscription plugin discovery
 
@@ -238,9 +290,9 @@ subscription. Those reference entries are design inventory, not working inbound
 backends; installed plugin manifests appear separately.
 
 Extension commands are not available in every installation. An interactive
-agent's lifecycle requires Herdr; selecting tmux provides the direct-pane
-message transport described under "Terminal backends", not agent lifecycle
-control.
+agent's lifecycle runs on Herdr, or on tmux in the Rust edition as
+described under "Terminal backends"; the Python edition provides only the
+direct-pane message transport on tmux.
 A headless transcript view is not a native interactive harness interface.
 
 ## Names, state, and shared workspaces

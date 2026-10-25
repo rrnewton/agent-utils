@@ -14,6 +14,20 @@ while keeping their terminals available for direct inspection.
    Muse skills are installed through Muse's native user-scope skill manager;
    Codex and Claude receive the same bundled file in their skill roots.
 
+   No Herdr? The Rust edition can run the same lifecycle under tmux
+   instead: select it once per registry with `"term_backend": "tmux"` in
+   `.agentctl/profiles.json`, or per command, and everything below works
+   the same way (sessions are workspaces, windows are tabs):
+
+   ```sh
+   agentctl --term-backend tmux start reviewer --harness claude --cwd . \
+     --brief 'Review the current changes and report concrete problems'
+   tmux attach  # watch or take over; Ctrl-b d detaches
+   ```
+
+   `agentctl userguide` covers the tmux differences (screen-inferred
+   status, harness executable lookup, and what stays Herdr-only).
+
 2. Start a worker in your project. Choose an accessible model with `--model` if
    the harness default is unsuitable:
 
