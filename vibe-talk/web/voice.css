@@ -22,9 +22,11 @@
   --mine-edge: #33587b;
   /* Small quiet text and a warning ON `--mine`: the send card's heading, where it goes, its status
      and a frozen card's notes. `--muted` and `--warn` are 4.1:1 and 3.9:1 there, under the 4.5:1
-     small text needs; these are 5.0:1. In light, the shared ones already pass (4.7:1). `#269
-     approval-card-inline`. */
-  --muted-on-mine: #aab2c0;
+     small text needs; these are 5.0:1 or better. In light, the shared ones already pass (4.7:1). `#269
+     approval-card-inline`. `#555 own-row-dark-contrast`: the owner's rows take it as their `--muted`,
+     and a reaction's count on his row sits on its chip's tint as well, so it is 5.6:1 on `--mine` and
+     4.8:1 on the chip (it was #aab2c0, 4.3:1 there). */
+  --muted-on-mine: #b4bcc8;
   --warn-on-mine: #e8a27a;
   --theirs: #1d2026; /* what the AGENT said */
   /* Everyone else in the channel: other people, and any bot that is not the coding agent.
@@ -172,7 +174,9 @@
   :root {
     --mine: #dbeaf8;
     --mine-edge: #b4d0e8;
-    --muted-on-mine: var(--muted);
+    /* `#555 own-row-dark-contrast`: on a reaction chip's tint over `--mine` the shared `--muted` is
+       4.2:1; this is 5.0:1 there and 5.6:1 on `--mine`. */
+    --muted-on-mine: #525b68;
     --warn-on-mine: var(--warn);
     --theirs: #ffffff;
     --third: #faf6ee;
@@ -1840,6 +1844,11 @@ a.search-hit-link {
   border-color: var(--mine-edge);
   margin-left: var(--speaker-inset);
   border-bottom-right-radius: 0.15rem;
+  /* `#555 own-row-dark-contrast`. The quiet ink of everything on his row — the time, "(edited)",
+     a reaction's count — is the one that reads at 4.5:1 on his tint (`--muted-on-mine`, as the send
+     card's notes are). The shared `--muted` is 3.5:1 to 4.2:1 there, which a read row's grey hid
+     until his rows could stand unread (`#549 own-read-stored`). */
+  --muted: var(--muted-on-mine);
 }
 
 /*
@@ -6192,6 +6201,12 @@ a.search-hit-link {
     opacity: 1;
   }
 
+  /* `#558 pack-triangle-clear-bridge`: in a window a phone's width, the wash is the button's
+     `::before` at its left (the phone rule), which has no box at any other width. */
+  :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover::before {
+    background: color-mix(in srgb, currentColor 18%, transparent);
+  }
+
   :root:not([data-input="keys"]) #side-log .reply-marker:hover::before,
   :root:not([data-input="keys"]) #discord-log .reply-marker:hover::before {
     box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
@@ -9993,10 +10008,47 @@ li.discord-message[data-root-continuation] > .thread-replies {
   /* `#526 pack-triangle-dim`: at its 32px floor, so centred in the button (and shifted a
      touch left with it) its ink still sits a few px from the screen's edge. Only a touch:
      the gutter left of the spine is narrower than the button and the room the rule above
-     keeps from the line (`pack-triangle-clear-bridge`), so here it stays where it was. */
+     keeps from the line (`#558 pack-triangle-clear-bridge`), so here it stays where it was. */
   #side-cards .reply-ungather.unpack-pack {
     width: 2rem;
     transform: translateX(-0.375rem);
+  }
+
+  /* `#558 pack-triangle-clear-bridge`, on a phone. The 32px target reaches over the bridge's
+     line, so it draws nothing of its own: its press, its keyboard ring and (in a narrow window
+     with a mouse, by the hover rules' own block) its hover wash are a 1.5rem rectangle at its
+     left, clear of the line, and the triangle is centred in that. The target stays the whole button, invisible over the
+     bridge's own tap room (`#501 thread-bridge-gutter`) as it was. */
+  #side-cards .reply-ungather.unpack-pack::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 1.5rem;
+    border-radius: 0.5rem;
+    pointer-events: none;
+  }
+
+  #side-cards .reply-ungather.unpack-pack .unpack-pack-mark {
+    left: 0.75rem;
+  }
+
+  #side-cards .reply-ungather.unpack-pack:active,
+  #side-cards .reply-ungather.unpack-pack:focus-visible,
+  :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover {
+    background: none;
+    outline: none;
+  }
+
+  #side-cards .reply-ungather.unpack-pack:active::before,
+  #side-cards .reply-ungather.unpack-pack:focus-visible::before {
+    background: color-mix(in srgb, currentColor 18%, transparent);
+  }
+
+  #side-cards .reply-ungather.unpack-pack:focus-visible::before {
+    outline: 2px solid currentColor;
+    outline-offset: -2px;
   }
 
   /* The disc in its whole square, and the triangle in its slim one, by the arithmetic their own
@@ -10008,7 +10060,8 @@ li.discord-message[data-root-continuation] > .thread-replies {
     left: calc(var(--reply-gutter) - 0.55rem - 0.09375rem - 0.25rem - 1.2rem);
   }
 
-  /* The pack triangle is centred across its button at every width (`#526`, above). */
+  /* The pack triangle is centred across its button (`#526`, above), and on a phone across the
+     wash at its button's left (`#558`, above, which outranks this). */
   #side-cards .unpack-pack-mark {
     left: 50%;
   }

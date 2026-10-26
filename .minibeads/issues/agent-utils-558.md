@@ -1,12 +1,13 @@
 ---
 title: 'pack-triangle-clear-bridge: the pack triangle''s rectangle must not touch the thread bridge''s line'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-26T21:40:17.721941906+00:00
-updated_at: 2026-10-26T21:40:17.721941906+00:00
+updated_at: 2026-10-27T00:24:36.590145150+00:00
+closed_at: 2026-10-27T00:24:36.590145029+00:00
 ---
 
 # Description

@@ -1,12 +1,13 @@
 ---
 title: 'own-row-dark-contrast: reaction counts and edited marks on an unread own row read below contrast in dark mode'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-26T21:09:10.516813060+00:00
-updated_at: 2026-10-26T21:09:10.516813060+00:00
+updated_at: 2026-10-27T00:24:36.594470883+00:00
+closed_at: 2026-10-27T00:24:36.594470763+00:00
 ---
 
 # Description

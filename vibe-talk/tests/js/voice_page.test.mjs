@@ -40672,9 +40672,11 @@ test("`#269 approval-card-inline`: beside a reply open in the list the card's Se
 test("`#269 approval-card-inline`: the card's small text and a frozen card's notes are legible on the owner's tile", () => {
   // `--muted` and `--warn` on `--mine` are 4.1:1 and 3.9:1 in dark, under small text's 4.5:1.
   const dark = cssBlock(":root");
-  assert.match(dark, /--muted-on-mine:\s*#aab2c0/);
+  // `#555 own-row-dark-contrast`: lighter in dark (and darker in light) since, so a reaction's count on
+  // its chip's tint over the owner's row reads at 4.5:1 too.
+  assert.match(dark, /--muted-on-mine:\s*#b4bcc8/);
   assert.match(dark, /--warn-on-mine:\s*#e8a27a/);
-  assert.match(cssBlockIn("(prefers-color-scheme: light)", ":root"), /--muted-on-mine:/, "light has no on-tile muted");
+  assert.match(cssBlockIn("(prefers-color-scheme: light)", ":root"), /--muted-on-mine:\s*#525b68/, "light has no on-tile muted");
   for (const selector of ["#post-confirm-title", "#post-confirm-where", "#post-confirm-expiry", ".sent-how"]) {
     assert.match(cssBlock(selector), /color:\s*var\(--muted-on-mine\)/, `${selector} is drawn in --muted on the tile`);
   }

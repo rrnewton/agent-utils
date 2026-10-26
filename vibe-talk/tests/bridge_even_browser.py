@@ -22,11 +22,11 @@ replies the owner's, in the Threads view with the runner unpacked, at 393x852, 4
   its tip a few px below the bottom of the card above it, horizontally centred in its
   button's rectangle, its target at least 32px, on a phone its ink a few px from the
   screen edge (`#501 thread-bridge-gutter`);
-* `pack-triangle-clear-bridge` (2026-10-26, "I want them to move left enough that the rounded
-  rectangle button that comes up when I hover is not intersecting the bridge"): at 768 and
-  1280 wide the whole button, the rectangle its wash draws, stands at least 3px left of the
-  bridge's vertical line; on a phone, whose gutter is narrower than that, how far it meets the
-  line is recorded;
+* `#558 pack-triangle-clear-bridge` (2026-10-26, "I want them to move left enough that the
+  rounded rectangle button that comes up when I hover is not intersecting the bridge"): the
+  rectangle its wash draws stands at least 3px left of the bridge's vertical line at every
+  size — at 768 and 1280 wide the whole button, on a phone a 24px rectangle at the 32px
+  target's left, shown here under the keyboard's ring — the triangle centred in it;
 * replies gathered under their root in All (Reply on the root, `#215 reply-coalesce`) keep
   one left edge and one connector length too;
 * the triangle still packs its thread.
@@ -77,10 +77,19 @@ ROWS_JS = """(id) => {
     const triW = parseFloat(tri.borderLeftWidth) + parseFloat(tri.borderRightWidth);
     const triH = parseFloat(tri.borderBottomWidth);
     const markBox = box(mark);
+    // `#558`: the rectangle a press, the keyboard ring or a hover draws. On a phone that is the
+    // button's ::before at its left; elsewhere the button itself.
+    const wash = getComputedStyle(button, '::before');
+    const buttonBox = box(button);
+    const ownWash = wash.content !== 'none' && wash.content !== 'normal' && wash.content !== '';
+    const washLeft = ownWash ? buttonBox.left + parseFloat(wash.left) : buttonBox.left;
+    const washWidth = ownWash ? parseFloat(wash.width) : buttonBox.width;
     const bridge = first.querySelector(':scope > .reply-bridge');
     const bridgeBox = box(bridge);
     const stroke = parseFloat(getComputedStyle(bridge).borderLeftWidth);
-    return {card: box(card), spineLeft: bridgeBox.left, spineRight: bridgeBox.left + stroke,
+    return {washLeft, washRight: washLeft + washWidth, ownWash,
+        washBg: ownWash ? wash.backgroundColor : getComputedStyle(button).backgroundColor,
+        card: box(card), spineLeft: bridgeBox.left, spineRight: bridgeBox.left + stroke,
         spineTop: bridgeBox.top, spineBottom: bridgeBox.bottom, buttonRadius: getComputedStyle(button).borderTopLeftRadius, overflow: document.documentElement.scrollWidth - window.innerWidth,
         rows: rows.map((li) => ({id: li.getAttribute('data-id'), who: li.getAttribute('data-who'),
             box: box(li), bg: getComputedStyle(li).backgroundColor,
@@ -236,31 +245,29 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             button, card = part(found, "button"), part(found, "card")
             desk.check(button["width"] >= 32 and button["height"] >= 32,
                        f"the triangle's target is {button['width']:.0f}px by {button['height']:.0f}px")
-            desk.check(abs(float(str(found["inkCentre"])) - (button["left"] + button["width"] / 2)) <= 2,
+            wash_left, wash_right = float(str(found["washLeft"])), float(str(found["washRight"]))
+            desk.check(abs(float(str(found["inkCentre"])) - (wash_left + wash_right) / 2) <= 2,
                        f"the triangle is not centred in its rectangle: ink centre {found['inkCentre']}, "
-                       f"button {button['left']}..{button['right']}")
+                       f"rectangle {wash_left}..{wash_right}")
             # `pack-triangle-clear-bridge`. The owner, 2026-10-26: "I want them to move left enough that
             # the rounded rectangle button that comes up when I hover is not intersecting the bridge.
             # Visual overlap between objects like that looks sloppy and bad." The whole button is the
-            # wash's rectangle, its 32px phone floor included, and it stands beside the spine for its
-            # whole height, so its right edge must stop short of the spine's left edge.
-            clearance = float(str(found["spineLeft"])) - button["right"]
+            # wash's rectangle, and it stands beside the spine for its whole height, so its right edge must
+            # stop short of the spine's left edge. On a phone the gutter left of the line (about 28px) is
+            # narrower than the 32px target and the room, so there the wash is a 24px rectangle at the
+            # target's left, the triangle centred in it, and the target alone reaches over the line,
+            # drawing nothing (the owner's choice, option A).
+            clearance = float(str(found["spineLeft"])) - wash_right
             beside = (button["top"] < float(str(found["spineBottom"]))
                       and button["bottom"] > float(str(found["spineTop"])))
-            desk.notes.append(f"rectangle {button['left']:.1f}..{button['right']:.1f}, {clearance:.1f}px clear of "
+            desk.notes.append(f"rectangle {wash_left:.1f}..{wash_right:.1f}, {clearance:.1f}px clear of "
                               f"the line at {float(str(found['spineLeft'])):.1f}")
-            if width >= 600:
-                desk.check(not beside or clearance >= BRIDGE_CLEARANCE_PX,
-                           f"the triangle's rectangle {button['left']:.1f}..{button['right']:.1f} comes within "
-                           f"{clearance:.1f}px of the bridge's line at {found['spineLeft']:.1f}")
-            else:
-                # A phone's gutter left of the line (about 28px) is narrower than the 32px target and the
-                # room, so the rectangle — drawn there only under a press, a phone having no hover — still
-                # meets the line until the owner chooses between a smaller wash and the bridge moving
-                # right. Recorded, not refused, and refused if it ever gets worse.
-                desk.check(not beside or clearance >= -5,
-                           f"the triangle's rectangle reaches {-clearance:.1f}px over the bridge's line")
-                desk.notes.append("phone: the rectangle meets the line, pending the owner's choice")
+            desk.check(not beside or clearance >= BRIDGE_CLEARANCE_PX,
+                       f"the triangle's rectangle {wash_left:.1f}..{wash_right:.1f} comes within "
+                       f"{clearance:.1f}px of the bridge's line at {found['spineLeft']:.1f}")
+            desk.check(wash_left >= 0, f"the triangle's rectangle runs off the screen at {wash_left:.1f}px")
+            desk.check(width >= 600 or bool(found["ownWash"]),
+                       "on a phone the wash is the whole 32px target again, reaching over the line")
             desk.check(button["left"] >= 0, f"the triangle's rectangle runs off the screen at {button['left']:.1f}px")
             gap = float(str(found["tipY"])) - card["bottom"]
             desk.check(-2 <= gap <= 10, f"the triangle's tip is {gap:.1f}px below the card above it")
@@ -274,6 +281,20 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 desk.check(0 <= ink_left <= 8, f"the triangle's ink starts {ink_left:.1f}px from the left edge")
                 desk.check(button["left"] >= 0, f"the triangle's target runs off the screen at {button['left']:.1f}px")
             desk.shot("2-unpacked")
+            if touch:
+                # A phone has no hover: its rectangle is drawn under a press and the keyboard's ring.
+                # The ring is the one a still screenshot can hold.
+                page.evaluate(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread='{RUNNER}'] "
+                              f".unpack-pack\").focus({{focusVisible: true}})")
+                desk.settled()
+                ringed = page.evaluate(ROWS_JS, RUNNER)
+                assert isinstance(ringed, dict)
+                desk.check(str(ringed["washBg"]) not in ("rgba(0, 0, 0, 0)", "transparent"),
+                           "the keyboard's ring draws no rectangle behind the triangle")
+                desk.check(float(str(ringed["spineLeft"])) - float(str(ringed["washRight"])) >= BRIDGE_CLEARANCE_PX,
+                           "the ringed rectangle meets the bridge's line")
+                desk.shot("3-unpacked-ring")
+                page.evaluate("() => document.activeElement && document.activeElement.blur()")
             if not touch:
                 page.mouse.move(button["left"] + button["width"] / 2, button["top"] + button["height"] / 2)
                 desk.settled()
