@@ -2173,13 +2173,13 @@ SUMMARY_FAILED_STATE = "36-channel-summary-failed"
 
 
 def _act_summary_failed(driver: Driver) -> None:
-    """Summary mode when the summariser FAILS: the row goes red and keeps the message.
+    """Summary mode when the summariser FAILS: the row says so quietly and keeps the message.
 
     There is one summariser and it talks to a vendor, so failure is now an ordinary operating state
     rather than an exotic one — a wedged agent, a rejected key, or simply a deployment with no
-    ElevenLabs credentials at all. The owner asked for it to be VISIBLE, and this is the only thing
-    in the repository that can say whether it is: the page suite can assert an attribute and a
-    declaration, and neither of those is a colour anybody can see on a phone.
+    ElevenLabs credentials at all. The owner asked for it to be said on the row, and then
+    (`#564 message-summary-toggle`) for that to be a subtle label that leaves the row's read state
+    and its Done alone; this is the only thing in the repository that can see how it is drawn.
 
     Driven with a real failure, not a stubbed response. The mock is wedged into `no_reply` — it
     transcribes the question and says nothing, which is what a hung agent looks like from here —
@@ -6889,7 +6889,7 @@ SCENES: tuple[Scene, ...] = (
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
     Scene(
         name=SUMMARY_FAILED_STATE,
-        what="summary mode when the summariser fails: the row goes red, says so, and keeps the message",
+        what="summary mode when the summariser fails: the row says so quietly and keeps the message",
         act=_act_summary_failed,
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
@@ -6903,21 +6903,16 @@ SCENES: tuple[Scene, ...] = (
                 ".getAttribute('data-summary-failed') === 'true'",
             ),
             (
-                # THE claim, and the reason this is a picture rather than a fixture. The page suite
-                # can assert the attribute, and it can assert that voice.css declares a rule for
-                # it; whether the rule reaches the pixels — past the greyscale filter on archived
-                # rows, past a later declaration, past a palette that has no red in it — is a
-                # rendering fact, and this is the only thing in the repository that can see it. A
-                # state pinned to the attribute alone would be green with the whole stylesheet
-                # deleted.
-                "the failed row is really DRAWN differently from an ordinary one",
+                # `#564 message-summary-toggle`. The owner, 2026-10-26: "The summary failed is very
+                # invasive ... I can no longer see if it's archived or mark it as read." A rendering
+                # fact, so checked here: the failed row has no bar down its edge (its left side is
+                # its right side's width), and its label is the muted aside, not red capitals.
+                "the failed row is drawn as its own row, with only a quiet label",
                 "(() => { const f = document.getElementById('summary-failed-probe'); "
-                "const rows = [...document.querySelectorAll('#discord-log > li')]; "
-                "const other = rows.find((n) => n !== f); "
-                "if (!other) return false; "
-                "const a = getComputedStyle(f), b = getComputedStyle(other); "
-                "return a.backgroundColor !== b.backgroundColor && "
-                "parseFloat(a.borderLeftWidth) > 0; })()",
+                "const a = getComputedStyle(f); "
+                "const m = getComputedStyle(f.querySelector('.summary-mark')); "
+                "return Math.abs(parseFloat(a.borderLeftWidth) - parseFloat(a.borderRightWidth)) < 0.5 && "
+                "m.textTransform === 'none' && parseInt(m.fontWeight, 10) < 600; })()",
             ),
             (
                 # A colour is not reachable by a screen reader, is not reachable by a reader who
@@ -7566,13 +7561,13 @@ def check_state_controls() -> list[str]:
         "38-link-kinds-off": ("line-through", "/pull/", "hidden-link-kinds"),
         # `#49 cached-summaries`, the other half. Pinned to THREE independent things, because each
         # is separately deletable and each on its own is satisfiable by a defect:
-        #   `backgroundColor` — the row is really drawn differently. Pinning this state to
-        #     `data-summary-failed` alone would leave it green with voice.css emptied, which is the
-        #     entire failure it exists to catch.
+        #   `textTransform`   — the label is really drawn quietly (`#564 message-summary-toggle`:
+        #     the owner found the red row invasive). Pinning this state to `data-summary-failed`
+        #     alone would leave it green with the label shouting again.
         #   `summary failed`  — it says so in words. A colour is not readable by a screen reader.
-        #   `.body`           — the message is still there. A red row that swallowed the message
-        #     would be worse than no summary mode at all, and it satisfies every colour check.
-        SUMMARY_FAILED_STATE: ("backgroundColor", "summary failed", ".body"),
+        #   `.body`           — the message is still there. A row that swallowed the message would
+        #     be worse than no summary mode at all.
+        SUMMARY_FAILED_STATE: ("textTransform", "summary failed", ".body"),
         # `#218 desktop-dock`. Pinned to the two halves of the owner's complaint, each separately
         # deletable: the SIZE of the dock and its controls (`height <= 100`, `r.height <= 40.5`),
         # and the picker as wide as its name (`field-sizing`) — plus, for each view, the pane in

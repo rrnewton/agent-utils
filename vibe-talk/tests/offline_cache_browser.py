@@ -1269,7 +1269,7 @@ TILE_JS = """({edge}) => {""" + FLOAT_HELPERS_JS + """
         const like = (one) => one.width === top.width && one.style === top.style && one.color === top.color;
         const said = (one) => `${one.width}px ${one.style} ${one.color}`;
         if (!like(right)) problems.push(`${label}: its right side is ${said(right)} and its top ${said(top)}`);
-        if (flag('data-summarised') || flag('data-summary-failed') ? !(left.width > right.width + 1) : !like(left)) {
+        if (flag('data-summarised') ? !(left.width > right.width + 1) : !like(left)) {
             problems.push(`${label}: its left side is ${said(left)} and its top ${said(top)}`);
         }
         const r = box(row), list = box(area);

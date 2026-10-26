@@ -17152,95 +17152,53 @@ test("...and a failed summary does not poison the measurement of how long summar
   );
 });
 
-test("...and the red is DRAWN, distinctly, in both colour schemes", async () => {
-  // Marked is not drawn — the failure this suite has already shipped once, with a highlight that
-  // was a 14% tint nobody could see on #1d2026.
-  const drawn = cssBlock('#discord-log li.discord-message[data-summary-failed="true"]');
-  assert.match(drawn, /background:/, "a failed row does not take a surface of its own");
-  assert.match(drawn, /border-color:/);
-  assert.match(drawn, /border-left:\s*3px solid/, "a failed row has no mark down its edge");
-  // Every row's left side is a one-pixel hairline, the coder's tile's too since
-  // `#213 row-side-borders`, and `border-color` alone would make it a red hairline — an edge, not a
-  // mark — on the coding agent's rows, which are most of a real backlog. The same trap the summary
-  // tint had to clear.
-  assert.match(
-    cssRules(BASE_CSS, ".messages li").join("\n"),
-    /(?<![-\w])border:\s*1px solid/,
-    "the fixture for the hairline this bar has to be wider than has changed"
-  );
-  // ...and an ARCHIVED row is `filter: grayscale(1)` at 42% opacity. A greyscaled red is a grey,
-  // and a row the reader has filed is exactly where an unnoticed spend would hide.
+test("...and a failed row is QUIET: a small muted label, and the row keeps its read state and its edge", async () => {
+  // `#564 message-summary-toggle`. The owner, 2026-10-26: "The summary failed is very invasive. I'm
+  // fine with a subtle label but it makes the UI non functional. I can no longer see if it's
+  // archived or mark it as read." It used to take a red surface, a 3px bar, and `filter: none` and
+  // `opacity: 1` over an archived row's greyscale, so a filed row that failed looked unfiled.
+  for (const list of ["#side-log", "#side-cards", "#discord-log", "#pinned-log"]) {
+    assert.deepEqual(
+      cssRules(CSS, `${list} li.discord-message[data-summary-failed="true"]`),
+      [],
+      `${list}: a failed row still restyles the row itself`
+    );
+  }
+  // Nothing anywhere in the sheet overrides a row's read amounts or surface for a failed summary.
+  for (const [, selector, body] of CSS.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (!/data-summary-failed/.test(selector)) continue;
+    assert.ok(selector.split(",").every((one) => /\.summary-mark$/.test(one.trim())),
+      `a failed-summary rule styles more than its label: ${selector.trim()}`);
+    assert.doesNotMatch(body, /--row-(filter|opacity|grey)|background|border/,
+      `the failed label's rule reaches the row: ${body.trim()}`);
+  }
+  // The fixture the old rule defeated is still there, so the archived row keeps its grey.
   assert.match(
     cssBlock('#discord-log li.discord-message[data-archived="true"]'),
     /filter:\s*grayscale\(1\)/,
-    "the fixture for the greyscale this rule has to defeat has changed"
+    "the fixture for an archived row's greyscale has changed"
   );
-  assert.match(drawn, /filter:\s*none/, "a failed archived row is greyscaled, so its red is a grey");
-  assert.match(drawn, /opacity:\s*1/, "a failed archived row is drawn at 42%");
-
-  // Source order, not specificity, decides against the summarised tint: the two selectors weigh
-  // the same, so the failure rule has to come second.
-  assert.ok(
-    CSS.indexOf('li.discord-message[data-summary-failed="true"] {') >
-      CSS.indexOf('li.discord-message[data-summarised="true"] {'),
-    "the failure rule is declared before the summarised one, so the teal wins"
-  );
-
-  // A COLOUR OF ITS OWN, not a reuse of one already carrying a meaning. There is no red in this
-  // palette: `--warn` is orange and already means both 'being read aloud' and 'armed to clear'.
-  //
-  // IN BOTH SCHEMES, and the light one is not an afterthought here — it is the one the author
-  // judged second, so it is the one where a token quietly equal to another goes unnoticed. Checked
-  // at index 0 alone, this assertion passed with the light failure surface set to the light summary
-  // teal, and passed again with it set to the ordinary row surface: a failed row indistinguishable
-  // from a summarised one, and then from a row that did not fail at all, with the suite green.
-  const TINTS = ["--mine", "--theirs", "--third", "--summary-bg", "--row-hover", "--summary-fail-bg"];
-  for (const [i, scheme] of ["dark", "light"].entries()) {
-    const surfaces = new Set(TINTS.map((name) => tokenValues(CSS, name)[i]));
-    assert.equal(
-      surfaces.size,
-      TINTS.length,
-      `the ${scheme} failure surface repeats another row tint: ${[...surfaces]}`
-    );
-    // The INK too. It carries the two words "summary failed" and the standing sentence that says
-    // the server cannot summarise at all; equal to the summary's teal, both of those read as
-    // ordinary summary furniture and nothing on the row says anything went wrong.
-    assert.notEqual(
-      tokenValues(CSS, "--summary-fail-ink")[i],
-      tokenValues(CSS, "--summary-ink")[i],
-      `the ${scheme} failure label is written in the summary's own ink`
-    );
-    assert.notEqual(
-      tokenValues(CSS, "--summary-fail-edge")[i],
-      tokenValues(CSS, "--summary-edge")[i],
-      `the ${scheme} failure bar is the summary's own edge colour`
-    );
-  }
-  // ...and specifically not `--warn`, which is web/style.css's orange and already carries two
-  // meanings on this very list: the row being read aloud, and an armed Clear. Read from the BASE
-  // sheet rather than restated here, so this compares against the colour that is really in force.
-  const warn = tokenValues(BASE_CSS, "--warn");
-  assert.equal(warn.length, 2, "web/style.css no longer declares --warn for both schemes");
-  for (const [i, scheme] of ["dark", "light"].entries()) {
-    assert.notEqual(
-      tokenValues(CSS, "--summary-fail-bg")[i],
-      warn[i],
-      `the ${scheme} failure surface is the colour that already means 'reading aloud'`
-    );
-    assert.notEqual(tokenValues(CSS, "--summary-fail-ink")[i], warn[i]);
-  }
-
-  // BOTH SCHEMES. A token declared only for dark renders as nothing at all in light, which for
-  // this one means a failed row that looks exactly like a row that did not fail.
-  for (const block of [cssBlock(":root"), cssBlockIn("(prefers-color-scheme: light)", ":root")]) {
-    for (const name of ["--summary-fail-bg", "--summary-fail-edge", "--summary-fail-ink"]) {
-      assert.match(block, new RegExp(`${name}:\\s*#[0-9a-f]{6}`, "i"), `${name} is missing a scheme`);
-    }
-  }
-
-  // And the two words are in the failure's own ink rather than the summary's teal.
+  // The two words are in the muted ink and the body's weight, not the failure's red capitals.
   const mark = cssBlock('#discord-log li.discord-message[data-summary-failed="true"] .summary-mark');
-  assert.match(mark, /color:\s*var\(--summary-fail-ink\)/, "the failure label reads as a summary");
+  assert.match(mark, /color:\s*var\(--muted\)/, "the failure label is not muted");
+  assert.match(mark, /text-transform:\s*none/, "the failure label still shouts in capitals");
+  assert.doesNotMatch(mark, /--summary-fail/, "the failure label is still red");
+  // The red is kept for the one sentence that says the SERVER cannot summarise, in both schemes.
+  for (const block of [cssBlock(":root"), cssBlockIn("(prefers-color-scheme: light)", ":root")]) {
+    assert.match(block, /--summary-fail-ink:\s*#[0-9a-f]{6}/i, "--summary-fail-ink is missing a scheme");
+    assert.doesNotMatch(block, /--summary-fail-(bg|edge)/, "an unused failure surface is still declared");
+  }
+});
+
+test("the thread list's track is never wider than the list, so an opened code block cannot push rows off a phone", () => {
+  // `#564 message-summary-toggle`. The owner, 2026-10-26: "When I unpack this thread the messages go
+  // off the screen." `.side-cards` is a grid; its implicit `auto` track took the min-content of an
+  // opened row's code block (`white-space: pre`), and every card and row with it.
+  const list = cssBlock(".side-cards");
+  assert.match(list, /display:\s*grid/, "the fixture changed: the thread list is no longer a grid");
+  assert.match(list, /grid-template-columns:\s*minmax\(0,\s*1fr\)/, "the thread list's track can grow past the list");
+  // ...and the block scrolls inside its own box rather than being cut.
+  assert.match(cssRules(CSS, ".md pre").join("\n"), /overflow-x:\s*auto/, "a code block cannot scroll on its own");
 });
 
 test("the page names the summariser it actually got, quoting the server rather than assuming", async () => {

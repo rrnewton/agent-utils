@@ -4627,7 +4627,8 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
 //     an act, not a preference, and one that spends money should not come back on by itself.
 //   * A FAILURE IS SHOWN, ON THE ROW IT HAPPENED TO. Every summary is now a paid round trip to a
 //     vendor, so "no summary arrived" is a thing that happens and a thing that costs. The row
-//     turns red, says `summary failed`, and KEEPS ITS MESSAGE; the page never puts an apology
+//     says `summary failed` in small muted words and KEEPS ITS MESSAGE, its read state and its
+//     Done (`#564 message-summary-toggle`: it used to turn red); the page never puts an apology
 //     where the content should be. The failures in one turn are counted and said once, and a
 //     server with no summariser at all is stated as a standing sentence rather than as fifty
 //     identical pills. See `summaryFailed`.
@@ -4701,7 +4702,7 @@ let summaryBackend = "";
  *   * IT IS SAID IN THE STANDING NOTE, not only in the transient pill. A permanent fact about the
  *     deployment has to be readable after the six seconds are up.
  *
- * The rows that WERE asked still go red. "A summary was attempted here and did not arrive" is true
+ * The rows that WERE asked still say so. "A summary was attempted here and did not arrive" is true
  * of them whatever the reason, and the deployment-level explanation is what the note is for.
  */
 let summariesUnavailable = "";
@@ -4713,7 +4714,7 @@ let summaryRecheck = false;
  * Why the SERVER says it cannot summarise at all, from client-config, or "" when it may.
  *
  * Known before anything is asked, so the control is disabled up front with this as its reason:
- * switching summaries on and watching every long row turn red after several seconds is the
+ * switching summaries on and watching every long row fail after several seconds is the
  * experience this replaces.
  */
 let summariesDisabledByServer = "";
@@ -4994,7 +4995,8 @@ let summaryFailureTimer = null;
  * never replaced.
  *
  * What CHANGED, at the owner's asking: the failure is no longer only a sentence that disappears.
- * The row itself turns red and says "summary failed" until it is answered. The earlier reading —
+ * The row itself says "summary failed" until it is answered: small and muted since `#564
+ * message-summary-toggle`, never a surface that hides its read state. The earlier reading —
  * that a failure should be quiet because the fallback is acceptable — confused "the reader is not
  * blocked" with "the reader need not be told", and the standing complaint about this view is that
  * nothing in it is noticeable enough. A per-row mark plus one counted pill is loud where the
@@ -5005,7 +5007,7 @@ let summaryFailureTimer = null;
 function summaryFailed(key, why, code, detail) {
   summaries.set(key, { text: null, failed: true, why, code });
   // A DEPLOYMENT-LEVEL refusal, not a row-level one: this server has no summariser configured, so
-  // every other row would buy the same answer. The rows already asked about still go red — a
+  // every other row would buy the same answer. The rows already asked about still say so — a
   // summary really was attempted for them and really did not arrive — but nothing further is
   // asked, and the reason is stated where it will still be readable in a minute.
   //
@@ -5035,7 +5037,7 @@ function reportSummaryFailures() {
   if (failed.length === 0) {
     return;
   }
-  // ONE redraw for the whole batch, and it is what puts the red on the rows: see
+  // ONE redraw for the whole batch, and it is what puts the words on the rows: see
   // `applySummaryState`. Inside `preservingScroll`, because a failed row grows by the height of
   // its mark and rows above the viewport are exactly the case the browser cannot anchor.
   renderSummaries();

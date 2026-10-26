@@ -79,15 +79,10 @@
   --summary-bg: #14312f;
   --summary-edge: #2f7d73;
   --summary-ink: #6fd8c6;
-  /* `#49 cached-summaries`. The surface a row takes on when its summary was ASKED FOR and did not
-     arrive. RED, and a red that exists nowhere else in this interface: `--warn` is orange and is
-     already spoken for twice over (the row being read aloud, and an armed Clear), so borrowing it
-     would make "this is speaking" and "this is broken" the same colour. Judged in dark first, on
-     #1d2026, for the same reason as the tint above — and it has to be told apart from the four
-     surfaces a channel row can already have (two speakers, third parties, and the summary teal),
-     not merely from the page background. */
-  --summary-fail-bg: #3a1a1e;
-  --summary-fail-edge: #a3454f;
+  /* `#49 cached-summaries`. The ink of the one standing sentence that says this SERVER cannot
+     summarise at all (`#summary-note[data-unavailable]`). A red that exists nowhere else in this
+     interface: `--warn` is orange and already means the row being read aloud and an armed Clear.
+     A ROW whose summary failed no longer takes it (`#564 message-summary-toggle`, below). */
   --summary-fail-ink: #ff9aa2;
   /* THE reading column, in characters. Only the desktop regime at the foot of this file consults
      it — a phone has no room for a column and no margin to put beside one — but it is declared
@@ -198,11 +193,8 @@
     --summary-bg: #e4f4f1;
     --summary-edge: #4c9c91;
     --summary-ink: #1d6b60;
-    /* The failure tint, in light. Declared here as well and not left to the dark value, because a
-       token with only one scheme renders as nothing at all in the other one — which for THIS
-       token means a row that failed looks exactly like a row that did not. */
-    --summary-fail-bg: #fdeaec;
-    --summary-fail-edge: #c2555f;
+    /* The unavailable sentence's ink, in light: a token with only one scheme renders as nothing
+       at all in the other. */
     --summary-fail-ink: #8f1d28;
     --pin-ink: #7a5300;
     --pin-edge: #c08b14;
@@ -4252,48 +4244,25 @@ a.search-hit-link {
 }
 
 /*
- * ...AND A ROW WHOSE SUMMARY DID NOT ARRIVE IS RED.
+ * ...AND A ROW WHOSE SUMMARY DID NOT ARRIVE SAYS SO QUIETLY, AND IS OTHERWISE ITS OWN ROW.
  *
- * The owner's ask, in one rule: a summary is now a paid round trip to a vendor, so a failure is a
- * real event with a real cause, and the cell that failed should look like it. The row still shows
- * its MESSAGE — nothing here hides the body — so this is a tint over content the reader can still
- * use, not an error state standing in for one.
- *
- * Three things this rule has to survive, each of which silently un-draws it:
- *
- *   * THE COMPETING SURFACE. Declared AFTER `[data-summarised="true"]` above, and at the same
- *     specificity, so source order decides. A failed row is never `data-summarised` today, but a
- *     rule that depends on that staying true is a rule waiting to lose.
- *   * THE HAIRLINE. Every row's left side is a one-pixel border (`.messages li` in web/style.css),
- *     the coding agent's tile's too since `#213 row-side-borders`, and `border-color` alone makes
- *     that a red hairline, which reads as an edge rather than a mark. The explicit 3px bar is the
- *     mark down the edge, on every speaker's row — the coding agent's included, which are most of
- *     a real backlog and so the rows that fail most.
- *   * THE GREYSCALE. An archived or already-read row is `filter: grayscale(1)` at 42% opacity, and
- *     a greyscaled red is a grey. Amounts of no filter and full opacity (see `data-replied` for
- *     how a row's amounts are drawn) are what make the failure visible on a row the reader has
- *     filed — which is the case where they would otherwise never learn that the money was spent
- *     and nothing came back.
+ * `#564 message-summary-toggle`. It used to turn red: its own surface, a 3px bar down its edge, and
+ * the read row's greyscale and fade overridden so the red would show on a filed row. The owner,
+ * 2026-10-26: "The summary failed is very invasive. I'm fine with a subtle label but it makes the UI
+ * non functional. I can no longer see if it's archived or mark it as read." A failed summary is the
+ * vendor's problem, not the reader's: the row still shows its whole message, so nothing here may
+ * change what the row says about itself — its speaker surface, its read and archived greyscale, its
+ * edge, its Done. All that is left of the failure is the two words, small and in the muted ink every
+ * other aside on a row is in, and the reason on the row's title.
  */
-#side-log li.discord-message[data-summary-failed="true"],
-#side-cards li.discord-message[data-summary-failed="true"],
-#discord-log li.discord-message[data-summary-failed="true"],
-#pinned-log li.discord-message[data-summary-failed="true"] {
-  background: var(--summary-fail-bg);
-  border-color: var(--summary-fail-edge);
-  border-left: 3px solid var(--summary-fail-edge);
-  --row-filter: none;
-  --row-grey: 0;
-  --row-opacity: 1;
-}
-
-/* The two words, in the failure's own ink. The tint says something is wrong at a glance; this is
-   the part a screen reader can say and a greyscale screenshot still carries. */
 #side-log li.discord-message[data-summary-failed="true"] .summary-mark,
 #side-cards li.discord-message[data-summary-failed="true"] .summary-mark,
 #discord-log li.discord-message[data-summary-failed="true"] .summary-mark,
 #pinned-log li.discord-message[data-summary-failed="true"] .summary-mark {
-  color: var(--summary-fail-ink);
+  color: var(--muted);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .summary-mark {
@@ -9024,6 +8993,12 @@ li.discord-message[data-root-continuation] > .thread-replies {
    card highlighted, which shows all of it (below). Edged in the thread's own colour, as its tag. */
 .side-cards {
   display: grid;
+  /* `#564 message-summary-toggle`. One track the list's width and NEVER WIDER. The implicit track
+     is `auto`, which is as wide as the widest row's min-content: a code block opened in an unpacked
+     row (`white-space: pre`, one unbroken line per source line) stretched the track, and with it
+     every card and row in the list, off a phone's right edge. Pinned at zero, the rows keep the
+     list's width and the block scrolls inside its own box (`.md pre`). */
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.45rem;
   margin: 0.2rem 0 0.6rem;
   padding: 0;
