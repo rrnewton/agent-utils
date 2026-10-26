@@ -227,6 +227,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("validation/", frozenset(GROUPS)),
     # Their own group is always-on, so naming them here only stops them reading as unclassified.
     ("scripts/check_editions.py", frozenset()),
+    ("scripts/check_rust_only.py", frozenset()),
     ("scripts/check_client_names.py", frozenset()),
     ("scripts/check_documented_defaults.py", frozenset()),
     ("scripts/check_site.py", frozenset()),

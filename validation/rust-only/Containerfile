@@ -1,0 +1,24 @@
+# Rust-only mode: the dispatched Rust tools with no Python interpreter.
+#
+#   podman build -t agent-utils-rust-only -f validation/rust-only/Containerfile .
+#   podman run --rm agent-utils-rust-only
+#
+# The runtime image is built from the workspace's release binaries and a
+# POSIX shell only. The build stage needs the Rust toolchain; neither stage
+# installs Python, and the smoke entrypoint fails if an interpreter is
+# present on PATH. This is the hermetic version of
+# scripts/check_rust_only.py (#542 rust-primary-rust-only-check).
+
+FROM docker.io/library/rust:1-slim-bookworm AS build
+WORKDIR /src
+COPY rs ./rs
+RUN cargo build --release --locked --workspace
+
+FROM docker.io/library/debian:bookworm-slim
+COPY --from=build /src/rs/target/release/agentctl /src/rs/target/release/herdr-agent /usr/local/bin/
+COPY --from=build /src/rs/target/release/dagrun /src/rs/target/release/cpuset-alloc /usr/local/bin/
+COPY --from=build /src/rs/target/release/tick-hub /src/rs/target/release/herdr-run /usr/local/bin/
+COPY --from=build /src/rs/target/release/pr-landing-planner /usr/local/bin/
+COPY validation/rust-only/smoke.sh /usr/local/bin/agent-utils-rust-only-smoke
+RUN chmod +x /usr/local/bin/agent-utils-rust-only-smoke
+ENTRYPOINT ["/usr/local/bin/agent-utils-rust-only-smoke"]

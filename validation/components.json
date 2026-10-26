@@ -234,6 +234,7 @@
         "scripts/check_editions.py",
         "scripts/check_no_any.py",
         "scripts/check_python_packages.py",
+        "scripts/check_rust_only.py",
         "scripts/check_rust_packages.py",
         "scripts/check_site.py",
         "scripts/check_standalone.py",
@@ -259,7 +260,8 @@
         "py/tests/test_gh_resolve.py",
         "py/tests/test_gh_resolve_copies.py",
         "py/tests/test_pid_namespace_init.py",
-        "py/tests/test_rebase_delta_guard.py"
+        "py/tests/test_rebase_delta_guard.py",
+        "py/tests/test_rust_only.py"
       ]
     },
     "tick-hub": {

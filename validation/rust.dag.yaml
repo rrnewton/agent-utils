@@ -211,6 +211,21 @@ steps:
     cpu_timeout: 1200
     hint: *rust_test_hint
 
+  - group: rust-only
+    job: check
+    desc: dispatched Rust tools run with no Python interpreter on PATH (campaign progress meter)
+    cmd: python3 scripts/check_rust_only.py --self-test && python3 scripts/check_rust_only.py
+    jobs_flag: ""
+    labels: [validation-rust]
+    timeout: 1200
+    cpu_timeout: 2400
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 120
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 2147483648
+
   - group: agent-teams
     job: test
     desc: agent-teams Rust tests, including the bounded exactly-once harness pass
