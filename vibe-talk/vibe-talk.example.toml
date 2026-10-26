@@ -345,7 +345,8 @@ enabled = true
 # binary frames. Provider endpoints belong in deployment configuration, never in source.
 # backend = "elevenlabs"
 # websocket_url = "wss://voice-provider.example/ws"
-# A path means the page's own host, which suits a bridge behind the same front door as the page:
+# A path means the page's own host. A bridge authenticates nobody, so never send a front door's /ws
+# to it directly: with relay_upstream (below) the page's socket goes through this server instead.
 # websocket_url = "/ws?mode=voice"
 # label = "WebSocket voice provider"
 # A bridge that can resume a conversation lists "replay" in session_started.capabilities and takes

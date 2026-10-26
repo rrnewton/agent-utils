@@ -49,6 +49,8 @@ pub enum Credential {
     Write,
     /// The adapter-only live-event ingestion token.
     Ingest,
+    /// The voice-only token, which opens the voice-socket relay alone. `#553 voice-ws-relay-auth`.
+    Voice,
 }
 
 impl Credential {
@@ -79,6 +81,7 @@ impl Credential {
         }
         match (auth::bearer_token(header), ingest) {
             (Some(presented), Some(expected)) if expected.matches(presented) => Self::Ingest,
+            _ if auth::is_voice_token(header, config) => Self::Voice,
             _ => Self::Unrecognized,
         }
     }
@@ -92,6 +95,7 @@ impl Credential {
             Self::Read => "read",
             Self::Write => "write",
             Self::Ingest => "ingest",
+            Self::Voice => "voice",
         }
     }
 }

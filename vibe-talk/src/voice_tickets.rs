@@ -17,9 +17,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// How long a minted ticket may wait to be redeemed. The page opens the socket straight after the
-/// voice-session call returns, so a minute is generous; a ticket found later is worthless.
-pub const TICKET_TTL: Duration = Duration::from_secs(60);
+/// How long a minted ticket may wait to be redeemed. Between the voice-session call and the socket
+/// the page may wait on the microphone permission prompt, so five minutes; a ticket is single-use
+/// either way, and one found later is worthless.
+pub const TICKET_TTL: Duration = Duration::from_secs(300);
 
 /// The most unredeemed tickets held at once. One per call start; a page that minted and never
 /// opened leaves one behind until it expires, so this bounds a burst, not a steady state.

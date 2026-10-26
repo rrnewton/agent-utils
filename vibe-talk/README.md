@@ -2502,7 +2502,7 @@ model provider or a real gateway.
 | ElevenLabs agent id | `elevenlabs.agent_id` | `VIBE_TALK_ELEVENLABS_AGENT_ID` | public |
 | Read-aloud backend | `read_aloud.backend` | `VIBE_TALK_READ_ALOUD_BACKEND` | `elevenlabs` (default), `browser` for the device speech engine, or `conversation` to use the configured `vibe-talk-v1` agent |
 | Conversation backend | `conversation.backend` | — | `elevenlabs` (default) or `websocket` for a deployment-managed `vibe-talk-v1` endpoint |
-| Conversation WebSocket | `conversation.websocket_url` | — | required for the `websocket` backend; keep private endpoints in deployment configuration. A path such as `/ws?mode=…` means the page's own host, so one configuration serves every host that puts a bridge behind its front door at that path |
+| Conversation WebSocket | `conversation.websocket_url` | — | required for the `websocket` backend; keep private endpoints in deployment configuration. A path such as `/ws?mode=…` means the page's own host, so one configuration serves every host that puts a bridge behind its front door at that path. A bridge authenticates nobody, so do not route a front door to it directly: set `conversation.relay_upstream`, and the page's socket goes through this server (see "Relaying the voice socket") |
 | Conversation label | `conversation.label` | — | provider name shown in the UI and its connection errors |
 | Voice relay upstream | `conversation.relay_upstream` | — | optional absolute `ws://` or `wss://` URL of the bridge this server relays the page's socket to (`/api/v1/voice-socket`); keep that bridge on loopback — see "Relaying the voice socket" |
 | Read-aloud relay token | `read_aloud.websocket_token_file` | — | optional file holding another server's voice-only token, sent as `Authorization: Bearer` when dialing `read_aloud.websocket_url`; read at each connection |
@@ -4748,7 +4748,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
 | GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider; with `conversation.relay_upstream`, its socket URL is the relay below with a single-use ticket |
-| GET | `/api/v1/voice-socket` | ticket or voice | WebSocket relay to `conversation.relay_upstream`: a page's single-use `ticket`, or the voice-only token without chat tools; no browser token opens it — see "Relaying the voice socket" |
+| GET | `/api/v1/voice-socket` | ticket or voice | WebSocket relay to `conversation.relay_upstream`: a page's single-use `ticket`, or the voice-only token without chat tools; no browser token opens it; `502 voice_relay_unreachable`, `503 voice_relay_busy` — see "Relaying the voice socket" |
 | GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers"; to the write token, once, the recap a page armed (`prompt.recap` says its number and counts, never its words) — see "A recap in the profile the bridge fetches" |
 | POST | `/api/v1/voice-recap` | **write** | `{conversation_id}`: arm a recap of that conversation for the bridge's next profile fetch, built as the replay route builds one; answers `{id, armed, included, dropped, truncated, words, expires_in_seconds}`, never the words; `409 recap_unavailable` unless the server hands recaps over that way — see "A recap in the profile the bridge fetches" |
 | DELETE | `/api/v1/voice-recap` | **write** | withdraw whatever recap is armed (204): a page starting a call it hands no recap |
@@ -5945,14 +5945,17 @@ Set `conversation.relay_upstream` and the bridge can stay on loopback:
 
 * `GET /api/v1/voice-session` hands the page `/api/v1/voice-socket?…&ticket=…` instead of
   `conversation.websocket_url`, keeping that URL's query (`mode`, `tools`) and adding a ticket: 256
-  random bits, single-use, good for one minute. A browser cannot put `Authorization` on a WebSocket,
+  random bits, single-use, good for five minutes (the microphone prompt may come between). A browser cannot put `Authorization` on a WebSocket,
   so the ticket stands in for the write token the voice-session call itself required.
 * `GET /api/v1/voice-socket` admits the socket on that ticket, or on the voice-only token
   (`auth.voice_token`, sent as `Authorization: Bearer`) — and on nothing else, not the read or the
   write token. It dials `relay_upstream` with the caller's query (less the ticket) before accepting
   the upgrade, so a bridge that is down is a `502 voice_relay_unreachable`, then copies frames both
-  ways until either side closes. A voice-token caller never gets chat tools: its `tools` parameter
-  is dropped, however it is encoded.
+  ways until either side closes, close codes and reasons included. A voice-token caller never gets
+  chat tools: of its query only `mode` is forwarded, and any tools parameter is stripped from
+  `relay_upstream`'s own. At most sixteen sockets are relayed at once (`503 voice_relay_busy`), and
+  a page that sends nothing, not even a pong to the relay's ping every 20 seconds, for 45 seconds
+  is closed on both sides, as the bridge's own keepalive would have closed it.
 * The voice-only token opens no other route: every `/api/` route and `/mcp` refuse it as an unknown
   token. Hand it to the other server, whose `[read_aloud]` names this relay as `websocket_url`, the
   token's file as `websocket_token_file`, and, when this server's certificate comes from a private

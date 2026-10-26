@@ -9,6 +9,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use vibe_talk::testing::{READ_TOKEN, WRITE_TOKEN};
 
@@ -51,6 +53,16 @@ async fn bridge() -> (String, mpsc::UnboundedReceiver<String>) {
                     .await;
                 while let Some(Ok(message)) = socket.next().await {
                     if let Message::Text(text) = message {
+                        if text.as_str() == "close-me" {
+                            // As a bridge ends a session after an error: a code and a reason.
+                            let _ = socket
+                                .close(Some(CloseFrame {
+                                    code: CloseCode::Library(4000),
+                                    reason: "bridge said goodbye".into(),
+                                }))
+                                .await;
+                            return;
+                        }
                         if socket.send(Message::Text(text)).await.is_err() {
                             return;
                         }
@@ -272,4 +284,33 @@ async fn read_aloud_reaches_a_bridge_through_another_servers_relay() {
         "the hello got a session through the relay"
     );
     assert_eq!(seen.recv().await.as_deref(), Some("/ws?mode=voice"));
+}
+
+#[tokio::test]
+async fn a_close_passes_through_with_its_code_and_reason() {
+    let (upstream, _seen) = bridge().await;
+    let base = server(&upstream).await;
+    let url = ws(&base, "/api/v1/voice-socket?mode=voice");
+    let mut socket = open(&url, Some(VOICE_TOKEN)).await.expect("opens");
+    assert_eq!(
+        next_text(&mut socket).await,
+        r#"{"type":"session_started"}"#
+    );
+    socket
+        .send(Message::Text("close-me".into()))
+        .await
+        .expect("sends");
+    let closed = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a frame in time")
+        {
+            Some(Ok(Message::Close(frame))) => break frame,
+            Some(Ok(_)) => {}
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    };
+    let frame = closed.expect("the bridge's close frame, not an empty one");
+    assert_eq!(frame.code, CloseCode::Library(4000));
+    assert_eq!(frame.reason.as_str(), "bridge said goodbye");
 }

@@ -36,14 +36,16 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// The credentials `[read_aloud]` names for its own `websocket_url`, or none when it names no
-    /// URL (the dial then goes to `conversation.websocket_url`, which they do not belong to).
+    /// The credentials `[read_aloud]` names for its own `websocket_url`, or none unless that is an
+    /// absolute `ws://` or `wss://` URL: otherwise the server dials `conversation.websocket_url`
+    /// instead ([`crate::voice_bridge::server_url`]), which they do not belong to.
     #[must_use]
     pub fn for_read_aloud(read_aloud: &ReadAloudConfig) -> Self {
         let named = read_aloud
             .websocket_url
             .as_deref()
-            .is_some_and(|url| !url.trim().is_empty());
+            .map(str::trim)
+            .is_some_and(|url| url.starts_with("ws://") || url.starts_with("wss://"));
         if !named {
             return Self::default();
         }
@@ -80,6 +82,12 @@ pub enum DialError {
 /// connection or handshake fails, including a relay's 401 for a token it does not accept.
 pub async fn connect(url: &str, credentials: &Credentials) -> Result<BridgeSocket, DialError> {
     let mut request = url.into_client_request()?;
+    if credentials.token_file.is_some() && !private_route(request.uri()) {
+        return Err(DialError::Credential(format!(
+            "read_aloud.websocket_token_file is set, but {url} is plain ws:// to another host: the \
+             token would cross the network in the clear; use wss://"
+        )));
+    }
     if let Some(path) = credentials.token_file.as_deref() {
         let token = read_token(path)?;
         let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
@@ -102,6 +110,22 @@ pub async fn connect(url: &str, credentials: &Credentials) -> Result<BridgeSocke
     let (socket, _) =
         tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector).await?;
     Ok(socket)
+}
+
+/// Whether a token may be sent to `uri`: over TLS, or over plain `ws://` to this host only.
+fn private_route(uri: &tokio_tungstenite::tungstenite::http::Uri) -> bool {
+    if uri.scheme_str() == Some("wss") {
+        return true;
+    }
+    match uri.host() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    }
 }
 
 fn read_token(path: &Path) -> Result<String, DialError> {
@@ -180,6 +204,13 @@ mod tests {
         assert_eq!(own.ca_file.as_deref(), Some(Path::new("/ca.pem")));
         assert!(Credentials::for_read_aloud(&read_aloud(None)).is_empty());
         assert!(Credentials::for_read_aloud(&read_aloud(Some("  "))).is_empty());
+        assert!(
+            Credentials::for_read_aloud(&read_aloud(Some("/ws?mode=voice"))).is_empty(),
+            "a path is not dialed, so the token must not go to the fallback URL"
+        );
+        assert!(
+            Credentials::for_read_aloud(&read_aloud(Some("https://relay.example.test"))).is_empty()
+        );
     }
 
     // The handshake callback's error type is `http::Response<Option<String>>`, fixed by
@@ -240,6 +271,20 @@ mod tests {
         };
         let error = connect("ws://127.0.0.1:9/ws", &blank).await.unwrap_err();
         assert!(matches!(error, DialError::Credential(ref why) if why.ends_with("is empty")));
+
+        let token = Credentials {
+            token_file: Some(file(&dir, "token", "voice-token-that-is-long-enough")),
+            ca_file: None,
+        };
+        let error = connect("ws://relay.example.test:8080/ws", &token)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DialError::Credential(ref why) if why.contains("use wss://")));
+        assert!(private_route(&"ws://[::1]:9/ws".parse().unwrap()));
+        assert!(private_route(&"ws://localhost:9/ws".parse().unwrap()));
+        assert!(private_route(
+            &"wss://relay.example.test/ws".parse().unwrap()
+        ));
 
         let roots = Credentials {
             token_file: None,

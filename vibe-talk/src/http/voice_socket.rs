@@ -13,16 +13,18 @@
 //!   ticket stands in for it, once: see [`crate::voice_tickets`];
 //! * **a server, with the voice-only token** (`auth.voice_token`) as `Authorization: Bearer`:
 //!   another vibe-talk reading messages aloud through this one. It gets the socket WITHOUT chat
-//!   tools: a `tools` parameter it sends is dropped before the bridge sees it.
+//!   tools: of what it sends only `mode` is forwarded (see [`upstream_for`]).
 //!
 //! Nothing else opens it, not even the read or write token: the page always comes with a ticket,
 //! and a server has no business holding a browser token to read aloud. Every refusal is the same
 //! 401 the rest of `/api/` gives, so the route says nothing about tickets to a caller without one.
 //!
-//! The rest of the query (`mode`, and `tools` for a page) is forwarded to the bridge in place of
-//! `relay_upstream`'s own; with none, `relay_upstream`'s query applies. The bridge is dialed BEFORE
-//! the upgrade is accepted, so a bridge that is down is a 502 the caller can read, not a socket
-//! that opens and closes at once.
+//! The bridge is dialed BEFORE the upgrade is accepted, so a bridge that is down is a 502 the
+//! caller can read, not a socket that opens and closes at once. At most [`MAX_RELAYS`] sockets are
+//! relayed at once (503 beyond), and a page that goes silent is noticed: the relay pings it every
+//! [`PING_EVERY`] and closes both sides after [`CLIENT_SILENCE`] without a frame, as the bridge's own
+//! keepalive would have done had it faced the page directly. Close frames, with their codes and
+//! reasons, pass through in both directions.
 
 use std::time::Duration;
 
@@ -48,6 +50,19 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The largest frame relayed in either direction, the bridge's own inbound cap.
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most sockets relayed at once, across every caller. A bridge for one owner serves a handful
+/// of sessions; this bounds what a leaked voice token can open.
+pub const MAX_RELAYS: usize = 16;
+
+/// How often the relay pings the client.
+pub const PING_EVERY: Duration = Duration::from_secs(20);
+
+/// How long the client may send nothing at all, not even a pong, before both sides are closed.
+pub const CLIENT_SILENCE: Duration = Duration::from_secs(45);
+
+/// Sockets being relayed now; one permit each, held for the socket's life.
+static RELAYS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_RELAYS);
 
 /// Who opened the socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,28 +107,55 @@ fn ticket_in(query: Option<&str>) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-/// The bridge URL for this caller: `upstream` with its query replaced by the caller's, less the
-/// ticket and, for a server, less `tools`. Parameters are decoded before they are judged and
-/// re-encoded after, so an encoded name cannot slip past the filter.
+/// The query parameter a server caller may choose: which of the bridge's modes it talks to.
+pub const MODE_PARAMETER: &str = "mode";
+
+/// The bridge URL for this caller.
+///
+/// A page's own query is forwarded, less the ticket; with none, `upstream`'s applies. A page's
+/// query came from this server (the voice-session call) to a holder of the write token, so it may
+/// ask for tools.
+///
+/// A server is held to an allowlist: `upstream`'s own query without any tools parameter, with at
+/// most its own `mode` in place of the configured one, and nothing else of what it sent. An
+/// allowlist rather than a filter, because a bridge's query parser may well read `Tools`,
+/// `tools[]` or `tools ` as `tools`; any name that folds to one starting with `tools` is dropped
+/// from the configured query too.
 #[must_use]
 pub fn upstream_for(upstream: &str, query: Option<&str>, caller: RelayCaller) -> String {
     let (base, own_query) = match upstream.split_once('?') {
-        Some((base, own)) => (base, Some(own)),
-        None => (upstream, None),
+        Some((base, own)) => (base, own),
+        None => (upstream, ""),
     };
-    let kept: Vec<(String, String)> = url::form_urlencoded::parse(query.unwrap_or("").as_bytes())
-        .filter(|(name, _)| name != TICKET_PARAMETER)
-        .filter(|(name, _)| caller == RelayCaller::Page || name != TOOLS_PARAMETER)
-        .map(|(name, value)| (name.into_owned(), value.into_owned()))
-        .collect();
-    let forwarded = if kept.is_empty() {
-        // Nothing of the caller's own: the configured query, filtered the same way.
-        url::form_urlencoded::parse(own_query.unwrap_or("").as_bytes())
-            .filter(|(name, _)| caller == RelayCaller::Page || name != TOOLS_PARAMETER)
+    let pairs = |text: &str| -> Vec<(String, String)> {
+        url::form_urlencoded::parse(text.as_bytes())
             .map(|(name, value)| (name.into_owned(), value.into_owned()))
             .collect()
-    } else {
-        kept
+    };
+    let forwarded: Vec<(String, String)> = match caller {
+        RelayCaller::Page => {
+            let kept: Vec<_> = pairs(query.unwrap_or(""))
+                .into_iter()
+                .filter(|(name, _)| name != TICKET_PARAMETER)
+                .collect();
+            if kept.is_empty() {
+                pairs(own_query)
+            } else {
+                kept
+            }
+        }
+        RelayCaller::Server => {
+            let mode = pairs(query.unwrap_or(""))
+                .into_iter()
+                .find(|(name, _)| name == MODE_PARAMETER);
+            let mut kept: Vec<_> = pairs(own_query)
+                .into_iter()
+                .filter(|(name, _)| !names_tools(name))
+                .filter(|(name, _)| mode.is_none() || name != MODE_PARAMETER)
+                .collect();
+            kept.extend(mode);
+            kept
+        }
     };
     if forwarded.is_empty() {
         return base.to_owned();
@@ -122,6 +164,17 @@ pub fn upstream_for(upstream: &str, query: Option<&str>, caller: RelayCaller) ->
         .extend_pairs(forwarded)
         .finish();
     format!("{base}?{query}")
+}
+
+/// Whether a parameter name could be read as `tools` by a lenient parser: case, brackets, dots,
+/// spaces and any other non-alphanumerics aside.
+fn names_tools(name: &str) -> bool {
+    let folded: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    folded.starts_with(TOOLS_PARAMETER)
 }
 
 /// The page's socket URL for a session, with a fresh ticket: this route, carrying
@@ -175,6 +228,13 @@ pub async fn relay(
             "open this route as a WebSocket (GET with Upgrade: websocket, version 13)",
         )
     })?;
+    let Ok(permit) = RELAYS.try_acquire() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "voice_relay_busy",
+            "this server is relaying as many voice sockets as it allows; try again shortly",
+        ));
+    };
     let target = upstream_for(upstream, request.uri().query(), caller);
     let bridge = match tokio::time::timeout(
         DIAL_TIMEOUT,
@@ -205,6 +265,7 @@ pub async fn relay(
                 tracing::info!(caller = ?caller, "voice relay: socket open");
                 pump(client, bridge).await;
                 tracing::info!(caller = ?caller, "voice relay: socket closed");
+                drop(permit);
             }
             Err(error) => {
                 tracing::warn!(error = %error, "voice relay: the client's upgrade did not complete");
@@ -255,7 +316,9 @@ fn accept_key(headers: &HeaderMap) -> Option<HeaderValue> {
     HeaderValue::from_str(&accept).ok()
 }
 
-/// Copy frames both ways until either side closes or fails, then close the other.
+/// Copy frames both ways until either side closes, fails, or the client goes silent; then close
+/// both. A close frame is passed on with its code and reason; pings and pongs are each hop's own
+/// (tungstenite answers a ping itself), and the relay keeps its own watch on the client.
 async fn pump<C, B>(client: C, bridge: B)
 where
     C: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -267,41 +330,54 @@ where
 {
     let (mut client_tx, mut client_rx) = client.split();
     let (mut bridge_tx, mut bridge_rx) = bridge.split();
-    let upward = async {
-        while let Some(Ok(message)) = client_rx.next().await {
-            if forward(&mut bridge_tx, message).await.is_err() {
-                break;
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
+    let mut heard = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            message = client_rx.next() => {
+                let Some(Ok(message)) = message else { break };
+                heard = tokio::time::Instant::now();
+                match message {
+                    Message::Text(_) | Message::Binary(_) => {
+                        if bridge_tx.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(frame) => {
+                        let _ = bridge_tx.send(Message::Close(frame)).await;
+                        break;
+                    }
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                }
+            }
+            message = bridge_rx.next() => {
+                let Some(Ok(message)) = message else { break };
+                match message {
+                    Message::Text(_) | Message::Binary(_) => {
+                        if client_tx.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(frame) => {
+                        let _ = client_tx.send(Message::Close(frame)).await;
+                        break;
+                    }
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                }
+            }
+            _ = ping.tick() => {
+                if heard.elapsed() >= CLIENT_SILENCE {
+                    tracing::info!("voice relay: the client went silent; closing both sides");
+                    break;
+                }
+                if client_tx.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                    break;
+                }
             }
         }
-        let _ = bridge_tx.close().await;
-    };
-    let downward = async {
-        while let Some(Ok(message)) = bridge_rx.next().await {
-            if forward(&mut client_tx, message).await.is_err() {
-                break;
-            }
-        }
-        let _ = client_tx.close().await;
-    };
-    // Either direction ending ends the relay: a page that hung up, or a bridge that closed its side
-    // after an error frame.
-    tokio::select! {
-        () = upward => {},
-        () = downward => {},
     }
-}
-
-/// Forward one message. Pings and pongs are each side's own business (tungstenite answers a ping
-/// itself), and a close ends this direction.
-async fn forward<S>(sink: &mut S, message: Message) -> Result<(), ()>
-where
-    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    match message {
-        Message::Text(_) | Message::Binary(_) => sink.send(message).await.map_err(|_| ()),
-        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(()),
-        Message::Close(_) => Err(()),
-    }
+    let _ = client_tx.close().await;
+    let _ = bridge_tx.close().await;
 }
 
 #[cfg(test)]
@@ -326,6 +402,11 @@ mod tests {
             "mode=voice&tools=chat",
             "mode=voice&t%6Fols=chat",
             "mode=voice&tools",
+            "mode=voice&Tools=chat",
+            "mode=voice&tools%5B%5D=chat",
+            "mode=voice&tools.0=chat",
+            "mode=voice&tools+=chat",
+            "mode=voice&other=1",
         ] {
             assert_eq!(
                 upstream_for("ws://127.0.0.1:9000/ws", Some(query), RelayCaller::Server),
@@ -335,12 +416,21 @@ mod tests {
         }
         assert_eq!(
             upstream_for(
-                "ws://127.0.0.1:9000/ws?mode=voice&tools=chat",
+                "ws://127.0.0.1:9000/ws?mode=voice&tools=chat&TOOLS[]=x&lang=en",
                 None,
                 RelayCaller::Server
             ),
-            "ws://127.0.0.1:9000/ws?mode=voice",
+            "ws://127.0.0.1:9000/ws?mode=voice&lang=en",
             "nor from the configured query"
+        );
+        assert_eq!(
+            upstream_for(
+                "ws://127.0.0.1:9000/ws?mode=default&lang=en",
+                Some("mode=voice&lang=xx"),
+                RelayCaller::Server
+            ),
+            "ws://127.0.0.1:9000/ws?lang=en&mode=voice",
+            "only its mode replaces the configured one"
         );
     }
 
