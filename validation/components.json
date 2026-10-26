@@ -38,6 +38,7 @@
         "py/tests/test_agentctl_chat_complexity.py",
         "py/tests/test_agentctl_chat_context.py",
         "py/tests/test_agentctl_chat_context_cli.py",
+        "py/tests/test_agentctl_chat_context_rust.py",
         "py/tests/test_agentctl_chat_deferred.py",
         "py/tests/test_agentctl_chat_history_rust.py",
         "py/tests/test_agentctl_chat_input.py",

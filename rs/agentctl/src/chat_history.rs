@@ -37,7 +37,7 @@ fn invalid(message: impl Into<String>) -> String {
 
 /// One JSON value that remembers object field order, for byte-faithful output.
 #[derive(Debug, Clone, PartialEq)]
-enum Ordered {
+pub(crate) enum Ordered {
     Null,
     Bool(bool),
     Int(i64),
@@ -49,21 +49,26 @@ enum Ordered {
 }
 
 impl Ordered {
-    fn get(&self, key: &str) -> Option<&Ordered> {
+    /// Build an object from ordered fields.
+    pub(crate) fn object(fields: Vec<(String, Ordered)>) -> Self {
+        Ordered::Object(fields)
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Option<&Ordered> {
         match self {
             Ordered::Object(fields) => fields.iter().find(|(name, _)| name == key).map(|(_, v)| v),
             _ => None,
         }
     }
 
-    fn as_text(&self) -> Option<&str> {
+    pub(crate) fn as_text(&self) -> Option<&str> {
         match self {
             Ordered::Text(text) => Some(text),
             _ => None,
         }
     }
 
-    fn as_int(&self) -> Option<i64> {
+    pub(crate) fn as_int(&self) -> Option<i64> {
         match self {
             Ordered::Int(value) => Some(*value),
             _ => None,
@@ -72,7 +77,7 @@ impl Ordered {
 
     /// Serialize like `json.dumps(..., indent=2)` in the other edition: two-space indent and
     /// `\uXXXX` escapes for every non-ASCII character.
-    fn dump(&self, indent: usize, out: &mut String) {
+    pub(crate) fn dump(&self, indent: usize, out: &mut String) {
         match self {
             Ordered::Null => out.push_str("null"),
             Ordered::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
@@ -146,13 +151,13 @@ fn dump_string(text: &str, out: &mut String) {
 }
 
 /// Minimal JSON parser producing [`Ordered`]; item artifacts are small.
-struct Parser<'a> {
+pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     index: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn parse(text: &'a str) -> Result<Ordered> {
+    pub(crate) fn parse(text: &'a str) -> Result<Ordered> {
         let mut parser = Parser {
             bytes: text.as_bytes(),
             index: 0,
@@ -585,7 +590,7 @@ fn reply_summary(record: &Value) -> Result<(i64, i64, i64, i64)> {
     Ok((count, sent, total_bytes, pending_bytes))
 }
 
-fn request_path(state: &Path, key: &str) -> Result<PathBuf> {
+pub(crate) fn request_path(state: &Path, key: &str) -> Result<PathBuf> {
     let valid = (12..=64).contains(&key.len())
         && key
             .bytes()
@@ -628,7 +633,7 @@ fn reply_item_path(state: &Path, key: &str, index: i64, sent: bool) -> PathBuf {
         .join(format!("{index:06}.json"))
 }
 
-fn read_json_value(path: &Path) -> Result<Value> {
+pub(crate) fn read_json_value(path: &Path) -> Result<Value> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| invalid(format!("cannot read {}: {error}", path.display())))?;
     serde_json::from_str(&text)

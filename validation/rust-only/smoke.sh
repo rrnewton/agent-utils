@@ -24,7 +24,6 @@ echo "needs-python agentctl migrate (subcommand)"
 echo "needs-python agentctl reset (subcommand)"
 echo "needs-python agentctl repair (subcommand)"
 echo "needs-python agentctl chat launch (subcommand)"
-echo "needs-python agentctl chat context (subcommand)"
 if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
     echo "FAIL a Python interpreter is present on PATH in the Rust-only environment"
     fail=1

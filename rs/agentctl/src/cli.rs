@@ -930,6 +930,11 @@ enum ChatCommand {
         after_help = "Example: agentctl chat history --bridge-state ~/.local/state/agentctl/chat --request <KEY-OR-PREFIX>"
     )]
     History(ChatHistory),
+    /// Read one page of prior thread messages for a saved request through the configured adapter
+    #[command(
+        after_help = "Example: agentctl chat context --bridge-state ~/.local/state/agentctl/chat --request <KEY-OR-PREFIX> --limit 10"
+    )]
+    Context(ChatContext),
     /// Internal systemd ExecStop helper for one inode-bound main-process pidfd
     #[command(hide = true)]
     GracefulStopMain(ChatGracefulStopMain),
@@ -1244,6 +1249,21 @@ struct ChatClose {
 }
 
 #[derive(Args)]
+struct ChatContext {
+    #[command(flatten)]
+    state: ChatState,
+    /// Saved request's hexadecimal key or unique prefix of at least 12 characters
+    #[arg(long, value_name = "KEY_OR_PREFIX")]
+    request: String,
+    /// Maximum prior messages per page, 1-200 (default: 10)
+    #[arg(long, value_name = "COUNT", default_value_t = 10)]
+    limit: i64,
+    /// Opaque cursor from the preceding context result to read older messages
+    #[arg(long, value_name = "TOKEN")]
+    cursor: Option<String>,
+}
+
+#[derive(Args)]
 struct ChatHistory {
     #[command(flatten)]
     state: ChatState,
@@ -1435,7 +1455,7 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
 // and the polling Chat launcher and its history/context readers. This edition refuses them with
 // exit status 2 and names the Python opt-in, instead of Clap's unrecognised-subcommand error.
 const PYTHON_ONLY_COMMANDS: [&str; 4] = ["mcp", "migrate", "reset", "repair"];
-const PYTHON_ONLY_CHAT_COMMANDS: [&str; 2] = ["launch", "context"];
+const PYTHON_ONLY_CHAT_COMMANDS: [&str; 1] = ["launch"];
 // Global options whose value is the following argument.
 const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
     "--registry",
@@ -2576,6 +2596,19 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::Context(value) => {
+            let output = crate::chat_context::read_context(
+                &value.state.bridge_state,
+                &value.request,
+                value.limit,
+                value.cursor.as_deref(),
+            )
+            .map_err(|error| {
+                Failure::Chat(crate::chat_runtime::ChatRuntimeError::Invalid(error).into())
+            })?;
+            write_text(&format!("{output}\n")).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::History(value) => {
             let output =
                 crate::chat_history::read_reply_history(&value.state.bridge_state, &value.request)
@@ -2841,7 +2874,7 @@ mod tests {
                 Some("chat launch"),
             ),
             (&["agentctl", "--state=/tmp/r", "chat", "history"], None),
-            (&["agentctl", "chat", "context"], Some("chat context")),
+            (&["agentctl", "chat", "context"], None),
             (&["agentctl", "--", "mcp"], Some("mcp")),
             (&["agentctl", "chat", "--", "launch"], Some("chat launch")),
             (&["agentctl", "help", "mcp"], Some("mcp")),
