@@ -398,6 +398,9 @@ struct WatchAgents {
     /// Directory for agent-watch-state.json and agent-watch.json (default: $XDG_STATE_HOME/agentctl/agent-watch)
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
+    /// Minutes a sender may wait for an agent's lifecycle lock before the coordinator is told, from 0 to 1440 (default: 10; 0 turns the check off). Every managed send holds that lock until its delivery is confirmed, so messages to a busy agent wait in turn; the notice names the holder and the waiters, is sent once per jam, and goes ahead of ordinary sends
+    #[arg(long, default_value = "10", value_parser = clap::value_parser!(u64).range(0..=1440), value_name = "MINUTES")]
+    delivery_wait_minutes: u64,
 }
 
 #[derive(Args)]
@@ -865,6 +868,9 @@ enum ChatCommand {
     /// Validate plugin, target, helper, and config authority, then create state
     Init(ChatInit),
     /// Inspect durable bridge state without contacting Herdr or a provider
+    #[command(
+        after_help = "Example:\n  agentctl --registry ~/project/.agentctl chat status --bridge-state ~/.local/state/agentctl/chat\n\nBesides the bridge's own records, delivery_alarm.agent_lock says who holds the bridged agent's\nlifecycle lock in --registry (from /proc/locks) and which senders are waiting for it, longest first,\nand each stalled request that has not reached the agent's queue gets waiting_on, one sentence\nnaming the holder and the waiters. Every managed send holds that lock until its delivery is\nconfirmed, so a request can wait behind other agents' messages; the bridge's own sends wait as\npriority senders and go ahead of ordinary agentctl sends. Pass the registry the bridge runs with."
+    )]
     Status(ChatState),
     /// Grant explicit senders temporary permission to message the bridge
     #[command(
@@ -916,9 +922,12 @@ enum ChatCommand {
         after_help = "Examples:\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --request-id \"$(uuidgen | tr A-F a-f)\" --file status.md\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --thread-id spaces/example/threads/one \\\n    --request-id \"$(uuidgen | tr A-F a-f)\" --file check.md\n\nWithout --thread-id the message starts a new thread. With it, the message is a reply in that\nthread, which must be named under the channel (<channel>/threads/<id>); it may be a thread\nthe operator started with an earlier publish. Use the provider's thread name for the root\nmessage: in Slack the thread of <channel>/messages/<ts> is <channel>/threads/<ts>.\n\nOn success it prints one JSON object: version, id (the request UUID), action (send), ok, and\nreceipt.message_id, the provider's name for the posted message; a threaded publish adds\nthread_id. Retry an uncertain outcome only with the identical UUID, channel, thread and text.\nIt neither writes bridge state nor creates a reply route."
     )]
     Publish(ChatPublish),
-    /// Run one bounded delivery, terminal-capture, and outbound recovery pass
+    /// Run one bounded delivery, terminal-capture, and outbound recovery pass; its sends wait for
+    /// the agent's lifecycle lock as priority senders, ahead of ordinary agentctl sends
     Tick(ChatOperate),
-    /// Run event-driven provider and Herdr subscriptions until SIGINT or SIGTERM
+    /// Run event-driven provider and Herdr subscriptions until SIGINT or SIGTERM; the bridge's
+    /// sends wait for the agent's lifecycle lock as priority senders, ahead of ordinary agentctl
+    /// sends, so a person's message waits at most for the delivery in progress
     Run(ChatRun),
     /// Store one reply for an open request from a file, and wake a running service to send it.
     /// Normally an agent replies between the prompt's two marker lines instead
@@ -1805,6 +1814,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 min_notice_interval: Duration::from_secs(value.min_notice_interval),
                 state_dir: value.state_dir,
                 landing_queue: Some(crate::landing_queue::path(&args.registry)),
+                delivery_wait: Duration::from_secs(value.delivery_wait_minutes * 60),
             };
             let mut probe = crate::agent_watch::ManagedProbe::new(
                 &client,
@@ -2463,7 +2473,9 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             Ok(0)
         }
         ChatCommand::Status(value) => {
-            let result = crate::chat_service::status(&value.bridge_state).map_err(Failure::Chat)?;
+            let mut result =
+                crate::chat_service::status(&value.bridge_state).map_err(Failure::Chat)?;
+            with_agent_lock(&mut result, &registry);
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
@@ -2647,7 +2659,8 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             let options = value.options();
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
-            let manager = ManagedAgents::new(&client, &registry)?;
+            // A person's messages go ahead of agent-to-agent sends (#556 chat-delivery-latency).
+            let manager = ManagedAgents::new(&client, &registry)?.with_lock_priority();
             let result = crate::chat_service::tick(&value.state.bridge_state, &manager, options)
                 .map_err(Failure::Chat)?;
             let code = if result.has_errors() { 75 } else { 0 };
@@ -2659,7 +2672,8 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             options.delivery.deliver_while_working = value.deliver_while_working;
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
-            let manager = ManagedAgents::new(&client, &registry)?;
+            // A person's messages go ahead of agent-to-agent sends (#556 chat-delivery-latency).
+            let manager = ManagedAgents::new(&client, &registry)?.with_lock_priority();
             let result = crate::chat_service::run_with_settings(
                 &value.operate.state.bridge_state,
                 &client,
@@ -2851,6 +2865,36 @@ fn add_capabilities(value: &mut serde_json::Value) {
     }
 }
 
+/// Add to a `chat status` report who holds the bridged agent's lifecycle lock in `registry` and
+/// who is waiting for it, as `delivery_alarm.agent_lock`, and give each stalled request that
+/// has not reached the agent's queue the reason it is still waiting, as `waiting_on`. A request
+/// waits for that lock behind every other sender to the agent, which the bridge's own records
+/// cannot show (#556 chat-delivery-latency).
+fn with_agent_lock(result: &mut Value, registry: &Path) {
+    let Some(agent) = result["agent_name"].as_str().map(str::to_owned) else {
+        return;
+    };
+    let report = crate::lock_wait::contention(registry, &agent);
+    let waiting_on = crate::lock_wait::describe(&agent, &report);
+    let Some(alarm) = result
+        .get_mut("delivery_alarm")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if let (Some(sentence), Some(stalled)) = (
+        waiting_on,
+        alarm.get_mut("stalled").and_then(Value::as_array_mut),
+    ) {
+        for request in stalled
+            .iter_mut()
+            .filter(|request| matches!(request["phase"].as_str(), Some("pending" | "submitting")))
+        {
+            request["waiting_on"] = Value::String(sentence.clone());
+        }
+    }
+    alarm.insert("agent_lock".to_owned(), report);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2872,6 +2916,43 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn chat_status_names_the_lock_holder_and_waiters_for_stalled_requests() {
+        let registry = std::env::temp_dir().join(format!(
+            "agentctl-cli-agent-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::agent::create_private_directory(&registry, "registry", true, true).unwrap();
+        let lock = crate::agent::open_private_lock(
+            &crate::lock_wait::lock_path(&registry, "coordinator"),
+            "lock",
+        )
+        .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        let _waiting = crate::lock_wait::register(&registry, "coordinator", true).unwrap();
+        let mut status = json!({
+            "agent_name": "coordinator",
+            "delivery_alarm": {"stalled": [
+                {"key": "a", "phase": "submitting"},
+                {"key": "b", "phase": "delivery_uncertain"},
+            ]},
+        });
+        with_agent_lock(&mut status, &registry);
+        let alarm = &status["delivery_alarm"];
+        assert_eq!(
+            alarm["agent_lock"]["holder"]["pid"],
+            json!(std::process::id())
+        );
+        assert_eq!(alarm["agent_lock"]["waiters"][0]["priority"], json!(true));
+        let waiting_on = alarm["stalled"][0]["waiting_on"].as_str().unwrap();
+        assert!(waiting_on.starts_with("1 sender waiting for agent coordinator's"));
+        assert!(alarm["stalled"][1].get("waiting_on").is_none());
+        let _ = fs::remove_dir_all(&registry);
+    }
     #[test]
     fn python_only_commands_are_detected_behind_global_options() {
         let cases: &[(&[&str], Option<&str>)] = &[

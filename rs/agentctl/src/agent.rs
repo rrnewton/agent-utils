@@ -2736,6 +2736,40 @@ pub(crate) fn lock_exclusive_with_runtime(
     )?)
 }
 
+/// [`lock_exclusive_with_runtime`], ranked by `gate` with `priority` through the queue
+/// library's `lock_exclusive_ranked`, calling `waiting` before each pause: only a caller that
+/// finds the lock taken ever pauses.
+pub(crate) fn lock_exclusive_ranked_with_runtime(
+    lock: &File,
+    path: &Path,
+    purpose: &str,
+    runtime: &dyn AgentRuntime,
+    (gate, priority): (&File, bool),
+    waiting: &dyn Fn(),
+) -> AgentResult<()> {
+    struct Noting<'a> {
+        runtime: &'a dyn AgentRuntime,
+        waiting: &'a dyn Fn(),
+    }
+    impl Waiter for Noting<'_> {
+        fn cancelled(&self) -> bool {
+            self.runtime.cancelled()
+        }
+        fn sleep(&self, duration: Duration) {
+            (self.waiting)();
+            self.runtime.sleep(duration);
+        }
+    }
+    Ok(agent_queue::fsio::lock_exclusive_ranked(
+        lock,
+        path,
+        purpose,
+        &Noting { runtime, waiting },
+        gate,
+        priority,
+    )?)
+}
+
 pub(crate) fn atomic_json(path: &Path, value: &Value) -> AgentResult<()> {
     Ok(agent_queue::fsio::atomic_json(path, value)?)
 }

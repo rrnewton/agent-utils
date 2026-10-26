@@ -13,7 +13,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use serde_json::Value;
@@ -184,6 +184,82 @@ pub fn lock_exclusive(lock: &File, path: &Path, purpose: &str, waiter: &dyn Wait
             }
             Err(error) => return Err(io_error(&format!("lock {purpose}"), path, error)),
         }
+    }
+}
+
+/// Longest an ordinary waiter defers to priority waiters without a break before it tries the
+/// lock anyway: see [`lock_exclusive_ranked`]. Longer than a slow delivery.
+pub const PRIORITY_DEFERENCE: Duration = Duration::from_secs(300);
+
+/// [`lock_exclusive`], ranked by the companion lock `gate` (another private lock file, never
+/// held long): while any `priority` waiter is waiting, ordinary waiters do not compete for
+/// `lock`, so a priority waiter waits at most for the current holder.
+///
+/// A priority waiter holds a shared `flock` on `gate` while it waits, and drops it once it has
+/// `lock`. An ordinary waiter, before each attempt on `lock`, takes `gate` exclusively without
+/// waiting and releases it at once; when that fails, a priority waiter is waiting, and it sleeps
+/// instead. An attempt that takes no lock is uncontended and costs nothing extra.
+///
+/// Plain [`lock_exclusive`] waiters (programs that do not know the gate) still compete as
+/// ordinary waiters always did, so ranking only ever helps a priority waiter.
+///
+/// A priority waiter that keeps arriving (a busy chat bridge) can keep ordinary waiters waiting
+/// as long as it does; that is the point. But one that stops while it waits (a stopped or stuck
+/// process holding the gate) must not hold them off a free lock for ever, so an ordinary waiter
+/// that has deferred for [`PRIORITY_DEFERENCE`] without a break tries the lock again anyway.
+pub fn lock_exclusive_ranked(
+    lock: &File,
+    path: &Path,
+    purpose: &str,
+    waiter: &dyn Waiter,
+    gate: &File,
+    priority: bool,
+) -> Result<()> {
+    let mut registered = false;
+    let mut deferring_since: Option<Instant> = None;
+    loop {
+        if priority && !registered {
+            // A failure means an ordinary waiter holds the gate for an instant; try again.
+            registered = FileExt::try_lock_shared(gate).is_ok();
+        }
+        let turn = priority || {
+            match FileExt::try_lock_exclusive(gate) {
+                Ok(()) => {
+                    let _ = FileExt::unlock(gate);
+                    deferring_since = None;
+                    true
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    deferring_since.get_or_insert_with(Instant::now).elapsed() >= PRIORITY_DEFERENCE
+                }
+                Err(error) => return Err(io_error(&format!("check {purpose} rank"), path, error)),
+            }
+        };
+        if turn {
+            match FileExt::try_lock_exclusive(lock) {
+                Ok(()) => {
+                    if registered {
+                        let _ = FileExt::unlock(gate);
+                    }
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(io_error(&format!("lock {purpose}"), path, error)),
+            }
+        }
+        if waiter.cancelled() {
+            if registered {
+                let _ = FileExt::unlock(gate);
+            }
+            return Err(Error::new(
+                ErrorKind::Cancelled,
+                format!(
+                    "cancelled while waiting to lock {purpose}: {}",
+                    path.display()
+                ),
+            ));
+        }
+        waiter.sleep(Duration::from_millis(10));
     }
 }
 
@@ -529,4 +605,66 @@ fn sync_directory_io(path: &Path) -> io::Result<()> {
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)?
         .sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[test]
+    fn a_priority_waiter_takes_the_lock_before_ordinary_waiters_that_came_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-queue-ranked-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_private_directory(&dir, "test directory", true, true).unwrap();
+        let lock_path = dir.join(".lock");
+        let gate_path = dir.join(".gate");
+        let holder = open_private_lock(&lock_path, "test lock").unwrap();
+        FileExt::try_lock_exclusive(&holder).unwrap();
+
+        // The priority waiter polls five times less often than the others, so only its rank
+        // can make it win the race for the released lock.
+        struct Slow;
+        impl Waiter for Slow {
+            fn sleep(&self, _duration: Duration) {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let waiter = |name: &'static str, priority: bool| {
+            let (lock_path, gate_path, order) =
+                (lock_path.clone(), gate_path.clone(), Arc::clone(&order));
+            thread::spawn(move || {
+                let lock = open_private_lock(&lock_path, "test lock").unwrap();
+                let gate = open_private_lock(&gate_path, "test gate").unwrap();
+                let pace: &dyn Waiter = if name == "priority" { &Slow } else { &Blocking };
+                lock_exclusive_ranked(&lock, &lock_path, "test lock", pace, &gate, priority)
+                    .unwrap();
+                order.lock().unwrap().push(name);
+                thread::sleep(Duration::from_millis(30));
+            })
+        };
+        let ordinary: Vec<_> = ["first", "second", "third"]
+            .into_iter()
+            .map(|name| waiter(name, false))
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+        let urgent = waiter("priority", true);
+        // Released between two of the slow waiter's polls.
+        thread::sleep(Duration::from_millis(125));
+        FileExt::unlock(&holder).unwrap();
+
+        urgent.join().unwrap();
+        for handle in ordinary {
+            handle.join().unwrap();
+        }
+        let order = order.lock().unwrap();
+        assert_eq!(order.first(), Some(&"priority"), "{order:?}");
+        assert_eq!(order.len(), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

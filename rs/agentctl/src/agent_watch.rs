@@ -83,6 +83,9 @@ pub struct WatchAgentsOptions {
     /// The registry's landing queue (`agentctl hold`), read when a child finishes so its
     /// notice can say who lands next; `None` leaves notices without that line.
     pub landing_queue: Option<PathBuf>,
+    /// How long a sender may wait for an agent's lifecycle lock before the jam is reported;
+    /// zero turns the check off.
+    pub delivery_wait: Duration,
 }
 
 impl WatchAgentsOptions {
@@ -479,6 +482,10 @@ struct WatchState {
     /// When each other recipient was last sent a batch.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     last_notice_by: BTreeMap<String, f64>,
+    /// For each agent whose deliveries are jammed and were reported, when the jam was
+    /// reported, so one jam is reported once.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    jams_reported: BTreeMap<String, f64>,
 }
 
 /// Where observations come from; the production source reads the registry through Herdr.
@@ -486,6 +493,11 @@ pub trait Probe {
     /// Observe every agent that should be watched this pass. An error means the team
     /// could not be listed at all; the pass reports it and starts no episodes.
     fn observe(&mut self) -> Result<Vec<Observation>>;
+    /// For each registered agent that senders are waiting to deliver to, its name and the
+    /// [`crate::lock_wait::contention`] report. The default sees no waits.
+    fn delivery_waits(&mut self) -> Vec<(String, Value)> {
+        Vec::new()
+    }
 }
 
 /// Where notices go; the production sink queues one message for the coordinator.
@@ -493,6 +505,11 @@ pub trait Notifier {
     /// Durably queue `text` for `coordinator` under `message_id` and return the queue
     /// outcome spelling. An error means nothing was queued and the batch is retried.
     fn notify(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String>;
+    /// [`Self::notify`] for a notice that must not wait behind the jam it reports: it is sent
+    /// as a priority sender. The default sends it as any other.
+    fn notify_urgent(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
+        self.notify(coordinator, text, message_id)
+    }
 }
 
 /// The watcher's clock, injectable for tests.
@@ -1120,6 +1137,9 @@ fn watch_agents_once(
     // A recipient's last send matters only while it can still rate-limit the next one.
     let window = options.min_notice_interval.as_secs_f64();
     state.last_notice_by.retain(|_, at| now - *at < window);
+    // First, as a priority sender: the other notices wait for the coordinator's lock like any
+    // ordinary sender, so behind a jam on the coordinator they would hold this one up.
+    let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
     let child_done = flush_child_done(state, notifier, now, options);
     let notice = flush_notices(state, notifier, now, options);
     // Agents whose view is scrolled up cannot be judged stalled or idle; say which, and do
@@ -1149,7 +1169,68 @@ fn watch_agents_once(
         "notice": notice,
         "child_done": child_done,
         "waiting": state.pending.len(),
+        "delivery_waits": delivery_waits,
     })
+}
+
+/// Report, once per jam, each agent whose senders have waited for its lifecycle lock longer
+/// than `--delivery-wait-minutes`: every managed send holds that lock until its delivery is
+/// confirmed, so a slow or busy agent makes every message to it wait in turn, and the senders
+/// only look idle (#556 chat-delivery-latency). The notice goes to the coordinator as a priority
+/// sender, because it may be about the coordinator's own lock. A jam lasts while any sender has
+/// waited past the threshold, whichever sender that is, so fifteen senders queued behind one
+/// another make one notice, not fifteen; it ends in the first pass that finds none. Returns
+/// every agent with waiters, for the pass report.
+fn report_delivery_jams(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    if options.delivery_wait.is_zero() {
+        state.jams_reported.clear();
+        return Vec::new();
+    }
+    let waits = probe.delivery_waits();
+    let threshold = options.delivery_wait.as_secs_f64();
+    let mut rows = Vec::new();
+    let mut still_jammed = BTreeMap::new();
+    for (agent, report) in &waits {
+        let longest = crate::lock_wait::longest_wait(report);
+        let Some(sentence) = crate::lock_wait::describe(agent, report) else {
+            continue;
+        };
+        let mut row = json!({"agent": agent, "longest_wait_seconds": longest, "detail": sentence});
+        if longest >= threshold {
+            if let Some(reported_at) = state.jams_reported.get(agent).copied() {
+                still_jammed.insert(agent.clone(), reported_at);
+                row["reported"] = json!(true);
+            } else if options.check_only {
+                row["due"] = json!(true);
+            } else {
+                let text = format!(
+                    "[agentctl watch-agents] deliveries to {agent} are waiting: {sentence}. Every \
+                     managed send holds that lock until its delivery is confirmed, so these \
+                     messages are typed one at a time; a chat bridge's requests go first. \
+                     `agentctl chat status --registry REGISTRY --bridge-state DIR` shows which \
+                     chat requests are caught in it."
+                );
+                let message_id = format!("agent-watch-jam-{agent}-{}", now as u64);
+                match notifier.notify_urgent(&options.coordinator, &text, &message_id) {
+                    Ok(outcome) => {
+                        still_jammed.insert(agent.clone(), now);
+                        row["reported"] = json!(true);
+                        row["outcome"] = json!(outcome);
+                    }
+                    Err(error) => row["error"] = json!(error.to_string()),
+                }
+            }
+        }
+        rows.push(row);
+    }
+    state.jams_reported = still_jammed;
+    rows
 }
 
 fn state_paths(options: &WatchAgentsOptions) -> Option<(PathBuf, PathBuf)> {
@@ -1304,6 +1385,29 @@ fn queue_has_entries(queue: &Path, child: &str) -> bool {
 }
 
 impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
+    /// Only an agent with a waiter record can have waiters, so the record directories name
+    /// every candidate, the coordinator included.
+    fn delivery_waits(&mut self) -> Vec<(String, Value)> {
+        let Ok(entries) = fs::read_dir(self.registry.join(".waiting")) else {
+            return Vec::new();
+        };
+        let mut agents: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        agents.sort();
+        agents
+            .into_iter()
+            .filter_map(|agent| {
+                let report = crate::lock_wait::contention(&self.registry, &agent);
+                let waiting = report["waiters"]
+                    .as_array()
+                    .is_some_and(|list| !list.is_empty());
+                waiting.then_some((agent, report))
+            })
+            .collect()
+    }
+
     fn observe(&mut self) -> Result<Vec<Observation>> {
         let manager = ManagedAgents::new(self.client, &self.registry)?;
         let rows = manager.list()?;
@@ -1432,7 +1536,32 @@ fn attempt_message_id(message_id: &str, attempt: u32) -> String {
 
 impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
     fn notify(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
-        let manager = ManagedAgents::new(self.client, &self.registry)?;
+        self.queue_notice(
+            ManagedAgents::new(self.client, &self.registry)?,
+            coordinator,
+            text,
+            message_id,
+        )
+    }
+
+    fn notify_urgent(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
+        self.queue_notice(
+            ManagedAgents::new(self.client, &self.registry)?.with_lock_priority(),
+            coordinator,
+            text,
+            message_id,
+        )
+    }
+}
+
+impl<A: ManagedApi + ?Sized> ManagedNotifier<'_, A> {
+    fn queue_notice(
+        &self,
+        manager: ManagedAgents<'_, A>,
+        coordinator: &str,
+        text: &str,
+        message_id: &str,
+    ) -> Result<String> {
         for attempt in 0..=NOTICE_REQUEUE_ATTEMPTS {
             let attempt_id = attempt_message_id(message_id, attempt);
             // A previous attempt may have queued this batch just before the watcher
@@ -1500,6 +1629,7 @@ mod tests {
             min_notice_interval: Duration::ZERO,
             state_dir: None,
             landing_queue: None,
+            delivery_wait: Duration::from_secs(600),
         }
     }
 
@@ -1527,14 +1657,88 @@ mod tests {
         }
     }
 
+    /// A probe whose only finding is a scripted wait for the coordinator's lifecycle lock.
+    struct JamProbe(Vec<f64>);
+
+    impl Probe for JamProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(Vec::new())
+        }
+        fn delivery_waits(&mut self) -> Vec<(String, Value)> {
+            let waited = if self.0.is_empty() {
+                0.0
+            } else {
+                self.0.remove(0)
+            };
+            if waited == 0.0 {
+                return Vec::new();
+            }
+            vec![(
+                "coordinator".to_owned(),
+                json!({
+                    "holder": {"pid": 11, "command": "agentctl send coordinator --file note"},
+                    "waiters": [{"pid": 22, "priority": true, "waiting_seconds": waited,
+                                 "command": "agentctl chat run"}],
+                }),
+            )]
+        }
+    }
+
+    #[test]
+    fn a_long_wait_for_an_agents_lock_is_reported_once_per_jam_as_urgent() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        // 5 min (under the 10 min threshold), 11 min, 12 min, then another sender at the head
+        // at 10.5 min (the same jam), cleared, then a new jam at 10 min.
+        let mut probe = JamProbe(vec![300.0, 660.0, 720.0, 630.0, 0.0, 600.0]);
+        let mut pass = |now: f64, state: &mut WatchState, notifier: &mut RecordingNotifier| {
+            watch_agents_once(&mut probe, notifier, state, now, &options)
+        };
+        let report = pass(1_000.0, &mut state, &mut notifier);
+        assert_eq!(report["delivery_waits"][0]["agent"], "coordinator");
+        assert!(notifier.sent.is_empty());
+        let report = pass(1_360.0, &mut state, &mut notifier);
+        assert_eq!(report["delivery_waits"][0]["reported"], true);
+        assert_eq!(notifier.sent.len(), 1);
+        let (to, text, id) = &notifier.sent[0];
+        assert_eq!(to, "coordinator");
+        assert!(
+            text.contains("deliveries to coordinator are waiting"),
+            "{text}"
+        );
+        assert!(text.contains("the longest for 11 min (PID 22: agentctl chat run, priority)"));
+        assert!(text.contains("held by PID 11: agentctl send coordinator --file note"));
+        assert_eq!(id, "agent-watch-jam-coordinator-1360");
+        assert_eq!(notifier.urgent, vec![id.clone()]);
+        pass(1_420.0, &mut state, &mut notifier);
+        pass(1_480.0, &mut state, &mut notifier);
+        assert_eq!(notifier.sent.len(), 1, "the same jam is reported once");
+        pass(1_540.0, &mut state, &mut notifier);
+        assert!(state.jams_reported.is_empty());
+        pass(1_600.0, &mut state, &mut notifier);
+        assert_eq!(notifier.sent.len(), 2, "a new jam is reported again");
+    }
+
     #[derive(Default)]
     struct RecordingNotifier {
         sent: Vec<(String, String, String)>,
         attempts: Vec<String>,
         fail_attempts: usize,
+        urgent: Vec<String>,
     }
 
     impl Notifier for RecordingNotifier {
+        fn notify_urgent(
+            &mut self,
+            coordinator: &str,
+            text: &str,
+            message_id: &str,
+        ) -> Result<String> {
+            self.urgent.push(message_id.to_owned());
+            self.notify(coordinator, text, message_id)
+        }
+
         fn notify(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
             self.attempts.push(message_id.to_owned());
             if self.fail_attempts > 0 {
