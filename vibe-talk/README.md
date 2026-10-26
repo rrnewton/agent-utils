@@ -6871,7 +6871,7 @@ render_timing -- --ignored --nocapture` prints these):
 |---|---|---|
 | A 200-line Rust block | 0.21 ms | 6.6 ms; the first block after the server starts, 16 ms, which includes reading the grammars |
 | 16 KiB of dense code | — | 17 ms |
-| The worst input found, at the bounds below | — | 50 ms |
+| The worst input found, at the bounds below | — | about 130 ms: the 80 ms budget and one more line |
 | A window of 100 messages, ten with a 20-line block | 2.0 ms | 8.8 ms the first time; 13 µs from the cache after |
 | The binary, stripped | 30.3 MB | 32.0 MB (+1.6 MB: the grammars, the regular-expression engine and syntect) |
 
@@ -6881,9 +6881,12 @@ sixteen thousand backticks on one line held Markdown's grammar for fifty seconds
 A block is drawn plain, as an unknown language is, when it has a line longer than 512 bytes, when
 the sum over the body's highlighted lines of each line's length squared would pass 2,097,152 (16 KiB
 of code in lines of a hundred characters is 1.6 million), or when highlighting the body has taken
-80 ms already. The first two are decided from the text alone, so a body is always drawn the same
-way; the clock is for a grammar slower than any measured. The full-text index renders past the
-cache, so rebuilding it does not push out what the timeline is reading.
+80 ms already, checked between lines. The first two are decided from the text alone, so a body is
+usually drawn the same way. The clock is what holds the worst cases found: a long line of
+backticks that costs Markdown's grammar 50 ms on its own, repeated, and nesting built up over
+thousands of short lines. A body it cuts short, on a busy machine as well, is drawn with its
+remaining blocks plain and cached so. The full-text index renders past the cache, so rebuilding
+it does not push out what the timeline is reading.
 
 The grammars run on Oniguruma rather than the pure-Rust engine syntect also supports: measured
 here, that was 2.5 times as fast and 350 KB smaller. Highlighting makes HTML larger, a span per

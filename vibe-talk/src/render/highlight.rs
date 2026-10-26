@@ -211,21 +211,25 @@ pub fn syntax_for(language: &str) -> Option<&'static SyntaxReference> {
 // A block past any of them is drawn plain, as an unknown language is.
 
 /// The longest line a block may hold and be highlighted, in bytes. At this length the worst
-/// grammar found takes about six milliseconds over a line (release build); a longer line is
-/// minified or generated text rather than code anyone reads.
+/// grammar found takes about fifty milliseconds over one line (Markdown's, on a line of tildes or
+/// backticks, release build); a longer line is minified or generated text rather than code anyone
+/// reads.
 pub const MAX_HIGHLIGHTED_LINE: usize = 512;
 
 /// The most work one body's highlighting may do: the sum over its highlighted lines of each line's
-/// length in bytes, squared. 16 KiB of code in lines of a hundred characters is 1.6 million; the
-/// worst grammar found does this much in about 50 milliseconds (eight lines of 510 backticks for
-/// Markdown's), ordinary code in a few.
+/// length in bytes, squared. 16 KiB of code in lines of a hundred characters is 1.6 million, which
+/// ordinary code highlights in a few milliseconds. It does not by itself hold the worst grammar
+/// found to the [`HIGHLIGHT_BUDGET`] (eight of its worst lines fit, at about fifty milliseconds
+/// each), nor work that builds up across many short lines rather than within one; the deadline
+/// does.
 pub const MAX_HIGHLIGHT_WORK: usize = 1 << 21;
 
 /// The time highlighting may take for one body, counted across its blocks and checked between
-/// lines. Four times what the densest 16 KiB of ordinary code takes in a release build, and five
-/// times the first block after the server starts, which also reads the grammars. A body that runs
-/// out of it is drawn with its remaining blocks plain, and cached so: drawing it again would cost
-/// the same time again.
+/// lines, so a body can cost this and one more line: about 130 ms at worst, as measured in review.
+/// Four times what the densest 16 KiB of ordinary code takes in a release build, and five times
+/// the first block after the server starts, which also reads the grammars. A body that runs out of
+/// it is drawn with its remaining blocks plain, and cached so: drawing it again would cost the
+/// same time again.
 pub const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(80);
 
 /// [`HIGHLIGHT_BUDGET`] as this build can keep it: a debug build runs the grammars an order of
