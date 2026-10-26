@@ -127,6 +127,14 @@ pub struct ClientConfigResponse {
     /// draws both as the owner's own words, because they are: one typed into Discord, one dictated
     /// through this bridge.
     pub owner_author_id: Option<String>,
+    /// Every account the configuration names as the owner's: `[owner] user_ids`, then each
+    /// provider's `owner_user_id`. `#536 mark-own-messages-read`.
+    ///
+    /// The page draws each as his, as it draws `owner_author_id`, so his messages from an account
+    /// only `[owner] user_ids` names are his here as they are to the server — drawn as his, and read
+    /// while "Mark my own messages as read" is on. Sent only when there are some.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_author_ids: Vec<String>,
     /// The accounts the configuration names as the coding agents, `coding_agent_user_ids`.
     /// `#323 slack-system-bots`.
     ///

@@ -4593,6 +4593,8 @@ pub async fn todo(
     let dismissed = state.store.dismissals(&window.channel.id).await?;
     let dismissed: std::collections::HashSet<&str> =
         dismissed.iter().map(MessageId::as_str).collect();
+    // `#536 mark-own-messages-read`: the owner's own words are read, judged as noise is.
+    let own = own_read_ids(state, &window.messages).await;
     let total = window.messages.len();
     let window_from = window
         .messages
@@ -4606,7 +4608,9 @@ pub async fn todo(
     let left = window
         .messages
         .into_iter()
-        .filter(|message| !message.noise && !dismissed.contains(message.id.as_str()))
+        .filter(|message| {
+            !message.noise && !dismissed.contains(message.id.as_str()) && !own.contains(&message.id)
+        })
         .collect();
     Ok(TodoView {
         channel: window.channel,
@@ -4616,6 +4620,36 @@ pub async fn todo(
         window_from,
         noise,
     })
+}
+
+/// Which of `messages` are the owner's own words, read while his "Mark my own messages as read"
+/// is on. `#536 mark-own-messages-read`; see [`crate::own_read`].
+///
+/// Judged on every read and never written, as noise is: turning the setting off brings every one
+/// back, and none of them takes a place under the store's bound on Done marks.
+pub async fn own_read_ids(
+    state: &AppState,
+    messages: &[Message],
+) -> std::collections::HashSet<MessageId> {
+    if messages.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let choice = state.own_read.choice(state.store.as_ref()).await;
+    if !choice.on {
+        return std::collections::HashSet::new();
+    }
+    let selves = state
+        .providers
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.client.self_author_id())
+        .chain(state.chat.self_author_id());
+    let accounts = crate::own_read::Accounts::of(&state.config, selves);
+    messages
+        .iter()
+        .filter(|message| choice.reads(&accounts, message, state.live.is_self_posted(&message.id)))
+        .map(|message| message.id.clone())
+        .collect()
 }
 
 /// Which of `messages` the reader has archived.
@@ -4825,12 +4859,15 @@ pub async fn declare_bankruptcy(
         .ok_or(OpError::UnknownMessage)?;
     let already = state.store.dismissals(&window.channel.id).await?;
     let already: std::collections::HashSet<&str> = already.iter().map(MessageId::as_str).collect();
+    // `#536 mark-own-messages-read`: nor the owner's own words while they count as read. The list
+    // never showed one, and a mark written for it would outlast the setting.
+    let own = own_read_ids(state, &window.messages).await;
     // By POSITION in the window, which is already sorted oldest-first, rather than by comparing
     // snowflakes here: the window is the ordering this server has, and a second ordering rule
     // beside it is a second thing to get wrong.
     let clearing: Vec<MessageId> = window.messages[..=boundary]
         .iter()
-        .filter(|m| !m.noise)
+        .filter(|m| !m.noise && !own.contains(&m.id))
         .map(|m| m.id.clone())
         .filter(|id| !already.contains(id.as_str()))
         .collect();

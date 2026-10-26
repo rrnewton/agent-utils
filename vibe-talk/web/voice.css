@@ -4635,6 +4635,13 @@ a.search-hit-link {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* `#536 mark-own-messages-read`. The reader's own words are read while the setting says so, so their
+   row offers no Done: kept in place, so the other acts do not move, and drawn as nothing. The page
+   also disables it, so it takes no focus and no tap. */
+.done-button[data-read-already] {
+  visibility: hidden;
+}
+
 /* The filter reads as thrown, drawn from the SAME attribute that says so to a screen reader:
    `true` for Hide read and `mixed` for Fold read, the two modes that take read messages out of
    the way. `#221 read-modes`. */

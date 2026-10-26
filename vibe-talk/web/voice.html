@@ -1435,6 +1435,7 @@
                         ON by default, and deliberately: a message this bridge posted is one the owner
                         dictated moments earlier. It is already read by the only definition that matters,
                         and leaving it in the queue means the queue is partly a record of things he said.
+                        `#536 mark-own-messages-read`: the server reads them so too (src/own_read.rs).
                       -->
                       <label class="toggle">
                         <input id="mark-own-read" type="checkbox" checked />
@@ -2767,11 +2768,14 @@
                 waiting for you.
               </p>
               <p class="hint">
-                With this on they are greyed in the channel, collapsed under
-                <strong>Fold read</strong> and left out of the list under
-                <strong>Hide read</strong>. It is not an archive: nothing is recorded on the
-                server, there is nothing to undo, and turning it off brings every one of them
-                straight back. Nothing here changes anything in the source chat service.
+                With this on they are read: greyed in the channel, collapsed under
+                <strong>Fold read</strong>, left out of the list under <strong>Hide read</strong>
+                and out of the to-do list on every device, with no <strong>Done</strong> to press.
+                Your messages are the accounts <em>Who is who</em> calls you, the accounts the
+                server is told are yours, and whatever this app posted for you. It is not an
+                archive: nothing is recorded per message, there is nothing to undo, and turning it
+                off brings every one of them straight back. Nothing here changes anything in the
+                source chat service.
               </p>
             </details>
 

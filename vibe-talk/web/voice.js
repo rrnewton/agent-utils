@@ -11605,6 +11605,12 @@ function doneFromKeyboard(target) {
   const stay = isTextField(target);
   const { pane, row, took } = rowForAct(target, false, stay);
   if (!pane || !row) return took;
+  // `#536 mark-own-messages-read`. The reader's own words are read while the setting says so, and
+  // the row offers no Done to press: the key says why rather than writing a mark that changes nothing.
+  if (ownReadRow(row)) {
+    setStatus(OWN_READ_DONE_NOTE);
+    return true;
+  }
   const ids = idsOf(row);
   if (ids.length === 0) return false;
   const marking = !ids.every((id) => archivedIds.has(id));
@@ -23574,6 +23580,7 @@ function hydrateFromCache() {
   deploymentCodingAgents = codingAgentsFrom(shell);
   if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
   ownerAuthorId = shell.owner_author_id || null;
+  learnOwnerIds(shell.owner_author_ids);
   fillChannelSelect("discord-channel");
   // `#355 provider-grouped-channels`. Settings by service, from the saved shell as from client-config.
   fillServiceSelect();
@@ -31777,7 +31784,23 @@ function isSelfId(id) {
 
 /** Whether `id` is one of the owner's own accounts. */
 function isOwnerId(id) {
-  return Boolean(id) && ((ownerAuthorId && id === ownerAuthorId) || providerOwnerIds.has(id));
+  return Boolean(id) &&
+    ((ownerAuthorId && id === ownerAuthorId) || providerOwnerIds.has(id) || configuredOwnerIds.has(id));
+}
+
+/**
+ * `#536 mark-own-messages-read`. Every account the server's configuration names as the owner's
+ * (`owner_author_ids`: `[owner] user_ids` and each provider's `owner_user_id`). Before it was sent an
+ * account only `[owner] user_ids` named was drawn as a person here while the server took it to be his.
+ *
+ * @type {Set<string>}
+ */
+let configuredOwnerIds = new Set();
+
+/** Take down `owner_author_ids` from a client configuration, or none from an older server's. */
+function learnOwnerIds(list) {
+  configuredOwnerIds = new Set(
+    (Array.isArray(list) ? list : []).filter((id) => typeof id === "string" && id !== "").map(String));
 }
 
 function loadIdentities() {
@@ -32276,6 +32299,9 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   setAttributeIfChanged(row, "data-own-read",
     !isArchived && !isNoiseRow && markOwnRead && who === "me" ? "true" : "false"
   );
+  // `#536 mark-own-messages-read`. Read whatever the archive says, so it offers neither Done nor
+  // Unarchive: the read look over an unread control was the mismatch the owner reported (`#256`).
+  const ownRead = !isNoiseRow && markOwnRead && who === "me";
   const isReading = nowPlaying !== null && nowPlaying.id === id;
   // ASKED FOR, but not yet speaking. Distinct from `data-reading` on purpose: this one the
   // reader can still change their mind about, and it is the only thing on screen during a wait
@@ -32332,6 +32358,11 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   markReadingBlock(row);
   const done = doneButtonOf(row);
   if (done) {
+    // Kept in its place, so the row's acts do not shift, but neither drawn nor pressable: a disabled
+    // button takes no focus and no tap, and web/voice.css draws it invisible (`data-read-already`).
+    if (done.disabled !== ownRead) done.disabled = ownRead;
+    if (ownRead && !done.hasAttribute("data-read-already")) done.setAttribute("data-read-already", "");
+    else if (done.hasAttribute("data-read-already")) done.removeAttribute("data-read-already");
     // Written every time, unlike the rest of this dress (`#532 shift-o-latency`): with this text too left
     // alone where unchanged, a reply's Send moved its row down the list by the box it closed
     // (tests/reply_continuity_browser.py). The place the Done keeps (`markRowDone`) depends on it.
@@ -35053,9 +35084,16 @@ function storedReadSpeed() {
  * makes the queue partly a record of things he said rather than things waiting for him.
  *
  * Held apart from the declared archive, and rendered with its own attribute, because it is not a
- * dismissal: nothing is recorded on the server, there is nothing to undo, and turning the setting
- * off must bring every one of them straight back. Writing a real dismissal per own-message would
- * be chatty, one-way, and wrong the moment the reader changed their mind.
+ * dismissal: nothing is recorded, there is nothing to undo, and turning the setting off brings every
+ * one of them straight back.
+ *
+ * `#536 mark-own-messages-read`. AND READ EVERYWHERE, not only greyed here. The owner, 2026-10-26:
+ * "They are rendering as MY messages... but they are not marked read." The rows were greyed while
+ * their Done button still offered Done — the read look over an unread control, `#256`'s mismatch —
+ * and the server's to-do list still counted them. Now the row offers no Done (`dressChannelRow`), e
+ * says why (`doneFromKeyboard`), every count here asks the same rule (`stillToDo`), the server
+ * applies the same rule to its own to-do list (`src/own_read.rs`), and an account only `[owner]
+ * user_ids` names is his here too (`configuredOwnerIds`), so both judge from the same accounts.
  */
 let markOwnRead = true;
 
@@ -35072,6 +35110,14 @@ function applyMarkOwnRead(on) {
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedMarkOwnRead() {
   return localStorage.getItem(MARK_OWN_KEY) !== "0";
+}
+
+/** What e says on a row of the reader's own words while they count as read. `#536 mark-own-messages-read`. */
+const OWN_READ_DONE_NOTE = "Your own messages count as read.";
+
+/** Whether `row` is the reader's own words, read by the setting (`dressChannelRow` draws it so). */
+function ownReadRow(row) {
+  return markOwnRead && row.getAttribute("data-who") === "me" && row.getAttribute("data-noise") !== "true";
 }
 
 /** Is this row one the reader never has to deal with? Declared archive, or own-and-implicitly-read. */
@@ -54587,6 +54633,7 @@ function applyClientConfig(config) {
   // The reader's own Discord account, if the operator has said what it is. Not derivable; see
   // `ownerAuthorId`.
   ownerAuthorId = (config && config.owner_author_id) || null;
+  learnOwnerIds(config && config.owner_author_ids);
   const describedVoice = config && config.conversational_voice;
   conversationalVoice = {
     name:
@@ -55109,7 +55156,13 @@ function applySyncedSetting(key) {
         setReadMode(localSettingValue(key) || "show");
         break;
       }
-      case MARK_OWN_KEY: applyMarkOwnRead(storedMarkOwnRead()); break;
+      case MARK_OWN_KEY:
+        // As the switch's own change does: the rows re-grey, and the queue is another list.
+        // Another device's change used to land in the flag and wait for the next redraw.
+        applyMarkOwnRead(storedMarkOwnRead());
+        if (threadingSupported) eachColumn(renderCachedTimeline);
+        else renderChannelRows();
+        break;
       case HIDE_EMPTY_KEY: applyHideEmptyMessages(storedHideEmptyMessages()); break;
       case COMBINE_KEY: applyCombineMessages(storedCombineMessages()); break;
       case RICH_HEADERS_KEY: applyRichHeaders(storedRichHeaders()); break;

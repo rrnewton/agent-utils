@@ -287,6 +287,7 @@ fn state_pieces_with(
         conversation,
         speech,
         store: Arc::clone(&store),
+        own_read: Arc::new(crate::own_read::OwnRead::default()),
         // A real hub, never a stub: a test drives `live::poll_once` or `AppState::live.publish`
         // directly and then reads the SSE route, which is the whole ingestion path minus the
         // timer. Sleeping for a poll interval would make the suite slow and flaky for no extra

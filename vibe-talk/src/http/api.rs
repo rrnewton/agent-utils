@@ -1003,6 +1003,7 @@ pub async fn client_config(
         transcript_records_supported: true,
         self_author_id: state.chat.self_author_id(),
         owner_author_id: state.chat.owner_author_id(),
+        owner_author_ids: crate::own_read::owner_ids(&state.config),
         coding_agent_ids: default_provider
             .map(|provider| provider.coding_agent_user_ids.clone())
             .unwrap_or_default(),
@@ -1245,6 +1246,8 @@ pub async fn set_client_settings(
     let (settings, changed) = state.store.apply_client_settings(&set, &seed).await?;
     // `#522 thread-card-max-lines`: the one synced setting the server itself acts on.
     state.thread_names.note_settings(&changed);
+    // `#536 mark-own-messages-read`: whether, and whose, own messages are read is read afresh.
+    state.own_read.forget();
     state.live.publish_settings(changed);
     Ok(no_store(Json(crate::contract::ClientSettings { settings })))
 }
@@ -4031,6 +4034,8 @@ pub async fn purge_storage(
     state.send_intent.forget();
     // `#512 voice-recap-private-stack`. So is a recap waiting for the bridge's fetch.
     state.voice_recap.forget();
+    // `#536 mark-own-messages-read`: the synced settings went with the purge.
+    state.own_read.forget();
     if forgotten > 0 {
         tracing::info!(
             channels = forgotten,

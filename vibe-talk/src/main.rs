@@ -734,6 +734,7 @@ async fn main() -> anyhow::Result<()> {
         conversation,
         speech,
         store,
+        own_read: Arc::new(vibe_talk::own_read::OwnRead::default()),
         spoken_names: Arc::new(vibe_talk::speakable::SharedNames::new()),
         added_channels: Arc::new(std::sync::RwLock::new(Vec::new())),
         hidden_channels: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),

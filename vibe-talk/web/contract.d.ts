@@ -285,6 +285,15 @@ declare namespace VibeTalk {
      */
     owner_author_id: string | null;
     /**
+     * Every account the configuration names as the owner's: `[owner] user_ids`, then each
+     * provider's `owner_user_id`. `#536 mark-own-messages-read`.
+     *
+     * The page draws each as his, as it draws `owner_author_id`, so his messages from an account
+     * only `[owner] user_ids` names are his here as they are to the server — drawn as his, and read
+     * while "Mark my own messages as read" is on. Sent only when there are some.
+     */
+    owner_author_ids?: string[];
+    /**
      * Each configured chat provider and what it can do, in configuration order.
      *
      * Every channel names its provider by key ([`ChannelInfo::provider`]). The deployment-wide

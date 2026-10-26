@@ -1935,6 +1935,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         speech_prep_enabled: page.speechPrepEnabled,
         self_author_id: page.selfAuthorId,
         owner_author_id: page.ownerAuthorId,
+        // `#536 mark-own-messages-read`. Absent unless a test names them, as an older server sends none.
+        owner_author_ids: page.ownerAuthorIds,
         // `#323 slack-system-bots`. Absent unless a test names coding agents or says only named
         // accounts may be one, as the server omits both otherwise.
         coding_agent_ids: page.codingAgentIds,
@@ -12977,6 +12979,90 @@ test("...and they are kept out of the queue, and come straight back when it is t
     2,
     "turning the setting off did not bring the reader's own messages back"
   );
+});
+
+test("`#536 mark-own-messages-read`: another device turning own messages read off or on redraws the rows here", async () => {
+  // The switch's own change re-greyed the rows; the same change synced from another device only set
+  // the flag, so the rows on screen said the old setting until something else redrew them.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", ...OWN }),
+    message({ id: "1000000000000000002", ...CODER }),
+  ]);
+  assert.equal(rowState(page, 0).ownRead, "true", "the premise: the owner's message is read");
+  page.pure("keepLocalSetting")("vibe-talk.voice.mark-own-read", "0");
+  page.pure("applySyncedSetting")("vibe-talk.voice.mark-own-read");
+  await page.settle();
+  assert.equal(page.el("mark-own-read").checked, false, "the switch does not say the synced choice");
+  assert.equal(rowState(page, 0).ownRead, "false", "another device's off did not redraw the row");
+  page.pure("keepLocalSetting")("vibe-talk.voice.mark-own-read", "1");
+  page.pure("applySyncedSetting")("vibe-talk.voice.mark-own-read");
+  await page.settle();
+  assert.equal(rowState(page, 0).ownRead, "true", "another device's on did not redraw the row");
+  assert.equal(rowState(page, 1).ownRead, "false", "the agent's message was drawn read");
+});
+
+test("`#536 mark-own-messages-read`: a row of the reader's own words offers no Done, and e says why", async () => {
+  // The owner, 2026-10-26: "They are rendering as MY messages... but they are not marked read." The
+  // rows were greyed while their Done button still offered Done, the read look over an unread control.
+  const page = await keyboardPageAtTop([
+    message({ id: "1", ...OWN }),
+    message({ id: "2", ...CODER }),
+    message({ id: "3", ...CODER }),
+  ]);
+  const offered = (id) => !doneButton(channelRow(page, id)).disabled &&
+    !doneButton(channelRow(page, id)).hasAttribute("data-read-already");
+  assert.equal(offered("1"), false, "the owner's own row still offers Done");
+  assert.equal(offered("2"), true, "the agent's row lost its Done");
+  assert.match(cssBlock(".done-button[data-read-already]"), /visibility:\s*hidden/, "the withheld Done is still drawn");
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.equal(selectedId(page), "1");
+  await pressHere(page, "e");
+  assert.deepStrictEqual(page.dismissCalls, [], "e wrote a mark for a message already read");
+  assert.match(statusText(page), /Your own messages count as read/);
+  // Turned off, the row is the reader's to mark like any other.
+  await page.el("mark-own-read").setChecked(false);
+  await page.settle();
+  assert.equal(offered("1"), true, "with the setting off the row still withholds Done");
+});
+
+test("`#536 mark-own-messages-read`: an account only the server's configuration names is drawn as the reader's, and read", async () => {
+  // `[owner] user_ids` reached the server's own rules but not the page: such an account was a person here.
+  const page = newPage();
+  page.ownerAuthorIds = ["U0OLDACCOUNT"];
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", author: "Ada", author_id: "U0OLDACCOUNT", author_is_bot: false }),
+    message({ id: "1000000000000000002", ...CODER }),
+  ]);
+  assert.equal(whoOf(page, 0), "me", "the configured account is not drawn as the reader's");
+  assert.equal(rowState(page, 0).ownRead, "true", "the configured account's message is not read");
+  assert.equal(rowState(page, 1).ownRead, "false");
+});
+
+test("`#536 mark-own-messages-read`: in a thread mixing the reader's messages and the agent's, Main's unread count is exactly the rows still offering Done", async () => {
+  // The owner, 2026-10-26: "lots of my messages would seem to be unread based on the status of their
+  // icon in the upper-right corner, but the thread card doesn't list any unread." One rule for both.
+  const page = newPage();
+  const messages = runThread(page, { read: 4, tail: [["own", false], ["agent", false], ["own", false]] });
+  await signIn(page);
+  await showDiscord(page, messages);
+  await pickThread(page, "flat");
+  await pickThread(page, "main");
+  await page.settle();
+  const chip = unreadChip(page, runId(0));
+  await pickThread(page, `thread:${RUN_THREAD}`);
+  await page.settle();
+  const offering = page.el("discord-log").children.filter((li) => {
+    const done = doneButton(li);
+    return li.getAttribute("data-id") !== runId(0) && li.getAttribute("data-archived") !== "true" &&
+      done && !done.disabled;
+  }).map((li) => li.getAttribute("data-id"));
+  // The agent's answer and the agent's message after it; none of the reader's own.
+  assert.deepStrictEqual(offering, [runId(500), runId(502)], "a row of the reader's own still offers Done");
+  assert.equal(chip && chip.textContent, `${offering.length} unread`,
+    "Main's count of the thread's unread replies disagrees with the rows that offer Done");
 });
 
 test("ONE VOICE AT A TIME: tapping twice never leaves two readings talking over each other", async () => {

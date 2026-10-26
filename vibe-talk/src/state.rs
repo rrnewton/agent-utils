@@ -65,6 +65,9 @@ pub struct AppState {
     /// [`crate::store::disabled::DisabledStore`], which refuses every call and names the setting
     /// to add — it is deliberately not a silent in-memory substitute. See [`crate::store`].
     pub store: Arc<dyn StateStore>,
+    /// Whether, and whose, own messages the owner has said are read, as last read from his synced
+    /// settings. `#536 mark-own-messages-read`; see [`crate::own_read`].
+    pub own_read: Arc<crate::own_read::OwnRead>,
     /// The live fan-out: where inbound Discord messages are published, and where the SSE route
     /// subscribes.
     ///

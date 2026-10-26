@@ -10472,6 +10472,19 @@ You can also set it without a restart: **Settings lists every account it has see
 say which is which. That is the faster fix, and it is per-browser; the configuration setting is for
 a deployment that would rather state it once.
 
+### Your own messages are read
+
+`#536 mark-own-messages-read`. With **Settings → Messages → Mark my own messages as read** on (the
+default), your messages are read everywhere, not only greyed on the page in front of you: they count
+as read in every tally on every device, no row of yours offers **Done**, and the server's to-do list
+leaves them out. Yours are, in this order:
+the accounts **Who is who** calls you (and not the ones it calls anything else), `[owner] user_ids`
+and every provider's `owner_user_id` (the page is told these as `owner_author_ids`, and draws them
+as yours), and the account this server posts as or any message it posted, unless
+`coding_agent_user_ids` names that account. Like a placeholder the noise rules catch, this is judged
+on every read and never written down: turning the setting off brings every one of them back, and
+none of them takes a place among your Done marks.
+
 ### Your own messages, to the voice agent
 
 `#438 voice-owner-identity`. The voice agent is told which messages are yours, so it does not read

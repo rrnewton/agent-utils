@@ -137,6 +137,10 @@
         ]
       },
       "owner_author_id": "7",
+      "owner_author_ids": [
+        "7",
+        "U0OLD"
+      ],
       "providers": [
         {
           "channel_discovery_supported": false,

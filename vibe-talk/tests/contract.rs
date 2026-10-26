@@ -228,6 +228,12 @@ fn client_config(
         transcript_records_supported: full,
         self_author_id: full.then(|| "9".into()),
         owner_author_id: full.then(|| "7".into()),
+        // `#536 mark-own-messages-read`. Present in the full sample, absent in the other.
+        owner_author_ids: if full {
+            vec!["7".into(), "U0OLD".into()]
+        } else {
+            Vec::new()
+        },
         // `#323 slack-system-bots`: both present in the full sample, both absent in the other.
         coding_agent_ids: if full {
             vec!["1000000000000000001".into()]
