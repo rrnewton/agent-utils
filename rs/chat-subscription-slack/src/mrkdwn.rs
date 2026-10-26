@@ -69,7 +69,7 @@ pub fn convert_markdown(markdown: &str) -> String {
 /// [`crate::outbound::split_body`]).
 #[must_use]
 pub fn convert_and_split(markdown: &str, limit: usize) -> Vec<String> {
-    let limit = limit.min(MAX_MRKDWN_BYTES).max(1);
+    let limit = limit.clamp(1, MAX_MRKDWN_BYTES);
     let converted = convert_markdown(markdown);
     if converted.is_empty() {
         return vec![String::new()];
@@ -358,9 +358,8 @@ fn render_table<'a>(node: &'a AstNode<'a>, alignments: &[TableAlignment]) -> Str
     }
     let render_row = |row: &Vec<String>| -> String {
         let mut line = String::new();
-        for index in 0..columns {
+        for (index, &width) in widths.iter().enumerate() {
             let cell = row.get(index).map_or("", String::as_str);
-            let width = widths[index];
             let padded = match alignments
                 .get(index)
                 .copied()
