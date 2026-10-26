@@ -7808,7 +7808,7 @@ filter, open the reply's box in that list, in one column or two, on a phone as o
   already, so its box goes at the thread's end. The box goes under the last of them, or under the
   message where it has none, with the later messages below it.
 - **The same box as the one at the foot of the list**, with its **Grow** (one choice for every box),
-  its **Send**, Enter and Ctrl+Enter as Settings has them, Ctrl+S and `c` to go back to it, and Esc and
+  its **Send**, Enter and Ctrl+Enter as Settings has them, Ctrl+S and `m` to go back to it, and Esc and
   **Cancel** to put it down. Who it answers and the id the answer goes to are on the line above it, and
   the line under it says where it posts, a new thread or a thread not known yet included.
 - **One box at a time.** While the reply is open, the list's own box ("Message the main channel…" or
@@ -8005,15 +8005,15 @@ from, so it cannot name a key the page does not answer.
 | `z`, or Ctrl+Z (Cmd+Z) | Undo the newest thing that can still be taken back — a Done, a send dismissed from the outbox, or a bookmark taken away — whichever was done last, as its Undo chip does; pressed again, the next one, while its chip is still up. In a message box or the search, Ctrl+Z stays the browser's undo of what was typed |
 | Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
-| Ctrl+C (Cmd+C) or `y` | Copy the highlighted message, all of its text as written; on a thread card, its first message. With text selected, or in a text box, Ctrl+C is the browser's copy as ever (see below) |
+| Ctrl+C (Cmd+C), `c` or `y` | Copy the highlighted message, all of its text as written; on a thread card, its first message. With text selected, the text (`c`, `y` and Ctrl+C alike); in a text box, Ctrl+C is the box's copy as ever (see below) |
 | Ctrl+0 (Cmd+0 on a Mac) | The voice (call) view, as the view switch goes there — from anywhere, a message box or the search included |
 | Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4 (Cmd on a Mac) | Main, All, the thread list, two columns — from anywhere, a message box or the search included. The bare `1`, `2`, `3` are retired |
 | `u`, `^` | In the Thread list, Unpack in turn (Pack all, Unpack unread, Unpack all); `^` packs the thread of the selected card or message into its card (`#440 thread-card-pack-toggle`) |
 | `h` | Show read, Fold read, Hide read, in turn, as the button in the bar does, in every view, the Threads view's cards included; the status line says which (`#432 read-mode-unify`) |
 | Shift+P, Shift+L | The Pinned and Links filters |
 | `;`, `:`; Ctrl+;, Ctrl+: (Cmd on a Mac) | The long messages, a step a press: expand all, then the unread open and the read folded, then collapse all, and round again; `:` goes the other way. The chords do the same from anywhere, a message box or the search included. See below |
-| `b` or `m` | Back to the bookmark, with the message under it selected |
-| `c` | Write to the channel (or the thread you are in); on Reply, the reply; in the call view, to the agent |
+| `b` | Back to the bookmark, with the message under it selected |
+| `m` | Write to the channel (or the thread you are in); on Reply, the reply; in the call view, to the agent |
 | Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on a button, a thread card, Settings, Help or the thread list too. In two columns, the box of the column you are in, or of the one with the selected message; Main's from the thread cards. It never changes the view when the view has a box: in the thread list with **Main channel** on, the box at the foot of the cards. The browser's "Save page" never opens |
 | Ctrl+Enter (Cmd+Enter) | In a message box, send; anywhere else, the message box, as Ctrl+S |
 | ↑ in the empty message box | Select the newest message |
@@ -8099,7 +8099,7 @@ from anywhere on a Mac too.
 
 `#248 composer-key`. Ctrl+S (Cmd+S) opened the search from `#224 keyboard-shortcuts` until the owner
 asked for it to do what it does in other chat clients: "When I'm using keyboard, I want to jump to text
-entry and start typing." It now goes to the box `c` goes to (the channel's, the thread's you are in,
+entry and start typing." It now goes to the box `m` goes to (the channel's, the thread's you are in,
 the reply's while one is open in the list, or on the call's view the agent's box under the transcript), from
 anywhere, including while you are typing in the search, and leaves Settings or Help first. Going to
 the agent's box starts nothing: a conversation starts only when you send. Ctrl+Enter (Cmd+Enter) does the same when the focus is not in a text box;
@@ -8158,8 +8158,11 @@ pack-keeps-card-still`, `#460 pack-gap-slide`) frame by frame in a real Chromium
 `#296 copy-highlighted-message`. The owner asked for a keystroke that copies the highlighted message
 without first selecting its text. **Ctrl+C (Cmd+C on a Mac) with nothing selected copies the message
 highlighted in the list**: the selection the keys or the mouse made in Main, All, a thread, the right
-column or the thread list. A thread card copies its thread's first message. A bare **`y`** does the same
-outside the text boxes, and is turned off with the other single-key shortcuts.
+column or the thread list. A thread card copies its thread's first message. A bare **`c`** or **`y`**
+does the same outside the text boxes, and is turned off with the other single-key shortcuts
+(`#538 c-key-copy`, the owner: "if the text entry box is not highlighted and I press the C key, I would
+like that to just copy, to be even lazier than pressing Command-C"; `c` went to the message box before,
+which is `m` now).
 
 - **What is copied** is the message as written: its raw text, every message of a combined row in order,
   the same as the ⋯ menu's Copy text. A summarised row copies the message, not its summary, and a folded
@@ -8168,10 +8171,10 @@ outside the text boxes, and is turned off with the other single-key shortcuts.
   in its text, so its addresses are copied with it. Beside the plain text goes a rich flavour, the
   body as the page renders it, for editors that paste formatting.
 - **Where the browser keeps its copy**: with any text selected on the page, Ctrl+C copies that text, as
-  it always has, and `y` does nothing, so it never copies the message in place of a selection you made;
-  with the focus in a text box (the message boxes, the search) it is the box's copy. With
-  no message highlighted, including after a tap on a touch screen, which selects without lighting
-  anything, both keys do nothing and Ctrl+C is the browser's.
+  it always has, and so do `c` and `y`, so neither copies the message in place of a selection you made;
+  with the focus in a text box (the message boxes, the search) it is the box's copy, and `c` and `y` are
+  typed. With no message highlighted, including after a tap on a touch screen, which selects without
+  lighting anything, Ctrl+C is the browser's, and `c` and `y` copy nothing and say so in the status line.
 - **How it is said**: the status pill says "Copied message.", read out politely to a screen reader. It
   floats over the list, so nothing moves under the reader.
 
@@ -8290,7 +8293,8 @@ with the word *Bookmark* in it, drawn just above one message.
 - **Shift+B** puts it above the selected message, moving it from wherever it was. Pressed on the
   message right under the line, it takes the bookmark away. The row's ⋯ menu and its press-and-hold
   details offer the same, as *Bookmark above* or *Remove bookmark*. Setting it marks nothing Done.
-- **`b`** (or `m`, the key of the place marker it replaced) goes back to it: the line at the top of
+- **`b`** goes back to it (`m`, the key of the place marker it replaced, went to it too until it became
+  the message box's key, `#538 c-key-copy`): the line at the top of
   the list and the message under it selected. The **Bookmark** chip, directly right of *Newest*,
   does the same, and is shown only while the line is off the screen, its arrow pointing toward it.
   A bookmark older than what is loaded is reached by reading older pages, as a reply's arrow is.

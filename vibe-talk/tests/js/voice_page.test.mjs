@@ -25085,9 +25085,10 @@ test("a HELD Ctrl+Enter outside a box goes to the box and sends NOTHING: its rep
   }
 });
 
-test("c and Ctrl+Enter on the call's view go to the agent's box, as Ctrl+S does, and start nothing", async () => {
-  // `#248 composer-key` with `#241 voice-composer`: the box c goes to on the call's view is the agent's.
-  for (const [key, fields] of [["c", {}], ["Enter", { ctrlKey: true }], ["Enter", { metaKey: true }]]) {
+test("m and Ctrl+Enter on the call's view go to the agent's box, as Ctrl+S does, and start nothing", async () => {
+  // `#248 composer-key` with `#241 voice-composer`: the box m goes to on the call's view is the agent's
+  // (`#538 c-key-copy`: c before).
+  for (const [key, fields] of [["m", {}], ["Enter", { ctrlKey: true }], ["Enter", { metaKey: true }]]) {
     const page = newPage();
     await signIn(page);
     assert.equal(page.tab(), "voice", "a fresh page did not open on the call's view");
@@ -26659,9 +26660,13 @@ test("`#296 copy-highlighted-message`: NEGATIVE CONTROLS: text selected, a text 
   let event = await pressCopy(page, row);
   browserKeptCopy(page, event, "with text selected");
   assert.equal(page.clipboard, "a sentence about", "with text selected, the copy is not the selection");
-  event = await press(page, row, "y");
-  assert.equal(event.defaulted, true, "y with text selected was taken");
-  assert.equal(page.clipboard, "a sentence about", "y with text selected copied the message");
+  // `#538 c-key-copy`: c and y with text selected copy the text, as the chord does, never the message.
+  for (const key of ["c", "y"]) {
+    page.clipboard = CLIPBOARD_BEFORE;
+    event = await press(page, row, key);
+    assert.equal(event.defaulted, false, `${key} with text selected was left to the browser`);
+    assert.equal(page.clipboard, "a sentence about", `${key} with text selected did not copy the selection`);
+  }
   // ...and let go of, the same key copies the message: it was the selection that held it back.
   await page.clearSelection();
   await pressCopy(page, row);
@@ -26709,9 +26714,15 @@ test("`#296 copy-highlighted-message`: NEGATIVE CONTROLS: text selected, a text 
   event = await pressCopy(fresh, fresh.el("scroll-area"));
   browserKeptCopy(fresh, event, "with nothing highlighted");
   assert.equal(fresh.clipboard, CLIPBOARD_BEFORE, "Ctrl+C with nothing highlighted copied something");
-  event = await press(fresh, fresh.el("scroll-area"), "y");
-  assert.equal(event.defaulted, true, "y with nothing highlighted was taken");
-  assert.equal(fresh.execCopies, 0, "y with nothing highlighted ran a copy");
+  // `#538 c-key-copy`: c and y with nothing to copy say so, and copy nothing.
+  for (const key of ["c", "y"]) {
+    fresh.el("status").textContent = "";
+    event = await press(fresh, fresh.el("scroll-area"), key);
+    assert.equal(fresh.execCopies, 0, `${key} with nothing highlighted ran a copy`);
+    assert.equal(fresh.clipboard, CLIPBOARD_BEFORE, `${key} with nothing highlighted copied something`);
+    assert.equal(fresh.el("status").textContent, "Nothing to copy: select a message, or some text, first.",
+      `${key} with nothing highlighted said nothing`);
+  }
   fresh.el("scroll-area").scrollTop = 0;
   await pressOn(fresh, channelRow(fresh, "3"), "touch");
   assert.deepStrictEqual(litIds(fresh), [], "a tap lit the message it selected");
@@ -26763,6 +26774,15 @@ test("`#296 copy-highlighted-message`: y copies the highlighted message, is turn
   assert.equal(page.clipboard, longMessage("message 2"), "y did not copy the highlighted message");
   assert.equal(page.clipboardHtml, `<div><p>${longMessage("message 2")}</p></div>`);
   assert.equal(page.el("status").textContent, "Copied message.");
+  // `#538 c-key-copy`: c the same, the owner's lazier Cmd+C; it no longer goes to the message box.
+  page.clipboard = CLIPBOARD_BEFORE;
+  page.el("status").textContent = "";
+  event = await press(page, row, "c");
+  assert.equal(event.defaulted, false, "c on a highlighted message was left to the browser");
+  assert.equal(page.clipboard, longMessage("message 2"), "c did not copy the highlighted message");
+  assert.equal(page.clipboardHtml, `<div><p>${longMessage("message 2")}</p></div>`);
+  assert.equal(page.el("status").textContent, "Copied message.");
+  assert.notEqual(focused(page), page.el("channel-compose-text"), "c went to the message box");
   // Y with Shift held is another key, and nothing.
   page.clipboard = CLIPBOARD_BEFORE;
   event = await press(page, row, "Y", { shiftKey: true });
@@ -26770,14 +26790,14 @@ test("`#296 copy-highlighted-message`: y copies the highlighted message, is turn
   assert.equal(page.clipboard, CLIPBOARD_BEFORE);
   // The list of keys, in the words of each keyboard, and what a screen reader hears on the row's Copy text.
   const listed = (one) => one.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd").map((node) => node.textContent);
-  assert.ok(listed(page).includes("Ctrl+C or y"), `the list of keys does not name Ctrl+C or y: ${listed(page).join(" | ")}`);
-  const entry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "Ctrl+C or y");
+  assert.ok(listed(page).includes("Ctrl+C, c, y"), `the list of keys does not name Ctrl+C, c and y: ${listed(page).join(" | ")}`);
+  const entry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "Ctrl+C, c, y");
   assert.match(entry.parentNode.text(), /highlighted message/);
   assert.match(entry.parentNode.text(), /first message/, "the list does not say what a card copies");
   const copyButton = row.descendants().find((node) => node.className === "row-copy-button");
-  assert.equal(copyButton.getAttribute("aria-keyshortcuts"), "Control+C Meta+C Y");
+  assert.equal(copyButton.getAttribute("aria-keyshortcuts"), "Control+C Meta+C C Y");
   const mac = await copyPage({ platform: "MacIntel" });
-  assert.ok(listed(mac).includes("Cmd+C or y"), `on a Mac the list does not say Cmd+C: ${listed(mac).join(" | ")}`);
+  assert.ok(listed(mac).includes("Cmd+C, c, y"), `on a Mac the list does not say Cmd+C: ${listed(mac).join(" | ")}`);
   // Single keys off: y is nothing, and Ctrl+C still copies.
   await page.el("single-keys").setChecked(false);
   await page.settle();
@@ -26874,11 +26894,12 @@ test("`#296 copy-highlighted-message`: NEGATIVE CONTROLS on the page itself: a p
     [longMessage("message 2"), longMessage("message 2")], "a page that copies the message over a selection passed");
 });
 
-test("c FOCUSES THE CHANNEL'S BOX; ↑ in it while empty selects the newest message, and with text is the caret's", async () => {
+test("m FOCUSES THE CHANNEL'S BOX; ↑ in it while empty selects the newest message, and with text is the caret's", async () => {
+  // `#538 c-key-copy`: m, c being the copy now.
   const page = await keyboardPage();
-  let event = await press(page, page.el("scroll-area"), "c");
+  let event = await press(page, page.el("scroll-area"), "m");
   assert.equal(event.defaulted, false);
-  assert.equal(focused(page), page.el("channel-compose-text"), `c left the focus on ${focusName(page)}`);
+  assert.equal(focused(page), page.el("channel-compose-text"), `m left the focus on ${focusName(page)}`);
   event = await pressHere(page, "ArrowUp");
   assert.equal(event.defaulted, false, "↑ in the empty box was left to it");
   assert.equal(selectedId(page), "30", `↑ in the empty box selected ${selectedId(page)}, not the newest message`);
@@ -28333,9 +28354,10 @@ test("Shift+P AND Shift+L turn the Pinned and Links filters on and off, with the
   assert.equal(page.el("links-filter").getAttribute("aria-pressed"), "false");
 });
 
-test("b GOES BACK TO THE BOOKMARK, the line at the top and the message under it selected; m too; Shift+B sets and removes it", async () => {
+test("b GOES BACK TO THE BOOKMARK, the line at the top and the message under it selected; Shift+B sets and removes it", async () => {
   // `#240 reading-bookmark`. "One to set and one to jump": Shift+B puts the line above the selected
-  // message, b goes back to it. m, the old place marker's key, goes there too.
+  // message, b goes back to it. m, the old place marker's key, went there too until `#538 c-key-copy`
+  // made it the message box's.
   const page = await keyboardPageAtTop();
   await press(page, page.el("scroll-area"), "ArrowDown");
   for (let i = 0; i < 2; i += 1) await pressHere(page, "j");
@@ -28345,7 +28367,7 @@ test("b GOES BACK TO THE BOOKMARK, the line at the top and the message under it 
   assert.deepStrictEqual(bookmarkAt(page), { id: "3", place: "above" }, "Shift+B did not draw the line above the selected message");
   assert.equal(statusText(page), "Bookmarked. b comes back here.");
   const area = page.el("scroll-area");
-  for (const key of ["b", "m"]) {
+  for (const key of ["b"]) {
     area.scrollTop = area.scrollHeight;
     await area.dispatch("scroll");
     area.focus();
@@ -28847,9 +28869,9 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
   const expected = new Map([
     [page.el("search-toggle"), "/ Control+/ Meta+/"],
     [page.el("help-link-keyboard"), "? Control+? Meta+?"],
-    [page.el("channel-compose-text"), "C Control+S Meta+S"],
-    [page.el("reply-text"), "C Control+S Meta+S"],
-    [page.el("compose-text"), "C Control+S Meta+S"],
+    [page.el("channel-compose-text"), "M Control+S Meta+S"],
+    [page.el("reply-text"), "M Control+S Meta+S"],
+    [page.el("compose-text"), "M Control+S Meta+S"],
     [page.el("open-settings"), ", Control+, Meta+,"],
     [page.el("close-settings"), "Escape"],
     [page.el("thread-back"), "Escape ArrowLeft"],
@@ -57275,12 +57297,13 @@ const bid = (n) => `800000000000000000${n}`;
 
 test("`#240 reading-bookmark`: b and Shift+B are in the table of keys, so Help, aria-keyshortcuts and the tooltips say them", async () => {
   const page = await keyboardPage();
-  assert.equal(page.el("jump-bookmark").getAttribute("aria-keyshortcuts"), "B M",
+  assert.equal(page.el("jump-bookmark").getAttribute("aria-keyshortcuts"), "B",
     "the chip does not say its keys to a screen reader");
   const item = rowMoreMenu(row(page, 0)).children.find((node) => node.className === "row-bookmark-button");
   assert.equal(item.getAttribute("aria-keyshortcuts"), "Shift+B", "the ⋯ item does not say its key");
   const keys = page.el("keyboard-keys").text();
-  assert.match(keys, /b or m/, "the list of keys does not name b");
+  assert.match(keys, /bBack to your bookmark/, "the list of keys does not name b");
+  assert.doesNotMatch(keys, /b or m/, "the list of keys still gives the bookmark m (`#538 c-key-copy`: the message box's)");
   assert.match(keys, /Shift\+B/, "the list of keys does not name Shift+B");
   assert.match(keys, /Marks nothing Done/, "the list does not say setting the bookmark marks nothing Done");
   // Single keys: never while typing in a box, and off with the switch.
@@ -60747,7 +60770,7 @@ test("`#251 author-filter`: Shift+M goes round the states with the bar that hold
   assert.deepStrictEqual(authorState(page), ["theirs", "true"]);
   await press(page, page.el("scroll-area"), "M", { shiftKey: true });
   assert.deepStrictEqual(authorState(page), ["everyone", "false"]);
-  // m alone is still the bookmark's.
+  // m alone is the message box's (`#538 c-key-copy`), never the author filter.
   await press(page, page.el("scroll-area"), "m");
   assert.deepStrictEqual(authorState(page), ["everyone", "false"], "a plain m changed the author filter");
   assert.ok(KEYMAP_SOURCE_HAS("author-filter"), "the list of keys does not name the author filter's key");
@@ -67155,7 +67178,7 @@ test("`#277 reply-in-column`: Quote reply in either column quotes the words sele
     { text: "> first thread answer\n\nyes, this", reply_to: "202", thread_id: "spaces/A/threads/one & two", keyed: true });
 });
 
-test("`#277 reply-in-column`: Escape closes an empty box at once; with words, the first goes to the column's list and keeps the draft, and the next puts the reply down; c goes back to the box", async () => {
+test("`#277 reply-in-column`: Escape closes an empty box at once; with words, the first goes to the column's list and keeps the draft, and the next puts the reply down; m goes back to the box", async () => {
   const { page } = await replyColumnsPage();
   const left = page.el("scroll-area");
   await replyButton(rowWithId(page, "200")).click();
@@ -67168,8 +67191,8 @@ test("`#277 reply-in-column`: Escape closes an empty box at once; with words, th
   await press(page, page.el("reply-text"), "Escape");
   assert.equal(replyBoxAt(page), "left", "Escape in a box with words in it put the reply down");
   assert.ok(nodeWithinFixture(left, focused(page)), `Escape out of the box left the keys on ${focusName(page)}, not its column's list`);
-  await press(page, focused(page), "c");
-  assert.equal(focused(page), page.el("reply-text"), `c went to ${focusName(page)}, not the reply open in the column`);
+  await press(page, focused(page), "m");
+  assert.equal(focused(page), page.el("reply-text"), `m went to ${focusName(page)}, not the reply open in the column`);
   await press(page, page.el("reply-text"), "Escape");
   await press(page, focused(page), "Escape");
   assert.equal(replyBoxAt(page), "closed", "the second Escape did not put the reply down");
@@ -67622,7 +67645,7 @@ test("`#410 inline-reply-editor`: one box — in two columns Reply in the thread
   assert.equal(focused(page), page.el("reply-text"), `Ctrl+S from the left column went to ${focusName(page)}, not the reply open on the right`);
 });
 
-test("`#410 inline-reply-editor`: the reply's box is a composer — Grow is the one choice, and Ctrl+S and c go to the box open in the list", async () => {
+test("`#410 inline-reply-editor`: the reply's box is a composer — Grow is the one choice, and Ctrl+S and m go to the box open in the list", async () => {
   assert.match(cssBlockIn(DESKTOP_QUERY, "#screen-main[data-composer-grow] #reply-text"), /field-sizing:\s*content/,
     "the reply's box does not grow with Grow ticked");
   assertMarkupContains("reply-compose", "reply-grow");
@@ -67634,8 +67657,8 @@ test("`#410 inline-reply-editor`: the reply's box is a composer — Grow is the 
   await press(page, page.el("scroll-area"), "s", { ctrlKey: true });
   assert.equal(focused(page), page.el("reply-text"), `Ctrl+S went to ${focusName(page)}, not the reply open in the list`);
   await press(page, page.el("reply-text"), "Escape");
-  await press(page, page.el("scroll-area"), "c");
-  assert.equal(focused(page), page.el("channel-compose-text"), `with the reply put down, c went to ${focusName(page)}`);
+  await press(page, page.el("scroll-area"), "m");
+  assert.equal(focused(page), page.el("channel-compose-text"), `with the reply put down, m went to ${focusName(page)}`);
 });
 
 test("`#410 inline-reply-editor`: a reply open under a row unpacked among the cards goes, as a draft, when a card opens its thread", async () => {

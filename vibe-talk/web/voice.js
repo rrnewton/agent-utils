@@ -12134,12 +12134,49 @@ function copyChordFromKeyboard() {
   return false;
 }
 
-/** y: the highlighted message copied, as Ctrl+C (Cmd+C) copies it with nothing selected. */
+/** What the status pill says for c or y with nothing to copy (`#538 c-key-copy`). */
+const NOTHING_TO_COPY = "Nothing to copy: select a message, or some text, first.";
+
+/** What it says once text the reader selected is on the clipboard by c or y. */
+const COPIED_SELECTION = "Copied the selected text.";
+
+/**
+ * c and y: the highlighted message copied, as Ctrl+C (Cmd+C) copies it with nothing selected; with text
+ * selected on the page, that text, as the chord would copy it (`#538 c-key-copy`); with neither, the
+ * status pill says so and nothing is copied. Never in a text field, where both are typed.
+ */
 function copyFromKeyboard() {
+  const selection = selectedText();
+  if (selection !== "") {
+    guardQuietly(() => copySelectionNow(selection))();
+    return true;
+  }
   const copy = messageCopy();
-  if (!copy) return false;
+  if (!copy) {
+    setStatus(NOTHING_TO_COPY);
+    return true;
+  }
   guardQuietly(() => copyNow(copy))();
   return true;
+}
+
+/**
+ * The text selected on the page, `selection`, on the clipboard from a key the browser does not copy with:
+ * by `execCommand("copy")`, the browser's own copy of the selection (no `copy` handler of the page takes
+ * it, the selection being the browser's), else as plain text by `writeClipboardText`.
+ *
+ * @param {string} selection
+ */
+async function copySelectionNow(selection) {
+  let copied = false;
+  try {
+    copied = typeof document.execCommand === "function" && document.execCommand("copy") === true;
+  } catch (_error) {
+    copied = false;
+  }
+  if (!copied) copied = await writeClipboardText(selection);
+  setStatus(copied ? COPIED_SELECTION : COPY_REFUSED);
+  return copied;
 }
 
 /**
@@ -12308,7 +12345,7 @@ function undoFromKeyboard() {
 }
 
 /**
- * c: the box to write in: the channel's (a thread's, in a thread), the reply's on Reply, or on the
+ * m (`#538 c-key-copy`; c before): the box to write in: the channel's (a thread's, in a thread), the reply's on Reply, or on the
  * call's view the agent's, under the transcript (`#241 voice-composer`). Going to the agent's box
  * opens nothing: a conversation starts only when something is sent from it.
  *
@@ -12905,8 +12942,9 @@ const KEYMAP = [
     run: () => pickChannel(),
   },
   {
-    group: KEYS_MOVING, chords: [{ key: "b" }, { key: "m" }],
-    does: "Back to your bookmark, and the message below it selected. m is the old key for it",
+    // `#538 c-key-copy`: b alone. m, the place marker's old key, is the message box's now.
+    group: KEYS_MOVING, chords: [{ key: "b" }],
+    does: "Back to your bookmark, and the message below it selected",
     controls: ["jump-bookmark"],
     run: () => bookmarkJumpFromKeyboard(),
   },
@@ -13015,10 +13053,12 @@ const KEYMAP = [
   },
   {
     // `#296 copy-highlighted-message`. y was free: no binding had it, and as a bare letter it never
-    // fires in a text field, where it is typed.
-    group: KEYS_MESSAGE, chords: [{ key: "c", mod: true }, { key: "y" }],
+    // fires in a text field, where it is typed. `#538 c-key-copy`, the owner: "if the text entry box is
+    // not highlighted and I press the C key, I would like that to just copy, to be even lazier than
+    // pressing Command-C." c was the message box's, which has Ctrl+S (Cmd+S) and now m.
+    group: KEYS_MESSAGE, chords: [{ key: "c", mod: true }, { key: "c" }, { key: "y" }],
     does: () => "Copy the highlighted message: all of its text as written, a summarised or folded one's too; on a " +
-      `thread card, its first message. With text selected, or in a text box, ${modKeyName()}+C copies that as usual`,
+      `thread card, its first message. With text selected, c and y copy that, and ${modKeyName()}+C copies it as usual`,
     rowControls: ["row-copy-button"],
     // The chord leaves its default to the browser whatever it finds, since that default is what fires the
     // `copy` event the message goes by (`copyChordFromKeyboard`).
@@ -13159,7 +13199,8 @@ const KEYMAP = [
     run: (event, target) => collapsedLinesFromKeyboard(1, target),
   },
   {
-    group: KEYS_WRITING, chords: [{ key: "c" }],
+    // `#538 c-key-copy`: m, the owner's pick, c being the copy now.
+    group: KEYS_WRITING, chords: [{ key: "m" }],
     does: "Write to the channel, or in the thread you are in; with a reply open, the reply; in the call view, to the agent",
     controls: ["channel-compose-text", "reply-text", "compose-text"],
     run: () => composeFromKeyboard(),

@@ -929,8 +929,8 @@ def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
         row = ringed(walk, "k", f"{words}: k")
     target = str(row["id"])
     check(row["archived"] != "true", f"{words}: no message near the newest is left to mark Done")
-    to_box = walk.key("c")
-    check(to_box["focus"] == "channel-compose-text", f"{words}: c left the focus on {to_box['focus']!r}")
+    to_box = walk.key("m")
+    check(to_box["focus"] == "channel-compose-text", f"{words}: m left the focus on {to_box['focus']!r}")
     for letter in "draft":
         press(walk.cdp, letter)
     walk.settled()
@@ -962,10 +962,10 @@ def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
     walk.shot(f"cmd-e-{mod.lower()}")
 
     # Out of sight: Esc leaves the box for the list with the draft kept, Home selects the top message, and
-    # c goes back to the box, the list going to its foot with it.
+    # m goes back to the box (`#538 c-key-copy`: c before), the list going to its foot with it.
     walk.key("Escape")
     top = str(ringed(walk, "Home", f"{words}: Home")["id"])
-    walk.key("c")
+    walk.key("m")
     gone = walk.page.evaluate(CMD_E_JS, top)
     check(gone["focus"] == "channel-compose-text" and gone["shown"] is False,
           f"{words}: the top message did not go out of sight as the box took the focus: {gone}")

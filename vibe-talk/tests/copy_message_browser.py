@@ -24,8 +24,8 @@ At 1280x800 on Linux, with Ctrl:
   flavour beside it; the status pill says "Copied message."; the list, the row and the highlight do
   not move -> the channel's box focused with a draft selected in it: Ctrl+C copies the draft; the
   caret alone in it: nothing; y typed into it -> Esc back to the list, the question still highlighted:
-  words of it selected, Ctrl+C copies those words; the selection let go of, the message again -> y
-  copies the message -> the thread list (Ctrl+3), ↓ onto a card: Ctrl+C and y copy its thread's first
+  words of it selected, Ctrl+C and c copy those words; the selection let go of, the message again -> y
+  and c copy the message (`#538 c-key-copy`) -> the thread list (Ctrl+3), ↓ onto a card: Ctrl+C and y copy its thread's first
   message.
 
 At 1280x800 in a second tab whose `navigator.platform` is emulated as a Mac's: the list of keys says
@@ -361,11 +361,16 @@ def desk_walk(reader: Reader) -> None:
     words = str(page.evaluate(SELECT_WORDS_JS, 24))
     reader.check(len(words) == 24, f"the drag selected {words!r}")
     reader.check(reader.copied("Control+c") == words, "with words of the question selected, Ctrl+C did not copy them")
+    # `#538 c-key-copy`: a bare c copies the words selected too, never the message over them.
+    reader.check(reader.copied("c") == words, "with words of the question selected, c did not copy them")
+    reader.check(reader.state()["status"] == "Copied the selected text.", "c did not say it copied the selection")
     page.evaluate("() => getSelection().removeAllRanges()")
     reader.check(reader.copied("Control+c") == LONG_FIRST, "with the selection let go of, Ctrl+C did not copy the question")
     reader.check(reader.copied("y") == LONG_FIRST, "y did not copy the highlighted question")
-    reader.desk.notes.append(f"with {len(words)} characters of it selected, Ctrl+C copied those; let go of, the "
-                             "message; y copied it too")
+    reader.check(reader.copied("c") == LONG_FIRST, "c did not copy the highlighted question")
+    reader.check(reader.state()["focus"] != "channel-compose-text", "c went to the message box")
+    reader.desk.notes.append(f"with {len(words)} characters of it selected, Ctrl+C and c copied those; let go of, "
+                             "the message; y and c copied it too")
 
     # The thread list: a card copies its thread's first message.
     reader.key("Control+3")
@@ -416,7 +421,7 @@ def mac_walk(reader: Reader, context: BrowserContext, origin: str, errors: list[
     other.check(mac.evaluate("() => navigator.platform") == "MacIntel", "the Mac's platform was not emulated")
     listed = mac.evaluate("() => [...document.querySelectorAll('#keyboard-keys kbd')].map((kbd) => kbd.textContent)")
     assert isinstance(listed, list)
-    other.check("Cmd+C or y" in listed, f"on a Mac the list of keys does not say Cmd+C or y: {listed}")
+    other.check("Cmd+C, c, y" in listed, f"on a Mac the list of keys does not say Cmd+C, c, y: {listed}")
     # The Edit menu's copy: the browser's own copy command, whose event the page answers.
     highlight(other, "201")
     text = other.copied("Meta+c", ["copy"])
@@ -429,7 +434,7 @@ def mac_walk(reader: Reader, context: BrowserContext, origin: str, errors: list[
     text = other.copied("Meta+c")
     other.check(text == other.content(reached[0][1]), f"Cmd+C with no copy command copied {text!r}")
     other.desk.shot("3-mac")
-    reader.desk.notes.append("on an emulated Mac the list said Cmd+C or y; Cmd+C copied the highlighted message both "
+    reader.desk.notes.append("on an emulated Mac the list said Cmd+C, c, y; Cmd+C copied the highlighted message both "
                              "with the Edit menu's copy command and, a task later by the page's own way, without it")
     mac.close()
 

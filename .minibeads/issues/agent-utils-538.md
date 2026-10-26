@@ -1,12 +1,13 @@
 ---
 title: 'c-key-copy: a bare c copies what Cmd+C copies, outside a text field'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-26T15:25:07.040538076+00:00
-updated_at: 2026-10-26T15:25:07.040538076+00:00
+updated_at: 2026-10-26T16:24:16.270725753+00:00
+closed_at: 2026-10-26T16:24:16.270725433+00:00
 ---
 
 # Description
