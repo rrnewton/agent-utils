@@ -769,10 +769,22 @@
     }
   }
 
+  // Constructing an Intl.DateTimeFormat costs far more than formatting with one, and every
+  // render formats hundreds of labels and tooltips, so formatters are kept per timezone and
+  // option set. Measured on a months-long archive, rebuilding them was a third of the CPU time of
+  // each zoom step.
+  var dateFormatters = new Map();
+
   function dateFormatter(options) {
-    var settings = Object.assign({}, options);
-    settings.timeZone = app.timezone;
-    return new Intl.DateTimeFormat(undefined, settings);
+    var key = app.timezone + "\u0000" + JSON.stringify(options);
+    var formatter = dateFormatters.get(key);
+    if (!formatter) {
+      var settings = Object.assign({}, options);
+      settings.timeZone = app.timezone;
+      formatter = new Intl.DateTimeFormat(undefined, settings);
+      dateFormatters.set(key, formatter);
+    }
+    return formatter;
   }
 
   function formatFullTime(milliseconds) {
@@ -1115,6 +1127,10 @@
     dom.identityDetails.hidden = detailChildren.length === 0;
   }
 
+  // Counts phases indexed so far. A label search matches phase text, so the cached agent order
+  // (see buildRows) must be recomputed when lazily loaded phases arrive during a search.
+  var phaseIndexRevision = 0;
+
   function indexPhase(phase) {
     if (!phase || typeof phase !== "object") {
       return;
@@ -1124,6 +1140,7 @@
       app.phasesByAgent.set(id, []);
     }
     app.phasesByAgent.get(id).push(phase);
+    phaseIndexRevision += 1;
   }
 
   function sortPhaseIndexes() {
@@ -2573,7 +2590,29 @@
     dom.teamFilter.value = current;
   }
 
+  // The summary menu lists every summary file -- thousands of buttons on a months-long archive --
+  // inside a closed <details>. It is built when the menu opens rather than on every data or team
+  // change, so a page that never opens it never pays for its DOM.
+  var summaryFilesStale = true;
+  var summaryMenuWatched = false;
+
   function populateSummaryFiles() {
+    summaryFilesStale = true;
+    if (!summaryMenuWatched) {
+      summaryMenuWatched = true;
+      dom.summaryMenu.addEventListener("toggle", function () {
+        if (dom.summaryMenu.open && summaryFilesStale) {
+          renderSummaryFiles();
+        }
+      });
+    }
+    if (dom.summaryMenu.open) {
+      renderSummaryFiles();
+    }
+  }
+
+  function renderSummaryFiles() {
+    summaryFilesStale = false;
     var files = app.data.summary_files.filter(function (file) {
       return selectedTeamAllows(file);
     });
@@ -2952,6 +2991,9 @@
     ]);
   }
 
+  var numericCollator = new Intl.Collator(undefined, { numeric: true });
+  var plainCollator = new Intl.Collator();
+
   function compareAgents(left, right) {
     var leftTeam = text(left.team);
     var rightTeam = text(right.team);
@@ -2965,16 +3007,65 @@
     var leftPath = agentOfficialName(left);
     var rightPath = agentOfficialName(right);
     if (leftPath && rightPath && leftPath !== rightPath) {
-      return leftPath.localeCompare(rightPath, undefined, { numeric: true });
+      return numericCollator.compare(leftPath, rightPath);
     }
     var startDifference = number(left.start_ms, 0) - number(right.start_ms, 0);
     if (startDifference) {
       return startDifference;
     }
-    return agentShortName(left).localeCompare(agentShortName(right));
+    return plainCollator.compare(agentShortName(left), agentShortName(right));
+  }
+
+  // The ordered, filtered agent tree depends on the data and the search/team filter, not on
+  // the view, so it is computed once per change of those and reused by every zoom and pan
+  // frame. Sorting thousands of agents on every wheel event dominated outer-zoom frames.
+  var orderedRowsCache = { key: null, value: null };
+
+  function orderedRowsKey() {
+    var transcriptQueryReady = transcriptSearchActive() && Boolean(app.query) &&
+      app.transcriptSearchState === "ready";
+    var matched = app.transcriptMatchedAgentIds;
+    return [
+      app.data,
+      app.data.agents,
+      app.data.agents.length,
+      app.data.edges.length,
+      app.selectedTeam,
+      app.searchScope,
+      app.query,
+      transcriptQueryReady,
+      matched,
+      matched ? matched.size : 0,
+      app.searchScope === "labels" && app.query ? phaseIndexRevision : 0,
+      app.teamActivityScores.size
+    ];
+  }
+
+  function sameKey(left, right) {
+    if (!left || !right || left.length !== right.length) {
+      return false;
+    }
+    for (var index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   function buildRows() {
+    var key = orderedRowsKey();
+    var ordered;
+    if (sameKey(orderedRowsCache.key, key)) {
+      ordered = orderedRowsCache.value;
+    } else {
+      ordered = buildOrderedRows();
+      orderedRowsCache = { key: key, value: ordered };
+    }
+    placeRows(ordered.slice());
+  }
+
+  function buildOrderedRows() {
     var query = app.searchScope === "labels"
       ? app.query.trim().toLocaleLowerCase()
       : "";
@@ -3091,7 +3182,10 @@
       .forEach(function (agent) {
         visit(agent, Math.max(0, number(agent.depth, 0)));
       });
+    return rows;
+  }
 
+  function placeRows(rows) {
     app.rowByAgent.clear();
     if (app.renderLod === "aggregate") {
       // Aggregate rendering needs the filtered agents only for team matching and

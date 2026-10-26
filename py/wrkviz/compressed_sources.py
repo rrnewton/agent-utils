@@ -27,6 +27,7 @@ staging directory for exactly this kind of scratch copy.
 from __future__ import annotations
 
 import importlib
+import io
 import os
 import shutil
 import subprocess
@@ -160,8 +161,8 @@ def read_source_bytes(path: Path) -> bytes:
 def read_first_line(path: Path) -> bytes:
     """The first line of *path*'s logical bytes, including its newline when it has one.
 
-    A plain file reads one line. A compressed one is decoded in full -- zstd has no cheap
-    line seek -- which is acceptable because discovery runs this once per candidate.
+    A compressed file is decoded as a stream and decoding stops at the first newline, so
+    discovery's metadata read costs about one line whichever spelling is present.
     """
 
     physical = resolve_source(path)
@@ -170,9 +171,39 @@ def read_first_line(path: Path) -> bytes:
     if not is_compressed(physical):
         with physical.open("rb") as handle:
             return handle.readline()
-    data = decode_bytes(physical, physical.read_bytes())
-    end = data.find(b"\n")
-    return data if end < 0 else data[: end + 1]
+    stdlib = _stdlib_zstd()
+    if stdlib is not None:
+        try:
+            with stdlib.open(physical, "rb") as handle:
+                line: bytes = handle.readline()
+        except Exception as exc:  # the module's own ZstdError
+            raise CompressedSourceError(f"cannot decompress {physical}: {exc}") from exc
+        return line
+    package = _zstandard()
+    if package is not None:
+        try:
+            with physical.open("rb") as raw, package.ZstdDecompressor().stream_reader(
+                raw
+            ) as reader:
+                line = io.BufferedReader(reader).readline()
+        except Exception as exc:  # zstandard.ZstdError
+            raise CompressedSourceError(f"cannot decompress {physical}: {exc}") from exc
+        return line
+    command = shutil.which("zstd")
+    if command is None:
+        return decode_bytes(physical, physical.read_bytes())  # raises the no-decoder error
+    # Stream, and stop at the first newline: discovery reads only a rollout's metadata line, and
+    # decoding a few hundred megabytes to find it would make every scan cost the whole corpus.
+    with subprocess.Popen(
+        [command, "--decompress", "--stdout", "--quiet", str(physical)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    ) as process:
+        assert process.stdout is not None
+        line = process.stdout.readline()
+        process.stdout.close()
+        process.kill()
+    return line
 
 
 def materialize_source(path: Path, directory: Path) -> Path:
