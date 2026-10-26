@@ -147,13 +147,24 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 }
 
+/// What a reply or the reader marked Done: the store's marks, less the owner's own messages, which
+/// start Done when this server first sees them (`#549 own-read-stored`) — a voice reply this server
+/// posted among them.
 async fn done_here(harness: &Harness) -> Vec<String> {
-    harness
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let marks = harness
         .store
-        .dismissals(&ChannelId(WRITE_CHANNEL.to_owned()))
+        .dismissals(&channel)
         .await
-        .expect("the store reads")
+        .expect("the store reads");
+    let own = harness
+        .store
+        .own_decided(&channel, &marks)
+        .await
+        .expect("the store reads");
+    marks
         .into_iter()
+        .filter(|id| !own.contains(id))
         .map(|id| id.0)
         .collect()
 }

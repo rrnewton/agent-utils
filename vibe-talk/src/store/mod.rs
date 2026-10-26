@@ -2129,6 +2129,60 @@ pub trait StateStore: Send + Sync {
     async fn restore(&self, channel: &ChannelId, messages: &[MessageId])
         -> Result<u64, StoreError>;
 
+    /// Which of `messages`, the owner's own, have had their first read state decided here.
+    /// `#549 own-read-stored`; see [`crate::own_read`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn own_decided(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<Vec<MessageId>, StoreError>;
+
+    /// Decide the first read state of each of `messages`, the owner's own, that was not decided
+    /// before, returning those: Done when `read`, left as it is otherwise. Never again for any of
+    /// them, which is what keeps one he put back unread across restarts and re-reads.
+    /// `#549 own-read-stored`.
+    ///
+    /// Its Done marks are held apart from the reader's own ([`Retention::max_dismissals`] for each),
+    /// so they never push one of his marks out; the record of what was decided is bounded by the
+    /// same count, the oldest going first.
+    ///
+    /// # Errors
+    ///
+    /// As [`StateStore::dismiss`].
+    async fn decide_own(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+        read: bool,
+    ) -> Result<Vec<MessageId>, StoreError>;
+
+    /// Every message of the owner's decided here that is not Done now, by channel in channel order,
+    /// oldest first within one: what "Apply to existing messages" marks. `#549 own-read-stored`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn own_not_done(&self) -> Result<Vec<(ChannelId, Vec<MessageId>)>, StoreError>;
+
+    /// Mark `messages`, the owner's own, Done as [`StateStore::decide_own`] does, whether decided
+    /// before or not, returning those that were not Done already. "Apply to existing messages".
+    /// `#549 own-read-stored`.
+    ///
+    /// # Errors
+    ///
+    /// As [`StateStore::dismiss`].
+    async fn dismiss_own(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<Vec<MessageId>, StoreError>;
+
     /// The owner's noise rules, exactly as he last saved them. `#196 auto-read-noise`.
     ///
     /// `Ok(None)` means he never has, and that is NOT the same answer as an empty list: "never

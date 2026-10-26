@@ -438,6 +438,9 @@ pub struct LiveHub {
     /// `#232 upstream-mark-read`. Fed on every publish, never waited on: see
     /// [`crate::upstream_clear`].
     upstream_clear: std::sync::Arc<crate::upstream_clear::Candidates>,
+    /// Every message published for the first time, for its first read state to be decided. `#549
+    /// own-read-stored`. Fed under the feed lock, never waited on: see [`crate::own_read`].
+    own_sightings: std::sync::Arc<crate::own_read::Sightings>,
     /// Each channel's newest window, kept current by every publish. `#210 voice-catchup-speed`.
     /// Here for the reason `upstream_clear` is: both producers reach the hub, and only the hub,
     /// so this is the one place a change cannot bypass. See [`crate::recent`].
@@ -509,6 +512,7 @@ impl LiveHub {
             hinted: Mutex::new(BTreeMap::new()),
             hint_generation,
             upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
+            own_sightings: std::sync::Arc::default(),
             recent,
             cache: std::sync::OnceLock::new(),
             store: std::sync::OnceLock::new(),
@@ -579,6 +583,12 @@ impl LiveHub {
     #[must_use]
     pub fn upstream_clear(&self) -> &std::sync::Arc<crate::upstream_clear::Candidates> {
         &self.upstream_clear
+    }
+
+    /// The messages waiting for their first read state. `#549 own-read-stored`.
+    #[must_use]
+    pub fn own_sightings(&self) -> &std::sync::Arc<crate::own_read::Sightings> {
+        &self.own_sightings
     }
 
     /// Queue one content-free request to poll `channel` now.
@@ -1342,6 +1352,12 @@ impl LiveHub {
             LiveKind::Create => Some(Some(live.message.clone())),
             LiveKind::Update => None,
         };
+        // `#549 own-read-stored`. A message out for the first time is a first sight: noted for its
+        // read state to be decided, in the background. One brief lock, never a wait.
+        if live.kind == LiveKind::Create && outcome == Published::New {
+            self.own_sightings
+                .note(channel, &live.message, live.self_posted);
+        }
         if let Some(held) = feed.created.get_mut(&live.message.id) {
             if live.kind == LiveKind::Delete {
                 *held = None;

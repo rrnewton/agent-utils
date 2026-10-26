@@ -4157,6 +4157,8 @@ async fn post_each(
             }
         }
     }
+    // `#549 own-read-stored`: what this server posted is first seen here, and starts read when his.
+    crate::own_read::settle_posted(state, &info.id, &posted).await;
     let first = posted.first().cloned().expect("at least one part posted");
     Ok((info, first, posted))
 }
@@ -4556,6 +4558,12 @@ pub struct TodoView {
     /// They are not in `messages` — a placeholder is not something to deal with — and they are
     /// still in `window`, because they are still in the channel.
     pub noise: usize,
+    /// The window's messages left out because they are Done, oldest first; absent when there are
+    /// none. `#549 own-read-stored`: the owner's own words start Done, the one he just sent among
+    /// them, and a page waiting to see that message come back from the provider before it lets its
+    /// "sent" receipt go would otherwise wait for as long as it shows this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done: Vec<MessageId>,
 }
 
 /// The messages in one channel that have not been dealt with here. Read scope to ask.
@@ -4590,11 +4598,11 @@ pub async fn todo(
     )
     .await?;
     let complete = window.is_whole_channel();
+    // `#549 own-read-stored`: the owner's own messages this read is the first to meet start read.
+    let own = crate::own_read::settle(state, caller, &window.channel.id, &window.messages).await;
     let dismissed = state.store.dismissals(&window.channel.id).await?;
     let dismissed: std::collections::HashSet<&str> =
         dismissed.iter().map(MessageId::as_str).collect();
-    // `#536 mark-own-messages-read`: the owner's own words are read, judged as noise is.
-    let own = own_read_ids(state, &window.messages).await;
     let total = window.messages.len();
     let window_from = window
         .messages
@@ -4605,13 +4613,13 @@ pub async fn todo(
         .iter()
         .filter(|message| message.noise)
         .count();
-    let left = window
+    let (left, done): (Vec<Message>, Vec<Message>) = window
         .messages
         .into_iter()
-        .filter(|message| {
-            !message.noise && !dismissed.contains(message.id.as_str()) && !own.contains(&message.id)
-        })
-        .collect();
+        .filter(|message| !message.noise)
+        .partition(|message| {
+            !dismissed.contains(message.id.as_str()) && !own.contains(&message.id)
+        });
     Ok(TodoView {
         channel: window.channel,
         messages: left,
@@ -4619,37 +4627,8 @@ pub async fn todo(
         complete,
         window_from,
         noise,
+        done: done.into_iter().map(|message| message.id).collect(),
     })
-}
-
-/// Which of `messages` are the owner's own words, read while his "Mark my own messages as read"
-/// is on. `#536 mark-own-messages-read`; see [`crate::own_read`].
-///
-/// Judged on every read and never written, as noise is: turning the setting off brings every one
-/// back, and none of them takes a place under the store's bound on Done marks.
-pub async fn own_read_ids(
-    state: &AppState,
-    messages: &[Message],
-) -> std::collections::HashSet<MessageId> {
-    if messages.is_empty() {
-        return std::collections::HashSet::new();
-    }
-    let choice = state.own_read.choice(state.store.as_ref()).await;
-    if !choice.on {
-        return std::collections::HashSet::new();
-    }
-    let selves = state
-        .providers
-        .entries()
-        .iter()
-        .filter_map(|entry| entry.client.self_author_id())
-        .chain(state.chat.self_author_id());
-    let accounts = crate::own_read::Accounts::of(&state.config, selves);
-    messages
-        .iter()
-        .filter(|message| choice.reads(&accounts, message, state.live.is_self_posted(&message.id)))
-        .map(|message| message.id.clone())
-        .collect()
 }
 
 /// Which of `messages` the reader has archived.
@@ -4664,13 +4643,33 @@ pub async fn own_read_ids(
 /// # Errors
 ///
 /// [`OpError`] when the store cannot be read.
+///
+/// `#549 own-read-stored`: the owner's own messages this read is the first to meet, `caller`'s,
+/// start read ([`crate::own_read::settle`]).
 pub async fn dismissed_within(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel: &ChannelId,
     messages: &[Message],
 ) -> Result<Vec<MessageId>, OpError> {
-    let dismissed = state.store.dismissals(channel).await?;
+    let own = crate::own_read::settle(state, caller, channel, messages).await;
+    let dismissed = with_own(state.store.dismissals(channel).await?, own);
     Ok(dismissed_among(dismissed, messages))
+}
+
+/// The store's marks, newest first, with `own` among them: the messages a read's own first sight
+/// decided read. `#549 own-read-stored`.
+fn with_own(
+    mut dismissed: Vec<MessageId>,
+    own: std::collections::HashSet<MessageId>,
+) -> Vec<MessageId> {
+    if own.is_empty() {
+        return dismissed;
+    }
+    let held: std::collections::HashSet<MessageId> = dismissed.iter().cloned().collect();
+    dismissed.extend(own.into_iter().filter(|id| !held.contains(id)));
+    dismissed.sort_by_key(|id| std::cmp::Reverse(id.numeric()));
+    dismissed
 }
 
 /// The marks among `dismissed` that name one of `messages`, in `dismissed`'s order.
@@ -4701,11 +4700,14 @@ pub const MAX_REPLY_DISMISSALS: usize = 1_000;
 /// [`OpError`] when the store cannot be read.
 pub async fn timeline_read_state(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel: &ChannelId,
     messages: &[Message],
     replies: bool,
 ) -> Result<(Vec<MessageId>, Option<crate::contract::ReplyDismissals>), OpError> {
-    let dismissed = state.store.dismissals(channel).await?;
+    // `#549 own-read-stored`: the owner's own messages this read is the first to meet start read.
+    let own = crate::own_read::settle(state, caller, channel, messages).await;
+    let dismissed = with_own(state.store.dismissals(channel).await?, own);
     let from_up = if replies {
         reply_dismissals(&dismissed, messages)
     } else {
@@ -4857,11 +4859,11 @@ pub async fn declare_bankruptcy(
         .iter()
         .position(|m| &m.id == through)
         .ok_or(OpError::UnknownMessage)?;
+    // `#549 own-read-stored`: the owner's own messages this read is the first to meet start read,
+    // and are already dealt with; any other of his is cleared like anyone's.
+    let own = crate::own_read::settle(state, caller, &window.channel.id, &window.messages).await;
     let already = state.store.dismissals(&window.channel.id).await?;
     let already: std::collections::HashSet<&str> = already.iter().map(MessageId::as_str).collect();
-    // `#536 mark-own-messages-read`: nor the owner's own words while they count as read. The list
-    // never showed one, and a mark written for it would outlast the setting.
-    let own = own_read_ids(state, &window.messages).await;
     // By POSITION in the window, which is already sorted oldest-first, rather than by comparing
     // snowflakes here: the window is the ordering this server has, and a second ordering rule
     // beside it is a second thing to get wrong.
@@ -4906,6 +4908,36 @@ pub async fn restore(
         channel,
         messages: wanted.to_vec(),
     })
+}
+
+/// "Apply to existing messages": mark read every message of the owner's this server has seen that
+/// is not Done now, in every channel on the list. Write scope, and the OPERATOR's act alone — there
+/// is no MCP tool. `#549 own-read-stored`; see [`crate::own_read`].
+///
+/// "Mark my own messages as read" decides where a message's read state STARTS, at its first sight;
+/// this is the one act that reaches the messages already seen — those first seen while the setting
+/// was off, and those he put back since. Each change names exactly what it marked, so the page's
+/// undo puts back that set ([`restore`]) and nothing else.
+///
+/// # Errors
+///
+/// [`OpError::Store`] when no store is configured or it fails.
+pub async fn apply_own_read(state: &AppState) -> Result<Vec<InboxChange>, OpError> {
+    let listed = channels(state).await;
+    let mut changes = Vec::new();
+    for (channel, messages) in state.store.own_not_done().await? {
+        let Some(info) = listed.iter().find(|info| info.id == channel) else {
+            continue;
+        };
+        let marked = state.store.dismiss_own(&channel, &messages).await?;
+        if !marked.is_empty() {
+            changes.push(InboxChange {
+                channel: info.clone(),
+                messages: marked,
+            });
+        }
+    }
+    Ok(changes)
 }
 
 // --- messages read automatically -----------------------------------------------------------------

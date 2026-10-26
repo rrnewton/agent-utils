@@ -149,6 +149,9 @@ class FakeApi:
         self.messages.append(message(base, ANSWER_ID, ANSWER, AGENT, reply))
         for i, (text, who) in enumerate(after, start=1):
             self.messages.append(message(base + i, f"77000000000000005{i:02d}", text, who, reply))
+        # `#549 own-read-stored`: the server decided the owner's own messages Done when it first saw
+        # them, "Mark my own messages as read" being on.
+        self.dismissed |= {str(m["id"]) for m in self.messages if m["author_id"] == OWNER["author_id"]}
         self.threads = [{"id": THREAD_ID, "root": self.messages[2], "title": "Canary rollback",
                          "reply_count": READ_REPLIES + 7, "reply_count_exact": True,
                          "updated_at": self.messages[-1]["timestamp"]}]
@@ -392,7 +395,7 @@ MAIN_JS = """(root) => {
     chipBorder: chip ? getComputedStyle(chip).borderTopColor : null,
     chipLayer: chip ? [getComputedStyle(chip).position, getComputedStyle(chip).zIndex, getComputedStyle(chip).filter] : null,
     accent,
-    ownRead: row ? row.dataset.ownRead : null,
+    archived: row ? row.dataset.archived : null,
     rowOpacity: row ? getComputedStyle(row).opacity : null,
     veil: row ? getComputedStyle(row, '::after').backgroundColor : null,
     chipPressable: chip ? (() => {
@@ -664,7 +667,8 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(mm["text"] == "4 unread", f"{size}: the question's unread count says {mm['text']!r}")
     check(mm["label"] == "Open this thread at its first unread reply, 4 unread replies",
           f"{size}: the count's accessible name is {mm['label']!r}")
-    check(mm["ownRead"] == "true", f"{size}: the kept question is no longer drawn as read")
+    # `#549 own-read-stored`: his question started read, in the read state the server keeps.
+    check(mm["archived"] == "true", f"{size}: the kept question is no longer drawn as read")
     check(mm["veil"] not in ("rgba(0, 0, 0, 0)", "transparent"),
           f"{size}: the kept question is not faded as a read row: {mm['veil']}")
     check(mm["chipColor"] == mm["accent"] and mm["chipBorder"] == mm["accent"],

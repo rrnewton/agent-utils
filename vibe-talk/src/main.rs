@@ -867,6 +867,9 @@ async fn main() -> anyhow::Result<()> {
             live_limit,
         ));
     }
+    // `#549 own-read-stored`. The owner's own messages the live hub publishes are first seen
+    // there, and their read state is decided in the background.
+    tokio::spawn(vibe_talk::own_read::run(state.clone()));
     // `#232 upstream-mark-read`. Only a provider that can clear its own unread state gets the
     // loop; it is off for every channel until the owner sets one in Settings.
     if state.chat.supports_upstream_clear() {

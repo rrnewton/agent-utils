@@ -64,6 +64,11 @@ struct State {
     /// `(channel, message)` to `(snowflake, when it was dismissed)`. The same shape the real
     /// table has, so the count bound and the ordering can be reproduced rather than assumed.
     dismissals: BTreeMap<(String, String), (u64, i64)>,
+    /// The dismissals "Mark my own messages as read" wrote rather than the reader, bounded apart
+    /// from his. `#549 own-read-stored`.
+    own_marks: std::collections::BTreeSet<(String, String)>,
+    /// `(channel, message)` to when its first read state was decided. `#549 own-read-stored`.
+    own_decided: BTreeMap<(String, String), i64>,
     /// Channel to `(alias, when it was set)`. `#39 channel-alias`.
     aliases: BTreeMap<String, (String, i64)>,
     /// Channels added from inside the app: id -> (label, writable, provider, added_at_ms).
@@ -207,6 +212,52 @@ fn armed(state: &mut State) -> Result<(), StoreError> {
     match state.fail_next.take() {
         Some(why) => Err(StoreError::Backend(why)),
         None => Ok(()),
+    }
+}
+
+/// Pair every id with its snowflake, refusing the whole batch for one that will not order, as the
+/// real store's dismissal does.
+fn orderable(messages: &[MessageId]) -> Result<Vec<(MessageId, u64)>, StoreError> {
+    messages
+        .iter()
+        .map(|message| {
+            message
+                .numeric()
+                .map(|n| (message.clone(), n))
+                .ok_or_else(|| {
+                    StoreError::BadId(format!(
+                        "{message:?} is not a message snowflake, so this server cannot order it"
+                    ))
+                })
+        })
+        .collect()
+}
+
+/// Keep one class of dismissal under the count bound, the oldest going first: the reader's own
+/// (`own` false) or those "Mark my own messages as read" wrote (`own` true), each with a bound of
+/// its own, so neither ever evicts the other. `#549 own-read-stored`.
+fn prune_dismissals(state: &mut State, retention: Retention, own: bool) {
+    loop {
+        let in_class = |slot: &(String, String)| state.own_marks.contains(slot) == own;
+        let held = state
+            .dismissals
+            .keys()
+            .filter(|slot| in_class(slot))
+            .count();
+        if held <= retention.max_dismissals as usize {
+            return;
+        }
+        let Some(oldest) = state
+            .dismissals
+            .iter()
+            .filter(|(slot, _)| in_class(slot))
+            .min_by_key(|(slot, (_, at))| (*at, (*slot).clone()))
+            .map(|(slot, _)| slot.clone())
+        else {
+            return;
+        };
+        state.dismissals.remove(&oldest);
+        state.own_marks.remove(&oldest);
     }
 }
 
@@ -724,19 +775,7 @@ impl StateStore for FakeStore {
             state.dismissals.insert(slot, (numeric, at));
             added += 1;
         }
-        while state.dismissals.len() > self.retention.max_dismissals as usize {
-            let oldest = state
-                .dismissals
-                .iter()
-                .min_by_key(|(slot, (_, at))| (*at, (*slot).clone()))
-                .map(|(slot, _)| slot.clone());
-            match oldest {
-                Some(slot) => {
-                    state.dismissals.remove(&slot);
-                }
-                None => break,
-            }
-        }
+        prune_dismissals(&mut state, self.retention, false);
         Ok(added)
     }
 
@@ -751,10 +790,123 @@ impl StateStore for FakeStore {
         for message in messages {
             let slot = (channel.as_str().to_owned(), message.as_str().to_owned());
             if state.dismissals.remove(&slot).is_some() {
+                state.own_marks.remove(&slot);
                 removed += 1;
             }
         }
         Ok(removed)
+    }
+
+    async fn own_decided(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<Vec<MessageId>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(messages
+            .iter()
+            .filter(|message| {
+                state
+                    .own_decided
+                    .contains_key(&(channel.as_str().to_owned(), message.as_str().to_owned()))
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn decide_own(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+        read: bool,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        let ordered = orderable(messages)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let at = now_ms();
+        let mut decided = Vec::new();
+        for (message, numeric) in ordered {
+            let slot = (channel.as_str().to_owned(), message.as_str().to_owned());
+            if state.own_decided.contains_key(&slot) {
+                continue;
+            }
+            state.own_decided.insert(slot.clone(), at);
+            if read && !state.dismissals.contains_key(&slot) {
+                state.dismissals.insert(slot.clone(), (numeric, at));
+                state.own_marks.insert(slot);
+            }
+            decided.push(message);
+        }
+        prune_dismissals(&mut state, self.retention, true);
+        while state.own_decided.len() > self.retention.max_dismissals as usize {
+            let oldest = state
+                .own_decided
+                .iter()
+                .min_by_key(|(slot, at)| (**at, (*slot).clone()))
+                .map(|(slot, _)| slot.clone());
+            match oldest {
+                Some(slot) => {
+                    state.own_decided.remove(&slot);
+                }
+                None => break,
+            }
+        }
+        Ok(decided)
+    }
+
+    async fn own_not_done(&self) -> Result<Vec<(ChannelId, Vec<MessageId>)>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let mut by_channel: BTreeMap<String, Vec<(u64, MessageId)>> = BTreeMap::new();
+        for (channel, message) in state.own_decided.keys() {
+            if state
+                .dismissals
+                .contains_key(&(channel.clone(), message.clone()))
+            {
+                continue;
+            }
+            let id = MessageId(message.clone());
+            let numeric = id.numeric().unwrap_or(0);
+            by_channel
+                .entry(channel.clone())
+                .or_default()
+                .push((numeric, id));
+        }
+        Ok(by_channel
+            .into_iter()
+            .map(|(channel, mut held)| {
+                held.sort_by_key(|(numeric, _)| *numeric);
+                (
+                    ChannelId(channel),
+                    held.into_iter().map(|(_, id)| id).collect(),
+                )
+            })
+            .collect())
+    }
+
+    async fn dismiss_own(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<Vec<MessageId>, StoreError> {
+        let ordered = orderable(messages)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let at = now_ms();
+        let mut marked = Vec::new();
+        for (message, numeric) in ordered {
+            let slot = (channel.as_str().to_owned(), message.as_str().to_owned());
+            state.own_decided.entry(slot.clone()).or_insert(at);
+            if state.dismissals.contains_key(&slot) {
+                continue;
+            }
+            state.dismissals.insert(slot.clone(), (numeric, at));
+            state.own_marks.insert(slot);
+            marked.push(message);
+        }
+        prune_dismissals(&mut state, self.retention, true);
+        Ok(marked)
     }
 
     async fn noise_rules(&self) -> Result<Option<Vec<String>>, StoreError> {
@@ -1465,6 +1617,8 @@ impl StateStore for FakeStore {
         state.post_keys.clear();
         state.summaries.clear();
         state.dismissals.clear();
+        state.own_marks.clear();
+        state.own_decided.clear();
         state.aliases.clear();
         state.noise_rules = None;
         state.ask_before_send = None;

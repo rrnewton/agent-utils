@@ -1,13 +1,14 @@
-//! `#536 mark-own-messages-read`: with "Mark my own messages as read" on, the owner's own messages
-//! are read to this server too, not only greyed by one page.
+//! `#549 own-read-stored` (after `#536 mark-own-messages-read`): with "Mark my own messages as read"
+//! on, the owner's own messages START read, in the one stored read bit, and from then on are toggled
+//! like anyone's.
 //!
-//! The owner, 2026-10-26: "They are rendering as MY messages... but they are not marked read." The
-//! setting was a rule of the page alone: the server's to-do list still counted them, "Done through
-//! here" wrote marks for them, and an account only `[owner] user_ids` named was not even drawn as his.
-//! Checked against the bridge-shaped fake the Google Chat instance reads through (the owner named by
-//! `owner_user_id`) and against a loopback Slack fake shaped as the Slack instance is (the owner named
-//! only by `[owner] user_ids`, the coding agents by `coding_agent_user_ids`), through the HTTP routes a
-//! page reads. Like noise, the rule is judged on every read and nothing is written per message.
+//! The owner, 2026-10-26: "I think it was simpler to just do what the setting says which is to mark
+//! them as read IE record the state that they are read and then I can toggle one individually ...
+//! it's just a question of whether the state starts as read or starts as unread when the message is
+//! ingested". Checked against the bridge-shaped fake the Google Chat instance reads through (the owner
+//! named by `owner_user_id`) and against a loopback Slack fake shaped as the Slack instance is (the
+//! owner named only by `[owner] user_ids`, the coding agents by `coding_agent_user_ids`), through the
+//! HTTP routes a page reads, and through the live hub a pushed message arrives by.
 
 mod slack_fake;
 
@@ -148,34 +149,212 @@ fn bridge() -> Bridge {
     }
 }
 
+/// The channel's messages a window read says are Done, as the page is told.
+async fn window_done(state: &AppState, channel: &str, token: &str) -> BTreeSet<String> {
+    let body = get(
+        state,
+        &format!("/api/v1/channels/{channel}/messages"),
+        token,
+    )
+    .await;
+    body["dismissed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no dismissed in {body}"))
+        .iter()
+        .map(|id| id.as_str().expect("id").to_owned())
+        .collect()
+}
+
+/// Put messages back, as the page's Unarchive and Undo do.
+async fn put_back(state: &AppState, channel: &str, ids: &[&MessageId]) {
+    let messages: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+    let (status, body) = call(
+        state,
+        "POST",
+        &format!("/api/v1/channels/{channel}/restore"),
+        WRITE_TOKEN,
+        Some(json!({ "messages": messages })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The same server, restarted: the store and the chat service are what they were, and everything
+/// held in memory — the settings read, the live hub's memory of what it published and what this
+/// server posted — is gone.
+fn restarted(state: &AppState) -> AppState {
+    let mut fresh = state.clone();
+    fresh.own_read = Arc::new(vibe_talk::own_read::OwnRead::default());
+    fresh.live = Arc::new(vibe_talk::live::LiveHub::new());
+    fresh
+}
+
 #[tokio::test]
-async fn the_to_do_list_leaves_his_own_messages_out_and_writes_nothing() {
+async fn a_read_that_first_meets_his_messages_records_them_done() {
     let b = bridge();
-    // For either token: this is a judgement on the read, not a write.
-    for token in [WRITE_TOKEN, READ_TOKEN] {
-        assert_eq!(todo(&b.state, WRITE_CHANNEL, token).await, set_of(&b.agent));
-    }
-    assert!(
-        held(&b.store, WRITE_CHANNEL).await.is_empty(),
-        "a mark was written for a message nobody marked"
+    assert_eq!(
+        todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await,
+        set_of(&b.agent)
+    );
+    // Recorded, as Done is: the one read bit, not a judgement made again on every read.
+    assert_eq!(held(&b.store, WRITE_CHANNEL).await, set_of(&b.owner));
+    // And every surface reads that bit: a window read tells the page so.
+    assert_eq!(
+        window_done(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await,
+        set_of(&b.owner)
     );
 }
 
 #[tokio::test]
-async fn turned_off_they_are_back_at_once_and_on_again_they_go() {
+async fn a_read_scope_read_answers_the_same_and_writes_nothing() {
     let b = bridge();
+    assert_eq!(
+        todo(&b.state, WRITE_CHANNEL, READ_TOKEN).await,
+        set_of(&b.agent)
+    );
+    assert_eq!(
+        window_done(&b.state, WRITE_CHANNEL, READ_TOKEN).await,
+        set_of(&b.owner)
+    );
+    assert!(
+        held(&b.store, WRITE_CHANNEL).await.is_empty(),
+        "a read-scope read wrote a mark"
+    );
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    assert!(b
+        .store
+        .own_decided(&channel, &b.owner)
+        .await
+        .expect("decided")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn one_of_his_put_back_stays_unread_across_rereads_a_restart_and_a_re_ingest() {
+    let b = bridge();
+    todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await;
+    // He puts one of his back, as Unarchive does: an ordinary read bit, toggled.
+    put_back(&b.state, WRITE_CHANNEL, &[&b.owner[0]]).await;
+    let waiting: BTreeSet<String> = set_of(b.agent.iter().chain([&b.owner[0]]));
+    assert_eq!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await, waiting);
+    // Read again, for the page and the to-do list: nothing marks it again.
+    window_done(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await;
+    assert_eq!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await, waiting);
+    // Restarted: the decision is in the store, not in memory.
+    let after = restarted(&b.state);
+    assert_eq!(todo(&after, WRITE_CHANNEL, WRITE_TOKEN).await, waiting);
+    // And the live hub, which has forgotten what it published, publishes it again — the poller's
+    // first walk after a restart, or an adapter re-delivering it: still not marked again.
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let copy = b.discord.message(&b.owner[0]).expect("held");
+    after.live.publish(&channel, copy.clone());
+    assert!(after.live.publish_ingested(
+        "redelivered".to_owned(),
+        vibe_talk::live::LiveKind::Create,
+        false,
+        &channel,
+        copy,
+    ));
+    vibe_talk::own_read::decide_waiting(&after).await;
+    assert_eq!(todo(&after, WRITE_CHANNEL, WRITE_TOKEN).await, waiting);
+    assert!(!held(&b.store, WRITE_CHANNEL).await.contains(&b.owner[0].0));
+}
+
+#[tokio::test]
+async fn a_message_of_his_the_live_hub_publishes_is_done_before_any_read() {
+    let b = bridge();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let pushed = b.discord.seed(&channel, "ada", "typed in the chat app");
+    let message = b.discord.message(&pushed).expect("held");
+    b.state.live.publish(&channel, message);
+    vibe_talk::own_read::decide_waiting(&b.state).await;
+    assert_eq!(
+        held(&b.store, WRITE_CHANNEL).await,
+        set_of([&pushed]),
+        "the push did not record his message read"
+    );
+    // The agent's, pushed the same way, waits.
+    let answer = b.discord.seed(&channel, "codex-bot", "an answer");
+    b.state
+        .live
+        .publish(&channel, b.discord.message(&answer).expect("held"));
+    vibe_talk::own_read::decide_waiting(&b.state).await;
+    assert!(!held(&b.store, WRITE_CHANNEL).await.contains(&answer.0));
+}
+
+#[tokio::test]
+async fn the_setting_decides_only_messages_first_seen_after_it_changes() {
+    let b = bridge();
+    // Seen while on: his start read.
+    todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await;
+    set(&b.state, &[("vibe-talk.voice.mark-own-read", "0")]).await;
+    // Turned off, they stay read: the setting is where a message starts, not a rule over it.
     assert_eq!(
         todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await,
         set_of(&b.agent)
     );
+    // One first seen while off starts unread...
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let later = b.discord.seed(&channel, "ada", "said while it was off");
+    assert!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN)
+        .await
+        .contains(&later.0));
+    // ...and turning it on again does not reach back to it.
+    set(&b.state, &[("vibe-talk.voice.mark-own-read", "1")]).await;
+    assert!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN)
+        .await
+        .contains(&later.0));
+}
+
+#[tokio::test]
+async fn apply_to_existing_marks_his_undone_messages_once_and_the_undo_puts_back_that_set() {
+    let b = bridge();
     set(&b.state, &[("vibe-talk.voice.mark-own-read", "0")]).await;
     let everything: BTreeSet<String> = set_of(b.owner.iter().chain(&b.agent));
     assert_eq!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await, everything);
-    set(&b.state, &[("vibe-talk.voice.mark-own-read", "1")]).await;
+    let (status, body) = call(
+        &b.state,
+        "POST",
+        "/api/v1/own-read/apply",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], json!(2), "{body}");
+    let changes = body["changes"].as_array().expect("changes");
+    assert_eq!(changes.len(), 1, "{body}");
+    assert_eq!(changes[0]["channel"]["id"], json!(WRITE_CHANNEL), "{body}");
+    let marked: Vec<String> = changes[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|id| id.as_str().expect("id").to_owned())
+        .collect();
+    assert_eq!(
+        marked,
+        b.owner.iter().map(|id| id.0.clone()).collect::<Vec<_>>()
+    );
     assert_eq!(
         todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await,
         set_of(&b.agent)
     );
+    // Nothing left to apply.
+    let (_, again) = call(
+        &b.state,
+        "POST",
+        "/api/v1/own-read/apply",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(again["count"], json!(0), "{again}");
+    // The undo puts back exactly what it marked.
+    put_back(&b.state, WRITE_CHANNEL, &b.owner.iter().collect::<Vec<_>>()).await;
+    assert_eq!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await, everything);
+    // A read-scope caller cannot apply it.
+    let (status, _) = call(&b.state, "POST", "/api/v1/own-read/apply", READ_TOKEN, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -213,8 +392,10 @@ async fn a_message_this_server_posted_is_his() {
 }
 
 #[tokio::test]
-async fn done_through_here_writes_no_mark_for_his_messages() {
+async fn done_through_here_clears_what_was_waiting_his_put_back_included() {
     let b = bridge();
+    todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await;
+    put_back(&b.state, WRITE_CHANNEL, &[&b.owner[1]]).await;
     let (status, body) = call(
         &b.state,
         "POST",
@@ -224,11 +405,22 @@ async fn done_through_here_writes_no_mark_for_his_messages() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // Only the agent's: a mark for one of his would outlast the setting.
+    // What it cleared is what was waiting: the agent's, and the one of his he put back. The other of
+    // his started read, and is not in the set an undo would put back.
+    let cleared: BTreeSet<String> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|id| id.as_str().expect("id").to_owned())
+        .collect();
+    assert_eq!(
+        cleared,
+        set_of(b.agent.iter().chain([&b.owner[1]])),
+        "{body}"
+    );
     assert_eq!(
         held(&b.store, WRITE_CHANNEL).await,
-        set_of(&b.agent),
-        "{body}"
+        set_of(b.owner.iter().chain(&b.agent))
     );
 }
 
@@ -246,7 +438,8 @@ async fn a_purge_forgets_the_choice_with_the_settings() {
     assert_eq!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await.len(), 4);
     let (status, body) = call(&b.state, "DELETE", "/api/v1/storage", WRITE_TOKEN, None).await;
     assert!(status.is_success(), "{status}: {body}");
-    // The setting went with the purge, so the shipped default stands again: on.
+    // The setting went with the purge, so the shipped default stands again: on. And so did the
+    // record of which of his messages were decided, so each is first seen again.
     assert_eq!(
         todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await,
         set_of(&b.agent)
@@ -347,7 +540,11 @@ async fn slack_his_messages_are_read_and_the_apps_are_not() {
             "{stamp} is missing from {left:?}"
         );
     }
-    assert!(held(&store, CH).await.is_empty());
+    // His question and his reply in its thread, which the to-do list's window holds too.
+    assert_eq!(
+        held(&store, CH).await,
+        BTreeSet::from([id_of(&stamps.question), id_of(&stamps.follow_up)])
+    );
     // The page is told his account, which only `[owner] user_ids` names.
     let config = get(&app, "/api/v1/client-config", READ_TOKEN).await;
     assert_eq!(config["owner_author_ids"], json!([OWNER]), "{config}");
@@ -374,6 +571,18 @@ async fn slack_a_thread_mixing_his_messages_and_the_apps_leaves_only_the_apps_to
         .filter_map(|message| message["id"].as_str())
         .collect();
     assert!(ids.contains(&id_of(&stamps.follow_up).as_str()), "{thread}");
+    // The thread's read told the page his reply is Done, and the app's answer is not.
+    let done: Vec<&str> = thread["dismissed"]
+        .as_array()
+        .expect("dismissed")
+        .iter()
+        .filter_map(|id| id.as_str())
+        .collect();
+    assert!(
+        done.contains(&id_of(&stamps.follow_up).as_str()),
+        "{thread}"
+    );
+    assert!(!done.contains(&id_of(&stamps.answer).as_str()), "{thread}");
     let left = todo(&app, CH, WRITE_TOKEN).await;
     for his in [&stamps.question, &stamps.follow_up] {
         assert!(
@@ -381,5 +590,8 @@ async fn slack_a_thread_mixing_his_messages_and_the_apps_leaves_only_the_apps_to
             "{his} is still to do: {left:?}"
         );
     }
-    assert!(held(&store, CH).await.is_empty());
+    assert_eq!(
+        held(&store, CH).await,
+        BTreeSet::from([id_of(&stamps.question), id_of(&stamps.follow_up)])
+    );
 }
