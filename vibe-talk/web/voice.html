@@ -1556,6 +1556,28 @@
                     </div>
                   </section>
 
+                  <section class="settings-group">
+                    <div class="group-head">
+                      <h3 title="A link to a message in a channel this app reads opens it here; Back comes back."><button class="fold-toggle" id="fold-message-links" type="button" aria-expanded="false" aria-controls="fold-message-links-body">Message links</button></h3>
+                      <button class="help-link" id="help-link-message-links" type="button" data-help="message-links" aria-label="About message links" title="A link to a message in a channel this app reads opens it here; Back comes back.">?</button>
+                    </div>
+                    <div class="fold-body" id="fold-message-links-body" hidden="until-found">
+                      <!--
+                        `#543 in-app-message-links`. ON by default. The owner, 2026-10-26: "I would prefer
+                        to keep these message links in vibe talk by default because you could always follow
+                        the link in vibe talk and then if you really want to copy the slack link from there."
+                        The server marks every link to a chat message (src/message_links.rs); web/voice.js
+                        keeps the tap here when the channel is one this app reads, and the gesture or the
+                        browser's Back returns to where the reader was. Off, every such link opens the chat
+                        service as any link does. Synced, as the other switches in Messages are.
+                      -->
+                      <label class="toggle">
+                        <input id="in-app-links" type="checkbox" checked />
+                        Open links to messages here, in this app
+                      </label>
+                    </div>
+                  </section>
+
                   <!--
                     `#193 compose-draft-loss`. A send dismissed from the outbox unsent is not gone at one
                     tap: it is kept here, on this device only, for a week (the newest ten), and Put back
@@ -2874,6 +2896,25 @@
                 parentheses that the same author has used to start more than one message in the
                 channel. Anything else is drawn as written. Turn this off to see every first line
                 as it was written.
+              </p>
+            </details>
+
+            <details id="help-message-links" class="help-entry">
+              <summary><h2>Message links</h2></summary>
+              <p class="hint">
+                Messages often point at earlier ones with a link copied from the chat service. With
+                this on, a link to a message in a channel this app reads <strong>opens the message
+                here</strong>: the channel and view change if they need to, a reply opens in its
+                thread, and the message is brought on screen and lit for a moment. A link whose text
+                was only its address is shown as <code>#channel › message</code>.
+              </p>
+              <p class="hint">
+                The <strong>back gesture</strong>, or the browser's Back, returns to exactly where you
+                were before the link, and several links followed one after another go back one at a
+                time. From the message itself, its <strong>⋯</strong> menu still opens it in the chat
+                service or copies the service's own link. A link to a channel this app does not read
+                opens the chat service, as it always did. Turn this off to have every message link
+                open the chat service.
               </p>
             </details>
 

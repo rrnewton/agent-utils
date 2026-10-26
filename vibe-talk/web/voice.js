@@ -73,6 +73,7 @@ const MARKER_KEY = "vibe-talk.voice.place-marker";
 const COMBINE_KEY = "vibe-talk.voice.combine";
 const HIDE_EMPTY_KEY = "vibe-talk.voice.hide-empty";
 const RICH_HEADERS_KEY = "vibe-talk.voice.rich-headers";
+const IN_APP_LINKS_KEY = "vibe-talk.voice.in-app-links";
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
 // --- two columns on a desk: which column the code is working on -------------------------------
@@ -157,7 +158,7 @@ const ALL_CHANNELS = "*";
  * @overload
  * @param {"api-token" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
  *   | "card-max-lines" | "collapsed-lines"
- *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "mark-own-read" | "mic-auto-gain"
+ *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "in-app-links" | "mark-own-read" | "mic-auto-gain"
  *   | "mic-echo-cancellation" | "side-compose-grow"
  *   | "message-cache-enabled"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
@@ -186,7 +187,7 @@ const ALL_CHANNELS = "*";
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help"
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-card-max-lines" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-opening-links" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-card-max-lines" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-opening-links" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-message-links" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
@@ -196,7 +197,7 @@ const ALL_CHANNELS = "*";
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-card-max-lines" | "help-link-channel-alias" | "help-link-collapsed-lines"
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar" | "help-link-empty-messages"
  *   | "help-link-identities" | "help-link-keyboard"
- *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
+ *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-message-links" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
  *   | "help-link-speech-prep"
  *   | "help-link-message-cache" | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
@@ -996,7 +997,18 @@ function closeOpenMenu(name) {
  * @returns {string[]}
  */
 function backLevels() {
-  if (sideActive) return inColumn(columns.main, backLevels);
+  // `#543 in-app-message-links`. A jump by a link is a level over what was open when it was taken.
+  return withLinkJumps(screenLevelsNow());
+}
+
+/**
+ * What is open now, as levels, the first-opened first, without the jumps taken by links. Read in the
+ * left column, whose state is the page's (`COLUMN_STATE`).
+ *
+ * @returns {string[]}
+ */
+function screenLevelsNow() {
+  if (sideActive) return inColumn(columns.main, screenLevelsNow);
   const levels = screenLevels(currentScreen);
   // On top of everything, in every browser: see "A MENU IS AN ENTRY TOO".
   levels.push(...openMenus());
@@ -1070,6 +1082,7 @@ function closeBackLevel(tag) {
   else if (tag === "side") closeSideByX();
   else if (tag === "list") threadListBack();
   else if (tag === "thread") leaveThread();
+  else if (tag === "jump") returnFromLinkJump();
 }
 
 /**
@@ -1091,6 +1104,9 @@ function closeBackLevelsTo(target) {
       backRefused = said;
       return;
     }
+    // `#543 in-app-message-links`. Undoing a jump puts back everything under it as it was, whatever
+    // is open as it begins: nothing under it is closed on its account.
+    if (levels[levels.length - 1] === "jump") return;
   }
 }
 
@@ -1941,6 +1957,332 @@ async function copyDeepLink(message) {
   return copied;
 }
 
+// --- in-app message links (#543 in-app-message-links) -----------------------------------------
+//
+// The owner, 2026-10-26, of a thread whose messages cite earlier ones by their Slack permalinks:
+// "Threads like this are actually really horrible on mobile … It would be great if we could recognize
+// chat links and translate them into vibe talk links to jump there in the client directly. It would
+// also be great if our jump worked with the back gesture in Android so we could jump back after we look
+// at the message. I would prefer to keep these message links in vibe talk by default."
+//
+// THE SERVER RECOGNIZES, THE PAGE DECIDES. The server marks every link in a rendered body whose address
+// is a message's, a thread's or a conversation's in a service it reads (src/message_links.rs): its
+// `data-msg` says the channel, the message and the thread, in this server's own ids. The address is
+// untouched. As the body is drawn (`wireMessageLinks`), a marked link becomes this app's when the
+// switch is on (`inAppLinks`, Settings' Message links, ON by default and synced) and the channel is
+// one this server reads: a link whose text was its own address is shown as `#channel › message`, and a
+// tap jumps (`jumpToMessageLink`) instead of leaving. A modified click — a new tab, a new window — and
+// a link the page does not take still go where the address goes, and from the message itself the ⋯
+// menu still opens or copies the service's own link (`#408`, `#409`).
+//
+// THE JUMP walks the way a `#462` link's open does: the channel switched if it must be, a reply's
+// thread opened over the view it was read from, a root message's view kept where it can show it, and
+// the message fetched around and landed on by the reply arrow's own walk (`seekMessage`).
+//
+// BACK COMES BACK. Each jump is one level of `#304`'s Back stack (`jump`), so it is one history entry:
+// the gesture, the browser's Back and a mouse's back button return to where the reader was — the
+// channel, the view, the thread open, and the message their eye was on at the same height
+// (`linkJumpSpot`, `returnToLinkSpot`). A jump is a level over everything that was open when it was
+// taken, and what it opened itself is part of it rather than a level of its own, so ONE Back undoes
+// one jump, however much it changed; what the reader opens after landing is a level over the jump, as
+// anywhere. Several jumps stack, each Back undoing one. Nothing else is pushed: scrolling is no place.
+
+/** Whether a link to a message opens it here. ON unless the reader has turned it off. */
+let inAppLinks = true;
+
+function applyInAppLinks(on) {
+  inAppLinks = Boolean(on);
+  el("in-app-links").checked = inAppLinks;
+  try {
+    localStorage.setItem(IN_APP_LINKS_KEY, inAppLinks ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+}
+
+/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
+function storedInAppLinks() {
+  return localStorage.getItem(IN_APP_LINKS_KEY) !== "0";
+}
+
+/**
+ * @typedef {{service: string, channel: string, message: string | null, thread: string | null}} MessageLinkRef
+ * @typedef {{place: ChannelPlace | null, column: "main" | "side", pinned: boolean, anchor: string | null,
+ *   offset: number, focus: DeepLinkRef | null}} LinkSpot
+ * @typedef {{spot: LinkSpot, below: string[], landed: string[] | null}} LinkJump
+ */
+
+/** What a link's `data-msg` names: `service:channel:message:thread`, each escaped; null for any other shape. */
+function messageLinkRef(text) {
+  const parts = String(text || "").split(":");
+  if (parts.length !== 4) return null;
+  try {
+    const [service, channel, message, thread] = parts.map((part) => decodeURIComponent(part));
+    if (!service || !channel || [channel, message, thread].some((part) => part.length > DEEP_LINK_PART_MAX)) return null;
+    return { service, channel, message: message || null, thread: thread || null };
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** Whether a link to `ref` is this app's now: the switch on, and its channel one this server reads. */
+function keepsInApp(ref) {
+  return inAppLinks && Boolean(ref) && knownChannels.some((channel) => String(channel.id) === ref.channel);
+}
+
+/** The words for a link to `ref` whose text was only its address: where it goes, in this app's names. */
+function messageLinkLabel(ref) {
+  const what = ref.message ? (ref.thread ? "reply" : "message") : ref.thread ? "thread" : null;
+  const channel = `#${channelLabel(ref.channel)}`;
+  return what ? `${channel} › ${what}` : channel;
+}
+
+/**
+ * Make the links to messages in a body just drawn this app's, where they are (see the head of this
+ * section): each one marked by the server is given a tap that jumps, decided again when it is tapped,
+ * and one this app takes is marked for the stylesheet and, if its text was its address, named.
+ */
+function wireMessageLinks(box) {
+  const walk = (node) => {
+    for (const kid of node.children) {
+      if (String(kid.tagName).toLowerCase() !== "a") {
+        walk(kid);
+        continue;
+      }
+      const ref = messageLinkRef(kid.getAttribute("data-msg"));
+      if (!ref) continue;
+      kid.addEventListener("click", inThisColumn((event) => onMessageLinkTap(ref, event)));
+      if (!keepsInApp(ref)) continue;
+      const href = String(kid.getAttribute("href") || "");
+      kid.setAttribute("data-in-app", "");
+      if (renderedText(kid) === href) {
+        const label = messageLinkLabel(ref);
+        kid.replaceChildren(document.createTextNode(label));
+      }
+      kid.setAttribute("title", `Opens here — ${href}`);
+    }
+  };
+  walk(box);
+}
+
+/**
+ * A tap on a link to a message: a jump, when the link is this app's and nothing asks for another tab.
+ * Otherwise the browser follows the address, as for any link.
+ *
+ * @param {MessageLinkRef} ref
+ * @param {any} event
+ */
+function onMessageLinkTap(ref, event) {
+  if (!keepsInApp(ref)) return;
+  if (event && (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || (event.button || 0) > 0)) return;
+  if (event && typeof event.preventDefault === "function") event.preventDefault();
+  if (event && typeof event.stopPropagation === "function") event.stopPropagation();
+  void guardQuietly(jumpToMessageLink)(ref);
+}
+
+/** The jumps taken by links, the first first; the last is the one a Back undoes. */
+let linkJumps = /** @type {LinkJump[]} */ ([]);
+/** Each jump and each return takes a ticket: a later one ends one still under way. */
+let linkJumpTicket = 0;
+
+/**
+ * Where the reader is, to come back to: the place, the column, and the message their eye is on.
+ *
+ * @returns {LinkSpot}
+ */
+function linkJumpSpot() {
+  const column = sideActive ? "side" : "main";
+  const place = channelPlace();
+  const mark = captureScroll();
+  const anchor = mark.anchor;
+  return {
+    place, column, pinned: mark.pinned,
+    anchor: anchor ? anchor.getAttribute("data-context-id") || idsOf(anchor)[0] || null : null,
+    offset: anchor ? mark.top - listPlaceTop(el("scroll-area")) : 0,
+    focus: deepLinkFocus,
+  };
+}
+
+/**
+ * The levels a Back would close, with the jumps taken by links among them: the levels open when the
+ * last jump was taken, the jump, and what has been opened over it since it landed. While it is under
+ * way, nothing it opens is a level of its own; and a level it opened that is closed is forgotten, so
+ * a level opened again after it is one over the jump.
+ *
+ * @param {string[]} levels what is open, as `backLevels` reads it without the jumps
+ */
+function withLinkJumps(levels) {
+  const top = linkJumps[linkJumps.length - 1];
+  if (!top) return levels;
+  if (top.landed === null) return [...top.below, "jump"];
+  let common = 0;
+  while (common < top.landed.length && top.landed[common] === levels[common]) common += 1;
+  if (common < top.landed.length) top.landed = top.landed.slice(0, common);
+  return [...top.below, "jump", ...levels.slice(common)];
+}
+
+/** Wait for the channel on screen to have read the view it shows, or to be left; false when it was left. */
+async function linkJumpRead(channel, ticket) {
+  await waitForDeepLink(() => ticket !== linkJumpTicket || String(el("discord-channel").value) !== channel ||
+    (timelineReadsStarted > 0 && channelCanon.views.has(viewKey()) && !discordFetchInFlight));
+  return ticket === linkJumpTicket && String(el("discord-channel").value) === channel;
+}
+
+/** Choose channel `channel` as a link's arrival, which is no choice of the reader's (`#462`). */
+function arriveOnChannel(channel) {
+  el("discord-channel").value = channel;
+  const wasShowing = deepLinkShowing;
+  deepLinkShowing = true;
+  try {
+    changeSelectedChannel();
+  } finally {
+    deepLinkShowing = wasShowing;
+  }
+}
+
+/** Put channel place `place` on as an arrival: by the views' own choosing, or a thread by its id. */
+function arriveAtPlace(place) {
+  if (visitKey(channelPlace()) === visitKey(place)) return;
+  if (channelPlaceShowable(place)) {
+    showChannelPlace(place);
+  } else if (place.view === "thread" && place.thread) {
+    // Not yet known is not gone: opened by id, as a link's thread is, and named by the read after.
+    const wasShowing = deepLinkShowing;
+    deepLinkShowing = true;
+    try {
+      chooseOneColumn({ view: "thread", thread: place.thread, summary: null, origin: place.origin || "main" });
+    } finally {
+      deepLinkShowing = wasShowing;
+    }
+  }
+}
+
+/**
+ * Jump to what a link names: see THE JUMP above. The reader's spot is taken first, and the jump is a
+ * level from the start, so its entry is pushed in the tap's own task and a Back at any point undoes it.
+ *
+ * @param {MessageLinkRef} ref
+ */
+async function jumpToMessageLink(ref) {
+  if (currentScreen !== "main" || currentView !== "discord") return undefined;
+  // Where the reader is, in the column the link was tapped in; the jump itself is the left column's.
+  const spot = linkJumpSpot();
+  return inColumn(columns.main, () => jumpFromSpot(ref, spot));
+}
+
+/**
+ * `jumpToMessageLink` from `spot`, in the left column.
+ *
+ * @param {MessageLinkRef} ref
+ * @param {LinkSpot} spot
+ */
+async function jumpFromSpot(ref, spot) {
+  const here = String(el("discord-channel").value || "");
+  if (ref.channel === here && !ref.message && !ref.thread) {
+    setStatus("That link is to this channel.");
+    return;
+  }
+  const under = linkJumps[linkJumps.length - 1];
+  // A jump still under way when another is taken: what it had opened by now is its own.
+  if (under && under.landed === null) under.landed = screenLevelsNow();
+  /** @type {LinkJump} */
+  const jump = { spot, below: backLevels(), landed: null };
+  linkJumps.push(jump);
+  const ticket = ++linkJumpTicket;
+  scheduleBackSync();
+  try {
+    if (ref.channel !== here) {
+      arriveOnChannel(ref.channel);
+      if (!await linkJumpRead(ref.channel, ticket)) return;
+    }
+    const channel = ref.channel;
+    const now = channelPlace();
+    /** @type {ChannelPlace | null} */
+    let place = null;
+    if (ref.thread && threadingSupported) {
+      const origin = now && now.layout === "one" && (now.view === "main" || now.view === "flat") ? now.view
+        : now && now.view === "thread" && (now.origin === "main" || now.origin === "flat") ? now.origin
+          : defaultChannelView();
+      place = { screen: "main", channel, layout: "one", view: "thread", thread: ref.thread, origin, side: null };
+    } else if (ref.message && now && (now.layout === "list" || (now.layout === "one" && now.view === "thread"))) {
+      // A root message is on the channel's own timeline: the view a thread was opened from, or the
+      // channel's own, where the thread list or a thread cannot show it.
+      const view = now.layout === "one" && (now.origin === "main" || now.origin === "flat") ? now.origin : defaultChannelView();
+      place = { screen: "main", channel, layout: "one", view: view === "flat" ? "flat" : "main", thread: null, origin: null, side: null };
+    }
+    if (place) {
+      arriveAtPlace(place);
+      if (!await linkJumpRead(channel, ticket)) return;
+    }
+    if (!ref.message) {
+      setStatus(ref.thread ? "Here is the linked thread." : `Here is #${channelLabel(channel)}.`);
+      return;
+    }
+    const provider = providerOfChannel(channel);
+    const name = provider && typeof provider.name === "string" && provider.name.trim() ? provider.name.trim() : chatProviderName;
+    deepLinkFocus = { provider: String(name || ref.service).toLowerCase(), channel, message: ref.message, thread: ref.thread };
+    const target = ref.message;
+    await seekMessage(target, () => landOnDeepLink(target),
+      () => threadingSupported && channelView !== "flat" && answeredElsewhere(target));
+    if (ticket === linkJumpTicket && !rowHolding(target)) deepLinkFocus = null;
+  } finally {
+    // Landed, or given up: what is open now is the jump's, and what opens after is over it.
+    if (jump.landed === null && linkJumps.includes(jump)) {
+      jump.landed = screenLevelsNow();
+      scheduleBackSync();
+    }
+  }
+}
+
+/** Undo the last jump: its level goes at once, and the reader is put back where they were. */
+function returnFromLinkJump() {
+  const jump = linkJumps.pop();
+  if (!jump) return;
+  void guardQuietly(returnToLinkSpot)(jump.spot);
+}
+
+/**
+ * Put the reader back on `spot`: its channel, its place, and the message their eye was on, at the same
+ * height — walked back to if it is no longer in the list, as a link's message is.
+ *
+ * @param {LinkSpot} spot
+ */
+async function returnToLinkSpot(spot) {
+  const ticket = ++linkJumpTicket;
+  const place = spot.place;
+  if (!place || currentScreen !== "main" || currentView !== "discord") return;
+  if (!knownChannels.some((channel) => String(channel.id) === place.channel)) return;
+  if (String(el("discord-channel").value) !== place.channel) {
+    arriveOnChannel(place.channel);
+    if (!await linkJumpRead(place.channel, ticket)) return;
+  }
+  arriveAtPlace(place);
+  if (!await linkJumpRead(place.channel, ticket)) return;
+  deepLinkFocus = spot.focus;
+  syncDeepLinkAddress();
+  const column = spot.column === "side" && sideShowing() ? columns.side : columns.main;
+  const put = () => inColumn(column, () => putBackOnSpot(spot));
+  if (spot.pinned || !spot.anchor) {
+    if (spot.pinned) inColumn(column, scrollToNewest);
+    setStatus("Back where you were.");
+    return;
+  }
+  if (put()) return;
+  const anchor = spot.anchor;
+  await inColumn(column, () => seekMessage(anchor, () => ticket === linkJumpTicket && putBackOnSpot(spot),
+    () => threadingSupported && channelView !== "flat" && answeredElsewhere(anchor)));
+}
+
+/** Put the row `spot` names at the height it was, in the column being worked on; false when it is not drawn. */
+function putBackOnSpot(spot) {
+  const row = [...visibleList().children].find((candidate) =>
+    candidate.getAttribute("data-context-id") === spot.anchor || idsOf(candidate).includes(String(spot.anchor)));
+  if (!row) return false;
+  restoreScroll({ pinned: false, anchor: row, top: listPlaceTop(el("scroll-area")) + spot.offset });
+  setStatus("Back where you were.");
+  return true;
+}
+
 // --- screens ----------------------------------------------------------------------------------
 //
 // Three screens, no router and no framework: they are three sections stacked in one grid cell and
@@ -2113,6 +2455,7 @@ const SETTINGS_FOLDS = [
   "empty-messages",
   "combining",
   "rich-headers",
+  "message-links",
   "dismissed",
   "settings-channels",
   "hidden-channels",
@@ -2229,6 +2572,7 @@ const HELP_TOPICS = [
   "empty-messages",
   "combining",
   "rich-headers",
+  "message-links",
   "reading-width",
   "collapsed-lines",
   "card-max-lines",
@@ -31477,6 +31821,8 @@ function messageBody(message) {
   const html = renderedHtmlOf(message);
   if (html !== "") {
     insertSanitizedHtml(box, html);
+    // `#543 in-app-message-links`. A link to a message in a channel this app reads opens it here.
+    wireMessageLinks(box);
   } else {
     const heading = headingOf(message);
     const cut = typeof message.cardRestCut === "number" ? message.cardRestCut : heading ? heading.cut : 0;
@@ -55037,6 +55383,9 @@ function forgetToken() {
   deepLinkApplied = true;
   deepLinkEpoch += 1;
   deepLinkStartMoves = null;
+  // `#543 in-app-message-links`: and the jumps taken by links, whose spots are the signed-out reader's.
+  linkJumps = [];
+  linkJumpTicket += 1;
   try {
     const history = backHistory();
     if (history && typeof window === "object" && window.location) {
@@ -55095,6 +55444,8 @@ const SYNCED_SETTING_KEYS = [
   "vibe-talk.voice.hide-empty",
   "vibe-talk.voice.combine",
   "vibe-talk.voice.rich-headers",
+  // `#543 in-app-message-links`. Whether a link to a message opens it here.
+  "vibe-talk.voice.in-app-links",
   "vibe-talk.voice.collapsed-lines",
   "vibe-talk.voice.hidden-link-kinds",
   "vibe-talk.voice.threads-unpacked",
@@ -55207,6 +55558,10 @@ function applySyncedSetting(key) {
       case HIDE_EMPTY_KEY: applyHideEmptyMessages(storedHideEmptyMessages()); break;
       case COMBINE_KEY: applyCombineMessages(storedCombineMessages()); break;
       case RICH_HEADERS_KEY: applyRichHeaders(storedRichHeaders()); break;
+      case IN_APP_LINKS_KEY:
+        applyInAppLinks(storedInAppLinks());
+        eachColumn(regroupChannelRows);
+        break;
       case COLLAPSED_LINES_KEY:
         applyCollapsedLines(storedCollapsedLines());
         refreshElisionLines();
@@ -55644,6 +55999,7 @@ applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
 applyHideEmptyMessages(storedHideEmptyMessages());
 applyRichHeaders(storedRichHeaders());
+applyInAppLinks(storedInAppLinks());
 applyEnterSends(storedEnterSends());
 // `#340 composer-grow-box`. Drawn as stored, and stored only once the reader ticks one: absent means off.
 renderComposerGrow(storedComposerGrow());
@@ -55815,6 +56171,15 @@ el("rich-headers").addEventListener("change", () => {
       ? "an agent's tag, title and time are shown in the message header."
       : "every message's first line is shown as it was written."
   );
+});
+
+// `#543 in-app-message-links`. Each column drawn again from what it holds, its links decided anew.
+el("in-app-links").addEventListener("change", () => {
+  applyInAppLinks(el("in-app-links").checked);
+  eachColumn(regroupChannelRows);
+  setStatus(el("in-app-links").checked
+    ? "links to messages open here."
+    : "links to messages open the chat service.");
 });
 
 // `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the

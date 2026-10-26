@@ -1012,6 +1012,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#543 in-app-message-links`, in the browser engine: the columns channel with three messages whose
+  # bodies link to earlier messages as the server renders them. At 1280x800 and 393x852 with touch, a
+  # tap on a link to a reply opens its thread and lands on it as one history entry, a real Back closes
+  # it with the reader's message at the height it was; the same for a root up the list, and for two
+  # jumps stacked, each Back undoing one. Nothing leaves for the service.
+  - group: check
+    job: in-app-links-browser
+    desc: a link to a message in a channel the app reads opens it in the app, landed on, as one history entry; a real Back returns to the reader's message at the same height, stacked jumps undone one at a time, in current Chromium at 1280x800 and 393x852 with touch
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/in_app_links_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#408 copy-upstream-link` as `#409 open-upstream-link` leaves it, in the browser engine: the fake
   # channel as Slack, its long question carrying its own address there as a served read would. At
   # 1280x800 and 393x852 its ⋯ menu offers the "Open in Slack" link second under Copy text, wholly
