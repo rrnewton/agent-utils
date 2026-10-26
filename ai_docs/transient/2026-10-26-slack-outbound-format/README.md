@@ -58,6 +58,8 @@ back with the vendor CLI's `slack.message list --content-format=text` (and mrkdw
 and score blank lines kept, table intact, headings and links as in the
 dry-run table.
 
+The approved live run, also on 2026-10-26, is in [live-results.md](live-results.md).
+
 ## Capture fidelity (part 0)
 
 The broken line in the original report came from the bridge capturing a
