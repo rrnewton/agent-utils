@@ -19,6 +19,7 @@ pub mod harness_tui;
 pub(crate) mod inbox;
 pub mod landing_queue;
 pub mod legacy_cli;
+pub mod lock_wait;
 pub mod plugins;
 pub(crate) mod profiles;
 pub(crate) mod prompt_time;

@@ -1121,9 +1121,35 @@ pub trait ManagedApi: AgentApi {
         }
         self.send_text(pane, text)
     }
-    /// Recent scrollback without wrapping, to find text a prompt left in a pane.
+    /// Recent scrollback without wrapping, to find text a prompt left in a pane: at most
+    /// [`SCROLLBACK_LINES`], and no more than the pane holds (its visible rows and the
+    /// scrollback it keeps), when Herdr reports that. A longer read returns nothing more, yet a
+    /// loaded Herdr server took 0.5 to 12.7 s over one that asked a full-screen Claude Code pane
+    /// (89 rows, no scrollback) for 400 lines, against 7 ms for 89 (#556 chat-delivery-latency).
     fn read_scrollback(&self, pane: &str) -> crate::error::Result<String> {
-        self.read(pane, "recent-unwrapped", Some(SCROLLBACK_LINES))
+        let holds = self
+            .pane_info(pane)
+            .ok()
+            .and_then(|info| info.scroll)
+            .and_then(|scroll| {
+                usize::try_from(
+                    scroll
+                        .viewport_rows
+                        .saturating_add(scroll.max_offset_from_bottom),
+                )
+                .ok()
+            })
+            .filter(|rows| *rows > 0);
+        let lines = holds.map_or(SCROLLBACK_LINES, |rows| rows.min(SCROLLBACK_LINES));
+        self.read(pane, "recent-unwrapped", Some(lines))
+    }
+    /// [`Self::read_scrollback`] for each of `panes`, in the same order. The default reads them
+    /// one after another; a client whose reads are independent requests may make them at once.
+    fn read_scrollbacks(&self, panes: &[String]) -> Vec<crate::error::Result<String>> {
+        panes
+            .iter()
+            .map(|pane| self.read_scrollback(pane))
+            .collect()
     }
     /// Resolve an exact live Herdr agent name.
     fn agent_pane(&self, name: &str) -> crate::error::Result<String>;
@@ -1310,6 +1336,28 @@ pub trait ManagedApi: AgentApi {
 impl ManagedApi for HerdrClient {
     fn process_liveness(&self, expected: &CustomProcessIdentity) -> ProcessLiveness {
         HerdrClient::process_liveness(self, expected)
+    }
+    /// Each read is its own Herdr request, and a loaded server can take over 12 s to read a busy
+    /// pane's scrollback, so a send that inspects every running agent's pane makes the reads at
+    /// once, at most [`CONCURRENT_SCROLLBACK_READS`] at a time (#556 chat-delivery-latency).
+    fn read_scrollbacks(&self, panes: &[String]) -> Vec<crate::error::Result<String>> {
+        let mut results = Vec::with_capacity(panes.len());
+        for batch in panes.chunks(CONCURRENT_SCROLLBACK_READS) {
+            std::thread::scope(|scope| {
+                let readers: Vec<_> = batch
+                    .iter()
+                    .map(|pane| scope.spawn(move || self.read_scrollback(pane)))
+                    .collect();
+                for reader in readers {
+                    results.push(reader.join().unwrap_or_else(|_| {
+                        Err(crate::error::AdapterError::unavailable(
+                            "a scrollback read panicked",
+                        ))
+                    }));
+                }
+            });
+        }
+        results
     }
     fn agent_pane(&self, name: &str) -> crate::error::Result<String> {
         HerdrClient::agent_pane(self, name)
@@ -3053,6 +3101,8 @@ fn readback_tail(text: &str) -> String {
 const COUNTERMAND_LOCK: Duration = Duration::from_secs(2);
 /// Lines of scrollback each read-back reads; a read this long may have lost old lines.
 const SCROLLBACK_LINES: usize = 400;
+/// Most scrollback reads one send makes at once: see [`ManagedApi::read_scrollbacks`].
+const CONCURRENT_SCROLLBACK_READS: usize = 8;
 /// Opt-in for countermanding a misroute; by default a misroute is only quarantined.
 const COUNTERMAND_ENV: &str = "AGENTCTL_MISROUTE_COUNTERMAND";
 /// What a program that received someone else's prompt is told after being interrupted.
@@ -3085,6 +3135,28 @@ fn missing_target(error: &impl std::fmt::Display) -> Option<&'static str> {
     None
 }
 
+/// How often `text` shows in the scrollback `screen`, compared as read-back compares it.
+fn occurrences(screen: &str, text: &str) -> usize {
+    let tail = readback_tail(text);
+    if tail.is_empty() {
+        return 0;
+    }
+    readback_form(screen).matches(&tail).count()
+}
+
+/// The read-back state of `pane` that shows the text `count` times now, against the counts
+/// `before` sending: see `WorkspaceClient::observe`.
+fn state_of(count: usize, pane: &str, before: &BTreeMap<String, usize>) -> &'static str {
+    let old_count = before.get(pane).copied().unwrap_or(0);
+    if count > old_count {
+        "fresh"
+    } else if old_count > 0 {
+        "uncertain"
+    } else {
+        "absent"
+    }
+}
+
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// Before sending: how often the prompt shows in the target and, for a prompt long enough
     /// to attribute, in every other registered agent's pane. Only occurrences beyond these are
@@ -3096,9 +3168,11 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         if readback_tail(text).chars().count() >= ATTRIBUTABLE {
             panes.extend(self.peer_panes().into_iter().filter(|peer| peer != pane_id));
         }
+        // The reads are made at once where the client can (#556 chat-delivery-latency).
+        let reads = self.client.read_scrollbacks(&panes);
         let mut windows = BTreeMap::new();
-        for pane in panes {
-            match self.window(&pane, text) {
+        for (pane, read) in panes.into_iter().zip(reads) {
+            match read.map(|screen| occurrences(&screen, text)) {
                 Ok(window) => {
                     windows.insert(pane, window);
                 }
@@ -3124,12 +3198,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
 
     /// How often the text shows in the pane's scrollback.
     fn window(&self, pane: &str, text: &str) -> crate::error::Result<usize> {
-        let screen = self.client.read_scrollback(pane)?;
-        let tail = readback_tail(text);
-        if tail.is_empty() {
-            return Ok(0);
-        }
-        Ok(readback_form(&screen).matches(&tail).count())
+        Ok(occurrences(&self.client.read_scrollback(pane)?, text))
     }
 
     /// How long the target has to show a sent prompt.
@@ -3147,15 +3216,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         text: &str,
         before: &BTreeMap<String, usize>,
     ) -> crate::error::Result<&'static str> {
-        let count = self.window(pane, text)?;
-        let old_count = before.get(pane).copied().unwrap_or(0);
-        Ok(if count > old_count {
-            "fresh"
-        } else if old_count > 0 {
-            "uncertain"
-        } else {
-            "absent"
-        })
+        Ok(state_of(self.window(pane, text)?, pane, before))
     }
 
     /// Wait up to the read-back limit for the prompt to appear newly in the target pane.
@@ -3187,13 +3248,26 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<BTreeMap<String, &'static str>> {
         let deadline = runtime.monotonic() + self.readback_limit();
+        let peers: Vec<String> = before
+            .keys()
+            .filter(|peer| peer.as_str() != pane_id)
+            .cloned()
+            .collect();
+        // The first look at every peer is made at once where the client can.
+        let first = self.client.read_scrollbacks(&peers);
         let mut states = BTreeMap::new();
-        for peer in before.keys().filter(|peer| peer.as_str() != pane_id) {
+        for (peer, read) in peers.iter().zip(first) {
+            let first_look = read.map(|screen| state_of(occurrences(&screen, text), peer, before));
             // A transient read failure in another agent's pane is not evidence about this
             // submission. Retry only the observation, within one shared read-back deadline;
             // never type again or skip a peer whose outcome remains unknown.
+            let mut first_look = Some(first_look);
             let state = loop {
-                match self.observe(peer, text, before) {
+                let look = match first_look.take() {
+                    Some(look) => look,
+                    None => self.observe(peer, text, before),
+                };
+                match look {
                     Ok(state) => break state,
                     Err(error) => {
                         let now = runtime.monotonic();
@@ -4578,6 +4652,8 @@ pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     inherited_workspace: Option<String>,
     /// Executables for agentcloud-backed agents.
     cloud_tools: CloudTools,
+    /// Wait for an agent's lifecycle lock as a priority sender: see [`Self::with_lock_priority`].
+    lock_priority: bool,
     #[cfg(test)]
     revive_wrkslots_executable: Option<PathBuf>,
     /// The caller's process ancestry as tests pretend it; `Some(None)` is a caller that is no
@@ -4603,6 +4679,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             project_workspace_override: None,
             inherited_workspace,
             cloud_tools: CloudTools::default(),
+            lock_priority: false,
             #[cfg(test)]
             revive_wrkslots_executable: None,
             #[cfg(test)]
@@ -4614,6 +4691,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     #[must_use]
     pub fn with_cloud_tools(mut self, tools: CloudTools) -> Self {
         self.cloud_tools = tools;
+        self
+    }
+
+    /// Wait for an agent's lifecycle lock as a priority sender: while this manager waits, other
+    /// agentctl senders stop competing for the lock, so it waits only for the current holder.
+    /// Every managed send holds the lock from enqueue until its delivery is confirmed, and
+    /// without a rank a chat bridge's request for a busy coordinator could lose the race to
+    /// fifteen agent messages in a row (#556 chat-delivery-latency). Meant for senders that
+    /// carry a person's messages; ordinary agent-to-agent sends keep the default.
+    #[must_use]
+    pub fn with_lock_priority(mut self) -> Self {
+        self.lock_priority = true;
         self
     }
 
@@ -4662,9 +4751,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<File> {
         name(agent_name)?;
         agent::create_private_directory(&self.registry, "agent registry", true, true)?;
-        let path = self.registry.join(format!(".{agent_name}.lock"));
+        let path = crate::lock_wait::lock_path(&self.registry, agent_name);
         let file = agent::open_private_lock(&path, "agent lifecycle lock")?;
-        agent::lock_exclusive_with_runtime(&file, &path, "agent lifecycle", runtime)?;
+        // Every sender waits in rank behind any priority sender, and one that has to wait at
+        // all says so, so status and the watcher can show it (#556 chat-delivery-latency).
+        let gate_path = crate::lock_wait::rank_path(&self.registry, agent_name);
+        let gate = agent::open_private_lock(&gate_path, "agent lifecycle rank lock")?;
+        let waiting = std::cell::RefCell::new(None);
+        agent::lock_exclusive_ranked_with_runtime(
+            &file,
+            &path,
+            "agent lifecycle",
+            runtime,
+            (&gate, self.lock_priority),
+            &|| {
+                let mut waiting = waiting.borrow_mut();
+                if waiting.is_none() {
+                    *waiting = Some(crate::lock_wait::register(
+                        &self.registry,
+                        agent_name,
+                        self.lock_priority,
+                    ));
+                }
+            },
+        )?;
         Ok(file)
     }
 
@@ -17145,6 +17255,8 @@ fi
     mod identity;
     /// Launch specs written at start, read at adopt and anchor, and replayed by revive.
     mod launch_spec;
+    /// Priority and visibility of waits for an agent's lifecycle lock.
+    mod lock_rank;
     /// Follow-ups typed into a running Muse turn: steered, proved, withdrawn or held.
     mod muse_followup;
     /// Muse 1.4 paused, idle, staged and working status, and the input each one admits.
