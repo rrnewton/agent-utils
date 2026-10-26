@@ -907,7 +907,11 @@ enum ChatCommand {
         after_help = "Examples:\n  agentctl chat sent --bridge-state ~/.local/state/agentctl/chat\n  agentctl chat sent --bridge-state ~/.local/state/agentctl/chat --request <KEY> --json\n\nEach reply shows when it was sent (or captured, while unsent, or for a record kept before send\ntimes were recorded, which it says) in UTC and how long ago, its\nnumber within its request, the request key, the chat message and thread it answers, and its\noutcome: `sent as <provider message ID>` once the chat provider accepted it, `captured, not yet\nsent`, or `send in progress or outcome unknown`, which the service retries with the same\noperation ID so it is never posted twice. The first 300 characters of each reply follow, every\nline prefixed with `> `. --json prints one document (schema agentctl-chat-sent/v1) with the\nsame fields, times as Unix milliseconds, and each reply's whole text.\n\nThe bridge holds only the replies of requests that are not retired, so the chat thread itself\nis the complete record. It reads under the shared state lock and never writes state or\ncontacts Herdr, a helper, or a provider."
     )]
     Sent(ChatSent),
-    /// Publish one explicit operator root message through the configured helper
+    /// Publish one explicit operator message through the configured helper: a new root message,
+    /// or with --thread-id a reply in an existing thread
+    #[command(
+        after_help = "Examples:\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --request-id \"$(uuidgen | tr A-F a-f)\" --file status.md\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --thread-id spaces/example/threads/one \\\n    --request-id \"$(uuidgen | tr A-F a-f)\" --file check.md\n\nWithout --thread-id the message starts a new thread. With it, the message is a reply in that\nthread, which must be named under the channel (<channel>/threads/<id>); it may be a thread\nthe operator started with an earlier publish. Use the provider's thread name for the root\nmessage: in Slack the thread of <channel>/messages/<ts> is <channel>/threads/<ts>.\n\nOn success it prints one JSON object: version, id (the request UUID), action (send), ok, and\nreceipt.message_id, the provider's name for the posted message; a threaded publish adds\nthread_id. Retry an uncertain outcome only with the identical UUID, channel, thread and text.\nIt neither writes bridge state nor creates a reply route."
+    )]
     Publish(ChatPublish),
     /// Run one bounded delivery, terminal-capture, and outbound recovery pass
     Tick(ChatOperate),
@@ -1081,6 +1085,10 @@ struct ChatPublish {
     /// Exact configured provider channel or space authority
     #[arg(long, value_name = "CHANNEL")]
     channel_id: String,
+    /// Existing thread of the channel to reply in, as <channel>/threads/<id> (default: start a
+    /// new thread with a root message)
+    #[arg(long, value_name = "THREAD", allow_hyphen_values = true)]
+    thread_id: Option<String>,
     /// Caller-owned lowercase RFC 4122 version-4 idempotency UUID
     #[arg(long, value_name = "UUID", value_parser = operation_uuid)]
     request_id: String,
@@ -2510,6 +2518,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             let result = crate::chat_service::publish(
                 &value.state.bridge_state,
                 &value.channel_id,
+                value.thread_id.as_deref(),
                 &value.request_id,
                 &body,
             )
@@ -3152,7 +3161,14 @@ mod tests {
             .err()
             .expect("chat publish help");
         let help = error.to_string();
-        for required in ["--bridge-state", "--channel-id", "--request-id", "--file"] {
+        for required in [
+            "--bridge-state",
+            "--channel-id",
+            "--thread-id",
+            "--request-id",
+            "--file",
+            "receipt.message_id",
+        ] {
             assert!(help.contains(required));
         }
         let retry = Cli::try_parse_from([
@@ -3857,6 +3873,34 @@ mod tests {
         assert_eq!(publish.request_id, uuid);
         assert_eq!(publish.text.as_deref(), Some("hello"));
         assert!(publish.file.is_none());
+        assert!(publish.thread_id.is_none());
+
+        let threaded = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "publish",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--channel-id",
+            "spaces/example",
+            "--thread-id",
+            "spaces/example/threads/one",
+            "--request-id",
+            uuid,
+            "--file",
+            "message.txt",
+        ])
+        .expect("threaded publish");
+        let Some(Commands::Chat(Chat {
+            command: ChatCommand::Publish(threaded),
+        })) = threaded.command
+        else {
+            panic!("expected threaded publish command");
+        };
+        assert_eq!(
+            threaded.thread_id.as_deref(),
+            Some("spaces/example/threads/one")
+        );
 
         assert!(Cli::try_parse_from([
             "agentctl",

@@ -31,8 +31,8 @@ use crate::chat_events::{self, PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
     CoordinatorDeliveryResult, DeliveryAlarm, DeliveryEntry, OutboundCancellation, OutboundFailure,
-    ReplyRoute, ReplyRouteEntry, ReplyStoreOutcome, RequestPhase, RootMessageSubmission,
-    RootMessageTransport, SNAPSHOT_LINES,
+    ReplyRoute, ReplyRouteEntry, ReplyStoreOutcome, ReplySubmission, ReplyTransport, RequestPhase,
+    RootMessageSubmission, RootMessageTransport, SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
 use crate::error::AdapterErrorKind;
@@ -375,14 +375,18 @@ pub fn sent_replies(
     Ok(BridgeState::inspect(state_root)?.sent_replies(request, last, json)?)
 }
 
-/// Publish one explicit owner/operator root message without mutating durable bridge state.
+/// Publish one explicit owner/operator message without mutating durable bridge state: a new root
+/// message, or, with `thread_id`, a reply in an existing thread of the same channel.
 ///
-/// The configured channel authority and request are validated before the exact configured helper
-/// is pinned or spawned. The caller owns the UUID across any retry whose provider outcome is
-/// uncertain; this command deliberately does not create an event-loop reply record.
+/// The configured channel authority, the thread (named under the channel, as
+/// `<channel>/threads/<id>`), and the request are validated before the exact configured helper is
+/// pinned or spawned. The caller owns the UUID across any retry whose provider outcome is
+/// uncertain; this command deliberately does not create an event-loop reply record. The receipt
+/// names the posted message, so a caller can thread later messages under a root it published.
 pub fn publish(
     state_root: &Path,
     channel_id: &str,
+    thread_id: Option<&str>,
     request_id: &str,
     body: &str,
 ) -> Result<Value, ChatServiceError> {
@@ -407,25 +411,51 @@ pub fn publish(
             "chat publish channel is outside the configured channel_ids authority".to_owned(),
         ));
     }
-    let submission = RootMessageSubmission {
+    if let Some(thread) = thread_id {
+        let prefix = format!("{channel_id}/");
+        if !thread.starts_with(&prefix) || thread.len() <= prefix.len() {
+            return Err(ChatServiceError::Generation(
+                "chat publish --thread-id must name a thread of the --channel-id channel, as \
+                 <channel>/threads/<id>"
+                    .to_owned(),
+            ));
+        }
+    }
+    let root = RootMessageSubmission {
         channel_id,
         body,
         request_id,
     };
-    chat_runtime::validate_root_message_submission(&submission)?;
+    chat_runtime::validate_root_message_submission(&root)?;
+    let reply = thread_id.map(|thread_id| ReplySubmission {
+        channel_id,
+        thread_id,
+        body,
+        request_id,
+    });
+    if let Some(reply) = reply.as_ref() {
+        chat_runtime::validate_reply_submission(reply)?;
+    }
     let mut transport = state.outbound_transport()?.ok_or_else(|| {
         ChatServiceError::Generation(
             "chat publish requires an explicit outbound_command helper".to_owned(),
         )
     })?;
-    let message_id = transport.publish_root(submission)?;
-    Ok(json!({
+    let message_id = match reply {
+        Some(reply) => transport.send(reply)?,
+        None => transport.publish_root(root)?,
+    };
+    let mut receipt = json!({
         "version": 1,
         "id": request_id,
         "action": "send",
         "ok": true,
         "receipt": {"message_id": message_id},
-    }))
+    });
+    if let Some(thread) = thread_id {
+        receipt["thread_id"] = json!(thread);
+    }
+    Ok(receipt)
 }
 
 /// Close capture for one exact request and durably retire it when terminal and replay-safe.
@@ -8391,6 +8421,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         let error = publish(
             &root,
             "spaces/denied",
+            None,
             "123e4567-e89b-42d3-a456-426614174000",
             "operator message",
         )
@@ -8454,8 +8485,14 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         .expect("initialize state");
         let state_before = state_namespace_snapshot(&root);
 
-        let receipt = publish(&root, "spaces/allowed", request_id, "operator message")
-            .expect("publish root message");
+        let receipt = publish(
+            &root,
+            "spaces/allowed",
+            None,
+            request_id,
+            "operator message",
+        )
+        .expect("publish root message");
         assert_eq!(
             receipt,
             json!({
@@ -8464,6 +8501,156 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 "action": "send",
                 "ok": true,
                 "receipt": {"message_id": "spaces/allowed/messages/root"},
+            })
+        );
+        assert_eq!(state_namespace_snapshot(&root), state_before);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn publish_refuses_a_thread_outside_the_channel_before_helper_open_and_state_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-chat-publish-thread-authority-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private fixture");
+        BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
+                channel_ids: vec!["spaces/allowed".to_owned(), "spaces/other".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
+                agent_name: "coordinator".to_owned(),
+                agent_label: "coordinator".to_owned(),
+                outbound_enabled: true,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
+                backend_configuration: None,
+                outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    executable: "/definitely/missing/helper".into(),
+                    arguments: Vec::new(),
+                    environment: Vec::new(),
+                    timeout_millis: 1_000,
+                    shutdown_grace_millis: 0,
+                }),
+                reply_alias_range: None,
+            },
+        )
+        .expect("initialize state without opening helper");
+        let state_before = state_namespace_snapshot(&root);
+
+        for thread in [
+            "spaces/other/threads/root",
+            "spaces/allowed/",
+            "spaces/allowedx/threads/root",
+            "threads/root",
+        ] {
+            let error = publish(
+                &root,
+                "spaces/allowed",
+                Some(thread),
+                "123e4567-e89b-42d3-a456-426614174000",
+                "operator message",
+            )
+            .expect_err("thread outside the channel");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must name a thread of the --channel-id channel"),
+                "{thread}: {error}"
+            );
+        }
+        let error = publish(
+            &root,
+            "spaces/allowed",
+            Some("spaces/allowed/threads/one\ntwo"),
+            "123e4567-e89b-42d3-a456-426614174000",
+            "operator message",
+        )
+        .expect_err("multiline thread");
+        assert!(
+            error.to_string().contains("thread resource"),
+            "multiline thread: {error}"
+        );
+        assert_eq!(state_namespace_snapshot(&root), state_before);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn publish_with_thread_id_sends_the_thread_and_returns_its_receipt() {
+        let fixture = std::env::temp_dir().join(format!(
+            "agentctl-chat-publish-thread-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&fixture).expect("create fixture");
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).expect("private fixture");
+        let helper = fixture.join("helper");
+        fs::copy(
+            fs::canonicalize("/bin/sh").expect("canonical shell"),
+            &helper,
+        )
+        .expect("copy native helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("private helper");
+        let request_id = "123e4567-e89b-42d3-a456-426614174001";
+        let response = format!(
+            "{{\"version\":1,\"id\":\"{request_id}\",\"action\":\"send\",\"ok\":true,\"receipt\":{{\"message_id\":\"spaces/allowed/messages/reply\"}}}}"
+        );
+        // The helper answers only a send whose thread is exactly the requested one.
+        let script = format!(
+            "IFS= read -r request || exit 2; case \"$request\" in *'\"thread_id\":\"spaces/allowed/threads/root\"'*) ;; *) exit 3;; esac; printf '%s\\n' '{response}'"
+        );
+        let root = fixture.join("state");
+        BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
+                channel_ids: vec!["spaces/allowed".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
+                agent_name: "coordinator".to_owned(),
+                agent_label: "coordinator".to_owned(),
+                outbound_enabled: true,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
+                backend_configuration: None,
+                outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    executable: helper,
+                    arguments: vec!["-c".to_owned(), script],
+                    environment: Vec::new(),
+                    timeout_millis: 2_000,
+                    shutdown_grace_millis: 50,
+                }),
+                reply_alias_range: None,
+            },
+        )
+        .expect("initialize state");
+        let state_before = state_namespace_snapshot(&root);
+
+        let receipt = publish(
+            &root,
+            "spaces/allowed",
+            Some("spaces/allowed/threads/root"),
+            request_id,
+            "operator check",
+        )
+        .expect("publish thread reply");
+        assert_eq!(
+            receipt,
+            json!({
+                "version": 1,
+                "id": request_id,
+                "action": "send",
+                "ok": true,
+                "receipt": {"message_id": "spaces/allowed/messages/reply"},
+                "thread_id": "spaces/allowed/threads/root",
             })
         );
         assert_eq!(state_namespace_snapshot(&root), state_before);

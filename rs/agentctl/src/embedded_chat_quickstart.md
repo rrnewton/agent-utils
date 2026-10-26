@@ -102,8 +102,9 @@ Use `agentctl chat status --bridge-state DIR` for a read-only durable status
 snapshot. Stop `run` before `agentctl chat tick --bridge-state DIR`, which runs
 one bounded recovery pass. `agentctl chat publish --bridge-state DIR
 --channel-id CHANNEL --request-id UUID TEXT` is the explicit operator-only way
-to send a root message; it does not mutate bridge state or act as an event-loop
-reply. `agentctl chat thread --bridge-state DIR --thread THREAD` prints one
+to send a root message, and with `--thread-id THREAD` a reply in an existing
+thread; it prints the posted message's ID and does not mutate bridge state or
+act as an event-loop reply. `agentctl chat thread --bridge-state DIR --thread THREAD` prints one
 thread's retained messages, oldest first; a request prompt for a reply in an
 existing thread prints this command, with absolute paths.
 

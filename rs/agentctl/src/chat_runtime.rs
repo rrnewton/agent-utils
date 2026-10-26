@@ -4049,6 +4049,13 @@ fn validate_outbound_send(
     Ok(())
 }
 
+/// Validate one threaded reply submission before any helper launch.
+pub fn validate_reply_submission(
+    submission: &ReplySubmission<'_>,
+) -> std::result::Result<(), OutboundFailure> {
+    validate_outbound_send(submission)
+}
+
 /// Validate one explicit operator-authored root message before any helper launch.
 pub fn validate_root_message_submission(
     submission: &RootMessageSubmission<'_>,

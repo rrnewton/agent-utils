@@ -635,11 +635,32 @@ agentctl chat publish \
 outbound-enabled state and an exact channel from `channel_ids`, validates a
 nonempty body of at most 30,000 UTF-8 bytes, and sends `thread_id: null`. The
 lowercase RFC 4122 version-4 UUID is caller-owned; an uncertain result may be
-retried only with the identical UUID, channel, and body. The command runs the
-helper only through the reviewed process supervisor, binds the returned message
-resource to the requested channel, and prints the exact v1 success receipt. It
+retried only with the identical UUID, channel, thread, and body. The command
+runs the helper only through the reviewed process supervisor, binds the
+returned message resource to the requested channel, and prints the exact v1
+success receipt, whose `receipt.message_id` names the posted message. It
 neither writes bridge state nor creates an event-loop reply route; this is an
 explicit operator action, not automatic subscription behavior.
+
+With `--thread-id THREAD` the message is instead a reply in an existing thread
+of the same channel, such as a thread the operator started with an earlier
+`publish`, so a series of status messages can hang under one root message:
+
+```sh
+agentctl chat publish \
+  --bridge-state /home/me/.local/state/agentctl/project-chat \
+  --channel-id spaces/example \
+  --thread-id spaces/example/threads/one \
+  --request-id 123e4567-e89b-42d3-a456-426614174001 \
+  --file check.md
+```
+
+The thread must be named under the channel (`<channel>/threads/<id>`); a thread
+of another channel is refused before the helper starts. The helper receives
+that `thread_id` exactly as it would for a reply to a request, and the printed
+receipt adds `thread_id`. Each provider names a root message's thread its own
+way: in Slack, the thread of `C0123456789/messages/1700000000.000100` is
+`C0123456789/threads/1700000000.000100`.
 
 Explicitly close reply capture for an old request:
 
