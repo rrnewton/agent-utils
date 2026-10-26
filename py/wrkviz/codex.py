@@ -678,7 +678,34 @@ def _write_snapshot_file(
         os.close(parent_fd)
 
 
+#: Discovery reads the metadata line of every rollout under the sessions root, and a project
+#: ingest repeats that for every team sharing the root -- on a host with thousands of rollouts
+#: that was most of each team's ingest. Keyed on the physical file's identity, size and mtime, so
+#: a file that grows or is replaced is read again.
+_FIRST_METADATA_CACHE: dict[tuple[str, int, int, int], dict[str, object] | None] = {}
+
+
 def _first_metadata(path: Path) -> dict[str, object] | None:
+    physical = resolve_source(path)
+    try:
+        identity = physical.stat() if physical is not None else None
+    except OSError:
+        identity = None
+    key = (
+        (str(physical), identity.st_ino, identity.st_size, identity.st_mtime_ns)
+        if physical is not None and identity is not None
+        else None
+    )
+    if key is not None and key in _FIRST_METADATA_CACHE:
+        cached = _FIRST_METADATA_CACHE[key]
+        return dict(cached) if cached is not None else None
+    result = _read_first_metadata(path)
+    if key is not None:
+        _FIRST_METADATA_CACHE[key] = dict(result) if result is not None else None
+    return result
+
+
+def _read_first_metadata(path: Path) -> dict[str, object] | None:
     try:
         line = read_first_line(path)
     except OSError:

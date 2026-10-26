@@ -711,9 +711,18 @@ the one that was asked for.
 Codex ingestion snapshots the newline-complete prefix of every selected rollout before parsing.
 The schema-1 source manifest records each copied path, byte length, line count, digest, and update
 time. Reruns accept exact reuse, a byte-for-byte prefix extension, or a newly discovered descendant;
-disappearance, truncation, prefix rewriting, source-identity changes, and unsafe/symlinked paths
-fail before an existing snapshot is replaced. Parsing is restricted to the paths in that validated
-manifest generation, so an orphan copy from an interrupted attempt is not adopted.
+truncation, prefix rewriting, source-identity changes, and unsafe/symlinked paths fail before an
+existing snapshot is replaced. Parsing is restricted to the paths in that validated manifest
+generation, so an orphan copy from an interrupted attempt is not adopted.
+
+A rollout that disappears upstream is **retired**, not refused: upstream is a feed with its own
+retention and the archive is the record. The archived snapshot is verified against its manifest
+record and stands in for the upstream file unchanged; the record gains `upstream_retired_at` (the
+run that first noticed, sticky) and the ingest receipt's `upstream_retired_sources` lists every
+retired source on every run. A retired source whose own snapshot is missing or no longer matches
+its record still refuses, because that is the archive's copy failing. Claude transcripts follow the
+same rule. An upstream file compressed in place (`X.zst`) is read through `compressed_sources` as
+its decoded bytes, so recorded digests keep matching; the plain spelling wins when both exist.
 
 A logical coordinator history may cross process/session restarts, but this relationship is never
 inferred from temporal proximity. The only authority is an ordered, repeatable
@@ -1030,9 +1039,11 @@ TaskGraph discovery follows provider semantics rather than filename scans. A pro
 session (`parent_id` absent) uses its nonempty `db_name` as the primary task database, falling back
 to its session UUID. Every delegated session uses its UUID even if it inherited a `db_name`.
 `associated_dbs` contributes an additional union of references. A never-observed reference whose
-file does not yet exist is lazy and omitted. A previously snapshotted file that remains referenced
-but disappears is corruption; a source that is deliberately dereferenced is retained as an
-immutable `detached` source so old history does not vanish. A later replacement receives a stable
+file does not yet exist is lazy and omitted. A previously snapshotted file that is gone upstream
+in both spellings is retired and, like a source that is deliberately dereferenced, retained as an
+immutable `detached` source so old history does not vanish. A lineage whose root session database
+is gone upstream re-normalizes from its verified snapshot objects and reports every source in
+`upstream_retired_sources`. A later replacement receives a stable
 per-owner source ordinal: ordinal zero preserves historical event IDs, while later sources use an
 `-sN-` namespace. Shared-source ownership is sticky after first observation; initial ranking favors
 the effective primary reference, then the provider-initial session, shallower lineage, earlier

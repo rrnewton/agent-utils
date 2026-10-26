@@ -3281,14 +3281,26 @@ def test_task_note_allocation_sequence_rollback_is_rejected(tmp_path: Path) -> N
         snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
 
 
-def test_disappeared_task_database_is_rejected(tmp_path: Path) -> None:
+def test_task_database_retired_upstream_is_kept_detached(tmp_path: Path) -> None:
+    # Upstream retention is expected: the archive's snapshot of a task database that is gone
+    # upstream is the record, kept exactly as a dereferenced (detached) source is.
     source, _, task_db = _fixture(tmp_path)
     snapshot = tmp_path / "snapshot"
     first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
     task_db.unlink()
 
-    with pytest.raises(OrcParseError, match="source disappeared"):
-        snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+    second = snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+
+    before = {item.source_path: item for item in first.sources}
+    after = {item.source_path: item for item in second.sources}
+    assert set(after) == set(before)
+    retired = after[".tg/project.db"]
+    assert retired.source_state == "detached"
+    assert retired.sha256 == before[".tg/project.db"].sha256
+    team = load_orc_team(snapshot, ROOT, "orc-test", "UTC", second.sources)
+    assert team.task_notes == load_orc_team(
+        snapshot, ROOT, "orc-test", "UTC", first.sources
+    ).task_notes
 
 
 def test_provider_initial_session_without_name_uses_session_task_database(

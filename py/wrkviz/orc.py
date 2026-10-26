@@ -4246,6 +4246,9 @@ def _plan_snapshot_sources(
         and (
             source.source_state == _SOURCE_STATE_DETACHED
             or source.source_path in newly_detached_paths
+            # Retired upstream: gone in both spellings. Upstream retention is expected and the
+            # archive's snapshot is the record, so it is kept exactly as a detached source is.
+            or not source_exists(_live_source_path(source_root, source.source_path))
         )
     }
     disappeared = sorted(set(previous_by_path) - discovered_paths - frozen_paths)
