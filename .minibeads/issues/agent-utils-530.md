@@ -1,10 +1,11 @@
 ---
 title: 'slack-outbound-format: selectable converted Slack outbound path preserving Markdown fidelity'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-26T14:26:01.776575683+00:00
-updated_at: 2026-10-26T14:26:01.776575683+00:00
+updated_at: 2026-10-26T18:46:21.101952295+00:00
+closed_at: 2026-10-26T18:46:21.101952155+00:00
 ---
 
 # Description
