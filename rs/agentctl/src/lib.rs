@@ -33,6 +33,7 @@ pub mod submission;
 pub mod term;
 pub mod tui_prompts;
 pub mod units;
+pub(crate) mod worker_reset;
 
 /// Reference for the canonical command and its supported adapters.
 pub const USER_GUIDE: &str = include_str!("embedded_userguide.md");

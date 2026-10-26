@@ -232,6 +232,9 @@ enum Commands {
     /// Pause automation input without suspending the harness or its running work
     #[command(after_help = "Example: agentctl pause reviewer")]
     Pause(Named),
+    /// Reset an idle headless turn-runner worker's conversation context
+    #[command(after_help = "Example: agentctl reset worker")]
+    Reset(Named),
     /// Re-enable automation input; queued messages still require drain or send
     #[command(after_help = "Example: agentctl resume reviewer && agentctl drain reviewer")]
     Resume(Named),
@@ -1466,7 +1469,7 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
 // Commands only the Python edition implements: the MCP server, the headless-worker operations,
 // and the polling Chat launcher and its history/context readers. This edition refuses them with
 // exit status 2 and names the Python opt-in, instead of Clap's unrecognised-subcommand error.
-const PYTHON_ONLY_COMMANDS: [&str; 3] = ["migrate", "reset", "repair"];
+const PYTHON_ONLY_COMMANDS: [&str; 2] = ["migrate", "repair"];
 const PYTHON_ONLY_CHAT_COMMANDS: [&str; 1] = ["launch"];
 // Global options whose value is the following argument.
 const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
@@ -2399,6 +2402,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             manager.designate_after(&mut result, &value.agent.name, value.as_coordinator);
             result
         }
+        Commands::Reset(value) => manager.reset(&value.name)?,
         Commands::Pause(value) => manager.pause(&value.name, true)?,
         Commands::Resume(value) => manager.pause(&value.name, false)?,
         Commands::Capabilities

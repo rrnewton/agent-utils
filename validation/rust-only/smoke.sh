@@ -19,8 +19,7 @@ done
 for tool in wrkslots wrkviz parallel-experiment-runner herdr-chat herdr-subagents; do
     echo "needs-python $tool"
 done
-echo "needs-python agentctl migrate (subcommand)"
-echo "needs-python agentctl reset (subcommand)"
+echo "needs-python agentctl migrate (subcommand; folds into the herdr-subagents port)"
 echo "needs-python agentctl repair (subcommand)"
 echo "needs-python agentctl chat launch (subcommand)"
 if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then

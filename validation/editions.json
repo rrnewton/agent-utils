@@ -11,9 +11,8 @@
       "python_entrypoint": "py/bin/agentctl",
       "note": "Rust is primary since the engine-rust-default switch. The subcommands below are the exceptions: they are python-primary with no Rust edition yet, and the Rust edition refuses them by name (rs/agentctl/src/cli.rs PYTHON_ONLY_COMMANDS and PYTHON_ONLY_CHAT_COMMANDS). Fleshing them out is campaign milestone 2: chat history and chat context (adapter transports) moved to Rust in #545 rust-primary-agentctl-chat-readers; chat launch is next.",
       "subcommands": [
-        {"name": "migrate", "primary": "python", "mirror": {"edition": "rust", "state": "absent"}, "parity_check": null, "note": "Headless-worker migration; python-only."},
-        {"name": "reset", "primary": "python", "mirror": {"edition": "rust", "state": "absent"}, "parity_check": null, "note": "Headless-worker operation; python-only."},
-        {"name": "repair", "primary": "python", "mirror": {"edition": "rust", "state": "absent"}, "parity_check": null, "note": "Headless-worker operation; python-only."},
+        {"name": "migrate", "primary": "python", "mirror": {"edition": "rust", "state": "absent"}, "parity_check": null, "note": "Headless-worker migration; stays python-primary until the herdr-subagents port carries it (coordinator decision, #545)."},
+        {"name": "repair", "primary": "python", "mirror": {"edition": "rust", "state": "absent"}, "parity_check": null, "note": "Headless-worker operation; stays python-primary until the herdr-subagents port carries it (coordinator decision, #545)."},
         {"name": "chat launch", "primary": "python", "mirror": {"edition": "rust", "state": "absent"}, "parity_check": null, "note": "Google Chat polling launcher; blocks retiring Python agentctl."}
       ]
     },
