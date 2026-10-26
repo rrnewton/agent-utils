@@ -321,6 +321,7 @@ mod tests {
         AuthConfig {
             read_token: Secret::new("read-token-that-is-long-enough"),
             write_token: Secret::new("write-token-that-is-long-enough"),
+            voice_token: None,
         }
     }
 

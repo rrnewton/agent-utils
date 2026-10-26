@@ -29,6 +29,8 @@ pub const ENV_READ_TOKEN: &str = "VIBE_TALK_READ_TOKEN";
 pub const ENV_WRITE_TOKEN: &str = "VIBE_TALK_WRITE_TOKEN";
 /// Environment variable carrying the dedicated live-adapter token.
 pub const ENV_INGEST_TOKEN: &str = "VIBE_TALK_INGEST_TOKEN";
+/// Environment variable carrying the voice-only token. `#553 voice-ws-relay-auth`.
+pub const ENV_VOICE_TOKEN: &str = "VIBE_TALK_VOICE_TOKEN";
 /// Environment variable selecting read-aloud: `elevenlabs` (default), `browser`, or `conversation`.
 pub const ENV_READ_ALOUD_BACKEND: &str = "VIBE_TALK_READ_ALOUD_BACKEND";
 /// Environment variable carrying the ElevenLabs API key.
@@ -309,6 +311,17 @@ pub struct ReadAloudConfig {
     /// Optional server-side route to the same conversational agent. Useful when the browser uses
     /// a public `wss://` ingress while the application can reach the bridge on loopback.
     pub websocket_url: Option<String>,
+    /// A file holding the token this server presents, as `Authorization: Bearer`, when it dials
+    /// `websocket_url`: another vibe-talk's voice-only token, for read-aloud through that
+    /// server's relay (`#553 voice-ws-relay-auth`). Read at each connection, so a rotated token
+    /// is picked up without a restart. Unset: no header, as before.
+    #[serde(default)]
+    pub websocket_token_file: Option<PathBuf>,
+    /// A PEM file of certificates trusted, in addition to the bundled public roots, when dialing a
+    /// `wss://` `websocket_url`: for a relay whose certificate a private authority issued. Read
+    /// at each connection. `#553 voice-ws-relay-auth`.
+    #[serde(default)]
+    pub websocket_ca_file: Option<PathBuf>,
 }
 
 /// Who the owner is: the person this deployment reads the chat FOR. `#438 voice-owner-identity`.
@@ -1001,6 +1014,10 @@ pub struct AuthConfig {
     pub read_token: Secret,
     /// Token permitting reads AND posting.
     pub write_token: Secret,
+    /// Token permitting ONLY the voice-socket relay, without its chat tools. `#553
+    /// voice-ws-relay-auth`. Handed to another server that reads messages aloud through this
+    /// one's bridge, so it opens no `/api/` route and no `/mcp`. `None`: nothing holds it.
+    pub voice_token: Option<Secret>,
 }
 
 /// Authentication for provider-neutral live-event and change-hint ingestion.
@@ -1095,6 +1112,15 @@ pub struct ConversationConfig {
     pub backend: ConversationBackend,
     /// Stable WebSocket endpoint used by [`ConversationBackend::WebSocket`].
     pub websocket_url: Option<String>,
+    /// The bridge this server relays the voice socket to: an absolute `ws://` or `wss://` URL it
+    /// can reach (on loopback, typically) and nobody else need. `#553 voice-ws-relay-auth`.
+    ///
+    /// Set, the page is handed `/api/v1/voice-socket` with a single-use ticket in place of
+    /// `websocket_url` (whose query, such as `mode` or `tools`, is kept), and that route admits a
+    /// ticket or a bearer token before it dials this URL. A bridge that authenticates nobody can
+    /// then stay off the network. Unset: the page opens `websocket_url` itself, as before.
+    #[serde(default)]
+    pub relay_upstream: Option<String>,
     /// Human-readable label shown in connection details.
     #[serde(default = "default_conversation_label")]
     pub label: String,
@@ -1167,6 +1193,7 @@ impl Default for ConversationConfig {
         Self {
             backend: ConversationBackend::ElevenLabs,
             websocket_url: None,
+            relay_upstream: None,
             label: default_conversation_label(),
             ask_before_send: default_ask_before_send(),
             explicit_send_only: default_explicit_send_only(),
@@ -1367,6 +1394,7 @@ struct FileProvider {
 struct FileAuth {
     read_token: Option<Secret>,
     write_token: Option<Secret>,
+    voice_token: Option<Secret>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1602,10 +1630,25 @@ impl Config {
                     .to_owned(),
             });
         }
+        let voice_token = get(ENV_VOICE_TOKEN)
+            .map(Secret::new)
+            .or(file.auth.voice_token);
+        if let Some(token) = voice_token.as_ref() {
+            check_token_strength("auth.voice_token", token)?;
+            if token == &read_token || token == &write_token {
+                return Err(ConfigError::Invalid {
+                    field: "auth.voice_token".to_owned(),
+                    detail: "must differ from both API tokens, or the voice scope grants reading \
+                             or posting"
+                        .to_owned(),
+                });
+            }
+        }
         let ingest_token = get(ENV_INGEST_TOKEN).map(Secret::new).or(file.ingest.token);
         if let Some(token) = ingest_token.as_ref() {
             check_token_strength("ingest.token", token)?;
-            if token == &read_token || token == &write_token {
+            if token == &read_token || token == &write_token || Some(token) == voice_token.as_ref()
+            {
                 return Err(ConfigError::Invalid {
                     field: "ingest.token".to_owned(),
                     detail: "must differ from both API tokens, because an adapter credential has \
@@ -1703,6 +1746,7 @@ impl Config {
             auth: AuthConfig {
                 read_token,
                 write_token,
+                voice_token,
             },
             ingest: IngestConfig {
                 token: ingest_token,
@@ -1726,6 +1770,8 @@ impl Config {
                     }
                 },
                 websocket_url: file.read_aloud.websocket_url,
+                websocket_token_file: file.read_aloud.websocket_token_file,
+                websocket_ca_file: file.read_aloud.websocket_ca_file,
             },
             speakable,
             render: file.render,
@@ -1779,6 +1825,15 @@ fn speech_hold_checked(
                 conversation.speech_hold_cap_seconds
             ),
         });
+    }
+    // `#553 voice-ws-relay-auth`: the server dials it, so it must be a URL the server can dial.
+    if let Some(url) = conversation.relay_upstream.as_deref().map(str::trim) {
+        if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+            return Err(ConfigError::Invalid {
+                field: "conversation.relay_upstream".to_owned(),
+                detail: format!("{url:?} is not an absolute ws:// or wss:// URL"),
+            });
+        }
     }
     Ok(conversation)
 }

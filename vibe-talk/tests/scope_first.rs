@@ -23,6 +23,9 @@ use vibe_talk::speech_tickets::{Prepared, SpeechTickets};
 use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_TOKEN};
 
 const INGEST_TOKEN: &str = "test-ingest-token-0000000000";
+/// The voice-only token, which opens the voice-socket relay and nothing else. `#553
+/// voice-ws-relay-auth`.
+const VOICE_TOKEN: &str = "test-voice-token-00000000000";
 /// A bearer token that is neither of the configured ones.
 const WRONG_TOKEN: &str = "not-a-configured-token-00000";
 /// A path segment that does not percent-decode to UTF-8, so `Path` refuses it with 400.
@@ -44,6 +47,9 @@ enum Auth {
     /// A pairing code in the body, because the device redeeming it has no token yet. `#369
     /// pairing-link`. Every refusal is one 410, whatever was sent.
     Pairing,
+    /// A page's single-use ticket in the query, or the voice-only token: the voice-socket relay.
+    /// `#553 voice-ws-relay-auth`. No browser token opens it.
+    Relay,
 }
 
 /// What a route reads from the request beyond its path.
@@ -82,7 +88,7 @@ const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Every route the router serves, and who may call it.
 fn inventory() -> Vec<Route> {
-    use Auth::{Ingest, Pairing, Public, Read, Ticket, Write};
+    use Auth::{Ingest, Pairing, Public, Read, Relay, Ticket, Write};
     use Input::{Bytes, Json, Nothing, OwnJson, Query};
     let limit = Query("?limit=5", "?limit=soon");
     vec![
@@ -137,6 +143,8 @@ fn inventory() -> Vec<Route> {
             OwnJson(r#"{"code":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#),
         ),
         route("GET", "/api/v1/voice-session", Write, Nothing),
+        // `#553 voice-ws-relay-auth`.
+        route("GET", "/api/v1/voice-socket", Relay, Nothing),
         route("GET", "/api/v1/voice-agent", Read, Nothing),
         // `#512 voice-recap-private-stack`.
         route(
@@ -604,7 +612,10 @@ fn the_inventory_is_every_route_the_router_serves() {
         let bearer = matches!(route.auth, Auth::Read | Auth::Write);
         if route.path.starts_with("/api/") && !bearer {
             assert!(
-                matches!(route.auth, Auth::Ticket | Auth::Ingest | Auth::Pairing),
+                matches!(
+                    route.auth,
+                    Auth::Ticket | Auth::Ingest | Auth::Pairing | Auth::Relay
+                ),
                 "{} {} is under /api/ without a credential",
                 route.method,
                 route.path
@@ -621,7 +632,10 @@ struct Harness {
 fn harness() -> Harness {
     let text = format!(
         "{}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n",
-        vibe_talk::testing::config_toml()
+        vibe_talk::testing::config_toml().replace(
+            &format!("write_token = \"{WRITE_TOKEN}\"\n"),
+            &format!("write_token = \"{WRITE_TOKEN}\"\nvoice_token = \"{VOICE_TOKEN}\"\n"),
+        )
     );
     let (state, _chat, _voice) = vibe_talk::testing::state_from_toml(&text);
     let tickets = std::sync::Arc::clone(&state.speech_tickets);
@@ -807,9 +821,11 @@ fn requests(route: &Route, token: Option<&'static str>, ticket: &str) -> (Sent, 
 
 /// The callers that may NOT use a route, and the status each must get.
 fn refused_callers(auth: Auth) -> Vec<(Option<&'static str>, StatusCode)> {
+    // The voice token is no browser token: every route but the relay refuses it as unknown.
     let unauthenticated = [
         (None, StatusCode::UNAUTHORIZED),
         (Some(WRONG_TOKEN), StatusCode::UNAUTHORIZED),
+        (Some(VOICE_TOKEN), StatusCode::UNAUTHORIZED),
     ];
     match auth {
         Auth::Public => Vec::new(),
@@ -831,6 +847,13 @@ fn refused_callers(auth: Auth) -> Vec<(Option<&'static str>, StatusCode)> {
             (None, StatusCode::NOT_FOUND),
             (Some(WRITE_TOKEN), StatusCode::NOT_FOUND),
         ],
+        // No ticket, and no voice token: neither browser token opens the relay.
+        Auth::Relay => vec![
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(WRONG_TOKEN), StatusCode::UNAUTHORIZED),
+            (Some(READ_TOKEN), StatusCode::UNAUTHORIZED),
+            (Some(WRITE_TOKEN), StatusCode::UNAUTHORIZED),
+        ],
         // Any bearer token or none: only a live code counts, and none is live here.
         Auth::Pairing => vec![
             (None, StatusCode::GONE),
@@ -848,6 +871,7 @@ fn authorized_tokens(auth: Auth) -> Vec<Option<&'static str>> {
         Auth::Write => vec![Some(WRITE_TOKEN)],
         Auth::Ingest => vec![Some(INGEST_TOKEN)],
         Auth::Ticket => vec![None, Some(WRITE_TOKEN)],
+        Auth::Relay => vec![Some(VOICE_TOKEN)],
         // The code is the credential, and no header grants a redemption.
         Auth::Pairing | Auth::Public => Vec::new(),
     }

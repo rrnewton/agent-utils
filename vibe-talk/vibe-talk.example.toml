@@ -189,6 +189,11 @@ live_poll_seconds = 0
 # Environment: VIBE_TALK_READ_TOKEN / VIBE_TALK_WRITE_TOKEN
 read_token = "REPLACE-ME-at-least-24-characters"
 write_token = "REPLACE-ME-different-and-at-least-24-characters"
+# Optional voice-only token (#553 voice-ws-relay-auth): it opens GET /api/v1/voice-socket, the relay
+# to conversation.relay_upstream, without chat tools, and NO other route. Hand it to another server
+# that reads messages aloud through this one (its read_aloud.websocket_token_file). At least 24
+# characters, different from both tokens above. Environment: VIBE_TALK_VOICE_TOKEN
+# voice_token = "REPLACE-ME-a-third-token-of-at-least-24-characters"
 
 # Optional provider-neutral input for an external adapter. Leave this whole section absent to
 # disable POST /api/v1/live/events, POST /api/v1/live/hints and /api/v1/live/tail. The token is
@@ -243,6 +248,12 @@ backend = "elevenlabs"
 # by another ingress or by a path: read-aloud with backend = "conversation" dials it, and so does the
 # hello that asks the bridge whether it takes a recap (see [replay]), whatever the backend above.
 # websocket_url = "ws://127.0.0.1:7070/ws?mode=voice"
+# Through ANOTHER vibe-talk's relay (#553 voice-ws-relay-auth): that server's voice-only token, read
+# from a file at each connection and sent as Authorization: Bearer, and a PEM file of extra roots
+# when its certificate was issued by a private authority. Both apply to websocket_url above only.
+# websocket_url = "wss://voice-host.example:8443/api/v1/voice-socket?mode=voice"
+# websocket_token_file = "/etc/vibe-talk/voice-relay-token"
+# websocket_ca_file = "/etc/vibe-talk/private-root.pem"
 
 # [render] says how message bodies are drawn on the page. Absent, single newlines are soft.
 # [render]
@@ -340,6 +351,13 @@ enabled = true
 # A bridge that can resume a conversation lists "replay" in session_started.capabilities and takes
 # the replay frame; see [replay] below. With a path above, set read_aloud.websocket_url (above) to
 # this server's own route to the same bridge, so it can ask; it cannot dial the page's host.
+#
+# A bridge that authenticates nobody should not be published as it is (#553 voice-ws-relay-auth).
+# With relay_upstream set, the page is handed GET /api/v1/voice-socket with a single-use ticket (and
+# websocket_url's query, such as mode and tools) instead of websocket_url, and this server relays
+# the socket to relay_upstream, which only it needs to reach: keep the bridge on loopback and send
+# no front-door route to it. auth.voice_token opens the same relay for another server's read-aloud.
+# relay_upstream = "ws://127.0.0.1:7070/ws"
 #
 # "Ask me before the voice agent sends" (#264 voice-send-approval). ON by default: the agent's
 # post_reply only proposes a message, reads it back and asks "Send it?", and nothing is posted

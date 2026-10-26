@@ -64,6 +64,19 @@ pub fn scope_of(header: Option<&str>, config: &AuthConfig) -> Option<Scope> {
     None
 }
 
+/// Whether the presented credential is the voice-only token. `#553 voice-ws-relay-auth`.
+///
+/// Deliberately NOT a [`Scope`]: the voice token opens the voice-socket relay and nothing else, so
+/// [`scope_of`] never recognises it and every `/api/` route and `/mcp` refuse it as they refuse a
+/// token they do not know.
+#[must_use]
+pub fn is_voice_token(header: Option<&str>, config: &AuthConfig) -> bool {
+    match (bearer_token(header), config.voice_token.as_ref()) {
+        (Some(token), Some(voice)) => voice.matches(token),
+        _ => false,
+    }
+}
+
 /// Authorize a request that requires `required`.
 ///
 /// # Errors
@@ -91,6 +104,7 @@ mod tests {
         AuthConfig {
             read_token: Secret::new("read-token-that-is-long-enough"),
             write_token: Secret::new("write-token-that-is-long-enough"),
+            voice_token: None,
         }
     }
 

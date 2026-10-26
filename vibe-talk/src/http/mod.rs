@@ -48,6 +48,10 @@
 //!   token, and one pasted into a bridged channel would otherwise reach every read-scope caller.
 //!   [`redact_layer`] rewrites every `/api/` and `/mcp` answer to the read token as it leaves
 //!   (`#369 pairing-link`).
+//! * `/api/v1/voice-socket` is the voice socket relayed to a bridge only this server reaches
+//!   (`#553 voice-ws-relay-auth`). Its credential is a single-use ticket from the page's own
+//!   voice-session call, or the voice-only token, which opens this route and no other; the door in
+//!   front of routing exempts it for `GET` alone. See [`voice_socket`].
 //! * `/mcp` is the Streamable HTTP MCP endpoint. It requires a bearer token too, and answers a
 //!   credential-less caller with a bland 401 before it reads the body at all.
 
@@ -56,6 +60,7 @@ pub mod api;
 pub mod assets;
 pub mod bearer_layer;
 pub mod redact_layer;
+pub mod voice_socket;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
@@ -204,6 +209,9 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/pair", post(api::mint_pairing))
         .route("/api/v1/pair/redeem", post(api::redeem_pairing))
         .route("/api/v1/voice-session", get(api::voice_session))
+        // `#553 voice-ws-relay-auth`. The voice socket, relayed to `conversation.relay_upstream`:
+        // a page's single-use ticket or the voice-only token, never a browser token.
+        .route("/api/v1/voice-socket", get(voice_socket::relay))
         // `#14 voice-agent-prompt`. READ scope: the prompt is public text from this repository and
         // the tool list is filtered to the caller's own scope, so it discloses nothing the same
         // credential could not learn from `tools/list`. A private bridge fetches it at session open.

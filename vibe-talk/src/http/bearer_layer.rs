@@ -43,11 +43,12 @@ pub async fn require_bearer(
 
 /// Whether a request must carry one of the two browser tokens before it is routed.
 ///
-/// Everything under `/api/` does, except the seven requests whose route carries a different
+/// Everything under `/api/` does, except the eight requests whose route carries a different
 /// credential and checks it before reading anything else: the adapter's ingest token, the
-/// read-aloud ticket in the path that stands in for the header an `<audio src>` cannot send, and
-/// the pairing code in the body of a redemption, which is how a device with no token yet gets one
-/// (`#369 pairing-link`).
+/// read-aloud ticket in the path that stands in for the header an `<audio src>` cannot send, the
+/// pairing code in the body of a redemption, which is how a device with no token yet gets one
+/// (`#369 pairing-link`), and the voice socket's ticket or voice-only token (`#553
+/// voice-ws-relay-auth`).
 fn needs_bearer(method: &Method, path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/api/") else {
         return false;
@@ -68,6 +69,9 @@ fn needs_bearer(method: &Method, path: &str) -> bool {
             method == Method::POST || method == Method::GET
         }
         [Some("v1"), Some("pair"), Some("redeem"), None, _] => method == Method::POST,
+        // `#553 voice-ws-relay-auth`: a page's ticket or the voice-only token, neither of them a
+        // browser token.
+        [Some("v1"), Some("voice-socket"), None, _, _] => method == Method::GET,
         // `HEAD` because axum answers it wherever it answers `GET`, and a media element may use it.
         // An empty ticket is never a live one, so it earns no exemption and routing never answers it.
         [Some("v1"), Some("speech"), Some(ticket), None, _] if !ticket.is_empty() => {
@@ -122,5 +126,8 @@ mod tests {
         assert!(needs_bearer(&Method::GET, "/api/v1/speech/ticket/"));
         assert!(needs_bearer(&Method::GET, "/api/v1/speech/"));
         assert!(needs_bearer(&Method::POST, "/api/v1/speech//timing"));
+        assert!(!needs_bearer(&Method::GET, "/api/v1/voice-socket"));
+        assert!(needs_bearer(&Method::POST, "/api/v1/voice-socket"));
+        assert!(needs_bearer(&Method::GET, "/api/v1/voice-socket/x"));
     }
 }

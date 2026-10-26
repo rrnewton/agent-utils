@@ -37,7 +37,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             status,
             code,
@@ -1416,6 +1416,14 @@ pub async fn voice_session(
     );
     let mut session: VoiceSession = session?;
     session.agent_prompt = agent_prompt;
+    // `#553 voice-ws-relay-auth`. A relayed bridge is opened through this server, on a ticket that
+    // stands in for the bearer token a browser cannot put on a WebSocket.
+    if session.protocol == "vibe-talk-v1" && state.config.conversation.relay_upstream.is_some() {
+        session.websocket_url = super::voice_socket::page_url(
+            state.config.conversation.websocket_url.as_deref(),
+            &state.voice_tickets.mint(),
+        );
+    }
     let warming = crate::recent::warm(&state);
     tracing::info!(
         channels = warming,

@@ -82,6 +82,9 @@ pub struct AppState {
     /// a ticket. Device speech reads the text already in the browser and uses no tickets.
     /// See [`crate::speech_tickets`] for why server audio uses this authority boundary.
     pub speech_tickets: Arc<crate::speech_tickets::SpeechTickets>,
+    /// Single-use tickets that open the voice-socket relay for a browser page. `#553
+    /// voice-ws-relay-auth`; see [`crate::voice_tickets`].
+    pub voice_tickets: Arc<crate::voice_tickets::VoiceTickets>,
     /// Messages fetched in the last thirty seconds, so preparing them for speech does not fetch
     /// them again, and the provider warm-up that preparation starts without waiting for it.
     /// `#191 read-aloud-first-lag`; see [`crate::read_ahead`].

@@ -300,6 +300,7 @@ fn state_pieces_with(
         pairing: Arc::new(crate::pairing::Pairing::new()),
         headings: Arc::new(crate::heading::HeadingTags::new()),
         speech_tickets: Arc::new(crate::speech_tickets::SpeechTickets::new()),
+        voice_tickets: Arc::new(crate::voice_tickets::VoiceTickets::new()),
         read_ahead: Arc::new(crate::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(crate::recent_view::Shadow::new()),
         agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),

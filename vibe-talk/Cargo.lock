@@ -2221,6 +2221,8 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "jiff",
  "reqwest",
  "ring",
@@ -2241,6 +2243,7 @@ dependencies = [
  "tracing-subscriber",
  "two-face",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

@@ -83,6 +83,8 @@ pub enum ReplaySupport {
 #[derive(Debug)]
 pub struct BridgeHello {
     url: Option<String>,
+    /// `#553 voice-ws-relay-auth`. What the hello presents when it dials `url`.
+    credentials: crate::bridge_dial::Credentials,
     kept: Mutex<Option<(Hello, Instant)>>,
     asking: AtomicBool,
     /// The bridge sessions this server opens itself, the hello's among them, each owed one profile
@@ -100,6 +102,7 @@ impl BridgeHello {
     pub fn new(url: Option<String>) -> Self {
         Self {
             url,
+            credentials: crate::bridge_dial::Credentials::default(),
             kept: Mutex::new(None),
             asking: AtomicBool::new(false),
             own: Arc::new(crate::voice_recap::OwnSessions::new()),
@@ -110,8 +113,11 @@ impl BridgeHello {
     /// Ask at the server's own route to the configured bridge ([`server_url`]).
     #[must_use]
     pub fn for_config(config: &Config) -> Self {
+        // The read-aloud credentials go with read-aloud's own URL only, which `server_url` prefers
+        // whenever it is set; `for_read_aloud` is empty otherwise.
         Self {
             profile_fallback: config.replay.bridge_fetches_profile,
+            credentials: crate::bridge_dial::Credentials::for_read_aloud(&config.read_aloud),
             ..Self::new(server_url(config))
         }
     }
@@ -155,7 +161,7 @@ impl BridgeHello {
             Some(url) => {
                 let said = {
                     let _open = self.own.begin();
-                    hello(url).await
+                    hello(url, &self.credentials).await
                 };
                 match said {
                     Ok(capabilities) => Hello::Answered(capabilities),
@@ -274,14 +280,17 @@ pub fn log(answer: &Hello, profile_fallback: bool) {
 ///
 /// Why nothing was heard, in words: the connection refused or not accepted within ten seconds, no
 /// `session_started` within ten seconds of it, an `error` frame in its place, or a close.
-pub async fn hello(url: &str) -> Result<Vec<String>, String> {
-    let (mut socket, _) =
-        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
-            .await
-            .map_err(|_| {
-                "the voice bridge did not accept a connection within 10 seconds".to_owned()
-            })?
-            .map_err(|error| format!("the voice bridge refused the connection: {error}"))?;
+pub async fn hello(
+    url: &str,
+    credentials: &crate::bridge_dial::Credentials,
+) -> Result<Vec<String>, String> {
+    let mut socket = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        crate::bridge_dial::connect(url, credentials),
+    )
+    .await
+    .map_err(|_| "the voice bridge did not accept a connection within 10 seconds".to_owned())?
+    .map_err(|error| format!("the voice bridge refused the connection: {error}"))?;
     let ready_by = tokio::time::Instant::now() + READY_TIMEOUT;
     let capabilities = loop {
         let left = ready_by.saturating_duration_since(tokio::time::Instant::now());

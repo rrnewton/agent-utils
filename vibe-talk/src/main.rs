@@ -669,6 +669,9 @@ async fn main() -> anyhow::Result<()> {
                 &config.conversation,
                 config.read_aloud.websocket_url.as_deref(),
             )
+            .with_credentials(vibe_talk::bridge_dial::Credentials::for_read_aloud(
+                &config.read_aloud,
+            ))
             .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
         ),
         ReadAloudBackend::ElevenLabs => {
@@ -744,6 +747,7 @@ async fn main() -> anyhow::Result<()> {
         pairing: Arc::new(vibe_talk::pairing::Pairing::new()),
         headings: Arc::new(vibe_talk::heading::HeadingTags::new()),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
+        voice_tickets: Arc::new(vibe_talk::voice_tickets::VoiceTickets::new()),
         read_ahead: Arc::new(vibe_talk::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(vibe_talk::recent_view::Shadow::new()),
         agent_override: Arc::new(vibe_talk::voice_prompt::OverrideAnswers::new()),

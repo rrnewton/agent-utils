@@ -257,6 +257,9 @@ pub struct ConversationSpeech {
     /// `#512 voice-recap-private-stack`. Where each session this opens is counted as one of the
     /// server's own, so the profile fetch the bridge makes for it is never handed a recap.
     own_sessions: Option<Arc<crate::voice_recap::OwnSessions>>,
+    /// `#553 voice-ws-relay-auth`. What each dial presents: a relay's voice-only token and extra
+    /// trusted roots, when read-aloud goes through another server's relay.
+    credentials: crate::bridge_dial::Credentials,
 }
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -352,7 +355,16 @@ impl ConversationSpeech {
             generations: Arc::new(AtomicU64::new(0)),
             first_audio_timeout: FIRST_AUDIO_TIMEOUT,
             own_sessions: None,
+            credentials: crate::bridge_dial::Credentials::default(),
         }
+    }
+
+    /// Present `credentials` on every dial (`#553 voice-ws-relay-auth`): see
+    /// [`crate::bridge_dial::Credentials::for_read_aloud`] for which URL they belong to.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: crate::bridge_dial::Credentials) -> Self {
+        self.credentials = credentials;
+        self
     }
 
     /// Count each session this opens among the server's own (`#512 voice-recap-private-stack`):
@@ -432,9 +444,9 @@ impl ConversationSpeech {
                     .to_owned(),
             })?;
         let connecting = Instant::now();
-        let (mut socket, _) = tokio::time::timeout(
+        let mut socket = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            tokio_tungstenite::connect_async(url),
+            crate::bridge_dial::connect(url, &self.credentials),
         )
         .await
         .map_err(|_| SpeechError::Backend {

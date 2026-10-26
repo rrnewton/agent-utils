@@ -2495,6 +2495,7 @@ model provider or a real gateway.
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
+| Voice-only token | `auth.voice_token` | `VIBE_TALK_VOICE_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; opens `GET /api/v1/voice-socket` and no other route — see "Relaying the voice socket" |
 | Channels | `[[channels]]` | `VIBE_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated; a fourth field, or `provider` in the file, names the channel's provider |
 | More providers | `[[providers]]` | — | see [Several chat providers in one server](#several-chat-providers-in-one-server) |
 | A provider's token | `providers.<key>.token` | `VIBE_TALK_PROVIDER_<KEY>_TOKEN` | **secret**; the key upper-cased with `-` as `_`, so `google-chat` reads `VIBE_TALK_PROVIDER_GOOGLE_CHAT_TOKEN` |
@@ -2503,6 +2504,9 @@ model provider or a real gateway.
 | Conversation backend | `conversation.backend` | — | `elevenlabs` (default) or `websocket` for a deployment-managed `vibe-talk-v1` endpoint |
 | Conversation WebSocket | `conversation.websocket_url` | — | required for the `websocket` backend; keep private endpoints in deployment configuration. A path such as `/ws?mode=…` means the page's own host, so one configuration serves every host that puts a bridge behind its front door at that path |
 | Conversation label | `conversation.label` | — | provider name shown in the UI and its connection errors |
+| Voice relay upstream | `conversation.relay_upstream` | — | optional absolute `ws://` or `wss://` URL of the bridge this server relays the page's socket to (`/api/v1/voice-socket`); keep that bridge on loopback — see "Relaying the voice socket" |
+| Read-aloud relay token | `read_aloud.websocket_token_file` | — | optional file holding another server's voice-only token, sent as `Authorization: Bearer` when dialing `read_aloud.websocket_url`; read at each connection |
+| Read-aloud relay roots | `read_aloud.websocket_ca_file` | — | optional PEM file of certificates trusted, beside the bundled public roots, when dialing a `wss://` `read_aloud.websocket_url` |
 | Prepare bodies for speech | `speakable.enabled` | `VIBE_TALK_SPEAKABLE` | **on by default**; off relays exactly what was typed. Does not affect the time-zone conversion. A value that is neither `true` nor `false` refuses to start |
 | Single newlines in a message | `render.single_newline` | — | `"soft"` (default): a single newline inside a paragraph is a space and the screen wraps the lines; `"hard"`: every newline is a line break, chat's old rule. See "How message text is drawn" |
 | ElevenLabs API key | `elevenlabs.api_key` | `VIBE_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and for the ElevenLabs read-aloud backend |
@@ -4743,7 +4747,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/live/hints` | ingest | content-free `{channel_id}` wake-up for that polled provider's existing cursor |
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
-| GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider |
+| GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider; with `conversation.relay_upstream`, its socket URL is the relay below with a single-use ticket |
+| GET | `/api/v1/voice-socket` | ticket or voice | WebSocket relay to `conversation.relay_upstream`: a page's single-use `ticket`, or the voice-only token without chat tools; no browser token opens it — see "Relaying the voice socket" |
 | GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers"; to the write token, once, the recap a page armed (`prompt.recap` says its number and counts, never its words) — see "A recap in the profile the bridge fetches" |
 | POST | `/api/v1/voice-recap` | **write** | `{conversation_id}`: arm a recap of that conversation for the bridge's next profile fetch, built as the replay route builds one; answers `{id, armed, included, dropped, truncated, words, expires_in_seconds}`, never the words; `409 recap_unavailable` unless the server hands recaps over that way — see "A recap in the profile the bridge fetches" |
 | DELETE | `/api/v1/voice-recap` | **write** | withdraw whatever recap is armed (204): a page starting a call it hands no recap |
@@ -5930,6 +5935,31 @@ audio with no text, and records the server's close reason. A `vibe-talk-v1` serv
 * **Say why the session ended**, in the close frame's reason or an `error` frame — the page records
   it as `close_reason` — and log every session end on one line with the reason, the turn, the time
   since it opened and the last frame the client sent.
+
+### Relaying the voice socket
+
+A deployment-managed bridge authenticates nobody (`#553 voice-ws-relay-auth`). Behind a front door
+that sends `/ws` straight to it, anyone who can reach the door can talk to the voice agent and its
+chat tools, and a second server that wants the same bridge for read-aloud has nothing to present.
+Set `conversation.relay_upstream` and the bridge can stay on loopback:
+
+* `GET /api/v1/voice-session` hands the page `/api/v1/voice-socket?…&ticket=…` instead of
+  `conversation.websocket_url`, keeping that URL's query (`mode`, `tools`) and adding a ticket: 256
+  random bits, single-use, good for one minute. A browser cannot put `Authorization` on a WebSocket,
+  so the ticket stands in for the write token the voice-session call itself required.
+* `GET /api/v1/voice-socket` admits the socket on that ticket, or on the voice-only token
+  (`auth.voice_token`, sent as `Authorization: Bearer`) — and on nothing else, not the read or the
+  write token. It dials `relay_upstream` with the caller's query (less the ticket) before accepting
+  the upgrade, so a bridge that is down is a `502 voice_relay_unreachable`, then copies frames both
+  ways until either side closes. A voice-token caller never gets chat tools: its `tools` parameter
+  is dropped, however it is encoded.
+* The voice-only token opens no other route: every `/api/` route and `/mcp` refuse it as an unknown
+  token. Hand it to the other server, whose `[read_aloud]` names this relay as `websocket_url`, the
+  token's file as `websocket_token_file`, and, when this server's certificate comes from a private
+  authority, that authority's PEM as `websocket_ca_file`. Both files are read at each connection.
+
+With the relay in place the front door needs no route of its own for the bridge: the page's socket
+goes to the app like every other request.
 
 ### Repeatable live spoken-read acceptance
 
