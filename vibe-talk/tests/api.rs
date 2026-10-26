@@ -1910,6 +1910,7 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
             "read_marks",
             "summaries",
             "dismissals",
+            "own_decided",
             "upstream_clear",
             "aliases",
             "noise_rules",
