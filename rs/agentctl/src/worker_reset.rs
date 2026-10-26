@@ -1,6 +1,6 @@
 //! Native Rust `reset` for one headless turn-runner worker.
 //!
-//! Ports the runtime half of the Python operation: under the runtime home's
+//! Ports the runtime half of the existing operation: under the runtime home's
 //! registry lock, refuse unknown/TUI/busy workers, rotate the harness
 //! session identity, append the reset marker to the transcript, and save the
 //! registry. The registry row is kept as ordered JSON and only its

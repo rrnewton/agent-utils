@@ -2967,7 +2967,7 @@ mod tests {
             ),
             (
                 &["agentctl", "--herdr-bin=/bin/herdr", "reset"],
-                Some("reset"),
+                None,
             ),
             (
                 &["agentctl", "chat", "launch", "--config", "c.json"],
