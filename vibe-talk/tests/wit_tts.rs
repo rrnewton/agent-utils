@@ -241,10 +241,14 @@ api_base = "{api_base}"
 }
 
 fn token_file(contents: &str) -> std::path::PathBuf {
+    // Unique per call: tests in one binary share a process, and two of
+    // them writing one path would truncate each other's token mid-read.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
         "vibe-talk-wit-token-{}-{}.txt",
         std::process::id(),
-        contents.len()
+        serial
     ));
     std::fs::write(&path, contents).expect("write token file");
     path
