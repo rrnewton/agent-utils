@@ -116,3 +116,4 @@ pub mod voice_bridge;
 pub mod voice_health;
 pub mod voice_prompt;
 pub mod voice_recap;
+pub mod wit;

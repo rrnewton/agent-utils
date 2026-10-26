@@ -31,6 +31,15 @@ pub const ENV_WRITE_TOKEN: &str = "VIBE_TALK_WRITE_TOKEN";
 pub const ENV_INGEST_TOKEN: &str = "VIBE_TALK_INGEST_TOKEN";
 /// Environment variable selecting read-aloud: `elevenlabs` (default), `browser`, or `conversation`.
 pub const ENV_READ_ALOUD_BACKEND: &str = "VIBE_TALK_READ_ALOUD_BACKEND";
+/// Environment variable naming the file the Wit.ai app token is read from.
+/// The token itself never travels in an environment variable or a config
+/// value: a file path does, and the file is read at startup.
+pub const ENV_WIT_TOKEN_FILE: &str = "VIBE_TALK_WIT_TOKEN_FILE";
+/// Which Wit.ai voice reads a message aloud. Public: it names a catalogue voice.
+pub const ENV_WIT_VOICE: &str = "VIBE_TALK_WIT_VOICE";
+/// Environment variable overriding the Wit.ai API base, so a test or a proxy
+/// can point elsewhere.
+pub const ENV_WIT_API_BASE: &str = "VIBE_TALK_WIT_API_BASE";
 /// Environment variable carrying the ElevenLabs API key.
 pub const ENV_ELEVENLABS_API_KEY: &str = "VIBE_TALK_ELEVENLABS_API_KEY";
 /// Environment variable carrying the ElevenLabs agent id.
@@ -184,6 +193,8 @@ pub struct Config {
     pub owner: OwnerConfig,
     /// ElevenLabs wiring, when configured.
     pub elevenlabs: ElevenLabsConfig,
+    /// Wit.ai wiring, when configured. `#552 wit-tts-provider`.
+    pub wit: WitConfig,
     /// Provider used for live conversational voice sessions.
     pub conversation: ConversationConfig,
     /// Durable state: where it lives, and how much of it is kept.
@@ -297,6 +308,8 @@ pub enum ReadAloudBackend {
     Browser,
     /// Ask the configured conversational WebSocket agent to speak the message.
     Conversation,
+    /// Server audio from the public Wit.ai speech service. `#552 wit-tts-provider`.
+    Wit,
 }
 
 /// Backend selection for tapping messages to read them aloud.
@@ -1075,6 +1088,45 @@ impl Default for ElevenLabsConfig {
     }
 }
 
+/// Default Wit.ai API base: the public speech service, no path suffix.
+pub const DEFAULT_WIT_API_BASE: &str = "https://api.wit.ai";
+
+/// `[wit]`: the public Wit.ai speech service, for `read_aloud.backend = "wit"`.
+/// `#552 wit-tts-provider`.
+///
+/// The app token is optional in the same way ElevenLabs' key is: a
+/// deployment that has not wired it still starts, and asking it to read is
+/// a loud refusal naming `wit.token_file`. What is never optional is the
+/// token's route in — a file this server reads, never a value written in
+/// the configuration or an environment variable, and never logged.
+#[derive(Clone, Debug)]
+pub struct WitConfig {
+    /// App (server access) token, read from `wit.token_file` at startup. A secret.
+    pub token: Option<Secret>,
+    /// Which catalogue voice reads a message aloud, for example `wit$Remi`.
+    ///
+    /// Optional because the reader may choose one in Settings instead;
+    /// with neither, reading is a loud refusal naming this setting rather
+    /// than a silent guess at the catalogue's first voice.
+    pub voice: Option<String>,
+    /// Default pace as a multiplier (0.5 to 2.0), when the reader has not
+    /// chosen one for a read. `None` is the voice's own pace.
+    pub speed: Option<f64>,
+    /// API base, so a test or a proxy can point elsewhere.
+    pub api_base: String,
+}
+
+impl Default for WitConfig {
+    fn default() -> Self {
+        Self {
+            token: None,
+            voice: None,
+            speed: None,
+            api_base: DEFAULT_WIT_API_BASE.to_owned(),
+        }
+    }
+}
+
 /// Conversational voice backend selected by this deployment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1222,6 +1274,8 @@ struct FileConfig {
     channels: Vec<FileChannel>,
     #[serde(default)]
     elevenlabs: FileElevenLabs,
+    #[serde(default)]
+    wit: FileWit,
     #[serde(default)]
     conversation: ConversationConfig,
     #[serde(default)]
@@ -1385,6 +1439,19 @@ struct FileChannel {
     #[serde(default)]
     writable: bool,
     provider: Option<String>,
+}
+
+/// `[wit]` as written. `token` is declared only to be REFUSED by name: a
+/// secret does not belong inline (the `summaries.llm` rule), so it is typed
+/// as a raw value the refusal never has to hold or print.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileWit {
+    token_file: Option<String>,
+    token: Option<toml::Value>,
+    voice: Option<String>,
+    speed: Option<f64>,
+    api_base: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1679,6 +1746,12 @@ impl Config {
             get(ENV_SUMMARY_BACKEND),
             file.summaries,
         )?;
+        let wit = wit_config(
+            file.wit,
+            get(ENV_WIT_TOKEN_FILE),
+            get(ENV_WIT_VOICE),
+            get(ENV_WIT_API_BASE),
+        )?;
         let conversation = speech_hold_checked(file.conversation)?;
         let replay = replay_config(
             [
@@ -1716,11 +1789,12 @@ impl Config {
                     Some("browser") => ReadAloudBackend::Browser,
                     Some("elevenlabs") => ReadAloudBackend::ElevenLabs,
                     Some("conversation") => ReadAloudBackend::Conversation,
+                    Some("wit") => ReadAloudBackend::Wit,
                     Some(other) => {
                         return Err(ConfigError::Invalid {
                             field: "read_aloud.backend".to_owned(),
                             detail: format!(
-                                "unknown backend {other:?}; choose browser, elevenlabs, or conversation"
+                                "unknown backend {other:?}; choose browser, elevenlabs, conversation, or wit"
                             ),
                         })
                     }
@@ -1745,6 +1819,7 @@ impl Config {
                     .map(str::to_owned)
                     .or(file.elevenlabs.voice_id),
             },
+            wit,
             conversation,
             storage,
             summaries,
@@ -1752,6 +1827,89 @@ impl Config {
             message_cache,
         })
     }
+}
+
+/// Resolve and check `[wit]`. `#552 wit-tts-provider`.
+///
+/// An inline token is refused by name, as in [`llm_config`]: the token
+/// belongs in a file only this server reads, named by `token_file` (or by
+/// [`ENV_WIT_TOKEN_FILE`], which wins). A named file that cannot be read
+/// or holds nothing stops startup: the operator named it, and starting
+/// without it would surface later as a read that fails in the browser.
+/// No file named at all is not an error here — reading then refuses
+/// loudly, naming `wit.token_file`, as an unwired ElevenLabs key does.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the field to fix.
+fn wit_config(
+    file: FileWit,
+    token_file_env: Option<&str>,
+    voice_env: Option<&str>,
+    api_base_env: Option<&str>,
+) -> Result<WitConfig, ConfigError> {
+    let invalid = |field: &str, detail: String| ConfigError::Invalid {
+        field: format!("wit.{field}"),
+        detail,
+    };
+    if file.token.is_some() {
+        return Err(invalid(
+            "token",
+            "a secret must not be written in the configuration file; put it in a file \
+             readable only by this server and name that file with token_file"
+                .to_owned(),
+        ));
+    }
+    let text = |value: Option<String>| value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let token_file = token_file_env
+        .map(str::to_owned)
+        .or_else(|| text(file.token_file));
+    let token = match token_file {
+        None => None,
+        Some(named) => {
+            let path = PathBuf::from(&named);
+            if !path.is_absolute() {
+                return Err(invalid(
+                    "token_file",
+                    format!("{} is relative; give an absolute path", path.display()),
+                ));
+            }
+            let read = std::fs::read_to_string(&path).map_err(|source| {
+                invalid(
+                    "token_file",
+                    format!("{} could not be read: {source}", path.display()),
+                )
+            })?;
+            let value = read.trim().to_owned();
+            if value.is_empty() {
+                return Err(invalid(
+                    "token_file",
+                    format!(
+                        "{} holds no token; put the Wit.ai app token in it",
+                        path.display()
+                    ),
+                ));
+            }
+            Some(Secret::new(value))
+        }
+    };
+    if let Some(speed) = file.speed {
+        if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
+            return Err(invalid(
+                "speed",
+                format!("{speed} is outside 0.5 to 2.0; give a pace multiplier"),
+            ));
+        }
+    }
+    Ok(WitConfig {
+        token,
+        voice: voice_env.map(str::to_owned).or_else(|| text(file.voice)),
+        speed: file.speed,
+        api_base: api_base_env
+            .map(str::to_owned)
+            .or_else(|| text(file.api_base))
+            .unwrap_or_else(|| DEFAULT_WIT_API_BASE.to_owned()),
+    })
 }
 
 /// Refuse a speech hold outside its bounds. `#512 voice-recap-private-stack`. Refused rather than

@@ -197,6 +197,9 @@ fn routes(state: AppState) -> Router {
         // not an HTTP failure. See `api::diagnostics`.
         .route("/api/v1/diagnostics", get(api::diagnostics))
         .route("/api/v1/signed-url", get(api::signed_url))
+        // `#552 wit-tts-provider`. READ scope: public catalogue names for the Settings
+        // voice picker; no credential crosses. See `api::read_aloud_voices`.
+        .route("/api/v1/read-aloud/voices", get(api::read_aloud_voices))
         // `#369 pairing-link`. WRITE scope to mint a single-use code, because the code redeems for
         // the write token. Redeeming takes NO bearer token: the code in the body is the
         // credential, every refusal is one 410, and failures are limited per client address. See

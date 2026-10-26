@@ -41,6 +41,24 @@ pub struct Description {
     pub local_only: bool,
 }
 
+/// One voice a provider offers, for a Settings picker.
+///
+/// Only providers with a catalogue have any; the rest answer an empty
+/// list, which the page reads as "no picker for this backend".
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct VoiceInfo {
+    /// The voice name a synthesis request names.
+    pub name: String,
+    /// The locale the voice speaks.
+    pub locale: String,
+    /// The voice's gender as the provider reports it, when it reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gender: Option<String>,
+    /// Delivery styles the voice supports, when the provider lists them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub styles: Vec<String>,
+}
+
 /// Why a message could not be read aloud.
 #[derive(Debug, thiserror::Error)]
 pub enum SpeechError {
@@ -211,6 +229,38 @@ pub trait SpeechProvider: Send + Sync {
         _selection: Option<&str>,
     ) -> Result<SpeechStream, SpeechError> {
         self.speak_stream(text, speed).await
+    }
+
+    /// Stream one part of what the reader selected, in the voice the
+    /// reader chose in Settings when the provider has a catalogue.
+    ///
+    /// The default ignores the choice, which is right for a provider with
+    /// one voice of its own. A catalogued provider overrides this and
+    /// falls back to its configured voice when `voice` names none.
+    ///
+    /// # Errors
+    /// The same failures as [`SpeechProvider::speak_stream`].
+    async fn speak_stream_voiced(
+        &self,
+        text: &str,
+        speed: Option<f64>,
+        selection: Option<&str>,
+        _voice: Option<&str>,
+    ) -> Result<SpeechStream, SpeechError> {
+        self.speak_stream_for_selection(text, speed, selection)
+            .await
+    }
+
+    /// The voices this provider offers, for the Settings picker.
+    ///
+    /// The default is none: most providers have one voice of their own
+    /// and nothing to pick between.
+    ///
+    /// # Errors
+    /// Returns [`SpeechError`] when the catalogue cannot be listed, so a
+    /// picker that cannot load says why instead of opening empty.
+    async fn voices(&self) -> Result<Vec<VoiceInfo>, SpeechError> {
+        Ok(Vec::new())
     }
 }
 

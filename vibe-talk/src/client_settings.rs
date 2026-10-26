@@ -68,6 +68,9 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.relay",
     "vibe-talk.voice.read-audio-source",
     "vibe-talk.voice.read-speed",
+    // The Wit.ai voice chosen in Settings, when read-aloud uses that
+    // provider's catalogue. `#552 wit-tts-provider`.
+    "vibe-talk.voice.wit-voice",
     "vibe-talk.voice.prompts",
     "vibe-talk.voice.mic",
     // Messages: own messages, empty, combining, rich headers, message links (`#543

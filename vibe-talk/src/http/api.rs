@@ -1394,6 +1394,34 @@ pub async fn signed_url(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(minted)).into_response())
 }
 
+/// The voices the selected read-aloud provider offers, for the Settings picker.
+#[derive(Debug, serde::Serialize)]
+pub struct ReadAloudVoicesResponse {
+    /// Stable provider identifier, as `client-config` reports it.
+    pub backend: &'static str,
+    /// Every voice the reader may choose, in the provider's order.
+    pub voices: Vec<crate::speech::VoiceInfo>,
+}
+
+/// `GET /api/v1/read-aloud/voices` — the Settings voice picker's list.
+///
+/// Read scope: a list of public catalogue names, no credentials. A
+/// provider with no catalogue answers an empty list under its own name,
+/// which the page reads as "no picker for this backend". A provider that
+/// cannot list (a refused Wit.ai token) fails loudly through the shared
+/// speech mapping, so the picker says why instead of opening empty.
+/// `#552 wit-tts-provider`.
+pub async fn read_aloud_voices(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+) -> Result<Json<ReadAloudVoicesResponse>, ApiError> {
+    let voices = state.speech.voices().await?;
+    Ok(Json(ReadAloudVoicesResponse {
+        backend: state.speech.describe().backend,
+        voices,
+    }))
+}
+
 /// `GET /api/v1/voice-session` — open a session through the configured voice provider.
 ///
 /// Like the compatibility signed-URL endpoint, this requires WRITE scope because a conversation
@@ -5132,6 +5160,9 @@ pub struct PrepareSpeechRequest {
     pub ids: Vec<String>,
     /// The pace the reader has chosen, if they have chosen one.
     pub speed: Option<f64>,
+    /// The voice the reader has chosen in Settings, for a provider with a
+    /// catalogue. `#552 wit-tts-provider`.
+    pub voice: Option<String>,
     /// How many recent messages to look through for those ids.
     pub limit: Option<u16>,
 }
@@ -5300,6 +5331,12 @@ pub async fn prepare_speech(
             said,
             blocks: blocks.into_iter().map(|block| block.said).collect(),
             speed: crate::speech::clamp_speed(request.speed),
+            voice: request
+                .voice
+                .as_deref()
+                .map(str::trim)
+                .filter(|voice| !voice.is_empty())
+                .map(str::to_owned),
             observation: crate::speech_tickets::fresh_observation(),
             preparation_ms,
         });
@@ -5459,7 +5496,7 @@ pub async fn play_speech(
     let requested = std::time::Instant::now();
     let mut stream = state
         .speech
-        .speak_stream_for_selection(said, prepared.speed, selection)
+        .speak_stream_voiced(said, prepared.speed, selection, prepared.voice.as_deref())
         .await?;
     let first_audio = match stream.chunks.next().await {
         Some(Ok(chunk)) => chunk,

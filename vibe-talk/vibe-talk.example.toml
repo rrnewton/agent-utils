@@ -243,6 +243,31 @@ backend = "elevenlabs"
 # by another ingress or by a path: read-aloud with backend = "conversation" dials it, and so does the
 # hello that asks the bridge whether it takes a recap (see [replay]), whatever the backend above.
 # websocket_url = "ws://127.0.0.1:7070/ws?mode=voice"
+# "wit" reads through the public Wit.ai speech service: an already-running
+# hosted service, no GPU and nothing to self-host. It needs a [wit] section
+# naming a token file (below). Settings then offers "Wit.ai voice" and the
+# catalogue picker for that app.
+
+# [wit] configures read_aloud backend = "wit". `#552 wit-tts-provider`.
+#
+# Where to get the token: create an app at https://wit.ai (a free account),
+# then copy its *Server Access Token* from the app's Settings page. That
+# token can call the speech APIs on the app's behalf: synthesize and list
+# voices. Put the token — alone, on one line — in a file only this server
+# can read, and name the file here. The token is never written inline in
+# this file, never taken from an environment variable, and never logged.
+# Environment: VIBE_TALK_WIT_TOKEN_FILE / VIBE_TALK_WIT_VOICE / VIBE_TALK_WIT_API_BASE
+# [wit]
+# token_file = "/absolute/path/to/wit-token"
+# Which catalogue voice reads, as GET /voices names it. Optional: the
+# reader can pick one in Settings instead; with neither, reading refuses
+# and names this setting.
+# voice = "wit$Remi"
+# Default pace as a multiplier from 0.5 to 2.0, when the reader has not
+# chosen one for a read. Absent, the voice's own pace.
+# speed = 1.0
+# Only change this to point at a test double or a proxy.
+# api_base = "https://api.wit.ai"
 
 # [render] says how message bodies are drawn on the page. Absent, single newlines are soft.
 # [render]

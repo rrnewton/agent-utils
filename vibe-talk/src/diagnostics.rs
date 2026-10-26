@@ -337,6 +337,13 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
 
     checks.push(read_aloud_selection(state));
 
+    // `#552 wit-tts-provider`. Only a Wit.ai deployment spends this call:
+    // it proves the token file's token is accepted and says how many
+    // voices the Settings picker will list.
+    if state.speech.describe().backend == "wit" {
+        checks.push(wit_token(state, &deadline).await);
+    }
+
     checks.push(elevenlabs_key(state, &deadline).await);
     // One vendor call answers both of these, and the voice check reads the agent's verdict as
     // well as its profile — so the voice row is BUILT first and PUSHED second, which is the
@@ -413,6 +420,35 @@ fn read_aloud_selection(state: &AppState) -> Check {
         Diagnosis::Confirmed(format!("{} selected: {playback}", provider.label)),
     )
     .about(provider.backend)
+}
+
+/// Whether the Wit.ai app token is accepted, and how many voices it lists.
+///
+/// Calls the provider's catalogue rather than synthesizing: the cheapest
+/// authenticated Wit.ai call, and the one whose answer the Settings
+/// picker shows. `#552 wit-tts-provider`.
+async fn wit_token(state: &AppState, deadline: &Deadline) -> Check {
+    let diagnosis = match within(deadline, state.speech.voices()).await {
+        Err(timed_out) => timed_out,
+        Ok(Ok(voices)) => Diagnosis::Confirmed(format!(
+            "Wit.ai accepted the app token and lists {} voices for the Settings picker",
+            voices.len()
+        )),
+        Ok(Err(error)) => match &error {
+            crate::speech::SpeechError::NotConfigured { .. } => {
+                Diagnosis::NotConfigured("wit.token_file")
+            }
+            crate::speech::SpeechError::Backend { code, .. } if *code == "wit_unreachable" => {
+                Diagnosis::Unreachable(error.to_string())
+            }
+            crate::speech::SpeechError::Backend { .. } => Diagnosis::UnexpectedStatus {
+                status: 401,
+                body: error.to_string(),
+            },
+            other => Diagnosis::Unintelligible(other.to_string()),
+        },
+    };
+    Check::new("wit.token", "Wit.ai app token", diagnosis)
 }
 
 /// Which of a chat provider's checks a row is. `#325 provider-diagnostics-ids`.
