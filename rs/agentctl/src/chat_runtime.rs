@@ -627,6 +627,20 @@ pub fn slack_format_env_override() -> std::result::Result<Option<SlackFormat>, S
     }
 }
 
+/// The format a bridge selection names for `channel_id`: the per-channel entry, then the
+/// bridge default, with the `AGENTCTL_SLACK_FORMAT` override replacing the value of whichever
+/// applies; `None` when neither selects one, whatever the environment says.
+fn selected_slack_format(
+    by_channel: &BTreeMap<String, SlackFormat>,
+    default: Option<SlackFormat>,
+    channel_id: &str,
+) -> std::result::Result<Option<SlackFormat>, String> {
+    let Some(base) = by_channel.get(channel_id).copied().or(default) else {
+        return Ok(None);
+    };
+    Ok(Some(slack_format_env_override()?.unwrap_or(base)))
+}
+
 /// Authority and routing configuration retained for one bridge state directory.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -736,9 +750,10 @@ impl BridgeConfiguration {
             .map_or(1..=u64::MAX, |range| range.first..=range.last)
     }
 
-    /// The Slack outbound format in effect for `channel_id`: the
-    /// `AGENTCTL_SLACK_FORMAT` environment override, then the per-channel
-    /// key, then this bridge's `slack_format`, then `markdown`.
+    /// The Slack outbound format this bridge names on the wire for `channel_id`, or `None` when
+    /// it names none and the helper's own `--format` decides: the per-channel key, then this
+    /// bridge's `slack_format`, with the `AGENTCTL_SLACK_FORMAT` environment variable overriding
+    /// the value of whichever applies. The variable alone, with neither key, selects nothing.
     ///
     /// # Errors
     ///
@@ -746,16 +761,8 @@ impl BridgeConfiguration {
     pub fn effective_slack_format(
         &self,
         channel_id: &str,
-    ) -> std::result::Result<SlackFormat, String> {
-        if let Some(format) = slack_format_env_override()? {
-            return Ok(format);
-        }
-        Ok(self
-            .slack_format_by_channel
-            .get(channel_id)
-            .copied()
-            .or(self.slack_format)
-            .unwrap_or_default())
+    ) -> std::result::Result<Option<SlackFormat>, String> {
+        selected_slack_format(&self.slack_format_by_channel, self.slack_format, channel_id)
     }
 
     /// The receipt emoji this bridge actually adds, or `None` when it adds none: the receipt is
@@ -3587,12 +3594,10 @@ impl CommandOutboundTransport {
         if let Some(format) = self.slack_format_override {
             return Some(format);
         }
-        let base = self
-            .slack_format_by_channel
-            .get(channel_id)
-            .copied()
-            .or(self.slack_format)?;
-        Some(slack_format_env_override().ok().flatten().unwrap_or(base))
+        // The environment was validated when the transport was opened.
+        selected_slack_format(&self.slack_format_by_channel, self.slack_format, channel_id)
+            .ok()
+            .flatten()
     }
 
     /// Bind service-generation cancellation before processing any operation.
@@ -6922,17 +6927,30 @@ impl BridgeState {
             .map(|record| record.files.clone())
             .unwrap_or_default();
         let provider_down = self.provider_down_locked()?;
+        // Report only what the bridge names on the wire: the environment overrides a selection's
+        // value and selects nothing by itself, so with no key the helper's own format decides.
+        let slack_format_environment =
+            slack_format_env_override().map_err(ChatRuntimeError::invalid)?;
         let slack_format_by_channel: Map<String, Value> = self
             .config
             .slack_format_by_channel
             .iter()
-            .map(|(channel, format)| (channel.clone(), Value::from(format.name())))
+            .map(|(channel, format)| {
+                let format = slack_format_environment.unwrap_or(*format);
+                (channel.clone(), Value::from(format.name()))
+            })
             .collect();
-        let slack_format = slack_format_env_override()
-            .map_err(ChatRuntimeError::invalid)?
-            .or(self.config.slack_format)
-            .unwrap_or_default()
-            .name();
+        let slack_format = self
+            .config
+            .slack_format
+            .map(|format| slack_format_environment.unwrap_or(format).name());
+        let slack_format_selected =
+            self.config.slack_format.is_some() || !self.config.slack_format_by_channel.is_empty();
+        let slack_format_source = match (slack_format_selected, slack_format_environment) {
+            (false, _) => "helper",
+            (true, Some(_)) => "environment",
+            (true, None) => "config",
+        };
         Ok(serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
             "backend_configuration_schema": self.config.backend_configuration.as_ref().map(|value| &value.schema),
@@ -7020,6 +7038,14 @@ impl BridgeState {
         .map(|mut status| {
             if let Some(object) = status.as_object_mut() {
                 object.insert("slack_format".to_owned(), Value::from(slack_format));
+                object.insert(
+                    "slack_format_source".to_owned(),
+                    Value::from(slack_format_source),
+                );
+                object.insert(
+                    "slack_format_environment_ignored".to_owned(),
+                    Value::from(!slack_format_selected && slack_format_environment.is_some()),
+                );
                 object.insert(
                     "slack_format_by_channel".to_owned(),
                     Value::Object(slack_format_by_channel),
@@ -31303,7 +31329,15 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             configuration
                 .effective_slack_format("spaces/example")
                 .unwrap(),
-            SlackFormat::Markdown
+            Some(SlackFormat::Markdown)
+        );
+        // No key names no format: the helper's own default decides.
+        configuration.slack_format = None;
+        assert_eq!(
+            configuration
+                .effective_slack_format("spaces/example")
+                .unwrap(),
+            None
         );
         configuration
             .slack_format_by_channel
@@ -31312,7 +31346,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             configuration
                 .effective_slack_format("spaces/example")
                 .unwrap(),
-            SlackFormat::Converted
+            Some(SlackFormat::Converted)
         );
     }
 

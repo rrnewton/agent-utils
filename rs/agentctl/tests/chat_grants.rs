@@ -1,5 +1,6 @@
-//! Exercise sender grant management through the installed command interface, without a provider,
-//! a Herdr executable, or an agent registry. Each test uses only its own scratch bridge state.
+//! Exercise sender grant management, and the Slack format `chat status` reports, through the
+//! installed command interface, without a provider, a Herdr executable, or an agent registry.
+//! Each test uses only its own scratch bridge state.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -28,6 +29,11 @@ struct Run {
 
 impl Scratch {
     fn new() -> Self {
+        Self::with_configuration(json!({}))
+    }
+
+    /// A scratch bridge whose configuration also holds the keys of `extra`.
+    fn with_configuration(extra: Value) -> Self {
         let root = std::env::temp_dir().join(format!(
             "agentctl-chat-grants-cli-{}-{}",
             std::process::id(),
@@ -38,7 +44,7 @@ impl Scratch {
             .expect("private scratch directory");
         fs::create_dir(root.join("home")).expect("create scratch home directory");
         let state = root.join("bridge");
-        let configuration: BridgeConfiguration = serde_json::from_value(json!({
+        let mut document = json!({
             "subscription_plugin": "fixture",
             "channel_ids": ["spaces/example"],
             "allowed_senders": ["users/owner"],
@@ -46,13 +52,27 @@ impl Scratch {
             "agent_label": "coordinator",
             "outbound_enabled": false,
             "ack_reaction": null
-        }))
-        .expect("configuration without an outbound helper or explicit maximum");
+        });
+        for (key, value) in extra.as_object().expect("extra configuration keys") {
+            document[key] = value.clone();
+        }
+        let configuration: BridgeConfiguration = serde_json::from_value(document)
+            .expect("configuration without an outbound helper or explicit maximum");
         BridgeState::initialize(&state, configuration).expect("initialize scratch bridge");
         Self { root, state }
     }
 
     fn chat(&self, subcommand: &str, arguments: &[&str]) -> Run {
+        self.chat_with_env(subcommand, arguments, &[])
+    }
+
+    /// `chat` with `environment` set for the command; `AGENTCTL_SLACK_FORMAT` is otherwise unset.
+    fn chat_with_env(
+        &self,
+        subcommand: &str,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Run {
         let task_home = self.root.join("home");
         let registry = self.root.join("absent-registry");
         let stdout_path = self.root.join("stdout");
@@ -66,6 +86,8 @@ impl Scratch {
             .env("XDG_DATA_HOME", task_home.join(".local/share"))
             .env("XDG_STATE_HOME", task_home.join(".local/state"))
             .env("XDG_RUNTIME_DIR", task_home.join("runtime"))
+            .env_remove("AGENTCTL_SLACK_FORMAT")
+            .envs(environment.iter().copied())
             .arg("--registry")
             .arg(&registry)
             .arg("--herdr-bin")
@@ -342,4 +364,44 @@ fn revoke_cli_refuses_permanent_owners_without_removing_other_grants() {
         succeeded(&scratch.chat("revoke", &["users/unknown"]))["revoked"],
         json!([])
     );
+}
+
+#[test]
+fn status_reports_only_the_slack_format_the_bridge_names_on_the_wire() {
+    // No key: the bridge names no format, so the environment variable alone selects nothing and
+    // status says the helper decides instead of claiming the variable's value.
+    let unselected = Scratch::new();
+    let status = succeeded(&unselected.chat("status", &[]));
+    assert_eq!(status["slack_format"], Value::Null, "{status}");
+    assert_eq!(status["slack_format_source"], "helper");
+    assert_eq!(status["slack_format_environment_ignored"], false);
+    let status = succeeded(&unselected.chat_with_env(
+        "status",
+        &[],
+        &[("AGENTCTL_SLACK_FORMAT", "converted")],
+    ));
+    assert_eq!(status["slack_format"], Value::Null, "{status}");
+    assert_eq!(status["slack_format_source"], "helper");
+    assert_eq!(status["slack_format_environment_ignored"], true);
+
+    // A key: the environment overrides its value, per channel as well.
+    let selected = Scratch::with_configuration(json!({
+        "slack_format": "markdown",
+        "slack_format_by_channel": {"spaces/example": "markdown"}
+    }));
+    let status = succeeded(&selected.chat("status", &[]));
+    assert_eq!(status["slack_format"], "markdown", "{status}");
+    assert_eq!(status["slack_format_source"], "config");
+    let status = succeeded(&selected.chat_with_env(
+        "status",
+        &[],
+        &[("AGENTCTL_SLACK_FORMAT", "converted")],
+    ));
+    assert_eq!(status["slack_format"], "converted", "{status}");
+    assert_eq!(
+        status["slack_format_by_channel"]["spaces/example"],
+        "converted"
+    );
+    assert_eq!(status["slack_format_source"], "environment");
+    assert_eq!(status["slack_format_environment_ignored"], false);
 }

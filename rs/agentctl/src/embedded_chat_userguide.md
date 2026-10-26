@@ -2046,20 +2046,26 @@ fences survive, and a table becomes an aligned monospace code block, because
 a native Slack table block does not come back in the client's text) and post
 it as `--slack-mrkdwn`, split at block boundaries under that body's
 4,000-byte cap. Select it, in the order that wins: an
-`agentctl chat publish --slack-format markdown|converted` flag for one root
-message; a `slack_format_by_channel` entry for the channel; then the bridge's
-`slack_format` key in its configuration (for example
-`"slack_format": "converted"`), with `AGENTCTL_SLACK_FORMAT` overriding the
-value of whichever of those selections applies. With no selection the wire
-request names no format, so the helper's own `--format` (itself overridden
-by its environment) decides, exactly as before; an explicit `markdown`
-selection names itself on the wire and overrides a helper configured
-`converted`. The helper also
-accepts `--format=converted` (or `--slack-format=converted`) in its own
+`agentctl chat publish --slack-format markdown|converted` flag for one
+message, which nothing overrides; a `slack_format_by_channel` entry for the
+channel; then the bridge's `slack_format` key in its configuration (for
+example `"slack_format": "converted"`). `AGENTCTL_SLACK_FORMAT` in the
+bridge's environment overrides the value of a configuration key, but selects
+nothing by itself: with neither key the wire request names no format, so the
+helper's own `--format` (itself overridden by the helper's environment, which
+the bridge passes only when `outbound_command.environment` names the
+variable) decides, exactly as before. An explicit `markdown` selection names
+itself on the wire and overrides a helper configured `converted`. The helper
+also accepts `--format=converted` (or `--slack-format=converted`) in its own
 arguments, with the environment variable overriding them. Either path can be
-selected per bridge while both are evaluated; `agentctl chat status` reports
-the active one as `slack_format` (plus any `slack_format_by_channel`), and
-the helper's diagnostics log names the path of each post, without its text.
+selected per bridge while both are evaluated. `agentctl chat status` reports
+what the bridge names on the wire: `slack_format` for its default
+(`null` when no key selects one, so the helper decides),
+`slack_format_by_channel`, `slack_format_source` (`config`, `environment`
+when the variable overrides a key, or `helper` when nothing is selected), and
+`slack_format_environment_ignored`, true when the variable is set but no key
+exists for it to override. The helper's diagnostics log names the path of
+each post, without its text.
 The dry-run comparison harness is
 `cargo run -p chat-subscription-slack --example slack_format_compare -- FILE.md`;
 it posts nothing, and its live mode refuses without an explicit test channel
