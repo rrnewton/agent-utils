@@ -235,6 +235,9 @@ enum Commands {
     /// Re-enable automation input; queued messages still require drain or send
     #[command(after_help = "Example: agentctl resume reviewer && agentctl drain reviewer")]
     Resume(Named),
+    /// Serve MCP stdio access to the same named sessions and operations as this CLI
+    #[command(after_help = "Example: agentctl mcp")]
+    Mcp,
     /// Initialize, inspect, recover, or run a durable chat bridge
     #[command(
         after_help = "Example: agentctl chat status --bridge-state ~/.local/state/agentctl/chat"
@@ -1454,7 +1457,7 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
 // Commands only the Python edition implements: the MCP server, the headless-worker operations,
 // and the polling Chat launcher and its history/context readers. This edition refuses them with
 // exit status 2 and names the Python opt-in, instead of Clap's unrecognised-subcommand error.
-const PYTHON_ONLY_COMMANDS: [&str; 4] = ["mcp", "migrate", "reset", "repair"];
+const PYTHON_ONLY_COMMANDS: [&str; 3] = ["migrate", "reset", "repair"];
 const PYTHON_ONLY_CHAT_COMMANDS: [&str; 1] = ["launch"];
 // Global options whose value is the following argument.
 const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
@@ -1706,6 +1709,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Userguide => {
             print!("{}", crate::USER_GUIDE);
             return Ok(0);
+        }
+        Commands::Mcp => {
+            return Ok(crate::mcp::serve(
+                args.registry.to_string_lossy().as_ref(),
+                args.herdr_bin.to_string_lossy().as_ref(),
+            ));
         }
         Commands::Chat(value) => {
             return run_chat(args.registry, args.herdr_bin, value);
@@ -1975,6 +1984,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         hostname: from_environment.hostname,
     });
     let mut result = match command {
+        Commands::Mcp => {
+            return Ok(crate::mcp::serve(
+                args.registry.to_string_lossy().as_ref(),
+                args.herdr_bin.to_string_lossy().as_ref(),
+            ));
+        }
         Commands::Start(value) => {
             let cloud_flags = [
                 (value.cloud_harness.is_some(), "--cloud-harness"),
@@ -2860,7 +2875,7 @@ mod tests {
     #[test]
     fn python_only_commands_are_detected_behind_global_options() {
         let cases: &[(&[&str], Option<&str>)] = &[
-            (&["agentctl", "mcp"], Some("mcp")),
+            (&["agentctl", "mcp"], None),
             (
                 &["agentctl", "--registry", "/tmp/r", "migrate"],
                 Some("migrate"),
@@ -2875,9 +2890,9 @@ mod tests {
             ),
             (&["agentctl", "--state=/tmp/r", "chat", "history"], None),
             (&["agentctl", "chat", "context"], None),
-            (&["agentctl", "--", "mcp"], Some("mcp")),
+            (&["agentctl", "--", "mcp"], None),
             (&["agentctl", "chat", "--", "launch"], Some("chat launch")),
-            (&["agentctl", "help", "mcp"], Some("mcp")),
+            (&["agentctl", "help", "mcp"], None),
             (&["agentctl", "help", "chat", "launch"], Some("chat launch")),
             (&["agentctl", "chat", "help", "launch"], Some("chat launch")),
             (&["agentctl", "chat", "status"], None),

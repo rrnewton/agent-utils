@@ -19,7 +19,6 @@ done
 for tool in wrkslots wrkviz parallel-experiment-runner herdr-chat herdr-subagents; do
     echo "needs-python $tool"
 done
-echo "needs-python agentctl mcp (subcommand)"
 echo "needs-python agentctl migrate (subcommand)"
 echo "needs-python agentctl reset (subcommand)"
 echo "needs-python agentctl repair (subcommand)"
