@@ -15210,9 +15210,28 @@ fn outbound_text(agent_label: &str, body: &str) -> String {
     let prefix = format!("[{agent_label}]");
     if body.starts_with(&prefix) {
         body.to_owned()
+    } else if starts_with_markdown_heading(body) {
+        // On the heading's line the label would make it a paragraph that starts with `#`, so the
+        // label is a paragraph of its own (`#551 headings-real-headings`).
+        format!("{prefix}\n\n{body}")
     } else {
         format!("{prefix} {body}")
     }
+}
+
+/// Whether `body` opens with a Markdown ATX heading: up to three spaces, one to six `#`, then a
+/// space, a tab or the end of the line.
+fn starts_with_markdown_heading(body: &str) -> bool {
+    let line = body.lines().next().unwrap_or_default();
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let rest = &line[indent..];
+    let marks = rest.len() - rest.trim_start_matches('#').len();
+    indent <= 3
+        && (1..=6).contains(&marks)
+        && rest[marks..]
+            .chars()
+            .next()
+            .is_none_or(|c| c == ' ' || c == '\t')
 }
 
 fn validate_outbound_body(agent_label: &str, body: &str) -> Result<()> {
@@ -31300,6 +31319,29 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         reporter.prompt_printed("chat-one");
         assert_eq!(*runtime.noted.borrow(), ["chat-one"]);
         assert_eq!(*reported.borrow(), ["chat-one"]);
+    }
+
+    #[test]
+    fn the_agent_label_never_turns_an_opening_heading_into_a_paragraph() {
+        // `#551 headings-real-headings`.
+        assert_eq!(
+            outbound_text("coord", "# Weekly report\n\nAll green."),
+            "[coord]\n\n# Weekly report\n\nAll green."
+        );
+        assert_eq!(outbound_text("coord", "### Done"), "[coord]\n\n### Done");
+        assert_eq!(outbound_text("coord", "All green."), "[coord] All green.");
+        assert_eq!(
+            outbound_text("coord", "#general is quiet"),
+            "[coord] #general is quiet"
+        );
+        assert_eq!(
+            outbound_text("coord", "####### seven"),
+            "[coord] ####### seven"
+        );
+        assert_eq!(
+            outbound_text("coord", "[coord] # As written"),
+            "[coord] # As written"
+        );
     }
 
     #[test]

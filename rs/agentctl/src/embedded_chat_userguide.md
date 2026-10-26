@@ -2040,12 +2040,23 @@ Slack outbound format: `markdown` or `converted`. By default a reply's
 Markdown goes to the client as `--markdown` and Slack converts it, which
 drops some blank lines, can glue a table under a bullet to its neighbours,
 and turns headings into header blocks. The `converted` path instead has
-`agentctl-slack-outbound` convert the Markdown itself (headings become bold
-lines, lists and task boxes (`☐`/`☑`) stay as text, block quotes and code
-fences survive, and a table becomes an aligned monospace code block, because
-a native Slack table block does not come back in the client's text) and post
-it as `--slack-mrkdwn`, split at block boundaries under that body's
-4,000-byte cap. Select it, in the order that wins: an
+`agentctl-slack-outbound` convert the Markdown itself (lists and task boxes
+(`☐`/`☑`) stay as text, block quotes and code fences survive, and a table
+becomes an aligned monospace code block, because a native Slack table block
+does not come back in the client's text) and post it as `--slack-mrkdwn`,
+split at block boundaries under that body's 4,000-byte cap. A message part
+with a heading of levels 1 to 3, of at most 150 characters, is posted as
+Block Kit blocks as well: each such heading a `header` block, which Slack
+draws as a heading and returns as one in a history read's `rich_content`, and
+the mrkdwn between them `section` blocks of at most 3,000 characters, with
+the mrkdwn (headings as bold lines) as the notification fallback and the
+stored text. A deeper or longer heading stays a bold line, and a part whose
+blocks would pass 50 is posted as mrkdwn alone. Slack's header block has no
+level. On every provider, a reply that opens with a heading gets its
+`[agent_label]` prefix as a paragraph of its own, so the heading stays one. The helper writes the blocks to a new owner-only file in the
+temporary directory for the client's `--blocks=file://…`, and deletes it once
+the client exits; the warm worker leaves posts with blocks to a new client
+run. Select it, in the order that wins: an
 `agentctl chat publish --slack-format markdown|converted` flag for one
 message, which nothing overrides; a `slack_format_by_channel` entry for the
 channel; then the bridge's `slack_format` key in its configuration (for
