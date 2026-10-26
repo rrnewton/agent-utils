@@ -45,7 +45,7 @@ from offline_cache_browser import CHANNEL, TOKEN, Json, check, handler_for
 from two_column_browser import RUNNER, ColumnsApi, Desk
 
 if TYPE_CHECKING:
-    from playwright.sync_api import BrowserType, Page
+    from playwright.sync_api import BrowserType, Page, Route
 
 # (label, width, height, phone). The phone is the owner's: 393x852.
 SIZES = (("desk-1280", 1280, 800, False), ("phone-393", 393, 852, True))
@@ -106,6 +106,40 @@ LINK_JS = """(id) => {
     return {text: a.textContent, inApp: a.hasAttribute('data-in-app'), href: a.getAttribute('href'),
             x: r.left + Math.min(r.width / 2, 20), y: r.top + r.height / 2};
 }"""
+
+
+class Spot:
+    """What `SPOT_JS` read, with the types each part has."""
+
+    def __init__(self, found: Json) -> None:
+        top = found["top"]
+        self.top = float(top) if isinstance(top, (int, float)) else None
+        self.scroll = float(str(found["scroll"]))
+        self.thread = bool(found["thread"])
+        self.picker = str(found["picker"])
+        self.status = str(found["status"])
+        self.length = int(str(found["length"]))
+        self.index = int(str(found["index"]))
+        self.search = str(found["search"])
+
+
+def drift(before: Spot, after: Spot) -> float:
+    """How far the reader's message moved between two spots, in pixels; infinite where it is not drawn."""
+    if before.top is None or after.top is None:
+        return float("inf")
+    return abs(after.top - before.top)
+
+
+class Link:
+    """What `LINK_JS` read of a link, with the types each part has."""
+
+    def __init__(self, found: Json) -> None:
+        self.text = str(found["text"])
+        self.in_app = bool(found["inApp"])
+        self.href = str(found["href"])
+        self.x = float(str(found["x"]))
+        self.y = float(str(found["y"]))
+
 
 LANDED_JS = """(id) => document.querySelector(`#discord-log > li[data-id="${id}"]`)?.getAttribute('data-landed') === 'true'"""
 
@@ -168,14 +202,24 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     origin = f"http://127.0.0.1:{server.server_port}"
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-msglinks-") as profile:
-            options: Json = {"viewport": {"width": width, "height": height}, "color_scheme": "dark"}
             if phone:
-                options.update(device_scale_factor=2.625, is_mobile=True, has_touch=True)
-            context = chromium.launch_persistent_context(
-                profile, headless=True, executable_path=args.browser_executable, **options)
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark",
+                    device_scale_factor=2.625, is_mobile=True, has_touch=True,
+                )
+            else:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark",
+                )
             # Nothing may leave for the service: a request there is a jump that did not stay.
             left: list[str] = []
-            context.route("https://discord.com/**", lambda route: (left.append(route.request.url), route.abort()))
+            def leaving(route: Route) -> None:
+                left.append(route.request.url)
+                route.abort()
+
+            context.route("https://discord.com/**", leaving)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []
@@ -212,11 +256,11 @@ class Reader:
     def page(self) -> Page:
         return self.desk.page
 
-    def spot(self, message_id: str) -> Json:
+    def spot(self, message_id: str) -> Spot:
         found: Json = self.page.evaluate(SPOT_JS, message_id)
-        return found
+        return Spot(found)
 
-    def scroll_to_middle(self, message_id: str) -> Json:
+    def scroll_to_middle(self, message_id: str) -> Spot:
         """Scroll the list so the row sits a third of the way down the window, as a reader reading it."""
         self.page.evaluate(
             """(id) => {
@@ -232,17 +276,17 @@ class Reader:
         self.desk.settled()
         return self.spot(message_id)
 
-    def tap_link(self, message_id: str) -> Json:
-        link: Json | None = self.page.evaluate(LINK_JS, message_id)
-        self.desk.check(link is not None, f"{message_id} draws no marked link")
-        assert link is not None
+    def tap_link(self, message_id: str) -> Link:
+        found: Json | None = self.page.evaluate(LINK_JS, message_id)
+        self.desk.check(found is not None, f"{message_id} draws no marked link")
         self.desk.settled()
-        link = self.page.evaluate(LINK_JS, message_id)
-        assert link is not None
+        found = self.page.evaluate(LINK_JS, message_id)
+        assert found is not None
+        link = Link(found)
         if self.phone:
-            self.page.touchscreen.tap(float(link["x"]), float(link["y"]))
+            self.page.touchscreen.tap(link.x, link.y)
         else:
-            self.page.mouse.click(float(link["x"]), float(link["y"]))
+            self.page.mouse.click(link.x, link.y)
         return link
 
     def back(self) -> None:
@@ -250,60 +294,59 @@ class Reader:
         self.page.go_back(wait_until="commit")
         self.desk.settled()
 
-    def wait_back_where(self, message_id: str, why: str) -> Json:
+    def wait_back_where(self, message_id: str, why: str) -> Spot:
         self.desk.wait_for(
             """() => document.getElementById('status').textContent === 'Back where you were.'""", why)
         self.desk.settled()
         return self.spot(message_id)
 
-    def same_height(self, before: Json, after: Json, what: str) -> None:
-        self.desk.check(after["top"] is not None, f"{what}: the reader's message is not drawn after Back")
-        drift = abs(float(after["top"]) - float(before["top"]))
-        self.desk.check(drift <= 2, f"{what}: Back put the reader's message at {after['top']:.0f}, "
-                                    f"not {before['top']:.0f} ({drift:.0f}px off)")
+    def same_height(self, before: Spot, after: Spot, what: str) -> None:
+        moved = drift(before, after)
+        self.desk.check(moved <= 2, f"{what}: Back put the reader's message at {after.top}, "
+                                    f"not {before.top} ({moved:.0f}px off)")
 
     def walk(self) -> None:
         notes = self.desk.notes
-        start = int(self.spot("220")["index"])
+        start = self.spot("220").index
         # The reply link: drawn as the app's, named by where it goes.
         before = self.scroll_to_middle("220")
-        self.desk.check(not before["thread"] and before["picker"] == "flat", "the channel is not in All")
-        self.desk.check(float(before["scroll"]) > 0, "the reader is not scrolled up the list")
+        self.desk.check(not before.thread and before.picker == "flat", "the channel is not in All")
+        self.desk.check(before.scroll > 0, "the reader is not scrolled up the list")
         link = self.tap_link("220")
-        self.desk.check(bool(link["inApp"]), "the link to a reply here is not the app's")
-        self.desk.check(link["text"] == "#lead team › reply",
-                        f"the link whose text was its address reads {link['text']!r}")
+        self.desk.check(bool(link.in_app), "the link to a reply here is not the app's")
+        self.desk.check(link.text == "#lead team › reply",
+                        f"the link whose text was its address reads {link.text!r}")
         self.desk.wait_for(f"() => ({LANDED_JS})('206')", "the tap did not land on the linked reply")
         landed = self.spot("206")
-        self.desk.check(landed["thread"] and landed["picker"] == f"thread:{RUNNER}",
-                        f"the reply's thread did not open: {landed['picker']}")
-        self.desk.check(int(landed["index"]) == int(before["index"]) + 1,
-                        f"the jump moved {int(landed['index']) - int(before['index'])} history entries, not one")
-        self.desk.check("m=discord%3A" in str(landed["search"]) and "206" in str(landed["search"]),
-                        f"the address does not name the landed message: {landed['search']}")
+        self.desk.check(landed.thread and landed.picker == f"thread:{RUNNER}",
+                        f"the reply's thread did not open: {landed.picker}")
+        self.desk.check(landed.index == before.index + 1,
+                        f"the jump moved {landed.index - before.index} history entries, not one")
+        self.desk.check("m=discord%3A" in str(landed.search) and "206" in str(landed.search),
+                        f"the address does not name the landed message: {landed.search}")
         self.desk.shot("landed-reply")
-        notes.append(f"reply link {link['text']!r} landed 206 in its thread, +1 entry")
+        notes.append(f"reply link {link.text!r} landed 206 in its thread, +1 entry")
 
         self.back()
         after = self.wait_back_where("220", "Back after the jump did not come back")
-        self.desk.check(not after["thread"] and after["picker"] == "flat", "Back did not close the thread to All")
+        self.desk.check(not after.thread and after.picker == "flat", "Back did not close the thread to All")
         self.same_height(before, after, "the reply jump")
-        notes.append(f"Back: All, 220 within {abs(float(after['top']) - float(before['top'])):.0f}px")
+        notes.append(f"Back: All, 220 within {drift(before, after):.0f}px")
 
         # The root link, named by its writer, far up the list.
         before = self.scroll_to_middle("207")
         link = self.tap_link("207")
-        self.desk.check(link["text"] == "the plan", f"a named link lost its name: {link['text']!r}")
+        self.desk.check(link.text == "the plan", f"a named link lost its name: {link.text!r}")
         self.desk.wait_for(f"() => ({LANDED_JS})('201')", "the tap did not land on the linked root")
         landed = self.spot("201")
-        self.desk.check(not landed["thread"] and landed["picker"] == "flat", "a jump to a root left All")
-        self.desk.check(float(landed["scroll"]) < float(before["scroll"]),
+        self.desk.check(not landed.thread and landed.picker == "flat", "a jump to a root left All")
+        self.desk.check(landed.scroll < before.scroll,
                         "the jump to a message up the list did not move the list")
         self.desk.shot("landed-root")
         self.back()
         after = self.wait_back_where("207", "Back after the root jump did not come back")
         self.same_height(before, after, "the root jump")
-        notes.append(f"root link landed 201, Back: 207 within {abs(float(after['top']) - float(before['top'])):.0f}px")
+        notes.append(f"root link landed 201, Back: 207 within {drift(before, after):.0f}px")
 
         # Two jumps one after another, the second from the first's landing, then two Backs.
         before = self.scroll_to_middle("220")
@@ -311,26 +354,26 @@ class Reader:
         self.desk.wait_for(f"() => ({LANDED_JS})('206')", "the first of two jumps did not land")
         self.desk.settled()
         link = self.tap_link("206")
-        self.desk.check(link["text"] == "#lead team › message",
-                        f"the link to a root whose text was its address reads {link['text']!r}")
+        self.desk.check(link.text == "#lead team › message",
+                        f"the link to a root whose text was its address reads {link.text!r}")
         self.desk.wait_for(f"() => ({LANDED_JS})('201') && document.getElementById('thread-heading').hidden",
                            "the second jump, from the thread to a root, did not land in All")
-        self.desk.check(int(self.spot("201")["index"]) == int(before["index"]) + 2,
+        self.desk.check(self.spot("201").index == before.index + 2,
                         "two jumps are not two entries over the start")
         self.back()
         self.desk.wait_for("() => !document.getElementById('thread-heading').hidden && "
                            "document.getElementById('status').textContent === 'Back where you were.'",
                            "the first Back did not return to the thread the second jump was taken from")
-        self.desk.check(self.spot("206")["top"] is not None, "the first Back's thread does not draw 206")
+        self.desk.check(self.spot("206").top is not None, "the first Back's thread does not draw 206")
         self.page.evaluate("() => { document.getElementById('status').textContent = ''; }")
         self.back()
         after = self.wait_back_where("220", "the second Back did not return to the start")
-        self.desk.check(not after["thread"] and after["picker"] == "flat", "the second Back did not return to All")
+        self.desk.check(not after.thread and after.picker == "flat", "the second Back did not return to All")
         self.same_height(before, after, "two stacked jumps")
-        self.desk.check(int(after["index"]) == int(before["index"]),
+        self.desk.check(after.index == before.index,
                         "two Backs did not return to the entry the first jump was taken from")
-        notes.append(f"two stacked jumps, two Backs: 220 within {abs(float(after['top']) - float(before['top'])):.0f}px")
-        self.desk.check(int(after["index"]) == start, "the walk did not end on the entry it started on")
+        notes.append(f"two stacked jumps, two Backs: 220 within {drift(before, after):.0f}px")
+        self.desk.check(after.index == start, "the walk did not end on the entry it started on")
 
 
 if __name__ == "__main__":
