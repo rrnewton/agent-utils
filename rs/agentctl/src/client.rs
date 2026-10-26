@@ -3066,7 +3066,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl FakeExecutable {
         fn new(response: &str) -> Self {
-            let guard = EXECUTABLE_FIXTURE.lock().unwrap();
+            // One failed test must not fail every later user of the fixture.
+            let guard = EXECUTABLE_FIXTURE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let root = std::env::temp_dir().join(format!(
                 "agentctl-adapter-{}-{}",
                 std::process::id(),
@@ -3253,9 +3256,22 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn spawn_test_process(executable: &Path) -> ChildGuard {
-        let mut command = Command::new(executable);
-        command.arg("30").process_group(0);
-        ChildGuard(command.spawn().expect("start test executable"))
+        // A just-copied executable is briefly busy (ETXTBSY) when another test thread forked
+        // while the copy was open for writing: that child holds the descriptor until it execs.
+        for _ in 0..100 {
+            let mut command = Command::new(executable);
+            command.arg("30").process_group(0);
+            match command.spawn() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => return ChildGuard(result.expect("start test executable")),
+            }
+        }
+        panic!(
+            "start test executable: {} stayed busy for 2s",
+            executable.display()
+        );
     }
 
     #[cfg(target_os = "linux")]
