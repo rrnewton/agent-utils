@@ -1,12 +1,13 @@
 ---
 title: 'package-contract-oom: packaging step OOM-killed at its 640MiB boxed cap under host load'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - validation
 created_at: 2026-10-26T21:59:46.301522203+00:00
-updated_at: 2026-10-26T21:59:46.301522203+00:00
+updated_at: 2026-10-26T23:16:13.065351812+00:00
+closed_at: 2026-10-26T23:16:13.065351702+00:00
 ---
 
 # Description

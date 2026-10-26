@@ -1,6 +1,6 @@
 ---
 title: 'wit-tts-provider: a Wit.ai voice for read-aloud'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - read-aloud
 - voice
 created_at: 2026-10-26T20:32:35.117291686+00:00
-updated_at: 2026-10-26T20:32:35.117291686+00:00
+updated_at: 2026-10-26T23:16:13.062576977+00:00
+closed_at: 2026-10-26T23:16:13.062576767+00:00
 ---
 
 # Description
