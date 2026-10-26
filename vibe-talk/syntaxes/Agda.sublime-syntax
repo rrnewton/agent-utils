@@ -1,0 +1,65 @@
+%YAML 1.2
+---
+# Agda, converted from the TextMate grammar GitHub highlights Agda with:
+# https://github.com/agda/agda-github-syntax-highlighting, Agda.yml at
+# ba5005841ff9bdc5186af68befd58ed456fc7a8c (MIT, see LICENSE.agda-github-syntax-highlighting).
+# Rule for rule; what changed in conversion is listed in README.md beside this file.
+name: Agda
+scope: source.agda
+file_extensions:
+  - agda
+
+contexts:
+  main:
+    # Line comments
+    - match: '--'
+      push:
+        - meta_scope: comment.line.double-dash.agda
+        - match: '$'
+          pop: true
+    # Pragmas, before block comments: `{-#` is never a comment.
+    - match: '\{-#'
+      push:
+        - meta_scope: support.other.agda
+        - match: '#-\}'
+          pop: true
+    # Block comments
+    - match: '\{-'
+      push:
+        - meta_scope: comment.block.agda
+        - match: '-\}'
+          pop: true
+    # String literals
+    - match: '"'
+      push:
+        - meta_scope: string.quoted.double.agda
+        - match: '"'
+          pop: true
+    # Character literals
+    - match: '''([^\\'']|\\[''\\"[:alnum:]]+)'''
+      scope: constant.character.agda
+    # Numeric literals
+    - match: '(?:^|(?<=[\s(){}]))(-?\d+|0x[0-9A-F]+|-?\d+\.\d+((e|E)(\+|-)?\d+)?|-?\d+(e|E)(\+|-)?\d+)(?=[\s(){}]|$)'
+      scope: constant.numeric.agda
+    # Names of datatypes, records, modules and constructors
+    - match: '\b(data|record|module|constructor|open *import|open|import)\s+([^;(){}@"\s]+)'
+      captures:
+        1: keyword.other.agda
+        2: entity.name.type.agda
+    # Goals
+    - match: '((?:^|(?<=[.;(){}@"\s]))\?(?=[.;(){}@"\s]|$)|\{!.*!\})'
+      scope: entity.name.tag.agda
+    # Universes, like Set₁: a subscript is not part of a word, so \b does not work.
+    - match: '\b(Set|Prop)[0123456789₀₁₂₃₄₅₆₇₈₉]*(?=$|[\s(){}])'
+      scope: constant.language.agda
+    # The same for λ, → and ∀.
+    - match: '(?:^|(?<=[\s(){}]))(λ|→|->|∀|=|←|:)(?=$|[\s(){}])'
+      scope: keyword.other.agda
+    # Type declarations: the `a` and `b` of `a b : Set` at the start of a line, after any keywords.
+    - match: '^\s*(((abstract|instance|macro|pattern|postulate|primitive|private|syntax|variable|where|let)\s+)*)((([^;(){}@"\s]+)\s+)+)(?=:)'
+      captures:
+        1: keyword.other.agda
+        4: entity.name.agda
+    # Other keywords
+    - match: '(?:^|(?<=[\s(){}]))(abstract|codata|coinductive|constructor|data|do|eta-equality|field|forall|hiding|import|in|inductive|infix|infixl|infixr|instance|interleaved|let|macro|module|mutual|no-eta-equality|opaque|open|overlap|pattern|postulate|primitive|private|public|quote|quoteTerm|record|renaming|rewrite|syntax|tactic|unfolding|unquote|unquoteDecl|unquoteDef|using|variable|where|with)(?=$|[\s(){}])'
+      scope: keyword.other.agda

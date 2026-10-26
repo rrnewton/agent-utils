@@ -5738,6 +5738,9 @@ a.search-hit-link {
   padding: 0 0.25em;
 }
 
+/* A code block keeps its lines as written and SCROLLS SIDEWAYS inside its row when one is wider than
+   the row, as a table does below: code wrapped at the screen's edge reads as two lines, and
+   indentation is meaning in half the languages it holds. `#531 server-side-syntax-highlight`. */
 .md pre {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.85em;
@@ -5745,8 +5748,11 @@ a.search-hit-link {
   border: 1px solid var(--edge);
   border-radius: 0.35rem;
   padding: 0.4rem 0.5rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+  max-width: 100%;
+  tab-size: 4;
 }
 
 .md pre code {
@@ -5754,6 +5760,111 @@ a.search-hit-link {
   background: none;
   border: 0;
   padding: 0;
+}
+
+/* HIGHLIGHTED CODE. The server marks each token of a block whose language it knows with one of a
+   few classes (src/render/highlight.rs, `CLASSES`), and these are their colours: after GitHub's
+   Primer palette, every one at least 4.5:1 on the block's background in its scheme, so a phone in
+   sunlight still reads a comment. Operators and punctuation keep the text's own colour. */
+.md pre {
+  --hl-comment: #8b949e;
+  --hl-string: #a5d6ff;
+  --hl-constant: #79c0ff;
+  --hl-keyword: #ff7b72;
+  --hl-type: #ffa657;
+  --hl-function: #d2a8ff;
+  --hl-escape: #56d4dd;
+  --hl-property: #7ee787;
+  --hl-macro: #f2cc60;
+  --hl-variable: #ffa198;
+  --hl-inserted: #7ee787;
+  --hl-inserted-bg: rgba(46, 160, 67, 0.15);
+  --hl-deleted: #ffa198;
+  --hl-deleted-bg: rgba(248, 81, 73, 0.15);
+}
+
+@media (prefers-color-scheme: light) {
+  .md pre {
+    --hl-comment: #57606a;
+    --hl-string: #0a3069;
+    --hl-constant: #0550ae;
+    --hl-keyword: #cf222e;
+    --hl-type: #953800;
+    --hl-function: #8250df;
+    --hl-escape: #1b7c83;
+    --hl-property: #116329;
+    --hl-macro: #7d4e00;
+    --hl-variable: #a40e26;
+    --hl-inserted: #116329;
+    --hl-inserted-bg: #dafbe1;
+    --hl-deleted: #82071e;
+    --hl-deleted-bg: #ffebe9;
+  }
+}
+
+.md .hl-c {
+  color: var(--hl-comment);
+  font-style: italic;
+}
+
+.md :is(.hl-s, .hl-u) {
+  color: var(--hl-string);
+}
+
+.md :is(.hl-n, .hl-h) {
+  color: var(--hl-constant);
+}
+
+.md .hl-k {
+  color: var(--hl-keyword);
+}
+
+.md .hl-t {
+  color: var(--hl-type);
+}
+
+.md :is(.hl-f, .hl-gh) {
+  color: var(--hl-function);
+}
+
+.md .hl-e {
+  color: var(--hl-escape);
+}
+
+.md .hl-p {
+  color: var(--hl-property);
+}
+
+.md .hl-m {
+  color: var(--hl-macro);
+}
+
+.md .hl-v {
+  color: var(--hl-variable);
+}
+
+/* A diff's added and removed lines are tinted across their text, the way every review tool shows
+   them, so the change is visible before a single line is read. */
+.md .hl-gi {
+  color: var(--hl-inserted);
+  background: var(--hl-inserted-bg);
+}
+
+.md .hl-gd {
+  color: var(--hl-deleted);
+  background: var(--hl-deleted-bg);
+}
+
+.md :is(.hl-h, .hl-b) {
+  font-weight: 650;
+}
+
+.md .hl-i {
+  font-style: italic;
+}
+
+.md .hl-u {
+  text-decoration: underline;
 }
 
 .md blockquote {

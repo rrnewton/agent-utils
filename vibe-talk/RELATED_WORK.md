@@ -5,6 +5,38 @@ source code, vendor documentation, and package metadata. Where a claim rests on 
 file is cited; where it rests on vendor documentation, the doc page is linked; claims that could not
 be confirmed are marked **unverified** and are never used to carry a conclusion.
 
+## Highlighting code on the server (2026-10-26)
+
+`#531 server-side-syntax-highlight` colours fenced code blocks where the rest of a body is
+rendered, on the server, for the reason `#217 markdown-blocks` moved Markdown there: the page stays
+free of dependencies, and a phone does no parsing. Forges that render on their own servers do the
+same; GitHub highlights with TextMate grammars collected by
+[linguist](https://github.com/github-linguist/linguist), and its Agda grammar is one of the two
+converted here.
+
+* [syntect](https://github.com/trishume/syntect) runs Sublime Text and TextMate grammars, the
+  largest body of maintained grammars there is, and is what [bat](https://github.com/sharkdp/bat)
+  and comrak's own plugin use. Chosen. Its HTML writer and comrak's plugin name every scope as a class, hundreds of
+  them; this project instead maps scopes to seventeen classes through syntect's own theme matching,
+  so the sanitizer's allowlist stays short and the stylesheet owns every colour. Oniguruma rather
+  than the pure-Rust `fancy-regex` engine: measured on this crate, 2.5 times as fast and 350 KB
+  smaller.
+* [two-face](https://github.com/CosmicHorrorDev/two-face) packages bat's grammars for syntect,
+  adding the ones syntect's defaults lack (TypeScript, TOML, Lean 4). Used at build time only; the
+  binary carries the eighteen grammars kept.
+* [tree-sitter-highlight](https://github.com/tree-sitter/tree-sitter/tree/master/highlight) parses
+  with real grammars and highlights more exactly, but each language is a generated C parser to
+  build and keep current, commonly hundreds of kilobytes of tables apiece (**unverified** for the
+  languages here), against about ten kilobytes of compressed grammar apiece for syntect.
+  [inkjet](https://github.com/Colonial-Dev/inkjet) bundles dozens of them in one crate.
+* [highlight.js](https://github.com/highlightjs/highlight.js), [Prism](https://github.com/PrismJS/prism)
+  and [Shiki](https://github.com/shikijs/shiki) highlight in the browser. Each would put a library
+  on every phone and a second renderer beside the server's, which `#217 markdown-blocks` removed.
+
+Grammars converted for this project, both MIT-licensed, with their licence texts in
+`syntaxes/`: Agda from [agda/agda-github-syntax-highlighting](https://github.com/agda/agda-github-syntax-highlighting),
+and Rocq from the Rocq prover's [vsrocq](https://github.com/rocq-prover/vsrocq).
+
 ## Short labels for repository links (2026-10-08)
 
 `#227 github-link-abbrev` draws a link whose text is its own GitHub address with a short label,

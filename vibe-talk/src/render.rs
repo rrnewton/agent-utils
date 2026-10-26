@@ -81,8 +81,9 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hash};
 use std::ops::Range;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use comrak::arena_tree::NodeEdge;
 use comrak::nodes::{AstNode, ListType, NodeList, NodeValue};
@@ -92,12 +93,14 @@ use crate::config::Config;
 use crate::heading::HeadingTags;
 use crate::model::{ChannelInfo, MentionName, Message};
 
+pub mod highlight;
+
 /// How one provider writes message text, where that differs from GitHub-flavoured Markdown.
 ///
 /// Every provider shares Discord's mention syntax, `<@id>` and `<#id>`: the Slack reader keeps a
 /// user mention in that form on purpose (see [`crate::slack::mrkdwn`]), so the chips are drawn for
 /// all three. What differs is emphasis and links.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Markup {
     /// Discord's Markdown, which is CommonMark's for everything rendered here: `*a*` is italic.
@@ -569,9 +572,128 @@ pub fn to_html(text: &str, markup: Markup) -> String {
 /// [`to_html`], drawing each user mention that `mentions` names as the person's name rather than
 /// their id: `<@U0123ABCD>` is the chip `@Ada Lovelace`. `#318 slack-mention-names`. A mention it
 /// does not name is drawn by id, as every mention was before.
+///
+/// Answered from [`RENDERED`] when the same body was rendered recently.
 #[must_use]
 pub fn to_html_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
-    render_visiting(text, markup, mentions, |_, _| ()).0
+    if let Some(html) = RENDERED.get(text, markup, mentions) {
+        return html;
+    }
+    let html = render_visiting(text, markup, mentions, |_, _| ()).0;
+    RENDERED.put(text, markup, mentions, &html);
+    html
+}
+
+/// The bytes of text and HTML one generation of [`RENDERED`] holds before it becomes the old one.
+pub const RENDERED_GENERATION_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bodies rendered recently, so a page load, a refresh and a live event that send the same
+/// messages render each of them once. `#531 server-side-syntax-highlight`: highlighting a long
+/// code block costs milliseconds, and the timeline sends the same window again on every refresh.
+///
+/// What a body renders to depends only on its text, its markup and the names of its mentions, so
+/// those are the key, compared in full: a hash only finds the candidates. Two generations, each
+/// bounded by [`RENDERED_GENERATION_BYTES`]: a body is put in the young one, and when that is full
+/// it becomes the old one and the oldest are dropped. A body found in the old generation moves to
+/// the young one, so what is still being read stays.
+static RENDERED: LazyLock<RenderCache> = LazyLock::new(RenderCache::default);
+
+#[derive(Default)]
+struct RenderCache {
+    hasher: std::collections::hash_map::RandomState,
+    generations: Mutex<Generations>,
+}
+
+#[derive(Default)]
+struct Generations {
+    young: HashMap<u64, Vec<RenderedBody>>,
+    young_bytes: usize,
+    old: HashMap<u64, Vec<RenderedBody>>,
+}
+
+struct RenderedBody {
+    markup: Markup,
+    text: String,
+    mentions: Vec<MentionName>,
+    html: String,
+}
+
+impl RenderedBody {
+    fn is(&self, text: &str, markup: Markup, mentions: &[MentionName]) -> bool {
+        self.markup == markup && self.text == text && self.mentions == mentions
+    }
+
+    fn bytes(&self) -> usize {
+        self.text.len() + self.html.len()
+    }
+}
+
+impl RenderCache {
+    fn key(&self, text: &str, markup: Markup, mentions: &[MentionName]) -> u64 {
+        self.hasher.hash_one((
+            markup,
+            text,
+            mentions
+                .iter()
+                .map(|mention| (&mention.id, &mention.name))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn get(&self, text: &str, markup: Markup, mentions: &[MentionName]) -> Option<String> {
+        let key = self.key(text, markup, mentions);
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(found) = generations
+            .young
+            .get(&key)
+            .and_then(|bodies| bodies.iter().find(|body| body.is(text, markup, mentions)))
+        {
+            return Some(found.html.clone());
+        }
+        let bodies = generations.old.get_mut(&key)?;
+        let at = bodies
+            .iter()
+            .position(|body| body.is(text, markup, mentions))?;
+        let body = bodies.swap_remove(at);
+        let html = body.html.clone();
+        generations.insert(key, body);
+        Some(html)
+    }
+
+    fn put(&self, text: &str, markup: Markup, mentions: &[MentionName], html: &str) {
+        let key = self.key(text, markup, mentions);
+        let body = RenderedBody {
+            markup,
+            text: text.to_owned(),
+            mentions: mentions.to_vec(),
+            html: html.to_owned(),
+        };
+        self.generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, body);
+    }
+}
+
+impl Generations {
+    fn insert(&mut self, key: u64, body: RenderedBody) {
+        let bodies = self.young.entry(key).or_default();
+        if bodies
+            .iter()
+            .any(|have| have.is(&body.text, body.markup, &body.mentions))
+        {
+            return;
+        }
+        self.young_bytes += body.bytes();
+        bodies.push(body);
+        if self.young_bytes > RENDERED_GENERATION_BYTES {
+            self.old = std::mem::take(&mut self.young);
+            self.young_bytes = 0;
+        }
+    }
 }
 
 /// [`to_html_named`], handing the parsed and adjusted tree, and the text it was parsed from, to
@@ -610,13 +732,40 @@ fn render_visiting<T>(
         return (plain_html(text), None);
     }
     let visited = visit(root, &source);
-    let mut html = String::new();
-    comrak::format_html(root, &options, &mut html).expect("formatting into a String cannot fail");
-    let html = SANITIZER.clean(&html).to_string();
-    if html.len() > text.len().saturating_mul(MAX_GROWTH) + GROWTH_ALLOWANCE {
+    let limit = text.len().saturating_mul(MAX_GROWTH) + GROWTH_ALLOWANCE;
+    // Highlighting is what grows code most, a span for every token, so a body it takes past the
+    // bound is written again without it before it is given up as plain paragraphs: its code is
+    // still drawn as code, only in one colour.
+    let mut plugins = comrak::options::Plugins::default();
+    plugins.render.codefence_syntax_highlighter = Some(&highlight::Highlighter);
+    let html = write_html(root, &options, &plugins);
+    let html = if html.len() > limit && has_code_block(root) {
+        write_html(root, &options, &comrak::options::Plugins::default())
+    } else {
+        html
+    };
+    if html.len() > limit {
         return (plain_html(text), None);
     }
     (html, Some(visited))
+}
+
+/// The tree written as HTML with `plugins`, then sanitized.
+fn write_html<'a>(
+    root: &'a AstNode<'a>,
+    options: &Options,
+    plugins: &comrak::options::Plugins<'_>,
+) -> String {
+    let mut html = String::new();
+    comrak::format_html_with_plugins(root, options, &mut html, plugins)
+        .expect("formatting into a String cannot fail");
+    SANITIZER.clean(&html).to_string()
+}
+
+/// Whether the tree holds a fenced or indented code block.
+fn has_code_block<'a>(root: &'a AstNode<'a>) -> bool {
+    root.descendants()
+        .any(|node| matches!(node.data.borrow().value, NodeValue::CodeBlock(_)))
 }
 
 // --- read-aloud blocks: `#376 read-aloud-blocks` ----------------------------------------------
@@ -1317,8 +1466,8 @@ pub const TAGS: [&str; 26] = [
     "ul",
 ];
 
-/// The class a mention chip carries. The page styles it. The only other class a `span` may keep is
-/// [`RESTATED_CLASS`].
+/// The class a mention chip carries. The page styles it. The only other classes a `span` may keep
+/// are [`RESTATED_CLASS`] and the highlighter's [`highlight::CLASSES`].
 pub const MENTION_CLASS: &str = "mention";
 
 /// The sanitizer, built once.
@@ -1362,7 +1511,13 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
         // comrak before the sanitizer sees anything, so the only markup that reaches it is markup
         // this module made.
         .allowed_classes(HashMap::from([
-            ("span", HashSet::from([MENTION_CLASS, RESTATED_CLASS])),
+            (
+                "span",
+                [MENTION_CLASS, RESTATED_CLASS]
+                    .into_iter()
+                    .chain(highlight::CLASSES)
+                    .collect(),
+            ),
             ("p", HashSet::from([RESTATED_CLASS])),
             ("ul", HashSet::from(["contains-task-list"])),
             ("ol", HashSet::from(["contains-task-list"])),
@@ -2635,6 +2790,79 @@ mod tests {
                  <input disabled=\"\">bfiveu"
             )
         );
+    }
+
+    /// The highlighter's classes, `#531 server-side-syntax-highlight`: exactly its list, only on a
+    /// `span`, and nothing it might arrive with beside them.
+    #[test]
+    fn the_sanitizer_keeps_exactly_the_highlighters_classes_on_a_span() {
+        let cleaned = SANITIZER
+            .clean(
+                "<pre class=\"hl-k\"><code class=\"language-rust hl-s\">\
+                 <span class=\"hl-k hl-evil hl- hl-kk\" style=\"color:red\" data-x=\"1\">fn</span>\
+                 <span class=\"hl-gi\">+</span><span class=\"hl-zz\">z</span></code></pre>",
+            )
+            .to_string();
+        assert_eq!(
+            cleaned,
+            "<pre><code><span class=\"hl-k\">fn</span><span class=\"hl-gi\">+</span>\
+             <span class=\"\">z</span></code></pre>"
+        );
+        for class in super::highlight::CLASSES {
+            let span = format!("<span class=\"{class}\">x</span>");
+            assert_eq!(SANITIZER.clean(&span).to_string(), span);
+        }
+        // A message cannot write one: its markup is text.
+        assert_eq!(
+            html("<span class=\"hl-k\">fn</span>"),
+            "<p>&lt;span class=\"hl-k\"&gt;fn&lt;/span&gt;</p>\n"
+        );
+    }
+
+    /// `#531 server-side-syntax-highlight`: a body is rendered once and then answered from the
+    /// cache, by its whole key, and a full generation makes room by dropping the oldest.
+    #[test]
+    fn the_render_cache_answers_by_the_whole_key_and_drops_the_oldest() {
+        use crate::model::MentionName;
+        let cache = super::RenderCache::default();
+        let ada = [MentionName {
+            id: "U1".into(),
+            name: "Ada".into(),
+        }];
+        cache.put("<@U1> hi", Markup::Discord, &ada, "ada");
+        assert_eq!(
+            cache.get("<@U1> hi", Markup::Discord, &ada),
+            Some("ada".into())
+        );
+        assert_eq!(cache.get("<@U1> hi", Markup::Discord, &[]), None);
+        assert_eq!(cache.get("<@U1> hi", Markup::Slack, &ada), None);
+        assert_eq!(cache.get("<@U1> hi!", Markup::Discord, &ada), None);
+
+        // One body larger than a generation fills it at once and moves it to the old one, where
+        // it is still found, and is brought back.
+        let big = "x".repeat(super::RENDERED_GENERATION_BYTES);
+        cache.put(&big, Markup::Discord, &[], "big");
+        {
+            let generations = cache.generations.lock().unwrap();
+            assert!(generations.young.is_empty());
+            assert_eq!(generations.old.values().map(Vec::len).sum::<usize>(), 2);
+        }
+        assert_eq!(
+            cache.get("<@U1> hi", Markup::Discord, &ada),
+            Some("ada".into())
+        );
+        assert_eq!(cache.generations.lock().unwrap().young.len(), 1);
+        // The next full generation drops what was not read again.
+        cache.put(&format!("{big}y"), Markup::Discord, &[], "bigger");
+        assert_eq!(cache.get(&big, Markup::Discord, &[]), None);
+        assert_eq!(
+            cache.get("<@U1> hi", Markup::Discord, &ada),
+            Some("ada".into())
+        );
+
+        // Through the module's own cache, a body renders the same the second time.
+        let text = "```rust\nfn cached() {}\n```";
+        assert_eq!(html(text), html(text));
     }
 
     #[test]

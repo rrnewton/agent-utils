@@ -48,9 +48,11 @@ axum = { version = "0.8", default-features = false, features = [
 base64 = "0.22"
 bytes = "1"
 # Message bodies are rendered HERE, not in the browser: GitHub-flavoured Markdown with chat's line
-# breaks. Without default features, which are its command-line front end and syntax highlighting —
-# neither is wanted by a server that only parses a document and formats it. 0.55 rather than the
-# newest because 0.56 raised its minimum Rust past this crate's declared 1.85.
+# breaks. Without default features: its command-line front end is not wanted, and its own syntect
+# plugin writes a class for every scope a grammar names, hundreds of them, where the sanitizer
+# wants a short fixed list. Code blocks are highlighted through comrak's highlighter interface by
+# `src/render/highlight.rs` instead, with syntect directly (below). 0.55 rather than the newest
+# because 0.56 raised its minimum Rust past this crate's declared 1.85.
 comrak = { version = "0.55", default-features = false }
 # Ticket minting only: 256 bits from the system CSPRNG. Already in the tree transitively.
 getrandom = "0.3"
@@ -78,6 +80,13 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The code-block highlighter (`src/render/highlight.rs`, `#531 server-side-syntax-highlight`). Only
+# the parser: no bundled themes (colours come from the stylesheet), no bundled grammars (`build.rs`
+# writes a compact set), no HTML writer (ours writes a fixed list of classes). Oniguruma rather than
+# the pure-Rust `regex-fancy`: measured on this crate, it highlighted 2.5 times as fast and made the
+# binary 350 KB SMALLER (see the README's rendering section). The cost is a C library, built from
+# source by `cc` as rusqlite's bundled SQLite already is.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-onig"] }
 thiserror = "2"
 # `process` runs `[summaries.llm].bearer_token_command` with a timeout that KILLS a hung child
 # (`kill_on_drop`), which `std::process` cannot do without leaking a blocked thread.
@@ -113,6 +122,13 @@ url = "2"
 # declared Rust 1.85.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "system"] }
+
+# `build.rs` writes the highlighter's compact syntax set: a subset of two-face's grammars (bat's
+# collection) and the ones in `syntaxes/`. Build time only; none of this is in the binary but the
+# set it writes. `syntect-onig` selects two-face's grammars for the runtime's regex engine.
+[build-dependencies]
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-onig", "yaml-load"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

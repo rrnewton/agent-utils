@@ -6796,7 +6796,9 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    *"widgets pull request 123"* — only where the page shows a label, and any other address by its
    host, *"a link on example.com"* (`#187 speakable-ids-urls`). The rules are a table in
    `src/link_labels.rs`, where another host can be added.
-7. Raw HTML written in a message is shown as the characters it is, and
+7. **A fenced code block that names its language is highlighted** (`#531
+   server-side-syntax-highlight`); see [Code blocks](#code-blocks) below.
+8. Raw HTML written in a message is shown as the characters it is, and
    [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
    elements and attributes; see [Security](#security).
 
@@ -6814,6 +6816,68 @@ the same as a sentence with no Markdown — never as an error and never as unsan
 | Table cells | 2,000 | GFM pads every row to its header's width, so a wide header over many one-character rows is C × R cells: 2,000 characters made 840 KB of HTML. Counted from the text before parsing; past the budget the message renders with tables off. |
 | Depth | 32 | The sanitizer's HTML parser slows with every element still open, so thousands of nested `>` took seconds. |
 | Growth | 8 × the text + 8 KiB | HTML far larger than its words, such as hundreds of empty checkboxes, is not sent or kept in the offline copy. |
+
+A body is rendered once and kept: the server holds what it rendered recently, by the body's text,
+markup and mention names, so a refresh, a page load and a live event that carry the same messages do
+not render them again. Two generations of 8 MiB each; a body still being read moves to the newer
+one, and the oldest are dropped. A window of a hundred messages took 2.0 ms to render before this
+cache and takes 13 µs from it.
+
+#### Code blocks
+
+`#531 server-side-syntax-highlight`. A fenced block whose info string names a language the server
+knows is drawn with its tokens coloured: keywords, strings, comments, numbers and constants, types,
+function names, escapes, keys and tags, macros and attributes, a diff's added and removed lines, and
+Markdown's headings, emphasis and links. A block with no language, or one not in this list, is plain
+monospace: **the language is never guessed from the code.**
+
+| Language | Fence words |
+|---|---|
+| Rust | `rust`, `rs` |
+| Python | `python`, `py`, `python3`, `py3` |
+| TypeScript | `typescript`, `ts`; with JSX, `tsx` and `jsx` |
+| JavaScript | `javascript`, `js`, `mjs`, `cjs` |
+| Shell | `bash`, `sh`, `shell`, `zsh` |
+| JSON, YAML, TOML | `json`, `jsonc`, `json5`; `yaml`, `yml`; `toml` |
+| Diff | `diff`, `patch` |
+| C, C++ | `c`, `h`; `cpp`, `c++`, `cc`, `cxx`, `hpp` |
+| Go | `go`, `golang` |
+| SQL | `sql` |
+| Markdown | `markdown`, `md` |
+| Haskell, OCaml | `haskell`, `hs`; `ocaml`, `ml`, `mli` |
+| Lean 4, Agda, Rocq (Coq) | `lean`, `lean4`; `agda`; `rocq`, `coq`, `v` |
+
+Case does not matter, and anything after a comma is ignored (`rust,ignore` is Rust). The list is
+`LANGUAGES` in `src/render/highlight.rs`.
+
+**The server sends no colour.** Each token is a `<span>` with one of seventeen short classes
+(`hl-k` for a keyword, `hl-s` a string, `hl-c` a comment, and so on), and the stylesheet colours
+them once for the dark scheme and once for the light, every colour at least 4.5:1 on the block's
+background. The sanitizer allows exactly those classes on a `span`, so a highlighted block is still
+nothing but markup this server wrote. A long line scrolls sideways inside its block rather than
+wrapping or widening the row.
+
+The tokens are found by [syntect](https://github.com/trishume/syntect) with Sublime Text grammars,
+compiled into the binary at build time by `build.rs`: a subset of the collection bat ships (through
+[two-face](https://github.com/CosmicHorrorDev/two-face)), and, for Agda and Rocq, which it lacks,
+grammars converted from their communities' own; sources and licences are in `syntaxes/README.md`.
+The code-block highlighting that comrak itself offers was not used: it writes a class for every
+scope a grammar names, hundreds of them, where the sanitizer needs a short fixed list.
+
+**What it costs**, measured on 2026-10-26 in a release build (`cargo test --release --lib
+render_timing -- --ignored --nocapture` prints these):
+
+| | Before | Highlighted |
+|---|---|---|
+| A 200-line Rust block | 0.21 ms | 6.6 ms; the first block after the server starts, 16 ms, which includes reading the grammars |
+| 16 KiB of dense code, the most one body renders | — | 18 ms |
+| A window of 100 messages, ten with a 20-line block | 2.0 ms | 8.8 ms the first time; 13 µs from the cache after |
+| The binary, stripped | 30.3 MB | 32.0 MB (+1.6 MB: the grammars, the regular-expression engine and syntect) |
+
+The grammars run on Oniguruma rather than the pure-Rust engine syntect also supports: measured
+here, that was 2.5 times as fast and 350 KB smaller. Highlighting makes HTML larger, a span per
+token, so a body it would take past the growth bound above is written again without it: its code is
+still a code block, in one colour.
 
 A message saved on the device before the field existed is drawn the same way: as its text, never as
 markup. Nothing a model reads carries the field: `/messages`, `/digest`, one message by id, the MCP

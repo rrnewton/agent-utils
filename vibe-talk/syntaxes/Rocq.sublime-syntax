@@ -1,0 +1,145 @@
+%YAML 1.2
+---
+# Rocq (formerly Coq), converted from the TextMate grammar of the Rocq prover's own editor support:
+# https://github.com/rocq-prover/vsrocq, client/syntax/rocq.tmLanguage.json at
+# bc21058b0bb3cab9211f41a623cd1fa30dc42420 (MIT, see LICENSE.vsrocq).
+# Rule for rule; what changed in conversion is listed in README.md beside this file.
+name: Rocq
+scope: source.rocq
+file_extensions:
+  - v
+
+variables:
+  ident: '(?:\p{L}|[_\x{00A0}])(?:\p{L}|[0-9_\x{00A0}''])*'
+
+contexts:
+  main:
+    # Vernacular import keywords
+    - match: '\b(From|Require|Import|Export|Local|Global|Include)\b'
+      scope: keyword.control.import.rocq
+    # Vernacular scope keywords
+    - match: '\b((Open|Close|Delimit|Undelimit|Bind|Declare)\s+Scope)\b'
+      scope: keyword.control.import.rocq
+    # Theorem declarations
+    - match: '\b(Theorem|Lemma|Remark|Fact|Corollary|Property|Proposition)\s+({{ident}})'
+      captures:
+        1: keyword.source.rocq
+        2: entity.name.function.theorem.rocq
+    - match: '\bGoal\b'
+      scope: keyword.source.rocq
+    # Assumptions
+    - match: '\b(Parameters?|Axioms?|Conjectures?|Variables?|Hypothesis|Hypotheses)(\s+Inline)?\b\s*\(?\s*({{ident}})'
+      captures:
+        1: keyword.source.rocq
+        2: keyword.source.rocq
+        3: entity.name.assumption.rocq
+    # Context
+    - match: '\b(Context)\b\s*`?\s*(\(|\{)?\s*({{ident}})'
+      captures:
+        1: keyword.source.rocq
+        3: entity.name.assumption.rocq
+    # Definitions
+    - match: '(\b(?:Program|Local)\s+)?\b(Definition|Fixpoint|CoFixpoint|Function|Example|Let(?:\s+Fixpoint|\s+CoFixpoint)?|Instance|Equations|Equations?)\s+({{ident}})'
+      captures:
+        1: keyword.source.rocq
+        2: keyword.source.rocq
+        3: entity.name.function.rocq
+    # Obligations
+    - match: '\b((Show\s+)?Obligation\s+Tactic|Obligations\s+of|Obligation|Next\s+Obligation(\s+of)?|Solve\s+Obligations(\s+of)?|Solve\s+All\s+Obligations|Admit\s+Obligations(\s+of)?|Instance)\b'
+      captures:
+        1: keyword.source.rocq
+    # Type declarations
+    - match: '\b(CoInductive|Inductive|Variant|Record|Structure|Class)\s+(>\s*)?({{ident}})'
+      captures:
+        1: keyword.source.rocq
+        3: entity.name.type.rocq
+    # Ltac declarations
+    - match: '\b(Ltac)\s+({{ident}})'
+      captures:
+        1: keyword.source.rocq
+        2: entity.name.function.ltac
+    # Ltac2 declarations
+    - match: '\b(Ltac2)\s+(mutable\s+)?(rec\s+)?({{ident}})'
+      captures:
+        1: keyword.source.rocq
+        2: keyword.source.rocq
+        3: keyword.source.rocq
+        4: entity.name.function.ltac
+    # Vernacular keywords
+    - match: '\b(Hint(\s+Mode)?|Create\s+HintDb|Constructors|Resolve|Rewrite|Ltac|Ltac2|Implicit(\s+Types?)?|Set|Unset|Test|Remove\s+Printing|Arguments|((Tactic|Reserved)\s+)?Notation|Abbreviation|Infix|Section|Module(\s+Type)?|End|Check|Print(\s+All)?|Eval|Compute|Search|Universes?|Coercions|Generalizable(\s+(All|Variable))?|Existing(\s+(Class|Instance))?|Canonical|About|Locate|Collection|Typeclasses\s+(Opaque|Transparent))\b'
+      scope: keyword.source.rocq
+    # Proof keywords
+    - match: '\b(Proof|Qed|Defined|Save|Abort(\s+All)?|Undo(\s+To)?|Restart|Focus|Unfocus|Unfocused|Show\s+Proof|Show\s+Existentials|Show|Unshelve)\b'
+      scope: keyword.source.rocq
+    # Vernacular debug keywords
+    - match: '\b(Quit|Drop|Time|Redirect|Timeout|Fail)\b'
+      scope: keyword.debug.rocq
+    # Admits are bad
+    - match: '\b(admit|Admitted)\b'
+      scope: invalid.illegal.admit.rocq
+    # Comments, before the operators: `(*` opens a comment, it is not `(` and `*`.
+    - match: '\(\*\*(?!\*)'
+      push: doc_comment_body
+    - match: '\(\*(?!#)'
+      push: block_comment_body
+    # Operators
+    - match: ':|\||=|<|>|\*|\+|-|\{|\}|≠|∨|∧|↔|¬|→|≤|≥'
+      scope: keyword.operator.rocq
+    # Type keywords
+    - match: '\b(forall|exists|Univ|Type|Set|Prop|SProp|nat|bool|option|list|unit|sum|prod|comparison|Empty_set)\b|∀|∃'
+      scope: support.type.rocq
+    # Ltac keywords
+    - match: '\b(try|repeat|rew|progress|fresh|solve|now|first|tryif|at|once|do|only)\b'
+      scope: keyword.control.ltac
+    # Common Ltac connectors
+    - match: '\b(into|with|eqn|by|move|as|using)\b'
+      scope: keyword.control.ltac
+    # Gallina keywords
+    - match: '\b(match|lazymatch|multimatch|match!|lazy_match!|multi_match!|fun|with|return|end|let|in|if|then|else|fix|for|where|and)\b|λ'
+      scope: keyword.control.gallina
+    # Ltac builtins
+    - match: '\b(intro|intros|revert|induction|destruct|auto|eauto|tauto|eassumption|apply|eapply|assumption|constructor|econstructor|reflexivity|inversion|injection|assert|split|esplit|omega|fold|unfold|specialize|rewrite|erewrite|change|symmetry|refine|simpl|intuition|firstorder|generalize|idtac|exist|exists|eexists|elim|eelim|rename|subst|congruence|trivial|left|right|set|pose|discriminate|clear|clearbody|contradict|contradiction|exact|dependent|remember|case|easy|unshelve|pattern|transitivity|etransitivity|f_equal|exfalso|replace|abstract|cycle|swap|revgoals|shelve|unshelve)\b'
+      scope: support.function.builtin.ltac
+    - match: '\b((0(x|X)[0-9a-fA-F]+)|([0-9]+(\.[0-9]+)?))\b'
+      scope: constant.numeric.gallina
+    # Gallina builtin constructors
+    - match: '\b(True|False|tt|false|true|Some|None|nil|cons|pair|inl|inr|O|S|Eq|Lt|Gt|id|ex|all|unique)\b'
+      scope: constant.language.constructor.gallina
+    - match: '\b_\b'
+      scope: constant.language.wildcard.rocq
+    - match: '"'
+      scope: punctuation.definition.string.begin.rocq
+      push: string_body
+
+  # A comment nests, and a string inside one is read as a string, so `"*)"` does not end it.
+  # The end is tried last (upstream's `applyEndPatternLast`).
+  doc_comment_body:
+    - meta_scope: comment.doc.rocq
+    - match: '\(\*\*(?!\*)'
+      push: doc_comment_body
+    - match: '\(\*(?!#)'
+      push: block_comment_body
+    - match: '"'
+      push: comment_string_body
+    - match: '\*\)'
+      pop: true
+
+  block_comment_body:
+    - meta_scope: comment.block.rocq
+    - match: '\(\*(?!#)'
+      push: block_comment_body
+    - match: '"'
+      push: comment_string_body
+    - match: '\*\)'
+      pop: true
+
+  comment_string_body:
+    - meta_scope: string.quoted.double.rocq
+    - match: '"'
+      pop: true
+
+  string_body:
+    - meta_scope: string.quoted.double.rocq
+    - match: '"'
+      scope: punctuation.definition.string.end.rocq
+      pop: true
