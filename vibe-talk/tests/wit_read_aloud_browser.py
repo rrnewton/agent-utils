@@ -30,6 +30,7 @@ import struct
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +40,8 @@ from urllib.parse import unquote, urlsplit
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
+
+Json = dict[str, object]
 
 TOKEN = "write-token-browser-wit-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
@@ -60,7 +63,7 @@ def tone_wav(seconds: float = 1.2) -> bytes:
             + b"data" + struct.pack("<I", len(pcm)) + pcm)
 
 
-def message(index: int, message_id: str, content: str) -> dict:
+def message(index: int, message_id: str, content: str) -> Json:
     return {
         "id": message_id,
         "channel_id": CHANNEL["id"],
@@ -77,11 +80,11 @@ def message(index: int, message_id: str, content: str) -> dict:
 @dataclass
 class FakeApi:
     lock: threading.Lock = field(default_factory=threading.Lock)
-    prepares: list[dict] = field(default_factory=list)
-    timings: list[tuple[str, dict]] = field(default_factory=list)
+    prepares: list[Json] = field(default_factory=list)
+    timings: list[tuple[str, Json]] = field(default_factory=list)
     reads: list[str] = field(default_factory=list)
 
-    def client_config(self) -> dict:
+    def client_config(self) -> Json:
         return {
             "version": "browser-check",
             "chat_provider_name": "Discord",
@@ -102,7 +105,7 @@ class FakeApi:
             "speech_prep_enabled": True,
         }
 
-    def timeline(self) -> dict:
+    def timeline(self) -> Json:
         rows = [message(i, mid, text) for i, (mid, text) in enumerate(MESSAGES.items())]
         return {"channel": CHANNEL, "messages": rows, "threads": [], "thread": None,
                 "has_threads": False, "has_more": False, "next_before": None, "notice": None,
@@ -179,7 +182,7 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
             except OSError:
                 pass
 
-        def json(self, status: int, payload: dict) -> None:
+        def json(self, status: int, payload: Json) -> None:
             body = b"" if status == 204 else json.dumps(payload).encode()
             self.send_bytes(status, "application/json", body)
 
@@ -229,7 +232,7 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def walk(page: "Page", api: FakeApi, url: str, shot) -> None:
+def walk(page: "Page", api: FakeApi, url: str, shot: Callable[[str], None]) -> None:
     """One reader's walk, the same at phone and desktop sizes."""
     page.goto(url, wait_until="load")
     page.fill("#api-token", TOKEN)
@@ -259,19 +262,23 @@ def walk(page: "Page", api: FakeApi, url: str, shot) -> None:
     page.wait_for_function(f"() => preparedSpeech.size === {len(MESSAGES)}", timeout=10_000)
     with api.lock:
         prepares = list(api.prepares)
-    check(prepares and all(p.get("voice") == "wit$Clara" for p in prepares),
+    check(len(prepares) > 0 and all(p.get("voice") == "wit$Clara" for p in prepares),
           f"speech preparation did not ask for the picked voice: {prepares}")
-    page.tap(f'#discord-log > li[data-id="401"] .body') if page.viewport_size["width"] < 600 \
-        else page.click(f'#discord-log > li[data-id="401"] .body')
+    viewport = page.viewport_size or {"width": 1440, "height": 900}
+    if viewport["width"] < 600:
+        page.tap('#discord-log > li[data-id="401"] .body')
+    else:
+        page.click('#discord-log > li[data-id="401"] .body')
     deadline = time.monotonic() + 15
-    timing = None
+    timing: Json | None = None
     while time.monotonic() < deadline:
         with api.lock:
             timing = next((t for name, t in api.timings if name == "ticket-401"), None)
         if timing:
             break
         time.sleep(0.05)
-    check(timing is not None, "the page never reported the Wit.ai read audible")
+    if timing is None:
+        raise AssertionError("the page never reported the Wit.ai read audible")
     audible = timing.get("tap_to_audible_ms")
     check(isinstance(audible, int) and audible < 5000,
           f"the Wit.ai read was not promptly audible: {timing}")
@@ -302,16 +309,16 @@ def main() -> int:
 
     try:
         with sync_playwright() as playwright:
-            for name, viewport, mobile in [
-                ("phone", {"width": 393, "height": 852}, True),
-                ("desktop", {"width": 1440, "height": 900}, False),
+            for name, width, height, mobile in [
+                ("phone", 393, 852, True),
+                ("desktop", 1440, 900, False),
             ]:
                 with tempfile.TemporaryDirectory(prefix="vibe-talk-wit-chrome-") as profile:
                     context = playwright.chromium.launch_persistent_context(
                         profile,
                         headless=True,
                         executable_path=executable,
-                        viewport=viewport,
+                        viewport={"width": width, "height": height},
                         is_mobile=mobile,
                         has_touch=mobile,
                     )
@@ -330,7 +337,7 @@ def main() -> int:
                     walk(page, api, url, shot)
                     check(not errors, f"page errors during the {name} walk: {errors}")
                     context.close()
-                    print(f"wit read-aloud walk ({name} {viewport['width']}x{viewport['height']}): ok")
+                    print(f"wit read-aloud walk ({name} {width}x{height}): ok")
     finally:
         server.shutdown()
     return 0
