@@ -344,6 +344,12 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         checks.push(wit_token(state, &deadline).await);
     }
 
+    // `#561 local-tts-provider`. Only a local deployment spends this call:
+    // it proves the sidecar is up and says how many voices it offers.
+    if state.speech.describe().backend == "local" {
+        checks.push(local_sidecar(state, &deadline).await);
+    }
+
     checks.push(elevenlabs_key(state, &deadline).await);
     // One vendor call answers both of these, and the voice check reads the agent's verdict as
     // well as its profile — so the voice row is BUILT first and PUSHED second, which is the
@@ -457,6 +463,36 @@ async fn wit_token(state: &AppState, deadline: &Deadline) -> Check {
         },
     };
     Check::new("wit.token", "Wit.ai app token", diagnosis)
+}
+
+/// Whether the local speech sidecar is up, and how many voices it offers.
+///
+/// Calls the provider's catalogue rather than synthesizing: the cheapest
+/// sidecar call, and the one whose answer the Settings picker shows.
+/// `#561 local-tts-provider`.
+async fn local_sidecar(state: &AppState, deadline: &Deadline) -> Check {
+    let diagnosis = match within(deadline, state.speech.voices()).await {
+        Err(timed_out) => timed_out,
+        Ok(Ok(voices)) => Diagnosis::Confirmed(format!(
+            "the local speech sidecar is up and lists {} voices for the Settings picker",
+            voices.len()
+        )),
+        Ok(Err(error)) => match &error {
+            crate::speech::SpeechError::NotConfigured { .. } => {
+                Diagnosis::NotConfigured("local_tts.endpoint")
+            }
+            crate::speech::SpeechError::Backend { code, .. }
+                if *code == "local_tts_unreachable" =>
+            {
+                Diagnosis::Unreachable(error.to_string())
+            }
+            crate::speech::SpeechError::Backend { .. } => {
+                Diagnosis::Unintelligible(error.to_string())
+            }
+            other => Diagnosis::Unintelligible(other.to_string()),
+        },
+    };
+    Check::new("local_tts.sidecar", "Local speech sidecar", diagnosis)
 }
 
 /// Which of a chat provider's checks a row is. `#325 provider-diagnostics-ids`.

@@ -688,6 +688,15 @@ async fn main() -> anyhow::Result<()> {
                 config.wit.clone(),
             ))
         }
+        ReadAloudBackend::Local => {
+            let endpoint = config.local_tts.endpoint.as_deref().unwrap_or_default();
+            let client = vibe_talk::local_tts::http::HttpLocalTtsClient::new(endpoint)
+                .map_err(|error| anyhow::anyhow!("local tts client: {error}"))?;
+            Arc::new(vibe_talk::local_tts::speech::LocalSpeech::new(
+                Arc::new(client),
+                config.local_tts.clone(),
+            ))
+        }
     };
     let read_aloud = speech.describe();
     tracing::info!(

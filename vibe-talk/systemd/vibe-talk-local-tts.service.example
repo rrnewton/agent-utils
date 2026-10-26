@@ -1,0 +1,33 @@
+[Unit]
+Description=Local CPU text-to-speech sidecar for vibe-talk read-aloud
+Documentation=https://github.com/rrnewton/agent-utils/tree/main/vibe-talk
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+# Replace both REPLACE_* values. The model directory holds the Kokoro-82M
+# files (kokoro-v1.0.onnx, voices-v1.0.bin; Apache-2.0) fetched ONCE, by
+# hand, and lives outside the repository; the sidecar only ever reads it
+# and listens on loopback. vibe-talk wants:
+#   [read_aloud]
+#   backend = "local"
+#   [local_tts]
+#   endpoint = "http://127.0.0.1:18771"
+#   voice = "af_heart"
+ExecStart=/REPLACE_WITH_CHECKOUT/vibe-talk/.venv/bin/python /REPLACE_WITH_CHECKOUT/vibe-talk/scripts/local_tts_sidecar.py --model-dir /REPLACE_WITH_MODEL_DIR --port 18771
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+UMask=0077
+LimitCORE=0
+# Kokoro-82M fp32 with its runtime, measured on the development server.
+MemoryHigh=2G
+MemoryMax=4G
+MemorySwapMax=0
+TasksMax=512
+
+[Install]
+WantedBy=default.target

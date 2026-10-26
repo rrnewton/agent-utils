@@ -180,6 +180,7 @@ fn state_pieces(
         store,
         Arc::new(crate::summarize::fake::FakeSummarizer::new()),
         None,
+        None,
     )
 }
 
@@ -196,7 +197,7 @@ pub fn state_with_summarizer(
     let store = Arc::new(FakeStore::new());
     let summarizer = Arc::new(crate::summarize::fake::FakeSummarizer::new());
     let (state, discord, _elevenlabs, _erased) =
-        state_pieces_with(text, store.clone(), summarizer.clone(), None);
+        state_pieces_with(text, store.clone(), summarizer.clone(), None, None);
     (state, discord, store, summarizer)
 }
 
@@ -213,7 +214,7 @@ pub fn state_with_backend(
 ) -> (AppState, Arc<FakeDiscord>, Arc<FakeStore>) {
     let store = Arc::new(FakeStore::new());
     let (state, discord, _elevenlabs, _erased) =
-        state_pieces_with(text, store.clone(), summarizer, None);
+        state_pieces_with(text, store.clone(), summarizer, None, None);
     (state, discord, store)
 }
 
@@ -233,6 +234,27 @@ pub fn state_with_wit(
         store,
         Arc::new(crate::summarize::fake::FakeSummarizer::new()),
         Some(client),
+        None,
+    );
+    (state, discord)
+}
+
+/// A server whose read-aloud speaks through the given local-sidecar
+/// client, plus a handle to the fake Discord. `#561 local-tts-provider`:
+/// the in-memory fake for adapter tests, the real HTTP client against a
+/// loopback fake sidecar for wire tests.
+#[must_use]
+pub fn state_with_local(
+    text: &str,
+    client: Arc<dyn crate::local_tts::LocalTtsClient>,
+) -> (AppState, Arc<FakeDiscord>) {
+    let store = Arc::new(FakeStore::new());
+    let (state, discord, _elevenlabs, _erased) = state_pieces_with(
+        text,
+        store,
+        Arc::new(crate::summarize::fake::FakeSummarizer::new()),
+        None,
+        Some(client),
     );
     (state, discord)
 }
@@ -242,6 +264,7 @@ fn state_pieces_with(
     store: Arc<dyn crate::store::StateStore>,
     summarizer: Arc<dyn crate::summarize::Summarizer>,
     wit_client: Option<Arc<dyn crate::wit::WitClient>>,
+    local_client: Option<Arc<dyn crate::local_tts::LocalTtsClient>>,
 ) -> (
     AppState,
     Arc<FakeDiscord>,
@@ -287,6 +310,13 @@ fn state_pieces_with(
             wit_client.unwrap_or_else(|| Arc::new(crate::wit::fake::FakeWit::new())),
             config.wit.clone(),
         )),
+        crate::config::ReadAloudBackend::Local => {
+            Arc::new(crate::local_tts::speech::LocalSpeech::new(
+                local_client
+                    .unwrap_or_else(|| Arc::new(crate::local_tts::fake::FakeLocalTts::new())),
+                config.local_tts.clone(),
+            ))
+        }
     };
     // The fake answers for the deployment's one provider, recorded under that provider's own
     // namespace exactly as `main` records a real client's.

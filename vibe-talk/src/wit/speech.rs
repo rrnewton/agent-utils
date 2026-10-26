@@ -195,6 +195,17 @@ struct Wav {
     data_len: usize,
 }
 
+/// Whether `bytes` parse as one playable WAV piece, for adapters sharing
+/// this module's merging and silence rules (`crate::local_tts`).
+///
+/// # Errors
+///
+/// [`WitError::Shape`] when the bytes are not 16-bit PCM WAV with a
+/// playable rate and channel count.
+pub fn parse_wav_for_merge(bytes: &[u8]) -> Result<(), WitError> {
+    parse_wav(bytes).map(|_| ())
+}
+
 fn parse_wav(bytes: &[u8]) -> Result<Wav, WitError> {
     let shape = |detail: &str| WitError::Shape(detail.to_owned());
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {

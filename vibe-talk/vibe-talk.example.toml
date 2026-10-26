@@ -280,6 +280,30 @@ backend = "elevenlabs"
 # Only change this to point at a test double or a proxy.
 # api_base = "https://api.wit.ai"
 
+# "local" reads through a TTS model running on THIS machine's CPU in a
+# sidecar process (scripts/local_tts_sidecar.py): no cloud service, no
+# private voice stack, and no network call at synthesis time. It needs a
+# [local_tts] section naming the sidecar's loopback endpoint (below).
+# Kokoro-82M (Apache-2.0 weights and voices) is the default engine; Piper
+# (MIT code, per-voice licences) is the light option. Model files are
+# fetched once into a directory outside this repository.
+
+# [local_tts] configures read_aloud backend = "local". `#561 local-tts-provider`.
+#
+# Environment: VIBE_TALK_LOCAL_TTS_ENDPOINT / VIBE_TALK_LOCAL_TTS_VOICE
+# [local_tts]
+# Where the sidecar listens. Start it with:
+#   vibe-talk/.venv/bin/python vibe-talk/scripts/local_tts_sidecar.py \
+#       --model-dir /path/to/kokoro-models --port 18771
+# endpoint = "http://127.0.0.1:18771"
+# Which model voice reads, as the sidecar's GET /voices names it.
+# Optional: the reader can pick one in Settings instead; with neither,
+# reading refuses and names this setting.
+# voice = "af_heart"
+# Default pace as a multiplier from 0.5 to 2.0, when the reader has not
+# chosen one for a read. Absent, the voice's own pace.
+# speed = 1.0
+
 # [render] says how message bodies are drawn on the page. Absent, single newlines are soft.
 # [render]
 # What a single newline inside a paragraph is. "soft": a space, as standard Markdown has it, so the

@@ -42,6 +42,11 @@ pub const ENV_WIT_VOICE: &str = "VIBE_TALK_WIT_VOICE";
 /// Environment variable overriding the Wit.ai API base, so a test or a proxy
 /// can point elsewhere.
 pub const ENV_WIT_API_BASE: &str = "VIBE_TALK_WIT_API_BASE";
+/// Where the local speech sidecar listens, for `read_aloud.backend = "local"`.
+/// Public: a loopback URL inside this machine, naming no credential.
+pub const ENV_LOCAL_TTS_ENDPOINT: &str = "VIBE_TALK_LOCAL_TTS_ENDPOINT";
+/// Which local voice reads a message aloud. Public: it names a model voice.
+pub const ENV_LOCAL_TTS_VOICE: &str = "VIBE_TALK_LOCAL_TTS_VOICE";
 /// Environment variable carrying the ElevenLabs API key.
 pub const ENV_ELEVENLABS_API_KEY: &str = "VIBE_TALK_ELEVENLABS_API_KEY";
 /// Environment variable carrying the ElevenLabs agent id.
@@ -197,6 +202,8 @@ pub struct Config {
     pub elevenlabs: ElevenLabsConfig,
     /// Wit.ai wiring, when configured. `#552 wit-tts-provider`.
     pub wit: WitConfig,
+    /// Local-sidecar wiring, when configured. `#561 local-tts-provider`.
+    pub local_tts: LocalTtsConfig,
     /// Provider used for live conversational voice sessions.
     pub conversation: ConversationConfig,
     /// Durable state: where it lives, and how much of it is kept.
@@ -312,6 +319,9 @@ pub enum ReadAloudBackend {
     Conversation,
     /// Server audio from the public Wit.ai speech service. `#552 wit-tts-provider`.
     Wit,
+    /// Server audio from a TTS model running on this machine's CPU.
+    /// `#561 local-tts-provider`.
+    Local,
 }
 
 /// Backend selection for tapping messages to read them aloud.
@@ -1133,6 +1143,27 @@ pub struct WitConfig {
     pub api_base: String,
 }
 
+/// `[local_tts]`: a TTS model on this machine's CPU, for
+/// `read_aloud.backend = "local"`. `#561 local-tts-provider`.
+///
+/// The model runs in a sidecar process (see `scripts/local_tts_sidecar.py`);
+/// this server only knows where it listens. Every field is optional in the
+/// same way Wit.ai's are: an unwired deployment starts, and asking it to
+/// read is a loud refusal naming `local_tts.endpoint`.
+#[derive(Clone, Debug, Default)]
+pub struct LocalTtsConfig {
+    /// The sidecar's loopback base URL, for example `http://127.0.0.1:18771`.
+    pub endpoint: Option<String>,
+    /// Which model voice reads a message aloud, for example `af_heart`.
+    ///
+    /// Optional because the reader may choose one in Settings instead;
+    /// with neither, reading is a loud refusal naming this setting.
+    pub voice: Option<String>,
+    /// Default pace as a multiplier (0.5 to 2.0), when the reader has not
+    /// chosen one for a read. `None` is the voice's own pace.
+    pub speed: Option<f64>,
+}
+
 impl Default for WitConfig {
     fn default() -> Self {
         Self {
@@ -1304,6 +1335,8 @@ struct FileConfig {
     #[serde(default)]
     wit: FileWit,
     #[serde(default)]
+    local_tts: FileLocalTts,
+    #[serde(default)]
     conversation: ConversationConfig,
     #[serde(default)]
     read_aloud: ReadAloudConfig,
@@ -1467,6 +1500,16 @@ struct FileChannel {
     #[serde(default)]
     writable: bool,
     provider: Option<String>,
+}
+
+/// `[local_tts]` as written. No secret exists to refuse: a loopback URL
+/// and a voice name are all this section holds.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileLocalTts {
+    endpoint: Option<String>,
+    voice: Option<String>,
+    speed: Option<f64>,
 }
 
 /// `[wit]` as written. `token` is declared only to be REFUSED by name: a
@@ -1795,11 +1838,12 @@ impl Config {
             Some("elevenlabs") => ReadAloudBackend::ElevenLabs,
             Some("conversation") => ReadAloudBackend::Conversation,
             Some("wit") => ReadAloudBackend::Wit,
+            Some("local") => ReadAloudBackend::Local,
             Some(other) => {
                 return Err(ConfigError::Invalid {
                     field: "read_aloud.backend".to_owned(),
                     detail: format!(
-                    "unknown backend {other:?}; choose browser, elevenlabs, conversation, or wit"
+                    "unknown backend {other:?}; choose browser, elevenlabs, conversation, wit, or local"
                 ),
                 })
             }
@@ -1810,6 +1854,11 @@ impl Config {
             get(ENV_WIT_VOICE),
             get(ENV_WIT_API_BASE),
             read_aloud_backend == ReadAloudBackend::Wit,
+        )?;
+        let local_tts = local_tts_config(
+            file.local_tts,
+            get(ENV_LOCAL_TTS_ENDPOINT),
+            get(ENV_LOCAL_TTS_VOICE),
         )?;
         let conversation = speech_hold_checked(file.conversation)?;
         let replay = replay_config(
@@ -1868,6 +1917,7 @@ impl Config {
                     .or(file.elevenlabs.voice_id),
             },
             wit,
+            local_tts,
             conversation,
             storage,
             summaries,
@@ -1962,6 +2012,38 @@ fn wit_config(
             .map(str::to_owned)
             .or_else(|| text(file.api_base))
             .unwrap_or_else(|| DEFAULT_WIT_API_BASE.to_owned()),
+    })
+}
+
+/// Resolve and check `[local_tts]`. `#561 local-tts-provider`.
+///
+/// Only the pace is validated: an endpoint that does not answer is a
+/// read-time failure with its own loud error, not a startup refusal, so a
+/// deployment can start before its sidecar does.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the field to fix.
+fn local_tts_config(
+    file: FileLocalTts,
+    endpoint_env: Option<&str>,
+    voice_env: Option<&str>,
+) -> Result<LocalTtsConfig, ConfigError> {
+    let text = |value: Option<String>| value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    if let Some(speed) = file.speed {
+        if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
+            return Err(ConfigError::Invalid {
+                field: "local_tts.speed".to_owned(),
+                detail: format!("{speed} is outside 0.5 to 2.0; give a pace multiplier"),
+            });
+        }
+    }
+    Ok(LocalTtsConfig {
+        endpoint: endpoint_env
+            .map(str::to_owned)
+            .or_else(|| text(file.endpoint)),
+        voice: voice_env.map(str::to_owned).or_else(|| text(file.voice)),
+        speed: file.speed,
     })
 }
 
