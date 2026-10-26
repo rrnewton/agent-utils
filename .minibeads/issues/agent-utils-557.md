@@ -1,13 +1,14 @@
 ---
 title: 'agent-teams-cancel-perms: agent-teams creates queue tombstone directories and files with umask modes'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agent-teams
 - agent-queue
 created_at: 2026-10-26T21:32:19.832064604+00:00
-updated_at: 2026-10-26T21:32:19.832064604+00:00
+updated_at: 2026-10-26T22:51:40.674984871+00:00
+closed_at: 2026-10-26T22:51:40.674984782+00:00
 ---
 
 # Description

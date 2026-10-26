@@ -1,6 +1,6 @@
 ---
 title: 'chat-delivery-latency: owner chat requests reach the coordinator 5-56 minutes late'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - chat
 - agent-queue
 created_at: 2026-10-26T21:32:19.829086498+00:00
-updated_at: 2026-10-26T21:32:19.829086498+00:00
+updated_at: 2026-10-26T22:51:40.671910331+00:00
+closed_at: 2026-10-26T22:51:40.671910181+00:00
 ---
 
 # Description
