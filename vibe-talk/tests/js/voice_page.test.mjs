@@ -13108,7 +13108,7 @@ test("`#429 keyboard-hides-bar`: both rows go while the keyboard is up, only on 
   // A reading or a call keeps one slim row: its Stop or Hang up, and nothing else of the tile. A
   // read playing makes Read its Pause, and Stop (`#442 read-strip-order`, hidden otherwise) stays.
   assert.match(body,
-    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane > :not\(#hang-up, #read-aloud\[data-active="true"\], #read-aloud-stop\) \{\s*display:\s*none;\s*\}/,
+    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane > :is\(\.control, \.popover\):not\(#hang-up, #read-aloud\[data-active="true"\], #read-aloud-stop\) \{\s*display:\s*none;\s*\}/,
     "the rest of the tile stays up beside Stop");
   assert.match(body,
     /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane:has\(#read-aloud-stop:not\(\[hidden\]\)\) \{\s*grid-template-columns:\s*1fr 1fr;\s*\}/,
@@ -54191,7 +54191,9 @@ test("`#231 two-column-polish` x `#226 page-energy-profile`: with the cards up, 
   assert.ok(page.el("discord-log").children.every((li, at) => li === rows[at]), "Main's rows were replaced");
   // The control: the cards redrawn on every pass, as they were before they kept what they were drawn
   // from. The same refresh has to build them again, or the check above could not see it.
-  const control = await quietPoll(brokenScript("  if (signature !== sideCardsDrawn) {", "  if (true) {"));
+  // `#532 shift-o-latency`: and nothing kept from the pass before, which a pass that changed nothing keeps.
+  const control = await quietPoll(brokenScriptEach(["  if (signature !== sideCardsDrawn) {", "  if (true) {"],
+    ['const keep = sideCardsDrawn !== "" && sideCardsKept.whole === whole;', "const keep = false;"]));
   assert.ok(builtSince(control.page, control.made, "li") >= control.cards.length,
     "the negative control did not redraw the cards, so the check above proves nothing");
 });
@@ -71607,11 +71609,11 @@ test("`#306 done-stale-across-views`: a thread's card on the right counts an Und
 /** The left column's own catch-up after a Done or an Undo made in the right column, taken out for a negative control. */
 const LEFT_FOLLOWS = ["  if (madeIn === columns.side && !sideShowing()) {", "  if (false) {"];
 /** ...its rows drawn again where they disagree with its copy, taken out: only Main's counts drawn. */
-const LEFT_REDRAWS = ["      if (rowsMissDone()) renderCachedTimeline();\n      else syncUnreadReplies();",
-  "      syncUnreadReplies();"];
+const LEFT_REDRAWS = ["        if (rowsMissDone()) renderCachedTimeline();\n        else syncUnreadReplies();",
+  "        syncUnreadReplies();"];
 /** ...Main's roots' counts of unread replies drawn again, taken out: only rows that disagree drawn. */
-const LEFT_COUNTS = ["      if (rowsMissDone()) renderCachedTimeline();\n      else syncUnreadReplies();",
-  "      if (rowsMissDone()) renderCachedTimeline();"];
+const LEFT_COUNTS = ["        if (rowsMissDone()) renderCachedTimeline();\n        else syncUnreadReplies();",
+  "        if (rowsMissDone()) renderCachedTimeline();"];
 
 /**
  * Two columns over the channel of `threadData`, thread one & two on the right; a Done on message `id`
@@ -81505,6 +81507,166 @@ test("`#407 unpack-row-parity`: Enter and o fold the selected unpacked row, e ma
   await pressHere(page, "r");
   assert.ok(replyInStream(page), "r did not reply to the selected unpacked row");
   assert.match(page.el("reply-target-meta").textContent, /id 707$/, "r answered another message");
+});
+
+// --- `#532 shift-o-latency` -----------------------------------------------------------------------
+//
+// The owner, 2026-10-26: Shift+O "does take a couple seconds. If I am folding up 4 messages in a row in a
+// thread I thought I could spam the key four times and see them responsively fold up", and of e: "one of
+// those things that I most want to be instantly responsive locally". Each press drew every thread
+// unpacked in the Threads view again, three times over. Now a fold or a Done is drawn on the rows already
+// there: the thread's card counts again in place, its rows are dressed again and its runs placed again,
+// and every other thread is left alone.
+
+/** `SHIFT_O_THREADS` threads of a root and `SHIFT_O_REPLIES` long replies, every message unread. */
+const SHIFT_O_THREADS = 12;
+const SHIFT_O_REPLIES = 5;
+function shiftOData() {
+  const messages = [];
+  const threads = [];
+  for (let t = 0; t < SHIFT_O_THREADS; t += 1) {
+    const id = `spaces/A/threads/s${t}`;
+    const rootId = String(9532000 + t * 10);
+    const record = { id, root_message_id: rootId, is_root: true, reply_count: SHIFT_O_REPLIES, reply_count_exact: true };
+    const root = message({ id: rootId, content: `thread ${t} root`, thread: record });
+    messages.push(root);
+    for (let r = 1; r <= SHIFT_O_REPLIES; r += 1) {
+      messages.push(message({ id: String(9532000 + t * 10 + r), content: longMessage(`thread ${t} reply ${r}`),
+        thread: { ...record, is_root: false } }));
+    }
+    threads.push({ id, root, title: "Thread", reply_count: SHIFT_O_REPLIES, reply_count_exact: true,
+      updated_at: messages.at(-1).timestamp });
+  }
+  return { messages, threads };
+}
+
+async function shiftOPage(script = SCRIPT) {
+  const data = shiftOData();
+  const page = newPage(new Map([[UNPACK_STORAGE, "on"]]), script);
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return page;
+}
+
+/** Per-press budget in this fixture, which lays nothing out: a press that draws more than its own rows misses it. */
+const SHIFT_O_BUDGET_MS = 50;
+
+/**
+ * Press `key` `times` times on whatever holds the focus, each press timed and the elements it built
+ * counted, and the Threads view's rows of every other thread compared before and after.
+ */
+async function pressesInPlace(page, key, fields, times, own) {
+  const others = () => page.el("side-cards").children.filter((li) => li.getAttribute("data-unpack-thread") !== own &&
+    !(li.hasAttribute("data-card") && li.getAttribute("data-id") === own));
+  const before = others();
+  const took = [];
+  let built = 0;
+  for (let at = 0; at < times; at += 1) {
+    const made = page.createdTags.length;
+    const start = performance.now();
+    await pressHere(page, key, fields);
+    took.push(performance.now() - start);
+    built += builtSince(page, made, "li");
+  }
+  const after = others();
+  const kept = after.length === before.length && after.every((li, at) => li === before[at]);
+  return { took, built, kept };
+}
+
+test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads view each draw in place, within budget, and the folds, Dones and Undo are right", async () => {
+  const page = await shiftOPage();
+  const own = "spaces/A/threads/s11";
+  const rows = () => unpackRows(page, own);
+  assert.equal(rows().length, SHIFT_O_REPLIES, "the premise is the last thread's replies unpacked under its card");
+  const drawn = rows();
+  await mouseOnto(page, unpackedRow(page, "9532115"));
+  const folds = await pressesInPlace(page, "O", { shiftKey: true }, 4, own);
+  assert.equal(folds.built, 0, `Shift+O built ${folds.built} rows: it drew the list again rather than fold in place`);
+  assert.ok(folds.kept, "Shift+O drew the other threads again");
+  assert.ok(rows().every((li, at) => li === drawn[at]), "Shift+O drew its own thread's rows again");
+  assert.deepStrictEqual(rows().map((li) => li.getAttribute("data-read-run")), [null, "head", "member", "member", "member"],
+    "four presses did not fold the four last replies into one line");
+  assert.equal(readRunLineOf(rows()[1]).textContent, "… 4 read messages …");
+  assert.equal(selectedId(page), "9532111", "the selection did not step above the folds");
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages),
+    [["9532115"], ["9532114"], ["9532113"], ["9532112"]], "each fold did not mark its message read");
+  for (const li of rows().slice(1)) assert.equal(li.getAttribute("data-archived"), "true", "a folded row is not drawn read");
+  assert.ok(folds.took.every((ms) => ms < SHIFT_O_BUDGET_MS),
+    `a Shift+O took over ${SHIFT_O_BUDGET_MS} ms: ${folds.took.map((ms) => ms.toFixed(1)).join(", ")}`);
+
+  // e down another thread: each Done drawn on its row, the card's unread counted again in place.
+  const other = "spaces/A/threads/s10";
+  const card = cardRow(page, other);
+  const theirs = unpackRows(page, other);
+  await mouseOnto(page, unpackedRow(page, "9532101"));
+  const dones = await pressesInPlace(page, "e", {}, 4, other);
+  assert.equal(dones.built, 0, `e built ${dones.built} rows: it drew the list again rather than the Done in place`);
+  assert.ok(unpackRows(page, other).every((li, at) => li === theirs[at]), "e drew its thread's rows again");
+  assert.equal(cardRow(page, other), card, "e drew the thread's card again rather than count it in place");
+  assert.deepStrictEqual(page.dismissCalls.slice(4).map((call) => call.messages),
+    [["9532101"], ["9532102"], ["9532103"], ["9532104"]], "e did not mark four messages Done, stepping down");
+  assert.deepStrictEqual(unpackRows(page, other).map((li) => li.getAttribute("data-archived")),
+    ["true", "true", "true", "true", "false"], "the Done rows are not drawn read");
+  const counted = () => card.children.find((node) => node.className === "side-card-open").getAttribute("aria-label");
+  assert.match(counted(), /· 1 unread$/, `the card did not count the Dones: ${counted()}`);
+  assert.ok(dones.took.every((ms) => ms < SHIFT_O_BUDGET_MS),
+    `an e took over ${SHIFT_O_BUDGET_MS} ms: ${dones.took.map((ms) => ms.toFixed(1)).join(", ")}`);
+  // z puts back the last, on the row drawn, and the card counts it.
+  await pressHere(page, "z");
+  assert.deepStrictEqual(page.restoreCalls.at(-1), { messages: ["9532104"] }, "z did not undo the last e");
+  assert.equal(unpackedRow(page, "9532104").getAttribute("data-archived"), "false", "z did not draw the row unread");
+  assert.match(counted(), /· 2 unread$/, `the card did not count the put back: ${counted()}`);
+
+  // THE CONTROL: the list drawn anew on every pass, as before: the same presses build rows, so the
+  // checks above can see it.
+  const control = await shiftOPage(brokenScriptEach(
+    ['const keep = sideCardsDrawn !== "" && sideCardsKept.whole === whole;', "const keep = false;"]));
+  await mouseOnto(control, unpackedRow(control, "9532115"));
+  const redrawn = await pressesInPlace(control, "O", { shiftKey: true }, 1, own);
+  assert.ok(redrawn.built > 0 && !redrawn.kept, "the negative control did not draw the list again");
+});
+
+test("`#532 shift-o-latency`: a kept block is drawn again for what its rows show: a Done of a message read by a rule, an edit, a reaction", async () => {
+  // From the adversarial review: a block kept from the last pass is drawn again only for what its parts
+  // say. A noise message is read by a rule whether Done or not, so "still to do" alone did not change.
+  const data = shiftOData();
+  const noisy = "9532113";
+  const page = newPage(new Map([[UNPACK_STORAGE, "on"]]));
+  page.threadingSupported = true;
+  data.messages = data.messages.map((one) => (one.id === noisy ? { ...one, noise: true } : one));
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  const row = unpackedRow(page, noisy);
+  assert.equal(row.getAttribute("data-noise"), "true", "the premise: a message read by a rule");
+  await mouseOnto(page, row);
+  await pressHere(page, "e");
+  assert.deepStrictEqual(page.dismissCalls.at(-1), { messages: [noisy] }, "the premise: e marked it Done");
+  assert.equal(unpackedRow(page, noisy).getAttribute("data-archived"), "true", "the Done of a noise message was not drawn");
+  assert.equal(unpackedRow(page, noisy).getAttribute("data-noise"), "false", "a Done noise row still says it is noise");
+
+  // An edit and a reaction are in what a kept row is drawn again for, though its id and read state are
+  // the same; and the thread's reported count and its cover, which decide its loading line.
+  const look = page.pure("messageLook");
+  const base = data.messages.find((one) => one.id === "9532112");
+  assert.notEqual(look({ ...base, content: `${base.content} and more`, edited_timestamp: "2026-10-26T12:00:00Z" }), look(base),
+    "an edit is not in a row's signature");
+  assert.notEqual(look({ ...base, reactions: [{ emoji: "👍", count: 1, me: false }] }), look(base),
+    "a reaction is not in a row's signature");
+  const choice = (count) => ({ ...page.pure("threadChoices")().find((one) => one.id === "spaces/A/threads/s11"), count });
+  const held = page.pure("unpackHeldMessages")(choice(SHIFT_O_REPLIES));
+  assert.notEqual(page.pure("unpackSignature")(choice(SHIFT_O_REPLIES + 1), held),
+    page.pure("unpackSignature")(choice(SHIFT_O_REPLIES), held), "a thread grown by its count keeps its block, unread");
 });
 
 test("`#407 unpack-row-parity`: ; and : step the unpacked rows' folds as they step a thread's, each step said", async () => {

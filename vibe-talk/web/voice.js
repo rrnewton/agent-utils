@@ -11752,7 +11752,6 @@ function foldOneFromKeyboard(target) {
   if (opened) for (const id of ids) opened.delete(id);
   if (!ids.every((id) => archivedIds.has(id))) guardQuietly(() => markRowDone(ids, at))();
   if (unpack !== null) {
-    sideCardsDrawn = "";
     renderSideColumn();
   } else {
     inColumn(pane === sidePane ? columns.side : columns.main, () => {
@@ -32085,6 +32084,11 @@ function childByClass(row, className) {
   // moment the second class was added -- so the label could be set to "reading" and never set
   // back, which is precisely the bug that reached the suite.
   const has = (name) => name === className || (name.includes(className) && name.split(/\s+/).includes(className));
+  // `#532 shift-o-latency`. Found before, and still in the row with the class: a pass dressing every row
+  // unpacked under the cards asks this for each part of every row, and walked them all each time.
+  const parts = /** @type {any} */ (row).partsFound;
+  const known = parts ? parts.get(className) : undefined;
+  if (known && has(String(known.className || "")) && nodeWithin(row, known)) return known;
   const stack = [];
   const push = (node) => {
     const kids = node.children;
@@ -32095,6 +32099,8 @@ function childByClass(row, className) {
     const node = stack.pop();
     const name = String(node.className || "");
     if (has(name)) {
+      if (!parts) /** @type {any} */ (row).partsFound = new Map();
+      /** @type {any} */ (row).partsFound.set(className, node);
       return node;
     }
     if (name !== "md") {
@@ -32159,11 +32165,10 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   const ids = idsOf(row);
   // DIMS, never hides. See the note at the head of this section: this is derived from what
   // happens to be loaded, and evidence that admits it is incomplete must not remove anything.
-  row.setAttribute("data-replied", ids.some((one) => answered.has(one)) ? "true" : "false");
+  setAttributeIfChanged(row, "data-replied", ids.some((one) => answered.has(one)) ? "true" : "false");
   // The speaker treatment, on the same pass and from the same census. `me` and `coder` are drawn
   // as the transcript's two speakers; see web/voice.css.
-  row.setAttribute(
-    "data-who",
+  setAttributeIfChanged(row, "data-who",
     bucketFor(
       row.getAttribute("data-author-id"),
       row.getAttribute("data-author-bot") === "true",
@@ -32179,7 +32184,7 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   // UNREAD: the other reading files an unseen message away behind one the reader has dealt with,
   // and the whole point of the archive is that it says what is left.
   const isArchived = ids.length > 0 && ids.every((one) => archivedIds.has(one));
-  row.setAttribute("data-archived", isArchived ? "true" : "false");
+  setAttributeIfChanged(row, "data-archived", isArchived ? "true" : "false");
   // `#245 done-feedback`. The moment of a Done, on whichever row now stands for the message.
   drawDoneFlash(row);
   drawRowPin(row);
@@ -32189,28 +32194,27 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   // a row that vanished could not be rescued from a rule that caught it by mistake.
   const held = rowMessages(row);
   const isNoiseRow = held.length > 0 && held.every(isNoise);
-  row.setAttribute("data-noise", !isArchived && isNoiseRow ? "true" : "false");
+  setAttributeIfChanged(row, "data-noise", !isArchived && isNoiseRow ? "true" : "false");
   const rescue = notNoiseButtonOf(row);
-  if (rescue) rescue.hidden = !isNoiseRow;
+  if (rescue) setHiddenIfChanged(rescue, !isNoiseRow);
   // Separate from the declared archive: this one is implied, carries no undo, and disappears
   // the moment the setting is turned off.
-  row.setAttribute(
-    "data-own-read",
+  setAttributeIfChanged(row, "data-own-read",
     !isArchived && !isNoiseRow && markOwnRead && who === "me" ? "true" : "false"
   );
   const isReading = nowPlaying !== null && nowPlaying.id === id;
   // ASKED FOR, but not yet speaking. Distinct from `data-reading` on purpose: this one the
   // reader can still change their mind about, and it is the only thing on screen during a wait
   // that is entirely somebody else's network.
-  row.setAttribute("data-pending", pendingRead === id ? "true" : "false");
+  setAttributeIfChanged(row, "data-pending", pendingRead === id ? "true" : "false");
   // IS THIS MESSAGE ITSELF AN ANSWER? The opposite direction from `data-replied`, and the more
   // reliable one: that is derived from whatever happens to be loaded and misses an answer
   // further back than the window, whereas the pointer for this is ON the message. Correct
   // whether or not the message it answers is anywhere on screen.
-  row.setAttribute("data-is-reply", row.getAttribute("data-reply-to") ? "true" : "false");
+  setAttributeIfChanged(row, "data-is-reply", row.getAttribute("data-reply-to") ? "true" : "false");
   // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
   // tell them which message they hit — on a list where the next act archives it.
-  row.setAttribute("data-reading", isReading ? "true" : "false");
+  setAttributeIfChanged(row, "data-reading", isReading ? "true" : "false");
   // THE ROW BEING READ STAYS OPEN.
   //
   // The owner watched a message he was listening to collapse mid-read and assumed a stray tap.
@@ -32238,10 +32242,10 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   // saying nothing at all.
   const named = childByClass(row, "msg-author");
   if (named) {
-    named.className = isReading ? "msg-author reading-mark" : "msg-author";
+    setClassNameIfChanged(named, isReading ? "msg-author reading-mark" : "msg-author");
     // `#376 read-aloud-blocks`: and how far through, "reading 2 of 5", in a read of several parts.
-    named.textContent = isReading ? readingLabel() : authorLabel(row);
-    named.hidden = !isReading && (who === "me" || who === "coder");
+    setTextIfChanged(named, isReading ? readingLabel() : authorLabel(row));
+    setHiddenIfChanged(named, !isReading && (who === "me" || who === "coder"));
     // `#377 compact-collapsed-rows`. Where the header line has no room for the whole name it shows a
     // prefix and an ellipsis (web/voice.css); the whole name is here, for a pointer resting on it.
     const whole = isReading ? "" : authorLabel(row);
@@ -32254,8 +32258,12 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   markReadingBlock(row);
   const done = doneButtonOf(row);
   if (done) {
+    // Written every time, unlike the rest of this dress (`#532 shift-o-latency`): with this text too left
+    // alone where unchanged, a reply's Send moved its row down the list by the box it closed
+    // (tests/reply_continuity_browser.py). The place the Done keeps (`markRowDone`) depends on it.
     done.textContent = isArchived ? "Unarchive" : "Done";
-    done.setAttribute(
+    setAttributeIfChanged(
+      done,
       "title",
       isArchived
         ? "Put this back in the list. This does not change the source chat service."
@@ -32337,7 +32345,7 @@ function renderChannelRows() {
   paintAllThreadFocus();
   // `#407 unpack-row-parity`. Whatever this pass was for — a read aloud starting or ending, a pin, a
   // reply sent — the rows unpacked under the cards are dressed again with it, as message rows.
-  if (!sideActive) dressUnpackedRows();
+  if (!sideActive && !unpackDressedAfter) dressUnpackedRows();
   // `#419 threads-view-main-messages`. Main's messages among the cards are Main's rows' messages: what
   // changed them here (a message posted from the box at the foot, an arrival, a Done) is drawn there too.
   // Drawn again only where something they draw changed (`renderSideCards`).
@@ -32347,6 +32355,14 @@ function renderChannelRows() {
   if (replyDocked) placeInlineReply();
   else if (pendingReply) reopenPendingReply();
 }
+
+/**
+ * `#532 shift-o-latency`. True while a pass over the left column's rows is made for a Done or a put back
+ * made on a row unpacked under the cards (`followDoneEverywhere`): the cards are drawn next, and they
+ * dress again the one block whose messages changed (`redrawUnpackBlock`), so the pass leaves every
+ * unpacked row alone rather than dress them all again for nothing.
+ */
+let unpackDressedAfter = false;
 
 /**
  * Dress every message row unpacked under the cards again from what the page holds now
@@ -41889,7 +41905,6 @@ async function refreshAfterInboxChange() {
   // which draws no thread of its own while it shows them: what changed is drawn in the cards, and its
   // left-over thread is neither drawn nor written over the store.
   if (sideActive && columns.side.mode !== "thread") {
-    sideCardsDrawn = "";
     renderSideColumn();
     return;
   }
@@ -42526,12 +42541,18 @@ function followDoneEverywhere(ids, madeIn) {
     });
   }
   if (madeIn === columns.side && !sideShowing()) {
-    inColumn(columns.main, () => {
-      archivedIds = caughtUp(archivedIds);
-      // Its rows, or under Hide read which rows it draws; else Main's roots' counts of unread replies.
-      if (rowsMissDone()) renderCachedTimeline();
-      else syncUnreadReplies();
-    });
+    // The cards, drawn at the end of this, dress the rows of what changed among them.
+    unpackDressedAfter = sideColumnUp();
+    try {
+      inColumn(columns.main, () => {
+        archivedIds = caughtUp(archivedIds);
+        // Its rows, or under Hide read which rows it draws; else Main's roots' counts of unread replies.
+        if (rowsMissDone()) renderCachedTimeline();
+        else syncUnreadReplies();
+      });
+    } finally {
+      unpackDressedAfter = false;
+    }
   }
   if (madeIn !== columns.side && sideShowing()) {
     inColumn(columns.side, () => {
@@ -42807,11 +42828,12 @@ function drawRowPin(row) {
   // hide a pin behind its row's unpinned half — and Unpin then acts on every one of them. The
   // chip says it in words, and says when what is shown is the copy the pin kept.
   const isPinned = idsOf(row).some(isPinnedId);
-  row.setAttribute("data-pinned", isPinned ? "true" : "false");
+  setAttributeIfChanged(row, "data-pinned", isPinned ? "true" : "false");
   const chip = childByClass(row, "pin-chip");
   if (chip) {
-    chip.hidden = !isPinned;
-    chip.setAttribute(
+    setHiddenIfChanged(chip, !isPinned);
+    setAttributeIfChanged(
+      chip,
       "title",
       rowMessages(row).some((message) => keptByPin.has(message))
         ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
@@ -42820,7 +42842,7 @@ function drawRowPin(row) {
     );
   }
   const pinItem = childByClass(row, "row-pin-button");
-  if (pinItem) pinItem.textContent = isPinned ? "Unpin message" : "Pin message";
+  if (pinItem) setTextIfChanged(pinItem, isPinned ? "Unpin message" : "Pin message");
 }
 
 function renderPins() {
@@ -46699,6 +46721,29 @@ function setTextIfChanged(node, text) {
 }
 
 /**
+ * Set `node`'s attribute `name` to `value`, unless it already holds that. `#532 shift-o-latency`: the
+ * browser counts a write of the same value as a change, and the passes that dress every row again
+ * (`dressChannelRow`) would otherwise have every row styled again for nothing.
+ *
+ * @param {Element} node
+ * @param {string} name
+ * @param {string} value
+ */
+function setAttributeIfChanged(node, name, value) {
+  if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+}
+
+/** Hide or show `node`, unless it already is (`setAttributeIfChanged`). */
+function setHiddenIfChanged(node, hidden) {
+  if (node.hidden !== hidden) node.hidden = hidden;
+}
+
+/** Set `node`'s classes to `name`, unless they already are (`setAttributeIfChanged`). */
+function setClassNameIfChanged(node, name) {
+  if (node.className !== name) node.className = name;
+}
+
+/**
  * What a card says of its thread: "display_name: summary" when the summariser has named it and summed
  * it up, else the text of its first message, else its name. Whitespace is folded, so a raw card's
  * clamped lines show lines of words rather than a paragraph break; a summarised card's words are
@@ -46798,6 +46843,85 @@ function cardMessageCount(choice, tally) {
 let sideCardsDrawn = "";
 
 /**
+ * One thread as the cards draw it, in parts (`renderSideCards`, `#532 shift-o-latency`): `card`, what its
+ * card says; `counts`, what it counts (its age, replies, unread and whether it is read, which a card
+ * already drawn takes in place, `countSideCard`); `block`, what its unpacked block draws
+ * (`unpackSignature`); `read`, which of the block's messages are still to do (`unpackReadSignature`); and
+ * `fold`, which of them the reader folded away one by one (`#480 fold-one-message-key`). Each of the
+ * last three is "" for a thread not unpacked.
+ *
+ * @typedef {{card: string, counts: string, block: string, read: string, fold: string}} CardParts
+ */
+
+/**
+ * `#532 shift-o-latency`. What the last pass over the cards drew: the whole list's signature, each
+ * thread's parts (`CardParts`) with its card's element and its block's rows, and each run of Main's
+ * messages (by its messages) with its rows. The next pass under the same whole keeps every element it
+ * can: a card or a block whose part is the same stays, and a block whose messages only changed their
+ * read state or what was folded away is dressed again and its runs placed again, in place. So a Done or
+ * a fold in one thread costs that thread's card, not every thread unpacked.
+ *
+ * @type {{whole: string, threads: Map<string, {parts: CardParts, card: HTMLElement, rows: HTMLElement[]}>, main: Map<string, HTMLElement[]>}}
+ */
+let sideCardsKept = { whole: "", threads: new Map(), main: new Map() };
+
+/**
+ * One thread's parts as a pass over the cards finds them (`CardParts`).
+ *
+ * @param {{choice: any, view: any, text: string, summarized: boolean, root: string, age: string, replies: string, unread: string, read: boolean, state: string, size: {messages: number, exact: boolean}}} card
+ * @returns {CardParts}
+ */
+function sideCardParts({ choice, view, text, summarized, root, age, replies, unread, read, state, size }) {
+  // Everything `sideCard` draws from but its counts: the name the search finds it by, where its root is
+  // cut, and the root's body the card draws. The highlight is painted on a kept card in place.
+  const parts = { card: JSON.stringify([choice.id, view.mode, text, summarized, root, state, threadName(choice, Infinity),
+    view.cut ? [view.cut.head, view.cut.whole] : null, choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : ""]),
+    counts: JSON.stringify([age, replies, unread, read, size.messages, size.exact]), block: "", read: "", fold: "" };
+  if (state !== "unpacked") return parts;
+  const held = unpackHeldMessages(choice);
+  return { ...parts, block: unpackSignature(choice, held), read: unpackReadSignature(held),
+    fold: [...foldedOneIds(viewKey("thread", choice.id))].sort().join(",") };
+}
+
+/**
+ * Put `wanted` in `list` as its children, in that order, moving only what is out of place: an element
+ * left where it was keeps its box, so the browser lays out only what changed (`#532 shift-o-latency`).
+ * What is not wanted goes, and an unpacked block's loading line going is no longer watched.
+ *
+ * @param {HTMLElement} list
+ * @param {HTMLElement[]} wanted
+ */
+function placeChildren(list, wanted) {
+  const keep = new Set(wanted);
+  for (const child of [...list.children]) {
+    if (keep.has(/** @type {HTMLElement} */ (child))) continue;
+    if (unpackObserver !== null) unpackObserver.unobserve(child);
+    list.removeChild(child);
+  }
+  let at = list.firstElementChild;
+  for (const node of wanted) {
+    if (at === node) {
+      at = at.nextElementSibling;
+      continue;
+    }
+    list.insertBefore(node, at);
+  }
+}
+
+/**
+ * Main's message rows kept from the last pass (`renderSideCards`), dressed again from what the page holds
+ * now (`dressChannelRow`), as a new row would be: a pin, a flash or a reply since they were drawn.
+ *
+ * @param {HTMLElement[]} rows
+ * @param {ReplyTally} tally
+ */
+function redressMainRows(rows, tally) {
+  const viewing = String(el("discord-channel").value);
+  const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
+  for (const row of rows) dressChannelRow(row, pass);
+}
+
+/**
  * One card per thread the channel's store knows, each a fixed three lines of what the thread is about,
  * then how long since it moved, and the button into it saying how many replies it has and how many of
  * them are unread. A press on a card highlights it (`#277 thread-card-focus`); its button goes into the
@@ -46839,19 +46963,35 @@ function renderSideCards() {
   const unpacked = cards.some((card) => card.state === "unpacked");
   // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
   const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
-  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpackMode, cards.map(({ choice, view, text, summarized, root, age, replies, unread, read, state, size }) =>
-    [choice.id, view.mode, text, summarized, root, age, replies, unread, read, state, size.messages, size.exact,
-      state === "unpacked" ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
-  main.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
-  main.length ? [readMode, combineMessages, nowPlaying ? nowPlaying.id : "", pendingRead] : ""]);
+  // `#532 shift-o-latency`. What the whole list is drawn under, then each thread's card and block, then
+  // Main's messages: a pass that changes one thread draws that thread again and keeps every other one.
+  const whole = JSON.stringify([order, readMode, readRunsSuspended(), unpackMode,
+    main.length ? [readMode, combineMessages, nowPlaying ? nowPlaying.id : "", pendingRead] : ""]);
+  const parts = cards.map(sideCardParts);
+  const signature = JSON.stringify([whole, parts, main.map((message) => [messageLook(message), readLook(message)])]);
   const more = olderThreadsToRead();
   if (signature !== sideCardsDrawn) {
+    // Kept only from a pass under the same whole, and never where the cards were asked to be drawn anew
+    // (`sideCardsDrawn` emptied: something the signatures do not say has changed).
+    const keep = sideCardsDrawn !== "" && sideCardsKept.whole === whole;
     sideCardsDrawn = signature;
     keepingCardPlace(() => {
-      if (unpackObserver !== null) {
+      if (!keep && unpackObserver !== null) {
         unpackObserver.disconnect();
         unpackObserver = null;
       }
+      const kept = cards.map((card) => (keep ? sideCardsKept.threads.get(card.choice.id) : undefined));
+      // A card that says the same is kept, its counts brought up to date where they changed: putting a new
+      // element in the list costs its every row laid out again, a count changed in place does not.
+      const cardRows = cards.map((card, at) => {
+        const was = kept[at];
+        if (!was || was.parts.card !== parts[at].card) return sideCard(card);
+        if (was.parts.counts !== parts[at].counts) countSideCard(was.card, card);
+        else /** @type {any} */ (was.card).cardChoice = card.choice;
+        // Highlighted or put out in place (`toggleLitCard`), and by the view since: as a card drawn now.
+        paintLitCard(was.card, card.choice.id);
+        return was.card;
+      });
       // `#407 unpack-row-parity`. Unpacked rows are built in the right column, the column of the cards
       // the keys and the mouse move them in (`sidePane`), its read state brought into line with the
       // store's for every message drawn, as each thread's own would be: a key acting on a row asks it.
@@ -46859,18 +46999,50 @@ function renderSideCards() {
         const shown = cards.filter((card) => card.state === "unpacked")
           .flatMap((card) => unpackHeldMessages(card.choice).map((message) => String(message.id)));
         archivedIds = caughtUpDone(archivedIds, shown);
-        return cards.map((card) => (card.state === "unpacked" ? unpackBlock(card.choice, tally) : []));
+        return cards.map((card, at) => {
+          const was = kept[at];
+          const now = parts[at];
+          if (card.state !== "unpacked") return [];
+          if (!was || was.parts.block === "" || was.parts.block !== now.block) return unpackBlock(card.choice, tally);
+          // The same block, but for its messages' read state or what was folded away one by one: its rows
+          // dressed again and their runs placed again where they are, in the frame of the act.
+          if (was.parts.read !== now.read || was.parts.fold !== now.fold) {
+            redrawUnpackBlock(card.choice, was.rows, tally);
+            // Placing the runs can remember a run opened as it grew (`readRunPlan`), which the block's
+            // signature says: read again, so the next pass finds it the same.
+            now.block = unpackSignature(card.choice, unpackHeldMessages(card.choice));
+          }
+          return was.rows;
+        });
       }) : [];
-      const drawn = cards.map((card, at) => [sideCard(card), ...(unpacked ? blocks[at] : [])]);
+      /** @type {typeof sideCardsKept.threads} */
+      const threads = new Map(cards.map((card, at) =>
+        [card.choice.id, { parts: parts[at], card: cardRows[at], rows: unpacked ? blocks[at] : [] }]));
+      const drawn = cards.map((card, at) => [cardRows[at], ...(unpacked ? blocks[at] : [])]);
       // `#419 threads-view-main-messages`. Main's messages in the list's order: each run of them between
       // two cards, by when it was posted against when each card's thread last moved. Only they are drawn
-      // as the right column's rows; the cards are drawn as before.
+      // as the right column's rows; the cards are drawn as before. A run drawn the same is kept, dressed
+      // again from what the page holds now.
       const runs = mainRunsAmong(main, cards.map((card) => THREAD_ORDERS[order].time(card.choice)));
+      /** @type {Map<string, HTMLElement[]>} */
+      const mainKept = new Map();
       const between = main.length ? inColumn(columns.side, () => {
         archivedIds = caughtUpDone(archivedIds, main.map((message) => String(message.id)));
-        return runs.map((run) => mainRows(run, tally));
+        return runs.map((run) => {
+          if (run.length === 0) return [];
+          // By its messages as drawn: a Done or a put back is in how a row is dressed, done again below.
+          const key = JSON.stringify(run.map(messageLook));
+          const was = keep ? sideCardsKept.main.get(key) : undefined;
+          const rows = was || mainRows(run, tally);
+          if (was) redressMainRows(rows, tally);
+          mainKept.set(key, rows);
+          return rows;
+        });
       }) : runs.map(() => []);
-      list.replaceChildren(...drawn.flatMap((rows, at) => [...between[at], ...rows]), ...between[drawn.length]);
+      const wanted = [...drawn.flatMap((rows, at) => [...between[at], ...rows]), ...between[drawn.length]];
+      if (keep) placeChildren(list, wanted);
+      else list.replaceChildren(...wanted);
+      sideCardsKept = { whole, threads, main: mainKept };
       // `#432 read-mode-unify`. Under Fold read, the runs of read threads and Main's read messages.
       foldCardRuns(list);
       filterSideCards();
@@ -47703,14 +47875,94 @@ function unpackNeedsRead(choice, held) {
   return !cover && replies === 0;
 }
 
+/**
+ * Place the runs of thread `choice`'s unpacked message rows `rows`, in order: Fold read's runs of read
+ * messages and the messages folded away one by one (`readRunPlan`), the root under a summarized card
+ * never in one. For a block being built (`unpackBlock`), and again on a block already drawn when only
+ * what was folded away changed (`redrawUnpackBlock`).
+ *
+ * @param {ReturnType<typeof threadChoice>} choice
+ * @param {HTMLElement[]} rows
+ */
+function placeUnpackRuns(choice, rows) {
+  const key = viewKey("thread", choice.id);
+  const forced = foldedOneIds(key);
+  const placed = (readMode === "fold" || forced.size > 0) && !readRunsSuspended()
+    ? readRunPlan(rows, key, (row) => !row.hasAttribute("data-root-child") &&
+      ((readMode === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))), idsOf, forced)
+    : new Map();
+  for (const row of rows) {
+    const { role, count } = placed.get(row) || { role: null, count: 0 };
+    placeInReadRun(row, role, count);
+  }
+}
+
+/**
+ * `#532 shift-o-latency`. Thread `choice`'s block as drawn, `drawn` its rows, brought into line where only
+ * its messages' read state or what is folded away changed: each message row dressed again
+ * (`dressChannelRow`), as a row built now would be, and the runs placed again (`placeUnpackRuns`). A Done,
+ * an e, a put back or a Shift+O drawn on the rows already there, in the frame of the key, rather than the
+ * block built again. Its loading or end line is not a message row.
+ *
+ * @param {ReturnType<typeof threadChoice>} choice
+ * @param {HTMLElement[]} drawn
+ * @param {ReplyTally} tally
+ */
+function redrawUnpackBlock(choice, drawn, tally) {
+  const rows = drawn.filter((row) => row.hasAttribute("data-id"));
+  const viewing = String(el("discord-channel").value);
+  const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
+  for (const row of rows) dressChannelRow(row, pass);
+  placeUnpackRuns(choice, rows);
+}
+
 /** What one block would draw, as a signature, so a pass that changes nothing rebuilds nothing. */
 function unpackSignature(choice, held) {
   const opened = openedReadRuns.get(viewKey("thread", choice.id));
+  const cover = channelCanon.views.get(viewKey("thread", choice.id));
   const view = cardView(choice);
   return JSON.stringify([choice.id, readMode, readRunsSuspended(), hideEmptyMessages, combineMessages,
     view.mode, view.cut ? view.cut.head : 0, view.cut && choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : "",
-    held.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
-    opened ? [...opened].sort() : [], unpackReads.get(choice.id) || "", nowPlaying ? nowPlaying.id : "", pendingRead]);
+    held.map(messageLook), hidingRead() ? unpackReadSignature(held) : "",
+    opened ? [...opened].sort() : [], unpackReads.get(choice.id) || "", nowPlaying ? nowPlaying.id : "", pendingRead,
+    // `#532 shift-o-latency`: what decides its loading or end line (`unpackNeedsRead`, the cover), which
+    // a block kept from the last pass would otherwise never ask again.
+    typeof choice.count === "number" ? choice.count : null, cover ? cover.more !== false : null]);
+}
+
+/**
+ * What a message's row draws from it beyond its id, as a signature: its words and their rendering (by
+ * length, and the edit the provider reported) and its reactions. A row kept from the last pass
+ * (`renderSideCards`) is drawn again when this changes: an edit or a reaction since. `#532 shift-o-latency`.
+ *
+ * @param {any} message
+ */
+function messageLook(message) {
+  const words = `${rawTextOf(message).length}:${renderedHtmlOf(message).length}`;
+  return `${String(message.id)}|${words}|${message.edited_timestamp || ""}|${JSON.stringify(message.reactions || null)}`;
+}
+
+/**
+ * Which of a block's messages `held` are still to do, as a signature. Apart from the block's own
+ * (`unpackSignature`), but under Hide read, which takes a read message out of the block: elsewhere a
+ * Done or a put back changes only how its row is dressed and where the runs fall, which a block already
+ * drawn takes in place (`redrawUnpackBlock`, `#532 shift-o-latency`).
+ *
+ * @param {any[]} held
+ */
+function unpackReadSignature(held) {
+  return held.map(readLook).join("");
+}
+
+/**
+ * How a message's row draws its read state, as a signature: Done or not in the store, and still to do
+ * or not — two answers, since a message read by a rule (noise, or the reader's own under Mark own read)
+ * is not to do whether it is Done or not, and its row says which. `#532 shift-o-latency`.
+ *
+ * @param {any} message
+ */
+function readLook(message) {
+  return `${channelCanon.dismissed.has(String(message.id)) ? "d" : "-"}${stillToDo(message, channelCanon.dismissed) ? "1" : "0"}`;
 }
 
 /**
@@ -47768,15 +48020,7 @@ function unpackBlock(choice, tally) {
     // where All's bridge holds its X.
     row.replaceChildren(...(at === 0 ? [packButton(choice.id)] : []), bridgePiece(row), ...row.children);
   });
-  const unpackForced = foldedOneIds(viewKey("thread", choice.id));
-  const placed = (readMode === "fold" || unpackForced.size > 0) && !readRunsSuspended()
-    ? readRunPlan(rows, viewKey("thread", choice.id), (row) => !row.hasAttribute("data-root-child") &&
-      ((readMode === "fold" && rowIsRead(row)) || idsOf(row).some((id) => unpackForced.has(id))), idsOf, unpackForced)
-    : new Map();
-  for (const row of rows) {
-    const { role, count } = placed.get(row) || { role: null, count: 0 };
-    placeInReadRun(row, role, count);
-  }
+  placeUnpackRuns(choice, rows);
   const cover = channelCanon.views.get(viewKey("thread", choice.id));
   if (unpackReads.get(choice.id) === "failed") {
     const failed = document.createElement("li");
@@ -48281,7 +48525,10 @@ function sideCard({ choice, view = cardView(choice), text, summarized, root, age
   button.append(body);
   // `#440 thread-card-pack-toggle`. In the Threads view a press goes round the card's states; in two
   // columns it highlights the card, as it always did (`#277 thread-card-focus`).
-  const press = () => (cardsCycle() ? cycleCardState(choice, row) : toggleLitCard(choice.id, row));
+  // `#532 shift-o-latency`: the thread as last drawn (`cardChoice`), the card being kept across passes.
+  /** @type {any} */ (row).cardChoice = choice;
+  const now = () => /** @type {any} */ (row).cardChoice;
+  const press = () => (cardsCycle() ? cycleCardState(now(), row) : toggleLitCard(now().id, row));
   button.addEventListener("click", press);
   sayRowShortcut(button, "side-card");
   row.setAttribute("data-card-state", state);
@@ -48295,7 +48542,7 @@ function sideCard({ choice, view = cardView(choice), text, summarized, root, age
   if (unread) row.setAttribute("data-unread", "");
   // `#432 read-mode-unify`. Read: every message of its thread, root and replies, as the read modes see it.
   if (read) row.setAttribute("data-thread-read", "");
-  const open = cardOpener("side-card", replies, unread, () => guardQuietly(() => enterCard(choice.id, choice.summary, row))());
+  const open = cardOpener("side-card", replies, unread, () => guardQuietly(() => enterCard(now().id, now().summary, row))());
   row.append(button, facts, open);
   // A press on the card's facts, or on its edge round the buttons, is a press on the card. Its two
   // buttons answer their own.
@@ -48318,6 +48565,30 @@ function sideCard({ choice, view = cardView(choice), text, summarized, root, age
   // where the card says a summary of them. `#262 search-load-older`.
   searchable(row, text, threadName(choice, Infinity), root);
   return row;
+}
+
+/**
+ * `#532 shift-o-latency`. Card `row`, drawn by `sideCard`, brought up to date where only what it counts has
+ * changed (`CardParts`): how long since its thread moved, its replies and unread, whether it is read, and
+ * the size a gap among the cards counts for it. In place, as `sideCard` would draw them.
+ *
+ * @param {HTMLElement} row
+ * @param {{choice: any, age: string, replies: string, unread: string, read: boolean, size: {messages: number, exact: boolean}}} card
+ */
+function countSideCard(row, { choice, age, replies, unread, read, size }) {
+  /** @type {any} */ (row).cardChoice = choice;
+  const facts = /** @type {any} */ (row).cardFacts;
+  if (facts) {
+    setTextIfChanged(facts, age);
+    const lastMoved = Number.isFinite(choice.at) ? choice.at : choice.started;
+    if (Number.isFinite(lastMoved)) setAttributeIfChanged(facts, "title", fullLocalAt(new Date(lastMoved)));
+  }
+  if (row.hasAttribute("data-unread") !== Boolean(unread)) row.toggleAttribute("data-unread", Boolean(unread));
+  if (row.hasAttribute("data-thread-read") !== Boolean(read)) row.toggleAttribute("data-thread-read", Boolean(read));
+  const was = childByClass(row, "side-card-open");
+  if (was) was.replaceWith(cardOpener("side-card", replies, unread, () => guardQuietly(() => enterCard(choice.id, choice.summary, row))()));
+  /** @type {any} */ (row).cardMessages = size ? size.messages : 1;
+  /** @type {any} */ (row).cardMessagesExact = size ? size.exact : false;
 }
 
 /**
