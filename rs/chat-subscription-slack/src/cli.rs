@@ -1189,6 +1189,7 @@ pub(crate) fn post_arguments(
     let body_flag = match format {
         TextFormat::Markdown => "--markdown=file://-",
         TextFormat::Text => "--text=file://-",
+        TextFormat::SlackMrkdwn | TextFormat::Converted => "--slack-mrkdwn=file://-",
     };
     let mut arguments = vec![
         "slack.message".to_owned(),
@@ -1289,8 +1290,15 @@ impl SlackTransport for CliTransport {
             post.thread_ts,
             post.format,
         );
+        let converted;
+        let body: &[u8] = if post.format == TextFormat::Converted {
+            converted = crate::mrkdwn::convert_markdown(post.text);
+            converted.as_bytes()
+        } else {
+            post.text.as_bytes()
+        };
         let completed = self
-            .run(&arguments, Some(post.text.as_bytes()))
+            .run(&arguments, Some(body))
             .map_err(|failure| run_failure(failure, true))?;
         post_outcome(&completed)
     }

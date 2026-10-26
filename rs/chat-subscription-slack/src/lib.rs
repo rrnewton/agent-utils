@@ -27,6 +27,7 @@ pub mod cli;
 pub mod diag;
 pub mod fake;
 pub mod ids;
+pub mod mrkdwn;
 pub mod outbound;
 pub mod plugin;
 pub mod refusals;

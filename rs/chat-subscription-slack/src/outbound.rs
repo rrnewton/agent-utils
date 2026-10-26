@@ -79,6 +79,16 @@ use crate::transport::{
 
 mod rejections;
 
+/// Parse the switchable Slack outbound format (`markdown` or `converted`).
+#[must_use]
+pub fn parse_slack_format(value: &str) -> Option<TextFormat> {
+    match value {
+        "markdown" => Some(TextFormat::Markdown),
+        "converted" => Some(TextFormat::Converted),
+        _ => None,
+    }
+}
+
 /// Largest request line accepted.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const LEDGER_VERSION: u64 = 1;
@@ -145,6 +155,31 @@ pub struct OutboundConfig {
 }
 
 impl OutboundConfig {
+    /// Parse `--name=value` helper arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first invalid or unknown argument. A missing app id is not
+    /// an argument error: it is reported on each request as `app_identity_required`.
+    /// Parse helper arguments, with `AGENTCTL_SLACK_FORMAT` (when set) as an
+    /// override of any `--format`/`--slack-format` argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first invalid or unknown argument or of an
+    /// invalid environment override.
+    pub fn parse_with_environment(
+        arguments: &[String],
+        slack_format_env: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut config = Self::parse(arguments)?;
+        if let Some(value) = slack_format_env {
+            config.format = parse_slack_format(value)
+                .ok_or_else(|| "AGENTCTL_SLACK_FORMAT must be markdown or converted".to_owned())?;
+        }
+        Ok(config)
+    }
+
     /// Parse `--name=value` helper arguments.
     ///
     /// # Errors
@@ -242,8 +277,19 @@ impl OutboundConfig {
                     config.format = match value {
                         "markdown" => TextFormat::Markdown,
                         "text" => TextFormat::Text,
-                        _ => return Err("--format must be markdown or text".to_owned()),
+                        "slack-mrkdwn" => TextFormat::SlackMrkdwn,
+                        "converted" => TextFormat::Converted,
+                        _ => {
+                            return Err(
+                                "--format must be markdown, text, slack-mrkdwn or converted"
+                                    .to_owned(),
+                            )
+                        }
                     };
+                }
+                "--slack-format" => {
+                    config.format = parse_slack_format(value)
+                        .ok_or_else(|| "--slack-format must be markdown or converted".to_owned())?;
                 }
                 "--bot-user-id" => {
                     if !ids::valid_author_id(value) {
@@ -368,7 +414,7 @@ impl OutboundConfig {
             self.cli_transport()?,
             cli,
             app_id,
-            self.format,
+            self.format.wire_format(),
             self.channels.clone(),
             self.timeout,
             crate::warm::WarmSettings {
@@ -398,7 +444,7 @@ impl OutboundConfig {
                                 socket.clone(),
                                 cli.clone(),
                                 app_id.clone(),
-                                self.format,
+                                self.format.wire_format(),
                                 self.timeout,
                                 Diagnostics::new(self.diagnostics_log.clone(), "slack-outbound"),
                             )
@@ -494,6 +540,7 @@ enum Request {
         channel_id: String,
         thread_ts: Option<String>,
         text: String,
+        slack_format: Option<TextFormat>,
     },
     Reaction {
         channel_id: String,
@@ -527,9 +574,27 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
             if !exact_keys(
                 object,
                 &["version", "id", "action", "channel_id", "thread_id", "text"],
+            ) && !exact_keys(
+                object,
+                &[
+                    "version",
+                    "id",
+                    "action",
+                    "channel_id",
+                    "thread_id",
+                    "text",
+                    "slack_format",
+                ],
             ) {
-                return Err(invalid("a send request has exactly version, id, action, channel_id, thread_id and text"));
+                return Err(invalid("a send request has exactly version, id, action, channel_id, thread_id and text, plus an optional slack_format"));
             }
+            let slack_format = match object.get("slack_format") {
+                None => None,
+                Some(Value::String(value)) => Some(parse_slack_format(value).ok_or_else(|| {
+                    invalid("slack_format must be markdown or converted")
+                })?),
+                Some(_) => return Err(invalid("slack_format must be a string")),
+            };
             let channel_id =
                 text("channel_id").ok_or_else(|| invalid("channel_id must be a string"))?;
             let thread_ts = match object.get("thread_id") {
@@ -552,6 +617,7 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
                 channel_id,
                 thread_ts,
                 text: body,
+                slack_format,
             })
         }
         "ensure_reaction" => {
@@ -784,6 +850,7 @@ pub fn handle_request(
             channel_id,
             thread_ts,
             text,
+            slack_format,
         } => send(
             config,
             app_id,
@@ -792,6 +859,7 @@ pub fn handle_request(
             &channel_id,
             thread_ts.as_deref(),
             &text,
+            slack_format,
             now_millis,
             &diagnostics,
         )
@@ -1026,7 +1094,7 @@ fn save_ledger(directory: &Path, id: &str, record: &LedgerRecord) -> Result<(), 
 }
 
 /// Letters and digits of the first `limit` characters' worth of visible text, lowercase, with
-/// Markdown link targets removed, so a Markdown body can be compared with its plain rendering.
+/// Markdown and Slack link targets removed, so a body can be compared with its plain rendering.
 fn fingerprint(text: &str, limit: usize) -> String {
     let mut visible = String::with_capacity(text.len());
     let mut rest = text;
@@ -1036,6 +1104,33 @@ fn fingerprint(text: &str, limit: usize) -> String {
         rest = rest.find(')').map_or("", |end| &rest[end + 1..]);
     }
     visible.push_str(rest);
+    // Slack mrkdwn links `<url|label>`: keep only the label.
+    let mut slack_visible = String::with_capacity(visible.len());
+    let mut rest = visible.as_str();
+    while let Some(start) = rest.find('<') {
+        slack_visible.push_str(&rest[..start]);
+        rest = &rest[start + 1..];
+        match rest.find('>') {
+            Some(end) => {
+                let inner = &rest[..end];
+                if let Some((_, label)) = inner.split_once('|') {
+                    slack_visible.push_str(label);
+                } else if !inner.contains("://")
+                    && !inner.starts_with('#')
+                    && !inner.starts_with('@')
+                {
+                    slack_visible.push_str(inner);
+                }
+                rest = &rest[end + 1..];
+            }
+            None => {
+                slack_visible.push_str(rest);
+                rest = "";
+            }
+        }
+    }
+    slack_visible.push_str(rest);
+    let visible = slack_visible;
     visible
         .chars()
         .filter(|character| character.is_alphanumeric())
@@ -1053,13 +1148,39 @@ fn send(
     channel_id: &str,
     thread_ts: Option<&str>,
     text: &str,
+    slack_format: Option<TextFormat>,
     now_millis: &dyn Fn() -> u64,
     diagnostics: &Diagnostics,
 ) -> Result<String, Refusal> {
     let directory = config.ledger.as_deref().ok_or_else(|| {
         Refusal::not_applied("helper_misconfigured", "--ledger is required", true)
     })?;
-    let chunks = split_body(text, config.max_chunk_bytes);
+    // The per-request format (from the bridge) wins over the helper's own
+    // configured format; the helper's format already reflects any
+    // `AGENTCTL_SLACK_FORMAT` environment override.
+    let format = slack_format.unwrap_or(config.format);
+    let (chunks, post_format) = match format {
+        TextFormat::Converted => (
+            crate::mrkdwn::convert_and_split(
+                text,
+                config.max_chunk_bytes.min(crate::mrkdwn::MAX_MRKDWN_BYTES),
+            ),
+            TextFormat::SlackMrkdwn,
+        ),
+        TextFormat::SlackMrkdwn => (
+            split_body(
+                text,
+                config.max_chunk_bytes.min(crate::mrkdwn::MAX_MRKDWN_BYTES),
+            ),
+            TextFormat::SlackMrkdwn,
+        ),
+        other => (split_body(text, config.max_chunk_bytes), other),
+    };
+    diagnostics.log(&format!(
+        "send {id}: slack_format={} chunks={}",
+        format.name(),
+        chunks.len()
+    ));
     let mut record = match load_ledger(directory, id)? {
         Some(record) => {
             if record.channel_id != channel_id
@@ -1157,12 +1278,13 @@ fn send(
             channel_id,
             thread_ts,
             text: chunk,
-            format: config.format,
+            format: post_format,
         });
         match posted {
             Ok(ts) if ids::valid_ts(&ts) => {
                 diagnostics.log(&format!(
-                    "send {id} chunk {index}: posted {channel_id} {ts}"
+                    "send {id} chunk {index}: posted {channel_id} {ts} slack_format={}",
+                    format.name()
                 ));
                 record.chunks[index].ts = Some(ts);
                 record.chunks[index].intent_millis = None;

@@ -15,7 +15,10 @@ use chat_subscription_slack::outbound::{handle_request, OutboundConfig, Role, MA
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let config = OutboundConfig::parse(&arguments);
+    let config = OutboundConfig::parse_with_environment(
+        &arguments,
+        std::env::var("AGENTCTL_SLACK_FORMAT").ok().as_deref(),
+    );
     if config.is_err()
         && arguments
             .iter()
