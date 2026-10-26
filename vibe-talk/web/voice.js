@@ -11910,6 +11910,13 @@ function menuFromKeyboard(target) {
 
 /** s: read the selected message aloud, or stop it: the act of a tap in Read. */
 function readFromKeyboard(target) {
+  // `#540 read-aloud-desktop`: a card is read as a press on it reads it, by its first message.
+  // Not a card standing as the line of a run of read threads, which Enter opens.
+  const { row: card } = keyContext(target);
+  if (card && card.hasAttribute("data-card") && card.getAttribute("data-read-run") !== "head") {
+    readCardAloud(card);
+    return true;
+  }
   const { row, took } = rowForAct(target);
   if (!row) return took;
   guardQuietly(() => readAloud(idsOf(row)))();
@@ -32413,6 +32420,8 @@ function renderChannelRows() {
   // `#407 unpack-row-parity`. Whatever this pass was for — a read aloud starting or ending, a pin, a
   // reply sent — the rows unpacked under the cards are dressed again with it, as message rows.
   if (!sideActive && !unpackDressedAfter) dressUnpackedRows();
+  // `#540 read-aloud-desktop`. And a card whose first message a read is reading, or has asked for.
+  if (!sideActive) paintReadingCards();
   // `#419 threads-view-main-messages`. Main's messages among the cards are Main's rows' messages: what
   // changed them here (a message posted from the box at the foot, an arrival, a Done) is drawn there too.
   // Drawn again only where something they draw changed (`renderSideCards`).
@@ -35353,6 +35362,92 @@ function browserSpeechFailure(error) {
   return "The device voice could not read that message. Check your media volume and installed voices, then tap again.";
 }
 
+// --- where a read's message is drawn: `#540 read-aloud-desktop` ----------------------------------
+//
+// The owner, 2026-10-26, on a desk: in the thread list the device voice said the message "wasn't
+// loaded", and a read's sentence was lit nowhere. Every lookup a read made named the left column's
+// lists, `#discord-log` and `#pinned-log`, and the thread list draws its messages in the cards' list
+// (unpacked rows, Main's rows among the cards) and the right column in `#side-log`. So a read finds its
+// message, and lights its rows, in every list a message row is drawn in, by the lists' own ids,
+// whichever column is being worked on.
+
+/** Every list a message row that can be read aloud is drawn in. */
+const READABLE_LISTS = ["discord-log", "pinned-log", "side-log", "side-pinned-log", "side-cards"];
+
+/** The rows of list `id`, or none where the page has no such list. */
+function listRows(id) {
+  const list = leftEl(id);
+  return list && list.children ? [...list.children] : [];
+}
+
+/**
+ * Whether `row` is drawn where the reader can see it: not inside a list hidden by `hidden`, `display` or
+ * `visibility` — the left column's behind the thread list is `visibility: hidden`. True where the
+ * browser cannot say.
+ */
+function rowSeen(row) {
+  const ask = /** @type {any} */ (row).checkVisibility;
+  return typeof ask === "function" ? Boolean(ask.call(row, { visibilityProperty: true })) : true;
+}
+
+/** Every message row drawn for the read whose first message is `id`, in every list. A card is none. */
+function readingRowsOf(id) {
+  const wanted = String(id);
+  return READABLE_LISTS.flatMap(listRows)
+    .filter((row) => row.getAttribute("data-id") === wanted && !row.hasAttribute("data-card"));
+}
+
+/**
+ * The message `id` as the page holds it: from any row drawn for it, a card's first message
+ * (`readCardAloud`), or the store, for one no list draws now. Null when none has it.
+ */
+function readableMessage(id) {
+  const wanted = String(id);
+  for (const row of READABLE_LISTS.flatMap(listRows)) {
+    const held = row.hasAttribute("data-card") ? [cardRootOf(row)] : rowMessages(row);
+    const found = held.find((message) => message && String(message.id) === wanted);
+    if (found) return found;
+  }
+  return heldMessage(wanted);
+}
+
+/** The thread's first message a card stands for, as last drawn; null while it is not loaded. */
+function cardRootOf(row) {
+  const choice = /** @type {any} */ (row).cardChoice;
+  return (choice && choice.root) || /** @type {any} */ (row).cardRoot || null;
+}
+
+/**
+ * `#540 read-aloud-desktop`. A press on a card in reading mode reads the thread's first message, as a
+ * copy of the card copies it (`#296 copy-highlighted-message`): the server speaks messages, and a
+ * summary is not one. The card is marked as its rows are (`markReadingCard`).
+ */
+function readCardAloud(row) {
+  const root = cardRootOf(row);
+  if (!root) {
+    setStatus("This thread's first message is not loaded yet; open the thread to read it.");
+    return;
+  }
+  guardQuietly(() => readAloud([String(root.id)]))();
+}
+
+/** Card `row` says whether its first message is being read, or asked for. Written only where it changes. */
+function markReadingCard(row) {
+  const root = cardRootOf(row);
+  const id = root ? String(root.id) : null;
+  const reading = id !== null && nowPlaying !== null && nowPlaying.id === id ? "true" : "false";
+  const pending = id !== null && pendingRead === id ? "true" : "false";
+  if (row.getAttribute("data-reading") !== reading) row.setAttribute("data-reading", reading);
+  if (row.getAttribute("data-pending") !== pending) row.setAttribute("data-pending", pending);
+}
+
+/** Every card in the cards' list, marked as `markReadingCard` says. */
+function paintReadingCards() {
+  for (const row of listRows("side-cards")) {
+    if (row.hasAttribute("data-card")) markReadingCard(row);
+  }
+}
+
 /** Speak the cached prepared row on the tap's own call stack, without a network request or await. */
 function readWithBrowserSpeech(parts, id, ticket) {
   const problem = browserSpeechProblem();
@@ -35360,9 +35455,8 @@ function readWithBrowserSpeech(parts, id, ticket) {
   if (session.socket && !session.chat) {
     throw new Error("Hang up the voice call before reading messages with the device voice.");
   }
-  const messages = [...el("discord-log").children, ...el("pinned-log").children].flatMap(rowMessages);
   const text = parts.map((part) => {
-    const message = messages.find((entry) => String(entry.id) === part);
+    const message = readableMessage(part);
     if (!message) throw new Error("That message is no longer loaded. Refresh the channel and tap it again.");
     // The server prepares the same body for every speech path. Device-local synthesis used to be
     // the exception: it read `content` directly, so markdown and long ids were spoken literally
@@ -35597,18 +35691,26 @@ async function prepareSpeechNow(signal) {
   // The rows the reader can see first, then the rest, each in screen order. `#375`.
   const seen = [];
   const beyond = [];
-  for (const li of shownChannelList().children) {
+  // `#540 read-aloud-desktop`. And the lists the thread list and the right column draw: their rows, and
+  // each card's first message, which a press on the card reads.
+  // Not the left column's list behind the thread list, which is out of sight there.
+  const shown = shownChannelList();
+  const lists = [...(threadListShown ? [] : [shown]), ...(sideColumnUp() ? [leftEl("side-cards")] : []),
+    ...(sideShowing() ? [leftEl("side-log")] : [])];
+  for (const li of lists.flatMap((list) => (list ? [...list.children] : []))) {
+    const card = li.hasAttribute("data-card") ? cardRootOf(li) : null;
     // `#196 auto-read-noise`. A placeholder is not prepared: preparing warms a vendor lookup for a
     // message nobody is going to ask to hear. A tap on one still reads it, preparing it then.
-    const held = rowMessages(li);
+    const held = card ? [card] : rowMessages(li);
     let visible = true;
     try {
-      visible = rowOnScreen(li);
+      // Against the scroller of the column the row is in.
+      visible = li.parentNode === shown ? rowOnScreen(li) : inColumn(columns.side, () => rowOnScreen(li));
     } catch (_error) {
       // Nothing laid out to ask: screen order alone.
     }
-    idsOf(li).forEach((id, index) => {
-      if (id && !preparedEntry(id) && !isNoise(held[index])) {
+    (card ? [String(card.id)] : idsOf(li)).forEach((id, index) => {
+      if (id && !preparedEntry(id) && !isNoise(held[index]) && !seen.includes(id) && !beyond.includes(id)) {
         (visible ? seen : beyond).push(id);
       }
     });
@@ -35955,6 +36057,9 @@ const STREAM_HEADER_LIMIT_BYTES = 64 * 1024;
 const SPEECH_ONSET_LEVEL = 0.02;
 /** How long a report waits, after `playing`, to learn when speech began before it goes anyway. */
 const SPEECH_ONSET_WAIT_MS = 5000;
+/** What the reader is told when a part of a read arrives whole with no speech in it (`#540`). */
+const SILENT_READ = "The voice sent silence for that message, so it was not archived. Tap it again, " +
+  "or switch Read to the device voice.";
 
 let readAloudContext = null;
 
@@ -36253,6 +36358,10 @@ function streamingPlayer(url, context, clock = readClock()) {
     url,
     /** This player can tell when speech begins, and says so with a `speech` event. */
     hearsSpeech: true,
+    /** Whether any sample that has arrived was loud enough to be speech (`SPEECH_ONSET_LEVEL`). */
+    heardSpeech() {
+      return spoke;
+    },
     /**
      * `#379 read-aloud-sentences`. Where this part plays on the audio clock: when its first sample
      * is due (null before any is), when what has arrived ends, whether that is all of it, and the
@@ -36454,6 +36563,8 @@ let learnedSecondsPerChar = null;
 let sentenceTimer = null;
 /** The sentence lit now, as "row part block index", so an unchanged one is not set again. */
 let litSentence = "";
+/** The first text node of each row's sentences when it was lit (`showReadingSentence`). */
+let litSentenceNodes = [];
 
 function sentenceHighlightSupported() {
   return typeof CSS !== "undefined" && CSS !== null && Boolean(CSS.highlights) &&
@@ -36709,14 +36820,22 @@ function showReadingSentence() {
   sentenceTimer = setTimeout(showReadingSentence, SENTENCE_STEP_MS);
   const segment = playing.segments[playing.segment];
   const player = playing.players[playing.segment];
-  const row = [...el("discord-log").children].find((li) => li.getAttribute("data-id") === playing.id);
-  const drawn = row && segment && segment.block !== null ? preparedBlocksOf(row, segment.part) : null;
-  const block = drawn ? drawn[segment.block] : null;
+  // `#540 read-aloud-desktop`. In every row drawn for the read — the thread list's, the right column's —
+  // not only the left column's list: the same sentence of the same block in each.
+  // The rows the reader can see first: the sentence is timed from the first, and a row drawn from
+  // part of the message (a split card's rest) may cut it into other sentences.
+  const lit = segment && segment.block !== null ? readingRowsOf(playing.id)
+    .sort((one, other) => Number(rowSeen(other)) - Number(rowSeen(one))).map((row) => {
+    const drawn = preparedBlocksOf(row, segment.part);
+    const block = drawn ? drawn[segment.block] : null;
+    // `#486 read-aloud-pieces`. A piece of the block lights its own sentences, or itself whole when it
+    // is one; where the page cuts the block otherwise, every sentence of the block.
+    const piece = block ? readPieceOf(block) : null;
+    return block ? { piece, sentences: sentencesOf(block.element, piece) } : null;
+  }).filter((one) => one !== null && one.sentences.length > 0) : [];
   const timeline = player && typeof player.timeline === "function" ? player.timeline() : null;
-  // `#486 read-aloud-pieces`. A piece of the block lights its own sentences, or itself whole when it
-  // is one; where the page cuts the block otherwise, every sentence of the block.
-  const piece = block ? readPieceOf(block) : null;
-  const sentences = block ? sentencesOf(block.element, piece) : [];
+  const piece = lit.length > 0 ? lit[0].piece : null;
+  const sentences = lit.length > 0 ? lit[0].sentences : [];
   if ((sentences.length < 2 && !piece) || sentences.length < 1 || !timeline || timeline.startsAt === null ||
       readAloudContext === null) {
     if (litSentence !== "") CSS.highlights.delete(SENTENCE_HIGHLIGHT);
@@ -36744,14 +36863,19 @@ function showReadingSentence() {
       break;
     }
   }
+  // The rows lit, by their first sentence's text node: a row the poll drew again is lit again.
   const key = `${playing.id} ${segment.part} ${segment.block} ${index}`;
-  if (key === litSentence) return;
-  const range = document.createRange();
-  const { from, to } = sentences[index];
-  range.setStart(from[0], from[1]);
-  range.setEnd(to[0], to[1]);
-  CSS.highlights.set(SENTENCE_HIGHLIGHT, new Highlight(range));
+  if (key === litSentence && lit.every((one) => litSentenceNodes.includes(one.sentences[0].from[0]))) return;
+  const ranges = lit.filter((one) => one.sentences.length === sentences.length).map((one) => {
+    const range = document.createRange();
+    const { from, to } = one.sentences[index];
+    range.setStart(from[0], from[1]);
+    range.setEnd(to[0], to[1]);
+    return range;
+  });
+  CSS.highlights.set(SENTENCE_HIGHLIGHT, new Highlight(...ranges));
   litSentence = key;
+  litSentenceNodes = lit.map((one) => one.sentences[0].from[0]);
 }
 
 /** "2 of 5" for a read of several parts; "" for a read of one, or none. */
@@ -36771,17 +36895,14 @@ function readingLabel() {
  * the steering strip. Cheap, so it runs at every boundary rather than redrawing the lists.
  */
 function showReadingPosition() {
-  eachColumn(() => {
-    for (const list of [el("discord-log"), el("pinned-log")]) {
-      for (const row of (list && list.children) || []) {
-        const reading = nowPlaying !== null && row.getAttribute("data-id") === nowPlaying.id;
-        if (!reading && row.getAttribute("data-reading-marked") === null) continue;
-        markReadingBlock(row);
-        const named = childByClass(row, "msg-author");
-        if (named && reading && row.getAttribute("data-reading") === "true") named.textContent = readingLabel();
-      }
-    }
-  });
+  // `#540 read-aloud-desktop`: in every list a row of the read is drawn in, the cards' list included.
+  for (const row of READABLE_LISTS.flatMap(listRows)) {
+    const reading = nowPlaying !== null && row.getAttribute("data-id") === nowPlaying.id;
+    if (!reading && row.getAttribute("data-reading-marked") === null) continue;
+    markReadingBlock(row);
+    const named = childByClass(row, "msg-author");
+    if (named && reading && row.getAttribute("data-reading") === "true") named.textContent = readingLabel();
+  }
   renderReadSteer();
 }
 
@@ -37563,6 +37684,16 @@ async function readAloud(ids, from = null) {
     // it ends, so the boundary is as long as the next part's audio is late, and no longer.
     audio.addEventListener("drained", () => {
       if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) return;
+      // `#540 read-aloud-desktop`. The whole of this part arrived and not one sample of it was speech:
+      // the voice answered with silence. Going on raced the light through every block in silence and
+      // then archived the message as heard; it stops here, says so, and archives nothing.
+      if ("heardSpeech" in audio && !audio.heardSpeech()) {
+        stopReading();
+        if (readingMode) setReadState("failed");
+        setStatus(SILENT_READ);
+        showError(SILENT_READ);
+        return;
+      }
       learnSpeakingRate(audio, segments[at], blocks);
       if (at + 1 < sources.length) startNext(at + 1);
     });
@@ -47051,6 +47182,7 @@ function renderSideCards() {
         else /** @type {any} */ (was.card).cardChoice = card.choice;
         // Highlighted or put out in place (`toggleLitCard`), and by the view since: as a card drawn now.
         paintLitCard(was.card, card.choice.id);
+        markReadingCard(was.card);
         return was.card;
       });
       // `#407 unpack-row-parity`. Unpacked rows are built in the right column, the column of the cards
@@ -48589,7 +48721,9 @@ function sideCard({ choice, view = cardView(choice), text, summarized, root, age
   // `#532 shift-o-latency`: the thread as last drawn (`cardChoice`), the card being kept across passes.
   /** @type {any} */ (row).cardChoice = choice;
   const now = () => /** @type {any} */ (row).cardChoice;
-  const press = () => (cardsCycle() ? cycleCardState(now(), row) : toggleLitCard(now().id, row));
+  // `#540 read-aloud-desktop`: in reading mode a press reads the thread's first message aloud.
+  const press = () => (readingMode ? readCardAloud(row)
+    : cardsCycle() ? cycleCardState(now(), row) : toggleLitCard(now().id, row));
   button.addEventListener("click", press);
   sayRowShortcut(button, "side-card");
   row.setAttribute("data-card-state", state);
@@ -48621,6 +48755,7 @@ function sideCard({ choice, view = cardView(choice), text, summarized, root, age
   /** @type {any} */ (row).cardMessages = size ? size.messages : 1;
   /** @type {any} */ (row).cardMessagesExact = size ? size.exact : false;
   paintLitCard(row, choice.id);
+  markReadingCard(row);
   // `#129 message-search`. A card stands in this list where messages stand in the others, so the
   // search reaches it, as it reaches the cards of the Threads list; and by its first message's words
   // where the card says a summary of them. `#262 search-load-older`.
