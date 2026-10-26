@@ -1602,3 +1602,62 @@ def test_orc_lineage_retired_with_damaged_archive_copy_refuses(tmp_path: Path) -
 
     with pytest.raises(OrcParseError, match="does not match its manifest"):
         ingest_orc(archive, source, ORC_ROOT, "orc-test", "UTC")
+
+
+def test_rollout_still_present_but_rewritten_is_refused_not_retired(tmp_path: Path) -> None:
+    sessions, archive, root, _ = _lineage(tmp_path)
+    data = root.read_bytes()
+    first, rest = data.split(b"\n", 1)
+    root.write_bytes(first.replace(ROOT.encode(), b"someone-else") + b"\n" + rest)
+
+    with pytest.raises(CodexParseError, match="still present but no longer readable"):
+        _ingest(sessions, archive)
+
+
+def test_retired_rollout_keeps_a_snapshot_longer_than_its_record(tmp_path: Path) -> None:
+    sessions, archive, root, _ = _lineage(tmp_path)
+    snapshot = _snapshot(archive)
+    tail = _line(1_030, "event_msg", {"type": "agent_message", "message": "written, not recorded"})
+    snapshot.write_bytes(snapshot.read_bytes() + tail)
+    root.unlink()
+
+    _, report = _ingest(sessions, archive)
+
+    assert report.upstream_retired_sources == (root.relative_to(sessions).as_posix(),)
+    assert snapshot.read_bytes().endswith(tail)
+
+
+def test_claude_root_replaced_by_a_symlink_is_refused(tmp_path: Path) -> None:
+    live = tmp_path / "live"
+    shutil.copytree(FIXTURE_ROOT, live)
+    snapshot = tmp_path / "snapshot"
+    first = snapshot_claude_lineage(_session(live), snapshot, (), "2026-01-03T00:00:00Z")
+    root = _session(live)
+    root.unlink()
+    root.symlink_to(tmp_path / "elsewhere.jsonl")
+
+    with pytest.raises(ClaudeParseError, match="not a regular file"):
+        snapshot_claude_lineage(root, snapshot, first.sources, "2026-01-04T00:00:00Z")
+
+
+def test_claude_subagents_keep_being_read_after_the_root_retires(tmp_path: Path) -> None:
+    live = tmp_path / "live"
+    shutil.copytree(FIXTURE_ROOT, live)
+    snapshot = tmp_path / "snapshot"
+    first = snapshot_claude_lineage(_session(live), snapshot, (), "2026-01-03T00:00:00Z")
+    root = _session(live)
+    child = root.parent / root.stem / "subagents" / "agent-a-child.jsonl"
+    root.unlink()
+    with child.open("ab") as handle:
+        handle.write(
+            b'{"type":"system","uuid":"child-late","timestamp":"2026-01-02T10:03:00.000Z",'
+            b'"sessionId":"11111111-1111-4111-8111-111111111111","agentId":"a-child"}\n'
+        )
+
+    after = snapshot_claude_lineage(root, snapshot, first.sources, "2026-01-04T00:00:00Z")
+
+    assert after.upstream_retired == (root.name,)
+    copies = {copy.source_path: copy for copy in after.sources}
+    child_relative = child.relative_to(root.parent).as_posix()
+    before = {copy.source_path: copy for copy in first.sources}
+    assert copies[child_relative].copied_bytes > before[child_relative].copied_bytes

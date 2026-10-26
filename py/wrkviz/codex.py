@@ -924,6 +924,14 @@ def snapshot_codex_lineage(
     retired_bytes: dict[str, bytes] = {}
     for source_path in sorted(set(previous_by_path) - set(candidate_paths)):
         recorded = previous_by_path[source_path]
+        # Retired means absent in both spellings. A file that is still there but that discovery
+        # dropped -- unreadable, undecodable, or a metadata line that no longer names this
+        # lineage -- is upstream content changed in place, which still refuses.
+        if resolve_source(sessions_root / PurePosixPath(source_path)) is not None:
+            raise CodexParseError(
+                "append-only source violation: previously observed rollout is still present "
+                f"but no longer readable as this lineage: {source_path!r}"
+            )
         held = _read_snapshot_file(snapshot_root, source_path)
         target = _snapshot_target(snapshot_root, source_path)
         if held is None:
@@ -1033,14 +1041,15 @@ def snapshot_codex_lineage(
                 )
 
         if retired:
-            # A snapshot can be longer than its manifest record only by an interrupted write's
-            # tail, which the manifest never vouched for; the record keeps exactly what it had.
-            assert previous is not None
+            # The snapshot is the archive's only copy now, so it is never rewritten. It can hold
+            # more than its record vouches for -- a newer prefix written just before an
+            # interrupted manifest write -- and those bytes stay; the record is unchanged.
+            assert previous is not None and existing is not None
             source = replace(
                 previous,
                 upstream_retired_at=previous.upstream_retired_at or updated_at,
             )
-            pending.append(_PendingCopy(source, complete, existing))
+            pending.append(_PendingCopy(source, existing, existing))
             continue
         baseline = existing or b""
         if len(complete) < len(baseline):

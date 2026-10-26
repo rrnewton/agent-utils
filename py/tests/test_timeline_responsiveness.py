@@ -441,3 +441,34 @@ def test_discover_agents_cli_writes_the_report(tmp_path: Path, capsys: pytest.Ca
     assert written["roots"][0]["descendants"] == 6
     assert [row["key"] for row in written["orphans"]] == ["codex:stray"]
     assert main(["discover-agents", "--home", f"h={home}", "--root", "claude:missing"]) == 2
+
+
+def test_discover_agents_reads_unit_variant_sources_and_creator_objects(tmp_path: Path) -> None:
+    from wrkviz.discover import Sources as TreeSources, discover
+
+    home, registry = _tree_fixture(tmp_path)
+    sessions = home / ".codex" / "sessions"
+    write_jsonl(sessions / "2026" / "01" / "05" / "rollout-review.jsonl", [
+        {"type": "session_meta", "timestamp": iso(300),
+         "payload": {"id": "review", "timestamp": iso(300), "cwd": "/work/project",
+                     "source": {"subagent": "review"}}},
+    ])
+    _agent_record(registry, "lane-c", "codex", 400.02, "/work/project")
+    record = json.loads((registry / "lane-c" / "agent.json").read_text(encoding="utf-8"))
+    record["created_by"] = {"agent": "lane-b", "proof": "launch"}
+    (registry / "lane-c" / "agent.json").write_text(json.dumps(record), encoding="utf-8")
+    _codex_rollout(sessions, "lane-c-1", 400.04, "/work/project", prompt="Work.")
+
+    tree = discover(
+        TreeSources(
+            claude_projects=(("h", home / ".claude" / "projects"),),
+            codex_sessions=(("h", sessions),),
+            registries=(("h", registry),),
+        ),
+        ["claude:coord-1"],
+        ["/work/project"],
+    )
+
+    assert tree.sessions["codex:lane-c-1"].parent == "codex:lane-b-1"
+    assert tree.sessions["codex:lane-c-1"].link == "agentctl-created-by"
+    assert "codex:review" in tree.orphans

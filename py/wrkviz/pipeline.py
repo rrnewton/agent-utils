@@ -58,7 +58,7 @@ from wrkviz.codex import (
     load_codex_team,
     snapshot_codex_lineage,
 )
-from wrkviz.compressed_sources import source_exists
+from wrkviz.compressed_sources import resolve_source
 from wrkviz.claude import (
     ClaudeParseError,
     ClaudeSourceCopy,
@@ -1963,9 +1963,12 @@ def _ingest_orc_locked(
     location = _source_snapshot_location(archive, team_slug, requested_snapshot_root)
     snapshot_root = location.root
     changed += prune_orc_staging(snapshot_root)
-    retired_lineage = bool(manifest_state.sources) and not source_exists(
+    # Absent in both spellings, not merely unreadable: a root that is present but irregular is
+    # left to the snapshot path below, which refuses it. Child sessions that outlive a retired
+    # root are not followed; the lineage is frozen at its last import.
+    retired_lineage = bool(manifest_state.sources) and resolve_source(
         source_root / ".orc" / "sessions" / root_session_id / "session.db"
-    )
+    ) is None
     if retired_lineage:
         # The root session database is gone upstream in both spellings: the whole lineage has
         # retired, and the archive's content-addressed snapshots are the record. Re-normalize

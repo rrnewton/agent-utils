@@ -278,7 +278,11 @@ def discover_claude_sources(session_file: Path) -> tuple[Path, ...]:
         raise ClaudeParseError(f"Claude session is not a regular file: {session_file}")
     if session_file.suffix != ".jsonl":
         raise ClaudeParseError("Claude session filename must end in .jsonl")
-    sources = [session_file]
+    return (session_file, *_discover_subagent_sources(session_file))
+
+
+def _discover_subagent_sources(session_file: Path) -> tuple[Path, ...]:
+    sources: list[Path] = []
     subagents = session_file.parent / session_file.stem / "subagents"
     if subagents.is_dir():
         for path in iter_logical_glob(subagents, "agent-*.jsonl"):
@@ -538,13 +542,15 @@ def _deduplicate(records: Sequence[_Record]) -> tuple[_Record, ...]:
     return tuple(result)
 
 
-def _tool_use_ids(record: _Record) -> tuple[str, ...]:
+def _tool_use_blocks(record: _Record) -> tuple[tuple[str, object], ...]:
+    """``(id, (name, input))`` for each tool call a record makes."""
+
     message = record.value.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, list):
         return ()
     return tuple(
-        str(block["id"])
+        (str(block["id"]), (block.get("name"), block.get("input")))
         for block in content
         if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
     )
@@ -562,20 +568,31 @@ def _drop_fork_prefixes(
     """
 
     first: dict[str, _Record] = {}
-    calls_by_thread: dict[str, str] = {}
+    calls_by_thread: dict[str, tuple[str, object]] = {}
     result: dict[str, list[_Record]] = {}
-    for thread_id, records in records_by_thread.items():
+    # A thread that opens with Claude Code's fork marker holds copies; one that does not holds
+    # originals. Originals claim records first, so a nested fork cannot take a real agent's work
+    # merely by sorting earlier.
+    ordered = sorted(
+        records_by_thread.items(),
+        key=lambda item: any(record.value.get("type") == "fork-context-ref" for record in item[1][:3]),
+    )
+    for thread_id, records in ordered:
         kept: list[_Record] = []
         for record in records:
-            calls = _tool_use_ids(record)
+            calls = _tool_use_blocks(record)
             # A fork also opens with the parent's spawning call re-recorded under a new UUID.
-            # A record whose every tool call an earlier thread already made is that copy.
+            # A record whose every tool call an earlier thread already made, identically, is
+            # that copy.
             if calls and all(
-                calls_by_thread.get(call, thread_id) != thread_id for call in calls
+                call_id in calls_by_thread
+                and calls_by_thread[call_id][0] != thread_id
+                and calls_by_thread[call_id][1] == block
+                for call_id, block in calls
             ):
                 continue
-            for call in calls:
-                calls_by_thread.setdefault(call, thread_id)
+            for call_id, block in calls:
+                calls_by_thread.setdefault(call_id, (thread_id, block))
             uuid = _optional_string(record.value.get("uuid"))
             previous = first.get(uuid) if uuid is not None else None
             if previous is None or previous.thread_id == thread_id:
@@ -589,7 +606,7 @@ def _drop_fork_prefixes(
                     f"(first seen in {previous.source_path}:{previous.line})"
                 )
         result[thread_id] = kept
-    return result
+    return {thread_id: result[thread_id] for thread_id in records_by_thread}
 
 
 def _extract(
@@ -954,7 +971,12 @@ def load_claude_team(
         own = [result for thread_id, result in candidates if thread_id == caller]
         if len(own) > 1 or (caller is None and len(candidates) > 1):
             raise ClaudeParseError(f"duplicate Claude tool result {call_id}")
-        result_by_call[call_id] = own[0] if own else candidates[0][1]
+        if own:
+            result_by_call[call_id] = own[0]
+        elif caller is None:
+            result_by_call[call_id] = candidates[0][1]
+        # A caller without its own result is still waiting (a spawn still running); another
+        # thread's synthetic "Fork started" is not that result, so the call stays open.
 
     turns_by_thread: dict[str, tuple[Turn, ...]] = {}
     for thread_id in records_by_thread:
@@ -1360,12 +1382,14 @@ def snapshot_claude_lineage(
 
     source_root = session_file.parent
     previous_by_path = {source.source_path: source for source in previous_sources}
-    # A lineage whose root transcript upstream has retired entirely is still a lineage: the
-    # archive holds it. Only a never-imported session with no upstream file is an error.
+    # A lineage whose root transcript upstream has retired is still a lineage: the archive holds
+    # it, and subagents that are still upstream keep being read. Retired means absent in both
+    # spellings; a root that is present but not a regular file still refuses, and a session
+    # never imported with no upstream file is an error.
     paths = (
-        discover_claude_sources(session_file)
-        if source_exists(session_file) or not previous_by_path
-        else ()
+        _discover_subagent_sources(session_file)
+        if resolve_source(session_file) is None and previous_by_path
+        else discover_claude_sources(session_file)
     )
     relative_to_path = {
         path.relative_to(source_root).as_posix(): path for path in paths

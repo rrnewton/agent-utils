@@ -142,18 +142,12 @@ def _records(path: Path, limit: int) -> Iterator[Mapping[str, object]]:
 def _claude_head(path: Path) -> tuple[str | None, float | None]:
     cwd: str | None = None
     started: float | None = None
-    with path.open("rb") as handle:
-        for index, line in enumerate(handle):
-            if index >= HEAD_RECORDS or (cwd and started):
-                break
-            try:
-                record = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if not isinstance(record, dict):
-                continue
-            cwd = cwd or (record.get("cwd") if isinstance(record.get("cwd"), str) else None)
-            started = started or _iso(record.get("timestamp"))
+    for record in _records(path, HEAD_RECORDS):
+        if cwd and started:
+            break
+        if cwd is None and isinstance(record.get("cwd"), str):
+            cwd = str(record["cwd"])
+        started = started or _iso(record.get("timestamp"))
     return cwd, started
 
 
@@ -161,11 +155,15 @@ def scan_claude(host: str, projects: Path) -> list[Session]:
     """Top-level Claude Code sessions and their native subagents."""
 
     sessions: list[Session] = []
-    for path in sorted(projects.glob("*/*.jsonl")):
+    for path in sorted(
+        session for directory in sorted(projects.glob("*")) if directory.is_dir()
+        for session in iter_logical_glob(directory, "*.jsonl") if session.parent == directory
+    ):
         cwd, started = _claude_head(path)
         root = Session("claude", path.stem, host, path, cwd, started)
         sessions.append(root)
-        for child in sorted((path.parent / path.stem / "subagents").glob("**/agent-*.jsonl")):
+        subagents = path.parent / path.stem / "subagents"
+        for child in iter_logical_glob(subagents, "agent-*.jsonl") if subagents.is_dir() else ():
             agent_id = child.stem.removeprefix("agent-")
             _, child_started = _claude_head(child)
             sessions.append(
@@ -189,8 +187,10 @@ def scan_codex(host: str, root: Path) -> list[Session]:
         meta = meta_record.get("payload") if isinstance(meta_record, dict) else None
         if not isinstance(meta, dict) or not isinstance(meta.get("id"), str):
             continue
+        # `source` is a string ("cli"), a unit variant ({"subagent": "review"}) or a spawn record.
         source = meta.get("source")
-        spawn = source.get("subagent", {}).get("thread_spawn", {}) if isinstance(source, dict) else {}
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
         parent = (
             spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
         ) or meta.get("parent_thread_id")
@@ -274,7 +274,10 @@ def load_registry(host: str, registry: Path) -> list[RegistryAgent]:
         for flag, value in zip(arguments, arguments[1:]):
             if flag in ("--session-id", "--resume") and isinstance(value, str):
                 session = session or value
+        # Recorded as {"agent": NAME, ...} (with proof fields); a bare string is accepted too.
         creator = record.get("created_by") or record.get("managed_by")
+        if isinstance(creator, dict):
+            creator = creator.get("agent")
         agents.append(
             RegistryAgent(
                 host, str(record["name"]), str(record.get("harness") or "unknown"),

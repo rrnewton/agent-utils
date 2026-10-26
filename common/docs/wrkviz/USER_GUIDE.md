@@ -523,25 +523,30 @@ and each ingest is an incremental read of the feed from the archive's last check
   snapshot and the checkpoint advances. Bytes the archive already holds are compared, not
   re-imported.
 - **A file upstream no longer has is retired, not lost.** When a previously imported file is gone
-  upstream (in either spelling below), ingest verifies the archive's own snapshot against its
-  checkpoint and keeps it. The run succeeds; the manifest records `upstream_retired_at` on that
-  source (the run that first noticed), and every run receipt lists every retired source under
-  `ingest.upstream_retired_sources`, so any one receipt answers "what is the archive the only
-  copy of". If upstream has the file again later, it is compared and appended as usual.
+  upstream (absent in both spellings below), ingest verifies the archive's own snapshot against its
+  checkpoint and keeps it, never rewriting it. A file that is still present but no longer reads as
+  the same lineage is not retired; it is changed content, refused below. The run succeeds; the manifest records `upstream_retired_at` on that
+  Codex or Claude source (the run that first noticed), and every run receipt lists those sources
+  under `ingest.upstream_retired_sources`, so any one receipt answers "what is the archive the
+  only copy of". If upstream has the file again later, it is compared and appended as usual.
 - **A file compressed in place is the same file.** `X.zst` is read as `X`: ingest decodes it
   (with Python 3.14's `compression.zstd`, the `zstandard` package, or the `zstd` command,
   whichever is present) and the recorded digests keep matching, so compression is never mistaken
   for a change. When both spellings exist the plain one wins, since a later copy can only be the
   same bytes or longer. Orc's SQLite databases are decoded into a private temporary copy for the
-  read.
+  read. This applies to upstream sources only: the archive's own snapshot store must stay
+  uncompressed, and a `.zst` object there reads as missing.
 - **Content changed in place is still refused.** If upstream bytes the archive has already
   imported now differ, or a file shrank below the checkpoint, ingest refuses that team and leaves
   its archive byte-identical, exactly as before. That is the one case retention cannot explain.
 
-Retirement works file by file for Codex rollouts and Claude transcripts. For Orc, a lineage whose
-root session database is gone upstream keeps its last normalized generation and is reported as
-retired; within a live Orc lineage, Orc's own rules for dereferenced task databases apply (see
-[Orc source semantics](#orc-source-semantics-and-limitations)).
+Retirement works file by file for Codex rollouts and Claude transcripts; a Claude lineage whose
+root transcript has retired still reads the subagent files upstream keeps. For Orc, a lineage whose
+root session database is gone upstream is re-normalized from its verified snapshots, listed in
+`upstream_retired_sources`, and frozen there (child sessions that outlive the root are not
+followed). A task database gone upstream within a live Orc lineage is kept as a `detached`
+source, as a dereferenced one is (see
+[Orc source semantics](#orc-source-semantics-and-limitations)); it is not listed in the receipt.
 
 Two things still refuse, because they are the archive's own copy failing rather than upstream
 moving on: a retired source whose snapshot is missing from the snapshot store, and one whose
@@ -1515,7 +1520,7 @@ host. Each child is attached to its parent by one of these links, recorded on ev
 | `codex-spawn` | the child rollout's recorded parent thread |
 | `orc-parent` | the Orc session index's `parent_id` |
 | `agentctl-launch` | an `agentctl ... start NAME` (or `$VAR start NAME` on a line naming agentctl) in the parent's log, the registry record of NAME created within 15 minutes after it, and that record's log: its recorded native session id, else the same harness, host and working directory starting within 5 minutes of the record |
-| `agentctl-created-by` | a registry record's `created_by` or `managed_by` |
+| `agentctl-created-by` | a registry record's `created_by` or `managed_by` (its `agent` field) |
 | `agentctl-restart` | a log whose first prompt was queued to a registered agent, or is addressed to it (`→ NAME`, `SENDER -> NAME`, `You are NAME`), attached to that agent's earlier session |
 | `shell-exec` | an unlinked log that starts within 2 minutes after a reached session ran `codex exec`, `claude -p` or `muse exec` on the same host; skipped when two sessions ran one within a second of each other |
 

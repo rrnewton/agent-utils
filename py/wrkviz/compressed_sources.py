@@ -5,6 +5,9 @@ in one pass -- the vendor mirrors *and* this tool's own content-addressed snapsh
 every importer then reported the file as missing, because every importer opens ``X``. Nothing about
 the records had changed; only their encoding had.
 
+This module covers upstream sources. The archive's own snapshot store is read as plain files and
+must be restored (decompressed) if it was compressed; a `.zst` object there reads as missing.
+
 This module is the one place that knows a compressed spelling exists. Callers keep asking for
 ``X``. :func:`resolve_source` answers with whichever of ``X`` and ``X.zst`` is present, preferring
 the plain file when both are, because the plain one is what a later re-fetch writes and it can only
