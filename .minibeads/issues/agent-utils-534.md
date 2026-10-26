@@ -1,10 +1,11 @@
 ---
 title: 'markdown-tables-render: tables, headings and line spacing in Slack messages'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-26T14:56:01.000799953+00:00
-updated_at: 2026-10-26T14:56:01.000799953+00:00
+updated_at: 2026-10-26T16:36:03.704135130+00:00
+closed_at: 2026-10-26T16:36:03.704135+00:00
 ---
 
 # Description
