@@ -570,6 +570,56 @@ async fn a_thread_is_named_by_one_call_and_a_bad_name_fails_it() {
 }
 
 #[tokio::test]
+async fn a_thread_is_asked_for_a_terse_line_that_does_not_repeat_its_name() {
+    // `#541 thread-summary-concise`. The owner's example, its names made neutral: the answer he
+    // asked for is a fragment with nobody as its subject and nothing the name already says.
+    let terse = "testing performance with production data, and comparing bottom-up activity \
+                 summaries with top-down weekly reports";
+    let mock = Mock::start(vec![Reply::text(&format!(
+        "dashboard-site-refresh\n{terse}"
+    ))])
+    .await;
+    let files = Files::new("llm-thread-terse");
+    let under = MessagesApiSummarizer::new(anthropic(&mock, &files));
+    let messages = [
+        message("the new site is up on the staging host"),
+        message("load times with the real data are next"),
+    ];
+    let naming = under
+        .name_thread(&ThreadRequest::new(&messages, 160))
+        .await
+        .expect("named");
+    assert_eq!(naming.slug, "dashboard-site-refresh");
+    assert_eq!(
+        naming.sentence, terse,
+        "a fragment was not taken as written"
+    );
+    let system = mock.captured()[0].body["system"]
+        .as_str()
+        .expect("a system instruction")
+        .to_owned();
+    assert!(system.contains(THREAD_RULE), "{system}");
+    assert!(
+        system.contains(THREAD_STYLE),
+        "the concision advice was not sent: {system}"
+    );
+    for advice in [
+        "a fragment is fine",
+        "\"The team is\"",
+        "Do not repeat what line 1 already says",
+    ] {
+        assert!(THREAD_STYLE.contains(advice), "the advice lost {advice:?}");
+    }
+    // Deliberately outside the policy input, so the sentences already filed are not all swept at
+    // once: the rule is in it, the style is not.
+    assert!(under.policy_input().contains(THREAD_RULE));
+    assert!(
+        !under.policy_input().contains(THREAD_STYLE),
+        "the style moved every filed summary to a new version"
+    );
+}
+
+#[tokio::test]
 async fn an_answer_longer_than_asked_for_is_kept_whole_and_the_request_is_unchanged() {
     // `#257 summary-truncation`. The model is still asked for 160 characters; an answer half as
     // long again — an ordinary overshoot — used to be cut at 160 with "…" and now arrives whole,

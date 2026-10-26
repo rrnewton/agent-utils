@@ -50,7 +50,7 @@ use tokio::time::Instant;
 
 use super::agent::{plain_uncut, PLAIN_TEXT_RULE};
 use super::rate_limit::{Priority, RateLimiter};
-use super::threads::{parse_thread_answer, ThreadNaming, ThreadRequest, THREAD_RULE};
+use super::threads::{parse_thread_answer, ThreadNaming, ThreadRequest, THREAD_RULE, THREAD_STYLE};
 use super::{Summarizer, Summary, SummaryError, SummaryRequest, PROMPT};
 use crate::config::{LlmConfig, LlmDialect, Secret};
 
@@ -897,8 +897,9 @@ impl Summarizer for MessagesApiSummarizer {
     }
 
     async fn name_thread(&self, request: &ThreadRequest<'_>) -> Result<ThreadNaming, SummaryError> {
+        // `#541 thread-summary-concise`: the style rides with the rule, outside the policy input.
         let system = format!(
-            "{THREAD_RULE}\nKeep the sentence under {} characters.",
+            "{THREAD_RULE}\n{THREAD_STYLE}\nKeep the sentence under {} characters.",
             request.sentence_chars
         );
         let reply = self

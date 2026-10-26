@@ -2185,7 +2185,9 @@ each thread, a short name you can find it by and one sentence on where it stands
 can be collapsed to one plain sentence, and every thread in the thread list gets a **display name**
 such as `runner-wedged` — chosen once and then kept, even as the thread drifts, so you always find
 it under the name you first learned — and a **sentence** that is refreshed as the thread grows, at
-1, 2, 4 and 8 messages and then every 10.
+1, 2, 4 and 8 messages and then every 10. The sentence is terse (`#541 thread-summary-concise`): a
+fragment rather than "The team is …", saying what the name does not. A sentence written before that
+advice stands until the thread's next refresh.
 
 **What it depends on.** A model provider you can reach over HTTPS: the Anthropic API, Google
 Vertex, or a gateway that speaks the Vertex path. Nothing else — no SDK, no plugin, no agent
