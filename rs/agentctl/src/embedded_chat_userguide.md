@@ -2036,6 +2036,31 @@ The transport sits behind a small interface. The command-line transport is the
 only implemented one; `transport: "web_api"` (plugin) or `--transport=web-api`
 (helper) selects a placeholder that refuses every operation.
 
+Slack outbound format: `markdown` or `converted`. By default a reply's
+Markdown goes to the client as `--markdown` and Slack converts it, which
+drops some blank lines, can glue a table under a bullet to its neighbours,
+and turns headings into header blocks. The `converted` path instead has
+`agentctl-slack-outbound` convert the Markdown itself (headings become bold
+lines, lists and task boxes (`☐`/`☑`) stay as text, block quotes and code
+fences survive, and a table becomes an aligned monospace code block, because
+a native Slack table block does not come back in the client's text) and post
+it as `--slack-mrkdwn`, split at block boundaries under that body's
+4,000-byte cap. Select it, in the order that wins: an
+`agentctl chat publish --slack-format markdown|converted` flag for one root
+message; the `AGENTCTL_SLACK_FORMAT` environment variable; a
+`slack_format_by_channel` entry for the channel; then the bridge's
+`slack_format` key in its configuration (for example
+`"slack_format": "converted"`); then the default `markdown`. The helper also
+accepts `--format=converted` (or `--slack-format=converted`) in its own
+arguments, with the environment variable overriding them. Either path can be
+selected per bridge while both are evaluated; `agentctl chat status` reports
+the active one as `slack_format` (plus any `slack_format_by_channel`), and
+the helper's diagnostics log names the path of each post, without its text.
+The dry-run comparison harness is
+`cargo run -p chat-subscription-slack --example slack_format_compare -- FILE.md`;
+it posts nothing, and its live mode refuses without an explicit test channel
+and coordinator approval.
+
 Resource names. The channel is the Slack conversation ID (`C…`). A message is
 `C…/messages/<ts>`, a thread is `C…/threads/<root ts>`, and a reaction receipt
 is `C…/messages/<ts>/reactions/<name>`. A sender is the Slack user ID (`U…`), so
