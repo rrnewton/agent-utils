@@ -1,6 +1,6 @@
 ---
 title: 'voice-ws-relay-auth: serve the voice socket through vibe-talk with its own authentication'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - voice
 - security
 created_at: 2026-10-26T20:40:55.149723461+00:00
-updated_at: 2026-10-26T20:40:55.149723461+00:00
+updated_at: 2026-10-26T22:28:07.151465334+00:00
+closed_at: 2026-10-26T22:28:07.151465043+00:00
 ---
 
 # Description
