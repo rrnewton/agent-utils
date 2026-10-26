@@ -163,6 +163,35 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn own_decided(
+        &self,
+        _: &ChannelId,
+        _: &[MessageId],
+    ) -> Result<Vec<MessageId>, StoreError> {
+        refuse()
+    }
+
+    async fn decide_own(
+        &self,
+        _: &ChannelId,
+        _: &[MessageId],
+        _: bool,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        refuse()
+    }
+
+    async fn own_not_done(&self) -> Result<Vec<(ChannelId, Vec<MessageId>)>, StoreError> {
+        refuse()
+    }
+
+    async fn dismiss_own(
+        &self,
+        _: &ChannelId,
+        _: &[MessageId],
+    ) -> Result<Vec<MessageId>, StoreError> {
+        refuse()
+    }
+
     async fn noise_rules(&self) -> Result<Option<Vec<String>>, StoreError> {
         // A refusal, not `Ok(None)`. The caller that wants the defaults when nothing is stored
         // (`noise::current_rules`) asks for them by name; answering "never saved" here would let

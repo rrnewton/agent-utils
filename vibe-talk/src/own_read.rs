@@ -1,26 +1,39 @@
-//! The owner's own messages are read. `#536 mark-own-messages-read`.
-//!
-//! # What was wrong
-//!
-//! Settings' "Mark my own messages as read" was a rule of the page alone, and only half of one: a
-//! row whose author was the owner was greyed and left out of Hide read, but its Done button still
-//! offered Done — the read look over an unread control, the mismatch `#256 reply-marks-read` was
-//! filed for — and this server's to-do list counted it as waiting for him. The owner, 2026-10-26:
-//! "They are rendering as MY messages... but they are not marked read."
+//! The owner's own messages START read, as recorded state. `#549 own-read-stored`, after `#536
+//! mark-own-messages-read`.
 //!
 //! # The rule
 //!
-//! While the setting is on — and it is on unless he turned it off: the page's own default — a
-//! message from one of his accounts is read. Like a placeholder the noise rules catch (`#196
-//! auto-read-noise`) it is JUDGED on every read and never written down: nothing is recorded per
-//! message, so nothing crowds the reader's own Done marks out of the store's bound on them, and
-//! turning the setting off brings every one of them straight back. ONE rule, asked in two places
-//! from the same accounts: the page draws them read, offers no Done on them and counts them read in
-//! every tally (`markOwnRead` in web/voice.js), and here the to-do list leaves them out
-//! ([`crate::ops::todo`]) and "Done through here" writes no mark for one
-//! ([`crate::ops::declare_bankruptcy`]). They are deliberately NOT added to a read's `dismissed`:
-//! the page holds that answer, and one that said a message of his was read after he turned the
-//! setting off would keep it read until the next read.
+//! There is one read bit per message, and it is this server's Done mark ([`StateStore::dismiss`]).
+//! "Mark my own messages as read" decides only where that bit STARTS for a message of the owner's:
+//!
+//! 1. At the first sight of one of his messages here — pushed, polled, relisted, read for a page, or
+//!    posted through this server — its bit is decided: Done if the setting is on, left unread if it
+//!    is off. The owner, 2026-10-26: "it's just a question of whether the state starts as read or
+//!    starts as unread when the message is ingested".
+//! 2. Decided ONCE ([`StateStore::decide_own`] records it), never again: one he puts back stays
+//!    unread across restarts, relists and re-reads, and Done, Undo and e work on his messages as on
+//!    anyone's. Turning the setting on or off changes what happens to messages first seen from then
+//!    on; "Apply to existing messages" ([`crate::ops::apply_own_read`]) marks his undone ones read
+//!    once, on request.
+//! 3. The marks it writes are held under the dismissal bound APART from the reader's own (see
+//!    [`crate::store::Retention::max_dismissals`]), so a busy owner's own words never push out a
+//!    mark he made himself.
+//!
+//! Every surface then reads the one bit: the to-do list, the page's counts, icons and thread cards,
+//! and what an agent is told.
+//!
+//! # Where first sight is
+//!
+//! - **The live hub** notes every message it publishes for the first time ([`Sightings::note`],
+//!   under its feed lock, never waiting), and [`run`] decides them in the background.
+//! - **A write-scope read** of a window, a page or a timeline decides any message of his in it not
+//!   decided yet ([`settle`]), after deciding whatever the hub has noted and not yet decided. So a
+//!   message that arrived while this server was down is decided at the first read that meets it.
+//! - **A post** through this server decides what it posted.
+//!
+//! A read-scope read writes nothing durable, here as everywhere: it is answered as if the messages
+//! it meets that are not decided yet were decided now, and the next write-scope read or the hub
+//! decides them for real.
 //!
 //! # Whose messages
 //!
@@ -35,13 +48,17 @@
 //!    (`coding_agent_user_ids`). The page draws such an account as his regardless; here, where the
 //!    answer decides what an agent is told is waiting, agents posting through one shared account
 //!    are not taken to be him.
+//!
+//! A message is decided the first time it is seen as HIS: one from an account he later calls "me"
+//! is decided at the next sight after that.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use crate::client_settings::SyncedSetting;
-use crate::model::Message;
-use crate::store::StateStore;
+use crate::model::{ChannelId, Message, MessageId};
+use crate::state::AppState;
+use crate::store::{StateStore, StoreError};
 
 /// The synced setting this follows: `"0"` is off, anything else or nothing at all is on.
 pub const MARK_OWN_KEY: &str = "vibe-talk.voice.mark-own-read";
@@ -56,7 +73,7 @@ const ME: &str = "me";
 /// The owner's standing choices, as the synced settings hold them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Choice {
-    /// Whether his own messages are read.
+    /// Whether his own messages start read.
     pub on: bool,
     /// Who is who: account id to bucket.
     pub identities: BTreeMap<String, String>,
@@ -103,11 +120,12 @@ impl Choice {
         (posted_here || accounts.selves.contains(author_id)) && !accounts.agents.contains(author_id)
     }
 
-    /// Whether `message` is read by this rule: on, his, and not already read as noise (which says
-    /// so for itself, and is counted as noise).
-    #[must_use]
-    pub fn reads(&self, accounts: &Accounts, message: &Message, posted_here: bool) -> bool {
-        self.on && !message.noise && self.owns(accounts, message.author_id.as_str(), posted_here)
+    /// Whether `message` is one of his whose read state this rule decides: his, not read as noise
+    /// already (which says so for itself), and with an id the store can order.
+    fn decides(&self, accounts: &Accounts, sighting: &Sighting) -> bool {
+        !sighting.noise
+            && sighting.id.numeric().is_some()
+            && self.owns(accounts, &sighting.author_id, sighting.posted_here)
     }
 }
 
@@ -233,6 +251,204 @@ impl OwnRead {
         }
         choice
     }
+}
+
+/// One message as first seen: what deciding its read state asks of it.
+#[derive(Clone, Debug)]
+struct Sighting {
+    id: MessageId,
+    author_id: String,
+    noise: bool,
+    posted_here: bool,
+}
+
+impl Sighting {
+    fn of(message: &Message, posted_here: bool) -> Self {
+        Self {
+            id: message.id.clone(),
+            author_id: message.author_id.as_str().to_owned(),
+            noise: message.noise,
+            posted_here,
+        }
+    }
+}
+
+/// How many messages the live hub may have noted and not yet had decided. Past it the oldest is
+/// let go; the next write-scope read that meets it decides it instead.
+const MAX_WAITING: usize = 4_096;
+
+/// The messages the live hub published for the first time, waiting for [`run`] to decide their
+/// read state. `#549 own-read-stored`.
+///
+/// Noted under the hub's feed lock, so [`Sightings::note`] takes one brief lock of its own and never
+/// waits; the store is written in the background.
+#[derive(Debug, Default)]
+pub struct Sightings {
+    waiting: Mutex<VecDeque<(ChannelId, Sighting)>>,
+    wake: tokio::sync::Notify,
+}
+
+impl Sightings {
+    /// The hub published `message` to `channel` for the first time; `self_posted` is whether this
+    /// server posted it.
+    pub fn note(&self, channel: &ChannelId, message: &Message, self_posted: bool) {
+        {
+            let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+            waiting.push_back((channel.clone(), Sighting::of(message, self_posted)));
+            while waiting.len() > MAX_WAITING {
+                waiting.pop_front();
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    fn take(&self) -> Vec<(ChannelId, Sighting)> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+            .collect()
+    }
+}
+
+/// Decide, in the background, the read state of every message of his the live hub publishes for
+/// the first time. Spawned once at startup.
+pub async fn run(state: AppState) {
+    let sightings = std::sync::Arc::clone(state.live.own_sightings());
+    loop {
+        sightings.wake.notified().await;
+        decide_waiting(&state).await;
+    }
+}
+
+/// Decide whatever the live hub has noted and not yet had decided.
+pub async fn decide_waiting(state: &AppState) {
+    let waiting = state.live.own_sightings().take();
+    if waiting.is_empty() {
+        return;
+    }
+    let mut by_channel: BTreeMap<ChannelId, Vec<Sighting>> = BTreeMap::new();
+    for (channel, sighting) in waiting {
+        by_channel.entry(channel).or_default().push(sighting);
+    }
+    for (channel, sightings) in by_channel {
+        decide(state, true, &channel, &sightings).await;
+    }
+}
+
+/// The messages among `messages`, read for `caller` in `channel`, that are Done in this answer
+/// because their first read state was decided now: the owner's own, first seen here, while "Mark my
+/// own messages as read" is on. A caller adds them to the store's Done marks it read, before or
+/// after this, so a read is never answered without the marks its own first sight wrote.
+///
+/// With write scope the decision is recorded, once ([`StateStore::decide_own`]); with read scope
+/// nothing is written, and the messages not yet decided are answered as if decided now. Whatever
+/// the live hub has noted is decided first, so a read never answers ahead of a message the hub saw.
+pub async fn settle(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    messages: &[Message],
+) -> HashSet<MessageId> {
+    decide_waiting(state).await;
+    let sightings: Vec<Sighting> = messages
+        .iter()
+        .map(|message| Sighting::of(message, state.live.is_self_posted(&message.id)))
+        .collect();
+    decide(
+        state,
+        caller >= crate::auth::Scope::Write,
+        channel,
+        &sightings,
+    )
+    .await
+}
+
+/// Decide what this server just posted to `channel`.
+pub async fn settle_posted(state: &AppState, channel: &ChannelId, posted: &[Message]) {
+    let sightings: Vec<Sighting> = posted
+        .iter()
+        .map(|message| Sighting::of(message, true))
+        .collect();
+    decide(state, true, channel, &sightings).await;
+}
+
+/// Decide the first read state of each of `sightings` that is his and not decided yet, recording it
+/// when `write`, and answer those that are Done because of it. A store that cannot answer decides
+/// nothing: a server with no store has no Done at all.
+async fn decide(
+    state: &AppState,
+    write: bool,
+    channel: &ChannelId,
+    sightings: &[Sighting],
+) -> HashSet<MessageId> {
+    if sightings.is_empty() {
+        return HashSet::new();
+    }
+    let choice = state.own_read.choice(state.store.as_ref()).await;
+    let accounts = accounts_of(state);
+    let mut his: Vec<MessageId> = sightings
+        .iter()
+        .filter(|sighting| choice.decides(&accounts, sighting))
+        .map(|sighting| sighting.id.clone())
+        .collect();
+    his.sort();
+    his.dedup();
+    if his.is_empty() {
+        return HashSet::new();
+    }
+    let decided: HashSet<MessageId> = match state.store.own_decided(channel, &his).await {
+        Ok(decided) => decided.into_iter().collect(),
+        Err(error) => {
+            note_failure(
+                channel,
+                &error,
+                "read which of the owner's messages were decided",
+            );
+            return HashSet::new();
+        }
+    };
+    let undecided: Vec<MessageId> = his.into_iter().filter(|id| !decided.contains(id)).collect();
+    if undecided.is_empty() {
+        return HashSet::new();
+    }
+    if !write {
+        return if choice.on {
+            undecided.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+    }
+    match state.store.decide_own(channel, &undecided, choice.on).await {
+        Ok(fresh) if choice.on => fresh.into_iter().collect(),
+        Ok(_) => HashSet::new(),
+        Err(error) => {
+            note_failure(
+                channel,
+                &error,
+                "record the first read state of the owner's messages",
+            );
+            HashSet::new()
+        }
+    }
+}
+
+/// Log a store failure, but not the absence of a store, which is a deployment's choice.
+fn note_failure(channel: &ChannelId, error: &StoreError, what: &str) {
+    if !matches!(error, StoreError::Unavailable(_)) {
+        tracing::warn!(channel = %channel, %error, "could not {what}");
+    }
+}
+
+/// The configured accounts, and the accounts this server posts as.
+fn accounts_of(state: &AppState) -> Accounts {
+    let selves = state
+        .providers
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.client.self_author_id())
+        .chain(state.chat.self_author_id());
+    Accounts::of(&state.config, selves)
 }
 
 #[cfg(test)]

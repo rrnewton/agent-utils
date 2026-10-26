@@ -352,6 +352,8 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"messages":["3333333333"]}"#),
         ),
+        // `#549 own-read-stored`.
+        route("POST", "/api/v1/own-read/apply", Write, Nothing),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/read",

@@ -3932,6 +3932,19 @@ taking the file back too. **Take a copy of `storage.path` before an upgrade.** R
 is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
 the server stopped, newest first; each step's note below says how.
 
+**Step 22 (`#549 own-read-stored`)** adds the `own_decided` table, which of the owner's own
+messages have had their first read state decided, and the `dismissals.own` column, which says a
+Done mark was written by "Mark my own messages as read" rather than by the reader, so the two are
+bounded apart. With the server stopped it can be undone in place; every Done mark stays, the
+owner's first marks then sharing the reader's bound as before the step:
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE own_decided; ALTER TABLE dismissals DROP COLUMN own; PRAGMA user_version = 21;'
+```
+
+Run that only on a file at version 22, only with an `sqlite3` new enough for `DROP COLUMN` (3.35 or
+later), and only when the build being returned to predates the step.
+
 **Step 21 (`#471 replication-c5-post-keys`)** only adds the `post_keys` table, the send log's
 settled posts, so with the server stopped it can be undone in place, losing nothing but that memory
 (a repeat after the next restart is posted again unless the provider recognises its key):
@@ -4767,6 +4780,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/todo?limit=&reason=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
 | POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` (at most 1,000 ids) — the undo, restoring exactly that set |
+| POST | `/api/v1/own-read/apply` | **write** | no body — "Apply to existing messages": marks read every message of the owner's this server has seen that is not Done, answering `{changes:[{channel, messages}], count}`, each change what the undo restores (`#549 own-read-stored`) |
 | POST | `/api/v1/channels/{id}/read` | **write** | `{message_id, epoch?}` — move this server's read mark forward. `epoch` is the `read_epoch` `/inbox` gave (or the last answer's `epoch`): a mark forgotten since has moved to a later epoch, and the request then writes nothing and answers `applied: false` with the mark and epoch as they stand, so a stale mark cannot undo a forget. Without `epoch` it always applies |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark and move the channel to its next read-mark `epoch`, which it answers |
 | POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…", thread_id?, after_reply?}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined. `thread_id` is checked to hold the message. `after_reply: true` is the page asking because a reply it sent answered the message (`#300 reply-marks-read`), or because Shift+E read and collapsed it (`#295 shift-e-read-collapse`): the provider is not asked for a message this server has already marked through, nor one before it, and the answer's `outcome` says `marked`, `already_marked` or `behind`; or `thread_channel` or `scope_unknown`, asking nothing, where the provider's cursor covers more than the channel (one thread of a larger space) or the provider cannot say whether it does. Without it the provider is always asked |
@@ -10478,18 +10492,30 @@ You can also set it without a restart: **Settings lists every account it has see
 say which is which. That is the faster fix, and it is per-browser; the configuration setting is for
 a deployment that would rather state it once.
 
-### Your own messages are read
+### Your own messages start read
 
-`#536 mark-own-messages-read`. With **Settings → Messages → Mark my own messages as read** on (the
-default), your messages are read everywhere, not only greyed on the page in front of you: they count
-as read in every tally on every device, no row of yours offers **Done**, and the server's to-do list
-leaves them out. Yours are, in this order:
-the accounts **Who is who** calls you (and not the ones it calls anything else), `[owner] user_ids`
-and every provider's `owner_user_id` (the page is told these as `owner_author_ids`, and draws them
-as yours), and the account this server posts as or any message it posted, unless
-`coding_agent_user_ids` names that account. Like a placeholder the noise rules catch, this is judged
-on every read and never written down: turning the setting off brings every one of them back, and
-none of them takes a place among your Done marks.
+`#549 own-read-stored` (after `#536 mark-own-messages-read`). There is one read bit per message, the
+server's Done mark. **Settings → Messages → Mark my own messages as read** (on by default) decides
+where that bit STARTS for a message of yours: the first time this server sees it — pushed, polled,
+relisted, read for a page, or posted through vibe-talk — it is recorded Done if the setting is on and
+left unread if it is off. That is decided once per message and never again, so from then on it is
+an ordinary message: **Unarchive** or <kbd>e</kbd> puts it back in the list, and it stays there
+across restarts, relists and re-reads, on every device, in the to-do list and in every count.
+
+Turning the setting off or on changes only messages first seen afterwards. **Apply to existing
+messages**, beside it, marks read every message of yours the server has seen that is not Done now, in
+every channel on the list (`POST /api/v1/own-read/apply`, write scope); the page asks for a second
+press first, and its **Undo** puts back exactly what was marked. A read with the read token writes
+nothing: it answers as if the messages of yours it meets that are not decided yet were decided then,
+and the next write-scope read, or the live feed, records them. The marks this writes are kept under
+the dismissal bound (`[storage] max_dismissals`) apart from the ones you make yourself, so your own
+words never push out a Done of yours.
+
+Yours are, in this order: the accounts **Who is who** calls you (and not the ones it calls anything
+else), `[owner] user_ids` and every provider's `owner_user_id` (the page is told these as
+`owner_author_ids`, and draws them as yours), and the account this server posts as or any message it
+posted, unless `coding_agent_user_ids` names that account. A message is decided the first time it is
+seen as yours, so one from an account you later call "me" is decided at its next sight.
 
 ### Your own messages, to the voice agent
 

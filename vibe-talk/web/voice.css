@@ -2068,11 +2068,7 @@ a.search-hit-link {
 #side-log li.discord-message[data-archived="true"],
 #side-cards li.discord-message[data-archived="true"],
 #discord-log li.discord-message[data-archived="true"],
-#pinned-log li.discord-message[data-archived="true"],
-#side-log li.discord-message[data-own-read="true"],
-#side-cards li.discord-message[data-own-read="true"],
-#discord-log li.discord-message[data-own-read="true"],
-#pinned-log li.discord-message[data-own-read="true"] {
+#pinned-log li.discord-message[data-archived="true"] {
   --row-opacity: 0.42;
   --row-filter: grayscale(1);
   --row-grey: 1;
@@ -2107,10 +2103,6 @@ a.search-hit-link {
 #side-cards li.discord-message[data-archived="true"][data-selected="true"],
 #discord-log li.discord-message[data-archived="true"][data-selected="true"],
 #pinned-log li.discord-message[data-archived="true"][data-selected="true"],
-#side-log li.discord-message[data-own-read="true"][data-selected="true"],
-#side-cards li.discord-message[data-own-read="true"][data-selected="true"],
-#discord-log li.discord-message[data-own-read="true"][data-selected="true"],
-#pinned-log li.discord-message[data-own-read="true"][data-selected="true"],
 #side-log li.discord-message[data-noise="true"][data-selected="true"],
 #side-cards li.discord-message[data-noise="true"][data-selected="true"],
 #discord-log li.discord-message[data-noise="true"][data-selected="true"],
@@ -2119,10 +2111,6 @@ a.search-hit-link {
 #side-cards li.discord-message[data-archived="true"]:focus-within,
 #discord-log li.discord-message[data-archived="true"]:focus-within,
 #pinned-log li.discord-message[data-archived="true"]:focus-within,
-#side-log li.discord-message[data-own-read="true"]:focus-within,
-#side-cards li.discord-message[data-own-read="true"]:focus-within,
-#discord-log li.discord-message[data-own-read="true"]:focus-within,
-#pinned-log li.discord-message[data-own-read="true"]:focus-within,
 #side-log li.discord-message[data-noise="true"]:focus-within,
 #side-cards li.discord-message[data-noise="true"]:focus-within,
 #discord-log li.discord-message[data-noise="true"]:focus-within,
@@ -4635,13 +4623,6 @@ a.search-hit-link {
   -webkit-tap-highlight-color: transparent;
 }
 
-/* `#536 mark-own-messages-read`. The reader's own words are read while the setting says so, so their
-   row offers no Done: kept in place, so the other acts do not move, and drawn as nothing. The page
-   also disables it, so it takes no focus and no tap. */
-.done-button[data-read-already] {
-  visibility: hidden;
-}
-
 /* The filter reads as thrown, drawn from the SAME attribute that says so to a screen reader:
    `true` for Hide read and `mixed` for Fold read, the two modes that take read messages out of
    the way. `#221 read-modes`. */
@@ -6082,19 +6063,19 @@ a.search-hit-link {
  * reader who does not see the hue. The row's own edge goes transparent under it, so the gaps between
  * the dashes are gaps, not a thin solid line.
  */
-#side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
-#side-cards li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
-#discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
-#pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) {
+#side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]),
+#side-cards li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]),
+#discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]),
+#pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) {
   border-color: transparent;
   outline-style: dashed;
   outline-color: var(--read-ring);
 }
 
-#side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
-#side-cards li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
-#discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
-#pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button) {
+#side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#side-cards li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button) {
   border-color: var(--muted);
 }
 

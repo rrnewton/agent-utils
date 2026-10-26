@@ -2183,6 +2183,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       const messages = page.messages.filter((m) => view === "flat" ||
         (view === "thread" && m.thread && m.thread.id === threadId) ||
         (view === "main" && (!m.thread || m.thread.is_root)));
+      // Every message this fake server holds, not only the view's: the server has seen the replies a
+      // Main read leaves out, through the live feed, and decided them then.
+      page.firstSight(page.messages);
       return json(200, {
         channel: page.channels[0], messages,
         threads: view === "threads" ? page.threads : [],
@@ -2207,8 +2210,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     // `#50 todo-view`. The dismissal overlay is reported on the CHANNEL read too, not only on
     // `/todo`: the channel view GREYS archived rows rather than hiding them, and cannot know which
     // they are otherwise. Same little store `/todo` filters on, so the two cannot disagree.
-    channelPage: async () =>
-      json(200, {
+    channelPage: async () => {
+      page.firstSight(page.messages);
+      return json(200, {
         channel: page.channels[0],
         messages: page.messages,
         dismissed: page.messages
@@ -2216,7 +2220,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           .filter((id) => page.dealtWith.has(id)),
         pins_revision: page.servePinsRevision ? page.pinsRevision : undefined,
         bookmark: page.servedBookmark(),
-      }),
+      });
+    },
     // `#48 transcript-storage`. The fixture is a real little store rather than a canned answer:
     // a POSTed turn lands in `storedTurns` and a later GET returns it, so "the page recorded the
     // turn" and "the page can read its own record back" are the same fact here as on the server.
@@ -2350,6 +2355,44 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     summaryPaths: [],
     /** `#50 todo-view`: the message ids this fake server considers dealt with. */
     dealtWith: new Set(),
+    /**
+     * `#549 own-read-stored`: the owner's messages whose first read state this fake server has
+     * decided, as the server's `own_decided` holds them. A read is the first sight here: a message of
+     * his it meets that is not decided yet is decided, Done while "Mark my own messages as read" is on
+     * (`firstSight`).
+     */
+    ownDecided: new Set(),
+    /** `#549 own-read-stored`: how many times "Apply to existing messages" reached the server. */
+    ownReadApplies: 0,
+    /**
+     * Decide the first read state of each of `messages` as the server does at first sight: his — by
+     * who-is-who, then the configured owner accounts, then the account this bridge posts as or, with
+     * `postedHere`, a message this server just posted — not noise, and not decided before; Done when
+     * the synced setting is on.
+     */
+    firstSight: (messages, postedHere = false) => {
+      const on = page.storage.get("vibe-talk.voice.mark-own-read") !== "0";
+      let identities = {};
+      try {
+        identities = JSON.parse(page.storage.get("vibe-talk.voice.identities") || "{}") || {};
+      } catch (_error) {
+        identities = {};
+      }
+      const owners = new Set([page.ownerAuthorId, ...(page.ownerAuthorIds || [])].filter(Boolean).map(String));
+      const his = (m) => {
+        const author = String(m.author_id || "");
+        if (!author) return false;
+        if (typeof identities[author] === "string") return identities[author] === "me";
+        return postedHere || owners.has(author) ||
+          (page.selfAuthorId !== null && author === String(page.selfAuthorId));
+      };
+      for (const m of messages) {
+        const id = String(m.id);
+        if (m.noise === true || page.ownDecided.has(id) || !his(m)) continue;
+        page.ownDecided.add(id);
+        if (on) page.dealtWith.add(id);
+      }
+    },
     /**
      * `#206 pin-message`: the pins this fake server keeps, by message id — a real little store, as
      * `dealtWith` is, so "the page pinned it" and "the next list carries it" are one fact here.
@@ -3186,6 +3229,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       }
       if (/\/timeline\?/.test(String(path))) {
         page.timelineCalls.push(String(path));
+        // `#549 own-read-stored`: whatever answers the read, the server decided his messages first.
+        page.firstSight(page.messages);
         return page.timeline(path, options);
       }
       // `#65 scrollback-paging` moved the channel read onto the CURSORED route. `/messages` is
@@ -3195,6 +3240,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // Counted, so a test can prove a read did NOT happen. `#39 channel-alias` needs that:
         // renaming a channel is a redraw of what is on screen and must not spend a request.
         page.pageReads += 1;
+        page.firstSight(page.messages);
         return page.channelPage(path, options);
       }
       // `#49 cached-summaries`. Recorded rather than merely answered: every assertion worth
@@ -3208,6 +3254,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (/\/todo(\?|$)/.test(String(path))) {
         page.todoReads += 1;
         page.todoReadPaths.push(String(path));
+        page.firstSight(page.messages);
         // `#196 auto-read-noise`: the server leaves out what it reads automatically, and says how many.
         const left = page.messages.filter((m) => !page.dealtWith.has(String(m.id)) && m.noise !== true);
         return json(200, {
@@ -3215,6 +3262,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           messages: left,
           window: page.messages.length,
           noise: page.messages.filter((m) => m.noise === true).length,
+          // `#549 own-read-stored`: and what it left out as Done.
+          done: page.messages.filter((m) => page.dealtWith.has(String(m.id)) && m.noise !== true)
+            .map((m) => String(m.id)),
           // `#240 reading-bookmark`: the window is every message, unless a test says it starts later.
           complete: page.todoWindowFrom === undefined,
           window_from: page.todoWindowFrom !== undefined ? page.todoWindowFrom
@@ -3724,6 +3774,18 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           read_state_notice: INBOX_NOTICE,
         });
       }
+      // `#549 own-read-stored`. "Apply to existing messages": every message of his this fake server
+      // decided and that is not Done, marked Done, and named, as the server's answer names them.
+      if (String(path) === "/api/v1/own-read/apply") {
+        page.ownReadApplies += 1;
+        const marked = [...page.ownDecided].filter((id) => !page.dealtWith.has(id));
+        for (const id of marked) page.dealtWith.add(id);
+        return json(200, {
+          changes: marked.length ? [{ channel: CHANNEL, messages: marked }] : [],
+          count: marked.length,
+          read_state_notice: INBOX_NOTICE,
+        });
+      }
       const wantsSummary =
         /^\/api\/v1\/channels\/([^/]+)\/messages\/([^/]+)\/summary(\?|$)/.exec(String(path));
       if (wantsSummary) {
@@ -3784,7 +3846,19 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           contentType: options && options.headers && options.headers["Content-Type"],
           body: JSON.parse((options && options.body) || "null"),
         });
-        return page.replyResponse(path, options);
+        // `#549 own-read-stored`: what the server posts is first seen as it posts it.
+        const answer = await page.replyResponse(path, options);
+        if (answer && answer.ok && typeof answer.text === "function") {
+          let body = null;
+          try {
+            body = JSON.parse(await answer.text());
+          } catch (_error) {
+            body = null;
+          }
+          const parts = body && Array.isArray(body.parts) ? body.parts : body && body.posted ? [body.posted] : [];
+          page.firstSight(parts.filter(Boolean), true);
+        }
+        return answer;
       }
       // `#46 conversation-replay`. Answered from `storedTurns` rather than from a canned string,
       // so "the page sent what the server built" and "the server built it from what was stored"
@@ -12950,14 +13024,16 @@ test("MY OWN MESSAGES ARE READ ALREADY, BY DEFAULT, WITHOUT VISITING SETTINGS", 
   ]);
 
   assert.equal(whoOf(page, 0), "me");
-  assert.equal(rowState(page, 0).ownRead, "true", "the owner's own message is not marked read");
-  assert.equal(rowState(page, 1).ownRead, "false", "the agent's message was marked read too");
-  // It is NOT the declared archive: nothing was recorded, so there is nothing to undo.
-  assert.equal(rowState(page, 0).archived, "false", "an implied read was filed as a dismissal");
-  assert.deepEqual(page.dismissCalls, [], "a dismissal was written for a message nobody archived");
+  // `#549 own-read-stored`: read in the one read bit the server keeps, which it set at the message's
+  // first sight, so the row is drawn from that bit as any row is — archived, with Unarchive.
+  assert.equal(rowState(page, 0).archived, "true", "the owner's own message is not marked read");
+  assert.equal(rowState(page, 1).archived, "false", "the agent's message was marked read too");
+  assert.equal(doneButton(row(page, 0)).textContent, "Unarchive");
+  // The server decided it; the page wrote nothing.
+  assert.deepEqual(page.dismissCalls, [], "the page wrote a dismissal for a message nobody archived");
 });
 
-test("...and they are kept out of the queue, and come straight back when it is turned off", async () => {
+test("...and they are kept out of the queue, and turning the setting off leaves them where their read state put them", async () => {
   const page = newPage();
   await signIn(page);
   page.messages = [
@@ -12974,60 +13050,126 @@ test("...and they are kept out of the queue, and come straight back when it is t
   );
   assert.equal(row(page, 0).getAttribute("data-id"), "1000000000000000002");
 
-  // Turning it off is the whole undo. Nothing was written, so nothing has to be unwritten.
+  // `#549 own-read-stored`: the setting decides where a message STARTS. Turned off, what was already
+  // seen keeps its read state, and nothing is read again for it.
+  const reads = page.todoReads;
   await page.el("mark-own-read").setChecked(false);
   await page.settle();
-  assert.equal(
-    page.el("discord-log").children.length,
-    2,
-    "turning the setting off did not bring the reader's own messages back"
-  );
+  assert.equal(page.el("discord-log").children.length, 1, "turning the setting off brought a read message back");
+  assert.equal(page.todoReads, reads, "turning the setting off read the queue again");
 });
 
-test("`#536 mark-own-messages-read`: another device turning own messages read off or on redraws the rows here", async () => {
-  // The switch's own change re-greyed the rows; the same change synced from another device only set
-  // the flag, so the rows on screen said the old setting until something else redrew them.
+test("`#549 own-read-stored`: another device turning own messages read off or on moves the switch here, and no row", async () => {
+  // The setting decides where a message's read state starts, at its first sight on the server; the
+  // rows on screen are drawn from that state, which the change does not touch.
   const page = newPage();
   await signIn(page);
   await showDiscord(page, [
     message({ id: "1000000000000000001", ...OWN }),
     message({ id: "1000000000000000002", ...CODER }),
   ]);
-  assert.equal(rowState(page, 0).ownRead, "true", "the premise: the owner's message is read");
+  assert.equal(rowState(page, 0).archived, "true", "the premise: the owner's message is read");
   page.pure("keepLocalSetting")("vibe-talk.voice.mark-own-read", "0");
   page.pure("applySyncedSetting")("vibe-talk.voice.mark-own-read");
   await page.settle();
   assert.equal(page.el("mark-own-read").checked, false, "the switch does not say the synced choice");
-  assert.equal(rowState(page, 0).ownRead, "false", "another device's off did not redraw the row");
+  assert.equal(rowState(page, 0).archived, "true", "another device's off put a read message back");
   page.pure("keepLocalSetting")("vibe-talk.voice.mark-own-read", "1");
   page.pure("applySyncedSetting")("vibe-talk.voice.mark-own-read");
   await page.settle();
-  assert.equal(rowState(page, 0).ownRead, "true", "another device's on did not redraw the row");
-  assert.equal(rowState(page, 1).ownRead, "false", "the agent's message was drawn read");
+  assert.equal(page.el("mark-own-read").checked, true);
+  assert.equal(rowState(page, 1).archived, "false", "another device's on marked the agent's message read");
 });
 
-test("`#536 mark-own-messages-read`: a row of the reader's own words offers no Done, and e says why", async () => {
-  // The owner, 2026-10-26: "They are rendering as MY messages... but they are not marked read." The
-  // rows were greyed while their Done button still offered Done, the read look over an unread control.
+test("`#549 own-read-stored`: a row of the reader's own words offers Unarchive, and e puts it back like any other", async () => {
+  // The owner, 2026-10-26: "record the state that they are read and then I can toggle one individually
+  // and it's perfectly valid."
   const page = await keyboardPageAtTop([
     message({ id: "1", ...OWN }),
     message({ id: "2", ...CODER }),
     message({ id: "3", ...CODER }),
   ]);
-  const offered = (id) => !doneButton(channelRow(page, id)).disabled &&
-    !doneButton(channelRow(page, id)).hasAttribute("data-read-already");
-  assert.equal(offered("1"), false, "the owner's own row still offers Done");
-  assert.equal(offered("2"), true, "the agent's row lost its Done");
-  assert.match(cssBlock(".done-button[data-read-already]"), /visibility:\s*hidden/, "the withheld Done is still drawn");
+  const button = (id) => doneButton(channelRow(page, id));
+  assert.equal(button("1").disabled, false, "the owner's own row withholds its button");
+  assert.equal(button("1").textContent, "Unarchive", "the owner's own row is not drawn read");
+  assert.equal(button("2").textContent, "Done");
   await press(page, page.el("scroll-area"), "ArrowDown");
   assert.equal(selectedId(page), "1");
   await pressHere(page, "e");
+  assert.deepStrictEqual(page.restoreCalls.map((call) => call.messages), [["1"]], "e did not put his message back");
   assert.deepStrictEqual(page.dismissCalls, [], "e wrote a mark for a message already read");
-  assert.match(statusText(page), /Your own messages count as read/);
-  // Turned off, the row is the reader's to mark like any other.
-  await page.el("mark-own-read").setChecked(false);
+  assert.equal(button("1").textContent, "Done", "his message put back is not drawn unread");
+  // ...and it stays unread through the next read: nothing marks it again.
+  await reReadChannel(page);
+  assert.equal(button("1").textContent, "Done", "a read marked his message read again");
+});
+
+test("`#549 own-read-stored`: Apply to existing messages asks twice, marks his undone messages read, and Undo puts back exactly those", async () => {
+  const page = newPage();
+  page.storage.set("vibe-talk.voice.mark-own-read", "0");
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", ...OWN }),
+    message({ id: "1000000000000000002", ...CODER }),
+    message({ id: "1000000000000000003", ...OWN }),
+  ]);
+  // First seen while the setting was off: his messages started unread.
+  assert.deepStrictEqual([0, 1, 2].map((i) => rowState(page, i).archived), ["false", "false", "false"]);
+  await page.el("mark-own-read").setChecked(true);
   await page.settle();
-  assert.equal(offered("1"), true, "with the setting off the row still withholds Done");
+  assert.deepStrictEqual([0, 1, 2].map((i) => rowState(page, i).archived), ["false", "false", "false"],
+    "turning the setting on reached back to messages already seen");
+  // The first press says what the second does, and writes nothing.
+  await page.el("own-read-apply").click();
+  await page.settle();
+  assert.equal(page.ownReadApplies, 0, "the first press applied it");
+  assert.match(page.el("own-read-state").textContent, /every message of yours/);
+  assert.equal(page.el("own-read-apply").textContent, "Mark them read");
+  await page.el("own-read-apply").click();
+  await page.settle();
+  assert.equal(page.ownReadApplies, 1);
+  assert.equal(page.el("own-read-state").textContent, "Marked 2 of your messages read. Undo puts them back.");
+  assert.deepStrictEqual([0, 1, 2].map((i) => rowState(page, i).archived), ["true", "false", "true"],
+    "the channel was not drawn from what Apply marked");
+  assert.equal(page.el("own-read-undo").hidden, false, "no Undo offered");
+  await page.el("own-read-undo").click();
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls.at(-1), { messages: ["1000000000000000001", "1000000000000000003"] });
+  assert.equal(page.el("own-read-undo").hidden, true);
+  assert.deepStrictEqual([0, 1, 2].map((i) => rowState(page, i).archived), ["false", "false", "false"],
+    "Undo did not put his messages back");
+  // A first press left alone is forgotten: the next press asks again.
+  await page.el("own-read-apply").click();
+  assert.equal(page.el("own-read-apply").textContent, "Mark them read");
+  page.expireTimers(sourceConstant("OWN_READ_APPLY_ARM_MS"));
+  await page.settle();
+  assert.equal(page.el("own-read-apply").textContent, "Apply to existing messages");
+});
+
+test("`#549 own-read-stored`: a message of his arriving live, or sent from here, is drawn read at once, and the server's next answer stands", async () => {
+  const page = newPage();
+  const stream = await withLiveChannel(page, [message({ id: "100", content: "already here", ...CODER })]);
+  await deliver(page, stream, sseMessage(message({ id: "200", content: "typed in the chat app", ...OWN })));
+  const arrived = rowWithId(page, "200");
+  assert.equal(arrived.getAttribute("data-archived"), "true", "his own message arrived drawn unread");
+  await deliver(page, stream, sseMessage(message({ id: "201", content: "the agent's", ...CODER })));
+  assert.equal(rowWithId(page, "201").getAttribute("data-archived"), "false", "the agent's message arrived drawn read");
+  // The server decided otherwise — he had turned the setting off on another device — and its next
+  // answer is the one that stands.
+  page.messages = [message({ id: "100", content: "already here", ...CODER }),
+    message({ id: "200", content: "typed in the chat app", ...OWN })];
+  page.ownDecided.add("200");
+  await reReadChannel(page);
+  assert.equal(rowWithId(page, "200").getAttribute("data-archived"), "false", "the server's answer did not stand");
+  // Sent from here: drawn read as the post is acknowledged, before any read.
+  const posted = message({ id: "300", content: "sent from the page", ...OWN });
+  page.replyResponse = async () => json(200, { posted });
+  await page.el("channel-compose-text").setValue(posted.content);
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.ok(rowWithId(page, "300"), "the sent message was not drawn");
+  assert.equal(rowWithId(page, "300").getAttribute("data-archived"), "true", "what he just sent was drawn unread");
+  assert.ok(page.ownDecided.has("300"), "the server did not decide what it posted");
 });
 
 test("`#536 mark-own-messages-read`: an account only the server's configuration names is drawn as the reader's, and read", async () => {
@@ -13040,8 +13182,8 @@ test("`#536 mark-own-messages-read`: an account only the server's configuration 
     message({ id: "1000000000000000002", ...CODER }),
   ]);
   assert.equal(whoOf(page, 0), "me", "the configured account is not drawn as the reader's");
-  assert.equal(rowState(page, 0).ownRead, "true", "the configured account's message is not read");
-  assert.equal(rowState(page, 1).ownRead, "false");
+  assert.equal(rowState(page, 0).archived, "true", "the configured account's message is not read");
+  assert.equal(rowState(page, 1).archived, "false");
 });
 
 test("`#536 mark-own-messages-read`: in a thread mixing the reader's messages and the agent's, Main's unread count is exactly the rows still offering Done", async () => {
@@ -13880,8 +14022,7 @@ test("...and the arrow does not recede with its row: a reply's state is drawn on
   // Each state SAYS how far a row recedes, rather than fading the row itself, so a reply can draw it
   // elsewhere; every other row draws it as before, on the whole row.
   // `#256 reply-marks-read`: being answered no longer recedes on its own (a reply marks the message Done).
-  for (const [state, amount] of [["data-own-read", "0.42"], ["data-archived", "0.42"],
-    ["data-noise", "0.32"]]) {
+  for (const [state, amount] of [["data-archived", "0.42"], ["data-noise", "0.32"]]) {
     const rule = cssBlock(`#discord-log li.discord-message[${state}="true"]`);
     assert.match(rule, new RegExp(`--row-opacity:\\s*${amount.replace(".", "\\.")}`), `${state} no longer says how far it recedes`);
     assert.doesNotMatch(rule, new RegExp(`${own}opacity:`), `${state} fades the whole row again, a reply's arrow with it`);
@@ -18561,7 +18702,7 @@ test("the bulk control counts a message that arrived live, and really clears it"
   assert.deepStrictEqual(shownIds(page), []);
 });
 
-test("a reply posted from the to-do list is counted by the list it lands in", async () => {
+test("a reply posted from the to-do list is counted by the list: what it answered leaves, and the reply, his own words, never joins", async () => {
   // The SECOND door into the same defect. A posted reply is appended to the log without any read,
   // exactly as a live arrival is, and it is in the window from now on — so the next `/todo` answer
   // will count it. A page that counted it only from that next read would spend the time in between
@@ -18580,15 +18721,16 @@ test("a reply posted from the to-do list is counted by the list it lands in", as
   await page.settle();
 
   // `#256 reply-marks-read`: the message answered is Done once the reply is sent, so it leaves the
-  // list as the reply joins it. The count follows both.
-  assert.deepStrictEqual(shownIds(page), ["8000000000000000001", "9000000000000000001"],
-    "the posted reply never landed in the list, or what it answered stayed in it");
+  // list. `#549 own-read-stored`: the reply is the reader's own words, which start read, so it does
+  // not join it. The count follows both.
+  assert.deepStrictEqual(shownIds(page), ["8000000000000000001"],
+    "the posted reply joined the list, or what it answered stayed in it");
   assert.match(
     page.el("clear-backlog").textContent,
-    /\(2\)/,
-    `the control says ${page.el("clear-backlog").textContent} over two rows it would clear`
+    /\(1\)/,
+    `the control says ${page.el("clear-backlog").textContent} over one row it would clear`
   );
-  assert.match(page.el("channel-summary").text(), /^2 of/, "the head of the list miscounts");
+  assert.match(page.el("channel-summary").text(), /^1 of/, "the head of the list miscounts");
 });
 
 test("a message arriving during a to-do POLL raises the chip, as it does in the channel", async () => {
@@ -20672,7 +20814,6 @@ const rowState = (page, i) => ({
   replied: row(page, i).getAttribute("data-replied"),
   archived: row(page, i).getAttribute("data-archived"),
   reading: row(page, i).getAttribute("data-reading"),
-  ownRead: row(page, i).getAttribute("data-own-read"),
   pending: row(page, i).getAttribute("data-pending"),
   // `#240 reading-bookmark`: "above" on the row the line is drawn over, else null.
   bookmark: row(page, i).getAttribute("data-bookmark"),
@@ -20699,11 +20840,11 @@ test("A MESSAGE SOMEBODY HAS ANSWERED IS RECORDED AS ANSWERED, BUT ONLY DONE DRA
 
   // Both axes named, because they are independent: being ANSWERED is derived from what happens to
   // be loaded, being ARCHIVED is the reader's own declaration, and neither implies the other.
-  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", ownRead: "false", pending: "false", bookmark: null, isReply: "false" });
+  assert.deepStrictEqual(rowState(page, 0), { replied: "true", archived: "false", reading: "false", pending: "false", bookmark: null, isReply: "false" });
   // The ANSWER is not itself answered. Discord marks only the answering message, so a naive
   // implementation that set the flag on whichever row carried a pointer would dim this one.
-  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", bookmark: null, isReply: "true" });
-  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", ownRead: "false", pending: "false", bookmark: null, isReply: "false" });
+  assert.deepStrictEqual(rowState(page, 1), { replied: "false", archived: "false", reading: "false", pending: "false", bookmark: null, isReply: "true" });
+  assert.deepStrictEqual(rowState(page, 2), { replied: "false", archived: "false", reading: "false", pending: "false", bookmark: null, isReply: "false" });
 
   // `#256 reply-marks-read`: recorded, NOT drawn. Grey means read (Done); a separate "answered" grey left a
   // message looking read while its Done button said unread, which is the mismatch the owner reported.
@@ -26484,7 +26625,7 @@ test("ON A PHONE'S NARROW ROW THE UNDO CHIP SAYS ONLY UNDO; wider, its name give
 test("SELECTED AND READ IS RINGED GREY, selected and unread in the accent, and marking animates between them (#245)", () => {
   // The look is the browser's to prove (tests/done_feedback_browser.py reads the computed styles and
   // the running animations); what this pins is that the rules saying it are where they have to be.
-  const readSelected = /#discord-log li\.discord-message\[data-selected="true"\]:is\(\[data-archived="true"\], \[data-own-read="true"\], \[data-noise="true"\]\)[^{]*\{([^}]*)\}/.exec(CSS_CODE);
+  const readSelected = /#discord-log li\.discord-message\[data-selected="true"\]:is\(\[data-archived="true"\], \[data-noise="true"\]\)[^{]*\{([^}]*)\}/.exec(CSS_CODE);
   assert.ok(readSelected, "nothing draws a selected read message differently from a selected unread one");
   assert.match(readSelected[1], /outline-color:\s*var\(--read-ring\)/, "a selected read message's ring is not grey");
   // From review: in the light scheme the grey and the blue are both dark inks a little apart in hue.
@@ -44716,7 +44857,6 @@ test("A PLACEHOLDER THE SERVER READS AUTOMATICALLY IS DIMMED, NOT HIDDEN, AND NO
   assert.match(quiet, /grayscale\(1\)/, "a noise row keeps its colour, so it reads as unread");
   // ...and it is not ALSO drawn as something the reader declared, which it is not.
   assert.equal(rows[1].getAttribute("data-archived"), "false");
-  assert.equal(rows[1].getAttribute("data-own-read"), "false");
   // The page decided nothing from the text: a message that merely LOOKS like the placeholder but
   // that the server did not flag is an ordinary row.
   const lookalike = newPage();
@@ -50444,7 +50584,7 @@ test("...and a read that finds a message read elsewhere grows the run, without m
   assert.equal(reading().getBoundingClientRect().top, 0, "a read that shrank a run moved the reader");
 });
 
-test("...and the reader's own words turned unread in Settings split the run they were in, with no read and no filter", async () => {
+test("...and the reader's own words put back split the run they were in, with no read and no filter; the setting moves nothing", async () => {
   // A channel without threads re-derives the rows it holds: nothing is read and no filter changes,
   // so the pass over the rows is the only thing that can decide the runs again.
   const page = newPage();
@@ -50455,16 +50595,19 @@ test("...and the reader's own words turned unread in Settings split the run they
   assert.equal(role("8800000000000000004"), "head");
   assert.equal(role("8800000000000000006"), "member");
   const reads = page.pageReads;
+  // `#549 own-read-stored`: the setting decides where messages first seen afterwards start; the run
+  // drawn from what was already seen stays as it is.
   await page.el("mark-own-read").setChecked(false);
   await page.settle();
-  assert.equal(page.pageReads, reads, "the premise: the setting redrew what the page holds, without a read");
+  assert.equal(page.pageReads, reads, "the setting read the channel again");
+  assert.equal(role("8800000000000000006"), "member", "the setting put the reader's own message back");
+  // Put back by hand, as any message is.
+  await page.pure("toggleArchived")(["8800000000000000006"], rowWithId(page, "8800000000000000006"));
+  await page.settle();
+  assert.equal(page.pageReads, reads, "the premise: the put back redrew what the page holds, without a read");
   assert.equal(role("8800000000000000006"), null, "the reader's own message, unread now, is hidden in the run");
   assert.equal(rowWithId(page, "8800000000000000006").hidden, false);
   assert.equal(role("8800000000000000004"), null, "what is left of the run, one row, stayed collapsed");
-  await page.el("mark-own-read").setChecked(true);
-  await page.settle();
-  assert.equal(readRunLineOf(rowWithId(page, "8800000000000000004")).textContent, "… 3 read messages …",
-    "the reader's own words read again did not rejoin the run");
 });
 
 test("Fold read: a jump to a message inside a run opens the run; Pinned and Hide read are as they were", async () => {
@@ -50771,17 +50914,17 @@ test("ON MAIN a root whose thread holds unread replies says how many, beside N r
   assert.equal(root.getAttribute("data-unread-replies"), "2");
   assert.equal(rowWithId(page, inboxId(5)).hasAttribute("data-unread-replies"), false);
   // The root is the owner's own words, read, and is drawn so.
-  assert.equal(root.getAttribute("data-own-read"), "true", "the root is no longer drawn as read");
+  assert.equal(root.getAttribute("data-archived"), "true", "the root is no longer drawn as read");
   // The cue is the accent, as the jump to news below wears it, and is not faded with its read root.
   assert.match(cssBlock(".thread-unread"), /color:\s*var\(--accent\)/);
   assert.match(cssBlock(".thread-unread"), /border:\s*1px solid var\(--accent\)/);
   assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather)"),
     /z-index:\s*1[\s\S]*filter:\s*none/);
   assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies] > .thread-replies"), /display:\s*inline-block/);
-  // The reader's own words turned unread in Settings count as unread replies too.
+  // `#549 own-read-stored`: turning the setting off changes no count; his reply's read state is kept.
   await page.el("mark-own-read").setChecked(false);
   await page.settle();
-  assert.deepStrictEqual(unreadSaid(page), { 2: "2 unread", 5: null, 7: "2 unread" });
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "2 unread" });
   // ...and back in All, no count again.
   await page.el("mark-own-read").setChecked(true);
   await page.settle();
@@ -50801,12 +50944,12 @@ test("HIDE READ keeps a root whose thread holds unread replies, drawn as read; C
   }
   await chooseReadMode(page, "Hide read");
   assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId), "Hide read hid a root with unread replies");
-  assert.equal(rowWithId(page, inboxId(2)).getAttribute("data-own-read"), "true", "the kept root is drawn as unread");
+  assert.equal(rowWithId(page, inboxId(2)).getAttribute("data-archived"), "true", "the kept root is drawn as unread");
   assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 7: "2 unread" });
-  // The control: with the server's rule alone the owner's questions all go.
+  // `#549 own-read-stored`: turning the setting off puts none of his words back.
   await page.el("mark-own-read").setChecked(false);
   await page.settle();
-  assert.deepStrictEqual(shownIds(page), [2, 5, 7, 12].map(inboxId), "his own words, unread now, were not drawn");
+  assert.deepStrictEqual(shownIds(page), [2, 7, 12].map(inboxId), "turning the setting off put his read words back");
 });
 
 test("DONE HERE: a reply marked Done in All or in its thread takes its count down on Main, and Hide read lets the root go", async () => {
@@ -51941,17 +52084,31 @@ test("ALL'S PAGE CARRYING A THREAD WHOLE answers for every reply of it: replies 
 });
 
 /**
- * Questions A, B and C on Slack, reopened in Main with no copy on the device, where All's page
+ * `#549 own-read-stored`. Question B is the owner's own words, so on `page`'s server it starts read.
+ * The tests that press Done on its root to settle its passed-over reply need it as one he has not
+ * marked read — first seen while "Mark my own messages as read" was off, or put back since — which is
+ * what this decides it as.
+ */
+function questionBNotRead(page) {
+  page.ownDecided.add(inboxId(5));
+  return page;
+}
+
+/**
+ * Questions A, B and C on Slack, reopened in Main with no copy on the device (B not marked read,
+ * unless `bNotRead` is false: see `questionBNotRead`), where All's page
  * passes over question B's thread — ten others are busier — and says so. B's one reply is Done on
  * the server, which this device cannot know without reading it. `left` is what All's page leaves out
  * (`allLeavingOut`), for a test to change later.
  */
-async function coldSlackPastTheTen(left = [SLACK_IDS.b]) {
+async function coldSlackPastTheTen(left = [SLACK_IDS.b], bNotRead = true) {
   const first = newPage();
+  if (bNotRead) questionBNotRead(first);
   await inboxOnMain(first, inboxChannel(first, SLACK_IDS));
   first.storage.delete(MESSAGE_CACHE_KEY);
   const page = reloadWith(first.storage, inboxChannel(newPage(), SLACK_IDS), (p) => {
     inboxChannel(p, SLACK_IDS);
+    if (bNotRead) questionBNotRead(p);
     allLeavingOut(p, left);
   });
   await reopenedChannel(page);
@@ -51982,6 +52139,7 @@ test("A SLACK THREAD PAST ALL'S TEN, on a cold open, says \"N new\" until Done o
   const reload = (from) => reloadWith(from.storage, from.messages, (p) => {
     inboxChannel(p, SLACK_IDS);
     for (const id of from.dealtWith) p.dealtWith.add(id);
+    for (const id of from.ownDecided) p.ownDecided.add(id);
     allLeavingOut(p, left);
   });
   const mid = reload(page);
@@ -52030,7 +52188,7 @@ test("A SLACK THREAD PAST ALL'S TEN, on a cold open, says \"N new\" until Done o
 
   // THE CONTROL: Done on a root whose thread a read has placed settles nothing — what its count says
   // beyond that read was posted since, so Done through a list never hides an answer nothing brought.
-  const warm = newPage();
+  const warm = questionBNotRead(newPage());
   const messages = inboxChannel(warm, SLACK_IDS);
   await inboxOnMain(warm, messages);
   await chooseReadMode(warm, "Hide read");
@@ -52150,6 +52308,7 @@ test("PUTTING THE ROOT BACK takes back what its Done settled, after a reload too
   const reopened = reloadWith(page.storage, page.messages, (p) => {
     inboxChannel(p, SLACK_IDS);
     for (const id of page.dealtWith) p.dealtWith.add(id);
+    for (const id of page.ownDecided) p.ownDecided.add(id);
     allLeavingOut(p, [SLACK_IDS.b]);
   });
   await reopenedChannel(reopened);
@@ -52313,6 +52472,8 @@ test("A DEVICE COPY SAVED BY AN EARLIER VERSION has its gaps placed afresh: B sa
     const reopened = reloadWith(page.storage, page.messages, (p) => {
       inboxChannel(p, SLACK_IDS);
       for (const id of page.dealtWith) p.dealtWith.add(id);
+      for (const id of page.ownDecided) p.ownDecided.add(id);
+    for (const id of page.ownDecided) p.ownDecided.add(id);
       allLeavingOut(p, [SLACK_IDS.b]);
     });
     await reopenedChannel(reopened);
@@ -52392,11 +52553,12 @@ test("UNREAD REPLIES CUT FROM THE DEVICE'S COPY still count after a reload, as n
  * Questions A, B and C on Slack, reopened in Main from the device's copy `store`, while All fails to
  * read whenever `failing()` says so; All's page passes over question B's thread when it does read.
  */
-async function reopenedWithAllFailing(store, messages, dealtWith, failing) {
+async function reopenedWithAllFailing(store, messages, dealtWith, failing, ownDecided = []) {
   const page = reloadWith(store, messages, (p) => {
     inboxChannel(p, SLACK_IDS);
     p.messages = messages;
     for (const id of dealtWith) p.dealtWith.add(id);
+    for (const id of ownDecided) p.ownDecided.add(id);
     allLeavingOut(p, [SLACK_IDS.b]);
     const serve = p.timeline;
     p.timeline = (path, options) => (failing() && viewOf(path) === "flat"
@@ -52409,11 +52571,11 @@ async function reopenedWithAllFailing(store, messages, dealtWith, failing) {
 
 test("UNDO AFTER THE SETTLED THREAD WAS LOWERED OR PASSED OVER by later reads still takes the settling back, and Done settles it again", async () => {
   // A cold open whose read of All fails: no read has placed any thread, and Done on B settles it.
-  const first = newPage();
+  const first = questionBNotRead(newPage());
   await inboxOnMain(first, inboxChannel(first, SLACK_IDS));
   first.storage.delete(MESSAGE_CACHE_KEY);
   let failing = true;
-  const page = await reopenedWithAllFailing(first.storage, first.messages, first.dealtWith, () => failing);
+  const page = await reopenedWithAllFailing(first.storage, first.messages, first.dealtWith, () => failing, first.ownDecided);
   assert.deepStrictEqual(viewsRead(page), ["main", "flat"]);
   assert.deepStrictEqual(unreadSaid(page), { 2: "2 new", 5: "1 new", 7: "3 new" });
   await chooseReadMode(page, "Hide read");
@@ -52457,7 +52619,7 @@ test("UNDO AFTER THE SETTLED THREAD WAS LOWERED OR PASSED OVER by later reads st
 test("A SETTLED THREAD'S READ REPLIES CUT FROM THE DEVICE'S COPY move with what Done settled, so putting the root back still takes it back", async () => {
   // B's first reply held and Done, its second never brought; then a copy saved by an earlier version,
   // whose gaps are dropped, reopened while All fails: B's gap is unknown, and Done on B settles it.
-  const first = newPage();
+  const first = questionBNotRead(newPage());
   const messages = inboxChannel(first, SLACK_IDS);
   await inboxOnMain(first, messages);
   answeredUnseen(first, messages);
@@ -52465,7 +52627,7 @@ test("A SETTLED THREAD'S READ REPLIES CUT FROM THE DEVICE'S COPY move with what 
   editSavedChannel(first, (entry) => {
     delete entry.settledByDone;
   });
-  const page = await reopenedWithAllFailing(first.storage, first.messages, first.dealtWith, () => true);
+  const page = await reopenedWithAllFailing(first.storage, first.messages, first.dealtWith, () => true, first.ownDecided);
   assert.equal(saidB(page), "1 new");
   await doneButton(rowWithId(page, inboxId(5))).click();
   await page.settle();
@@ -59524,9 +59686,9 @@ test("`#256 reply-marks-read`: a reply in a thread marks the message it answers 
   await replyAndSend(page, inboxId(8), "thanks, reviewing it");
   assert.deepStrictEqual(page.dismissCalls, [{ messages: [inboxId(8)] }], "the reply marked more than the message it answers");
   assert.equal(rowWithId(page, inboxId(8)).getAttribute("data-archived"), "true");
-  for (const n of [7, 9]) {
-    assert.equal(rowWithId(page, inboxId(n)).getAttribute("data-archived"), "false", `the reply marked ${n} of the same thread`);
-  }
+  // The thread's other unread reply is left; its root, his own question, started read (`#549
+  // own-read-stored`) and was not written by the reply either.
+  assert.equal(rowWithId(page, inboxId(9)).getAttribute("data-archived"), "false", "the reply marked 9 of the same thread");
   await pickThread(page, "main");
   assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" },
     "the root still counts the reply the owner answered as unread");
@@ -60633,12 +60795,12 @@ test("`#299 all-thread-strip`: neither selecting nor letting go reads, marks or 
   const page = await threadPage();
   await doneButton(rowWithId(page, "202")).click();
   await page.settle();
-  const before = page.el("discord-log").children.map((row) => [row.getAttribute("data-id"), row.getAttribute("data-archived"), row.getAttribute("data-own-read")]);
+  const before = page.el("discord-log").children.map((row) => [row.getAttribute("data-id"), row.getAttribute("data-archived")]);
   const reads = page.timelineCalls.length;
   const dismissed = page.dismissCalls.length;
   await stripOf(rowWithId(page, "201")).strip.click();
   await stripOf(rowWithId(page, "201")).strip.click();
-  assert.deepStrictEqual(page.el("discord-log").children.map((row) => [row.getAttribute("data-id"), row.getAttribute("data-archived"), row.getAttribute("data-own-read")]),
+  assert.deepStrictEqual(page.el("discord-log").children.map((row) => [row.getAttribute("data-id"), row.getAttribute("data-archived")]),
     before, "selecting a thread changed a row's read state");
   assert.equal(page.timelineCalls.length, reads, "selecting a thread read the channel");
   assert.equal(page.dismissCalls.length, dismissed, "selecting a thread marked something read");
@@ -60954,7 +61116,7 @@ test("`#251 author-filter`: it chooses rows, so Fold read's runs open under it, 
   assert.deepStrictEqual(passing(page), []);
   assert.equal(page.el("search-empty").hidden, false);
   assert.equal(page.el("search-empty").textContent,
-    "Your own messages count as read, so Hide read leaves them out — press h for Show read.");
+    "Your own messages start read, so Hide read leaves them out — press h for Show read.");
   await chooseAuthor(page, "theirs");
   assert.deepStrictEqual(passing(page), ["10", "11"], "Hide read and Theirs are not both applied");
 });
@@ -64672,7 +64834,7 @@ const MOVED_DESCRIPTIONS = new Map([
     "Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time."],
   ["Canned prompts", "What the two prompt buttons send. Empty a field to restore its default."],
   ["Microphone", "Applied to your next call, not the one in progress."],
-  ["Your own messages", "Greyed here, and kept out of the queue."],
+  ["Your own messages", "Whether your messages start read or unread."],
   ["Combining messages", "Same author, within five seconds. Turn it off to see the raw rows."],
   ["Rich headers", "Turn it off to see each message's first line as it was written."],
 ]);

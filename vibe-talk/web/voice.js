@@ -205,7 +205,7 @@ const ALL_CHANNELS = "*";
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
  *   | "message-cache-confirm-no" | "message-cache-confirm-yes" | "message-cache-erase"
  *   | "msg-scale-larger" | "msg-scale-smaller"
- *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "page-update"
+ *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "own-read-apply" | "own-read-undo" | "page-update"
  *   | "pair-confirm" | "pair-dismiss"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-prev" | "read-speed" | "read-steer-grip" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send"
@@ -8002,12 +8002,13 @@ function cycleAuthorFilter() {
 /**
  * What the list says where its rows would be when the author filter has left none of the messages
  * loaded, or "" when it has not. `searching` is whether text is typed too, and `pinned` whether the
- * list is the Pinned filter's. With "my own messages count as read" on, Hide read leaves out every
- * message of the owner's, so Mine under it is empty by design, and the sentence says how to see them.
+ * list is the Pinned filter's. With "Mark my own messages as read" on, the owner's messages start read,
+ * so Hide read leaves them out and Mine under it is empty unless he put one back, and the sentence says
+ * how to see them.
  */
 function authorEmptySentence(author, searching, pinned) {
   if (author === "mine" && !pinned && currentView === "discord" && hidingRead() && markOwnRead) {
-    return "Your own messages count as read, so Hide read leaves them out — press h for Show read.";
+    return "Your own messages start read, so Hide read leaves them out — press h for Show read.";
   }
   const whose = author === "mine" ? "yours" : "from anyone else";
   if (pinned) {
@@ -11981,12 +11982,6 @@ function doneFromKeyboard(target) {
   const stay = isTextField(target);
   const { pane, row, took } = rowForAct(target, false, stay);
   if (!pane || !row) return took;
-  // `#536 mark-own-messages-read`. The reader's own words are read while the setting says so, and
-  // the row offers no Done to press: the key says why rather than writing a mark that changes nothing.
-  if (ownReadRow(row)) {
-    setStatus(OWN_READ_DONE_NOTE);
-    return true;
-  }
   const ids = idsOf(row);
   if (ids.length === 0) return false;
   const marking = !ids.every((id) => archivedIds.has(id));
@@ -30825,6 +30820,8 @@ async function dispatchOutgoingMessage(entry, job) {
     // `#229 desktop-two-column`. The right column's reader on its newest line follows it too.
     const sidePinned = here && sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")));
     noteSelfAuthor(parts[0].author_id);
+    // `#549 own-read-stored`. What he just said starts read, as the server recorded it before answering.
+    noteStartsRead(entry.parts);
     if (here) {
       for (const part of entry.parts) appendToColumns(part);
       if (pinned) scrollToNewest();
@@ -32713,14 +32710,9 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   setAttributeIfChanged(row, "data-noise", !isArchived && isNoiseRow ? "true" : "false");
   const rescue = notNoiseButtonOf(row);
   if (rescue) setHiddenIfChanged(rescue, !isNoiseRow);
-  // Separate from the declared archive: this one is implied, carries no undo, and disappears
-  // the moment the setting is turned off.
-  setAttributeIfChanged(row, "data-own-read",
-    !isArchived && !isNoiseRow && markOwnRead && who === "me" ? "true" : "false"
-  );
-  // `#536 mark-own-messages-read`. Read whatever the archive says, so it offers neither Done nor
-  // Unarchive: the read look over an unread control was the mismatch the owner reported (`#256`).
-  const ownRead = !isNoiseRow && markOwnRead && who === "me";
+  // `#549 own-read-stored`. The reader's own words are no case of their own here: "Mark my own
+  // messages as read" decides where their read state STARTS, on the server, and the row is drawn from
+  // that state like any other — archived, with Unarchive, or not, with Done.
   const isReading = nowPlaying !== null && nowPlaying.id === id;
   // ASKED FOR, but not yet speaking. Distinct from `data-reading` on purpose: this one the
   // reader can still change their mind about, and it is the only thing on screen during a wait
@@ -32777,11 +32769,6 @@ function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
   markReadingBlock(row);
   const done = doneButtonOf(row);
   if (done) {
-    // Kept in its place, so the row's acts do not shift, but neither drawn nor pressable: a disabled
-    // button takes no focus and no tap, and web/voice.css draws it invisible (`data-read-already`).
-    if (done.disabled !== ownRead) done.disabled = ownRead;
-    if (ownRead && !done.hasAttribute("data-read-already")) done.setAttribute("data-read-already", "");
-    else if (done.hasAttribute("data-read-already")) done.removeAttribute("data-read-already");
     // Written every time, unlike the rest of this dress (`#532 shift-o-latency`): with this text too left
     // alone where unchanged, a reply's Send moved its row down the list by the box it closed
     // (tests/reply_continuity_browser.py). The place the Done keeps (`markRowDone`) depends on it.
@@ -35496,23 +35483,22 @@ function storedReadSpeed() {
 }
 
 /**
- * Are the reader's OWN messages already read?
+ * Do the reader's OWN messages START read?
  *
  * ON unless they have said otherwise. A message this bridge posted is one the owner dictated
  * moments earlier: it is read by the only definition that matters, and leaving it in the queue
  * makes the queue partly a record of things he said rather than things waiting for him.
  *
- * Held apart from the declared archive, and rendered with its own attribute, because it is not a
- * dismissal: nothing is recorded, there is nothing to undo, and turning the setting off brings every
- * one of them straight back.
- *
- * `#536 mark-own-messages-read`. AND READ EVERYWHERE, not only greyed here. The owner, 2026-10-26:
- * "They are rendering as MY messages... but they are not marked read." The rows were greyed while
- * their Done button still offered Done — the read look over an unread control, `#256`'s mismatch —
- * and the server's to-do list still counted them. Now the row offers no Done (`dressChannelRow`), e
- * says why (`doneFromKeyboard`), every count here asks the same rule (`stillToDo`), the server
- * applies the same rule to its own to-do list (`src/own_read.rs`), and an account only `[owner]
- * user_ids` names is his here too (`configuredOwnerIds`), so both judge from the same accounts.
+ * `#549 own-read-stored`. WHERE A MESSAGE'S READ STATE STARTS, and nothing more. The owner,
+ * 2026-10-26: "do what the setting says which is to mark them as read IE record the state that they
+ * are read and then I can toggle one individually ... it's just a question of whether the state starts
+ * as read or starts as unread when the message is ingested". The server decides it once, at the first
+ * sight of each message of his (`src/own_read.rs`), and records it as the one read bit, Done; from
+ * then on the row is drawn from that bit like any other, with Done or Unarchive, and every count here
+ * asks it. Turning the setting off or on changes only messages first seen afterwards; "Apply to
+ * existing messages" beside it reaches the rest (`applyOwnReadToExisting`). What this page does with
+ * the flag itself is draw a message of his read before the server's answer for it arrives
+ * (`noteStartsRead`).
  */
 let markOwnRead = true;
 
@@ -35531,17 +35517,119 @@ function storedMarkOwnRead() {
   return localStorage.getItem(MARK_OWN_KEY) !== "0";
 }
 
-/** What e says on a row of the reader's own words while they count as read. `#536 mark-own-messages-read`. */
-const OWN_READ_DONE_NOTE = "Your own messages count as read.";
+/** How long a first press of "Apply to existing messages" waits for the second, in milliseconds. */
+const OWN_READ_APPLY_ARM_MS = 10000;
 
-/** Whether `row` is the reader's own words, read by the setting (`dressChannelRow` draws it so). */
-function ownReadRow(row) {
-  return markOwnRead && row.getAttribute("data-who") === "me" && row.getAttribute("data-noise") !== "true";
+/** The timer of a first press of "Apply to existing messages" waiting for the second, or null. */
+let ownReadApplyArmed = null;
+
+/**
+ * What the last "Apply to existing messages" marked, by channel, for its Undo; null when there is
+ * nothing to put back. `#549 own-read-stored`.
+ *
+ * @type {{channel: string, messages: string[]}[] | null}
+ */
+let ownReadApplied = null;
+
+/** Put "Apply to existing messages" back to waiting for a first press. */
+function disarmOwnReadApply() {
+  if (ownReadApplyArmed !== null) clearTimeout(ownReadApplyArmed);
+  ownReadApplyArmed = null;
+  el("own-read-apply").textContent = "Apply to existing messages";
 }
 
-/** Is this row one the reader never has to deal with? Declared archive, or own-and-implicitly-read. */
-function readAlready(id, who) {
-  return archivedIds.has(String(id)) || (markOwnRead && who === "me");
+/**
+ * "Apply to existing messages": every message of the reader's this server has seen and that is not
+ * Done is marked read, in every channel. Pressed twice, the first press saying what the second does,
+ * because it reaches messages the reader may have put back on purpose. `#549 own-read-stored`.
+ */
+async function applyOwnReadToExisting() {
+  if (ownReadApplyArmed === null) {
+    ownReadApplyArmed = setTimeout(disarmOwnReadApply, OWN_READ_APPLY_ARM_MS);
+    el("own-read-apply").textContent = "Mark them read";
+    el("own-read-state").textContent = "This marks read every message of yours this server has seen " +
+      "that is not Done, in every channel, including any you put back. Press Mark them read to go ahead.";
+    return;
+  }
+  disarmOwnReadApply();
+  const payload = await api("/api/v1/own-read/apply", { method: "POST" });
+  const changes = payload && Array.isArray(payload.changes) ? payload.changes : [];
+  const held = changes
+    .map((change) => ({
+      channel: String(change && change.channel && change.channel.id),
+      messages: (change && Array.isArray(change.messages) ? change.messages : []).map(String),
+    }))
+    .filter((change) => change.messages.length > 0);
+  const count = held.reduce((sum, change) => sum + change.messages.length, 0);
+  ownReadApplied = count > 0 ? held : null;
+  el("own-read-undo").hidden = ownReadApplied === null;
+  const said = count === 0
+    ? "None of your messages was waiting."
+    : `Marked ${count} of your message${count === 1 ? "" : "s"} read. Undo puts ${count === 1 ? "it" : "them"} back.`;
+  el("own-read-state").textContent = said;
+  setStatus(said);
+  if (count > 0 && el("discord-channel").value) {
+    guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
+  }
+}
+
+/** Put back exactly what the last "Apply to existing messages" marked. `#549 own-read-stored`. */
+async function undoOwnReadApply() {
+  const held = ownReadApplied;
+  if (held === null) return;
+  ownReadApplied = null;
+  el("own-read-undo").hidden = true;
+  let count = 0;
+  for (const change of held) {
+    // As one restore may carry: the server's `MAX_DISMISS_BATCH`.
+    for (let at = 0; at < change.messages.length; at += 1000) {
+      const messages = change.messages.slice(at, at + 1000);
+      await api(`/api/v1/channels/${encodeURIComponent(change.channel)}/restore`, { method: "POST", body: { messages } });
+      count += messages.length;
+    }
+  }
+  const said = `Put ${count} of your message${count === 1 ? "" : "s"} back.`;
+  el("own-read-state").textContent = said;
+  setStatus(said);
+  if (el("discord-channel").value) {
+    guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
+  }
+}
+
+/**
+ * Whether `message` is one of the reader's own whose read state starts read, by the same accounts the
+ * server asks (`isOwnerId`, who-is-who, this bridge's account): "Mark my own messages as read" on, his,
+ * and not read as noise already. `#549 own-read-stored`.
+ */
+function startsRead(message) {
+  return markOwnRead && Boolean(message) && !isNoise(message) &&
+    bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) === "me";
+}
+
+/**
+ * Draw each of `messages` that `startsRead` read now, before the server's answer for it arrives: one
+ * this page just sent, or one of his the stream brought. The server decided it at the same first
+ * sight, and records it (`src/own_read.rs`), so this only spares a row of his a moment drawn unread
+ * between its arrival and the read that follows. Held as a write made here, settled at once
+ * (`localReadWrites`): a read sent before it does not undo it, and a read sent after it speaks for the
+ * message, so the server's answer is the one that stands. A message the page already holds keeps
+ * the state its reads gave it. `#549 own-read-stored`.
+ *
+ * @param {any[]} messages
+ */
+function noteStartsRead(messages) {
+  const fresh = messages.filter((message) => startsRead(message) &&
+    !(threadingSupported && heldMessage(String(message.id))) && !localReadWrites.has(String(message.id)));
+  if (fresh.length === 0) return;
+  readStateEpoch += 1;
+  const here = String(el("discord-channel").value);
+  for (const message of fresh) {
+    const id = String(message.id);
+    localReadWrites.set(id, { pending: 0, from: readStateEpoch });
+    if (String(message.channel_id) !== here) continue;
+    if (threadingSupported && channelCanon.channel === here) channelCanon.dismissed.add(id);
+    archivedIds.add(id);
+  }
 }
 
 /**
@@ -35571,8 +35659,7 @@ function isNoise(message) {
  * a reply Main does not draw (`#222 unread-replies`, `replyTally`).
  */
 function stillToDo(message, done = archivedIds) {
-  return !done.has(String(message.id)) && !isNoise(message) && !hiddenEmpty(message) &&
-    (!markOwnRead || bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) !== "me");
+  return !done.has(String(message.id)) && !isNoise(message) && !hiddenEmpty(message);
 }
 
 // --- empty messages ---------------------------------------------------------------------------
@@ -42173,17 +42260,18 @@ async function loadTodo(options) {
     renderChannelLoading(false);
     // Where the reader is now, not where they were when the read went out. `#280 scroll-stability`.
     const at = landedReadPosition(area, keepPosition, position.wasAtNewest);
-    // THE QUEUE, minus the reader's own words when they have said those are already read.
-    //
-    // Filtered HERE rather than on the server: this is a preference held in one browser, and the
-    // `/todo` route answers the same way for every client. Filtered BEFORE the count, because a
-    // backlog number that includes rows nobody can see is the kind of number a reader stops
-    // believing.
+    // THE QUEUE, as the server keeps it: the reader's own words in it only where their read state
+    // says so, like anyone's (`#549 own-read-stored`).
     const served = payload.messages || [];
-    observeOutgoingMessages(served);
-    // And empty messages, while the reader hides those (`#386 hide-empty-messages`).
-    const messages = served.filter((m) => !hiddenEmpty(m) &&
-      (!markOwnRead || bucketFor(m.author_id, m.author_is_bot, messageChannel(m)) !== "me"));
+    // And the window's messages the list leaves out as Done, the reader's own just sent among them:
+    // the provider has them, so a sent receipt waiting to see one may go (`#549 own-read-stored`).
+    const done = (Array.isArray(payload.done) ? payload.done : [])
+      .map((id) => ({ id: String(id), channel_id: String(channel) }));
+    observeOutgoingMessages([...served, ...done]);
+    // Minus empty messages, while the reader hides those (`#386 hide-empty-messages`). Filtered
+    // BEFORE the count, because a backlog number that includes rows nobody can see is the kind of
+    // number a reader stops believing.
+    const messages = served.filter((m) => !hiddenEmpty(m));
     const list = el("discord-log");
     list.replaceChildren(...glom(messages).map(discordNode));
     renderChannelRows();
@@ -52176,6 +52264,8 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // places it, replayed or not: it leaves Main for its thread now, not at the next read that can say.
     // A replayed copy gives the store its thread record and nothing else: the rest of it is older.
     const places = placesHeld(message);
+    // `#549 own-read-stored`. One of his, new here, is drawn as it starts: read, when he said so.
+    if (!replayed) noteStartsRead([message]);
     if (document.hidden) {
       // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
       // and no read for a page nobody can see. A call's agent is told as ever.
@@ -52235,6 +52325,8 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   const area = el("scroll-area");
   // Not while a filter change holds a message in place: nothing but the reader moves it. `#243`.
   const wasAtNewest = currentView === "discord" && followsNewest(area);
+  // `#549 own-read-stored`. One of his is drawn as it starts: read, when he said so.
+  if (!replayed) noteStartsRead([message]);
   appendChannelRow(message, true);
   discordNewestId = id;
   if (wasAtNewest) {
@@ -55580,13 +55672,8 @@ function applySyncedSetting(key) {
         setReadMode(localSettingValue(key) || "show");
         break;
       }
-      case MARK_OWN_KEY:
-        // As the switch's own change does: the rows re-grey, and the queue is another list.
-        // Another device's change used to land in the flag and wait for the next redraw.
-        applyMarkOwnRead(storedMarkOwnRead());
-        if (threadingSupported) eachColumn(renderCachedTimeline);
-        else renderChannelRows();
-        break;
+      // `#549 own-read-stored`. Only the switch: nothing drawn depends on it.
+      case MARK_OWN_KEY: applyMarkOwnRead(storedMarkOwnRead()); break;
       case HIDE_EMPTY_KEY: applyHideEmptyMessages(storedHideEmptyMessages()); break;
       case COMBINE_KEY: applyCombineMessages(storedCombineMessages()); break;
       case RICH_HEADERS_KEY: applyRichHeaders(storedRichHeaders()); break;
@@ -56144,17 +56231,13 @@ el("read-speed").addEventListener("click", () => {
   scheduleBackSync();
 });
 
+el("own-read-apply").addEventListener("click", guardQuietly(applyOwnReadToExisting));
+el("own-read-undo").addEventListener("click", guardQuietly(undoOwnReadApply));
+
 el("mark-own-read").addEventListener("change", () => {
+  // `#549 own-read-stored`. Nothing on screen changes: the setting decides where messages first seen
+  // from now on start, and "Apply to existing messages" is the act that reaches the rest.
   applyMarkOwnRead(el("mark-own-read").checked);
-  // Both: the channel view re-greys, and the queue is a different list than it was a moment ago.
-  if (threadingSupported) {
-    eachColumn(renderCachedTimeline);
-  } else {
-    renderChannelRows();
-  }
-  if (todoMode && !threadingSupported) {
-    guardQuietly(() => loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
-  }
 });
 
 // `#386 hide-empty-messages`. Each column drawn again from what it holds, as for Your own messages: an

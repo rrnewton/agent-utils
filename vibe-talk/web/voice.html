@@ -1427,20 +1427,26 @@
                 <div class="fold-body" id="fold-settings-messages-body" hidden="until-found">
                   <section class="settings-group">
                     <div class="group-head">
-                      <h3 title="Greyed here, and kept out of the queue."><button class="fold-toggle" id="fold-mark-own" type="button" aria-expanded="false" aria-controls="fold-mark-own-body">Your own messages</button></h3>
-                      <button class="help-link" id="help-link-mark-own" type="button" data-help="mark-own" aria-label="About marking your own messages read" title="Greyed here, and kept out of the queue.">?</button>
+                      <h3 title="Whether your messages start read or unread."><button class="fold-toggle" id="fold-mark-own" type="button" aria-expanded="false" aria-controls="fold-mark-own-body">Your own messages</button></h3>
+                      <button class="help-link" id="help-link-mark-own" type="button" data-help="mark-own" aria-label="About marking your own messages read" title="Whether your messages start read or unread.">?</button>
                     </div>
                     <div class="fold-body" id="fold-mark-own-body" hidden="until-found">
                       <!--
                         ON by default, and deliberately: a message this bridge posted is one the owner
                         dictated moments earlier. It is already read by the only definition that matters,
                         and leaving it in the queue means the queue is partly a record of things he said.
-                        `#536 mark-own-messages-read`: the server reads them so too (src/own_read.rs).
+                        `#549 own-read-stored`: where each message of his STARTS, recorded by the server
+                        at its first sight (src/own_read.rs); Apply reaches the messages already seen.
                       -->
                       <label class="toggle">
                         <input id="mark-own-read" type="checkbox" checked />
                         Mark my own messages as read
                       </label>
+                      <p class="hint">
+                        <button id="own-read-apply" class="secondary" type="button">Apply to existing messages</button>
+                        <button id="own-read-undo" class="secondary" type="button" hidden>Undo</button>
+                      </p>
+                      <p id="own-read-state" class="hint" aria-live="polite"></p>
                     </div>
                   </section>
 
@@ -2790,14 +2796,21 @@
                 waiting for you.
               </p>
               <p class="hint">
-                With this on they are read: greyed in the channel, collapsed under
-                <strong>Fold read</strong>, left out of the list under <strong>Hide read</strong>
-                and out of the to-do list on every device, with no <strong>Done</strong> to press.
-                Your messages are the accounts <em>Who is who</em> calls you, the accounts the
-                server is told are yours, and whatever this app posted for you. It is not an
-                archive: nothing is recorded per message, there is nothing to undo, and turning it
-                off brings every one of them straight back. Nothing here changes anything in the
-                source chat service.
+                With this on, each message of yours starts read when this server first sees it,
+                whether it was sent from here or from the chat service's own app: it is marked
+                Done, greyed in the channel, collapsed under <strong>Fold read</strong>, left out
+                of the list under <strong>Hide read</strong> and out of the to-do list on every
+                device. From then on it is like any other message: <strong>Unarchive</strong> (or
+                <kbd>e</kbd>) puts it back in the list, and it stays there. Your messages are the
+                accounts <em>Who is who</em> calls you, the accounts the server is told are yours,
+                and whatever this app posted for you.
+              </p>
+              <p class="hint">
+                Turning the setting off or on changes only messages first seen afterwards.
+                <strong>Apply to existing messages</strong> marks read every message of yours this
+                server has already seen that is not Done, in every channel; press it twice to go
+                ahead, and <strong>Undo</strong> puts back what it marked. Nothing here changes
+                anything in the source chat service.
               </p>
             </details>
 

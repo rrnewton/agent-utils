@@ -360,6 +360,9 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/todo", get(api::todo))
         .route("/api/v1/channels/{channel_id}/dismiss", post(api::dismiss))
         .route("/api/v1/channels/{channel_id}/restore", post(api::restore))
+        // `#549 own-read-stored`. "Apply to existing messages": the owner's own messages already
+        // seen and not Done, marked read once, on request. WRITE scope, and no MCP tool.
+        .route("/api/v1/own-read/apply", post(api::apply_own_read))
         .route(
             "/api/v1/channels/{channel_id}/read",
             post(api::mark_read).delete(api::forget_read_mark),

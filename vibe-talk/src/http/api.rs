@@ -1996,7 +1996,8 @@ pub async fn messages(
     let mut window = ops::messages(&state, caller, &channel_id, query.limit).await?;
     // `#427 server-thread-hues`: each message carries its thread's colour.
     ops::attach_message_hues(&state, caller, &window.channel.id, &mut window.messages).await;
-    let dismissed = ops::dismissed_within(&state, &window.channel.id, &window.messages).await?;
+    let dismissed =
+        ops::dismissed_within(&state, caller, &window.channel.id, &window.messages).await?;
     Ok(Json(MessagesResponse {
         complete: window.is_whole_channel(),
         channel: window.channel,
@@ -2103,7 +2104,7 @@ pub async fn page(
     // `#427 server-thread-hues`: each message carries its thread's colour, rendered or not — it
     // is a number, not a second copy of the body, and the read that meets a thread colours it.
     ops::attach_message_hues(&state, caller, &step.channel.id, &mut step.messages).await;
-    let dismissed = ops::dismissed_within(&state, &step.channel.id, &step.messages).await?;
+    let dismissed = ops::dismissed_within(&state, caller, &step.channel.id, &step.messages).await?;
     let pins_revision = ops::pins_revision(&state, &step.channel.id).await;
     let bookmark = ops::bookmark_state(&state, &step.channel.id).await;
     Ok(Json(PageResponse {
@@ -2216,7 +2217,7 @@ pub async fn timeline(
         && page.has_threads
         && page.thread.is_none();
     let (dismissed, reply_dismissals) =
-        ops::timeline_read_state(&state, &channel.id, &page.messages, replies).await?;
+        ops::timeline_read_state(&state, caller, &channel.id, &page.messages, replies).await?;
     // `#206 pin-message`. One indexed lookup on every read, delta included: this is how a refresh
     // that is happening anyway tells the page whether another device changed the pins.
     let pins_revision = ops::pins_revision(&state, &channel.id).await;
@@ -3934,6 +3935,8 @@ pub const PURGED: &[&str] = &[
     "read_marks",
     "summaries",
     "dismissals",
+    // `#549 own-read-stored`.
+    "own_decided",
     "upstream_clear",
     "aliases",
     "noise_rules",
@@ -4663,6 +4666,36 @@ pub async fn restore(
         .map(crate::model::MessageId)
         .collect();
     Ok(answered(ops::restore(&state, &channel_id, &wanted).await?))
+}
+
+/// What "Apply to existing messages" marked read. `#549 own-read-stored`.
+#[derive(Debug, Serialize)]
+pub struct OwnReadApplied {
+    /// Each channel and exactly what was marked in it, oldest first: what the undo puts back,
+    /// through `POST /api/v1/channels/{channel_id}/restore`.
+    pub changes: Vec<ops::InboxChange>,
+    /// How many messages were marked, in all.
+    pub count: usize,
+    /// See [`crate::store::INBOX_NOTICE`].
+    pub read_state_notice: &'static str,
+}
+
+/// `POST /api/v1/own-read/apply`
+///
+/// "Apply to existing messages", beside "Mark my own messages as read" in Settings: every message of
+/// the owner's this server has seen that is not Done now is marked read. `#549 own-read-stored`;
+/// see [`ops::apply_own_read`].
+pub async fn apply_own_read(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+) -> Result<Response, ApiError> {
+    let changes = ops::apply_own_read(&state).await?;
+    let count = changes.iter().map(|change| change.messages.len()).sum();
+    Ok(no_store(Json(OwnReadApplied {
+        changes,
+        count,
+        read_state_notice: crate::store::INBOX_NOTICE,
+    })))
 }
 
 // --- pinned messages ------------------------------------------------------------------------------

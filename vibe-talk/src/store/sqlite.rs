@@ -455,6 +455,26 @@ pub const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX post_keys_by_age ON post_keys (at_ms);
     ",
+    // v22 — the owner's own messages start read, as recorded state. `#549 own-read-stored`.
+    //
+    // `dismissals.own` says who wrote a Done mark: 0 the reader, 1 "Mark my own messages as read"
+    // at a message's first sight here (or its "Apply to existing messages"). Each class is held
+    // under `Retention::max_dismissals` apart, so a busy owner's own words never evict the marks he
+    // made himself. Every row before this step is the reader's, which is the column's default.
+    //
+    // `own_decided` records which of his messages have had their first read state decided, Done
+    // or not: decided once, never again, so one he put back stays unread across restarts and
+    // re-reads. Two ids and an instant, no message text, bounded by the same count, oldest first.
+    "
+    ALTER TABLE dismissals ADD COLUMN own INTEGER NOT NULL DEFAULT 0 CHECK (own IN (0, 1));
+
+    CREATE TABLE own_decided (
+        channel_id TEXT    NOT NULL,
+        message_id TEXT    NOT NULL,
+        at_ms      INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_id)
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -687,14 +707,36 @@ fn prune_summaries(
 /// ONE bound, not two, and the missing one is deliberate: see [`Retention::max_dismissals`]. The
 /// oldest marks go first, which is the right end — the reader is never shown a message old enough
 /// for its mark to have been evicted, because the window this filters is the recent one.
+///
+/// Per class (`own`, `#549 own-read-stored`): the reader's marks and those "Mark my own messages as
+/// read" wrote are each held under the bound apart, so neither ever evicts the other.
 fn prune_dismissals(
+    transaction: &rusqlite::Transaction<'_>,
+    retention: Retention,
+    own: bool,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "DELETE FROM dismissals WHERE own = ?2 AND rowid NOT IN (
+                 SELECT rowid FROM dismissals WHERE own = ?2
+                 ORDER BY at_ms DESC, rowid DESC LIMIT ?1
+             )",
+            rusqlite::params![i64::from(retention.max_dismissals), i64::from(own)],
+        )
+        .map_err(backend)?;
+    Ok(())
+}
+
+/// Keep the record of the owner's messages whose first read state was decided under the dismissal
+/// bound, the oldest going first. `#549 own-read-stored`.
+fn prune_own_decided(
     transaction: &rusqlite::Transaction<'_>,
     retention: Retention,
 ) -> Result<(), StoreError> {
     transaction
         .execute(
-            "DELETE FROM dismissals WHERE rowid NOT IN (
-                 SELECT rowid FROM dismissals ORDER BY at_ms DESC, rowid DESC LIMIT ?1
+            "DELETE FROM own_decided WHERE rowid NOT IN (
+                 SELECT rowid FROM own_decided ORDER BY at_ms DESC, rowid DESC LIMIT ?1
              )",
             [i64::from(retention.max_dismissals)],
         )
@@ -1862,7 +1904,7 @@ impl StateStore for SqliteStore {
                     )
                     .map_err(backend)? as u64;
             }
-            prune_dismissals(&transaction, retention)?;
+            prune_dismissals(&transaction, retention, false)?;
             transaction.commit().map_err(backend)?;
             Ok(added)
         })
@@ -1889,6 +1931,155 @@ impl StateStore for SqliteStore {
             }
             transaction.commit().map_err(backend)?;
             Ok(removed)
+        })
+        .await
+    }
+
+    async fn own_decided(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<Vec<MessageId>, StoreError> {
+        let channel = channel.clone();
+        let messages: Vec<MessageId> = messages.to_vec();
+        self.with_connection(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT 1 FROM own_decided WHERE channel_id = ?1 AND message_id = ?2")
+                .map_err(backend)?;
+            let mut decided = Vec::new();
+            for message in messages {
+                let held = statement
+                    .exists(rusqlite::params![channel.as_str(), message.as_str()])
+                    .map_err(backend)?;
+                if held {
+                    decided.push(message);
+                }
+            }
+            Ok(decided)
+        })
+        .await
+    }
+
+    async fn decide_own(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+        read: bool,
+    ) -> Result<Vec<MessageId>, StoreError> {
+        let channel = channel.clone();
+        let ordered = orderable(messages)?;
+        let retention = self.retention;
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let at = now_ms();
+            let mut decided = Vec::new();
+            for (message, numeric) in &ordered {
+                let fresh = transaction
+                    .execute(
+                        "INSERT INTO own_decided (channel_id, message_id, at_ms) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(channel_id, message_id) DO NOTHING",
+                        rusqlite::params![channel.as_str(), message.as_str(), at],
+                    )
+                    .map_err(backend)?
+                    > 0;
+                if !fresh {
+                    continue;
+                }
+                if read {
+                    // DO NOTHING: a mark already there, the reader's own, keeps its class.
+                    transaction
+                        .execute(
+                            "INSERT INTO dismissals (channel_id, message_id, numeric, at_ms, own)
+                             VALUES (?1, ?2, ?3, ?4, 1)
+                             ON CONFLICT(channel_id, message_id) DO NOTHING",
+                            rusqlite::params![channel.as_str(), message.as_str(), numeric, at],
+                        )
+                        .map_err(backend)?;
+                }
+                decided.push(message.clone());
+            }
+            prune_dismissals(&transaction, retention, true)?;
+            prune_own_decided(&transaction, retention)?;
+            transaction.commit().map_err(backend)?;
+            Ok(decided)
+        })
+        .await
+    }
+
+    async fn own_not_done(&self) -> Result<Vec<(ChannelId, Vec<MessageId>)>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT o.channel_id, o.message_id FROM own_decided o
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM dismissals d
+                         WHERE d.channel_id = o.channel_id AND d.message_id = o.message_id
+                     )
+                     ORDER BY o.channel_id, o.message_id",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(backend)?;
+            let mut out: Vec<(ChannelId, Vec<(u64, MessageId)>)> = Vec::new();
+            for row in rows {
+                let (channel, message) = row.map_err(backend)?;
+                let id = MessageId(message);
+                let at = id.numeric().unwrap_or(0);
+                match out.last_mut() {
+                    Some((held, list)) if held.as_str() == channel => list.push((at, id)),
+                    _ => out.push((ChannelId(channel), vec![(at, id)])),
+                }
+            }
+            Ok(out
+                .into_iter()
+                .map(|(channel, mut list)| {
+                    list.sort_by_key(|(at, _)| *at);
+                    (channel, list.into_iter().map(|(_, id)| id).collect())
+                })
+                .collect())
+        })
+        .await
+    }
+
+    async fn dismiss_own(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<Vec<MessageId>, StoreError> {
+        let channel = channel.clone();
+        let ordered = orderable(messages)?;
+        let retention = self.retention;
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let at = now_ms();
+            let mut marked = Vec::new();
+            for (message, numeric) in &ordered {
+                transaction
+                    .execute(
+                        "INSERT INTO own_decided (channel_id, message_id, at_ms) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(channel_id, message_id) DO NOTHING",
+                        rusqlite::params![channel.as_str(), message.as_str(), at],
+                    )
+                    .map_err(backend)?;
+                let added = transaction
+                    .execute(
+                        "INSERT INTO dismissals (channel_id, message_id, numeric, at_ms, own)
+                         VALUES (?1, ?2, ?3, ?4, 1)
+                         ON CONFLICT(channel_id, message_id) DO NOTHING",
+                        rusqlite::params![channel.as_str(), message.as_str(), numeric, at],
+                    )
+                    .map_err(backend)?;
+                if added > 0 {
+                    marked.push(message.clone());
+                }
+            }
+            prune_dismissals(&transaction, retention, true)?;
+            prune_own_decided(&transaction, retention)?;
+            transaction.commit().map_err(backend)?;
+            Ok(marked)
         })
         .await
     }
@@ -2902,6 +3093,10 @@ impl StateStore for SqliteStore {
             transaction
                 .execute("DELETE FROM dismissals", [])
                 .map_err(backend)?;
+            // `#549 own-read-stored`: and which of his messages were decided, so each starts again.
+            transaction
+                .execute("DELETE FROM own_decided", [])
+                .map_err(backend)?;
             transaction
                 .execute("DELETE FROM channel_aliases", [])
                 .map_err(backend)?;
@@ -3472,6 +3667,128 @@ mod tests {
             !held.iter().any(|id| id.as_str() == "1000000000000000100"),
             "the ceiling evicted the newest mark instead of the oldest: {held:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_owners_own_first_marks_never_evict_the_marks_he_made_himself() {
+        // `#549 own-read-stored`: the reviewer's second finding against writing marks for his own
+        // messages. Each class is bounded apart, so a flood of his own words leaves his Done alone.
+        let dir = TempDir::new("sqlite-own-budget");
+        let store = store(
+            &dir,
+            Retention {
+                max_dismissals: 2,
+                ..Retention::default()
+            },
+        );
+        let channel = ChannelId("1111111111".to_owned());
+        let his_done: Vec<MessageId> = (0..2_u64)
+            .map(|n| MessageId(format!("100000000000000{:04}", 100 + n)))
+            .collect();
+        store.dismiss(&channel, &his_done).await.expect("dismiss");
+        for n in 0..5_u64 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let own = MessageId(format!("100000000000000{:04}", 500 + n));
+            let decided = store
+                .decide_own(&channel, std::slice::from_ref(&own), true)
+                .await
+                .expect("decide");
+            assert_eq!(decided, vec![own]);
+        }
+        let held = store.dismissals(&channel).await.expect("read");
+        for id in &his_done {
+            assert!(
+                held.contains(id),
+                "an own first mark evicted {id:?}: {held:?}"
+            );
+        }
+        // His own first marks keep their own bound, the newest kept.
+        let own_held: Vec<&MessageId> = held.iter().filter(|id| !his_done.contains(id)).collect();
+        assert_eq!(
+            own_held,
+            vec![
+                &MessageId("1000000000000000504".to_owned()),
+                &MessageId("1000000000000000503".to_owned()),
+            ]
+        );
+        // And the other way: his Done marks never evict his own first marks.
+        store
+            .dismiss(&channel, &[MessageId("1000000000000000900".to_owned())])
+            .await
+            .expect("dismiss");
+        let held = store.dismissals(&channel).await.expect("read");
+        assert!(held.contains(&MessageId("1000000000000000503".to_owned())));
+        assert!(
+            !held.contains(&his_done[0]),
+            "his own bound did not hold: {held:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_own_message_put_back_stays_decided_across_a_reopen() {
+        // `#549 own-read-stored`: decided once, never again — the reviewer's first finding.
+        let dir = TempDir::new("sqlite-own-decided");
+        let channel = ChannelId("1111111111".to_owned());
+        let his = MessageId("1000000000000000200".to_owned());
+        let later = MessageId("1000000000000000300".to_owned());
+        {
+            let store = store(&dir, Retention::default());
+            assert_eq!(
+                store
+                    .decide_own(&channel, std::slice::from_ref(&his), true)
+                    .await
+                    .expect("decide"),
+                vec![his.clone()]
+            );
+            assert_eq!(
+                store.dismissals(&channel).await.expect("read"),
+                vec![his.clone()]
+            );
+            assert_eq!(
+                store
+                    .restore(&channel, std::slice::from_ref(&his))
+                    .await
+                    .expect("restore"),
+                1
+            );
+        }
+        let store = store(&dir, Retention::default());
+        assert_eq!(
+            store
+                .own_decided(&channel, &[his.clone(), later.clone()])
+                .await
+                .expect("decided"),
+            vec![his.clone()]
+        );
+        assert!(store
+            .decide_own(&channel, &[his.clone(), later.clone()], true)
+            .await
+            .expect("decide")
+            .contains(&later));
+        assert_eq!(
+            store.dismissals(&channel).await.expect("read"),
+            vec![later.clone()]
+        );
+        // What "Apply to existing messages" would mark: the one put back.
+        assert_eq!(
+            store.own_not_done().await.expect("not done"),
+            vec![(channel.clone(), vec![his.clone()])]
+        );
+        assert_eq!(
+            store
+                .dismiss_own(&channel, std::slice::from_ref(&his))
+                .await
+                .expect("apply"),
+            vec![his.clone()]
+        );
+        assert!(store.own_not_done().await.expect("not done").is_empty());
+        // A purge forgets which were decided, with the marks.
+        store.purge_everything().await.expect("purge");
+        assert!(store
+            .own_decided(&channel, &[his, later])
+            .await
+            .expect("decided")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -6934,7 +7251,8 @@ mod tests {
         // there are add tables, dropped here as their notes say.
         connection
             .execute_batch(
-                "DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
+                "DROP TABLE IF EXISTS own_decided; ALTER TABLE dismissals DROP COLUMN own;
+                 DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
                  DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;
                  DROP TABLE IF EXISTS thread_hues;",
             )
