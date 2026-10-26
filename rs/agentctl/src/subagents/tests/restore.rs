@@ -736,7 +736,7 @@ fn after_a_restart_restore_holds_boxed_slots_then_hands_each_to_its_back_agent()
     let pid = boxed_row["slot_owner"]["owner_pid"].as_u64().unwrap();
     let commands = host.commands();
     assert!(commands.contains(&format!(
-        "/opt/wrkslots --project-root {root} transfer-owner boxed-slot --agent boxed --owner-pid {pid} --expected-generation 3"
+        "/opt/wrkslots --project-root {root} --wait-lock 30 transfer-owner boxed-slot --agent boxed --owner-pid {pid} --expected-generation 3"
     )), "{commands:?}");
     assert!(commands.contains(&format!(
         "/opt/wrkslots --project-root {root} unhold boxed-slot"

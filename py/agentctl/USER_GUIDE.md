@@ -1307,6 +1307,18 @@ Slash commands, and therefore goals, are refused. A workspace trust dialog
 stops the launch for human attention. The pane closes when the harness exits.
 Slot problems are refused before any registry record or tab is created.
 
+Once the harness runs, agentctl makes its pinned process (the relayed program
+under `root`, the harness anchor otherwise) the slot's wrkslots owner: it reads
+the slot's row with `wrkslots status --slot SLOT --format json`, then runs
+`wrkslots --wait-lock 30 transfer-owner SLOT --agent AGENT --owner-pid PID
+--expected-generation N` with the row's agent and generation. wrkslots then
+sees the agent's exit through that exact process generation instead of judging
+the slot only by its agent name. wrkslots accepts the transfer only while the
+slot has no owner or a provably dead one, and only for a process inside the
+slot's box. The start status reports the outcome as `slot_owner`:
+`transferred`, or `refused` with wrkslots' reason. A refusal leaves the running
+agent in place.
+
 ## Boxing a (sub)coordinator
 
 ```sh

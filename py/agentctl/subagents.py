@@ -3017,6 +3017,13 @@ class ManagedAgents:
                         f"launch of {name!r} failed: {exc}; record and any created "
                         f"tab retained at {directory}"
                     ) from exc
+            # A coordinator usually creates the slot with no owner bound, so wrkslots
+            # could judge it only by agent name. Bind the harness just pinned, so ordinary
+            # owner death detection covers the slot; a refusal is reported, not raised.
+            slot_owner = (
+                None if slot is None or launch_project is None
+                else _bind_launched_slot_owner(record, slot, launch_project, self.registry)
+            )
             if brief is not None:
                 client = cast(HerdrClient, _WorkspaceClient(
                     self.client, record, queue=self._queue(name),
@@ -3032,7 +3039,10 @@ class ManagedAgents:
                            allow_legacy_workspace_binding=True)
             # Keep the generation lock until its initial instruction and result
             # are captured; a replacement must never receive this launch's brief.
-            return self.status(name)
+            status = self.status(name)
+            if slot_owner is not None:
+                status["slot_owner"] = slot_owner
+            return status
 
     def _launch_interactive(
         self, record: AgentRecord, workspace_id: str | None,
@@ -6039,6 +6049,62 @@ def wrkslots_executable(registry: str | Path | None = None) -> str | None:
     ``wrkslots``, then ``wrkslots`` on PATH."""
     configured = None if registry is None else wrkslots_for_registry(registry)
     return os.environ.get("AGENTCTL_WRKSLOTS_BIN") or configured or shutil.which("wrkslots")
+
+
+def _bind_launched_slot_owner(
+    record: AgentRecord, slot: str, project: str, registry: str | Path | None,
+) -> dict[str, object]:
+    """Make a slot launch's pinned harness process the slot's wrkslots owner.
+
+    The process is the harness anchor, or the relayed program under root isolation; both
+    run inside the slot's own box, which ``wrkslots transfer-owner`` requires of a process
+    outside its own ancestry. Mirrors the Rust ``bind_launched_slot_owner``.
+    """
+    identity = record.harness_identity or record.custom_process_identity
+    if identity is None:
+        return {"slot": slot, "action": "refused",
+                "reason": "the launched harness has no pinned process"}
+    pid = identity.pid
+    executable = wrkslots_executable(registry)
+    if not executable:
+        return {"slot": slot, "action": "refused", "owner_pid": pid,
+                "reason": "wrkslots is no longer available"}
+
+    def refused(reason: str) -> dict[str, object]:
+        return {"slot": slot, "action": "refused", "owner_pid": pid, "reason": reason}
+
+    base = [executable, "--project-root", project]
+    try:
+        listed = subprocess.run(
+            [*base, "status", "--slot", slot, "--format", "json"], cwd=project,
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return refused(f"wrkslots status failed: {exc}")
+    if listed.returncode != 0:
+        return refused(f"wrkslots status failed: {listed.stderr.strip()}")
+    try:
+        document = json.loads(listed.stdout)
+        row = next(item for item in document["active"] if item.get("slot") == slot)
+    except (ValueError, KeyError, TypeError, StopIteration, AttributeError):
+        return refused(f"slot {slot} is not active")
+    generation = row.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool):
+        return refused("wrkslots status gave no generation")
+    # The slot row names the agent wrkslots registered, which may differ from the agentctl
+    # name; transfer-owner checks it against the row.
+    slot_agent = row.get("agent") if isinstance(row.get("agent"), str) else record.name
+    try:
+        moved = subprocess.run(
+            [*base, "--wait-lock", "30", "transfer-owner", slot, "--agent", slot_agent,
+             "--owner-pid", str(pid), "--expected-generation", str(generation)],
+            cwd=project, capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return refused(f"transfer-owner refused: {exc}")
+    if moved.returncode != 0:
+        return refused(f"transfer-owner refused: {moved.stderr.strip()}")
+    return {"slot": slot, "action": "transferred", "owner_pid": pid, "generation": generation}
 
 
 def _slot_shell_command(

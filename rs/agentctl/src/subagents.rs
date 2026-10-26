@@ -6773,6 +6773,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut relay_executable = None;
         let mut slot_project = None;
         let mut slot_isolation = None;
+        // (wrkslots, project, slot) for a slot launch, so the launched harness can be bound
+        // as the slot's owner; a coordinator box is not a wrkslots slot row.
+        let mut slot_owner_target: Option<(PathBuf, PathBuf, String)> = None;
         let mut launch_extra = BTreeMap::new();
         if options.slot.is_some() && self.client.record_backend() != "herdr" {
             return Err(fail(
@@ -6815,6 +6818,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 } else {
                     slot_project = Some(project.display().to_string());
                     slot_isolation = Some(isolation.clone());
+                    if let Some(wrkslots) = launch.executable.clone().or_else(wrkslots_executable) {
+                        slot_owner_target = Some((wrkslots, project.clone(), launch.slot.clone()));
+                    }
                 }
                 let slot_path = fs::canonicalize(&slot_path).map_err(|_| {
                     fail(format!(
@@ -6976,6 +6982,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Err(fail(format!("launch of {agent_name:?} failed: {error}; record and any created tab retained at {}", directory.display())));
         }
         drop(identity_lock);
+        // A coordinator usually creates the slot with no owner bound, so wrkslots could judge
+        // it only by its agent name. Bind the harness agentctl just pinned, so ordinary owner
+        // death detection covers the slot. A refusal does not undo a running launch; it is
+        // reported in the returned status.
+        let slot_owner = slot_owner_target.map(|(wrkslots, project, slot)| {
+            self.bind_launched_slot_owner(&record, &wrkslots, &project, &slot)
+        });
         // Keep this generation's lifecycle lock through startup delivery and returned status.
         // Sending by name after releasing it can redirect the old brief into a replacement.
         if let Some(brief) = options.brief {
@@ -6984,7 +6997,59 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             let readback = Some(options.delivery.working_timeout);
             self.send_record(&record, &brief, options.delivery, None, readback)?;
         }
-        self.status(agent_name)
+        let mut status = self.status(agent_name)?;
+        if let Some(slot_owner) = slot_owner {
+            status["slot_owner"] = slot_owner;
+        }
+        Ok(status)
+    }
+
+    /// Make a slot launch's pinned harness process the slot's wrkslots owner.
+    ///
+    /// The process is the relayed program under root isolation, or the harness anchor
+    /// otherwise; both run inside the slot's own box, which `wrkslots transfer-owner` requires
+    /// of a process outside its own ancestry. Returns `{"action": "transferred", ...}` or
+    /// `{"action": "refused", "reason": ...}`.
+    fn bind_launched_slot_owner(
+        &self,
+        record: &AgentRecord,
+        wrkslots: &Path,
+        project: &Path,
+        slot: &str,
+    ) -> Value {
+        let pid = record
+            .harness_identity
+            .as_ref()
+            .or(record.custom_process_identity.as_ref())
+            .map(|identity| identity.pid);
+        let Some(pid) = pid else {
+            return json!({
+                "slot": slot,
+                "action": "refused",
+                "reason": "the launched harness has no pinned process",
+            });
+        };
+        match crate::restore::bind_slot_owner(
+            &crate::restore::SystemHost,
+            wrkslots,
+            project,
+            slot,
+            &record.name,
+            pid,
+        ) {
+            Ok(row) => json!({
+                "slot": slot,
+                "action": "transferred",
+                "owner_pid": pid,
+                "generation": row["generation"],
+            }),
+            Err(error) => json!({
+                "slot": slot,
+                "action": "refused",
+                "owner_pid": pid,
+                "reason": error.to_string(),
+            }),
+        }
     }
 
     /// Register an identity-checked live Herdr agent without owning its runtime.
@@ -12391,6 +12456,122 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    fn start_in_slot(fixture: &Fixture, executable: PathBuf, isolation: Option<&str>) -> Value {
+        fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    slot: Some(SlotLaunch {
+                        slot: "s1".to_owned(),
+                        isolation: isolation.map(str::to_owned),
+                        executable: Some(executable),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap()
+    }
+
+    fn owner_calls(fixture: &Fixture, behaviour: &str) -> Vec<String> {
+        fs::read_to_string(fixture.root.join(format!("owner-calls-{behaviour}")))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// REGRESSION 2026-10-25 (devbig014): slots started with `--slot S --slot-isolation root`
+    /// kept `owner: null`, so wrkslots could judge them only by agent name and the four
+    /// finished ones (inplace, inplacepoc, li2plan, parallel) refused removal.
+    #[test]
+    fn root_slot_start_binds_the_relayed_program_as_the_slot_owner() {
+        let fixture = Fixture::new();
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
+        let status = start_in_slot(&fixture, executable, None);
+        assert_eq!(status["lifecycle"], "running");
+        assert_eq!(
+            status["slot_owner"],
+            json!({"slot": "s1", "action": "transferred", "owner_pid": 4242, "generation": 3}),
+            "{status}"
+        );
+        let project = fs::canonicalize(&fixture.root).unwrap();
+        let project = project.display();
+        assert_eq!(
+            owner_calls(&fixture, "root"),
+            [
+                format!("--project-root {project} status --slot s1 --format json"),
+                format!(
+                    "--project-root {project} --wait-lock 30 transfer-owner s1 --agent slot-agent \
+                     --owner-pid 4242 --expected-generation 3"
+                ),
+            ]
+        );
+        // The shell-command call is still the one argv-root records.
+        let argv = fs::read_to_string(fixture.root.join("argv-root")).unwrap();
+        assert!(argv.lines().any(|line| line == "shell-command"), "{argv}");
+    }
+
+    #[test]
+    fn boxed_shell_slot_start_binds_the_harness_anchor_as_the_slot_owner() {
+        let fixture = Fixture::new();
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "ok");
+        let status = start_in_slot(&fixture, executable, Some("cgroup"));
+        let pid = status["harness_identity"]["pid"]
+            .as_u64()
+            .expect("harness anchor");
+        assert_eq!(status["slot_owner"]["action"], "transferred", "{status}");
+        assert_eq!(status["slot_owner"]["owner_pid"], pid);
+        let calls = owner_calls(&fixture, "ok");
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[1].ends_with(&format!(
+            "transfer-owner s1 --agent slot-agent --owner-pid {pid} --expected-generation 3"
+        )));
+    }
+
+    #[test]
+    fn a_refused_owner_binding_keeps_the_launch_and_reports_why() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("owner-refuse"), b"").unwrap();
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
+        let status = start_in_slot(&fixture, executable, None);
+        assert_eq!(status["lifecycle"], "running");
+        assert_eq!(status["slot_owner"]["action"], "refused", "{status}");
+        assert_eq!(status["slot_owner"]["owner_pid"], 4242);
+        assert_eq!(
+            status["slot_owner"]["reason"],
+            "transfer-owner refused: REFUSED: slot s1 owner is live"
+        );
+    }
+
+    #[test]
+    fn a_project_box_start_binds_no_slot_owner() {
+        let fixture = Fixture::new();
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
+        let status = fixture
+            .manager()
+            .start(
+                "planner",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    slot: Some(SlotLaunch {
+                        slot: "planner".to_owned(),
+                        project_box: true,
+                        executable: Some(executable),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(status.get("slot_owner").is_none(), "{status}");
+        assert!(owner_calls(&fixture, "root").is_empty());
+    }
+
     /// A stand-in `wrkslots` that records its argv and cwd, then answers like
     /// `shell-command --format json` (or fails, when told to).
     fn fake_wrkslots(root: &Path, slot_path: &Path, behaviour: &str) -> PathBuf {
@@ -12407,10 +12588,35 @@ pub(crate) mod tests {
             ),
             _ => "echo 'not json'".to_owned(),
         };
+        // `status` and `transfer-owner` (the owner binding after a slot launch) append to
+        // owner-calls-BEHAVIOUR instead, so argv-BEHAVIOUR keeps the shell-command call.
+        // `status` answers generation 3 for agent slot-agent; `transfer-owner` refuses while
+        // ROOT/owner-refuse exists.
+        let owner_calls = root.join(format!("owner-calls-{behaviour}"));
+        let refuse = root.join("owner-refuse");
+        let owner = r#"owner_call=; previous=; slot=
+for argument in "$@"; do
+  case "$argument" in status|transfer-owner) [ -z "$owner_call" ] && owner_call=$argument ;; esac
+  [ "$previous" = --slot ] && slot=$argument
+  previous=$argument
+done
+if [ -n "$owner_call" ]; then
+  printf '%s\n' "$*" >> '@CALLS@'
+  if [ "$owner_call" = status ]; then
+    printf '{"active": [{"slot": "%s", "generation": 3, "agent": "slot-agent"}]}\n' "$slot"
+    exit 0
+  fi
+  if [ -e '@REFUSE@' ]; then echo 'REFUSED: slot s1 owner is live' >&2; exit 3; fi
+  echo transferred
+  exit 0
+fi
+"#
+        .replace("@CALLS@", &owner_calls.display().to_string())
+        .replace("@REFUSE@", &refuse.display().to_string());
         write_executable(
             &script,
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > '{}'\n{body}\n",
+                "#!/bin/sh\n{owner}printf '%s\\n' \"$PWD\" \"$@\" > '{}'\n{body}\n",
                 root.join(format!("argv-{behaviour}")).display()
             ),
         );

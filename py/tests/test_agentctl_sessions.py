@@ -836,14 +836,40 @@ def _fake_wrkslots(tmp_path: Path, slot_path: Path, behaviour: str = "ok") -> Pa
             {"command": "exec boxed-shell", "slot_path": str(slot_path), "isolation": "root"})),
         "junk": "echo 'not json'",
     }
+    # `status` and `transfer-owner` (the owner binding after a slot launch) append to
+    # owner-calls-BEHAVIOUR instead, so argv-BEHAVIOUR keeps the shell-command call.
+    owner = (
+        'owner_call=; previous=; slot=\n'
+        'for argument in "$@"; do\n'
+        '  case "$argument" in status|transfer-owner) [ -z "$owner_call" ] && owner_call=$argument ;; esac\n'
+        '  [ "$previous" = --slot ] && slot=$argument\n'
+        '  previous=$argument\n'
+        'done\n'
+        'if [ -n "$owner_call" ]; then\n'
+        f'  printf \'%s\\n\' "$*" >> {str(tmp_path / f"owner-calls-{behaviour}")!r}\n'
+        '  if [ "$owner_call" = status ]; then\n'
+        '    printf \'{"active": [{"slot": "%s", "generation": 3, "agent": "slot-agent"}]}\\n\' "$slot"\n'
+        '    exit 0\n'
+        '  fi\n'
+        f'  if [ -e {str(tmp_path / "owner-refuse")!r} ]; then echo \'REFUSED: slot s1 owner is live\' >&2; exit 3; fi\n'
+        '  echo transferred\n'
+        '  exit 0\n'
+        'fi\n'
+    )
     script.write_text(
         "#!/bin/sh\n"
-        f"printf '%s\\n' \"$PWD\" \"$@\" > {str(tmp_path / f'argv-{behaviour}')!r}\n"
+        + owner
+        + f"printf '%s\\n' \"$PWD\" \"$@\" > {str(tmp_path / f'argv-{behaviour}')!r}\n"
         f"{answers[behaviour]}\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
     return script
+
+
+def _owner_calls(tmp_path: Path, behaviour: str) -> list[str]:
+    path = tmp_path / f"owner-calls-{behaviour}"
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
 
 def test_slot_start_boxes_the_pane_before_the_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -870,6 +896,14 @@ def test_slot_start_boxes_the_pane_before_the_harness(tmp_path: Path, monkeypatc
     assert argv[1:] == [
         "--project-root", str(project), "shell-command", "s1", "--isolation", "cgroup", "--format", "json",
     ]
+    # The fake anchors the harness at pid 300; that process becomes the slot's owner.
+    anchor = status["harness_identity"]
+    assert isinstance(anchor, dict) and anchor["pid"] == 300
+    assert status["slot_owner"] == {"slot": "s1", "action": "transferred", "owner_pid": 300, "generation": 3}
+    calls = _owner_calls(tmp_path, "ok")
+    assert len(calls) == 2 and calls[1].endswith(
+        "transfer-owner s1 --agent slot-agent --owner-pid 300 --expected-generation 3"
+    ), calls
 
 
 def test_slot_start_leaves_isolation_to_the_project_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -958,6 +992,26 @@ def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypat
     record = json.loads((sessions.registry / "worker" / "agent.json").read_text(encoding="utf-8"))
     assert record["adapter"] == "herdr-relay" and record["pane_reported_by_agentctl"] is True
     assert record["custom_process_identity"]["pid"] == 4242
+    # REGRESSION 2026-10-25 (devbig014): root slots kept owner null, so finished ones were
+    # judged only by agent name and refused removal. The relayed program now owns the slot.
+    assert status["slot_owner"] == {
+        "slot": "s1", "action": "transferred", "owner_pid": 4242, "generation": 3,
+    }
+    project = str(tmp_path.resolve())
+    assert _owner_calls(tmp_path, "root") == [
+        f"--project-root {project} status --slot s1 --format json",
+        f"--project-root {project} --wait-lock 30 transfer-owner s1 --agent slot-agent "
+        "--owner-pid 4242 --expected-generation 3",
+    ]
+    # A refusal keeps the running launch and says why.
+    (tmp_path / "owner-refuse").write_text("", encoding="utf-8")
+    from agentctl.subagents import AgentRecord, _bind_launched_slot_owner
+
+    loaded = AgentRecord.load(sessions.registry / "worker" / "agent.json", "worker")
+    assert _bind_launched_slot_owner(loaded, "s1", project, sessions.registry) == {
+        "slot": "s1", "action": "refused", "owner_pid": 4242,
+        "reason": "transfer-owner refused: REFUSED: slot s1 owner is live",
+    }
 
 
 def test_explain_agent_parses_herdr_screen_rule_verdicts() -> None:

@@ -832,15 +832,15 @@ fn wrkslots_argv(wrkslots: &Path, project: &Path, arguments: &[&str]) -> Vec<Str
     argv
 }
 
-/// The slot's status row, read with `wrkslots status --slot SLOT --format json`.
-fn slot_status(host: &dyn Host, wrkslots: &Path, agent: &SlotAgent) -> Result<Value> {
+/// One slot's active row in `project`, read with `wrkslots status --slot SLOT --format json`.
+fn slot_row(host: &dyn Host, wrkslots: &Path, project: &Path, slot: &str) -> Result<Value> {
     let outcome = host.run(
         &wrkslots_argv(
             wrkslots,
-            &agent.project,
-            &["status", "--slot", &agent.slot, "--format", "json"],
+            project,
+            &["status", "--slot", slot, "--format", "json"],
         ),
-        Some(&agent.project),
+        Some(project),
         Duration::from_secs(120),
     );
     if outcome.status != Some(0) {
@@ -853,9 +853,62 @@ fn slot_status(host: &dyn Host, wrkslots: &Path, agent: &SlotAgent) -> Result<Va
         .map_err(|error| fail(format!("wrkslots status printed no JSON: {error}")))?;
     document["active"]
         .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["slot"] == agent.slot.as_str()))
+        .and_then(|rows| rows.iter().find(|row| row["slot"] == slot))
         .cloned()
-        .ok_or_else(|| fail(format!("slot {} is not active", agent.slot)))
+        .ok_or_else(|| fail(format!("slot {slot} is not active")))
+}
+
+/// Make process `pid` the wrkslots owner of `slot` with `wrkslots transfer-owner`.
+///
+/// wrkslots accepts it only while the recorded owner is unbound or provably dead, and only for
+/// a process in this command's ancestry or inside the slot's own box, which is where a slot
+/// launch runs its harness. A busy registry lock is waited on for up to 30 seconds. Returns
+/// the slot's status row read before the transfer. A refusal is returned as an error carrying
+/// wrkslots' own reason; nothing here retries or overrides it.
+pub(crate) fn bind_slot_owner(
+    host: &dyn Host,
+    wrkslots: &Path,
+    project: &Path,
+    slot: &str,
+    agent: &str,
+    pid: u64,
+) -> Result<Value> {
+    let row = slot_row(host, wrkslots, project, slot)?;
+    let generation = row["generation"]
+        .as_u64()
+        .ok_or_else(|| fail("wrkslots status gave no generation"))?
+        .to_string();
+    // The slot row names the agent wrkslots registered, which may differ from the agentctl
+    // name; transfer-owner checks it against the row.
+    let slot_agent = row["agent"].as_str().unwrap_or(agent).to_owned();
+    let pid_text = pid.to_string();
+    let moved = host.run(
+        &wrkslots_argv(
+            wrkslots,
+            project,
+            &[
+                "--wait-lock",
+                "30",
+                "transfer-owner",
+                slot,
+                "--agent",
+                &slot_agent,
+                "--owner-pid",
+                &pid_text,
+                "--expected-generation",
+                &generation,
+            ],
+        ),
+        Some(project),
+        Duration::from_secs(120),
+    );
+    if moved.status != Some(0) {
+        return Err(fail(format!(
+            "transfer-owner refused: {}",
+            moved.stderr.trim()
+        )));
+    }
+    Ok(row)
 }
 
 /// Hold a dead agent's slot so that no cleanup can retire it before the agent is back.
@@ -891,37 +944,14 @@ fn transfer_slot<A: ManagedApi + ?Sized>(
             .iter()
             .find_map(|key| status[*key]["pid"].as_u64())
             .ok_or_else(|| fail("the revived harness has no pinned process"))?;
-        let row = slot_status(host, wrkslots, agent)?;
-        let generation = row["generation"]
-            .as_u64()
-            .ok_or_else(|| fail("wrkslots status gave no generation"))?
-            .to_string();
-        let slot_agent = row["agent"].as_str().unwrap_or(&agent.name).to_owned();
-        let pid_text = pid.to_string();
-        let moved = host.run(
-            &wrkslots_argv(
-                wrkslots,
-                &agent.project,
-                &[
-                    "transfer-owner",
-                    &agent.slot,
-                    "--agent",
-                    &slot_agent,
-                    "--owner-pid",
-                    &pid_text,
-                    "--expected-generation",
-                    &generation,
-                ],
-            ),
-            Some(&agent.project),
-            Duration::from_secs(120),
-        );
-        if moved.status != Some(0) {
-            return Err(fail(format!(
-                "transfer-owner refused: {}",
-                moved.stderr.trim()
-            )));
-        }
+        let row = bind_slot_owner(
+            host,
+            wrkslots,
+            &agent.project,
+            &agent.slot,
+            &agent.name,
+            pid,
+        )?;
         let mut unheld = false;
         if row["hold_reason"] == reboot_hold_reason(&agent.name).as_str() {
             let released = host.run(
