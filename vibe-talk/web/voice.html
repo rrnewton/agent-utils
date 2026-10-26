@@ -959,13 +959,11 @@
             comes and goes). The media keys a steering wheel or a headset sends do the same as
             its buttons.
 
-            `#434 read-aloud-pause`: and Pause, which is Play while the read is held. The same
-            state the Read button and the media keys drive, never a second opinion about it.
-            `#442 read-strip-order`: Pause comes after Next, and Stop last, in the markup as on
-            screen, so Tab and a screen reader meet the controls in the order they are seen.
-            Between Previous and the count, Pause split the position from the way through it.
-            Stop ends the read AND leaves reading mode, as the Read button's own way out does: one
-            tap, wherever the reader is looking. On a desk the grip at its left moves the strip
+            `#537 scrub-bar-no-play-pause`: no Pause and no Stop of its own. `#434` and `#442` put
+            them here; the owner, 2026-10-26: "I like how we currently have stop and pause on the
+            lower bar. We don't need to redundantly have it." Read under the list is the Pause of a
+            read playing (Resume while held) and Stop beside it ends the read and the mode, and the
+            keys and the media keys do both. On a desk the grip at its left moves the strip
             (drag, or the arrow keys; double-click or Home puts it back); a phone keeps it docked,
             and the stylesheet does not draw the grip there.
 
@@ -988,10 +986,8 @@
             <button id="read-prev" class="read-steer-button" type="button" aria-label="Previous block">Previous</button>
             <span id="read-steer-count" aria-live="polite"></span>
             <button id="read-next" class="read-steer-button" type="button" aria-label="Next block">Next</button>
-            <button id="read-pause" class="read-steer-button" type="button" aria-label="Pause reading" aria-pressed="false">Pause</button>
-            <button id="read-stop" class="read-steer-button" type="button" aria-label="Stop reading" title="Stop reading and leave reading mode">
-              <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="1.5" /></svg>
-            </button>
+            <!-- `#537 scrub-bar-no-play-pause`. No Pause or Stop here: the bar under the list has both
+                 (Read is the Pause of a read playing, and Stop beside it), so the strip steers. -->
             <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it
                  is long: those heard, the one being read, those to come. A tap on one reads from
                  there. Filled by web/voice.js, one button a block. -->

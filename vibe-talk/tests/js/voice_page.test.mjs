@@ -11819,54 +11819,51 @@ test("...and on a browser without Web Audio, pause and play pause and play the e
   assert.equal(reading.playCount, plays + 1, "play did not play the element again");
 });
 
-test("`#434 read-aloud-pause`: THE STRIP'S PAUSE, THE READ BUTTON AND THE MEDIA KEYS ARE ONE STATE", async () => {
-  // The owner: play/pause never reached the Read button, and the floating controller had none.
-  // One state path, said three ways: the strip's button, the Read button, the media session.
+test("`#434 read-aloud-pause`: THE READ BUTTON AND THE MEDIA KEYS ARE ONE STATE, AND THE STRIP HAS NO PAUSE OF ITS OWN", async () => {
+  // The owner: play/pause never reached the Read button. One state path, said two ways: the Read
+  // button and the media session. `#537 scrub-bar-no-play-pause`: the strip's own Pause is gone.
   const { page, rows } = await blockedRead({ mediaSession: true });
   await rows[0].dispatch("click", {});
   await page.settle();
-  assert.equal(page.el("read-pause").text(), "Pause", "the strip offers no pause while a read plays");
   assert.equal(page.el("read-aloud-label").text(), "Pause", "the Read button does not say Pause while a read plays");
   assert.equal(page.el("read-steer-count").text(), "1 of 3");
 
-  // Pause from the strip: the clock stops, the position stays, every control agrees.
-  await page.el("read-pause").click();
+  // Pause from the Read button: the clock stops, the position stays, every control agrees.
+  await page.el("read-aloud").click();
   await page.settle();
-  assert.equal(page.audio.state, "suspended", "the strip's Pause did not stop the audio clock");
+  assert.equal(page.audio.state, "suspended", "the Read button's Pause did not stop the audio clock");
   assert.equal(page.el("read-steer-count").text(), "1 of 3", "pausing moved the read");
-  assert.equal(page.el("read-pause").text(), "Play", "the strip does not offer Play while paused");
   assert.equal(page.el("read-aloud-label").text(), "Resume", "the Read button does not say Resume while paused");
-  assert.equal(page.mediaSession.playbackState, "paused", "the media session was not told of the strip's pause");
+  assert.equal(page.mediaSession.playbackState, "paused", "the media session was not told of the pause");
 
-  // Resume from the Read button: the same state, from the other control.
+  // Resume from the Read button: the same state.
   await page.el("read-aloud").click();
   await page.settle();
   assert.equal(page.audio.state, "running", "the Read button's Resume did not start the clock again");
-  assert.equal(page.el("read-pause").text(), "Pause");
+  assert.equal(page.el("read-aloud-label").text(), "Pause");
   assert.equal(page.el("read-aloud-label").text(), "Pause");
   assert.equal(page.mediaSession.playbackState, "playing");
 
-  // Pause from a media key, resume from the strip: still the one state.
+  // Pause from a media key, resume from the Read button: still the one state.
   page.mediaSession.handlers.pause();
   await page.settle();
-  assert.equal(page.el("read-pause").text(), "Play", "a media-key pause left the strip saying Pause");
   assert.equal(page.el("read-aloud-label").text(), "Resume", "a media-key pause left the Read button saying Pause");
-  await page.el("read-pause").click();
+  await page.el("read-aloud").click();
   await page.settle();
-  assert.equal(page.audio.state, "running", "the strip's Play did not resume a media-key pause");
+  assert.equal(page.audio.state, "running", "the Read button did not resume a media-key pause");
   assert.equal(page.mediaSession.playbackState, "playing");
 
   // A jump made while held cues the next block up HELD: Next is not a Play nobody pressed.
-  await page.el("read-pause").click();
+  await page.el("read-aloud").click();
   await page.settle();
   assert.equal(page.audio.state, "suspended");
   await page.el("read-next").click();
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "2 of 3", "Next while held did not cue the next block");
   assert.equal(page.audio.state, "suspended", "Next while held started the audio clock");
-  assert.equal(page.el("read-pause").text(), "Play", "the cued block is not held");
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the cued block is not held");
   assert.equal(page.mediaSession.playbackState, "paused");
-  await page.el("read-pause").click();
+  await page.el("read-aloud").click();
   await page.settle();
   assert.equal(page.audio.state, "running", "Play did not start the cued block");
 
@@ -11886,14 +11883,14 @@ test("`#434 read-aloud-pause`: a resume after the speech ticket ended re-prepare
   await page.el("read-next").click();
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "2 of 3", "the premise: the read is not on its second block");
-  await page.el("read-pause").click();
+  await page.el("read-aloud").click();
   await page.settle();
   assert.equal(page.audio.state, "suspended", "the premise: the read is not paused");
   const before = page.prepareCalls.length;
   const streams = page.audioStreams.length;
   page.speechTicketSuffix = "-again";
   page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000 + 1_000);
-  await page.el("read-pause").click();
+  await page.el("read-aloud").click();
   await page.settle();
   const again = page.prepareCalls.slice(before).filter((call) => (call.ids || []).includes(BLOCKED_ID)).length;
   assert.ok(again >= 1, "the resume on an ended ticket prepared nothing again");
@@ -11903,7 +11900,7 @@ test("`#434 read-aloud-pause`: a resume after the speech ticket ended re-prepare
   assert.equal(blockOf(resumed.url), "1", "the resume did not restart the paused block");
   assert.equal(page.el("read-steer-count").text(), "2 of 3", "the resume moved the read off the paused block");
   assert.equal(page.audio.state, "running", "the resumed read is not playing");
-  assert.equal(page.el("read-pause").text(), "Pause");
+  assert.equal(page.el("read-aloud-label").text(), "Pause");
 });
 
 test("`#434 read-aloud-pause`: the device voice pauses and resumes the same utterance, from the Read button", async () => {
@@ -11970,16 +11967,19 @@ test("`#433 read-strip-low`: the strip hugs the chips' measured height and the p
     "nothing measures the strip for the room kept over it");
 });
 
-test("`#442 read-strip-order`: the strip reads Previous, k of n, Next, Pause, Stop, in the markup as on screen", () => {
-  // The owner: "(Previous) (Play) 1 of 4 (Next)" is awkward; Play/Pause goes right of Next, and
-  // Stop after it. In the markup, not by `order`, so Tab and a screen reader meet the controls as
-  // they are seen. The desk's grip comes first, at the strip's left.
+test("`#442 read-strip-order`: the strip reads Previous, k of n, Next, in the markup as on screen, and holds no Pause or Stop (`#537`)", () => {
+  // In the markup, not by `order`, so Tab and a screen reader meet the controls as they are seen. The
+  // desk's grip comes first, at the strip's left. `#537 scrub-bar-no-play-pause`, the owner: "let's
+  // remove the pause/play from the floating scrub bar. I like how we currently have stop and pause on
+  // the lower bar. We don't need to redundantly have it. We can just have the next and previous".
   const strip = HTML_CODE.slice(HTML_CODE.indexOf('id="read-steer"'), HTML_CODE.indexOf('id="read-timeline"'));
   const ids = [...strip.matchAll(/\bid="(read-[\w-]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(ids, ["read-steer", "read-steer-grip", "read-prev", "read-steer-count", "read-next", "read-pause", "read-stop"],
-    "the strip's controls are not the grip, Previous, the count, Next, Pause, then Stop");
-  assert.match(/<button id="read-stop"[^>]*>/.exec(HTML_CODE)[0], /aria-label="Stop reading"/, "the strip's Stop has no name");
-  for (const selector of ["#read-steer", ".read-steer-button", "#read-steer-grip", "#read-prev", "#read-steer-count", "#read-next", "#read-pause", "#read-stop"]) {
+  assert.deepEqual(ids, ["read-steer", "read-steer-grip", "read-prev", "read-steer-count", "read-next"],
+    "the strip's controls are not the grip, Previous, the count and Next alone");
+  assert.ok(!PAGE_ELEMENTS.has("read-pause") && !PAGE_ELEMENTS.has("read-stop"), "the strip still has a Pause or a Stop of its own");
+  // The bar under the list keeps both: Read (the Pause of a read playing) and Stop beside it.
+  assert.ok(PAGE_ELEMENTS.has("read-aloud") && PAGE_ELEMENTS.has("read-aloud-stop"), "the bar lost its Pause or its Stop");
+  for (const selector of ["#read-steer", ".read-steer-button", "#read-steer-grip", "#read-prev", "#read-steer-count", "#read-next"]) {
     for (const rule of cssRules(CSS_CODE, selector)) {
       assert.doesNotMatch(rule, /(^|[\s;])order:|row-reverse|direction:\s*rtl/,
         `${selector} moves the strip's controls on screen away from their order in the markup`);
@@ -11995,16 +11995,17 @@ function assertReadingModeLeft(page, why) {
   assert.equal(page.el("read-aloud-stop").hidden, true, `${why}: the bar's Stop outlived the read`);
 }
 
-test("`#442 read-strip-order`: the strip's Stop ends the read and leaves reading mode in one tap", async () => {
+test("`#442 read-strip-order`: the bar's Stop ends the read and leaves reading mode in one tap", async () => {
   // The owner: once Read became Pause (`#434`) there was "no way then to STOP or exit read mode".
+  // `#537 scrub-bar-no-play-pause`: the bar's Stop is the one; the strip has none.
   const { page, rows } = await blockedRead({ mediaSession: true });
   await rows[0].dispatch("click", {});
   await page.settle();
   assert.equal(page.el("read-steer").hidden, false, "the premise: the strip is up");
-  page.el("read-stop").focus();
-  await page.el("read-stop").click();
+  page.el("read-aloud-stop").focus();
+  await page.el("read-aloud-stop").click();
   await page.settle();
-  assertReadingModeLeft(page, "the strip's Stop");
+  assertReadingModeLeft(page, "the bar's Stop");
   assert.equal(page.document.activeElement, page.el("read-aloud"), "the focus went with the Stop that vanished");
   assert.equal(page.mediaSession.playbackState, "none", "the media session still holds a stopped read");
 
@@ -12013,12 +12014,12 @@ test("`#442 read-strip-order`: the strip's Stop ends the read and leaves reading
   await page.settle();
   await rows[0].dispatch("click", {});
   await page.settle();
-  await page.el("read-pause").click();
+  await page.el("read-aloud").click();
   await page.settle();
   assert.equal(page.el("read-aloud-label").text(), "Resume", "the premise: the read is held");
-  await page.el("read-stop").click();
+  await page.el("read-aloud-stop").click();
   await page.settle();
-  assertReadingModeLeft(page, "the strip's Stop on a held read");
+  assertReadingModeLeft(page, "the bar's Stop on a held read");
 });
 
 test("`#442 read-strip-order`: Read is Pause with Stop beside it while a read plays, and only then", async () => {
@@ -12219,19 +12220,6 @@ test("`#451 read-strip-followups`: a read started with s outside reading mode ha
   await page.settle();
   assert.equal(page.el("read-aloud-label").text(), "Read", "the cancelled fetch still started a read");
   assertReadingModeLeft(page, "the cancelled fetch let go");
-});
-
-test("`#451 read-strip-followups`: a held read's Play is told from its Stop at a glance", () => {
-  // Held, Play and Stop were both filled with the warn colour, told apart only by the word on one
-  // and the square on the other. Stop keeps the fill; a held Play is hollow, ringed in the same
-  // colour, so fill itself says which one ends the read.
-  const held = cssBlock('#read-pause[aria-pressed="true"]');
-  const stop = cssBlock("#read-stop");
-  const fill = (rule) => /background:\s*([^;]+);/.exec(rule)[1].trim();
-  assert.match(stop, /background:\s*var\(--warn\);/, "Stop lost the way-out fill");
-  assert.notEqual(fill(held), fill(stop), "a held Play is filled as Stop is");
-  assert.match(held, /box-shadow:\s*inset 0 0 0 1px var\(--warn\)/, "a held Play is not ringed against Stop's fill");
-  assert.match(held, /color:\s*var\(--warn\)/, "a held Play does not say itself in the read's colour");
 });
 
 test("`#451 read-strip-followups`: a moved strip is held in the window again when the chips row grows", async () => {

@@ -8,21 +8,20 @@ another block of it jumps there, Previous and Next and the Media Session's previ
 pause and play move through it, and the boundaries between blocks are heard without a gap.
 
 `#433 read-strip-low` and `#434 read-aloud-pause`: the strip sits directly on the chips row with
-no gap (measured, at 412x915, 393x852 and on a desk), and its Pause, the Read button and the
-media keys are one state — pausing by any of them holds the position, resuming by any other
-carries on from the held block.
+no gap (measured, at 412x915, 393x852 and on a desk), and the Read button and the media keys are one
+state — pausing by either holds the position, resuming by the other carries on from the held block.
 
-`#442 read-strip-order`: the strip reads Previous, k of n, Next, Pause, Stop, in one line, in the
-same order on screen as in the markup and for Tab, at 393x852, 375x812 and on a desk (where the
-grip that moves it comes first). While a read plays the bar's Read is its Pause with Stop on its left,
-also in the keyboard-up slim row (`#429`). Stop, on the strip or the bar, ends the read and leaves
-reading mode. On a desk the strip is dragged by its grip and a double-click on the grip docks it.
+`#442 read-strip-order` and `#537 scrub-bar-no-play-pause`: the strip reads Previous, k of n, Next,
+and no Pause or Stop of its own, in one line, in the same order on screen as in the markup and for
+Tab, at 393x852, 375x812 and on a desk (where the grip that moves it comes first). While a read plays
+the bar's Read is its Pause with Stop on its left, also in the keyboard-up slim row (`#429`). The
+bar's Stop ends the read and leaves reading mode. On a desk the strip is dragged by its grip and a
+double-click on the grip docks it.
 
-`#451 read-strip-followups`: held at 393x852, the strip's Play is drawn hollow where Stop keeps its
-solid fill (computed, and in the paused screenshot); and on a desk a one-block read started with s
-outside reading mode — which draws no strip — is paused and stopped from the bar, the mode never
-entered. (The moved strip held in the window as the chips row grows, and the grip's keys in Help's
-list, are pinned in the fake-DOM suite, which can grow a row and read the list.)
+`#451 read-strip-followups`: on a desk a one-block read started with s outside reading mode — which
+draws no strip — is paused and stopped from the bar, the mode never entered. (The moved strip held in
+the window as the chips row grows, and the grip's keys in Help's list, are pinned in the fake-DOM
+suite, which can grow a row and read the list.)
 
 It serves the checked-out assets and a small fake API from one loopback origin. The fake voice
 behaves like the deployed one in the two ways the boundaries depend on: ONE session, so a block's
@@ -167,7 +166,8 @@ STRIP_LAYOUT = """() => {
   };
 }"""
 
-STRIP_ORDER = ["read-prev", "read-steer-count", "read-next", "read-pause", "read-stop"]
+# `#537 scrub-bar-no-play-pause`: no Pause or Stop on the strip; the bar under the list has both.
+STRIP_ORDER = ["read-prev", "read-steer-count", "read-next"]
 
 # The bar's Read (Pause while a read plays) and the Stop on its left: drawn, side by side, in one row,
 # Read keeping the edge under the thumb.
@@ -653,7 +653,7 @@ def main() -> int:
                     " return t.top - s.bottom; }"))
 
             def check_strip_order(page: Page, where: str, desk: bool = False) -> None:
-                # `#442 read-strip-order`: Previous, k of n, Next, Pause, Stop, in one line, the
+                # `#442 read-strip-order`, `#537`: Previous, k of n, Next and nothing else, in one line, the
                 # markup's order on screen. The grip that moves it is drawn on a desk only.
                 layout = page.evaluate(STRIP_LAYOUT)
                 want = (["read-steer-grip"] if desk else []) + STRIP_ORDER
@@ -821,22 +821,20 @@ def main() -> int:
                       "the audio clock ran on while paused")
                 check(position(page) == "6 of 7", f"pausing moved the read to {position(page)}")
                 # `#434 read-aloud-pause`: the one state, said by every control. The media pause
-                # is the strip's Play and the Read button's Resume, and the strip resumes it.
-                check(page.text_content("#read-pause") == "Play",
-                      f"a media pause left the strip saying {page.text_content('#read-pause')!r}")
+                # is the Read button's Resume, and the Read button resumes it.
                 check(page.text_content("#read-aloud-label") == "Resume",
                       f"a media pause left the Read button saying {page.text_content('#read-aloud-label')!r}")
                 shot("5b-paused")
-                press(page, "#read-pause", True)
+                press(page, "#read-aloud", True)
                 wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
-                         "the strip's Play did not resume a media pause")
+                         "the Read button did not resume a media pause")
                 check(position(page) == "6 of 7", f"resuming moved the read to {position(page)}")
                 # And the Read button holds and resumes the same read, from the same block.
                 press(page, "#read-aloud", True)
                 wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
                          "the Read button's Pause did not stop the audio clock")
-                check(page.text_content("#read-pause") == "Play",
-                      "the Read button's pause left the strip saying Pause")
+                check(page.text_content("#read-aloud-label") == "Resume",
+                      "the Read button's pause left it saying Pause")
                 press(page, "#read-aloud", True)
                 wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
                          "the Read button's Resume did not start the audio clock again")
@@ -897,7 +895,7 @@ def main() -> int:
                 time.sleep(0.3)
                 # Tab meets them as they are seen (the count is not a stop).
                 page.focus("#read-prev")
-                for wanted in ("read-next", "read-pause", "read-stop"):
+                for wanted in ("read-next",):
                     page.keyboard.press("Tab")
                     focused = page.evaluate("() => document.activeElement.id")
                     check(focused == wanted, f"Tab from the strip reached {focused!r}, not {wanted!r}")
@@ -925,13 +923,13 @@ def main() -> int:
                 page.dblclick("#read-steer-grip")
                 gap_docked = strip_gap(page)
                 check(abs(gap_docked) <= 2, f"a double-click left the strip {gap_docked:.1f}px off the chips row")
-                # Stop, on the strip: the read ends and reading mode is left, in one click.
-                press(page, "#read-stop", False)
-                check_mode_left(page, "the desk's strip")
+                # Stop, in the bar: the read ends and reading mode is left, in one click.
+                press(page, "#read-aloud-stop", False)
+                check_mode_left(page, "the desk's bar")
                 context.close()
 
-            # 9. At 393x852: the strip still hugs the chips row (`#433`), and its own Pause holds
-            # and resumes the read where it was held (`#434`).
+            # 9. At 393x852: the strip still hugs the chips row (`#433`), and the bar's Read holds
+            # and resumes the read where it was held (`#434`), the strip having no Pause (`#537`).
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                 context, page = open_page(profile, 393, 852, True)
                 press(page, f"{row} .body", True)
@@ -944,26 +942,11 @@ def main() -> int:
                     page.screenshot(path=str(args.screenshots / "9-phone-393.png"))
                 press(page, "#read-next", True)
                 wait_position(page, "2 of 7")
-                press(page, "#read-pause", True)
+                press(page, "#read-aloud", True)
                 wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
-                         "the strip's Pause did not stop the audio clock at 393x852")
-                check(position(page) == "2 of 7", f"the strip's pause moved the read to {position(page)}")
-                check(page.text_content("#read-pause") == "Play", "the held strip does not offer Play")
-                check(page.text_content("#read-aloud-label") == "Resume",
-                      "the strip's pause left the Read button saying Pause")
-                # `#451`: held, Play and Stop no longer share the solid fill. Play is hollow
-                # (the panel through it, its word in the warn colour), Stop keeps the fill.
-                fills = page.evaluate(
-                    "() => { const bg = (id) => getComputedStyle(document.getElementById(id)).backgroundColor;"
-                    " const ink = (id) => getComputedStyle(document.getElementById(id)).color;"
-                    " return {play: bg('read-pause'), stop: bg('read-stop'), playInk: ink('read-pause'),"
-                    " panel: getComputedStyle(document.getElementById('read-steer')).backgroundColor}; }")
-                check(fills["play"] != fills["stop"],
-                      f"the held Play is filled as Stop is: Play {fills['play']}, Stop {fills['stop']}")
-                check(fills["play"] == fills["panel"],
-                      f"the held Play is filled {fills['play']}, not hollow against its strip {fills['panel']}")
-                check(fills["playInk"] == fills["stop"],
-                      f"the held Play's word is {fills['playInk']}, not the fill's colour {fills['stop']}")
+                         "the Read button's Pause did not stop the audio clock at 393x852")
+                check(position(page) == "2 of 7", f"the pause moved the read to {position(page)}")
+                check(page.text_content("#read-aloud-label") == "Resume", "the held read does not offer Resume")
                 # The status pill stacks over the strip rather than under its top edge (`#433`).
                 page.evaluate("() => setStatus('held at the second block')")
                 pill_gap = float(page.evaluate(
@@ -973,10 +956,10 @@ def main() -> int:
                 check(pill_gap >= 4, f"the status pill stands {pill_gap:.1f}px into the strip at 393x852")
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / "9-phone-393-paused.png"))
-                press(page, "#read-pause", True)
+                press(page, "#read-aloud", True)
                 wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
-                         "the strip's Play did not resume the read at 393x852")
-                check(position(page) == "2 of 7", f"the strip's resume moved the read to {position(page)}")
+                         "the Read button's Resume did not resume the read at 393x852")
+                check(position(page) == "2 of 7", f"the resume moved the read to {position(page)}")
                 # At the foot of the list the last message scrolls clear of the strip: the room
                 # the composer keeps above itself grew by the strip's height (`#433`).
                 page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
@@ -991,9 +974,9 @@ def main() -> int:
                 check_mode_left(page, "393x852's bar")
                 context.close()
 
-            # 10. At 375x812, the narrow phone: the strip's five targets still stand in one line on
-            # the chips row, the bar has Pause and Stop side by side, the keyboard-up slim row keeps
-            # both (`#429`), and the strip's Stop leaves reading mode (`#442`).
+            # 10. At 375x812, the narrow phone: the strip's targets still stand in one line on the
+            # chips row, the bar has Pause and Stop side by side, the keyboard-up slim row keeps both
+            # (`#429`), and the bar's Stop leaves reading mode (`#442`).
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                 context, page = open_page(profile, 375, 812, True)
                 press(page, f"{row} .body", True)
@@ -1016,8 +999,8 @@ def main() -> int:
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / "10-phone-375-keyboard-row.png"))
                 page.evaluate("() => { delete document.documentElement.dataset.keyboard; }")
-                press(page, "#read-stop", True)
-                check_mode_left(page, "375x812's strip")
+                press(page, "#read-aloud-stop", True)
+                check_mode_left(page, "375x812's bar")
                 context.close()
 
             # 11. `#451`: on a desk, a one-block read started with s outside reading mode. It draws
@@ -1054,40 +1037,21 @@ def main() -> int:
                       "stopping the one-off read left reading mode on")
                 context.close()
 
-            # 11b. The same held strip in the dark, on a desk: Play hollow, Stop filled, there too.
-            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
-                context, page = open_page(profile, 1280, 800, False, scheme="dark")
-                press(page, f"{row} .body", False)
-                wait_position(page, "1 of 7")
-                press(page, "#read-pause", False)
-                wait_for(lambda: page.text_content("#read-pause") == "Play", 3,
-                         "the dark held strip does not offer Play")
-                dark_fills = page.evaluate(
-                    "() => { const bg = (id) => getComputedStyle(document.getElementById(id)).backgroundColor;"
-                    " return {play: bg('read-pause'), stop: bg('read-stop')}; }")
-                check(dark_fills["play"] != dark_fills["stop"],
-                      f"in the dark the held Play is filled as Stop is: Play {dark_fills['play']}, Stop {dark_fills['stop']}")
-                if args.screenshots:
-                    page.screenshot(path=str(args.screenshots / "11-desk-dark-paused.png"))
-                press(page, "#read-stop", False)
-                check_mode_left(page, "the dark desk's strip")
-                context.close()
-
         print(f"{browser_version}: 7 blocks walked at 412x915, 393x852, 375x812 and on a desk. Block boundaries, voice"
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
               f" (worst {worst}, the voice's waits {waits} ms); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
               f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms;"
               f" {underruns} underrun(s) inside a block, the host late with the audio."
               f" The strip's gap over the chips row: {gap412:.1f}px at 412x915, {gap393:.1f}px at 393x852,"
-              f" {gap_desk:.1f}px on a desk, {gap375:.1f}px at 375x812. Strip order Previous, k of n, Next, Pause,"
-              f" Stop in one line at 393, 375 and on a desk; the bar's Pause and Stop {bar375['readWidth']:.0f}px and"
+              f" {gap_desk:.1f}px on a desk, {gap375:.1f}px at 375x812. Strip order Previous, k of n, Next, no"
+              f" Pause or Stop, in one line at 393, 375 and on a desk; the bar's Pause and Stop {bar375['readWidth']:.0f}px and"
               f" {bar375['stopWidth']:.0f}px wide at 375 ({slim['readWidth']:.0f}/{slim['stopWidth']:.0f}px in the"
               f" keyboard-up row), {bar393['readWidth']:.0f}/{bar393['stopWidth']:.0f}px at 393,"
               f" {bar_desk['readWidth']:.0f}/{bar_desk['stopWidth']:.0f}px on a desk; dragged 300,250px and docked"
-              " again on a desk; a held Play hollow against Stop's fill, and a one-block read started"
+              " again on a desk; a one-block read started"
               " with s paused and stopped from a desk's bar. The first block's three sentences were lit in turn; highlight,"
-              " k of n, tap-to-jump, the timeline, Previous/Next, the media keys and Pause/Play by the"
-              " strip, the Read button and the media keys all move or hold the one read.")
+              " k of n, tap-to-jump, the timeline, Previous/Next, the media keys and Pause/Resume by the"
+              " Read button and the media keys all move or hold the one read.")
         return 0
     finally:
         api.stopping.set()

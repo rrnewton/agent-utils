@@ -206,7 +206,7 @@ const ALL_CHANNELS = "*";
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "page-update"
  *   | "pair-confirm" | "pair-dismiss"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-pause" | "read-prev" | "read-speed" | "read-steer-grip" | "read-stop" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-prev" | "read-speed" | "read-steer-grip" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send"
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
@@ -22009,8 +22009,9 @@ function renderControls() {
   // turned on, so it needs a visible way out that looks like a way out.
   //
   // `#434 read-aloud-pause`: while a read is actually playing the act is Pause, and while it is
-  // held it is Resume — the strip's Pause/Play and the media keys say the same, from the one
-  // state (`renderReadTransport`). With nothing playing it is "Stop" again, the way out above.
+  // held it is Resume — the media keys say the same, from the one state (`renderReadTransport`).
+  // `#537 scrub-bar-no-play-pause`: it is the only Pause on screen; the strip over the list steers.
+  // With nothing playing it is "Stop" again, the way out above.
   renderReadTransport();
   // `#451 read-strip-followups`: active for a read in progress as for the mode, so a read started
   // with s keeps the way-out colour and the keyboard-up slim row's Pause (`#429`), which both key
@@ -36784,7 +36785,7 @@ function showReadingPosition() {
   renderReadSteer();
 }
 
-/** The steering strip: Previous, "k of n", Next, Pause, while a read of several parts is playing. */
+/** The steering strip: Previous, "k of n", Next, while a read of several parts is playing (`#537`: no Pause). */
 function renderReadSteer() {
   const strip = el("read-steer");
   if (!strip) return;
@@ -37007,10 +37008,11 @@ function stepReading(delta) {
 }
 
 /**
- * `#434 read-aloud-pause`. ONE STATE PATH for pausing a read. The strip's Pause/Play, the Read
- * button (Pause while a read plays, Resume while it is held) and the media session's play/pause
- * all come here and nowhere else, so the three can never disagree about whether the voice is
- * held. `renderReadTransport` is its one rendering: every control that says the act reads it.
+ * `#434 read-aloud-pause`. ONE STATE PATH for pausing a read. The Read button (Pause while a read
+ * plays, Resume while it is held), the media session's play/pause and the keys all come here and
+ * nowhere else, so they can never disagree about whether the voice is held (`#537
+ * scrub-bar-no-play-pause` took the strip's own Pause/Play away: the bar has it).
+ * `renderReadTransport` is its one rendering: every control that says the act reads it.
  */
 function readingPaused() {
   return nowPlaying !== null && nowPlaying.paused === true;
@@ -37019,13 +37021,6 @@ function readingPaused() {
 /** What every transport control says now, from the one state: strip, Read button, data hooks. */
 function renderReadTransport() {
   const paused = readingPaused();
-  const hold = el("read-pause");
-  if (hold) {
-    hold.textContent = paused ? "Play" : "Pause";
-    hold.setAttribute("aria-label", paused ? "Play reading" : "Pause reading");
-    hold.setAttribute("aria-pressed", paused ? "true" : "false");
-    hold.disabled = nowPlaying === null;
-  }
   const strip = el("read-steer");
   if (strip) strip.setAttribute("data-paused", paused ? "true" : "false");
   const button = el("read-aloud");
@@ -55609,9 +55604,6 @@ el("read-speed-range").addEventListener("input", () => {
 el("read-prev").addEventListener("click", () => { stepReading(-1); });
 el("read-next").addEventListener("click", () => { stepReading(1); });
 
-// `#434 read-aloud-pause`. The strip's own hold on the read, by the one state path.
-el("read-pause").addEventListener("click", () => { toggleReadingPaused(); });
-
 // `#442 read-strip-order`. The strip moved on a desk, by its grip: pointer, keys, double-click home.
 el("read-steer-grip").addEventListener("pointerdown", onReadGripDown);
 el("read-steer-grip").addEventListener("pointermove", onReadGripMove);
@@ -55624,8 +55616,8 @@ if (typeof window.addEventListener === "function") window.addEventListener("resi
 
 el("read-aloud").addEventListener("click", () => {
   // `#434 read-aloud-pause`: while a read is playing or held, this button is its Pause/Resume —
-  // the strip's button and the media keys by another reach. Leaving the mode is what this button
-  // does with nothing playing, and what Stop beside it and on the strip do while a read plays
+  // the media keys by another reach. Leaving the mode is what this button does with nothing
+  // playing, and what Stop beside it does while a read plays
   // (`#442 read-strip-order`). `#451 read-strip-followups`: a read started with s outside the
   // mode pauses here too, where it used to enter the mode over a read still playing.
   if (readInProgress()) {
@@ -55651,12 +55643,11 @@ function leaveReadingMode() {
   const from = document.activeElement;
   if (readingMode) setReadingMode(false);
   else stopReading();
-  if (from && (from === el("read-stop") || from === el("read-aloud-stop"))) {
+  if (from && from === el("read-aloud-stop")) {
     const read = el("read-aloud");
     if (!read.hidden && typeof read.focus === "function") read.focus();
   }
 }
-el("read-stop").addEventListener("click", leaveReadingMode);
 el("read-aloud-stop").addEventListener("click", leaveReadingMode);
 
 /** Turn reading mode on or off. The one path in and out of it, whichever control asked. */

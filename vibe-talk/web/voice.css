@@ -6824,49 +6824,11 @@ a.search-hit-link {
   opacity: 0.45;
 }
 
-/* `#434 read-aloud-pause`. Pause, the control reached for without looking, filled stronger than
-   its neighbours; held (Play, pressed), it says so at a glance. Narrower than Previous and Next:
-   its word is shorter, and four targets and the count must still fit a phone in one line.
-   `#451 read-strip-followups`: held, Play is HOLLOW — the panel showing through, ringed and
-   worded in the warn colour — where Stop beside it keeps the solid warn fill it always had. The
-   two were both that fill, told apart only by a word against a square; now the fill itself says
-   which one ends the read. An inset ring rather than a thicker border, so holding a read does
-   not resize the strip on a 375px phone, where its line is measured to the pixel (`#442`). */
-#read-pause {
-  min-width: 4rem;
-  background: color-mix(in srgb, var(--warn) 38%, var(--panel));
-}
-
-#read-pause[aria-pressed="true"] {
-  background: var(--panel);
-  box-shadow: inset 0 0 0 1px var(--warn);
-  color: var(--warn);
-  font-weight: 700;
-}
-
 #read-steer-count {
   min-width: 3rem;
   font-size: 0.9rem;
   text-align: center;
   font-variant-numeric: tabular-nums;
-}
-
-/* `#442 read-strip-order`. Stop, last: the read ends and reading mode is left. A square, as on any
-   player, so a fifth target still lets the strip stand in one line on a 375px phone; its name is
-   its `aria-label`. The way out, so in the way-out colour, as the Read button's Stop is. */
-#read-stop {
-  min-width: 2.75rem;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--warn);
-  color: var(--on-warn, #10131a);
-}
-
-#read-stop svg {
-  width: 1rem;
-  height: 1rem;
 }
 
 /* The grip that moves the strip: drawn on a desk only (below). A phone keeps the strip docked. */

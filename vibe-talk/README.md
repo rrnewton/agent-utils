@@ -869,10 +869,11 @@ Under Previous and Next the strip draws the read as a **timeline of its blocks**
 (`#380 read-aloud-timeline`), each as wide as what it says: the blocks heard tinted, the one being
 read filled. A tap on one reads from there.
 
-The strip reads Previous, `k of n`, Next, Pause (Play while held) and Stop, in that order on screen
-and for Tab (`#442 read-strip-order`). While a read plays, the bar's Read button is its Pause, with
-Stop beside it, also in the slim row kept while the on-screen keyboard is up. Stop, on the strip or
-the bar, ends the read and leaves reading mode in one tap. On a desk the strip can be moved off what
+The strip reads Previous, `k of n` and Next, in that order on screen and for Tab
+(`#442 read-strip-order`); it has no Pause or Stop of its own (`#537 scrub-bar-no-play-pause`). While
+a read plays, the bar's Read button is its Pause (Resume while held), with Stop beside it, also in the
+slim row kept while the on-screen keyboard is up. Stop ends the read and leaves reading mode in one
+tap. On a desk the strip can be moved off what
 it covers by the grip at its left: drag it, or focus it and use the arrow keys (Shift for bigger
 steps). It stays inside the window and is remembered on that device; a double-click on the grip, or
 Home, puts it back on the chips row. On a phone it stays docked.
