@@ -1,13 +1,14 @@
 ---
 title: 'mark-own-messages-read: the owner''s own messages are never marked read'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - read-state
 created_at: 2026-10-26T15:11:54.825085807+00:00
-updated_at: 2026-10-26T15:11:54.825085807+00:00
+updated_at: 2026-10-26T18:23:09.616509318+00:00
+closed_at: 2026-10-26T18:23:09.616509218+00:00
 ---
 
 # Description
