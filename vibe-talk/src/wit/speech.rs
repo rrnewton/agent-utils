@@ -135,6 +135,18 @@ impl WitSpeech {
                 .synthesize(token, &chunk, &voice, pace)
                 .await
                 .map_err(shared_error)?;
+            // Validate BEFORE the cache: a malformed or silent answer is
+            // a failure of this read, never a result a re-tap replays.
+            // Each piece is checked on its own, so one silent sentence in
+            // a spoken message stops the read rather than playing as a
+            // gap the reader cannot tell from a pause.
+            parse_wav(&audio).map_err(shared_shape)?;
+            if is_silent(&audio) {
+                return Err(backend(
+                    "wit_silent_audio",
+                    "Wit.ai returned only silence for this message; nothing was played",
+                ));
+            }
             self.store(key, audio.clone()).await;
             pieces.push(audio);
         }
@@ -221,6 +233,11 @@ fn parse_wav(bytes: &[u8]) -> Result<Wav, WitError> {
     if audio_format != 1 || bits != 16 {
         return Err(shape("the WAV answer is not 16-bit PCM"));
     }
+    // A header the browser cannot play is not audio this server may hand
+    // back as success: no channels or no rate is silence by another name.
+    if channels == 0 || !(1..=384_000).contains(&sample_rate) {
+        return Err(shape("the WAV answer has no playable rate or channels"));
+    }
     let (data_start, data_len) = data.ok_or_else(|| shape("the WAV answer has no audio"))?;
     Ok(Wav {
         channels,
@@ -268,7 +285,13 @@ pub fn merge_wavs(pieces: &[Vec<u8>]) -> Result<Vec<u8>, WitError> {
     out.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0");
     out.extend_from_slice(&head.channels.to_le_bytes());
     out.extend_from_slice(&head.sample_rate.to_le_bytes());
-    out.extend_from_slice(&(head.sample_rate * u32::from(head.channels) * 2).to_le_bytes());
+    out.extend_from_slice(
+        &head
+            .sample_rate
+            .saturating_mul(u32::from(head.channels))
+            .saturating_mul(2)
+            .to_le_bytes(),
+    );
     out.extend_from_slice(&(head.channels * 2).to_le_bytes());
     out.extend_from_slice(&16_u16.to_le_bytes());
     out.extend_from_slice(b"data");
@@ -415,6 +438,27 @@ mod tests {
         let error = speech.speak("hello there", None).await.expect_err("bare");
         assert_eq!(error.code(), "wit_not_configured");
         assert!(error.to_string().contains("wit.token_file"));
+    }
+
+    #[tokio::test]
+    async fn a_silent_answer_is_never_cached() {
+        let fake = Arc::new(FakeWit::new());
+        let speech = WitSpeech::new(fake.clone(), config());
+        fake.be_silent();
+        assert!(speech.speak("again after silence", None).await.is_err());
+        fake.speak();
+        speech
+            .speak("again after silence", None)
+            .await
+            .expect("the vendor is asked again");
+        assert_eq!(fake.requests().len(), 2);
+    }
+
+    #[test]
+    fn a_wav_with_no_rate_is_not_playable_audio() {
+        let mut wav = fake_wav(&[500; 4]);
+        wav[24..28].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(merge_wavs(&[wav]).is_err());
     }
 
     #[tokio::test]

@@ -1746,11 +1746,27 @@ impl Config {
             get(ENV_SUMMARY_BACKEND),
             file.summaries,
         )?;
+        let read_aloud_backend = match get(ENV_READ_ALOUD_BACKEND) {
+            None => file.read_aloud.backend,
+            Some("browser") => ReadAloudBackend::Browser,
+            Some("elevenlabs") => ReadAloudBackend::ElevenLabs,
+            Some("conversation") => ReadAloudBackend::Conversation,
+            Some("wit") => ReadAloudBackend::Wit,
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    field: "read_aloud.backend".to_owned(),
+                    detail: format!(
+                    "unknown backend {other:?}; choose browser, elevenlabs, conversation, or wit"
+                ),
+                })
+            }
+        };
         let wit = wit_config(
             file.wit,
             get(ENV_WIT_TOKEN_FILE),
             get(ENV_WIT_VOICE),
             get(ENV_WIT_API_BASE),
+            read_aloud_backend == ReadAloudBackend::Wit,
         )?;
         let conversation = speech_hold_checked(file.conversation)?;
         let replay = replay_config(
@@ -1784,21 +1800,7 @@ impl Config {
             },
             channels,
             read_aloud: ReadAloudConfig {
-                backend: match get(ENV_READ_ALOUD_BACKEND) {
-                    None => file.read_aloud.backend,
-                    Some("browser") => ReadAloudBackend::Browser,
-                    Some("elevenlabs") => ReadAloudBackend::ElevenLabs,
-                    Some("conversation") => ReadAloudBackend::Conversation,
-                    Some("wit") => ReadAloudBackend::Wit,
-                    Some(other) => {
-                        return Err(ConfigError::Invalid {
-                            field: "read_aloud.backend".to_owned(),
-                            detail: format!(
-                                "unknown backend {other:?}; choose browser, elevenlabs, conversation, or wit"
-                            ),
-                        })
-                    }
-                },
+                backend: read_aloud_backend,
                 websocket_url: file.read_aloud.websocket_url,
             },
             speakable,
@@ -1847,6 +1849,7 @@ fn wit_config(
     token_file_env: Option<&str>,
     voice_env: Option<&str>,
     api_base_env: Option<&str>,
+    active: bool,
 ) -> Result<WitConfig, ConfigError> {
     let invalid = |field: &str, detail: String| ConfigError::Invalid {
         field: format!("wit.{field}"),
@@ -1864,7 +1867,11 @@ fn wit_config(
     let token_file = token_file_env
         .map(str::to_owned)
         .or_else(|| text(file.token_file));
-    let token = match token_file {
+    // The token file is read only when Wit.ai is the selected backend:
+    // a deployment reading through another voice is not stopped at
+    // startup by a Wit.ai file it never uses. An inline token is refused
+    // either way — a secret in the file is wrong whoever reads aloud.
+    let token = match token_file.filter(|_| active) {
         None => None,
         Some(named) => {
             let path = PathBuf::from(&named);

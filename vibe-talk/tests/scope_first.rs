@@ -128,6 +128,8 @@ fn inventory() -> Vec<Route> {
         route("GET", "/api/v1/live/tail", Ingest, Nothing),
         route("GET", "/api/v1/diagnostics", Read, Nothing),
         route("GET", "/api/v1/signed-url", Write, Nothing),
+        // `#552 wit-tts-provider`: public catalogue names for the Settings picker.
+        route("GET", "/api/v1/read-aloud/voices", Read, Nothing),
         // `#369 pairing-link`.
         route("POST", "/api/v1/pair", Write, Json(r#"{"ttl_seconds":60}"#)),
         route(

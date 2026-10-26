@@ -35736,7 +35736,10 @@ async function loadWitVoices() {
 
 /** Select where message audio is produced. The toggle itself never waits for either provider. */
 function setReadAudioSource(source, announce = true) {
+  // A stored "agent" from another server-audio backend means the Wit.ai
+  // voice on this one: the picker is the same choice under its own name.
   readAudioSource = source === "wit" && witReadAloud ? "wit"
+    : source === "agent" && witReadAloud ? "wit"
     : source === "agent" && agentReadAloud ? "agent" : "device";
   stopReading();
   forgetPreparedSpeech();
