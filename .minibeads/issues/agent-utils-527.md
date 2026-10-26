@@ -1,12 +1,13 @@
 ---
 title: 'herdr-run-idle-retention: keep few idle command tabs, reuse the least recently used one'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - herdr-run
 created_at: 2026-10-26T00:35:46.608143478+00:00
-updated_at: 2026-10-26T00:35:46.608143478+00:00
+updated_at: 2026-10-26T01:39:55.448730975+00:00
+closed_at: 2026-10-26T01:39:55.448730795+00:00
 ---
 
 # Description
