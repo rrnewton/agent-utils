@@ -333,6 +333,92 @@ PINS: tuple[Pin, ...] = (
         ),
     ),
     Pin(
+        "max-idle-tabs",
+        "`max_idle_tabs`: idle command tabs a workspace keeps",
+        code=(
+            Site(
+                "rs/herdr-run/src/config.rs",
+                r"(?m)^pub const DEFAULT_MAX_IDLE_TABS: u64 = (?P<value>[\d_]+);$",
+                "the Rust constant",
+            ),
+            Site(
+                "py/herdr_run/config.py",
+                r"(?m)^DEFAULT_MAX_IDLE_TABS = (?P<value>[\d_]+)$",
+                "the Python constant",
+            ),
+        ),
+        docs=(
+            Site(
+                "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
+                r"(?m)^max_idle_tabs: (?P<value>[\d_,]+)$",
+                "the value `herdr-run init` writes",
+            ),
+            Site(
+                "common/docs/herdr-run/USER_GUIDE.template.md",
+                r"`max_idle_tabs` \((?P<value>[\d_,]+)[^()]* by default\)",
+                "the idle cap the user guide states",
+            ),
+            Site(
+                "common/docs/herdr-run/rendered/python/USER_GUIDE.md",
+                r"`max_idle_tabs` \((?P<value>[\d_,]+)[^()]* by default\)",
+                "the idle cap the packaged Python guide states",
+            ),
+            Site(
+                "common/docs/herdr-run/rendered/rust/USER_GUIDE.md",
+                r"`max_idle_tabs` \((?P<value>[\d_,]+)[^()]* by default\)",
+                "the idle cap the packaged Rust guide states",
+            ),
+            Site(
+                "common/docs/herdr-run/QUICKSTART.md",
+                r"`max_idle_tabs` \((?P<value>[\d_,]+)\)",
+                "the idle cap the quickstart states",
+            ),
+        ),
+    ),
+    Pin(
+        "idle-tab-ttl-seconds",
+        "`idle_tab_ttl_seconds`: how long a finished command tab may sit idle",
+        code=(
+            Site(
+                "rs/herdr-run/src/config.rs",
+                r"(?m)^pub const DEFAULT_IDLE_TAB_TTL_SECONDS: f64 = (?P<value>[\d_]+)\.0;$",
+                "the Rust constant",
+            ),
+            Site(
+                "py/herdr_run/config.py",
+                r"(?m)^DEFAULT_IDLE_TAB_TTL_SECONDS = (?P<value>[\d_]+)\.0$",
+                "the Python constant",
+            ),
+        ),
+        docs=(
+            Site(
+                "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
+                r"(?m)^idle_tab_ttl_seconds: (?P<value>[\d_,]+)$",
+                "the value `herdr-run init` writes",
+            ),
+            Site(
+                "common/docs/herdr-run/USER_GUIDE.template.md",
+                r"`idle_tab_ttl_seconds` \((?P<value>[\d_,]+)[^()]* by default\)",
+                "the idle lifetime the user guide states",
+            ),
+            Site(
+                "common/docs/herdr-run/rendered/python/USER_GUIDE.md",
+                r"`idle_tab_ttl_seconds` \((?P<value>[\d_,]+)[^()]* by default\)",
+                "the idle lifetime the packaged Python guide states",
+            ),
+            Site(
+                "common/docs/herdr-run/rendered/rust/USER_GUIDE.md",
+                r"`idle_tab_ttl_seconds` \((?P<value>[\d_,]+)[^()]* by default\)",
+                "the idle lifetime the packaged Rust guide states",
+            ),
+            Site(
+                "common/docs/herdr-run/QUICKSTART.md",
+                r"`idle_tab_ttl_seconds` \((?P<value>[\d_,]+)\)",
+                "the idle lifetime the quickstart states",
+            ),
+        ),
+    ),
+    Pin(
         "retention-days",
         "`retention_days`: how long captured run output is kept",
         code=(

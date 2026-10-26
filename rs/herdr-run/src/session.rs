@@ -40,6 +40,9 @@ pub struct Target {
     pub created: Vec<String>,
     /// Whether the result came from a revalidated cache entry.
     pub from_cache: bool,
+    /// The pane lock, when resolution took this tab over from another agent and must hand the
+    /// lock it judged the tab under to the run ([`crate::evict::reuse_idle_tab`]).
+    pub reservation: Option<evict::PaneReservation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -129,20 +132,35 @@ fn resolve_target_locked<A: HerdrApi + ?Sized>(
                     tab_label,
                     created,
                     from_cache: true,
+                    reservation: None,
                 });
             }
         }
     }
 
+    let mut reservation = None;
     let (workspace_id, tab_id) = match client.workspace_id_for_label(&config.workspace)? {
         Some(workspace_id) => {
             let tab_id = match client.tab_id_for_label(&workspace_id, &tab_label)? {
                 Some(tab_id) => tab_id,
                 None => {
-                    enforce_pane_cap(client, config, &workspace_id, agent, Path::new("/proc"))?;
-                    let tab_id = client.create_tab(&workspace_id, &tab_label, cwd)?;
-                    created.push("tab".to_owned());
-                    tab_id
+                    if let Some(reuse) = evict::reuse_idle_tab(
+                        client,
+                        config,
+                        &workspace_id,
+                        agent,
+                        &tab_label,
+                        epoch_seconds_now(),
+                        Path::new("/proc"),
+                    ) {
+                        reservation = Some(reuse.reservation);
+                        reuse.tab_id
+                    } else {
+                        enforce_pane_cap(client, config, &workspace_id, agent, Path::new("/proc"))?;
+                        let tab_id = client.create_tab(&workspace_id, &tab_label, cwd)?;
+                        created.push("tab".to_owned());
+                        tab_id
+                    }
                 }
             };
             (workspace_id, tab_id)
@@ -159,6 +177,16 @@ fn resolve_target_locked<A: HerdrApi + ?Sized>(
     };
 
     let pane_id = pane_of_tab(client, &workspace_id, &tab_id)?;
+    if let Some(held) = &reservation {
+        if held.pane_id != pane_id {
+            // Judged unsplit under the lock a moment ago; a different pane now means somebody
+            // rearranged the tab, and the lock held is not this pane's.
+            return Err(HerdrRunError::unavailable(format!(
+                "tab {tab_id} was taken over for this agent with pane {} but now holds pane {pane_id}; nothing was executed",
+                held.pane_id
+            )));
+        }
+    }
     let target = Target {
         workspace_id,
         tab_id,
@@ -167,11 +195,18 @@ fn resolve_target_locked<A: HerdrApi + ?Sized>(
         tab_label,
         created,
         from_cache: false,
+        reservation,
     };
     // The cache is deliberately non-authoritative. A read-only or damaged spool must not turn a
     // usable live Herdr session into a failed command.
     let _ = store_cache(&path, &key, &target);
     Ok(target)
+}
+
+fn epoch_seconds_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
 /// Make room for ANOTHER tab once the workspace is already at `max_panes`, or refuse.
@@ -445,6 +480,7 @@ mod tests {
                 tab_label: field(4),
                 created: Vec::new(),
                 from_cache: false,
+                reservation: None,
             };
             store_cache(&path, row[1].as_str().unwrap(), &target).unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), row[3], "{row:?}");
@@ -695,6 +731,8 @@ mod tests {
         pane_prefix: String,
         /// When set, `tab close` reports success but the listing never changes.
         sticky_close: bool,
+        /// Labels given by `tab rename` or planted by a test, consulted before the filler rule.
+        labels: Mutex<BTreeMap<String, String>>,
     }
 
     impl CapFake {
@@ -720,6 +758,7 @@ mod tests {
                 closed: Mutex::new(Vec::new()),
                 pane_prefix: pane_prefix.to_owned(),
                 sticky_close: false,
+                labels: Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -750,6 +789,15 @@ mod tests {
         }
 
         fn tab_id_for_label(&self, _workspace_id: &str, label: &str) -> Result<Option<String>> {
+            if let Some((tab, _)) = self
+                .labels
+                .lock()
+                .expect("labels")
+                .iter()
+                .find(|(_, value)| value.as_str() == label)
+            {
+                return Ok(Some(tab.clone()));
+            }
             let panes = self.panes.lock().expect("panes");
             Ok(panes
                 .iter()
@@ -770,7 +818,11 @@ mod tests {
             Ok(format!("t{index}"))
         }
 
-        fn rename_tab(&self, _tab_id: &str, _label: &str) -> Result<()> {
+        fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
+            self.labels
+                .lock()
+                .expect("labels")
+                .insert(tab_id.to_owned(), label.to_owned());
             Ok(())
         }
 
@@ -889,6 +941,88 @@ mod tests {
         assert_eq!(fake.closed(), ["t1"]);
         assert_eq!(fake.creates(), 1);
         assert_eq!(fake.panes(None).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Record one finished run in `pane` (tab `t<index>`), finished `age` seconds ago.
+    fn record_finished_run(root: &Path, pane: &str, tab: &str, agent: &str, age: u64, shell: i64) {
+        let directory = root
+            .join(".herdr-run")
+            .join("runs")
+            .join(format!("run-{pane}"));
+        fs::create_dir_all(&directory).expect("run directory");
+        let record = serde_json::json!({
+            "agent": agent, "pane_id": pane, "run_id": format!("run-{pane}"), "exit_code": 0,
+            "tab": {"id": tab, "label": agent},
+            "workspace": {"id": "w1", "label": "agent-cmds"},
+            "readiness": {
+                "shell_pid": shell,
+                "shell_start_ticks": crate::identity::process_start_ticks(shell, Path::new("/proc")),
+                "boot_id": crate::identity::current_boot_id(Path::new("/proc")),
+            },
+        });
+        fs::write(directory.join("meta.json"), record.to_string()).expect("meta");
+        let marker = directory.join("exit_code");
+        fs::write(&marker, "0\n").expect("marker");
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+        fs::File::open(&marker)
+            .expect("open marker")
+            .set_modified(when)
+            .expect("age marker");
+    }
+
+    #[test]
+    fn a_new_agent_takes_over_the_least_recently_used_idle_tab_once_the_idle_pool_is_full() {
+        let root = temporary_root("reuse");
+        let mut config = config(&root);
+        let prefix = format!("reuse-{}-p", std::process::id());
+        let fake = CapFake::holding_panes(&prefix, 2);
+        let mut leader = idle_session_leader();
+        let pid = i64::from(leader.id());
+        for _ in 0..200 {
+            if evict::scan_session(pid, Path::new("/proc")).shell_sid == Some(pid) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for index in 0..2 {
+            let pane = format!("{prefix}{index}");
+            fake.idle.lock().expect("idle").insert(pane.clone(), pid);
+            fake.labels
+                .lock()
+                .expect("labels")
+                .insert(format!("t{index}"), format!("old-{index}"));
+            record_finished_run(
+                &root,
+                &pane,
+                &format!("t{index}"),
+                &format!("old-{index}"),
+                60 - index * 30,
+                pid,
+            );
+        }
+
+        // Below the cap a new agent gets a tab of its own, and the idle ones are left alone.
+        config.max_idle_tabs = 3;
+        let fresh = resolve_target(&fake, &config, "below", false).expect("new tab");
+        assert_eq!(fresh.created, ["tab"]);
+        assert!(fresh.reservation.is_none());
+
+        // At the cap the least recently used idle tab (t0, finished 60 s ago) is taken over.
+        config.max_idle_tabs = 2;
+        let taken = resolve_target(&fake, &config, "newcomer", false).expect("reused");
+        let _ = leader.kill();
+        let _ = leader.wait();
+        assert_eq!(taken.tab_id, "t0");
+        assert_eq!(taken.pane_id, format!("{prefix}0"));
+        assert!(taken.created.is_empty(), "{:?}", taken.created);
+        let held = taken
+            .reservation
+            .as_ref()
+            .expect("the verdict's lock is handed on");
+        assert_eq!(held.pane_id, taken.pane_id);
+        assert_eq!(fake.creates(), 1);
+        assert!(fake.closed().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1136,6 +1270,7 @@ mod tests {
                     tab_label: format!("agent-{index}"),
                     created: Vec::new(),
                     from_cache: false,
+                    reservation: None,
                 };
                 barrier.wait();
                 store_cache(&path, &format!("key-{index}"), &target).unwrap();

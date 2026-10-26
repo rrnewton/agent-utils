@@ -153,20 +153,31 @@ spool_dir: .herdr-run
 # and incomplete runs are kept regardless of age. The audit log is never pruned.
 retention_days: 4
 
-# At most this many panes in the workspace; 0 disables the cap. When a NEW tab is needed at the cap,
-# the least-recently-used tab whose shell is provably idle is closed to make room; only when every
-# tab is busy is the new tab refused. Existing tabs are never refused, and a tab running a command
-# is never closed. `herdr-run reap` reports which tabs are provably finished with.
+# At most this many panes in the workspace; 0 disables the cap. This is the ceiling on commands
+# running at once. When a NEW tab is needed at the cap, the least-recently-used tab whose shell is
+# provably idle is closed to make room; only when every tab is busy is the new tab refused.
+# Existing tabs are never refused, and a tab running a command is never closed. `herdr-run reap`
+# reports which tabs are provably finished with.
 max_panes: 32
+
+# How many IDLE command tabs the workspace keeps; 0 disables this cap. Every idle tab is another
+# pane the Herdr server tracks, so past this many the least recently used idle tabs are closed when
+# any run finishes, and a new agent that needs a tab takes over the least recently used idle one
+# (renaming it) instead of opening another. Below the cap a new agent gets a tab of its own, so an
+# agent that pauses between commands finds its tab again. Tabs with a command in flight are never
+# counted, so this never limits how many commands run at once; max_panes does that. Idle is judged
+# as below, under the pane lock, before any tab is closed or taken over.
+max_idle_tabs: 3
 
 # Seconds a tab may sit idle after its last recorded run finished before it is closed; 0 disables
 # this. Only a tab a surviving run record names is considered, every recorded run in it must have
 # finished, and its shell must be provably idle by the same rules the pane cap uses, judged under
 # the pane lock immediately before the close -- a tab running a command, holding a background job,
-# locked by another runner, or split into several panes is never closed. Runs sweep a bounded
-# number of expired tabs when they finish; `herdr-run sweep --idle` is the same sweep on demand
-# (add `--dry-run` to judge without closing). Tabs no run record names are left to `reap`.
-idle_tab_ttl_seconds: 900
+# locked by another runner, or split into several panes is never closed. Every run sweeps the
+# workspace by both idle bounds when it finishes; `herdr-run sweep --idle` is the same sweep on
+# demand, for a timer where runs are rare (add `--dry-run` to judge without closing). Tabs no run
+# record names are left to `reap`.
+idle_tab_ttl_seconds: 300
 
 # The remote `herdr-run net-doctor` probes with `git ls-remote`.
 probe_remote: https://github.com/git/git

@@ -16,9 +16,11 @@ from __future__ import annotations
 import fcntl
 import itertools
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from herdr_run.audit import make_private_dirs
 from herdr_run.client import HerdrClient
@@ -26,6 +28,9 @@ from herdr_run.config import Config, render_tab_name
 from herdr_run.errors import HerdrUnavailable
 from herdr_run.state import open_lock_file, session_lock_path
 from herdr_run.textfmt import json_text, quote, strict_json_loads
+
+if TYPE_CHECKING:
+    from herdr_run.evict import PaneReservation
 
 __all__ = ["Target", "resolve_target", "tab_label_for", "cache_path"]
 
@@ -41,6 +46,9 @@ class Target:
     tab_label: str
     created: tuple[str, ...]
     from_cache: bool
+    #: The pane lock, when resolution took this tab over from another agent and must hand the lock
+    #: it judged the tab under to the run (:func:`herdr_run.evict.reuse_idle_tab`).
+    reservation: PaneReservation | None = None
 
 
 def tab_label_for(config: Config, agent: str) -> str:
@@ -312,6 +320,7 @@ def _resolve_target_locked(
 
     workspace_id = client.workspace_id_for_label(config.workspace)
     tab_id: str | None = None
+    reservation: PaneReservation | None = None
     if workspace_id is None:
         # A new workspace arrives with one default tab; rename it into our schema instead of adding
         # a second one, so the common first-run case leaves exactly one tab behind.
@@ -324,13 +333,36 @@ def _resolve_target_locked(
     else:
         tab_id = client.tab_id_for_label(workspace_id, tab_label)
         if tab_id is None:
-            _enforce_pane_cap(client, config, workspace_id, agent)
-            tab_id = client.create_tab(
-                workspace_id=workspace_id, label=tab_label, cwd=cwd
-            )
-            created.append("tab")
+            # Imported here, not at module level: evict reaches session through sweep.
+            from herdr_run.evict import reuse_idle_tab
 
-    pane_id = _pane_of_tab(client, workspace_id, tab_id)
+            reuse = reuse_idle_tab(
+                client, config, workspace_id, agent, tab_label, now=time.time()
+            )
+            if reuse is not None:
+                reservation = reuse.reservation
+                tab_id = reuse.tab_id
+            else:
+                _enforce_pane_cap(client, config, workspace_id, agent)
+                tab_id = client.create_tab(
+                    workspace_id=workspace_id, label=tab_label, cwd=cwd
+                )
+                created.append("tab")
+
+    try:
+        pane_id = _pane_of_tab(client, workspace_id, tab_id)
+    except BaseException:
+        if reservation is not None:
+            reservation.lock.close()
+        raise
+    if reservation is not None and reservation.pane_id != pane_id:
+        # Judged unsplit under the lock a moment ago; a different pane now means somebody
+        # rearranged the tab, and the lock held is not this pane's.
+        reservation.lock.close()
+        raise HerdrUnavailable(
+            f"tab {tab_id} was taken over for this agent with pane {reservation.pane_id} but now "
+            f"holds pane {pane_id}; nothing was executed"
+        )
     target = Target(
         workspace_id=workspace_id,
         tab_id=tab_id,
@@ -339,6 +371,7 @@ def _resolve_target_locked(
         tab_label=tab_label,
         created=tuple(created),
         from_cache=False,
+        reservation=reservation,
     )
     try:
         _store_cache(path, key, target)

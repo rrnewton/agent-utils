@@ -112,10 +112,10 @@
       "now": 1800000000.0,
       "ttl_seconds": 900.0,
       "expected": [
-        {"pane_id": "p1", "tab_id": "t1", "last_run": "r1", "agent": "alpha", "tab_panes": 1, "recorded": true, "finished_at": 1799999099.0, "expired": true, "reason": "last run finished more than the idle TTL ago"},
-        {"pane_id": "p2", "tab_id": "t2", "last_run": "r2", "agent": "bravo", "tab_panes": 1, "recorded": true, "finished_at": 1799999100.0, "expired": false, "reason": "last run finished within the idle TTL"},
-        {"pane_id": "p3", "tab_id": "t3", "last_run": "r3", "agent": "charlie", "tab_panes": 1, "recorded": true, "finished_at": 1799999101.0, "expired": false, "reason": "last run finished within the idle TTL"},
-        {"pane_id": "p4", "tab_id": "t4", "last_run": null, "agent": null, "tab_panes": 1, "recorded": false, "finished_at": null, "expired": false, "reason": "no recorded run"}
+        {"pane_id": "p1", "tab_id": "t1", "last_run": "r1", "agent": "alpha", "tab_panes": 1, "recorded": true, "finished_at": 1799999099.0, "settled": true, "expired": true, "reason": "last run finished more than the idle TTL ago"},
+        {"pane_id": "p2", "tab_id": "t2", "last_run": "r2", "agent": "bravo", "tab_panes": 1, "recorded": true, "finished_at": 1799999100.0, "settled": true, "expired": false, "reason": "last run finished within the idle TTL"},
+        {"pane_id": "p3", "tab_id": "t3", "last_run": "r3", "agent": "charlie", "tab_panes": 1, "recorded": true, "finished_at": 1799999101.0, "settled": true, "expired": false, "reason": "last run finished within the idle TTL"},
+        {"pane_id": "p4", "tab_id": "t4", "last_run": null, "agent": null, "tab_panes": 1, "recorded": false, "finished_at": null, "settled": false, "expired": false, "reason": "no recorded run"}
       ]
     },
     {
@@ -128,7 +128,20 @@
       "now": 1800000000.0,
       "ttl_seconds": 900.0,
       "expected": [
-        {"pane_id": "p1", "tab_id": "t1", "last_run": "r2", "agent": "alpha", "tab_panes": 1, "recorded": true, "finished_at": null, "expired": false, "reason": "1 run(s) for this pane have no recorded exit_code"}
+        {"pane_id": "p1", "tab_id": "t1", "last_run": "r2", "agent": "alpha", "tab_panes": 1, "recorded": true, "finished_at": null, "settled": false, "expired": false, "reason": "1 run(s) for this pane have no recorded exit_code"}
+      ]
+    },
+    {
+      "name": "a later finished run in the same pane proves an earlier run without an exit code ended",
+      "panes": [["p1", "t1"]],
+      "records": [
+        {"pane_id": "p1", "run_id": "r1", "agent": "alpha", "exit_code": null},
+        {"pane_id": "p1", "run_id": "r2", "agent": "alpha", "exit_code": 0, "finished_at": 1700000000.0}
+      ],
+      "now": 1800000000.0,
+      "ttl_seconds": 900.0,
+      "expected": [
+        {"pane_id": "p1", "tab_id": "t1", "last_run": "r2", "agent": "alpha", "tab_panes": 1, "recorded": true, "finished_at": 1700000000.0, "settled": true, "expired": true, "reason": "last run finished more than the idle TTL ago"}
       ]
     },
     {
@@ -141,7 +154,7 @@
       "now": 1800000000.0,
       "ttl_seconds": 900.0,
       "expected": [
-        {"pane_id": "p1", "tab_id": "t1", "last_run": "r2", "agent": "beta", "tab_panes": 1, "recorded": true, "finished_at": 1799999990.0, "expired": false, "reason": "last run finished within the idle TTL"}
+        {"pane_id": "p1", "tab_id": "t1", "last_run": "r2", "agent": "beta", "tab_panes": 1, "recorded": true, "finished_at": 1799999990.0, "settled": true, "expired": false, "reason": "last run finished within the idle TTL"}
       ]
     },
     {
@@ -155,9 +168,9 @@
       "now": 1800000000.0,
       "ttl_seconds": 900.0,
       "expected": [
-        {"pane_id": "p1", "tab_id": "t1", "last_run": "r1", "agent": null, "tab_panes": 2, "recorded": true, "finished_at": null, "expired": false, "reason": "the finish time of this pane's last recorded run is unknown"},
-        {"pane_id": "p2", "tab_id": "t1", "last_run": "r2", "agent": null, "tab_panes": 2, "recorded": true, "finished_at": null, "expired": false, "reason": "the finish time of this pane's last recorded run is unknown"},
-        {"pane_id": "p3", "tab_id": "t3", "last_run": "r3", "agent": null, "tab_panes": 1, "recorded": true, "finished_at": null, "expired": false, "reason": "the finish time of this pane's last recorded run is unknown"}
+        {"pane_id": "p1", "tab_id": "t1", "last_run": "r1", "agent": null, "tab_panes": 2, "recorded": true, "finished_at": null, "settled": false, "expired": false, "reason": "the finish time of this pane's last recorded run is unknown"},
+        {"pane_id": "p2", "tab_id": "t1", "last_run": "r2", "agent": null, "tab_panes": 2, "recorded": true, "finished_at": null, "settled": false, "expired": false, "reason": "the finish time of this pane's last recorded run is unknown"},
+        {"pane_id": "p3", "tab_id": "t3", "last_run": "r3", "agent": null, "tab_panes": 1, "recorded": true, "finished_at": null, "settled": false, "expired": false, "reason": "the finish time of this pane's last recorded run is unknown"}
       ]
     },
     {
@@ -169,7 +182,7 @@
       "now": 1800000000.0,
       "ttl_seconds": 0.0,
       "expected": [
-        {"pane_id": "p1", "tab_id": "t1", "last_run": "r1", "agent": "alpha", "tab_panes": 1, "recorded": true, "finished_at": 1700000000.0, "expired": false, "reason": "the idle TTL is disabled"}
+        {"pane_id": "p1", "tab_id": "t1", "last_run": "r1", "agent": "alpha", "tab_panes": 1, "recorded": true, "finished_at": 1700000000.0, "settled": true, "expired": false, "reason": "the idle TTL is disabled"}
       ]
     }
   ]

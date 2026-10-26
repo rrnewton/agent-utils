@@ -17,6 +17,7 @@ from typing import cast
 import pytest
 
 import herdr_run.state as state
+from herdr_run.identity import current_boot_id, process_start_ticks
 from herdr_run.client import HerdrClient
 from herdr_run.config import Config
 from herdr_run.errors import ConfigError, HerdrUnavailable
@@ -382,6 +383,70 @@ def _idle_session_leader() -> subprocess.Popen[bytes]:
         assert time.monotonic() < deadline, "setsid child never became a session leader"
         time.sleep(0.01)
     return child
+
+
+def _record_finished_run(
+    config: Config, pane_id: str, tab_id: str, agent: str, age: float, shell: int
+) -> None:
+    """Plant one finished run in ``pane_id``, its completion marker aged ``age`` seconds."""
+    directory = os.path.join(config.project_root, config.spool_dir, "runs", f"run-{agent}")
+    os.makedirs(directory)
+    document = {
+        "agent": agent,
+        "pane_id": pane_id,
+        "run_id": f"run-{agent}",
+        "exit_code": 0,
+        "tab": {"id": tab_id, "label": agent},
+        "workspace": {"id": "w1", "label": config.workspace},
+        "readiness": {
+            "shell_pid": shell,
+            "shell_start_ticks": process_start_ticks(shell),
+            "boot_id": current_boot_id(),
+        },
+    }
+    with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    marker = os.path.join(directory, "exit_code")
+    with open(marker, "w", encoding="utf-8") as handle:
+        handle.write("0\n")
+    stamp = time.time() - age
+    os.utime(marker, (stamp, stamp))
+
+
+def test_a_new_agent_takes_over_the_least_recently_used_idle_tab_once_the_idle_pool_is_full(
+    tmp_path: object,
+) -> None:
+    root = str(tmp_path)
+    fake = FakeHerdrClient()
+    config = _config(root, max_idle_tabs=3)
+    _fill_workspace(fake, config, 2)
+    fillers = fake.panes()
+    child = _idle_session_leader()
+    try:
+        for index, pane in enumerate(fillers):
+            fake.busy_panes.discard(pane.pane_id)
+            fake.shell_pids[pane.pane_id] = child.pid
+            _record_finished_run(
+                config, pane.pane_id, pane.tab_id, f"filler-{index}", 60 - 30 * index, child.pid
+            )
+
+        # Below the cap a new agent gets a tab of its own, and the idle ones are left alone.
+        fresh = resolve_target(_client(fake), config, "below", use_cache=False)
+        assert fresh.created == ("tab",)
+        assert fresh.reservation is None
+
+        # At the cap the least recently used idle tab (filler-0, finished 60 s ago) is taken over.
+        config = _config(root, max_idle_tabs=2)
+        taken = resolve_target(_client(fake), config, "newcomer", use_cache=False)
+    finally:
+        child.kill()
+        child.wait()
+    assert (taken.tab_id, taken.pane_id) == (fillers[0].tab_id, fillers[0].pane_id)
+    assert taken.created == ()
+    assert taken.reservation is not None and taken.reservation.pane_id == taken.pane_id
+    assert f"rename_tab({fillers[0].tab_id},newcomer)" in fake.calls
+    assert fake.closed_tabs == []
+    taken.reservation.lock.close()
 
 
 def test_pane_cap_replaces_the_least_recently_used_idle_tab(tmp_path: object) -> None:

@@ -86,7 +86,7 @@ herdr-run init --upgrade           # bring the one here up to date with this rel
 herdr-run target                   # resolve/bring up the pane; print ids and readiness
 herdr-run config                   # print the effective configuration as JSON
 herdr-run reap                     # report which command tabs are provably finished. Closes nothing.
-herdr-run sweep --idle             # close command tabs idle past idle_tab_ttl_seconds (--dry-run reports)
+herdr-run sweep --idle             # close idle tabs past idle_tab_ttl_seconds or max_idle_tabs (--dry-run reports)
 herdr-run net-doctor               # smoke-test one narrow scenario (see below)
 herdr-run userguide                # this document
 ```
@@ -554,9 +554,12 @@ herdr-run: replaced idle tab 7 (pane 7-1, agent builder-3, last run 2026-10-01T0
 
 Only when **no** tab qualifies does bring-up fail with exit 69. The message names the remedy and
 says, for the first three tabs it considered, why each stayed open (`pane 4-1: foreground pgid 812
-!= shell pid 790; running: cargo`). One window remains: an agent whose tab is replaced after it resolved
-the tab but before it took the pane lock finds its pane gone and fails its readiness check before
-anything is typed; retrying brings up a fresh tab.
+!= shell pid 790; running: cargo`). A target is resolved before its pane lock is taken, so a tab can be
+replaced, retired, or taken over for another agent (below) in between. Once it holds the pane lock,
+and before anything is typed, `run` checks that the tab still carries this agent's label; when it
+does not, the run prints `herdr-run: tab … was closed or handed to another agent after it was
+resolved. Nothing was executed. Resolving the tab again.` on stderr and resolves once more, never
+from the cache. A second loss in a row is reported as pane busy (75).
 
 The cap is **per workspace**, while the measurement behind the number is **per server**. Nine
 projects each with their own `workspace:` and each sitting at 31 panes reproduce the measured
@@ -600,11 +603,13 @@ workspace is nearly full.
 A tab is reported STALE only when all three hold, each of them positive evidence:
 
 1. **No in-flight work** — every run naming the pane recorded an `exit_code`. A run without one is
-   the agent-is-thinking case, and it wins over every other signal. That state is written when a
-   command outlives its timeout: it is still running in a pane nobody owns, so the run is recorded
-   with a null exit code rather than not recorded at all. If the command later finishes, its
-   `exit_code` file is re-read on the next sweep, so one timeout cannot make a pane permanently
-   unreapable.
+   the agent-is-thinking case, and it wins over every other signal. A command that outlives its
+   timeout is recorded with a null exit code, because it is still running in a pane nobody owns.
+   If the command later finishes, its `exit_code` file is re-read on the next sweep, so one timeout
+   cannot make a pane permanently unreapable. (Every run is in fact recorded with a null exit code
+   while its command runs, and rewritten when it finishes; that is what keeps the idle sweeps below
+   from counting a busy tab as idle. `reap` reads only runs whose target was resolved afresh, not
+   from the session cache.)
 2. **The pane's shell is gone** — herdr still lists the pane, but `/proc` says the shell pid it
    reports does not exist. Note this is the PANE shell, not the trailing PID in the run directory
    name: that one is the short-lived `herdr-run` CLI and is dead for every completed run, so a
@@ -621,33 +626,109 @@ for every pane it declined and a count for every verdict including the zeros, be
 because nothing was stale" and "reaped 0 because the detector is inert" are otherwise the same
 output.
 
-#### The idle lifetime
+#### Idle retention: the lifetime and the idle cap
 
 Neither the cap nor `reap` ever closes a tab merely because its agent has gone away: the cap
-closes only to make room, and `reap` closes nothing at all. So without a lifetime every command
-workspace fills to `max_panes` idle shells and stays there for as long as the server runs.
-`idle_tab_ttl_seconds` (900 seconds by default) is that lifetime. A tab is retired when **every**
-recorded run in it finished, the last one more than the TTL ago — measured from the completion
-marker's mtime, the same reading retention ages a run by — and its shell passes the cap's idle
-verdict above, taken under the pane lock immediately before the close. Expiry only selects the
-candidates; it never authorises a close on its own, so a tab running a command, holding a
-background job, locked by another runner, or split into several panes is kept, with the reason
-reported.
+closes only to make room, and `reap` closes nothing at all. So without retention every command
+workspace fills to `max_panes` idle shells and stays there for as long as the server runs. Two
+bounds retire idle tabs, and both judge idleness the same way.
+
+`idle_tab_ttl_seconds` (300 seconds by default) bounds how LONG a tab lingers. A tab is retired
+when **every** recorded run in it finished, the last one more than the TTL ago — measured from the
+completion marker's mtime, the same reading retention ages a run by.
+
+`max_idle_tabs` (3 by default) bounds how MANY linger. The TTL alone lets a burst of agents leave
+one idle tab each for the whole TTL, and every one is another pane the Herdr server tracks. Past
+this many idle tabs, the least recently used are retired however recent they are. A tab counts as
+idle when every recorded run in it finished and its last finish is known; a tab with a command in
+flight is never counted, so this cap never limits how many commands run at once — `max_panes` does
+that. The count is read from the run records, so the tabs kept are not probed; only the ones past
+the cap are. For both bounds a run without an exit code counts as finished once a later run in the
+same tab has finished: runs in one tab are serialised by its lock and by the idle check, so the
+later run proves the earlier one ended (a command interrupted before it could record its exit code
+would otherwise pin its tab forever).
+
+The cap also changes how a new agent gets a tab. When an agent with no tab of its own arrives and
+the workspace already holds `max_idle_tabs` idle tabs, a new tab would only push the least recently
+used idle one out when the run finished; instead herdr-run takes that tab over, renames it for the
+new agent, and runs the command there. Below the cap the new agent gets a fresh tab, so an agent
+that pauses between commands finds its own tab again. A command shares nothing with the previous
+one in a reused pane: each is typed as `command sh -c '…cd <dir> && <argv>…'` and its output is
+collected from its own spool files. The previous owner's cached target still names the pane; its
+next command finds the tab under another label once it holds the pane lock and resolves afresh, as
+described under the pane cap above. Each takeover is reported on
+stderr and appended to the audit log as a `REUSED` entry naming the new agent as `agent`, with
+`previous_agent`, `tab_label`, `pane_id`, `tab_id`, `workspace_id`, `last_run` and `last_run_at`:
+
+```text
+herdr-run: reused idle tab 7 (pane 7-1, agent builder-3, last run 2026-10-01T09:00:00Z) for 'tester-9' rather than open another past max_idle_tabs 3
+```
+
+Rank or expiry only selects the candidates; neither authorises a close or a takeover on its own.
+Each candidate passes the cap's idle verdict above, under the pane lock, immediately before the
+close or the rename, after a fresh read of the run records confirms its last run is still the one
+ranked and still finished. A tab running a command, holding a background job, locked by another
+runner, or split into several panes is kept, with the reason reported. A takeover additionally
+requires that the live tab still carries the label its last run recorded and that the pane's shell
+is the recorded process (pid, start tick, and boot), so a tab a human renamed and adopted, or a
+pane or tab ID Herdr reissued after a restart, is never handed to an agent. A tab taken over keeps
+that pane lock until its new agent's command has been typed and collected, so nothing can type into
+the pane between the verdict and the command.
+
+The cap is a budget for agents that pause, not a limit on agents. With more agents active than
+`max_idle_tabs`, an agent that pauses may find its tab closed or taken over, and its next command
+costs a fresh resolution (a probe and a rename, or a new tab). If your agents routinely pause
+between commands in larger numbers than the cap, raise it.
 
 The candidate set is `reap`'s: panes a surviving run record names, in scope under the current
-configuration. A tab with no record is never retired this way; `reap` judges those, and the cap
-replaces them first. The retention bound applies equally: a tab whose records were pruned is
-invisible here.
+configuration. A tab with no record is never retired or taken over this way; `reap` judges those,
+and the cap replaces them first. The retention bound applies equally: a tab whose records were
+pruned is invisible here.
 
-Retirement happens in two places. A finished `run` sweeps opportunistically — at most four
-expired tabs examined, never its own — so the cleanup happens as a side effect of the work that
-creates the tabs and cannot silently stop the way a timer can; a failure to sweep is a warning
-and never changes the run's result. Each sweep first lists the workspace and reads the
-surviving run records, which retention bounds; the four-tab bound limits the probing that
-follows. `herdr-run sweep --idle` is the same sweep without the bound, for a timer or an
-operator; `--dry-run` judges every tab the way `reap`'s survey does — without the pane lock,
-so it can name a tab the real sweep would keep for its lock — and closes nothing. Both print a line per close on stderr and append a
-`RETIRED` entry to the audit log. Set `idle_tab_ttl_seconds: 0` to disable retirement entirely.
+Every finished `run` sweeps the workspace by both bounds, never closing its own tab (which counts
+as the most recently used idle tab). The whole sweep runs every time: one listing and a read of
+the surviving run records, then a probe per tab past a bound. It is a side effect of the work that
+creates the tabs, so it cannot silently stop the way a timer can; a failure to sweep is a warning
+and never changes the run's result. `herdr-run sweep --idle` is the same sweep on demand. Its JSON
+names, for every tab closed, the bound that chose it (`cause`: `idle_tab_ttl_seconds` or
+`max_idle_tabs`) and, for every recorded tab kept, why; `--dry-run` judges every tab the way
+`reap`'s survey does — without the pane lock, so it can name a tab the real sweep would keep for
+its lock — and closes nothing. Both print a line per close on stderr and append a `RETIRED` entry,
+with its `cause`, to the audit log. Set either bound to 0 to disable it.
+
+On a host where commands are rare, nothing runs the sweep at the end of a run, and tabs left by
+the last burst stay until the next one. A user timer closes the gap; run it as the account that
+owns the Herdr server, from the project directory so the project's `.herdr-run.yaml` applies:
+
+```ini
+# ~/.config/systemd/user/herdr-run-sweep.service
+[Unit]
+Description=Close idle herdr-run command tabs
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/src/my-project
+# The absolute path of the herdr-run your agents use; systemd does not search PATH.
+ExecStart=%h/.local/bin/herdr-run sweep --idle
+```
+
+```ini
+# ~/.config/systemd/user/herdr-run-sweep.timer
+[Unit]
+Description=Close idle herdr-run command tabs every ten minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable it with `systemctl --user daemon-reload && systemctl --user enable --now
+herdr-run-sweep.timer`, and read what each pass did with `journalctl --user -u
+herdr-run-sweep.service`. A workspace herdr cannot list is reported in the JSON's
+`listing_error` with exit 0, so a timer firing before the first command is not a failure.
 
 ### Audit log
 

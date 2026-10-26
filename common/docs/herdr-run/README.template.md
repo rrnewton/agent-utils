@@ -45,9 +45,11 @@ says so before it starts.
   CPU, every control call timing out). At the `max_panes` ceiling a NEW tab replaces the
   least-recently-used tab whose shell is provably idle, and is refused only when every tab is busy;
   an existing tab is never refused, a running command never closed, and `herdr-run reap` reports
-  which tabs are provably finished with. A tab whose last recorded run finished more than
-  `idle_tab_ttl_seconds` ago is retired under the same idle rules -- opportunistically by later
-  runs, or on demand with `herdr-run sweep --idle` -- so a workspace does not sit at the ceiling.
+  which tabs are provably finished with. Idle tabs are kept few under the same idle rules: past
+  `max_idle_tabs` the least recently used are retired, a new agent takes over the least recently
+  used idle tab instead of opening another, and a tab whose last recorded run finished more than
+  `idle_tab_ttl_seconds` ago is retired -- by every run as it finishes, or on demand with
+  `herdr-run sweep --idle` -- so a workspace holds about as many tabs as it runs commands.
 - **Visible, best-effort audit.** Refusals, admissions, failures, and completions are appended to a
   private JSONL log. Storage failures warn but never replace a completed command's exit status.
 
@@ -76,7 +78,7 @@ herdr-run check '<command>'      policy only: allowed or refused. Touches no pan
 herdr-run target                 resolve/bring up the pane; print ids and readiness
 herdr-run config                 print the effective configuration
 herdr-run reap                   report which command tabs are provably finished. Closes nothing.
-herdr-run sweep --idle           close command tabs idle past idle_tab_ttl_seconds (--dry-run reports)
+herdr-run sweep --idle           close idle command tabs past idle_tab_ttl_seconds or max_idle_tabs
 herdr-run net-doctor             smoke-test one scenario: a caller whose own network is blocked
 herdr-run quickstart             the one-screen introduction
 herdr-run userguide              the full user guide

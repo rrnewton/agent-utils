@@ -919,6 +919,7 @@ _CONFIG_KEYS: tuple[str, ...] = (
     "deny_subcommand",
     "deny_subcommand_option",
     "idle_tab_ttl_seconds",
+    "max_idle_tabs",
     "max_panes",
     "prefixes",
     "probe_remote",
@@ -2593,7 +2594,7 @@ def _sweep_idle(harness: Harness, report: Report) -> None:
         and '"considered": 0' in python.stdout
         and '"closed": []' in python.stdout
         and '"would_close": []' in python.stdout
-        and '"idle_tab_ttl_seconds": 900.0' in python.stdout
+        and '"idle_tab_ttl_seconds": 300.0' in python.stdout
         and "herdr has no workspace labelled" in python.stdout,
         "an inert sweep must still print its own shape, its TTL, and why it could not list: "
         f"{_describe(python)}",
@@ -4362,6 +4363,48 @@ def _e2e_run_and_report(harness: Harness, report: Report, shim: Path) -> None:
             _run_step(*a, "run", "printf 1", rc=0),
         ],
         expect=[(2, '"closed": 0'), (2, "the idle TTL is disabled")],
+    )
+
+    # The idle cap: past max_idle_tabs idle tabs the least recently used is retired at the end of
+    # a run, and a new agent takes over the least recently used idle tab once the pool is full.
+    def lower_the_idle_cap(edition: _E2EEdition) -> None:
+        (edition.project / ".herdr-run.yaml").write_text(config + "max_idle_tabs: 1\n", encoding="utf-8")
+
+    e2e.case(
+        "idle-cap-retires-least-recently-used",
+        config + "max_idle_tabs: 2\n",
+        [
+            _run_step("--agent", "a1", "run", "printf 1", rc=0),
+            _run_step("--agent", "a2", "run", "printf 2", rc=0),
+            _do("lower max_idle_tabs to 1", lower_the_idle_cap),
+            _run_step("--agent", "a1", "run", "printf 3", rc=0),
+            _run_step("sweep", "--idle", "--dry-run", rc=0),
+            _run_step("reap", rc=0),
+        ],
+        expect=[
+            (3, "less recently used than the 1 idle tab(s) max_idle_tabs keeps"),
+            (4, '"would_close": 0'),
+            (4, '"max_idle_tabs": 1'),
+            (5, '"GONE": 1'),
+        ],
+    )
+    e2e.case(
+        "idle-cap-reuses-least-recently-used",
+        config + "max_idle_tabs: 2\n",
+        [
+            _run_step("--agent", "a1", "run", "printf 1", rc=0),
+            _run_step("--agent", "a2", "run", "printf 2", rc=0),
+            _run_step("--agent", "a3", "run", "printf 3", rc=0),
+            _run_step("--agent", "a1", "run", "printf 4", rc=0),
+            _run_step("--agent", "a3", "status", rc=0),
+            _run_step("reap", rc=0),
+        ],
+        expect=[
+            (2, "reused idle tab"),
+            (2, "for 'a3' rather than open another past max_idle_tabs 2"),
+            (3, "reused idle tab"),
+            (5, '"SHELL_ALIVE": 2'),
+        ],
     )
 
     # The pane cap: the least recently used idle tab makes room; a busy one never does.
