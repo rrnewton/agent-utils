@@ -86,3 +86,32 @@ not captured).
 - headings as real headings: the converted path posts Slack header blocks
   for `#` headings, and the vibe-talk shim maps header blocks back to
   Markdown headings, so a heading round-trips as a heading.
+
+## Addendum: headings as headings (#551 headings-real-headings)
+
+Two more posts in the same test thread, approved by the coordinator.
+
+1. **Probe.** One app post with caller-supplied Block Kit blocks (header,
+   mrkdwn section, header, rich_text) and a mrkdwn fallback. Read back:
+   - `content` (all three formats) is the fallback text alone.
+   - `rich_content` lists every block, header and section included
+     (`header` / `plain_text` / `end_header`, and `section` / `section_text` /
+     `mrkdwn` / …), with `rich_content_complete` true.
+   - The vendor's own `--markdown` conversion, by contrast, leaves its header
+     blocks out of `rich_content` (see the first run above).
+   - The vibe-talk instance's then-current shim showed the fallback text.
+2. **Headings check.** `corpus/01-report.md` by the new converted path, which
+   sends headings as header blocks and the rest as sections, with today's
+   mrkdwn as the fallback. Read back:
+   - `rich_content` is complete: section (label line), header, section,
+     header, section.
+   - **The stored `content` has every newline turned into a space**: for a
+     blocks post, the fallback comes back as one run-on line.
+   - The new shim release rebuilds the message from the blocks. Its output,
+     rendered by vibe-talk's renderer (Slack dialect), draws both headings as
+     `<h2>`, with the lists, tables-as-code, quote and code intact.
+   - The shim then running on the vibe-talk instance shows the run-on fallback
+     instead. So the shim must switch before the bridge's helper does.
+
+Not verified: how the official Slack client draws the header blocks, because
+no one could check it by eye from this lane.
