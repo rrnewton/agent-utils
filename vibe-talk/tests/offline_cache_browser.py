@@ -419,7 +419,9 @@ class ReplyApi(FakeApi):
 
     def timeline(self, query: dict[str, list[str]]) -> Json:
         answer = super().timeline(query)
-        return {**answer, "dismissed": [*answer["dismissed"], ARCHIVED_REPLY]}
+        dismissed = answer["dismissed"]
+        assert isinstance(dismissed, list)
+        return {**answer, "dismissed": [*dismissed, ARCHIVED_REPLY]}
 
 
 # `#214 reply-arrow` and `#215 reply-coalesce`. A thread and the replies around it.
@@ -649,7 +651,9 @@ class TileApi(FakeApi):
 
     def timeline(self, query: dict[str, list[str]]) -> Json:
         answer = super().timeline(query)
-        return {**answer, "dismissed": [*answer["dismissed"], "202"]}
+        dismissed = answer["dismissed"]
+        assert isinstance(dismissed, list)
+        return {**answer, "dismissed": [*dismissed, "202"]}
 
     def summary(self, message_id: str) -> tuple[int, Json]:
         if message_id == FAILED_SUMMARY_ROW:
