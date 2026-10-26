@@ -1,6 +1,6 @@
 ---
 title: 'local-tts-provider: a local CPU voice for read-aloud'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - read-aloud
 - voice
 created_at: 2026-10-26T22:07:46.156399043+00:00
-updated_at: 2026-10-26T22:07:46.156399043+00:00
+updated_at: 2026-10-26T23:42:12.196092691+00:00
+closed_at: 2026-10-26T23:42:12.196092540+00:00
 ---
 
 # Description
