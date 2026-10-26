@@ -261,6 +261,8 @@ mod tests {
     fn a_thread(id: &str, is_root: bool) -> MessageThread {
         MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: id.to_owned(),
             root_message_id: Some(MessageId("1".to_owned())),
             is_root,

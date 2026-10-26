@@ -4103,6 +4103,8 @@ async fn post_each(
                         // message that had no replies yet said so; the page draws it as one.
                         one.thread = Some(crate::threads::MessageThread {
                             hue: None,
+                            display_name: None,
+                            summary: None,
                             id: thread.clone(),
                             root_message_id: Some(one.id.clone()),
                             is_root: true,

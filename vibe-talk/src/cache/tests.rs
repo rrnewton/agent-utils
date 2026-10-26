@@ -936,6 +936,8 @@ fn a_deleted_root_with_replies_leaves_its_replies_in_their_thread() {
     let mut root = m(1);
     root.thread = Some(MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         id: "m1".to_owned(),
         root_message_id: Some(mid("m1")),
         is_root: true,
@@ -1247,6 +1249,8 @@ fn thread_records_need_replies_and_their_activity_only_moves_forward() {
     let mut unanswered = m(1);
     unanswered.thread = Some(MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         id: "m1".to_owned(),
         root_message_id: Some(mid("m1")),
         is_root: true,
@@ -1489,6 +1493,8 @@ fn a_bounded_flat_page_never_deletes_a_reply_or_stamps_a_thread() {
             let mut root = m(i * 10);
             root.thread = Some(MessageThread {
                 hue: None,
+                display_name: None,
+                summary: None,
                 id: root.id.0.clone(),
                 root_message_id: Some(root.id.clone()),
                 is_root: true,
@@ -2131,6 +2137,8 @@ fn a_channel_erase_cascades_everywhere_and_the_index_stays_intact() {
     let mut root = m(1);
     root.thread = Some(MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         id: "m1".to_owned(),
         root_message_id: Some(mid("m1")),
         is_root: true,
@@ -2234,6 +2242,8 @@ fn with_a_thread(tag: &str) -> (Fixture, ChanKey, Scope) {
     let mut root = m(1);
     root.thread = Some(MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         id: "m1".to_owned(),
         root_message_id: Some(mid("m1")),
         is_root: true,

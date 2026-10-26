@@ -894,6 +894,8 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
                         .ok_or_else(|| ChatError::Shape("thread object has no id".to_owned()))?;
                     Ok(crate::threads::MessageThread {
                         hue: None,
+                        display_name: None,
+                        summary: None,
                         id: id.to_owned(),
                         root_message_id: Some(MessageId(field("id")?)),
                         is_root: true,

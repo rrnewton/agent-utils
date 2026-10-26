@@ -97,12 +97,20 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   counted as a phone's card wraps it — word by word at 36 characters, measured in Chromium at 393x852 —
   by the server and the page alike, so a wider card shows the same words in fewer lines. A first
   message longer than that is summarised from its first reply, where a short one waits for a third
-  message (`#484 summary-card-threshold`), and goes under its card as above. Until a summary comes —
-  summaries off, failing, or still being written — it is split: the card shows its first lines and
-  **…**, and unpacked, the rest is the first row under the card, starting **…**: the first message's own
-  row, its author and time, with no buttons of its own, so a reply, a reaction or Done from it is the
-  first message's. When the summary arrives the card takes it where it stands. A link to the first
-  message, opened over these cards, lands on its card.
+  message (`#484 summary-card-threshold`), and goes under its card as above. A card shows the first
+  message as its row does, lists, line breaks, code and links, and stops only between lines, never
+  inside a line, a list item, a code block or a quote (`#528 thread-card-markdown-and-cap`). While a
+  summary is being written (the server says it names threads) the card shows those first lines and the
+  message is already under it whole, so only the card's words change when the summary arrives; the
+  thread list is read again within seconds meanwhile. A summary already written comes with the page: a
+  thread's root carries its name and sentence on every read, and on the device's saved copy. Without a
+  summary (summaries off, or none a minute after the thread last moved) it is split: the card shows its
+  first lines and **…**, and unpacked, the rest is the first row under the card, starting **…**,
+  formatted, a numbered list going on with its numbers: the first message's own row, its author and
+  time, with no buttons of its own, so a reply, a reaction or Done from it is the first message's. A
+  first paragraph longer than the card on its own is not split: the card shows its first lines, clamped,
+  and the whole message is under it. A link to the first message, opened over these cards, lands on
+  its card.
 * **Two columns**, on a desk at least 1000px wide, put Main on the left and the same thread list on
   the right, where a thread chosen from it opens under its own card, moved up to the top of the column,
   still in its colour and still joined by its line to the thread's first message on the left; the

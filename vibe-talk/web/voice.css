@@ -9105,6 +9105,55 @@ li.discord-message[data-root-continuation] > .thread-replies {
   max-height: none;
 }
 
+/*
+ * `#528 thread-card-markdown-and-cap`. A card saying its root says it as the root's row does: the
+ * root's own body (`.md`, web/voice.js `cardView`), its lists, line breaks and code, a little tighter
+ * between blocks than a row, as a card is a heading. Its links are underlined words, not
+ * links (`.card-link`): the card is a button.
+ */
+.side-card-text .md > * + *,
+.side-card-text .md :is(li, blockquote) > * + * {
+  margin-top: 0.3em;
+}
+
+.side-card-text .md li + li,
+.side-card-text .md li > :is(ul, ol) {
+  margin-top: 0.1em;
+}
+
+.side-card-text .card-link {
+  color: inherit;
+  text-decoration: underline;
+}
+
+.side-card-text .card-ellipsis {
+  color: var(--muted);
+}
+
+/*
+ * A first unit longer than K on its own — one long paragraph — is clamped (`data-card-clamp`): shown
+ * whole, highlighted or opened, to K lines, its root under it whole when unpacked: the one card whose
+ * words a clamp may cut, because they are all in the row under it. Collapsed, to the reader's
+ * collapsed lines as every card is, or K where that is fewer. K is `--card-max-lines`, written by
+ * web/voice.js `applyCardMaxLines`. The card at the top of a thread keeps its own clamp.
+ */
+.side-card-row[data-card-clamp][data-highlighted] > .side-card > .side-card-text,
+.side-card-row[data-card-clamp][data-card-state="expanded"] > .side-card > .side-card-text,
+.side-card-row[data-card-clamp][data-card-state="unpacked"] > .side-card > .side-card-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--card-max-lines, 5);
+  line-clamp: var(--card-max-lines, 5);
+  overflow: hidden;
+  max-height: calc(var(--card-max-lines, 5) * 1.35em);
+}
+
+.side-card-row[data-card-clamp][data-card-state="collapsed"]:not([data-highlighted]) > .side-card > .side-card-text {
+  -webkit-line-clamp: min(var(--card-max-lines, 5), max(1, var(--collapsed-lines)));
+  line-clamp: min(var(--card-max-lines, 5), max(1, var(--collapsed-lines)));
+  max-height: calc(min(var(--card-max-lines, 5), max(1, var(--collapsed-lines))) * 1.35em);
+}
+
 .side-card-facts {
   grid-column: 1;
   display: flex;

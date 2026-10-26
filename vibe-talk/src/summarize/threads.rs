@@ -1003,7 +1003,13 @@ impl ThreadNames {
                 page.threads
                     .iter()
                     .chain(page.thread.iter())
-                    .map(|summary| summary.root.as_ref()),
+                    .map(|summary| summary.root.as_ref())
+                    .chain(
+                        page.messages
+                            .iter()
+                            .filter(|message| is_root(message))
+                            .map(Some),
+                    ),
             )
             .await;
         if !deps.summarizer.names_threads() {
@@ -1053,6 +1059,8 @@ impl ThreadNames {
                 }
             }
         }
+        self.name_roots(deps, channel, &mut page.messages, max_lines)
+            .await;
         if request.view == TimelineView::Threads && request.after.is_some() {
             // A thread renamed since the page was read may have shrunk under the threshold
             // while it was being named: its delta copy is served by the same rule (`#484`).
@@ -1073,6 +1081,47 @@ impl ThreadNames {
                         .parse::<jiff::Timestamp>()
                         .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
                 });
+            }
+        }
+    }
+
+    /// Put each named thread's name and sentence on its root among `messages`, by the rule a thread
+    /// list's copy is served by (`#484 summary-card-threshold`, `#522 thread-card-max-lines`).
+    /// `#528 thread-card-markdown-and-cap`: Main's page, and every other, then brings a thread's
+    /// summary with its root, so a page draws the summary card from the read that drew the root, and
+    /// from its saved copy on a reload, where it used to wait for a read of the thread list — which
+    /// a page sends after Main's, and then at most once a minute. Nothing is queued here: what is
+    /// due is queued by the thread list's read, as before. A root under the threshold is not looked
+    /// up at all, so a page of roots nobody has answered asks the store nothing.
+    async fn name_roots(
+        &self,
+        deps: &ThreadDeps,
+        channel: &ChannelId,
+        messages: &mut [Message],
+        max_lines: usize,
+    ) {
+        for message in messages.iter_mut() {
+            let Some(thread) = message.thread.as_ref().filter(|thread| thread.is_root) else {
+                continue;
+            };
+            let long_root = root_overflows_card(Some(message), max_lines);
+            if !thread_summary_shown(thread.reply_count, thread.reply_count_exact, long_root) {
+                continue;
+            }
+            let id = thread.id.clone();
+            let (name, sentence) = match self.lookup(deps, channel, &id).await {
+                Lookup::Known(Some(record)) => (
+                    Some(record.name),
+                    record.sentence.map(|sentence| {
+                        super::cut_for_serving(&sentence.summary, deps.sentence_chars)
+                    }),
+                ),
+                Lookup::Known(None) => continue,
+                Lookup::Unknown(name) => (name, None),
+            };
+            if let Some(thread) = message.thread.as_mut() {
+                thread.display_name = name;
+                thread.summary = sentence;
             }
         }
     }
@@ -1669,6 +1718,11 @@ fn activity_of(snapshot: &ThreadSummary) -> jiff::Timestamp {
 /// copy back.
 fn not_older(arriving: &ThreadSummary, held: &ThreadSummary) -> bool {
     (activity_of(arriving), arriving.reply_count) >= (activity_of(held), held.reply_count)
+}
+
+/// Whether `message` is a thread's root, by its own thread record.
+fn is_root(message: &Message) -> bool {
+    message.thread.as_ref().is_some_and(|thread| thread.is_root)
 }
 
 /// Serve neither half of a thread known to be under the summary threshold, whoever filed

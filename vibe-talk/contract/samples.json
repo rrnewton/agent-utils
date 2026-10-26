@@ -186,6 +186,7 @@
         "level_dbfs": -42
       },
       "speech_prep_enabled": true,
+      "thread_names_supported": true,
       "threading_supported": true,
       "token_scope": "write",
       "transcript_records_supported": true,

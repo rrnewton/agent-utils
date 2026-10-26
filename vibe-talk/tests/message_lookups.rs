@@ -58,6 +58,8 @@ fn thread_message(id: &str, n: i64, content: &str) -> Message {
         noise: false,
         thread: Some(MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: THREAD.to_owned(),
             root_message_id: Some(MessageId("t0".to_owned())),
             is_root: id == "t0",

@@ -21,7 +21,9 @@ use vibe_talk::summarize::threads::{
     name_key, sentence_key, FiledName, FiledSentence, ThreadDeps, ThreadNames,
 };
 use vibe_talk::testing::{self, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
-use vibe_talk::threads::{ThreadSummary, TimelinePage, TimelineRequest, TimelineView};
+use vibe_talk::threads::{
+    MessageThread, ThreadSummary, TimelinePage, TimelineRequest, TimelineView,
+};
 
 // --- a local Messages API -----------------------------------------------------------------------
 
@@ -314,6 +316,23 @@ impl Threads {
         }
     }
 
+    /// Thread `n`'s root as Main carries it: its own record says it heads the thread.
+    fn main_root(&self, n: usize) -> Message {
+        let summary = self.summary(n);
+        let mut root = summary.root.expect("a root");
+        root.thread = Some(MessageThread {
+            id: summary.id,
+            root_message_id: Some(root.id.clone()),
+            is_root: true,
+            reply_count: summary.reply_count,
+            reply_count_exact: true,
+            hue: None,
+            display_name: None,
+            summary: None,
+        });
+        root
+    }
+
     fn grow(&self, n: usize, to: u64) {
         self.replies.lock().unwrap()[n] = to;
     }
@@ -380,6 +399,11 @@ impl ChatClient for Threads {
                     ..TimelinePage::default()
                 })
             }
+            TimelineView::Main => Ok(TimelinePage {
+                messages: vec![self.main_root(0), self.main_root(1)],
+                has_threads: true,
+                ..TimelinePage::default()
+            }),
             _ => Ok(TimelinePage::default()),
         }
     }
@@ -692,6 +716,99 @@ async fn a_root_too_long_for_its_card_is_named_from_its_first_reply() {
         .expect("a sentence filed");
     let sentence: FiledSentence = serde_json::from_str(&filed.text).unwrap();
     assert_eq!(sentence.at, 2, "filed at the root and its one reply");
+}
+
+const MAIN: &str = "/api/v1/channels/2222222222/timeline?view=main";
+
+/// Each root on a page of Main: its id, and the name and sentence its record carries.
+fn root_names_of(body: &Value) -> Vec<(String, Option<String>, Option<String>)> {
+    body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|message| {
+            (
+                message["id"].as_str().unwrap().to_owned(),
+                message["thread"]["display_name"]
+                    .as_str()
+                    .map(str::to_owned),
+                message["thread"]["summary"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn main_brings_a_named_threads_name_and_sentence_on_its_root() {
+    // `#528 thread-card-markdown-and-cap`: a page draws its cards from the read that brought their
+    // roots, and from that read's saved copy on a reload, instead of waiting for a read of the
+    // thread list, which it sends after Main's and then at most once a minute.
+    let h = harness();
+    h.threads.root_says(0, SIX_LINE_ROOT);
+    h.threads.grow(0, 1);
+    h.threads.grow(1, 1);
+    let (status, before) = call(&h.app, MAIN, WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert!(
+        root_names_of(&before)
+            .iter()
+            .all(|(_, name, sentence)| name.is_none() && sentence.is_none()),
+        "a root named a thread nobody has named: {before}"
+    );
+    // Main queues nothing: the thread list's read names the long root's thread, as before.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.names.pending() + h.names.named(),
+        0,
+        "Main's read queued a naming"
+    );
+    let (_, list) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    assert_eq!(list["threads"].as_array().map(Vec::len), Some(2));
+    until_named(&h.names, 1).await;
+    let (_, listed) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let (_, after) = call(&h.app, MAIN, WRITE_TOKEN).await;
+    let roots = root_names_of(&after);
+    let listed = names_of(&listed);
+    assert_eq!(roots[0].0, "root-0");
+    assert!(
+        roots[0].1.is_some() && roots[0].2.is_some(),
+        "the long root's record names nothing: {after}"
+    );
+    assert_eq!(
+        (&roots[0].1, &roots[0].2),
+        (&listed[0].1, &listed[0].2),
+        "the root's record and the thread list disagree"
+    );
+    // The short root's thread, one reply and unnamed, is left alone (`#484`).
+    assert_eq!(roots[1], ("root-1".to_owned(), None, None));
+    // A read token is served what is filed, as the thread list serves it.
+    let (_, read) = call(&h.app, MAIN, READ_TOKEN).await;
+    assert_eq!(
+        root_names_of(&read),
+        roots,
+        "a read token was served other names"
+    );
+}
+
+#[tokio::test]
+async fn client_config_says_whether_this_server_names_threads() {
+    // `#528 thread-card-markdown-and-cap`: the page waits for a long root's summary only where one
+    // can come.
+    let h = harness();
+    let (status, body) = call(&h.app, "/api/v1/client-config", WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["thread_names_supported"], json!(true));
+    let (state, _discord) = testing::state();
+    let (_, body) = call(
+        &vibe_talk::http::router(state),
+        "/api/v1/client-config",
+        WRITE_TOKEN,
+    )
+    .await;
+    assert!(
+        body.get("thread_names_supported").is_none(),
+        "a server that cannot name threads says it can: {body}"
+    );
 }
 
 #[tokio::test]

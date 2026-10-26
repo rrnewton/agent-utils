@@ -135,6 +135,8 @@ impl NativeThread {
     fn membership(&self, root: bool) -> MessageThread {
         MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: self.id.clone(),
             root_message_id: Some(MessageId(self.id.clone())),
             is_root: root,
@@ -833,6 +835,8 @@ impl HttpDiscordClient {
                 // root still offers Thread and Reply's start option through the common record.
                 message.thread = Some(MessageThread {
                     hue: None,
+                    display_name: None,
+                    summary: None,
                     id: message.id.0.clone(),
                     root_message_id: Some(message.id.clone()),
                     is_root: true,
@@ -1734,6 +1738,8 @@ fn confirm_bridge_post(
         None => {
             message.thread = Some(MessageThread {
                 hue: None,
+                display_name: None,
+                summary: None,
                 id: thread.to_owned(),
                 root_message_id: None,
                 is_root: false,
@@ -3026,6 +3032,8 @@ mod tests {
             posted.thread,
             Some(MessageThread {
                 hue: None,
+                display_name: None,
+                summary: None,
                 id: "opaque/thread".into(),
                 root_message_id: None,
                 is_root: false,

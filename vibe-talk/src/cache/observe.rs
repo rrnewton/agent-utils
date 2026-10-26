@@ -764,6 +764,8 @@ mod tests {
         Message {
             thread: Some(MessageThread {
                 hue: None,
+                display_name: None,
+                summary: None,
                 id: id.to_owned(),
                 root_message_id: Some(MessageId(id.to_owned())),
                 is_root: true,

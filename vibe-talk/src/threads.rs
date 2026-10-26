@@ -132,6 +132,17 @@ pub struct MessageThread {
     /// every device, and the page never recolours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hue: Option<u16>,
+    /// On a thread's ROOT, the thread's name as [`ThreadSummary::display_name`] gives it: what a
+    /// summariser filed, served by the same rule (`#484 summary-card-threshold`). `#528
+    /// thread-card-markdown-and-cap`: a page that holds a root draws its thread's summary card from
+    /// the read that brought the root, and from its saved copy on a reload, rather than waiting for
+    /// a read of the thread list. Absent on replies, until named, and from an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// On a thread's root, the thread's sentence as [`ThreadSummary::summary`] gives it, under the
+    /// same rule as `display_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// One thread in the thread list, independent of the underlying provider's channel model.

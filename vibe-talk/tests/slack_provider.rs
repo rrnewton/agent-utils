@@ -909,6 +909,8 @@ async fn a_message_nobody_has_answered_heads_its_own_empty_thread_which_its_firs
         lone.thread,
         Some(MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: fresh.clone(),
             root_message_id: Some(mid(&fresh)),
             is_root: true,

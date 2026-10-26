@@ -57,6 +57,8 @@ fn message(id: &str, thread: Option<&str>) -> Message {
         noise: false,
         thread: thread.map(|thread| MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: thread.to_owned(),
             root_message_id: None,
             is_root: false,

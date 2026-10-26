@@ -33,6 +33,8 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
         noise: false,
         thread: thread.then(|| MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: THREAD.to_owned(),
             root_message_id: Some(MessageId("10".to_owned())),
             is_root: id == "10",

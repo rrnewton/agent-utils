@@ -1910,6 +1910,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         channel_registration_supported: page.channelRegistrationSupported,
         channel_discovery_supported: page.channelDiscoverySupported,
         threading_supported: page.threadingSupported,
+        // `#528 thread-card-markdown-and-cap`. Absent unless a test says the server names threads.
+        thread_names_supported: page.threadNamesSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
         // `#232 upstream-mark-read`. Absent unless a test says the provider can clear its unread
         // state, as the server omits it when false.
@@ -4812,6 +4814,14 @@ const TUNING_BANDS = {
     "how many characters one card line is counted at, the same as src/threads.rs CARD_LINE_CHARS: " +
     "the server and the page must count a root's lines alike, or a thread is split that the " +
     "server named early, or left long that it did not (#522 thread-card-max-lines)"],
+  CARD_INDENTED_CHARS: [28, 34,
+    "how many characters one card line of a list item or a quote is counted at: the card's 36 less " +
+    "its indent; much under, a short list splits early, and at 36 or over an indented card draws " +
+    "more lines than K (#528 thread-card-markdown-and-cap)"],
+  SUMMARY_WAIT_MS: [30000, 120000,
+    "how long after a thread's last activity a card waits for its summary in the summary's layout " +
+    "before it splits: under the summariser's own timeout a summary still coming is given up on, and " +
+    "past two minutes a summary that failed holds a card in the wrong layout (#528 thread-card-markdown-and-cap)"],
   ELIDED_MIN_WORDS: [5, 20,
     "the fewest hidden words a fold's label claims: under five the floor is too near nothing to " +
     "say anything is hidden, past twenty a fold over a paragraph says nothing (#244 elision-word-count)"],
@@ -52998,6 +53008,8 @@ const cardOf = (page, id) => {
 const cardPart = (page, id, name) => {
   const row = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id);
   const part = row ? row.descendants().find((node) => node.className === name) : null;
+  // `#528 thread-card-markdown-and-cap`: a card saying its root says it as the root's body, line by line.
+  if (part && name === "side-card-text" && part.children.length) return drawnLines(part).join("\n");
   return part ? part.text() : null;
 };
 /** The timeline reads made since `from`, as their views: "thread", "main", "flat", "threads". */
@@ -53019,7 +53031,8 @@ const headerCard = (page, id = "side-thread-card") => {
     thread: card.getAttribute("data-thread"),
     state: card.getAttribute("data-thread-state"),
     hue: card.style.getPropertyValue("--thread-hue"),
-    text: words ? words.textContent : null,
+    // `#528 thread-card-markdown-and-cap`: a card saying its root says it as the root's body, line by line.
+    text: words ? (words.children.length ? drawnLines(words).join("\n") : words.textContent) : null,
     title: button.getAttribute("title"),
     age: page.el(`${id}-age`).textContent,
     count: count.hidden ? "" : count.text(),
@@ -53387,8 +53400,9 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   await page.settle();
   await page.settle();
   const said = cardPart(page, "spaces/A/threads/long", "side-card-text");
-  // `#489 card-root-lines`: line by line, as the message is drawn.
-  assert.ok(said && said.startsWith("a long first message\nthat runs over several lines and on"), `the long card says ${said}`);
+  // `#489 card-root-lines`: line by line, as the message is drawn; `#528 thread-card-markdown-and-cap`:
+  // stopping between them, after the first paragraph, where the second would take the card past K.
+  assert.equal(said, "a long first message…", `the long card says ${said}`);
 });
 
 test("`#229 desktop-two-column`: every way into a thread selects it on the right — its tag, its N replies, a card — and a plain tap does not", async () => {
@@ -80872,10 +80886,61 @@ async function unpackCard(page, id) {
   assert.equal(cardRow(page, id).getAttribute("data-card-state"), "unpacked", `${id} did not unpack`);
 }
 
+/** Block tags: a line ends at each one's edges when a body is read line by line (`drawnLines`). */
+const DRAWN_BLOCKS = new Set(["p", "li", "ol", "ul", "pre", "h1", "h2", "h3", "h4", "blockquote", "div", "table", "tr", "hr"]);
+
+/**
+ * What a drawn body says line by line, as a reader sees it: a line at each block's edge and each line
+ * break, a numbered item led by its number — counted from its list's `start` — and a bullet by "•".
+ * `#528 thread-card-markdown-and-cap`: how a test sees that formatting, numbering included, survived.
+ */
+function drawnLines(node) {
+  const lines = [""];
+  const end = () => {
+    if (lines[lines.length - 1].trim() !== "") lines.push("");
+  };
+  const walk = (at) => {
+    for (const kid of at.children) {
+      const tag = kid.tagName;
+      if (tag === "#text") {
+        lines[lines.length - 1] += kid.textContent;
+        continue;
+      }
+      if (tag === "br") {
+        lines.push("");
+        continue;
+      }
+      const block = DRAWN_BLOCKS.has(tag);
+      if (block) end();
+      if (tag === "ol" || tag === "ul") {
+        let number = Number(kid.getAttribute("start")) || 1;
+        for (const item of kid.children.filter((one) => one.tagName === "li")) {
+          end();
+          lines[lines.length - 1] += tag === "ol" ? `${number++}. ` : "• ";
+          walk(item);
+          end();
+        }
+        continue;
+      }
+      lines[lines.length - 1] += kid.textContent || "";
+      walk(kid);
+      if (block) end();
+    }
+  };
+  walk(node);
+  return lines.map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+}
+
+/** The card of thread `id` in the Threads view's list, its words' element. */
+const cardWords = (page, id) => cardRow(page, id).descendants().find((node) => node.className === "side-card-text");
+
+/** What the card of thread `id` says, line by line (`drawnLines`). */
+const cardLinesOf = (page, id) => drawnLines(cardWords(page, id));
+
 test("`#522 thread-card-max-lines`: a root longer than K lines is split, its first K lines and … on the card and the rest, starting …, as the root's own first child with no controls of its own", async () => {
   const { page } = await bigCardPage();
-  const head = BIG_ROOT.split("\n").slice(0, 5).join("\n");
-  assert.equal(cardPart(page, BIG, "side-card-text"), `${head}…`, "the card does not say K lines and an ellipsis");
+  const head = BIG_ROOT.split("\n").slice(0, 5);
+  assert.deepStrictEqual(cardLinesOf(page, BIG), [...head.slice(0, 4), `${head[4]}…`], "the card does not say K lines and an ellipsis");
   assert.ok(cardRow(page, BIG).hasAttribute("data-split-card"), "the split card is not marked for the stylesheet");
   assert.ok(!cardRow(page, BIG).hasAttribute("data-summarised-card"), "a split card claims to say a summary");
   // The negative control: a one-line root is its card, whole, and not split.
@@ -80993,35 +81058,179 @@ test("`#522 thread-card-max-lines`: K is Thread card lines in Settings, 1 to 12 
   await page.el("card-max-lines").setValue("8");
   await page.settle();
   assert.equal(page.storage.get(CARD_LINES_STORAGE), "8", "the choice was not kept");
-  assert.equal(cardPart(page, BIG, "side-card-text"), BIG_ROOT, "eight lines do not fit a card of eight");
+  assert.equal(cardLinesOf(page, BIG).join("\n"), BIG_ROOT, "eight lines do not fit a card of eight");
   assert.ok(!cardRow(page, BIG).hasAttribute("data-split-card"));
   assert.match(page.el("card-max-lines-state").textContent, /at most 8 lines/);
   await page.el("card-max-lines-smaller").click();
   await page.settle();
   assert.equal(page.el("card-max-lines").value, "7");
   // One line over is not split: a continuation row for one line takes more room than the line.
-  assert.equal(cardPart(page, BIG, "side-card-text"), BIG_ROOT, "one line left over was split off");
+  assert.equal(cardLinesOf(page, BIG).join("\n"), BIG_ROOT, "one line left over was split off");
   await page.el("card-max-lines-smaller").click();
   await page.settle();
-  assert.equal(cardPart(page, BIG, "side-card-text"), `${BIG_ROOT.split("\n").slice(0, 6).join("\n")}…`);
+  assert.equal(cardLinesOf(page, BIG).join("\n"), `${BIG_ROOT.split("\n").slice(0, 6).join("\n")}…`);
   await page.el("card-max-lines").setValue("0");
   await page.settle();
   assert.equal(page.el("card-max-lines").value, "1", "K went under its one line");
   assert.equal(page.el("card-max-lines-smaller").disabled, true);
-  assert.equal(cardPart(page, BIG, "side-card-text"), "Deploy plan for the cache tier…");
+  assert.deepStrictEqual(cardLinesOf(page, BIG), ["Deploy plan for the cache tier…"]);
 });
 
-test("`#522 thread-card-max-lines`: lines are counted by the server's proxy, wrapped word by word at 36 characters, and a long line is cut where its K-th line ends", async () => {
+test("`#522 thread-card-max-lines`: lines are counted by the server's proxy, wrapped word by word at 36 characters, and the card stops only between units", async () => {
   // The wrap itself, as src/threads.rs `card_lines` wraps (its unit tests hold the same cases).
-  const wrap = (line) => [...page0.pure("wrapCardLine")(line)].map((piece) => piece.text);
   const page0 = newPage(new Map());
+  const wrap = (line, width) => [...page0.pure("wrapCardLine")(line, width)].map((piece) => piece.text);
   assert.deepStrictEqual(wrap(`${"x".repeat(17)}   ${"y".repeat(18)}`), [`${"x".repeat(17)} ${"y".repeat(18)}`]);
   assert.deepStrictEqual(wrap(`${"x".repeat(18)} ${"y".repeat(18)}`), ["x".repeat(18), "y".repeat(18)]);
   assert.deepStrictEqual(wrap("x".repeat(73)), ["x".repeat(36), "x".repeat(36), "x"]);
   assert.equal(wrap(Array(10).fill("abcdefghijklm").join(" ")).length, 5, "two 13-letter words to a line");
   assert.equal(sourceConstant("CARD_LINE_CHARS"), 36);
   assert.match(readFileSync(join(WEB, "..", "src", "threads.rs"), "utf8"), /pub const CARD_LINE_CHARS: usize = 36;/, "the page and the server count lines differently");
-  // One paragraph of 61 four-letter words, 304 characters, seven to a line: nine card lines, so split at five.
+  // `#528 thread-card-markdown-and-cap`. A list's item or a quote is counted at the card's narrower
+  // line, its indent taken off.
+  assert.equal(sourceConstant("CARD_INDENTED_CHARS"), 32);
+  assert.deepStrictEqual(wrap(`${"x".repeat(16)} ${"y".repeat(16)}`, 32), ["x".repeat(16), "y".repeat(16)]);
+  // Where the card stops, from its units' lines: after the last unit that fits K (5); nowhere when all
+  // fit, or when one line would be left over; and after a first unit longer than K, clamped (`whole`).
+  // Through JSON: the page's objects are of its own realm.
+  const cut = (lines) => JSON.parse(JSON.stringify(page0.pure("cutForCard")(lines)));
+  assert.deepStrictEqual(cut([1, 2, 2, 3]), { head: 3, whole: false });
+  assert.equal(cut([2, 3]), null, "what fits K was cut");
+  assert.equal(cut([2, 3, 1]), null, "one line left over was split off");
+  assert.deepStrictEqual(cut([2, 2, 2, 2]), { head: 2, whole: false }, "a unit was cut through to fill K");
+  assert.deepStrictEqual(cut([9, 1]), { head: 1, whole: true });
+  // A "…" with no line of words to end — after code, say — takes a line of its own: within K too.
+  const marked = (lines, marks) => JSON.parse(JSON.stringify(page0.pure("cutForCard")(lines, marks)));
+  assert.deepStrictEqual(marked([2, 3, 4], [0, 1, 0]), { head: 1, whole: false }, "the … after code took the card past K");
+  assert.deepStrictEqual(marked([2, 2, 4], [0, 1, 0]), { head: 2, whole: false });
+});
+
+// --- a thread card keeps its root's formatting (#528 thread-card-markdown-and-cap) -------------------
+//
+// The owner, 2026-10-26: "a long message with markdown formatting loses its formatting when it is
+// promoted to a thread card ... I wanted to split only at the line granularity and always retain
+// markdown formatting of course. And also I don't understand why we would fail to load the summaries
+// just as fast as the other messages."
+
+/** A long first message as the server renders it: two paragraphs, then a numbered list of five. */
+const MD_ITEMS = [
+  "Land change 101 `now`",
+  "Land change 102 and change 103 as accepted, the newer drafts only changed the description",
+  "Ask for a re-accept of change 104",
+  "Publish the 15 ready drafts",
+  "Accept change 108",
+];
+const MD_ROOT = ["MORNING SNAPSHOT, Mon 10-26 (details in [plan.md](https://example.test/plan))", "",
+  "DECISIONS FOR YOU:", "", ...MD_ITEMS.map((item, at) => `${at + 1}. ${item}`)].join("\n");
+const MD_ROOT_HTML = "<p>MORNING SNAPSHOT, Mon 10-26 (details in <a href=\"https://example.test/plan\">plan.md</a>)</p>\n" +
+  "<p>DECISIONS FOR YOU:</p>\n<ol>\n" +
+  MD_ITEMS.map((item) => `<li>${item.replace(/`([^`]+)`/, "<code>$1</code>")}</li>`).join("\n") + "\n</ol>\n";
+/** What the root says line by line, as its row draws it. */
+const MD_LINES = ["MORNING SNAPSHOT, Mon 10-26 (details in plan.md)", "DECISIONS FOR YOU:",
+  ...MD_ITEMS.map((item, at) => `${at + 1}. ${item.replace(/`/g, "")}`)];
+
+/** `bigCardPage` with the big thread's root `MD_ROOT`, rendered; `arrange` sees the data first. */
+async function markdownCardPage({ storage = null, arrange = null, content = MD_ROOT, html = MD_ROOT_HTML } = {}) {
+  const data = bigCardData();
+  data.messages[0] = { ...data.messages[0], content, content_html: html };
+  data.threads[0] = { ...data.threads[0], root: data.messages[0] };
+  const page = newPage(storage || new Map());
+  page.threadingSupported = true;
+  if (arrange) arrange(page, data);
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return { page, server, data };
+}
+
+test("`#528 thread-card-markdown-and-cap`: the card is the root's own formatted body, cut only between lines, and the continuation goes on formatted, its list numbered on", async () => {
+  const { page } = await markdownCardPage();
+  assert.ok(cardRow(page, BIG).hasAttribute("data-split-card"), "the premise: a root too long for its card is split");
+  const words = cardWords(page, BIG);
+  const tags = words.descendants().map((node) => node.tagName);
+  assert.ok(tags.includes("ol") && tags.includes("li") && tags.includes("code"), `the card lost its formatting: ${tags}`);
+  // The card's lines are the root's first whole lines, "…" after the last: two paragraphs (three
+  // card lines) and the first item, which fits; the second item (three lines) does not.
+  assert.deepStrictEqual(cardLinesOf(page, BIG), [...MD_LINES.slice(0, 2), `${MD_LINES[2]}…`],
+    "the card is not the root's first lines, cut between lines");
+  // A link on the card is a link's words, not a link: the card is a button.
+  assert.ok(!tags.includes("a"), "the card holds a link inside its button");
+  assert.ok(words.descendants().some((node) => node.className === "card-link" && node.text() === "plan.md"));
+  await unpackCard(page, BIG);
+  const [rest] = unpackRows(page, BIG);
+  assert.ok(rest.hasAttribute("data-root-continuation"), "the continuation is not the first row");
+  const body = bodyOf(rest).descendants().find((node) => node.className === "md");
+  // Numbered on from the card's one item, every word of the root on the card or here, none twice.
+  assert.deepStrictEqual(drawnLines(body), [`2. …${MD_LINES[3].slice(3)}`, ...MD_LINES.slice(4)],
+    "the continuation does not go on, formatted and numbered, from where the card stopped");
+  assert.equal(body.descendants().find((node) => node.tagName === "ol").getAttribute("start"), "2");
+  // The row acts on the root whole, as before.
+  assert.equal(rest.messages[0].content, MD_ROOT);
+  // Packed again and drawn again, the card says the same: nothing is cut twice.
+  assert.deepStrictEqual(cardLinesOf(page, BIG), [...MD_LINES.slice(0, 2), `${MD_LINES[2]}…`]);
+});
+
+test("`#528 thread-card-markdown-and-cap`: a list that starts at 0 goes on from 1, and a rich heading's root is continued from exactly where its card stopped", async () => {
+  const { page } = await markdownCardPage({ html: MD_ROOT_HTML.replace("<ol>", "<ol start=\"0\">") });
+  await unpackCard(page, BIG);
+  const body = bodyOf(unpackRows(page, BIG)[0]).descendants().find((node) => node.className === "md");
+  assert.equal(body.descendants().find((node) => node.tagName === "ol").getAttribute("start"), "1",
+    "a list numbered from 0 was not numbered on from where the card stopped");
+  // A plain root whose heading restates its first line (`#242 rich-headers`): the card's units and its
+  // continuation's are worked out from one body, so no line is said twice or dropped.
+  const lead = "[build-bot] Deploy plan for the cache tier";
+  const lines = [lead, ...BIG_ROOT.split("\n").slice(1)];
+  const data = bigCardData();
+  data.messages[0] = { ...data.messages[0], content: lines.join("\n"),
+    heading: { tag: "build-bot", title: "Deploy plan for the cache tier", cut: lead.length } };
+  const headed = newPage(new Map());
+  headed.threadingSupported = true;
+  headed.threads = data.threads;
+  headed.messages = data.messages;
+  forwardTimeline(headed);
+  await signIn(headed);
+  await showDiscord(headed, data.messages);
+  await pickThread(headed, "threads");
+  await headed.settle();
+  const card = cardLinesOf(headed, BIG);
+  await unpackCard(headed, BIG);
+  const rest = drawnLines(bodyOf(unpackRows(headed, BIG)[0]).descendants().find((node) => node.className === "md"));
+  const said = [...card.slice(0, -1), card.at(-1).replace(/…$/, ""), rest[0].replace(/^…/, ""), ...rest.slice(1)];
+  assert.deepStrictEqual(said, lines, `the card and its continuation do not say every line once: ${JSON.stringify({ card, rest })}`);
+});
+
+test("`#528 thread-card-markdown-and-cap`: a root's record does not name a thread the server would not, under the threshold", async () => {
+  // A one-line root with one reply is under the threshold (three messages, `#484`): a name its record
+  // still carries — kept from before K was raised, say — is not shown.
+  const data = bigCardData();
+  data.messages[2] = { ...data.messages[2], thread: { ...data.messages[2].thread, ...NAMED } };
+  data.threads[1] = { ...data.threads[1], root: data.messages[2] };
+  const page = newPage(new Map());
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  assert.equal(cardPart(page, SMALL, "side-card-text"), "is the canary green?", "a thread under the threshold was named");
+});
+
+test("`#528 thread-card-markdown-and-cap`: the cap holds for what the card draws, whatever the raw text says", async () => {
+  // A root whose text field is short — a copy that came without it — but whose rendered body is long:
+  // the card is still held to K lines. Before, a root was split only by its raw text, and drawn whole.
+  const { page } = await markdownCardPage({ content: "see below" });
+  assert.deepStrictEqual(cardLinesOf(page, BIG), [...MD_LINES.slice(0, 2), `${MD_LINES[2]}…`]);
+  assert.ok(cardRow(page, BIG).hasAttribute("data-split-card"));
+});
+
+test("`#528 thread-card-markdown-and-cap`: a first paragraph longer than K lines on its own is clamped on the card, and the root goes inward whole", async () => {
+  // One paragraph of 61 four-letter words, nine card lines: no line to stop at inside it.
   const words = Array.from({ length: 61 }, (_, at) => `w${String(at).padStart(3, "0")}`).join(" ");
   const data = bigCardData();
   data.messages[0].content = words;
@@ -81034,21 +81243,126 @@ test("`#522 thread-card-max-lines`: lines are counted by the server's proxy, wra
   await showDiscord(page, data.messages);
   await pickThread(page, "threads");
   await page.settle();
-  const said = cardPart(page, BIG, "side-card-text");
-  assert.ok(said.endsWith("…"), said);
-  const head = said.slice(0, -1);
-  assert.equal(head.split(" ").length, 35, `the card does not say five lines of seven words: ${head}`);
-  assert.ok(words.startsWith(`${head} `), "the cut was not made at a space");
+  const row = cardRow(page, BIG);
+  assert.ok(row.hasAttribute("data-card-clamp"), "a paragraph longer than K is not clamped");
+  assert.ok(!row.hasAttribute("data-split-card"), "a paragraph was split inside itself");
+  assert.deepStrictEqual(cardLinesOf(page, BIG), [words], "the clamped card does not say the paragraph");
+  assert.equal(page.documentElement.style.getPropertyValue("--card-max-lines"), "5", "K is not the clamp's");
+  const clamp = cssBlock(".side-card-row[data-card-clamp][data-card-state=\"unpacked\"] > .side-card > .side-card-text");
+  assert.match(clamp, /-webkit-line-clamp:\s*var\(--card-max-lines/, "the clamp is not K lines");
+  assert.match(clamp, /max-height:\s*calc\(var\(--card-max-lines/);
+  // Collapsed, the reader's collapsed lines as every card's, or K where that is fewer.
+  const collapsed = cssBlock(".side-card-row[data-card-clamp][data-card-state=\"collapsed\"]:not([data-highlighted]) > .side-card > .side-card-text");
+  assert.match(collapsed, /-webkit-line-clamp:\s*min\(var\(--card-max-lines, 5\), max\(1, var\(--collapsed-lines\)\)\)/);
   await unpackCard(page, BIG);
-  assert.equal(bodyOf(unpackRows(page, BIG)[0]).text(), `…${words.slice(head.length + 1)}`,
-    "the continuation does not carry on exactly where the card stopped");
-  // A word longer than a line — a link, say — is broken across card lines and joined back without a
-  // space, on the card and in the continuation; and the "…" has room on the card's last line.
-  const link = `https://example.test/${"a".repeat(260)}`;
-  const split = page0.pure("splitForCard")(link);
-  assert.ok(split, "a 281-character link is not split");
-  assert.equal(`${split.head}${split.rest}`, link, "the broken link lost or gained characters");
-  assert.equal([...split.head].length, 4 * 36 + 35, "the card's last line has no room for the ellipsis");
+  const [first] = unpackRows(page, BIG);
+  assert.ok(first.hasAttribute("data-root-child") && !first.hasAttribute("data-root-continuation"),
+    "the root does not go inward whole under a clamped card");
+  assert.equal(bodyOf(first).text(), words, "the root under a clamped card is not whole");
+});
+
+/** `bigCardData`'s big root, its record naming its thread as a page of Main brings it. */
+const NAMED = { display_name: "cache-tier-deploy", summary: "The cache tier deploy, pool by pool." };
+
+test("`#528 thread-card-markdown-and-cap`: a root's own record names its thread, so its card says the summary from Main's read, and from the device's copy on a reload", async () => {
+  const data = bigCardData();
+  data.messages[0] = { ...data.messages[0], thread: { ...data.messages[0].thread, ...NAMED } };
+  const page = newPage(new Map());
+  page.threadingSupported = true;
+  // The thread list knows nothing of the thread yet: what names it is the root's record alone.
+  page.threads = [data.threads[1]];
+  page.messages = data.messages;
+  forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  const summary = `${NAMED.display_name}: ${NAMED.summary}`;
+  assert.equal(cardPart(page, BIG, "side-card-text"), summary, "the root's record did not name its card");
+  assert.ok(cardRow(page, BIG).hasAttribute("data-summarised-card"));
+  // A copy of the root from the stream names nothing (only a page's copy does): it keeps the name.
+  const edited = { ...data.messages[0], content: `${BIG_ROOT}\n8. celebrate`, edited_timestamp: data.messages[1].timestamp,
+    thread: { ...data.messages[0].thread } };
+  delete edited.thread.display_name;
+  delete edited.thread.summary;
+  await deliver(page, page.stream(), sseUpdate("upd-528", edited));
+  await page.settle();
+  assert.equal(cardPart(page, BIG, "side-card-text"), summary, "the stream's copy took the thread's name away");
+  // Reloaded, before any read answers: the device's copy draws the summary card at once.
+  const again = reloadWith(new Map(page.storage), data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = [];
+    p.timeline = () => new Promise(() => {});
+  });
+  await signIn(again);
+  await again.settle();
+  assert.equal(again.el("thread-select").value, "threads", "the premise: the reload reopens the Threads view");
+  assert.equal(cardPart(again, BIG, "side-card-text"), summary, "the reload did not draw the saved summary at once");
+});
+
+/** `bigCardPage` with the server naming threads, the clock a second after the big thread's reply. */
+async function pendingCardPage(storage = new Map([[UNPACK_STORAGE, "all"]]), content = BIG_ROOT) {
+  const data = bigCardData();
+  data.messages[0].content = content;
+  const page = newPage(storage);
+  page.threadingSupported = true;
+  page.threadNamesSupported = true;
+  page.setClock(Date.parse(data.threads[0].updated_at) + 1000);
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return { page, server, data };
+}
+
+test("`#528 thread-card-markdown-and-cap`: a summary on its way is waited for in the summary's layout, read for at once, and only the card's words change when it lands", async () => {
+  const { page, server } = await pendingCardPage();
+  const row = cardRow(page, BIG);
+  assert.ok(row.hasAttribute("data-summary-pending"), "a long root's card with a reply does not wait for its summary");
+  assert.ok(!row.hasAttribute("data-split-card"), "a card waiting for its summary is split");
+  const head = BIG_ROOT.split("\n").slice(0, 5);
+  assert.deepStrictEqual(cardLinesOf(page, BIG), [...head.slice(0, 4), `${head[4]}…`]);
+  // The root is inward whole at once, as it will stay under the summary.
+  const ids = () => unpackRows(page, BIG).map((li) => li.getAttribute("data-ids"));
+  assert.deepStrictEqual(ids(), ["800", "801"]);
+  const [root] = unpackRows(page, BIG);
+  assert.ok(root.hasAttribute("data-root-child") && !root.hasAttribute("data-root-continuation"),
+    "the root is not inward whole while its summary is on its way");
+  assert.match(bodyOf(root).text(), /^Deploy plan for the cache tier/);
+  // The Threads list is read again within seconds, though it was read under a minute ago.
+  const from = page.timelineCalls.length;
+  await passTime(page, 2500);
+  assert.ok(readViewsSince(page, from).includes("threads"), `the thread list was not read again soon: ${readViewsSince(page, from)}`);
+  // The server names it; the next step's read brings it; the card says it and nothing under it moves.
+  Object.assign(page.threads[0], NAMED);
+  server.threadChanged.set(BIG, ++server.revision);
+  await passTime(page, 3000);
+  assert.equal(cardPart(page, BIG, "side-card-text"), `${NAMED.display_name}: ${NAMED.summary}`, "the summary did not land");
+  assert.ok(!cardRow(page, BIG).hasAttribute("data-summary-pending"));
+  assert.deepStrictEqual(ids(), ["800", "801"], "the rows under the card changed as the summary landed");
+  assert.ok(unpackRows(page, BIG)[0].hasAttribute("data-root-child"));
+});
+
+test("`#528 thread-card-markdown-and-cap`: a summary that does not come within its wait is not waited for: the card splits", async () => {
+  const { page } = await pendingCardPage();
+  assert.ok(cardRow(page, BIG).hasAttribute("data-summary-pending"), "the premise: waiting for a summary");
+  await passTime(page, sourceConstant("SUMMARY_WAIT_MS"));
+  assert.ok(!cardRow(page, BIG).hasAttribute("data-summary-pending"), "the card waited past its wait");
+  assert.ok(cardRow(page, BIG).hasAttribute("data-split-card"), "the card did not split when its summary did not come");
+  assert.ok(unpackRows(page, BIG)[0].hasAttribute("data-root-continuation"));
+  // Nor does a thread whose last activity is older than the wait wait at all, nor one with no reply.
+  const old = await pendingCardPage();
+  old.page.setClock(old.page.clock() + sourceConstant("SUMMARY_WAIT_MS"));
+  assert.equal(old.page.pure("cardPending")(old.page.pure("threadChoices")().find((one) => one.id === BIG)), false);
+  // Waiting with a first paragraph longer than K, the card is clamped to K as a clamped card is.
+  const words = Array.from({ length: 61 }, (_, at) => `w${String(at).padStart(3, "0")}`).join(" ");
+  const long = await pendingCardPage(undefined, words);
+  const row = cardRow(long.page, BIG);
+  assert.ok(row.hasAttribute("data-summary-pending") && row.hasAttribute("data-card-clamp"),
+    "a waiting card whose first paragraph is longer than K is not clamped");
 });
 
 // --- an unpacked row is a message row like any other (#407 unpack-row-parity) ---------------------------
@@ -81188,7 +81502,9 @@ test("`#407 unpack-row-parity`: ; and : step the unpacked rows' folds as they st
   const area = page.el("side-scroll");
   area.focus();
   const rows = () => foldState(page, "side-cards");
-  const all = ["700", "701", "702", "703", "705", "706", "707"];
+  // `#528 thread-card-markdown-and-cap`: the raw thread's root is one long paragraph, so its card is
+  // clamped and the root goes inward whole, folded like any long row.
+  const all = ["700", "701", "702", "703", "704", "705", "706", "707"];
   assert.deepStrictEqual(rows(), { open: [], shut: all }, "the fixture's unpacked rows are not all folded");
   await press(page, area, ";");
   assert.equal(statusSaid(page), FOLD_SAID.expand, `; said ${statusSaid(page)}`);
@@ -81198,7 +81514,7 @@ test("`#407 unpack-row-parity`: ; and : step the unpacked rows' folds as they st
   assert.deepStrictEqual(rows(), { open: [], shut: all }, ": did not collapse every unpacked row");
   await press(page, area, ":", { shiftKey: true });
   assert.equal(statusSaid(page), FOLD_SAID.unread);
-  assert.deepStrictEqual(rows(), { open: ["703", "707"], shut: ["700", "701", "702", "705", "706"] },
+  assert.deepStrictEqual(rows(), { open: ["703", "707"], shut: ["700", "701", "702", "704", "705", "706"] },
     ": did not open the unread rows and fold the read ones");
 });
 
