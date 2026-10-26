@@ -925,6 +925,11 @@ enum ChatCommand {
     Reply(ChatReply),
     /// Stop accepting fenced replies for one exact retained request
     Close(ChatClose),
+    /// Read every retained reply body for one request (explicit deep audit; cost is linear in its history)
+    #[command(
+        after_help = "Example: agentctl chat history --bridge-state ~/.local/state/agentctl/chat --request <KEY-OR-PREFIX>"
+    )]
+    History(ChatHistory),
     /// Internal systemd ExecStop helper for one inode-bound main-process pidfd
     #[command(hide = true)]
     GracefulStopMain(ChatGracefulStopMain),
@@ -1239,6 +1244,15 @@ struct ChatClose {
 }
 
 #[derive(Args)]
+struct ChatHistory {
+    #[command(flatten)]
+    state: ChatState,
+    /// Saved request's hexadecimal key or unique prefix of at least 12 characters
+    #[arg(long, value_name = "KEY_OR_PREFIX")]
+    request: String,
+}
+
+#[derive(Args)]
 struct ChatGracefulStopMain {
     /// Exact systemd MAINPID value
     #[arg(long)]
@@ -1421,7 +1435,7 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
 // and the polling Chat launcher and its history/context readers. This edition refuses them with
 // exit status 2 and names the Python opt-in, instead of Clap's unrecognised-subcommand error.
 const PYTHON_ONLY_COMMANDS: [&str; 4] = ["mcp", "migrate", "reset", "repair"];
-const PYTHON_ONLY_CHAT_COMMANDS: [&str; 3] = ["launch", "history", "context"];
+const PYTHON_ONLY_CHAT_COMMANDS: [&str; 2] = ["launch", "context"];
 // Global options whose value is the following argument.
 const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
     "--registry",
@@ -2562,6 +2576,15 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::History(value) => {
+            let output =
+                crate::chat_history::read_reply_history(&value.state.bridge_state, &value.request)
+                    .map_err(|error| {
+                        Failure::Chat(crate::chat_runtime::ChatRuntimeError::Invalid(error).into())
+                    })?;
+            write_text(&format!("{output}\n")).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Init(value) => {
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
@@ -2817,10 +2840,7 @@ mod tests {
                 &["agentctl", "chat", "launch", "--config", "c.json"],
                 Some("chat launch"),
             ),
-            (
-                &["agentctl", "--state=/tmp/r", "chat", "history"],
-                Some("chat history"),
-            ),
+            (&["agentctl", "--state=/tmp/r", "chat", "history"], None),
             (&["agentctl", "chat", "context"], Some("chat context")),
             (&["agentctl", "--", "mcp"], Some("mcp")),
             (&["agentctl", "chat", "--", "launch"], Some("chat launch")),
