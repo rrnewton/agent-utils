@@ -26,11 +26,11 @@
 //! | Slack | `https://WS.slack.com/archives/C/pSECONDSMICROS` | the message, in Main |
 //! | Slack | the same, `?thread_ts=ROOT&cid=C` | a reply, in its thread |
 //! | Slack | `https://WS.slack.com/archives/C` | the conversation |
-//! | Slack | `https://app.slack.com/client/T/C[/thread/C-ROOT]` | the conversation, or a thread at its root |
+//! | Slack | `https://app.slack.com/client/T/C[/thread/C-ROOT]` | the conversation, or a thread |
 //! | Slack | `slack://channel?team=T&id=C[&message=TS[&thread_ts=ROOT]]` | the same, in Slack's app |
 //! | Discord | `https://discord.com/channels/G/C[/M]`, and `discordapp.com`, `ptb.`, `canary.` | the channel, or a message in it |
 //! | Google Chat | `https://chat.google.com/[u/N/]room/S[/T[/M]]`, and `dm/` | the space, a thread, or a message in it |
-//! | Google Chat | `https://mail.google.com/chat/u/N/#chat/space/S[/T[/M]]`, and `dm/` | the same, in Gmail |
+//! | Google Chat | `https://mail.google.com/(chat|mail)/u/N/#chat/space/S[/T[/M]]`, and `dm/` | the same, in Gmail |
 //!
 //! The ids are this server's own spelling of the upstream's ([`crate::slack::ids`] for Slack, whose
 //! `ts` is a snowflake-shaped message id here and whose thread is its root's `ts`; Discord's
@@ -249,7 +249,9 @@ fn slack_client(segments: &[&str]) -> Option<Target> {
             if owner != *conversation {
                 return None;
             }
+            // The thread itself, opened at its root: no message is named over it.
             let mut target = slack(conversation, Some(root), None)?;
+            target.message = None;
             target.thread = Some(root.to_owned());
             Some(target)
         }
@@ -275,12 +277,14 @@ fn slack_app(url: &Url) -> Option<Target> {
 // --- Discord ---------------------------------------------------------------------------------
 
 /// The hosts Discord's clients hand links out on.
-const DISCORD_HOSTS: [&str; 5] = [
+const DISCORD_HOSTS: [&str; 7] = [
     "discord.com",
     "www.discord.com",
     "discordapp.com",
     "ptb.discord.com",
     "canary.discord.com",
+    "ptb.discordapp.com",
+    "canary.discordapp.com",
 ];
 
 /// `/channels/G/C[/M]`, a guild a snowflake or `@me` for a direct message.
@@ -322,11 +326,12 @@ fn google_chat(segments: &[&str]) -> Option<Target> {
     google_parts(rest)
 }
 
-/// `/chat/u/N/#chat/(space|dm)/S[/T[/M]]` on mail.google.com: the conversation is in the fragment.
+/// `/chat/u/N/#chat/(space|dm)/S[/T[/M]]` on mail.google.com, and the same under Gmail's own
+/// `/mail/u/N/`: the conversation is in the fragment.
 fn gmail_chat(url: &Url, segments: &[&str]) -> Option<Target> {
     match segments {
-        ["chat"] => {}
-        ["chat", "u", account] if account.bytes().all(|b| b.is_ascii_digit()) => {}
+        ["chat" | "mail"] => {}
+        ["chat" | "mail", "u", account] if account.bytes().all(|b| b.is_ascii_digit()) => {}
         _ => return None,
     }
     let fragment = url.fragment()?;
@@ -477,7 +482,7 @@ mod tests {
             recognize(&format!(
                 "https://app.slack.com/client/T0123ABCD/{C}/thread/{C}-{ts}"
             )),
-            Some(target(Service::Slack, C, Some(&slack_id(ts)), Some(ts)))
+            Some(target(Service::Slack, C, None, Some(ts)))
         );
         assert_eq!(
             recognize(&format!(
@@ -568,6 +573,7 @@ mod tests {
             Some(target(Service::Discord, c, None, None))
         );
         for host in [
+            "canary.discordapp.com",
             "discordapp.com",
             "ptb.discord.com",
             "canary.discord.com",
@@ -637,6 +643,10 @@ mod tests {
                 None,
                 Some("spaces/AAAa1/threads/BBBb2")
             ))
+        );
+        assert_eq!(
+            recognize("https://mail.google.com/mail/u/1/#chat/space/AAAa1"),
+            Some(target(Service::GoogleChat, space, None, None))
         );
         // What upstream_url forms is read back.
         let thread = crate::threads::MessageThread {

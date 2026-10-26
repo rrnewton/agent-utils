@@ -2000,6 +2000,22 @@ function applyInAppLinks(on) {
   }
 }
 
+/**
+ * Draw again every body the switch decides the links of, from what is held, as for Empty messages: each
+ * column's rows, the thread list's cards and the right column's.
+ */
+function redrawMessageLinks() {
+  if (threadingSupported) {
+    eachColumn(renderCachedTimeline);
+    eachColumn(() => {
+      if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineThreads));
+    });
+    renderSideColumn();
+  } else {
+    eachColumn(regroupChannelRows);
+  }
+}
+
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedInAppLinks() {
   return localStorage.getItem(IN_APP_LINKS_KEY) !== "0";
@@ -2084,6 +2100,8 @@ function onMessageLinkTap(ref, event) {
 let linkJumps = /** @type {LinkJump[]} */ ([]);
 /** Each jump and each return takes a ticket: a later one ends one still under way. */
 let linkJumpTicket = 0;
+/** How many returns are putting a place back now (`returnToLinkSpot`). */
+let linkReturning = 0;
 
 /**
  * Where the reader is, to come back to: the place, the column, and the message their eye is on.
@@ -2114,11 +2132,18 @@ function linkJumpSpot() {
 function withLinkJumps(levels) {
   const top = linkJumps[linkJumps.length - 1];
   if (!top) return levels;
-  if (top.landed === null) return [...top.below, "jump"];
+  // Screens and menus the reader opens while the jump loads are theirs, never the jump's.
+  if (top.landed === null) return [...top.below, "jump", ...levels.filter(ownLevel)];
   let common = 0;
   while (common < top.landed.length && top.landed[common] === levels[common]) common += 1;
-  if (common < top.landed.length) top.landed = top.landed.slice(0, common);
+  // Not while a return under it is putting a place back: what is open then is on its way.
+  if (common < top.landed.length && linkReturning === 0) top.landed = top.landed.slice(0, common);
   return [...top.below, "jump", ...levels.slice(common)];
+}
+
+/** Whether level `tag` is one only the reader opens: a screen over the channel, or a menu. */
+function ownLevel(tag) {
+  return tag === "settings" || tag === "help" || tag.startsWith("menu:");
 }
 
 /** Wait for the channel on screen to have read the view it shows, or to be left; false when it was left. */
@@ -2222,8 +2247,9 @@ async function jumpFromSpot(ref, spot) {
     const name = provider && typeof provider.name === "string" && provider.name.trim() ? provider.name.trim() : chatProviderName;
     deepLinkFocus = { provider: String(name || ref.service).toLowerCase(), channel, message: ref.message, thread: ref.thread };
     const target = ref.message;
-    await seekMessage(target, () => landOnDeepLink(target),
-      () => threadingSupported && channelView !== "flat" && answeredElsewhere(target));
+    // A Back while the walk looks further back ends it: nothing lands over the place put back.
+    await seekMessage(target, () => ticket === linkJumpTicket && landOnDeepLink(target),
+      () => ticket === linkJumpTicket && threadingSupported && channelView !== "flat" && answeredElsewhere(target));
     if (ticket === linkJumpTicket && !rowHolding(target)) deepLinkFocus = null;
   } finally {
     // Landed, or given up: what is open now is the jump's, and what opens after is over it.
@@ -2238,7 +2264,13 @@ async function jumpFromSpot(ref, spot) {
 function returnFromLinkJump() {
   const jump = linkJumps.pop();
   if (!jump) return;
-  void guardQuietly(returnToLinkSpot)(jump.spot);
+  // A walk the jump's seek is still making is over: its next step finds another ticket.
+  replyJumpTicket += 1;
+  linkReturning += 1;
+  void guardQuietly(returnToLinkSpot)(jump.spot).finally(() => {
+    linkReturning -= 1;
+    scheduleBackSync();
+  });
 }
 
 /**
@@ -55560,7 +55592,7 @@ function applySyncedSetting(key) {
       case RICH_HEADERS_KEY: applyRichHeaders(storedRichHeaders()); break;
       case IN_APP_LINKS_KEY:
         applyInAppLinks(storedInAppLinks());
-        eachColumn(regroupChannelRows);
+        redrawMessageLinks();
         break;
       case COLLAPSED_LINES_KEY:
         applyCollapsedLines(storedCollapsedLines());
@@ -56176,7 +56208,7 @@ el("rich-headers").addEventListener("change", () => {
 // `#543 in-app-message-links`. Each column drawn again from what it holds, its links decided anew.
 el("in-app-links").addEventListener("change", () => {
   applyInAppLinks(el("in-app-links").checked);
-  eachColumn(regroupChannelRows);
+  redrawMessageLinks();
   setStatus(el("in-app-links").checked
     ? "links to messages open here."
     : "links to messages open the chat service.");

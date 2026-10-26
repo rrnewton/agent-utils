@@ -18388,6 +18388,39 @@ test("`#543 in-app-message-links`: what the reader opens after landing is a leve
   assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
 });
 
+test("`#543 in-app-message-links`: a Back while the jump still walks back for its message ends the walk — nothing lands over the place put back", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
+  const all = pagedTimeline(page, { steps: 4, size: 4 });
+  const newest = all[all.length - 1];
+  const href = `https://discord.com/channels/100000000000000009/${CHANNEL.id}/${all[1].id}`;
+  newest.content_html = `<p>see <a href="${href}" data-msg="${msgMark(CHANNEL.id, all[1].id)}" ${MSG_LINK_ATTRS}>${href}</a></p>\n`;
+  // Every step back is held until the test lets it go, so the reader's Back comes mid-walk.
+  const serve = page.timeline;
+  let release = () => {};
+  const held = new Promise((resolve) => { release = resolve; });
+  page.timeline = async (path, options) => {
+    if (/[?&]before=/.test(path)) await held;
+    return serve(path, options);
+  };
+  await signIn(page);
+  await showDiscord(page, []);
+  await page.settle();
+  await linkIn(rowWithId(page, newest.id)).dispatch("click", { button: 0, preventDefault() {}, stopPropagation() {} });
+  await passTime(page, 60);
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "jump" }, "fixture: the jump is not under way");
+  await page.browserBack();
+  await untilDeepLink(page, () => statusText(page) === "Back where you were.");
+  assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
+  release();
+  for (let spins = 0; spins < 20; spins += 1) {
+    await passTime(page, 60);
+    await page.settle();
+  }
+  assert.notEqual(rowWithId(page, all[1].id)?.getAttribute("data-landed"), "true",
+    "the walk the reader's Back ended landed on the linked message anyway");
+  assert.doesNotMatch(page.el("status").textContent, /Here is the linked message/);
+});
+
 test("mark read through here targets the newest part without archiving the row", async () => {
   const page = newPage();
   page.upstreamReadMarkSupported = true;
