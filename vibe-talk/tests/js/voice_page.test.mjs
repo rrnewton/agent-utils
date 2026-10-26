@@ -15924,7 +15924,12 @@ test("message text is styled as one block family: bullets, hanging indent, parag
   assert.match(indent, /list-style-position:\s*outside/, "a wrapped item would start under its bullet");
   assert.match(cssBlock(".md > * + *"), /margin-top:\s*0\.55em/, "a blank line makes no gap");
   assert.match(cssBlock(".md h1"), /font-size:\s*1\.25em/);
-  assert.match(cssBlock(".md pre"), /white-space:\s*pre-wrap/, "a code block lost its own spacing");
+  // `#531 server-side-syntax-highlight`: an open message's code keeps its lines and scrolls sideways;
+  // a folded one's wraps, so the clamp can count and cut its lines.
+  assert.match(cssBlock(".md pre"), /white-space:\s*pre;/, "a code block lost its own spacing");
+  assert.match(cssBlock(".md pre"), /overflow-x:\s*auto/, "a long line of code would widen the row");
+  assert.match(cssBlock(".body.clamped pre"), /white-space:\s*pre-wrap/, "a folded code block would escape its clamp");
+  assert.match(cssBlock(".body.clamped pre"), /overflow-x:\s*visible/, "a folded code block is a box the clamp draws whole");
   assert.match(cssBlock(".md table"), /overflow-x:\s*auto/, "a wide table would widen the row");
   assert.match(cssBlock(".md .mention"), /color:\s*var\(--accent\)/);
 });

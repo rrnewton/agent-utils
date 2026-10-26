@@ -260,7 +260,8 @@ impl SearchText {
         bot: bool,
         mentions: &[MentionName],
     ) -> crate::cache::Rendered {
-        let (html, _heading) = headed_body(text, markup, bot, &|_| false, mentions);
+        let (html, _heading) =
+            headed_body_by(render_named, text, markup, bot, &|_| false, mentions);
         if html.is_empty() {
             return crate::cache::Rendered {
                 text: text.to_owned(),
@@ -495,7 +496,22 @@ pub fn headed_body(
     confirmed: &dyn Fn(&str) -> bool,
     mentions: &[MentionName],
 ) -> (String, Option<crate::model::Heading>) {
-    let html = to_html_named(text, markup, mentions);
+    headed_body_by(to_html_named, text, markup, bot, confirmed, mentions)
+}
+
+/// How a body is rendered: [`to_html_named`], through the cache, or [`render_named`], past it.
+type Render = fn(&str, Markup, &[MentionName]) -> String;
+
+/// [`headed_body`], rendering with `render`.
+fn headed_body_by(
+    render: Render,
+    text: &str,
+    markup: Markup,
+    bot: bool,
+    confirmed: &dyn Fn(&str) -> bool,
+    mentions: &[MentionName],
+) -> (String, Option<crate::model::Heading>) {
+    let html = render(text, markup, mentions);
     let plain = html == plain_html(text);
     let Some(found) = crate::heading::extract(text, bot, confirmed) else {
         return (if plain { String::new() } else { html }, None);
@@ -504,7 +520,7 @@ pub fn headed_body(
     if plain {
         return (String::new(), Some(heading));
     }
-    match mark_restated(&html, &text[..found.cut], markup, mentions) {
+    match mark_restated(render, &html, &text[..found.cut], markup, mentions) {
         Some(marked) => (marked, Some(heading)),
         None => (html, None),
     }
@@ -522,12 +538,13 @@ pub const RESTATED_CLASS: &str = "rh-src";
 /// the paragraph's end. The marked string is then put through the sanitizer again and must come out
 /// unchanged, so nothing reaches the page that the sanitizer did not write.
 fn mark_restated(
+    render: Render,
     html: &str,
     prefix: &str,
     markup: Markup,
     mentions: &[MentionName],
 ) -> Option<String> {
-    let alone = to_html_named(prefix, markup, mentions);
+    let alone = render(prefix, markup, mentions);
     let words = alone.strip_prefix("<p>")?.strip_suffix("</p>\n")?;
     if words.contains("<p>") || words.contains("</p>") {
         return None;
@@ -579,12 +596,20 @@ pub fn to_html_named(text: &str, markup: Markup, mentions: &[MentionName]) -> St
     if let Some(html) = RENDERED.get(text, markup, mentions) {
         return html;
     }
-    let html = render_visiting(text, markup, mentions, |_, _| ()).0;
+    let html = render_named(text, markup, mentions);
     RENDERED.put(text, markup, mentions, &html);
     html
 }
 
-/// The bytes of text and HTML one generation of [`RENDERED`] holds before it becomes the old one.
+/// [`to_html_named`] without the cache: neither read nor written. For the message cache's
+/// full-text index, which renders every message it holds when it rebuilds, and would otherwise
+/// push the bodies the timeline is reading out of [`RENDERED`] with old ones.
+fn render_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
+    render_visiting(text, markup, mentions, |_, _| ()).0
+}
+
+/// The bytes one generation of [`RENDERED`] holds before it becomes the old one: its bodies' text
+/// and HTML and an allowance for each entry (`RenderedBody::bytes`).
 pub const RENDERED_GENERATION_BYTES: usize = 8 * 1024 * 1024;
 
 /// Bodies rendered recently, so a page load, a refresh and a live event that send the same
@@ -623,8 +648,17 @@ impl RenderedBody {
         self.markup == markup && self.text == text && self.mentions == mentions
     }
 
+    /// What the entry holds, counted generously: its strings, its mentions, and a fixed allowance
+    /// for the allocations, headers and map slot around them, so a generation of very short bodies
+    /// is bounded by memory too and not only by their text.
     fn bytes(&self) -> usize {
-        self.text.len() + self.html.len()
+        const OVERHEAD: usize = 256;
+        let mentions: usize = self
+            .mentions
+            .iter()
+            .map(|mention| mention.id.len() + mention.name.len() + 64)
+            .sum();
+        OVERHEAD + self.text.len() + self.html.len() + mentions
     }
 }
 
@@ -736,8 +770,9 @@ fn render_visiting<T>(
     // Highlighting is what grows code most, a span for every token, so a body it takes past the
     // bound is written again without it before it is given up as plain paragraphs: its code is
     // still drawn as code, only in one colour.
+    let highlighter = highlight::Highlighter::for_one_body();
     let mut plugins = comrak::options::Plugins::default();
-    plugins.render.codefence_syntax_highlighter = Some(&highlight::Highlighter);
+    plugins.render.codefence_syntax_highlighter = Some(&highlighter);
     let html = write_html(root, &options, &plugins);
     let html = if html.len() > limit && has_code_block(root) {
         write_html(root, &options, &comrak::options::Plugins::default())

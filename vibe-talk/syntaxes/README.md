@@ -34,12 +34,14 @@ a rule with `applyEndPatternLast` lists its `pop` last. Beyond that:
   `(?<=^|[…])`, is written `(?:^|(?<=[…]))`, the same match in a form every regex engine syntect
   can use accepts. A lookahead that needed a following space also accepts the end of the line.
 - **Agda:** pragmas are matched before block comments rather than excluded from them with
-  `{-[^#]`, which also lets a `{-` at the end of a line open a comment. `constant.char` is the
-  standard `constant.character`.
+  `{-[^#]`; the same text is matched either way. `constant.char` is the standard
+  `constant.character`.
 - **Rocq:** the identifier pattern repeated in six rules is one variable, `ident`, and its
-  ` ` is written `\x{00A0}`. Comments come before the operator rule, which changes nothing (no
-  operator starts with `(`) but says why `(*` is never read as `(` and `*`. A comment's nested
-  strings and comments are named contexts rather than repository includes.
+  no-break space is written `\x{00A0}`. Comments come before the operator rule, which changes
+  nothing (no operator starts with `(`) but says why `(*` is never read as `(` and `*`. A comment's
+  nested strings and comments are named contexts rather than repository includes. One scope moved:
+  upstream's Ltac2 rule names the optional `rec` as the function's name (capture 3); here the name
+  is the identifier after it (capture 4), and `rec` is a keyword.
 
 `src/render/highlight.rs` has a sample of each language in its tests, which fail if a grammar
 stops producing the kinds of token it should.

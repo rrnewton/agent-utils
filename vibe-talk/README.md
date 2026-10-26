@@ -6819,8 +6819,8 @@ the same as a sentence with no Markdown — never as an error and never as unsan
 
 A body is rendered once and kept: the server holds what it rendered recently, by the body's text,
 markup and mention names, so a refresh, a page load and a live event that carry the same messages do
-not render them again. Two generations of 8 MiB each; a body still being read moves to the newer
-one, and the oldest are dropped. A window of a hundred messages took 2.0 ms to render before this
+not render them again. Two generations of 8 MiB each, counting an allowance for every entry beside
+its text and HTML; a body still being read moves to the newer one, and the oldest are dropped. A window of a hundred messages took 2.0 ms to render before this
 cache and takes 13 µs from it.
 
 #### Code blocks
@@ -6870,9 +6870,20 @@ render_timing -- --ignored --nocapture` prints these):
 | | Before | Highlighted |
 |---|---|---|
 | A 200-line Rust block | 0.21 ms | 6.6 ms; the first block after the server starts, 16 ms, which includes reading the grammars |
-| 16 KiB of dense code, the most one body renders | — | 18 ms |
+| 16 KiB of dense code | — | 17 ms |
+| The worst input found, at the bounds below | — | 50 ms |
 | A window of 100 messages, ten with a 20-line block | 2.0 ms | 8.8 ms the first time; 13 µs from the cache after |
 | The binary, stripped | 30.3 MB | 32.0 MB (+1.6 MB: the grammars, the regular-expression engine and syntect) |
+
+**What it may cost is bounded**, because anyone in the channel writes the code. A grammar is regular
+expressions run over each line, and some backtrack in proportion to the square of a line's length:
+sixteen thousand backticks on one line held Markdown's grammar for fifty seconds before these bounds.
+A block is drawn plain, as an unknown language is, when it has a line longer than 512 bytes, when
+the sum over the body's highlighted lines of each line's length squared would pass 2,097,152 (16 KiB
+of code in lines of a hundred characters is 1.6 million), or when highlighting the body has taken
+80 ms already. The first two are decided from the text alone, so a body is always drawn the same
+way; the clock is for a grammar slower than any measured. The full-text index renders past the
+cache, so rebuilding it does not push out what the timeline is reading.
 
 The grammars run on Oniguruma rather than the pure-Rust engine syntect also supports: measured
 here, that was 2.5 times as fast and 350 KB smaller. Highlighting makes HTML larger, a span per

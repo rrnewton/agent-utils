@@ -5755,6 +5755,17 @@ a.search-hit-link {
   tab-size: 4;
 }
 
+/* EXCEPT FOLDED. A clamp counts only the lines it can reach, and a scroll box is a box of its own
+   that it draws whole, past the fold (as it does a table), under a "(~N more words)" that is then
+   untrue. So a folded message's code wraps as it always did and is cut with the text; opened, it
+   scrolls. A card is a heading and is folded as a message is. */
+.body.clamped pre,
+.side-card-text pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: visible;
+}
+
 .md pre code {
   font-size: inherit;
   background: none;
