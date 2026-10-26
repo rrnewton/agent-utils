@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-551-c4bd6fca9da",
+    "issue_id": "agent-utils-551",
+    "author": "cl-slackswitch",
+    "body": "[opus 5.5] Code landed on main (265db7ed..b5e5e89b): the converted path posts header blocks with a text-only fallback when blocks are refused; the agent label sits on its own paragraph before any opening Markdown block; vibe-talk reads headings as sentences and never ends a thread card on one. Verified live in the #530 slack-outbound-format test thread: the blocks round-trip complete in rich_content. Offline, the reader's shim plus vibe-talk's renderer draw the headings as h2. Open for deployment only: the private vibe-talk Slack shim release that maps header blocks to '## ' headings is staged but not active, and must go live BEFORE the bridge's helper is upgraded, because a blocks post's stored text loses its newlines. After both, check one real reply in vibe-talk. Not verified: the official Slack client's drawing of the header blocks. Slack's header block has no level, so every heading reads as h2.",
+    "created_at": "2026-10-26T23:14:54.391383914Z",
+    "updated_at": "2026-10-26T23:14:54.391383914Z"
+  }
+]
