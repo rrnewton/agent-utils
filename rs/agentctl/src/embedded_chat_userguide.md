@@ -2047,10 +2047,14 @@ a native Slack table block does not come back in the client's text) and post
 it as `--slack-mrkdwn`, split at block boundaries under that body's
 4,000-byte cap. Select it, in the order that wins: an
 `agentctl chat publish --slack-format markdown|converted` flag for one root
-message; the `AGENTCTL_SLACK_FORMAT` environment variable; a
-`slack_format_by_channel` entry for the channel; then the bridge's
+message; a `slack_format_by_channel` entry for the channel; then the bridge's
 `slack_format` key in its configuration (for example
-`"slack_format": "converted"`); then the default `markdown`. The helper also
+`"slack_format": "converted"`), with `AGENTCTL_SLACK_FORMAT` overriding the
+value of whichever of those selections applies. With no selection the wire
+request names no format, so the helper's own `--format` (itself overridden
+by its environment) decides, exactly as before; an explicit `markdown`
+selection names itself on the wire and overrides a helper configured
+`converted`. The helper also
 accepts `--format=converted` (or `--slack-format=converted`) in its own
 arguments, with the environment variable overriding them. Either path can be
 selected per bridge while both are evaluated; `agentctl chat status` reports

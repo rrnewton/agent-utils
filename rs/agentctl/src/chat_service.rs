@@ -6278,7 +6278,7 @@ mod tests {
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
-                slack_format: SlackFormat::Markdown,
+                slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
@@ -7768,7 +7768,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
-                slack_format: SlackFormat::Markdown,
+                slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
@@ -8419,7 +8419,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     shutdown_grace_millis: 0,
                 }),
                 reply_alias_range: None,
-                slack_format: SlackFormat::Markdown,
+                slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
@@ -8489,7 +8489,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     shutdown_grace_millis: 50,
                 }),
                 reply_alias_range: None,
-                slack_format: SlackFormat::Markdown,
+                slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
@@ -9032,7 +9032,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
-                slack_format: SlackFormat::Markdown,
+                slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
@@ -10852,7 +10852,7 @@ esac
                 shutdown_grace_millis: 30_000,
             }),
             reply_alias_range: None,
-            slack_format: SlackFormat::Markdown,
+            slack_format: Some(SlackFormat::Markdown),
             slack_format_by_channel: std::collections::BTreeMap::new(),
         };
         let outbound = configured_outbound_join_timeout(&configuration);
@@ -11310,7 +11310,7 @@ esac
                 backend_configuration: None,
                 outbound_command,
                 reply_alias_range: None,
-                slack_format: SlackFormat::Markdown,
+                slack_format: Some(SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )

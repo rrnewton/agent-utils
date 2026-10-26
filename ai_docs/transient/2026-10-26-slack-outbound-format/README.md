@@ -9,10 +9,10 @@ Two outbound paths stay selectable until there is a clear winner:
 - `converted`: `agentctl-slack-outbound` converts Markdown itself (comrak)
   and posts `--slack-mrkdwn`, split at block boundaries under 4,000 bytes.
 
-Vendor check (2026-10-26, read-only): `meta slack.message send --help`
+Vendor check (2026-10-26, read-only): the vendor CLI's `slack.message send --help`
 offers `--markdown` (12,000 bytes), `--text` (12,000), `--slack-mrkdwn`
 (4,000) and `--blocks` (up to 50 Block Kit blocks); `--dry-run` previews
-both mrkdwn and blocks posts, and `meta slack.message validate` accepts a
+both mrkdwn and blocks posts, and the vendor CLI's `slack.message validate` accepts a
 mrkdwn body. Detailed help says `--text`/`--slack-mrkdwn` keep every line
 break while `--markdown` joins single line breaks, and that a Block Kit
 table block exists. The converted path still renders tables as an aligned
@@ -54,7 +54,7 @@ Live posting is never the default and was **not** run for this change.
 The harness refuses live mode without `--channel=C…` for a test channel
 plus `SLACK_FORMAT_COMPARE_LIVE=1`, and the lane must tell the coordinator
 before any live post. When approved, post each sample by both paths, read
-back with `meta slack.message list --content-format=text` (and mrkdwn),
+back with the vendor CLI's `slack.message list --content-format=text` (and mrkdwn),
 and score blank lines kept, table intact, headings and links as in the
 dry-run table.
 

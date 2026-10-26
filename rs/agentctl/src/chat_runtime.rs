@@ -608,10 +608,6 @@ impl SlackFormat {
             _ => None,
         }
     }
-
-    fn is_markdown(&self) -> bool {
-        *self == Self::Markdown
-    }
 }
 
 /// The `AGENTCTL_SLACK_FORMAT` override, when set and valid.
@@ -676,10 +672,11 @@ pub struct BridgeConfiguration {
     /// pane: see [`ReplyAliasRange`]. Absent, every number is this bridge's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_alias_range: Option<ReplyAliasRange>,
-    /// Slack outbound format for this bridge (default `markdown`); the
-    /// `AGENTCTL_SLACK_FORMAT` environment variable overrides it at runtime.
-    #[serde(default, skip_serializing_if = "SlackFormat::is_markdown")]
-    pub slack_format: SlackFormat,
+    /// Slack outbound format for this bridge; absent names no format on the
+    /// wire. The `AGENTCTL_SLACK_FORMAT` environment variable overrides the
+    /// value of an explicit selection at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack_format: Option<SlackFormat>,
     /// Per-channel Slack outbound format, overriding `slack_format`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slack_format_by_channel: BTreeMap<String, SlackFormat>,
@@ -757,7 +754,8 @@ impl BridgeConfiguration {
             .slack_format_by_channel
             .get(channel_id)
             .copied()
-            .unwrap_or(self.slack_format))
+            .or(self.slack_format)
+            .unwrap_or_default())
     }
 
     /// The receipt emoji this bridge actually adds, or `None` when it adds none: the receipt is
@@ -831,6 +829,7 @@ impl BridgeConfiguration {
 
     /// Validate and pin the configured one-shot outbound helper, when present.
     pub fn outbound_transport(&self) -> Result<Option<CommandOutboundTransport>> {
+        slack_format_env_override().map_err(ChatRuntimeError::invalid)?;
         let mut transport = self
             .outbound_command
             .as_ref()
@@ -3391,7 +3390,7 @@ pub struct CommandOutboundTransport {
     timeout: Duration,
     shutdown_grace: Duration,
     cancellation: Option<OutboundCancellation>,
-    slack_format: SlackFormat,
+    slack_format: Option<SlackFormat>,
     slack_format_by_channel: BTreeMap<String, SlackFormat>,
     slack_format_override: Option<SlackFormat>,
 }
@@ -3554,18 +3553,18 @@ impl CommandOutboundTransport {
             timeout,
             shutdown_grace,
             cancellation: None,
-            slack_format: SlackFormat::Markdown,
+            slack_format: None,
             slack_format_by_channel: BTreeMap::new(),
             slack_format_override: None,
         })
     }
 
     /// Select the Slack outbound formats this transport passes to its helper:
-    /// a bridge default plus per-channel overrides. `markdown` (the default)
+    /// an optional bridge default plus per-channel overrides. No selection
     /// adds nothing to the wire request, so non-Slack helpers are unchanged.
     pub fn set_slack_formats(
         &mut self,
-        default: SlackFormat,
+        default: Option<SlackFormat>,
         by_channel: BTreeMap<String, SlackFormat>,
     ) {
         self.slack_format = default;
@@ -3578,17 +3577,22 @@ impl CommandOutboundTransport {
         self.slack_format_override = format;
     }
 
-    fn slack_format_for(&self, channel_id: &str) -> SlackFormat {
+    /// The format to name on the wire for `channel_id`, or `None` to name
+    /// none: no bridge Slack selection was made, so a non-Slack helper (and
+    /// a Slack helper's own `--format`/environment) decides, exactly as
+    /// before this switch existed. An explicit selection — a publish flag,
+    /// a per-channel key, or a bridge `slack_format` key — names itself,
+    /// `markdown` included, with the environment overriding its value.
+    fn slack_format_for(&self, channel_id: &str) -> Option<SlackFormat> {
         if let Some(format) = self.slack_format_override {
-            return format;
+            return Some(format);
         }
-        if let Ok(Some(format)) = slack_format_env_override() {
-            return format;
-        }
-        self.slack_format_by_channel
+        let base = self
+            .slack_format_by_channel
             .get(channel_id)
             .copied()
-            .unwrap_or(self.slack_format)
+            .or(self.slack_format)?;
+        Some(slack_format_env_override().ok().flatten().unwrap_or(base))
     }
 
     /// Bind service-generation cancellation before processing any operation.
@@ -3939,14 +3943,14 @@ struct WireError {
 pub fn encode_send_request(
     submission: &ReplySubmission<'_>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
-    encode_send_request_with_format(submission, SlackFormat::Markdown)
+    encode_send_request_with_format(submission, None)
 }
 
 /// Encode one v1 send request naming a non-default Slack outbound format.
 /// `markdown` encodes exactly as [`encode_send_request`].
 pub fn encode_send_request_with_format(
     submission: &ReplySubmission<'_>,
-    format: SlackFormat,
+    format: Option<SlackFormat>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
     validate_outbound_send(submission)?;
     encode_wire_request(&SendWireRequest {
@@ -3956,10 +3960,7 @@ pub fn encode_send_request_with_format(
         channel_id: submission.channel_id,
         thread_id: Some(submission.thread_id),
         text: submission.body,
-        slack_format: match format {
-            SlackFormat::Markdown => None,
-            SlackFormat::Converted => Some("converted"),
-        },
+        slack_format: format.map(SlackFormat::name),
     })
 }
 
@@ -3967,13 +3968,13 @@ pub fn encode_send_request_with_format(
 pub fn encode_root_message_request(
     submission: &RootMessageSubmission<'_>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
-    encode_root_message_request_with_format(submission, SlackFormat::Markdown)
+    encode_root_message_request_with_format(submission, None)
 }
 
 /// Encode one v1 root-message request naming a non-default Slack format.
 pub fn encode_root_message_request_with_format(
     submission: &RootMessageSubmission<'_>,
-    format: SlackFormat,
+    format: Option<SlackFormat>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
     validate_root_message_submission(submission)?;
     encode_wire_request(&SendWireRequest {
@@ -3983,10 +3984,7 @@ pub fn encode_root_message_request_with_format(
         channel_id: submission.channel_id,
         thread_id: None,
         text: submission.body,
-        slack_format: match format {
-            SlackFormat::Markdown => None,
-            SlackFormat::Converted => Some("converted"),
-        },
+        slack_format: format.map(SlackFormat::name),
     })
 }
 
@@ -6931,9 +6929,9 @@ impl BridgeState {
             .map(|(channel, format)| (channel.clone(), Value::from(format.name())))
             .collect();
         let slack_format = slack_format_env_override()
-            .ok()
-            .flatten()
-            .unwrap_or(self.config.slack_format)
+            .map_err(ChatRuntimeError::invalid)?
+            .or(self.config.slack_format)
+            .unwrap_or_default()
             .name();
         Ok(serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
@@ -14652,6 +14650,36 @@ fn soft_wrap_continues(current: &str, next: &str, current_width: usize, pane_wid
     if structural {
         return false;
     }
+    // Labelled lines, lone URLs and preformatted rows are hard lines even
+    // at the full width, and a lettered list item starts a new line.
+    if current.ends_with(':')
+        || current.starts_with("    ")
+        || next.starts_with("    ")
+        || !current.contains(' ')
+        || !next.contains(' ')
+    {
+        return false;
+    }
+    // A new labelled line (`latency: …`) starts a new line, as a lettered
+    // list item does.
+    let labelled = next.split_once(": ").is_some_and(|(head, _)| {
+        !head.is_empty()
+            && head.len() <= 32
+            && head
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == ' ')
+    });
+    if labelled {
+        return false;
+    }
+    let lettered = next.split_once(['.', ')']).is_some_and(|(head, rest)| {
+        head.len() == 1
+            && head.bytes().all(|byte| byte.is_ascii_alphabetic())
+            && rest.starts_with(' ')
+    });
+    if lettered {
+        return false;
+    }
     let next_first = next.chars().next().unwrap_or_default();
     let continues_word = next_first.is_lowercase() || next_first.is_ascii_digit();
     let ends_sentence = current.ends_with(['.', '!', '?']);
@@ -15702,7 +15730,7 @@ mod tests {
             backend_configuration: None,
             outbound_command: None,
             reply_alias_range: None,
-            slack_format: SlackFormat::Markdown,
+            slack_format: Some(SlackFormat::Markdown),
             slack_format_by_channel: std::collections::BTreeMap::new(),
         }
     }
@@ -31261,7 +31289,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             serde_json::from_slice(&encode_send_request(&send).expect("encode")).expect("json");
         assert!(plain.get("slack_format").is_none(), "{plain}");
         let converted: Value = serde_json::from_slice(
-            &encode_send_request_with_format(&send, SlackFormat::Converted).expect("encode"),
+            &encode_send_request_with_format(&send, Some(SlackFormat::Converted)).expect("encode"),
         )
         .expect("json");
         assert_eq!(converted["slack_format"], json!("converted"));
@@ -31653,6 +31681,24 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             "{joined}"
         );
         assert!(joined.contains("\n- a list item"), "{joined}");
+    }
+
+    #[test]
+    fn hard_lines_at_the_full_width_are_not_joined() {
+        let label = "Availability: the regional endpoints stayed healthy all day in";
+        assert_eq!(label.len(), 62);
+        let lines: Vec<String> = [
+            label.to_owned(),
+            "latency: the tail stayed flat".to_owned(),
+            "a) a lettered item, not a continuation of the line above it ok".to_owned(),
+            "    preformatted row that fills the whole pane width exactly = 1".to_owned(),
+            "    next preformatted row".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let joined =
+            unwrap_soft_wrapped(&lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>());
+        assert_eq!(joined, lines.join("\n"), "{joined}");
     }
 
     #[test]

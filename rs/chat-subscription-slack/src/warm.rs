@@ -1028,6 +1028,13 @@ impl Worker {
                 return no_spare(&format!("the spare could not be checked: {error}"));
             }
         }
+        let converted_body;
+        let text = if self.format == TextFormat::Converted {
+            converted_body = crate::mrkdwn::convert_markdown(text);
+            converted_body.as_str()
+        } else {
+            text
+        };
         if text.is_empty() || pipe_capacity(&spare.stdin).is_none_or(|room| text.len() > room) {
             spare.discard();
             return no_spare("the body does not fit the spare's input pipe");
