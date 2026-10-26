@@ -120,10 +120,37 @@ pub trait EventStream: Send {
 /// How a post's body is interpreted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextFormat {
-    /// Standard Markdown, rendered by Slack's client.
+    /// Standard Markdown, rendered by Slack's client (`--markdown`).
     Markdown,
     /// Plain text, shown as typed.
     Text,
+    /// Slack mrkdwn, shown as typed (`--slack-mrkdwn`, at most 4,000 bytes).
+    SlackMrkdwn,
+    /// Standard Markdown that the helper converts to Slack mrkdwn itself
+    /// (see [`crate::mrkdwn`]) and then posts as [`Self::SlackMrkdwn`].
+    Converted,
+}
+
+impl TextFormat {
+    /// The short name used in logs and the warm-worker protocol.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Text => "text",
+            Self::SlackMrkdwn => "slack-mrkdwn",
+            Self::Converted => "converted",
+        }
+    }
+
+    /// The format actually handed to the Slack client for this format.
+    #[must_use]
+    pub fn wire_format(self) -> Self {
+        match self {
+            Self::Converted => Self::SlackMrkdwn,
+            other => other,
+        }
+    }
 }
 
 /// One post request.

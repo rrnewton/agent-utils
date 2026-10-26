@@ -132,10 +132,7 @@ fn identity_name(identity: ClientIdentity) -> &'static str {
 }
 
 fn format_name(format: TextFormat) -> &'static str {
-    match format {
-        TextFormat::Markdown => "markdown",
-        TextFormat::Text => "text",
-    }
+    format.name()
 }
 
 impl WarmClient {

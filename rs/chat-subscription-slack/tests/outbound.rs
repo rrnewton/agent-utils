@@ -1035,3 +1035,48 @@ fn a_failing_listing_still_reposts_after_the_window() {
     assert_eq!(at(start + 121_000)["ok"], json!(true));
     assert_eq!(fake.state().posts.len(), 1);
 }
+
+#[test]
+fn converted_format_posts_converted_mrkdwn_and_env_overrides() {
+    let ledger = ledger("converted-format");
+    // Helper configured for the vendor markdown path; the request selects converted.
+    let config = config(&ledger, Some(APP));
+    assert_eq!(config.format, TextFormat::Markdown);
+    let fake = FakeTransport::new();
+    let mut request = send(
+        ID,
+        Some("1792000801.000100"),
+        "# Report\n\n**Done** & <ok>\n\n- [x] shipped",
+    );
+    request["slack_format"] = json!("converted");
+    let response = run(&config, &fake, &request, 1_000);
+    assert_eq!(response["ok"], json!(true), "{response}");
+    let posts = &fake.state().posts;
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].format, TextFormat::SlackMrkdwn);
+    assert_eq!(
+        posts[0].text,
+        "*Report*\n\n*Done* &amp; &lt;ok&gt;\n\n• ☑ shipped"
+    );
+
+    // The environment override converts a plain helper configuration.
+    let env_config = OutboundConfig::parse_with_environment(
+        &[
+            "--cli=/opt/slack/bin/slack-cli".to_owned(),
+            format!("--channel={CHANNEL}"),
+            format!("--ledger={}", ledger.display()),
+        ],
+        Some("converted"),
+    )
+    .expect("env override");
+    assert_eq!(env_config.format, TextFormat::Converted);
+    assert!(OutboundConfig::parse_with_environment(
+        &[
+            "--cli=/opt/slack/bin/slack-cli".to_owned(),
+            format!("--channel={CHANNEL}"),
+            format!("--ledger={}", ledger.display()),
+        ],
+        Some("bogus"),
+    )
+    .is_err());
+}

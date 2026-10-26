@@ -11,6 +11,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+comrak = { version = "0.55", default-features = false }
 chat-subscription = { version = "0.1.0", path = "../chat-subscription" }
 chat-subscription-plugin = { version = "0.1.0", path = "../chat-subscription-plugin" }
 libc = "0.2"
