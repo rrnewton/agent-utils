@@ -35984,6 +35984,10 @@ function browserSpeechProblem() {
 
 // Short utterances avoid mobile engines' long-text limits while keeping every part of the row.
 const BROWSER_SPEECH_CHUNK_CHARS = 180;
+// `#554 read-pause-reply-resume`. One sentence per utterance, so a resume says the sentence it was
+// paused in again, and no more of what was heard. A sentence shorter than this ("Yes.", or an "e.g.")
+// is said with the next one.
+const BROWSER_SPEECH_SENTENCE_MIN_CHARS = 24;
 const BROWSER_SPEECH_START_MS = 10000;
 const BROWSER_SPEECH_FINISH_MS = 60000;
 
@@ -35992,11 +35996,18 @@ function browserSpeechChunks(text) {
   const chunks = [];
   while (remaining.length > 0) {
     let end = Math.min(BROWSER_SPEECH_CHUNK_CHARS, remaining.length);
-    if (end < remaining.length) {
-      const prefix = remaining.slice(0, end).join("");
-      const sentences = [...prefix.matchAll(/[.!?;:]\s+/gu)];
-      const last = sentences[sentences.length - 1];
-      const sentenceEnd = last ? Array.from(prefix.slice(0, last.index + last[0].length)).length : 0;
+    const head = remaining.slice(0, end).join("");
+    // Closing quotes (straight, curly or angled) and brackets may follow the end of a sentence.
+    const sentence = [...head.matchAll(/[.!?]+[\u0022\u0027\u2019\u201d\u00bb)\]]*\s+/gu)]
+      .map((found) => Array.from(head.slice(0, found.index + found[0].length)).length)
+      .find((length) => length >= BROWSER_SPEECH_SENTENCE_MIN_CHARS);
+    if (sentence !== undefined) {
+      end = sentence;
+    } else if (end < remaining.length) {
+      // A sentence longer than an utterance: cut at its last clause, else its last word.
+      const clauses = [...head.matchAll(/[.!?;:]\s+/gu)];
+      const last = clauses[clauses.length - 1];
+      const sentenceEnd = last ? Array.from(head.slice(0, last.index + last[0].length)).length : 0;
       const space = remaining.slice(0, end).lastIndexOf(" ");
       if (sentenceEnd >= end / 2) end = sentenceEnd;
       else if (space > 0) end = space + 1;
@@ -36134,8 +36145,8 @@ function readWithBrowserSpeech(parts, id, ticket) {
   // paused by a held read that was stopped would swallow the next read into a paused queue.
   nowPlaying = { id, playback: "browser",
     audio: { pause: () => { engine.cancel(); if (typeof engine.resume === "function") engine.resume(); } }, urls: [],
-    utterance: null, speechTimer: null, parts, chunk: 0, paused: false, stale: false, speechStarted: false,
-    pauseTransport: null, resumeTransport: null, rearmSpeech: null };
+    utterance: null, speechTimer: null, parts, chunk: 0, paused: false, stale: false,
+    pauseTransport: null, resumeTransport: null };
   const current = () => ticket === readingTicket && nowPlaying !== null && nowPlaying.id === id;
   const fail = (error) => {
     if (!current()) return;
@@ -36169,7 +36180,6 @@ function readWithBrowserSpeech(parts, id, ticket) {
     };
     utterance.onstart = () => {
       if (!isCurrentPart()) return;
-      nowPlaying.speechStarted = true;
       watch(BROWSER_SPEECH_FINISH_MS, "speech-timeout");
       if (pendingRead === id) setStatus(`Reading with ${readAloudLabel}.`);
       pendingRead = null;
@@ -36188,12 +36198,6 @@ function readWithBrowserSpeech(parts, id, ticket) {
       }
     };
     nowPlaying.utterance = utterance;
-    nowPlaying.speechStarted = false;
-    // A resume re-arms the held part's watchdog, which the pause took down with the voice: the
-    // start watchdog for a part that never started, the finish one for a part under way.
-    nowPlaying.rearmSpeech = () => watch(
-      nowPlaying.speechStarted ? BROWSER_SPEECH_FINISH_MS : BROWSER_SPEECH_START_MS,
-      nowPlaying.speechStarted ? "speech-timeout" : "start-timeout");
     watch(BROWSER_SPEECH_START_MS, "start-timeout");
     try {
       engine.speak(utterance);
@@ -36201,36 +36205,32 @@ function readWithBrowserSpeech(parts, id, ticket) {
       fail("synthesis-failed");
     }
   };
-  // `#434 read-aloud-pause`. The device voice's share of the one pause path: the engine holds
-  // the utterance where it is, and its watchdog stops with it (an hour on pause is not a
-  // timeout). An engine with no pause is stopped at the chunk instead — its utterance is let go
-  // first, so the cancel is not read as this part ending — and the resume speaks that chunk
-  // again: the position kept, at the granularity the engine allows.
+  // `#434 read-aloud-pause`. The device voice's share of the one pause path. `#554
+  // read-pause-reply-resume`: it is a STOP AT THE SENTENCE, never the engine's own pause. Chrome on
+  // a phone has none: its `pause()` stops the voice and its `resume()` does nothing (in Chromium,
+  // the phone build's speech platform), and the stopped utterance is never ended, so the engine goes on
+  // counting it as current and a Resume that asked the engine to resume was silence until the
+  // watchdog gave the read up. So the utterance is let go first — the cancel is then not read as
+  // this part ending — the engine is emptied, and the watchdog stops with it (an hour on pause is
+  // not a timeout). The resume says the sentence it was paused in again, from its start, and goes
+  // on: the same on every engine, and after anything the reader did in between (a reply dictated
+  // through the keyboard's microphone takes the audio, and can silence an engine's queue).
   nowPlaying.pauseTransport = () => {
     if (nowPlaying.speechTimer !== null) clearTimeout(nowPlaying.speechTimer);
     nowPlaying.speechTimer = null;
-    if (typeof engine.pause === "function") {
-      engine.pause();
-    } else {
+    nowPlaying.utterance = null;
+    engine.cancel();
+    // An engine cancelled while paused can stay paused (see `audio.pause`).
+    if (engine.paused === true && typeof engine.resume === "function") engine.resume();
+  };
+  nowPlaying.resumeTransport = () => {
+    if (nowPlaying.utterance !== null) {
       nowPlaying.utterance = null;
       engine.cancel();
     }
-  };
-  nowPlaying.resumeTransport = () => {
-    if (nowPlaying.utterance !== null && nowPlaying.stale !== true && typeof engine.resume === "function") {
-      engine.resume();
-      if (typeof nowPlaying.rearmSpeech === "function") nowPlaying.rearmSpeech();
-    } else {
-      // Let the held utterance go first, so the chunk is not spoken over it (an engine that can
-      // pause but not resume still holds it, paused, in its queue).
-      if (nowPlaying.utterance !== null) {
-        nowPlaying.utterance = null;
-        engine.cancel();
-        if (typeof engine.resume === "function") engine.resume();
-      }
-      nowPlaying.stale = false;
-      speakPart(nowPlaying.chunk || 0);
-    }
+    if (engine.paused === true && typeof engine.resume === "function") engine.resume();
+    nowPlaying.stale = false;
+    speakPart(nowPlaying.chunk || 0);
   };
   // An engine a stopped held read left paused must not swallow this one (see `audio.pause`).
   if (engine.paused === true && typeof engine.resume === "function") engine.resume();
@@ -37851,8 +37851,9 @@ function toggleReadingPaused() {
 /**
  * Pause what is being read where it is, and carry on from there. Played through Web Audio, the
  * audio clock simply stops; played by an `<audio>` element, the element pauses; said by the
- * device voice, the engine pauses (`pauseTransport`, its own because its timers are its own).
- * The position — the block, and where in it the clock had got to — is kept entire.
+ * device voice, it stops at the sentence, which the resume says again (`pauseTransport`, its own
+ * because its timers are its own; `#554 read-pause-reply-resume`). The position — the block, and
+ * where in it the clock had got to, or the sentence — is kept.
  */
 function pauseReading() {
   const playing = nowPlaying;
