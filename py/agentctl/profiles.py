@@ -480,11 +480,11 @@ def _term_backend(value: object) -> str | None:
     # is validated for the shared file and otherwise ignored here.
     if value is None:
         return None
-    if value not in ("herdr", "tmux"):
+    if not isinstance(value, str) or value not in ("herdr", "tmux"):
         raise AgentDeliveryError(
             f'profile config term_backend must be "herdr" or "tmux", got {value!r}'
         )
-    return cast(str, value)
+    return value
 
 
 def _wrkslots(value: object) -> str | None:
