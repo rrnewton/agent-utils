@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-561-c8976e3d7fd",
+    "issue_id": "agent-utils-561",
+    "author": "mu-wit",
+    "body": "[watermelon-full-preview] Kokoro-82M measurements on this devserver (4 threads, host load ~60): model load 1.02s; per-sentence wall 0.50-1.14s for 45-82 chars; audio 2.4-7.4s per sentence; real-time factor 4.2-6.5x; 54 voices in voices-v1.0.bin. Files: kokoro-v1.0.onnx 325MB + voices-v1.0.bin 28MB fetched once into a model dir outside the repo. Licences: Kokoro-82M model card apache-2.0 (weights and voices); Piper code MIT, Piper voices per-dataset (sidecar header says to read each voice's .onnx.json). Real sidecar verified by hand: GET /voices lists 54, POST /synthesize returns non-silent WAV (peak 15279, 56832 samples).",
+    "created_at": "2026-10-26T22:32:10.087782107Z",
+    "updated_at": "2026-10-26T22:32:10.087782107Z"
+  }
+]
