@@ -18333,6 +18333,12 @@ function rootOverflowsCard(root) {
 //     text reached the page. A first unit longer than K on its own, one long paragraph, has no line to
 //     stop at: the card shows its first K lines, clamped (`data-card-clamp`), and the root goes inward
 //     whole as under a summary, so nothing is cut out or said by halves.
+//   * `#533 card-split-atomic-blocks`. A TABLE, A CODE BLOCK OR A QUOTE IS ONE UNIT, counted by the lines
+//     it draws: a table a line a row, code a line a line of it (both scroll sideways rather than wrap), a
+//     quote by the proxy. One too tall for the card that comes first is not clamped — a clamp cannot cut a
+//     table or code between its lines, and drew a giant card — but stood for on the card by one line
+//     (`cardStubText`: "Table (7 columns × 6 rows)", or its first line) and "…", and drawn whole, as
+//     itself, at the head of the continuation under it: the split view, as a long root has.
 //   * A SUMMARY ON ITS WAY IS WAITED FOR IN THE SUMMARY'S LAYOUT (`cardPending`): a root too long for
 //     its card is named from its first reply, so where the server names threads the card says the
 //     root's first lines meanwhile and the root goes inward whole at once. When the summary lands only
@@ -18356,6 +18362,12 @@ let threadNamesSupported = false;
 /** The block tags whose items, not themselves, are a card's units. */
 const CARD_LIST_TAGS = new Set(["ul", "ol"]);
 
+/**
+ * The blocks a card never cuts into nor clamps (`#533 card-split-atomic-blocks`): one too tall to be on the
+ * card is stood for there by one line (`cardStubText`) and drawn whole in the continuation.
+ */
+const CARD_WHOLE_TAGS = new Set(["table", "pre", "blockquote"]);
+
 /** The blocks a card's "…" is written into, rather than after. */
 const CARD_TEXT_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li"]);
 
@@ -18374,19 +18386,25 @@ const nodeWords = (node) => (node.nodeType === 3 ? String(node.textContent) : re
  * a list there, rather than the list; and each line of a paragraph, its line break included. Each
  * with its block, its place in that block (`index`), its nodes, the card lines its words take, and
  * `mark`, the line a "…" after it takes of its own (1 after a block with no line of words to end:
- * code, a quote, a table, an item ending in a list of its own), else 0.
+ * code, a quote, a table, an item ending in a list of its own), else 0. A table counts a line a row and
+ * code a line a line, as they draw them (`#533 card-split-atomic-blocks`); `whole` marks either, or a
+ * quote, as a block the card never cuts into (`CARD_WHOLE_TAGS`).
  *
- * @returns {Array<{block: any, index: number, nodes: any[], lines: number, mark: number}>}
+ * @returns {Array<{block: any, index: number, nodes: any[], lines: number, mark: number, whole: boolean}>}
  */
 function cardUnits(box) {
-  /** @type {Array<{block: any, index: number, nodes: any[], lines: number, mark: number}>} */
+  /** @type {Array<{block: any, index: number, nodes: any[], lines: number, mark: number, whole: boolean}>} */
   const units = [];
   const unit = (block, index, nodes, width) => {
     const words = nodes.map(nodeWords).join("");
     const last = nodes.length === 1 ? nodes[0] : null;
-    const inner = last && tagNameOf(last) === "li" ? sayingNodes(last).pop() : null;
-    const mark = last && (!CARD_TEXT_TAGS.has(tagNameOf(last)) || (inner && CARD_LIST_TAGS.has(tagNameOf(inner)))) ? 1 : 0;
-    units.push({ block, index, nodes, lines: cardProxyLines(proxyLinesOf(words), width), mark });
+    const tag = tagNameOf(last);
+    const inner = last && tag === "li" ? sayingNodes(last).pop() : null;
+    const mark = last && (!CARD_TEXT_TAGS.has(tag) || (inner && CARD_LIST_TAGS.has(tagNameOf(inner)))) ? 1 : 0;
+    const lines = tag === "table" ? Math.max(1, tableShape(last).rows)
+      : tag === "pre" ? Math.max(1, (String(last.textContent || "") || renderedText(last)).replace(/\n+$/, "").split("\n").length)
+        : cardProxyLines(proxyLinesOf(words), width);
+    units.push({ block, index, nodes, lines, mark, whole: CARD_WHOLE_TAGS.has(tag) });
   };
   for (const block of sayingNodes(box)) {
     const tag = tagNameOf(block);
@@ -18528,7 +18546,7 @@ function cardCutEntry(root) {
   const held = cardCuts.get(root);
   if (held && held.lines === cardMaxLines) return held;
   const units = cardUnits(messageBody(root));
-  const cut = cutForCard(units.map((unit) => unit.lines), units.map((unit) => unit.mark));
+  const cut = cutForCard(units.map((unit) => unit.lines), units.map((unit) => unit.mark), units.map((unit) => unit.whole));
   const entry = { lines: cardMaxLines, cut, text: foldedCardText(renderedText(cardHead(root, cut))) };
   cardCuts.set(root, entry);
   return entry;
@@ -18536,9 +18554,14 @@ function cardCutEntry(root) {
 
 /**
  * `cardCut`'s work on the card lines of a root's units, in order, at the K in force; `marks`, the
- * line each unit's "…" would take of its own (`cardUnits`), so the "…" never takes the card past K.
+ * line each unit's "…" would take of its own (`cardUnits`), so the "…" never takes the card past K;
+ * `wholes`, which units are blocks never cut into nor clamped. A first unit longer than K is clamped
+ * (`whole`), but such a block, which is stood for on the card by one line (`stub`, `cardHead`) and goes
+ * whole into the continuation: a cut before it (`#533 card-split-atomic-blocks`).
+ *
+ * @returns {{head: number, whole: boolean, stub?: boolean} | null}
  */
-function cutForCard(lines, marks = []) {
+function cutForCard(lines, marks = [], wholes = []) {
   const total = lines.reduce((sum, n) => sum + n, 0);
   if (total <= cardMaxLines) return null;
   let head = 0;
@@ -18551,9 +18574,43 @@ function cutForCard(lines, marks = []) {
     head -= 1;
     used -= lines[head];
   }
-  if (head === 0) return { head: 1, whole: true };
+  if (head === 0) return wholes[0] ? { head: 0, whole: false, stub: true } : { head: 1, whole: true };
   if (total - used < 2) return null;
   return { head, whole: false };
+}
+
+/**
+ * The rows and columns of table `table`: its rows, header included, and the most cells in one of them.
+ *
+ * @param {Element} table
+ */
+function tableShape(table) {
+  const rows = [];
+  const walk = (node) => {
+    for (const kid of [...node.childNodes]) {
+      if (kid.nodeType !== 1) continue;
+      if (tagNameOf(kid) === "tr") rows.push(kid);
+      else if (tagNameOf(kid) !== "table") walk(kid);
+    }
+  };
+  walk(table);
+  const cells = (row) => [...row.childNodes].filter((kid) => ["td", "th"].includes(tagNameOf(kid))).length;
+  return { rows: rows.length, columns: Math.max(0, ...rows.map(cells)) };
+}
+
+/**
+ * The one line a card says for block `block`, too tall to be on it (`#533 card-split-atomic-blocks`):
+ * "Table (7 columns × 6 rows)", or the first line of a code block or a quote.
+ *
+ * @param {Element} block
+ */
+function cardStubText(block) {
+  if (tagNameOf(block) === "table") {
+    const { rows, columns } = tableShape(block);
+    return `Table (${columns} column${columns === 1 ? "" : "s"} × ${rows} row${rows === 1 ? "" : "s"})`;
+  }
+  const first = renderedText(block).split("\n").map((line) => line.trim()).find(Boolean);
+  return first || (tagNameOf(block) === "pre" ? "Code" : "Quote");
 }
 
 /** A card's words as text: line by line, each line's white space closed up, blank lines dropped (`#489`). */
@@ -18563,6 +18620,15 @@ const foldedCardText = (text) =>
 /** The card's body for `root` cut at `cut`: its first units and "…", or the whole root where it fits. */
 function cardHead(root, cut) {
   const box = messageBody(root);
+  if (cut && cut.stub) {
+    // A first block too tall for the card, stood for by one line: the block itself is the continuation's.
+    const block = cardUnits(box)[0].nodes[0];
+    const line = document.createElement("p");
+    line.className = "card-stub";
+    line.append(document.createTextNode(`${cardStubText(block)} `), cardEllipsis());
+    box.replaceChildren(line);
+    return box;
+  }
   if (cut) {
     keepCardUnits(box, (at) => at < cut.head);
     if (!cut.whole) appendCardEllipsis(box);
