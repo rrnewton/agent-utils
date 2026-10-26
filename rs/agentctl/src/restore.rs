@@ -1330,6 +1330,14 @@ const REALERT_SECONDS: f64 = 3600.0;
 /// Seconds after boot before a missing restore report is a finding.
 const RESTORE_GRACE_SECONDS: u64 = 900;
 
+/// Pause before the one retry of a `systemctl --user` query that got no usable answer.
+///
+/// Package updates reload or re-execute the user service manager (on 2026-10-26 Chef did so at
+/// 03:02 and 08:48 after updating a package that ships user units), and while it does,
+/// `systemctl --user` is refused with "Failed to connect to user scope bus via local transport:
+/// Connection refused". The same retry also gives a unit in a transient state time to settle.
+const SYSTEMCTL_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 fn finding(
     check: &str,
     subject: &str,
@@ -1340,6 +1348,20 @@ fn finding(
     json!({"check": check, "subject": subject, "ok": ok, "detail": detail.into(), "repair": repair})
 }
 
+/// A subject the watch could not check, because systemctl gave no usable answer even after one
+/// retry. It is neither healthy nor failing (`ok` is null): it is never repaired, never alerted
+/// on, and is reported as a warning about the watch itself.
+fn unchecked(check: &str, subject: &str, reason: impl Into<String>, repair: Value) -> Value {
+    json!({
+        "check": check,
+        "subject": subject,
+        "ok": Value::Null,
+        "warning": "could-not-check",
+        "detail": format!("could not check: {}", reason.into()),
+        "repair": repair,
+    })
+}
+
 /// Parse `systemctl show --timestamp=unix` `KEY=VALUE` lines.
 fn properties(text: &str) -> BTreeMap<String, String> {
     text.lines()
@@ -1348,17 +1370,71 @@ fn properties(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn show(host: &dyn Host, unit: &str, keys: &[&str]) -> BTreeMap<String, String> {
+/// Why a systemctl command gave no usable answer.
+fn no_answer(command: &str, outcome: &CommandOutcome) -> String {
+    let stderr = outcome.stderr.trim();
+    match (outcome.status, stderr.is_empty()) {
+        (_, false) => format!("{command}: {stderr}"),
+        (Some(status), true) => format!("{command}: exit status {status}"),
+        (None, true) => format!("{command}: did not run"),
+    }
+}
+
+/// `systemctl --user show UNIT -p KEY...`, once.
+///
+/// `show` exits 0 and prints every requested property, even for a unit that does not exist
+/// (`LoadState=not-found`), so a nonzero exit, no exit, or a missing property means systemctl
+/// could not reach the service manager or was cut off: the answer says nothing about the unit.
+fn show_once(
+    host: &dyn Host,
+    unit: &str,
+    keys: &[&str],
+) -> std::result::Result<BTreeMap<String, String>, String> {
     let mut argv = strings(&["systemctl", "--user", "show", unit, "--timestamp=unix"]);
     for key in keys {
         argv.push("-p".to_owned());
         argv.push((*key).to_owned());
     }
-    properties(&host.run(&argv, None, Duration::from_secs(30)).stdout)
+    let command = format!("systemctl --user show {unit}");
+    let outcome = host.run(&argv, None, Duration::from_secs(30));
+    if outcome.status != Some(0) {
+        return Err(no_answer(&command, &outcome));
+    }
+    let state = properties(&outcome.stdout);
+    match keys.iter().find(|key| !state.contains_key(**key)) {
+        Some(missing) => Err(format!("{command}: the answer has no {missing}=")),
+        None => Ok(state),
+    }
 }
 
-/// Why a timer is not keeping its schedule, or `None` when it is.
-fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Option<String> {
+/// [`show_once`], retried once after [`SYSTEMCTL_RETRY_DELAY`]; `Err` means "could not check".
+fn show(
+    host: &dyn Host,
+    unit: &str,
+    keys: &[&str],
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    show_once(host, unit, keys).or_else(|_| {
+        host.sleep(SYSTEMCTL_RETRY_DELAY);
+        show_once(host, unit, keys).map_err(|reason| {
+            format!(
+                "{reason} (also {}s earlier)",
+                SYSTEMCTL_RETRY_DELAY.as_secs()
+            )
+        })
+    })
+}
+
+/// A unit's `ActiveState`, or why it could not be checked.
+fn active_state(host: &dyn Host, unit: &str) -> std::result::Result<String, String> {
+    show(host, unit, &["ActiveState"]).map(|state| state["ActiveState"].clone())
+}
+
+/// A check that may not get an answer: `Ok(None)` healthy, `Ok(Some(problem))` a problem the
+/// service manager confirmed, `Err(reason)` could not check.
+type Check = std::result::Result<Option<String>, String>;
+
+/// Why a timer is not keeping its schedule.
+fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Check {
     let state = show(
         host,
         &timer.unit,
@@ -1368,13 +1444,10 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Option<String> {
             "NextElapseUSecMonotonic",
             "LastTriggerUSec",
         ],
-    );
-    let active = state.get("ActiveState").map(String::as_str).unwrap_or("");
+    )?;
+    let active = state["ActiveState"].as_str();
     if active != "active" {
-        return Some(format!(
-            "timer is {}",
-            if active.is_empty() { "unknown" } else { active }
-        ));
+        return confirm_inactive_timer(host, timer, active);
     }
     let scheduled = |key: &str| {
         state
@@ -1382,13 +1455,15 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Option<String> {
             .is_some_and(|value| !value.is_empty() && value != "infinity" && value != "0")
     };
     if !scheduled("NextElapseUSecRealtime") && !scheduled("NextElapseUSecMonotonic") {
-        return Some("timer is active but will never fire again (no next elapse)".to_owned());
+        return Ok(Some(
+            "timer is active but will never fire again (no next elapse)".to_owned(),
+        ));
     }
     let last = state
         .get("LastTriggerUSec")
         .and_then(|value| value.strip_prefix('@'))
         .and_then(|value| value.parse::<f64>().ok());
-    match last {
+    Ok(match last {
         Some(last) if host.now() - last > timer.max_age_seconds as f64 => Some(format!(
             "last fired {:.0} seconds ago, more than {}",
             host.now() - last,
@@ -1401,33 +1476,93 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Option<String> {
             Some("has not fired since boot".to_owned())
         }
         _ => None,
-    }
+    })
 }
 
-/// Why the service a timer triggers failed on its last run, or `None` when it did not.
+/// Look again, after a pause, before calling a timer inactive or unknown.
+///
+/// A reloading service manager can briefly answer for a timer it has not loaded yet, so the state
+/// must hold [`SYSTEMCTL_RETRY_DELAY`] later, and a timer the manager calls not loaded must also be
+/// missing from `list-timers --all`.
+fn confirm_inactive_timer(host: &dyn Host, timer: &TimerWatch, first: &str) -> Check {
+    host.sleep(SYSTEMCTL_RETRY_DELAY);
+    let state = show(host, &timer.unit, &["LoadState", "ActiveState"])?;
+    let (load, active) = (state["LoadState"].as_str(), state["ActiveState"].as_str());
+    if active == "active" {
+        return Err(format!(
+            "{} was {first}, then active {}s later; checked again next pass",
+            timer.unit,
+            SYSTEMCTL_RETRY_DELAY.as_secs()
+        ));
+    }
+    if load == "loaded" {
+        return Ok(Some(format!("timer is {active}")));
+    }
+    let command = "systemctl --user list-timers --all";
+    let listed = host.run(
+        &strings(&[
+            "systemctl",
+            "--user",
+            "list-timers",
+            "--all",
+            "--no-legend",
+            "--plain",
+            &timer.unit,
+        ]),
+        None,
+        Duration::from_secs(30),
+    );
+    if listed.status != Some(0) {
+        return Err(no_answer(command, &listed));
+    }
+    if listed
+        .stdout
+        .split_whitespace()
+        .any(|word| word == timer.unit)
+    {
+        return Err(format!(
+            "systemctl --user show {} says LoadState={load}, but {command} lists it",
+            timer.unit
+        ));
+    }
+    Ok(Some(format!(
+        "timer is not loaded (LoadState={}) and {command} does not list it",
+        if load.is_empty() { "unknown" } else { load }
+    )))
+}
+
+/// Why the service a timer triggers failed on its last run.
 ///
 /// A timer can keep a perfect schedule while its service fails on every run. Restarting either
 /// cannot repair that, so this is reported, never repaired. `Result=` already honours the
 /// service's `SuccessExitStatus=`.
-fn service_failure(host: &dyn Host, timer: &TimerWatch) -> Option<String> {
-    let triggers = show(host, &timer.unit, &["Triggers"]);
-    let service = triggers.get("Triggers").filter(|value| unit_name(value))?;
-    let state = show(host, service, &["ActiveState", "Result", "ExecMainStatus"]);
-    let result = state.get("Result").map(String::as_str).unwrap_or("");
-    let active = state.get("ActiveState").map(String::as_str).unwrap_or("");
-    (active == "failed" || !matches!(result, "" | "success")).then(|| {
-        format!(
-            "{service} failed on its last run (Result={}, exit status {})",
-            if result.is_empty() { "unknown" } else { result },
-            state
-                .get("ExecMainStatus")
-                .map(String::as_str)
-                .unwrap_or("unknown")
-        )
-    })
+fn service_failure(host: &dyn Host, timer: &TimerWatch) -> Check {
+    let triggers = show(host, &timer.unit, &["Triggers"])?;
+    let Some(service) = triggers.get("Triggers").filter(|value| unit_name(value)) else {
+        return Ok(None);
+    };
+    let state = show(host, service, &["ActiveState", "Result", "ExecMainStatus"])?;
+    let result = state["Result"].as_str();
+    let active = state["ActiveState"].as_str();
+    Ok(
+        (active == "failed" || !matches!(result, "" | "success")).then(|| {
+            format!(
+                "{service} failed on its last run (Result={}, exit status {})",
+                if result.is_empty() { "unknown" } else { result },
+                if state["ExecMainStatus"].is_empty() {
+                    "unknown"
+                } else {
+                    state["ExecMainStatus"].as_str()
+                }
+            )
+        }),
+    )
 }
 
 /// One pass of checks, repairs, and findings.
+///
+/// Only a problem the service manager confirmed is repaired. A unit or timer that systemctl could
+/// not check, even after one retry, gets an [`unchecked`] finding and is left alone.
 pub fn watch_once<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
@@ -1458,44 +1593,97 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
         ));
     }
     for unit in &config.units {
-        let active = |host: &dyn Host| {
-            show(host, unit, &["ActiveState"])
-                .get("ActiveState")
-                .map(String::as_str)
-                == Some("active")
+        let state = match active_state(host, unit) {
+            Err(reason) => {
+                findings.push(unchecked("unit", unit, reason, Value::Null));
+                continue;
+            }
+            Ok(state) if state == "active" => {
+                findings.push(finding("unit", unit, true, "active", Value::Null));
+                continue;
+            }
+            Ok(state) => state,
         };
-        if active(host) {
-            findings.push(finding("unit", unit, true, "active", Value::Null));
-            continue;
-        }
+        // A unit that is activating or reloading, or a manager mid-reload, settles in seconds.
+        host.sleep(SYSTEMCTL_RETRY_DELAY);
+        let state = match active_state(host, unit) {
+            Err(reason) => {
+                findings.push(unchecked(
+                    "unit",
+                    unit,
+                    format!("{unit} was {state}, then {reason}"),
+                    Value::Null,
+                ));
+                continue;
+            }
+            Ok(now) if now == "active" => {
+                findings.push(finding(
+                    "unit",
+                    unit,
+                    true,
+                    format!(
+                        "active ({state} {}s earlier)",
+                        SYSTEMCTL_RETRY_DELAY.as_secs()
+                    ),
+                    Value::Null,
+                ));
+                continue;
+            }
+            Ok(now) => now,
+        };
         if options.check_only {
-            findings.push(finding("unit", unit, false, "not active", Value::Null));
+            findings.push(finding(
+                "unit",
+                unit,
+                false,
+                format!("not active ({state})"),
+                Value::Null,
+            ));
             continue;
         }
         let _ = systemctl(host, "reset-failed", unit);
         let started = systemctl(host, "start", unit);
-        let recovered = active(host);
-        findings.push(finding(
-            "unit",
-            unit,
-            recovered,
-            if recovered { "was not active; started".to_owned() } else { format!("not active: {}", started.stderr.trim()) },
-            json!({"action": format!("systemctl --user reset-failed {unit} && systemctl --user start {unit}"), "status": started.status}),
-        ));
+        let repair = json!({"action": format!("systemctl --user reset-failed {unit} && systemctl --user start {unit}"), "status": started.status});
+        findings.push(match active_state(host, unit) {
+            Ok(now) if now == "active" => {
+                finding("unit", unit, true, format!("was {state}; started"), repair)
+            }
+            Ok(now) => finding(
+                "unit",
+                unit,
+                false,
+                format!("not active ({now}): {}", started.stderr.trim()),
+                repair,
+            ),
+            Err(reason) => unchecked(
+                "unit",
+                unit,
+                format!("{unit} was {state} and was started, then {reason}"),
+                repair,
+            ),
+        });
     }
     for timer in &config.timers {
-        let Some(problem) = timer_problem(host, timer) else {
-            findings.push(match service_failure(host, timer) {
-                Some(failure) => finding("timer", &timer.unit, false, failure, Value::Null),
-                None => finding(
-                    "timer",
-                    &timer.unit,
-                    true,
-                    "keeps its schedule",
-                    Value::Null,
-                ),
-            });
-            continue;
+        let problem = match timer_problem(host, timer) {
+            Err(reason) => {
+                findings.push(unchecked("timer", &timer.unit, reason, Value::Null));
+                continue;
+            }
+            Ok(None) => {
+                findings.push(match service_failure(host, timer) {
+                    Err(reason) => unchecked("timer", &timer.unit, reason, Value::Null),
+                    Ok(Some(failure)) => finding("timer", &timer.unit, false, failure, Value::Null),
+                    Ok(None) => finding(
+                        "timer",
+                        &timer.unit,
+                        true,
+                        "keeps its schedule",
+                        Value::Null,
+                    ),
+                });
+                continue;
+            }
+            Ok(Some(problem)) => problem,
         };
         if options.check_only {
             findings.push(finding("timer", &timer.unit, false, problem, Value::Null));
@@ -1504,29 +1692,46 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
         let _ = systemctl(host, "restart", &timer.unit);
         let mut repair = vec![format!("systemctl --user restart {}", timer.unit)];
         let mut remaining = timer_problem(host, timer);
-        if remaining.is_some() {
+        if matches!(remaining, Ok(Some(_))) {
             // A timer whose only trigger counts from its service's last run has no base until
             // that service runs once in this service manager.
-            if let Some(service) = show(host, &timer.unit, &["Triggers"])
-                .get("Triggers")
-                .filter(|value| unit_name(value))
-            {
-                let _ = systemctl(host, "start", service);
-                repair.push(format!("systemctl --user start {service}"));
-                remaining = timer_problem(host, timer);
+            if let Ok(triggers) = show(host, &timer.unit, &["Triggers"]) {
+                if let Some(service) = triggers.get("Triggers").filter(|value| unit_name(value)) {
+                    let _ = systemctl(host, "start", service);
+                    repair.push(format!("systemctl --user start {service}"));
+                    remaining = timer_problem(host, timer);
+                }
             }
         }
-        let remaining = remaining.or_else(|| service_failure(host, timer));
-        findings.push(finding(
-            "timer",
-            &timer.unit,
-            remaining.is_none(),
-            match remaining {
-                None => format!("{problem}; repaired"),
-                Some(still) => still,
-            },
-            json!({"actions": repair}),
-        ));
+        let remaining = match remaining {
+            Ok(None) => service_failure(host, timer),
+            other => other,
+        };
+        findings.push(match remaining {
+            Ok(None) => finding(
+                "timer",
+                &timer.unit,
+                true,
+                format!("{problem}; repaired"),
+                json!({"actions": repair}),
+            ),
+            Ok(Some(still)) => finding(
+                "timer",
+                &timer.unit,
+                false,
+                still,
+                json!({"actions": repair}),
+            ),
+            Err(reason) => unchecked(
+                "timer",
+                &timer.unit,
+                format!(
+                    "{problem}; repaired with {}, then {reason}",
+                    repair.join(" && ")
+                ),
+                json!({"actions": repair}),
+            ),
+        });
     }
     let project = registry.parent().unwrap_or(registry);
     // Any wrkslots command remounts, so a check-only pass leaves slot images alone.
@@ -1711,19 +1916,32 @@ pub fn watch<A: ManagedApi + ?Sized>(
         } else {
             alert(client, registry, config, host, &findings, &mut alerted)
         };
-        for row in findings.iter().filter(|row| row["ok"] == false) {
-            eprintln!(
-                "agentctl watch: {} {}: {}",
+        let line = |row: &Value| {
+            format!(
+                "{} {}: {}",
                 row["check"].as_str().unwrap_or("?"),
                 row["subject"].as_str().unwrap_or("?"),
                 row["detail"].as_str().unwrap_or("")
-            );
+            )
+        };
+        for row in findings.iter().filter(|row| row["ok"] == false) {
+            eprintln!("agentctl watch: {}", line(row));
+        }
+        // What the watch itself could not check: its own health, not the subject's.
+        let warnings = findings
+            .iter()
+            .filter(|row| row["warning"].is_string())
+            .map(line)
+            .collect::<Vec<_>>();
+        for warning in &warnings {
+            eprintln!("agentctl watch: warning: {warning}");
         }
         let health = json!({
             "schema": "agentctl-watch-health/v1",
             "checked_at": host.now(),
             "boot_id": host.boot_id().ok(),
             "ok": findings.iter().all(|row| row["ok"] == true),
+            "warnings": warnings,
             "findings": findings,
             "notice": notice,
             "alerted": alerted,

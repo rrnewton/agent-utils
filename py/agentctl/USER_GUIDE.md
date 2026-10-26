@@ -752,9 +752,21 @@ checks and repairs:
 | this boot's restore completed (after 15 minutes of uptime) | none |
 | the coordinator's harness is alive | none; reviving is restore's job |
 
+Only a problem the service manager confirmed is repaired. A unit is looked at
+twice, 5 seconds apart, before it is started, so a unit that is only activating
+is left alone. A timer that is not active is looked at again 5 seconds later,
+and one the manager calls not loaded must also be missing from
+`systemctl --user list-timers --all`. When `systemctl --user show` gives no
+usable answer (a nonzero exit, a timeout, or a missing property; for example
+"Failed to connect to user scope bus" while a package update reloads or
+re-executes the user service manager), it is retried once 5 seconds later; if
+that fails too, the finding has `"ok": null` and
+`"warning": "could-not-check"`, nothing is started or restarted for it, the
+coordinator is not told, and it is listed under `warnings` in `health.json`.
+
 Each pass writes `health.json` (default `$XDG_STATE_HOME/agentctl/watch`) and
-logs every unrepaired finding to standard error, which the service journal
-keeps. When the coordinator can hear, the watch also queues it one message per
+logs every unrepaired finding, and every `warning: ... could not check` line,
+to standard error, which the service journal keeps. When the coordinator can hear, the watch also queues it one message per
 pass listing unrepaired findings it has not reported in the last hour.
 `--once` runs a single pass and exits 0 when every check passed, 1 otherwise;
 `--check-only` repairs, remounts, and sends nothing.

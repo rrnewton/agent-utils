@@ -323,9 +323,27 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
         "",
     );
     host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=inactive\nResult=success\nExecMainStatus=0\n",
+        "",
+    );
+    host.answer(
         "show tick.timer --timestamp=unix -p ActiveState",
         0,
         fresh,
+        "",
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=\n",
         "",
     );
     let config = RestoreConfig {
@@ -382,6 +400,7 @@ fn watch_reports_a_failed_unit_it_cannot_start() {
     let fixture = Fixture::new();
     let registry = fixture.root.join("registry");
     let host = ScriptedHost::new();
+    host.answer("show bridge.service", 0, "ActiveState=failed\n", "");
     host.answer("show bridge.service", 0, "ActiveState=failed\n", "");
     host.answer(
         "start bridge.service",
@@ -513,6 +532,7 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
     let registry = fixture.root.join("registry");
     let host = ScriptedHost::new();
     for _ in 0..2 {
+        host.answer("show bridge.service", 0, "ActiveState=failed\n", "");
         host.answer("show bridge.service", 0, "ActiveState=failed\n", "");
         host.answer("start bridge.service", 1, "", "Job failed\n");
         host.answer("show bridge.service", 0, "ActiveState=failed\n", "");
@@ -918,4 +938,327 @@ fn watch_says_no_image_backed_slots_rather_than_zero_remounted() {
         finding["detail"],
         "remounted 1 slot image(s): work/a at /slots/a"
     );
+}
+
+const REFUSED: &str =
+    "Failed to connect to user scope bus via local transport: Connection refused\n";
+
+fn watch_pass(fixture: &Fixture, host: &ScriptedHost, config: &RestoreConfig) -> Vec<Value> {
+    watch_once(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        host,
+        config,
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: false,
+            wrkslots: None,
+            state_dir: None,
+        },
+    )
+}
+
+fn timer_config(fixture: &Fixture, unit: &str) -> RestoreConfig {
+    RestoreConfig {
+        units: Vec::new(),
+        timers: vec![TimerWatch {
+            unit: unit.to_owned(),
+            max_age_seconds: 1800,
+        }],
+        ..config(fixture, None)
+    }
+}
+
+fn changed_anything(host: &ScriptedHost) -> bool {
+    host.commands().iter().any(|command| {
+        [" start ", " restart ", " reset-failed ", " stop "]
+            .iter()
+            .any(|verb| command.contains(verb))
+    })
+}
+
+#[test]
+fn watch_retries_a_refused_systemctl_once_and_believes_the_second_answer() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer("show bridge.service", 1, "", REFUSED);
+    host.answer("show bridge.service", 0, "ActiveState=active\n", "");
+    let before = host.now();
+    let findings = watch_pass(&fixture, &host, &config(&fixture, None));
+    let unit = findings.iter().find(|row| row["check"] == "unit").unwrap();
+    assert_eq!(unit["ok"], true, "{unit}");
+    assert_eq!(unit["detail"], "active");
+    assert_eq!(host.now() - before, 5.0, "one retry after a 5 s pause");
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+}
+
+#[test]
+fn watch_never_repairs_or_alerts_on_a_unit_it_could_not_check() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "coordinator",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let registry = fixture.root.join("registry");
+    let host = ScriptedHost::new();
+    host.answer("show bridge.service", 1, "", REFUSED);
+    host.answer("show bridge.service", 1, "", REFUSED);
+    let config = config(&fixture, Some("coordinator"));
+    let health = crate::restore::watch(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: false,
+            wrkslots: None,
+            state_dir: Some(fixture.root.join("watch")),
+        },
+    )
+    .unwrap();
+    let unit = health["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["check"] == "unit")
+        .unwrap();
+    assert_eq!(
+        unit["ok"],
+        Value::Null,
+        "neither healthy nor failing: {unit}"
+    );
+    assert_eq!(unit["warning"], "could-not-check");
+    assert_eq!(unit["repair"], Value::Null);
+    let detail = unit["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("could not check: systemctl --user show bridge.service: ")
+            && detail.contains("Connection refused")
+            && detail.contains("also 5s earlier"),
+        "{detail}"
+    );
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+    assert_eq!(
+        host.commands()
+            .iter()
+            .filter(|command| command.contains("show bridge.service"))
+            .count(),
+        2
+    );
+    assert_eq!(health["warnings"].as_array().unwrap().len(), 1, "{health}");
+    // The fixture has no restore report, so the watch does alert, about that alone.
+    assert!(
+        health["alerted"].get("unit:bridge.service").is_none(),
+        "{health}"
+    );
+    let sent = fixture.client.runs.lock().unwrap().clone();
+    assert!(
+        sent.iter().all(|text| !text.contains("bridge.service")),
+        "{sent:?}"
+    );
+}
+
+#[test]
+fn watch_treats_a_show_without_the_asked_property_as_unchecked() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    // A cut-off answer: exit 0 but no ActiveState=, twice.
+    host.answer("show bridge.service", 0, "", "");
+    host.answer("show bridge.service", 0, "", "");
+    let findings = watch_pass(&fixture, &host, &config(&fixture, None));
+    let unit = findings.iter().find(|row| row["check"] == "unit").unwrap();
+    assert_eq!(unit["ok"], Value::Null, "{unit}");
+    assert!(unit["detail"]
+        .as_str()
+        .unwrap()
+        .contains("the answer has no ActiveState="));
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+}
+
+#[test]
+fn watch_looks_twice_before_starting_a_unit_and_leaves_a_settling_one_alone() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer("show bridge.service", 0, "ActiveState=activating\n", "");
+    host.answer("show bridge.service", 0, "ActiveState=active\n", "");
+    let findings = watch_pass(&fixture, &host, &config(&fixture, None));
+    let unit = findings.iter().find(|row| row["check"] == "unit").unwrap();
+    assert_eq!(unit["ok"], true, "{unit}");
+    assert_eq!(unit["detail"], "active (activating 5s earlier)");
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+}
+
+#[test]
+fn watch_does_not_call_a_timer_unknown_when_systemctl_is_refused() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer("show tick.timer", 1, "", REFUSED);
+    host.answer("show tick.timer", 1, "", REFUSED);
+    let findings = watch_pass(&fixture, &host, &timer_config(&fixture, "tick.timer"));
+    let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
+    assert_eq!(timer["ok"], Value::Null, "{timer}");
+    assert_eq!(timer["warning"], "could-not-check");
+    assert!(!timer["detail"].as_str().unwrap().contains("unknown"));
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+}
+
+#[test]
+fn watch_rechecks_an_inactive_timer_and_leaves_one_that_was_only_reloading() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "show tick.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=inactive\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=\nLastTriggerUSec=\n",
+        "",
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p LoadState",
+        0,
+        "LoadState=loaded\nActiveState=active\n",
+        "",
+    );
+    let findings = watch_pass(&fixture, &host, &timer_config(&fixture, "tick.timer"));
+    let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
+    assert_eq!(timer["ok"], Value::Null, "{timer}");
+    assert!(timer["detail"]
+        .as_str()
+        .unwrap()
+        .contains("was inactive, then active 5s later"));
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+}
+
+#[test]
+fn watch_believes_a_not_found_timer_only_when_list_timers_agrees() {
+    let fixture = Fixture::new();
+    let inactive =
+        "ActiveState=inactive\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=\nLastTriggerUSec=\n";
+    let not_found = "LoadState=not-found\nActiveState=inactive\n";
+
+    // list-timers still lists it: the two answers disagree, so it was not checked.
+    let host = ScriptedHost::new();
+    host.answer(
+        "show tick.timer --timestamp=unix -p ActiveState",
+        0,
+        inactive,
+        "",
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p LoadState",
+        0,
+        not_found,
+        "",
+    );
+    host.answer(
+        "list-timers --all",
+        0,
+        "Mon 2026-10-26 09:16:55 PDT 23min Mon 2026-10-26 08:46:55 PDT 6min ago tick.timer tick.service\n",
+        "",
+    );
+    let findings = watch_pass(&fixture, &host, &timer_config(&fixture, "tick.timer"));
+    let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
+    assert_eq!(timer["ok"], Value::Null, "{timer}");
+    assert!(timer["detail"].as_str().unwrap().contains("lists it"));
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+
+    // list-timers is refused: still not checked.
+    let host = ScriptedHost::new();
+    host.answer(
+        "show tick.timer --timestamp=unix -p ActiveState",
+        0,
+        inactive,
+        "",
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p LoadState",
+        0,
+        not_found,
+        "",
+    );
+    host.answer("list-timers --all", 1, "", REFUSED);
+    let findings = watch_pass(&fixture, &host, &timer_config(&fixture, "tick.timer"));
+    let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
+    assert_eq!(timer["ok"], Value::Null, "{timer}");
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+
+    // Both agree it is gone: a confirmed problem, reported as one.
+    let host = ScriptedHost::new();
+    host.answer(
+        "show tick.timer --timestamp=unix -p ActiveState",
+        0,
+        inactive,
+        "",
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p LoadState",
+        0,
+        not_found,
+        "",
+    );
+    host.answer("list-timers --all", 0, "", "");
+    for _ in 0..2 {
+        host.answer(
+            "show tick.timer --timestamp=unix -p ActiveState",
+            0,
+            inactive,
+            "",
+        );
+        host.answer(
+            "show tick.timer --timestamp=unix -p LoadState",
+            0,
+            not_found,
+            "",
+        );
+        host.answer("list-timers --all", 0, "", "");
+    }
+    host.answer(
+        "show tick.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=\n",
+        "",
+    );
+    let findings = watch_pass(&fixture, &host, &timer_config(&fixture, "tick.timer"));
+    let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
+    assert_eq!(timer["ok"], false, "{timer}");
+    assert_eq!(
+        timer["detail"],
+        "timer is not loaded (LoadState=not-found) and systemctl --user list-timers --all does not list it"
+    );
+}
+
+#[test]
+fn watch_does_not_repair_a_timer_whose_service_it_could_not_check() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "show tick.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=@1999999990\n",
+        "",
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p Triggers",
+        1,
+        "",
+        REFUSED,
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p Triggers",
+        1,
+        "",
+        REFUSED,
+    );
+    let findings = watch_pass(&fixture, &host, &timer_config(&fixture, "tick.timer"));
+    let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
+    assert_eq!(timer["ok"], Value::Null, "{timer}");
+    assert!(!changed_anything(&host), "{:?}", host.commands());
 }
