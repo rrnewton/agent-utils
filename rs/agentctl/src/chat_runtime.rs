@@ -574,6 +574,63 @@ impl OutboundCommandConfiguration {
     }
 }
 
+/// Which Slack outbound path a bridge uses: the vendor `--markdown`
+/// conversion, or the helper's own Markdown-to-mrkdwn conversion
+/// (`converted`). Only the Slack helper reads the per-request field this
+/// selects; other helpers never receive it while it stays `markdown`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlackFormat {
+    /// Hand raw Markdown to the vendor CLI (`--markdown`).
+    #[default]
+    Markdown,
+    /// Convert Markdown to Slack mrkdwn in the helper (`--slack-mrkdwn`).
+    Converted,
+}
+
+impl SlackFormat {
+    /// The wire/config name of this format.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Converted => "converted",
+        }
+    }
+
+    /// Parse a `markdown`/`converted` value, as the CLI flag and the
+    /// `AGENTCTL_SLACK_FORMAT` environment variable carry it.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "markdown" => Some(Self::Markdown),
+            "converted" => Some(Self::Converted),
+            _ => None,
+        }
+    }
+
+    fn is_markdown(&self) -> bool {
+        *self == Self::Markdown
+    }
+}
+
+/// The `AGENTCTL_SLACK_FORMAT` override, when set and valid.
+///
+/// # Errors
+///
+/// Returns a description when the variable is set to an unknown value.
+pub fn slack_format_env_override() -> std::result::Result<Option<SlackFormat>, String> {
+    match env::var("AGENTCTL_SLACK_FORMAT") {
+        Ok(value) => SlackFormat::parse(&value)
+            .map(Some)
+            .ok_or_else(|| "AGENTCTL_SLACK_FORMAT must be markdown or converted".to_owned()),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("AGENTCTL_SLACK_FORMAT must be markdown or converted".to_owned())
+        }
+    }
+}
+
 /// Authority and routing configuration retained for one bridge state directory.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -619,6 +676,13 @@ pub struct BridgeConfiguration {
     /// pane: see [`ReplyAliasRange`]. Absent, every number is this bridge's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_alias_range: Option<ReplyAliasRange>,
+    /// Slack outbound format for this bridge (default `markdown`); the
+    /// `AGENTCTL_SLACK_FORMAT` environment variable overrides it at runtime.
+    #[serde(default, skip_serializing_if = "SlackFormat::is_markdown")]
+    pub slack_format: SlackFormat,
+    /// Per-channel Slack outbound format, overriding `slack_format`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slack_format_by_channel: BTreeMap<String, SlackFormat>,
 }
 
 /// The reply alias numbers, `first` to `last` inclusive, that one bridge assigns. Bridges that
@@ -673,6 +737,27 @@ impl BridgeConfiguration {
     pub fn reply_alias_numbers(&self) -> RangeInclusive<u64> {
         self.reply_alias_range
             .map_or(1..=u64::MAX, |range| range.first..=range.last)
+    }
+
+    /// The Slack outbound format in effect for `channel_id`: the
+    /// `AGENTCTL_SLACK_FORMAT` environment override, then the per-channel
+    /// key, then this bridge's `slack_format`, then `markdown`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when the environment override is invalid.
+    pub fn effective_slack_format(
+        &self,
+        channel_id: &str,
+    ) -> std::result::Result<SlackFormat, String> {
+        if let Some(format) = slack_format_env_override()? {
+            return Ok(format);
+        }
+        Ok(self
+            .slack_format_by_channel
+            .get(channel_id)
+            .copied()
+            .unwrap_or(self.slack_format))
     }
 
     /// The receipt emoji this bridge actually adds, or `None` when it adds none: the receipt is
@@ -746,10 +831,15 @@ impl BridgeConfiguration {
 
     /// Validate and pin the configured one-shot outbound helper, when present.
     pub fn outbound_transport(&self) -> Result<Option<CommandOutboundTransport>> {
-        self.outbound_command
+        let mut transport = self
+            .outbound_command
             .as_ref()
             .map(OutboundCommandConfiguration::open)
-            .transpose()
+            .transpose()?;
+        if let Some(transport) = transport.as_mut() {
+            transport.set_slack_formats(self.slack_format, self.slack_format_by_channel.clone());
+        }
+        Ok(transport)
     }
 
     /// Build and validate one provider-neutral subscription request.
@@ -3301,6 +3391,9 @@ pub struct CommandOutboundTransport {
     timeout: Duration,
     shutdown_grace: Duration,
     cancellation: Option<OutboundCancellation>,
+    slack_format: SlackFormat,
+    slack_format_by_channel: BTreeMap<String, SlackFormat>,
+    slack_format_override: Option<SlackFormat>,
 }
 
 /// Read-only provider directory operations used by the operator's grant command.
@@ -3378,6 +3471,9 @@ impl CommandOutboundTransport {
             timeout: self.timeout,
             shutdown_grace: self.shutdown_grace,
             cancellation: self.cancellation.clone(),
+            slack_format: self.slack_format,
+            slack_format_by_channel: self.slack_format_by_channel.clone(),
+            slack_format_override: self.slack_format_override,
         })
     }
 
@@ -3458,7 +3554,41 @@ impl CommandOutboundTransport {
             timeout,
             shutdown_grace,
             cancellation: None,
+            slack_format: SlackFormat::Markdown,
+            slack_format_by_channel: BTreeMap::new(),
+            slack_format_override: None,
         })
+    }
+
+    /// Select the Slack outbound formats this transport passes to its helper:
+    /// a bridge default plus per-channel overrides. `markdown` (the default)
+    /// adds nothing to the wire request, so non-Slack helpers are unchanged.
+    pub fn set_slack_formats(
+        &mut self,
+        default: SlackFormat,
+        by_channel: BTreeMap<String, SlackFormat>,
+    ) {
+        self.slack_format = default;
+        self.slack_format_by_channel = by_channel;
+    }
+
+    /// Force one Slack outbound format for the next operations, as
+    /// `agentctl chat publish --slack-format` does.
+    pub fn set_slack_format_override(&mut self, format: Option<SlackFormat>) {
+        self.slack_format_override = format;
+    }
+
+    fn slack_format_for(&self, channel_id: &str) -> SlackFormat {
+        if let Some(format) = self.slack_format_override {
+            return format;
+        }
+        if let Ok(Some(format)) = slack_format_env_override() {
+            return format;
+        }
+        self.slack_format_by_channel
+            .get(channel_id)
+            .copied()
+            .unwrap_or(self.slack_format)
     }
 
     /// Bind service-generation cancellation before processing any operation.
@@ -3601,7 +3731,8 @@ impl ReplyTransport for CommandOutboundTransport {
         &mut self,
         submission: ReplySubmission<'_>,
     ) -> std::result::Result<String, OutboundFailure> {
-        let request = encode_send_request(&submission)?;
+        let format = self.slack_format_for(submission.channel_id);
+        let request = encode_send_request_with_format(&submission, format)?;
         let response = self.exchange(&request)?;
         decode_send_response(&response, &submission)
     }
@@ -3612,7 +3743,8 @@ impl RootMessageTransport for CommandOutboundTransport {
         &mut self,
         submission: RootMessageSubmission<'_>,
     ) -> std::result::Result<String, OutboundFailure> {
-        let request = encode_root_message_request(&submission)?;
+        let format = self.slack_format_for(submission.channel_id);
+        let request = encode_root_message_request_with_format(&submission, format)?;
         let response = self.exchange(&request)?;
         decode_root_message_response(&response, &submission)
     }
@@ -3719,6 +3851,8 @@ struct SendWireRequest<'a> {
     channel_id: &'a str,
     thread_id: Option<&'a str>,
     text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slack_format: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -3805,6 +3939,15 @@ struct WireError {
 pub fn encode_send_request(
     submission: &ReplySubmission<'_>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    encode_send_request_with_format(submission, SlackFormat::Markdown)
+}
+
+/// Encode one v1 send request naming a non-default Slack outbound format.
+/// `markdown` encodes exactly as [`encode_send_request`].
+pub fn encode_send_request_with_format(
+    submission: &ReplySubmission<'_>,
+    format: SlackFormat,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
     validate_outbound_send(submission)?;
     encode_wire_request(&SendWireRequest {
         version: 1,
@@ -3813,12 +3956,24 @@ pub fn encode_send_request(
         channel_id: submission.channel_id,
         thread_id: Some(submission.thread_id),
         text: submission.body,
+        slack_format: match format {
+            SlackFormat::Markdown => None,
+            SlackFormat::Converted => Some("converted"),
+        },
     })
 }
 
 /// Encode one exact v1 root-message request with a JSON null thread authority.
 pub fn encode_root_message_request(
     submission: &RootMessageSubmission<'_>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    encode_root_message_request_with_format(submission, SlackFormat::Markdown)
+}
+
+/// Encode one v1 root-message request naming a non-default Slack format.
+pub fn encode_root_message_request_with_format(
+    submission: &RootMessageSubmission<'_>,
+    format: SlackFormat,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
     validate_root_message_submission(submission)?;
     encode_wire_request(&SendWireRequest {
@@ -3828,6 +3983,10 @@ pub fn encode_root_message_request(
         channel_id: submission.channel_id,
         thread_id: None,
         text: submission.body,
+        slack_format: match format {
+            SlackFormat::Markdown => None,
+            SlackFormat::Converted => Some("converted"),
+        },
     })
 }
 
@@ -6765,6 +6924,17 @@ impl BridgeState {
             .map(|record| record.files.clone())
             .unwrap_or_default();
         let provider_down = self.provider_down_locked()?;
+        let slack_format_by_channel: Map<String, Value> = self
+            .config
+            .slack_format_by_channel
+            .iter()
+            .map(|(channel, format)| (channel.clone(), Value::from(format.name())))
+            .collect();
+        let slack_format = slack_format_env_override()
+            .ok()
+            .flatten()
+            .unwrap_or(self.config.slack_format)
+            .name();
         Ok(serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
             "backend_configuration_schema": self.config.backend_configuration.as_ref().map(|value| &value.schema),
@@ -6849,6 +7019,16 @@ impl BridgeState {
             "reply_breaker": self.reply_breaker_status(),
             "reply_alias_problem": self.reply_alias_problem(),
         }))
+        .map(|mut status| {
+            if let Some(object) = status.as_object_mut() {
+                object.insert("slack_format".to_owned(), Value::from(slack_format));
+                object.insert(
+                    "slack_format_by_channel".to_owned(),
+                    Value::Object(slack_format_by_channel),
+                );
+            }
+            status
+        })
     }
 
     /// Each retained request's prompt delivery, oldest admission first, read without contacting a
@@ -14384,13 +14564,98 @@ fn reply_body(lines: &[String], opening_margin: &str, closing_margin: &str) -> R
         }
     }
     let margin = &opening_margin[..margin_length];
-    let body = lines
+    let stripped = lines
         .iter()
         .map(|line| line.strip_prefix(margin).unwrap_or(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let body = unwrap_soft_wrapped(&stripped);
     validate_reply_body(&body)?;
     Ok(body)
+}
+
+/// Join rows that a pane only soft-wrapped: a row filled to the pane's width
+/// whose next row continues its word or sentence, rather than starting a
+/// list item, heading, quotation, table or code. Rows inside a code fence
+/// are never joined, and neither are rows at any other width. The pane width
+/// is the widest row in the block: a soft-wrapped row reaches it exactly,
+/// as the two 162-column rows in a captured report did, while a hard line
+/// break in the reply almost never does. Without this, a reply captured
+/// from pane rows keeps the terminal's wrap as a hard newline, and the
+/// chat post it becomes breaks mid-sentence.
+fn unwrap_soft_wrapped(lines: &[&str]) -> String {
+    let pane_width = lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.trim_end()))
+        .max()
+        .unwrap_or(0);
+    if pane_width < 40 {
+        return lines.join("\n");
+    }
+    let mut merged: Vec<String> = Vec::new();
+    let mut last_raw_width = 0_usize;
+    let mut fence: Option<(char, usize)> = None;
+    for line in lines {
+        let trimmed = line.trim_start();
+        let was_fenced = fence.is_some() || opening_fence(trimmed).is_some();
+        if let Some((character, length)) = fence {
+            if closing_fence(trimmed, character, length) {
+                fence = None;
+            }
+        } else if let Some(opened) = opening_fence(trimmed) {
+            fence = Some(opened);
+        }
+        let join = !was_fenced
+            && fence.is_none()
+            && merged.last().is_some_and(|last: &String| {
+                soft_wrap_continues(last, line, last_raw_width, pane_width)
+            });
+        if join {
+            let last = merged.last_mut().expect("checked above");
+            last.push(' ');
+            last.push_str(line.trim_start());
+        } else {
+            merged.push((*line).to_owned());
+        }
+        last_raw_width = UnicodeWidthStr::width(line.trim_end());
+    }
+    merged.join("\n")
+}
+
+/// Whether `next` only continues `current` because the pane wrapped it:
+/// `current` filled the pane, and `next` starts neither a new structure nor
+/// a new sentence after a sentence-ending `current`.
+fn soft_wrap_continues(current: &str, next: &str, current_width: usize, pane_width: usize) -> bool {
+    if current_width != pane_width {
+        return false;
+    }
+    let current = current.trim_end();
+    let next = next.trim_start();
+    if current.is_empty() || next.is_empty() {
+        return false;
+    }
+    if current.ends_with(['|', '│']) || next.starts_with(['|', '│', '>']) {
+        return false;
+    }
+    let structural = next.starts_with("# ")
+        || next.starts_with("##")
+        || next.starts_with("```")
+        || next.starts_with("~~~")
+        || next.starts_with("- ")
+        || next.starts_with("* ")
+        || next.starts_with("+ ")
+        || next.starts_with("---")
+        || next.split_once(['.', ')']).is_some_and(|(head, rest)| {
+            !head.is_empty()
+                && head.bytes().all(|byte| byte.is_ascii_digit())
+                && rest.starts_with(' ')
+        });
+    if structural {
+        return false;
+    }
+    let next_first = next.chars().next().unwrap_or_default();
+    let continues_word = next_first.is_lowercase() || next_first.is_ascii_digit();
+    let ends_sentence = current.ends_with(['.', '!', '?']);
+    continues_word || !ends_sentence
 }
 
 fn invalid_rendered_character(character: char) -> bool {
@@ -15437,6 +15702,8 @@ mod tests {
             backend_configuration: None,
             outbound_command: None,
             reply_alias_range: None,
+            slack_format: SlackFormat::Markdown,
+            slack_format_by_channel: std::collections::BTreeMap::new(),
         }
     }
 
@@ -30982,6 +31249,46 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     }
 
     #[test]
+    fn slack_format_wire_and_status_are_reported() {
+        let send = ReplySubmission {
+            channel_id: "spaces/example",
+            thread_id: "spaces/example/threads/one",
+            body: "hello",
+            request_id: "123e4567-e89b-42d3-a456-426614174000",
+        };
+        // The default keeps the v1 wire shape exactly; converted names itself.
+        let plain: Value =
+            serde_json::from_slice(&encode_send_request(&send).expect("encode")).expect("json");
+        assert!(plain.get("slack_format").is_none(), "{plain}");
+        let converted: Value = serde_json::from_slice(
+            &encode_send_request_with_format(&send, SlackFormat::Converted).expect("encode"),
+        )
+        .expect("json");
+        assert_eq!(converted["slack_format"], json!("converted"));
+        assert_eq!(
+            SlackFormat::parse("converted"),
+            Some(SlackFormat::Converted)
+        );
+        assert_eq!(SlackFormat::parse("bogus"), None);
+        let mut configuration = config();
+        assert_eq!(
+            configuration
+                .effective_slack_format("spaces/example")
+                .unwrap(),
+            SlackFormat::Markdown
+        );
+        configuration
+            .slack_format_by_channel
+            .insert("spaces/example".to_owned(), SlackFormat::Converted);
+        assert_eq!(
+            configuration
+                .effective_slack_format("spaces/example")
+                .unwrap(),
+            SlackFormat::Converted
+        );
+    }
+
+    #[test]
     fn outbound_wire_binds_success_to_exact_uuid_action_and_authority() {
         let send = ReplySubmission {
             channel_id: "spaces/example",
@@ -31310,6 +31617,57 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 "{bullet}"
             );
         }
+    }
+
+    #[test]
+    fn soft_wrapped_pane_rows_are_joined_but_fenced_rows_are_not() {
+        // A row filled to the pane width (62 columns here) whose next row
+        // continues the sentence is one reply line, not two.
+        let first = "The bridge captured this reply from the pane rows and the wrap";
+        assert_eq!(first.len(), 62);
+        let lines: Vec<String> = [
+            first.to_owned(),
+            "broke the sentence where the next word did not fit at all".to_owned(),
+            "```".to_owned(),
+            // Padded to the pane width so only the fence guard saves it.
+            format!(
+                "{:<62}",
+                "let exactly_this_code_line_fills_the_whole_pane_width_ok = 1;"
+            ),
+            "let next = 2;".to_owned(),
+            "```".to_owned(),
+            "- a list item stays its own line even after a full row above".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let joined =
+            unwrap_soft_wrapped(&lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>());
+        assert!(
+            joined.contains("and the wrap broke the sentence"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "let exactly_this_code_line_fills_the_whole_pane_width_ok = 1;\nlet next = 2;"
+            ),
+            "{joined}"
+        );
+        assert!(joined.contains("\n- a list item"), "{joined}");
+    }
+
+    #[test]
+    fn a_captured_reply_joins_its_soft_wrapped_rows() {
+        let nonce = "AAAAAAAAAAAAAAAAAAAAAA";
+        let first = "This reply reached the chat exactly as the pane wrapped it and";
+        assert_eq!(first.len(), 62);
+        let rendered = format!(
+            "⏺ <CHAT_REPLY_{nonce}_1>\n  {first}\n  continued here without a hard break in the source text\n  </CHAT_REPLY_{nonce}_1>\n"
+        );
+        let scan = scan_reply_blocks(&rendered, nonce).unwrap();
+        assert_eq!(
+            scan.found.blocks[0].body,
+            format!("{first} continued here without a hard break in the source text")
+        );
     }
 
     /// A capture made of these rows.

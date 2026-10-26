@@ -32,7 +32,7 @@ use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
     CoordinatorDeliveryResult, DeliveryAlarm, DeliveryEntry, OutboundCancellation, OutboundFailure,
     ReplyRoute, ReplyRouteEntry, ReplyStoreOutcome, ReplySubmission, ReplyTransport, RequestPhase,
-    RootMessageSubmission, RootMessageTransport, SNAPSHOT_LINES,
+    RootMessageSubmission, RootMessageTransport, SlackFormat, SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
 use crate::error::AdapterErrorKind;
@@ -389,6 +389,7 @@ pub fn publish(
     thread_id: Option<&str>,
     request_id: &str,
     body: &str,
+    slack_format: Option<SlackFormat>,
 ) -> Result<Value, ChatServiceError> {
     let state = BridgeState::inspect(state_root)?;
     let configuration = state.config();
@@ -441,6 +442,7 @@ pub fn publish(
             "chat publish requires an explicit outbound_command helper".to_owned(),
         )
     })?;
+    transport.set_slack_format_override(slack_format);
     let message_id = match reply {
         Some(reply) => transport.send(reply)?,
         None => transport.publish_root(root)?,
@@ -6276,6 +6278,8 @@ mod tests {
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
+                slack_format: SlackFormat::Markdown,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state");
@@ -7764,6 +7768,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
+                slack_format: SlackFormat::Markdown,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state");
@@ -8413,6 +8419,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     shutdown_grace_millis: 0,
                 }),
                 reply_alias_range: None,
+                slack_format: SlackFormat::Markdown,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state without opening helper");
@@ -8424,6 +8432,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             None,
             "123e4567-e89b-42d3-a456-426614174000",
             "operator message",
+            None,
         )
         .expect_err("channel outside configured authority");
         assert!(error
@@ -8480,6 +8489,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     shutdown_grace_millis: 50,
                 }),
                 reply_alias_range: None,
+                slack_format: SlackFormat::Markdown,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state");
@@ -8491,6 +8502,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             None,
             request_id,
             "operator message",
+            None,
         )
         .expect("publish root message");
         assert_eq!(
@@ -9020,6 +9032,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
+                slack_format: SlackFormat::Markdown,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state");
@@ -10838,6 +10852,8 @@ esac
                 shutdown_grace_millis: 30_000,
             }),
             reply_alias_range: None,
+            slack_format: SlackFormat::Markdown,
+            slack_format_by_channel: std::collections::BTreeMap::new(),
         };
         let outbound = configured_outbound_join_timeout(&configuration);
         assert_eq!(outbound, Duration::from_secs(67));
@@ -11294,6 +11310,8 @@ esac
                 backend_configuration: None,
                 outbound_command,
                 reply_alias_range: None,
+                slack_format: SlackFormat::Markdown,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state");

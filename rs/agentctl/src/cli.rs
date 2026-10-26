@@ -1098,6 +1098,11 @@ struct ChatPublish {
     /// UTF-8 file containing the message, read with a 30,000-byte bound
     #[arg(long, value_name = "PATH", required_unless_present = "text")]
     file: Option<PathBuf>,
+    /// Slack outbound format for this message: markdown (vendor conversion) or converted
+    /// (the helper converts Markdown to Slack mrkdwn itself). Overrides the bridge config
+    /// and AGENTCTL_SLACK_FORMAT for this publish only (Slack helper only)
+    #[arg(long, value_name = "FORMAT", value_parser = slack_format_value)]
+    slack_format: Option<crate::chat_runtime::SlackFormat>,
 }
 
 impl ChatPublish {
@@ -1303,6 +1308,10 @@ fn chat_ignored_text_prefix(value: &str) -> Result<String, String> {
     crate::chat_runtime::validate_ignored_text_prefix(value)
         .map(|()| value.to_owned())
         .map_err(|error| error.to_string())
+}
+fn slack_format_value(value: &str) -> Result<crate::chat_runtime::SlackFormat, String> {
+    crate::chat_runtime::SlackFormat::parse(value)
+        .ok_or_else(|| "slack format must be markdown or converted".to_owned())
 }
 fn operation_uuid(value: &str) -> Result<String, String> {
     crate::chat_runtime::validate_operation_uuid(value)
@@ -2521,6 +2530,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 value.thread_id.as_deref(),
                 &value.request_id,
                 &body,
+                value.slack_format,
             )
             .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
