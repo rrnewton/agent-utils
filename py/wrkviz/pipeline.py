@@ -151,6 +151,7 @@ from wrkviz.summarize import (
     clean_summary_result,
     input_hash_for_provenance as summary_input_hash_for_provenance,
     knowledge_text_has_link,
+    overview_text_has_link,
     summarize_jobs,
 )
 from wrkviz.summary_registry import (
@@ -3012,7 +3013,7 @@ def _validate_project_overview(summary: SummaryResult, where: str) -> None:
         "Insufficient evidence:"
     ):
         raise ValueError(f"{where}: insufficient overview lacks an evidence limit")
-    if knowledge_text_has_link(summary.paragraph):
+    if overview_text_has_link(summary.paragraph):
         raise ValueError(f"{where}: project overview contains an unverified link")
 
 

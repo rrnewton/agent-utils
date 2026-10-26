@@ -88,6 +88,16 @@ _KNOWLEDGE_LINK = re.compile(
     r"\b[a-z0-9.-]+\.(?:com|org|net|io|dev|ai|gov|edu)(?:/|\b))",
     re.IGNORECASE,
 )
+#: A project overview is rendered as plain text (no auto-linking), so a bare name such as a
+#: package registry's domain is a name, not a link. What still counts as a link there is anything a
+#: reader could follow: a URL scheme, a www host, Markdown link syntax, an autolink, a glossary
+#: anchor, or a domain followed by a path.
+_OVERVIEW_LINK = re.compile(
+    r"(?:\b(?:https?|ftp|mailto):|\bwww\.|!?\[[^\]\n]*\]\s*(?:\(|\[)|"
+    r"<\s*(?:https?|ftp|mailto):|#glossary/|"
+    r"\b[a-z0-9.-]+\.(?:com|org|net|io|dev|ai|gov|edu)/)",
+    re.IGNORECASE,
+)
 _TRANSCRIPT_TIMESTAMP: Final = (
     r"(?:\d{10,16}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))"
 )
@@ -325,6 +335,34 @@ def knowledge_text_has_link(value: str) -> bool:
     """Return whether generated knowledge contains a link or URL-like target."""
 
     return _KNOWLEDGE_LINK.search(value) is not None
+
+
+def overview_text_has_link(value: str) -> bool:
+    """Return whether a project overview contains something a reader could follow as a link."""
+
+    return _OVERVIEW_LINK.search(value) is not None
+
+
+def strip_overview_links(value: str) -> str:
+    """Remove link targets from a generated project overview, keeping the words around them.
+
+    The overview is one paid model call and the last step of a team's run; rejecting it for a link
+    would stop the run after every phase was already paid for. Link syntax becomes its label, a
+    followable address is dropped, and a domain keeps its name but loses its path.
+    """
+
+    tail = r"(?=[.,;:!?)\]]*(?:\s|$))"  # stop before sentence punctuation
+    text = re.sub(r"!?\[([^\]\n]*)\]\s*\([^)\n]*\)", r"\1", value)
+    text = re.sub(r"<\s*(?:https?|ftp|mailto):[^>\s]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:https?|ftp|mailto):\S+?" + tail, "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwww\.\S+?" + tail, "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b([a-z0-9.-]+\.(?:com|org|net|io|dev|ai|gov|edu))/\S*?" + tail, r"\1", text,
+        flags=re.IGNORECASE,
+    )
+    text = text.replace("#glossary/", "")
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
 def _job_json(job: SummaryJob) -> dict[str, JsonValue]:
@@ -722,7 +760,8 @@ def _parse_backend_output_with_repairs(
                 raise SummaryError(
                     f"{where}.paragraph: insufficient overview must name its evidence limit"
                 )
-            if knowledge_text_has_link(paragraph):
+            paragraph = strip_overview_links(paragraph)
+            if overview_text_has_link(paragraph):
                 raise SummaryError(
                     f"{where}.paragraph: project overview must not contain links or URLs"
                 )
@@ -1766,5 +1805,7 @@ __all__ = [
     "WorkBullet",
     "build_summary_prompt",
     "knowledge_text_has_link",
+    "overview_text_has_link",
+    "strip_overview_links",
     "summarize_jobs",
 ]

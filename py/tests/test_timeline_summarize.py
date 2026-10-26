@@ -28,6 +28,8 @@ from wrkviz.summarize import (
     build_summary_prompt,
     clean_summary_prose,
     knowledge_text_has_link,
+    overview_text_has_link,
+    strip_overview_links,
     summarize_jobs,
 )
 from wrkviz.token_usage import TokenUsage
@@ -281,10 +283,22 @@ def test_backend_cannot_persist_linked_generated_knowledge(tmp_path: Path) -> No
         ]
     }
 
-    with pytest.raises(SummaryError, match="must not contain links or URLs"):
-        _parse_backend_output(
-            json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
-        )
+    # The overview is a team run's last paid step, so its link is removed rather than the run
+    # stopped: nothing followable persists, and the words around the link do.
+    parsed = _parse_backend_output(
+        json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+    )
+    paragraph = parsed[job.key].paragraph
+    assert paragraph == "Read invented docs for details."
+    assert not overview_text_has_link(paragraph)
+
+
+def test_project_overview_keeps_bare_names_and_drops_followable_addresses() -> None:
+    assert not overview_text_has_link("Published to crates.io and mirrored on github.com.")
+    assert overview_text_has_link("See github.com/org/repo")
+    assert strip_overview_links(
+        "Notes at https://example.invalid/x, www.example.org and github.com/org/repo."
+    ) == "Notes at, and github.com."
 
 
 def test_one_backend_batch_cannot_mix_summary_audiences() -> None:
