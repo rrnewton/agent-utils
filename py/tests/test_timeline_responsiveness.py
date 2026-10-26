@@ -331,3 +331,113 @@ def test_until_bounds_episodes_and_gaps(team: Sources) -> None:
     report = analyze(team, until=at(15))
     assert [(e.agent, round((e.turn_end - T0) / 60)) for e in report.episodes] == [("cl-a", 10)]
     assert report.gaps and all(gap.end <= at(15) for gap in report.gaps)
+
+
+# --- `wrkviz discover-agents`: the project's agent tree from roots and working directories ------
+
+
+def _codex_rollout(
+    sessions: Path, thread: str, minutes: float, cwd: str, *, parent: str | None = None,
+    prompt: str | None = None, commands: tuple[tuple[float, str], ...] = (),
+) -> None:
+    meta: dict[str, object] = {"id": thread, "timestamp": iso(minutes), "cwd": cwd, "source": "cli"}
+    if parent is not None:
+        meta["source"] = {"subagent": {"thread_spawn": {"parent_thread_id": parent}}}
+    records: list[dict[str, object]] = [{"type": "session_meta", "timestamp": iso(minutes), "payload": meta}]
+    if prompt is not None:
+        records.append({
+            "type": "response_item", "timestamp": iso(minutes),
+            "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": prompt}]},
+        })
+    for when, command in commands:
+        records.append({
+            "type": "response_item", "timestamp": iso(when),
+            "payload": {"type": "function_call", "name": "exec",
+                        "arguments": json.dumps({"cmd": command})},
+        })
+    write_jsonl(sessions / "2026" / "01" / "05" / f"rollout-{thread}.jsonl", records)
+
+
+def _agent_record(registry: Path, name: str, harness: str, minutes: float, cwd: str) -> None:
+    (registry / name).mkdir(parents=True, exist_ok=True)
+    (registry / name / "agent.json").write_text(
+        json.dumps({"name": name, "harness": harness, "cwd": cwd, "created_at": at(minutes)}),
+        encoding="utf-8",
+    )
+
+
+def _tree_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    home = tmp_path / "home"
+    registry = tmp_path / "registry"
+    project = "/work/project"
+    coordinator = home / ".claude" / "projects" / "-work-project" / "coord-1.jsonl"
+    write_jsonl(coordinator, [
+        {"type": "user", "uuid": "u1", "timestamp": iso(0), "cwd": project,
+         "message": {"role": "user", "content": "Coordinate."}},
+        {"type": "assistant", "uuid": "a1", "timestamp": iso(1), "cwd": project,
+         "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                     "input": {"command": "agentctl start lane-a --cwd /work/project --file brief.md"}}]}},
+        {"type": "assistant", "uuid": "a2", "timestamp": iso(2), "cwd": project,
+         "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "Bash",
+                     "input": {"command": "A=/opt/agentctl; $A start lane-b --cwd /work/project"}}]}},
+    ])
+    write_jsonl(coordinator.parent / "coord-1" / "subagents" / "agent-helper.jsonl", [
+        {"type": "user", "uuid": "s1", "timestamp": iso(3), "message": {"role": "user", "content": "Help."}},
+    ])
+    sessions = home / ".codex" / "sessions"
+    _agent_record(registry, "lane-a", "codex", 1.02, project)
+    _codex_rollout(sessions, "lane-a-1", 1.04, project, prompt="You are lane-a, a lane.",
+                   commands=((10, "codex exec 'review the diff'"),))
+    _codex_rollout(sessions, "lane-a-child", 5, project, parent="lane-a-1")
+    _codex_rollout(sessions, "lane-a-review", 10.5, project + "/slot")
+    _codex_rollout(sessions, "lane-a-2", 60, project, prompt="→ lane-a: carry on after the restart")
+    _agent_record(registry, "lane-b", "codex", 2.02, project)
+    _codex_rollout(sessions, "lane-b-1", 2.04, project, prompt="You are lane-b.")
+    _codex_rollout(sessions, "stray", 200, project + "/elsewhere", prompt="Unrelated work.")
+    _codex_rollout(sessions, "other-project", 210, "/work/other", prompt="Not ours.")
+    return home, registry
+
+
+def test_discover_agents_follows_every_link_and_lists_orphans(tmp_path: Path) -> None:
+    from wrkviz.discover import Sources as TreeSources, discover
+
+    home, registry = _tree_fixture(tmp_path)
+    tree = discover(
+        TreeSources(
+            claude_projects=(("h", home / ".claude" / "projects"),),
+            codex_sessions=(("h", home / ".codex" / "sessions"),),
+            registries=(("h", registry),),
+        ),
+        ["claude:coord-1"],
+        ["/work/project"],
+    )
+
+    links = {key: tree.sessions[key].link for key in tree.descendants("claude:coord-1")}
+    assert links == {
+        "claude-subagent:coord-1/helper": "claude-subagent",
+        "codex:lane-a-1": "agentctl-launch",
+        "codex:lane-b-1": "agentctl-launch",
+        "codex:lane-a-child": "codex-spawn",
+        "codex:lane-a-review": "shell-exec",
+        "codex:lane-a-2": "agentctl-restart",
+    }
+    assert tree.sessions["codex:lane-a-2"].parent == "codex:lane-a-1"
+    assert tree.orphans == ["codex:stray"]
+
+
+def test_discover_agents_cli_writes_the_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    home, registry = _tree_fixture(tmp_path)
+    report = tmp_path / "tree.json"
+
+    assert main([
+        "discover-agents", "--home", f"h={home}", "--registry", f"h={registry}",
+        "--cwd-prefix", "/work/project", "--root", "claude:coord-1", "--json", str(report),
+    ]) == 0
+
+    printed = capsys.readouterr().out
+    assert "| claude:coord-1 |" in printed and "orphans" in printed
+    written = json.loads(report.read_text(encoding="utf-8"))
+    assert written["roots"][0]["descendants"] == 6
+    assert [row["key"] for row in written["orphans"]] == ["codex:stray"]
+    assert main(["discover-agents", "--home", f"h={home}", "--root", "claude:missing"]) == 2

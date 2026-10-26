@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import sqlite3
 import sys
 from collections.abc import Sequence
 from datetime import datetime
@@ -72,6 +74,8 @@ from wrkviz.query import (
     schema_3_completeness,
     schema_3_record_counts,
 )
+from wrkviz.discover import Sources as DiscoverSources, discover, parse_labelled
+from wrkviz.discover import format_markdown as format_discovery
 from wrkviz.responsiveness import Sources as ResponsivenessSources, run as run_responsiveness
 from wrkviz.server import serve
 from wrkviz.snapshot_store import (
@@ -1081,7 +1085,109 @@ def _parser() -> argparse.ArgumentParser:
         help="also write one JSON row per episode to this file (default: not written)",
     )
     responsiveness.set_defaults(handler="responsiveness")
+
+    discover_agents = sub.add_parser(
+        "discover-agents",
+        help="find every agent session under a project's coordinators, across harnesses; zero tokens",
+        description=(
+            "Rebuild a project's agent tree from its coordinator sessions: native subagents "
+            "(Claude Code subagent files, Codex spawned children, Orc child sessions) and lanes "
+            "started with agentctl (an `agentctl ... start NAME` in a session's log, matched to the "
+            "registry record and from there to the child's own log). Every session that ran under "
+            "a --cwd-prefix and that no root reaches is listed as an orphan, so gaps in the links "
+            "are visible. Reads only; calls no model."
+        ),
+        epilog=(
+            "example:\n"
+            "  wrkviz discover-agents --home hostA=/archive/hostA --home hostB=/archive/hostB \\\n"
+            "    --registry hostA=~/project/.agentctl --cwd-prefix /home/me/project \\\n"
+            "    --root claude:SESSION-UUID --root codex:THREAD-ID --since 2026-10-01 \\\n"
+            "    --json tree.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    discover_agents.add_argument(
+        "--home", action="append", default=[], metavar="LABEL=DIR",
+        help="a host's home directory or its archived mirror; expands to whichever of "
+             ".claude/projects, .codex/sessions, .orc and .local/share/muse/sessions exist under "
+             "it, labelled LABEL; repeatable",
+    )
+    for flag, what in (
+        ("--claude-projects", "a Claude Code projects directory"),
+        ("--codex-sessions", "a Codex sessions directory"),
+        ("--orc-root", "a directory holding .orc/index.db"),
+        ("--muse-sessions", "a Muse sessions directory"),
+        ("--registry", "an agentctl registry directory (agent records and archive/)"),
+    ):
+        discover_agents.add_argument(
+            flag, action="append", default=[], metavar="LABEL=DIR",
+            help=f"{what} on host LABEL; repeatable (default: none beyond --home)",
+        )
+    discover_agents.add_argument(
+        "--root", action="append", default=[], required=True, metavar="PROVIDER:ID",
+        help="a coordinator session, as claude:SESSION-UUID, codex:THREAD-ID, orc:SESSION-ID or "
+             "muse:SESSION-ID; repeatable",
+    )
+    discover_agents.add_argument(
+        "--cwd-prefix", action="append", default=[], metavar="PATH",
+        help="working-directory prefix, as recorded on the host, whose sessions should all be in "
+             "the tree; sessions under it that no root reaches are orphans; repeatable "
+             "(default: none, so no orphans are reported)",
+    )
+    discover_agents.add_argument(
+        "--since", default=None,
+        help="report only orphans started or written since this RFC 3339 instant or date "
+             "(default: all)",
+    )
+    discover_agents.add_argument(
+        "--format", choices=("markdown", "json"), default="markdown",
+        help="report format on stdout (default: %(default)s)",
+    )
+    discover_agents.add_argument(
+        "--json", default=None, metavar="FILE",
+        help="also write the full JSON report (every tree node and orphan) to FILE "
+             "(default: not written)",
+    )
+    discover_agents.set_defaults(handler="discover_agents")
     return parser
+
+
+def _discover_agents(ns: argparse.Namespace) -> int:
+    sources: dict[str, list[tuple[str, Path]]] = {
+        "claude_projects": parse_labelled(ns.claude_projects, "--claude-projects"),
+        "codex_sessions": parse_labelled(ns.codex_sessions, "--codex-sessions"),
+        "orc_roots": parse_labelled(ns.orc_root, "--orc-root"),
+        "muse_sessions": parse_labelled(ns.muse_sessions, "--muse-sessions"),
+        "registries": parse_labelled(ns.registry, "--registry"),
+    }
+    for label, home in parse_labelled(ns.home, "--home"):
+        for key, relative in (
+            ("claude_projects", ".claude/projects"),
+            ("codex_sessions", ".codex/sessions"),
+            ("muse_sessions", ".local/share/muse/sessions"),
+        ):
+            if (home / relative).is_dir():
+                sources[key].append((label, home / relative))
+        if (home / ".orc" / "index.db").is_file():
+            sources["orc_roots"].append((label, home))
+    raw_since = str(ns.since) if ns.since is not None else None
+    if raw_since is not None and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_since):
+        raw_since += "T00:00:00Z"
+    since = _instant(raw_since, "--since")
+    discovery = discover(
+        DiscoverSources(**sources),
+        [str(root) for root in ns.root],
+        [str(prefix) for prefix in ns.cwd_prefix],
+        since,
+    )
+    report = discovery.to_json_obj()
+    if ns.json is not None:
+        Path(ns.json).expanduser().write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if ns.format == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_discovery(discovery), end="")
+    return 0
 
 
 def _instant(raw: object, label: str) -> float | None:
@@ -1794,6 +1900,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ), end="")
             return 0
         except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler == "discover_agents":
+        try:
+            return _discover_agents(ns)
+        except (OSError, ValueError, sqlite3.Error) as error:
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
     if handler == "inspect":

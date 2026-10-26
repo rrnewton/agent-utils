@@ -8,6 +8,7 @@ No language-model summary participates in this pass.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -401,8 +402,13 @@ def _flatten_output(text: str | None) -> str:
     return "\n".join(fragments) if fragments else text
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def _shell_segments(command: str) -> tuple[tuple[str, ...], ...]:
-    """Tokenize shell statements without matching command names inside quoted search text."""
+    """Tokenize shell statements without matching command names inside quoted search text.
+
+    Memoized: extraction asks a dozen questions of every tool call's command, and a coordinator
+    with a quarter of a million tool calls spent most of its ingest re-tokenizing the same strings.
+    """
 
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
@@ -450,7 +456,12 @@ def _command_has(tool: ToolCall, executable: str, *arguments: str) -> bool:
     """Require an actual command boundary, not a policy/search substring."""
 
     desired = (executable, *arguments)
-    for raw_segment in _shell_segments(_tool_command(tool)):
+    command = _tool_command(tool)
+    if executable not in re.sub(r"[\"'\\]", "", command):
+        # Every match below, nested shells included, spells the name once quoting is removed;
+        # most commands never mention it, and this spares them the tokenizer.
+        return False
+    for raw_segment in _shell_segments(command):
         segment = _executable_tokens(raw_segment)
         if segment[: len(desired)] == desired:
             return True

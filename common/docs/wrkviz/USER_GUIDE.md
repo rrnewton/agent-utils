@@ -1485,6 +1485,54 @@ the UI clearly says the exact body is unavailable and shows an inferred paragrap
 agent's subsequent work. Automatic final answers and each agent's own commentary/final response are
 plaintext; encrypted instruction bodies remain unavailable to the archive.
 
+## Discover a project's agent tree
+
+A coordinator that runs for weeks leaves its work spread across logs no single tool reads together:
+its own Claude Code transcript, Task subagents beside it, Codex and Muse lanes it started through
+agentctl, the subagents those lanes spawned, and one-shot reviewers a lane ran from its shell.
+`discover-agents` rebuilds that tree without a model, so you can see every session that belongs in
+a project before registering teams or summarizing a week.
+
+```bash
+wrkviz discover-agents \
+  --home hostA=/archive/hostA --home hostB=/archive/hostB \
+  --muse-sessions hostA=/archive/hostA/muse-sessions \
+  --registry hostA=~/project/.agentctl --registry hostB=/copies/hostB/.agentctl \
+  --cwd-prefix /home/me/project \
+  --root claude:COORDINATOR-SESSION-UUID --root claude:SECOND-COORDINATOR-UUID \
+  --since 2026-10-01 --json tree.json
+```
+
+`--home LABEL=DIR` is a host's home directory or its archived mirror; it expands to whichever of
+`.claude/projects`, `.codex/sessions`, `.orc` and `.local/share/muse/sessions` exist under it. The
+explicit flags (`--claude-projects`, `--codex-sessions`, `--orc-root`, `--muse-sessions`,
+`--registry`) add a single directory for a host. The label ties a registry to the logs of the same
+host. Each child is attached to its parent by one of these links, recorded on every node:
+
+| Link | Evidence |
+|---|---|
+| `claude-subagent` | a file under the session's `subagents/` directory |
+| `codex-spawn` | the child rollout's recorded parent thread |
+| `orc-parent` | the Orc session index's `parent_id` |
+| `agentctl-launch` | an `agentctl ... start NAME` (or `$VAR start NAME` on a line naming agentctl) in the parent's log, the registry record of NAME created within 15 minutes after it, and that record's log: its recorded native session id, else the same harness, host and working directory starting within 5 minutes of the record |
+| `agentctl-created-by` | a registry record's `created_by` or `managed_by` |
+| `agentctl-restart` | a log whose first prompt was queued to a registered agent, or is addressed to it (`→ NAME`, `SENDER -> NAME`, `You are NAME`), attached to that agent's earlier session |
+| `shell-exec` | an unlinked log that starts within 2 minutes after a reached session ran `codex exec`, `claude -p` or `muse exec` on the same host; skipped when two sessions ran one within a second of each other |
+
+The last two are inferences from timing and wording rather than recorded links, which is why they
+carry their own names: filter them out of the JSON when only recorded links will do.
+
+Every session whose working directory is under a `--cwd-prefix` and that no root reaches is an
+**orphan**. Orphans are the gaps: a lane started some other way, a coordinator not passed as a
+root, a restart whose first prompt names nobody. `--since` limits the orphan list to sessions
+started or written since then; the tree itself is not limited. The report also counts launches of a
+registered name that resolved to no log, and launch-like text naming no registered agent (prose and
+usage examples), which is ignored.
+
+The Markdown report gives each root's direct children, all descendants and a count per link, then
+the orphans; `--json FILE` writes every node with its parent, link, host, working directory, start
+and log path. Native Claude subagents are counted, never listed as orphans.
+
 ## Measure parent-child responsiveness (persistent-agent teams)
 
 A coordinator keeps its subagents busy only if it learns promptly that one stopped and then acts.
