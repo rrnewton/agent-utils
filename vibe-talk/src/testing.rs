@@ -179,6 +179,7 @@ fn state_pieces(
         text,
         store,
         Arc::new(crate::summarize::fake::FakeSummarizer::new()),
+        None,
     )
 }
 
@@ -195,7 +196,7 @@ pub fn state_with_summarizer(
     let store = Arc::new(FakeStore::new());
     let summarizer = Arc::new(crate::summarize::fake::FakeSummarizer::new());
     let (state, discord, _elevenlabs, _erased) =
-        state_pieces_with(text, store.clone(), summarizer.clone());
+        state_pieces_with(text, store.clone(), summarizer.clone(), None);
     (state, discord, store, summarizer)
 }
 
@@ -211,14 +212,36 @@ pub fn state_with_backend(
     summarizer: Arc<dyn crate::summarize::Summarizer>,
 ) -> (AppState, Arc<FakeDiscord>, Arc<FakeStore>) {
     let store = Arc::new(FakeStore::new());
-    let (state, discord, _elevenlabs, _erased) = state_pieces_with(text, store.clone(), summarizer);
+    let (state, discord, _elevenlabs, _erased) =
+        state_pieces_with(text, store.clone(), summarizer, None);
     (state, discord, store)
+}
+
+/// A server whose read-aloud speaks through the given Wit.ai client, plus
+/// a handle to the fake Discord. `#552 wit-tts-provider`: the in-memory
+/// fake for adapter tests, the real HTTP client against a loopback fake
+/// server for wire tests. The configuration text names the token and
+/// voice the provider uses.
+#[must_use]
+pub fn state_with_wit(
+    text: &str,
+    client: Arc<dyn crate::wit::WitClient>,
+) -> (AppState, Arc<FakeDiscord>) {
+    let store = Arc::new(FakeStore::new());
+    let (state, discord, _elevenlabs, _erased) = state_pieces_with(
+        text,
+        store,
+        Arc::new(crate::summarize::fake::FakeSummarizer::new()),
+        Some(client),
+    );
+    (state, discord)
 }
 
 fn state_pieces_with(
     text: &str,
     store: Arc<dyn crate::store::StateStore>,
     summarizer: Arc<dyn crate::summarize::Summarizer>,
+    wit_client: Option<Arc<dyn crate::wit::WitClient>>,
 ) -> (
     AppState,
     Arc<FakeDiscord>,
@@ -260,6 +283,10 @@ fn state_pieces_with(
                 config.elevenlabs.clone(),
             ))
         }
+        crate::config::ReadAloudBackend::Wit => Arc::new(crate::wit::speech::WitSpeech::new(
+            wit_client.unwrap_or_else(|| Arc::new(crate::wit::fake::FakeWit::new())),
+            config.wit.clone(),
+        )),
     };
     // The fake answers for the deployment's one provider, recorded under that provider's own
     // namespace exactly as `main` records a real client's.

@@ -1344,8 +1344,16 @@
                       <label for="settings-audio-source">Read messages with</label>
                       <select id="settings-audio-source">
                         <option id="settings-agent-audio" value="agent">Agent audio</option>
+                        <option id="settings-wit-audio" value="wit" hidden>Wit.ai voice</option>
                         <option value="device">Device voice</option>
                       </select>
+                      <div id="wit-voice-picker" hidden>
+                        <label for="settings-wit-voice">Wit.ai voice</label>
+                        <select id="settings-wit-voice">
+                          <option value="">Configured voice</option>
+                        </select>
+                        <p id="wit-voice-state" class="hint" aria-live="polite"></p>
+                      </div>
                       <p class="help-text-row">
                         <button class="help-link help-link-text" id="help-link-speech-prep" type="button" data-help="speech-prep" title="The rewrite for the ear that every message is read out in, by either voice.">How messages are pre-processed for speech</button>
                       </p>

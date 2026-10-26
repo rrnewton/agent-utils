@@ -176,7 +176,7 @@ const ALL_CHANNELS = "*";
 /**
  * @overload
  * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
- *   | "settings-channel" | "settings-service" | "slack-open-in" | "thread-select" | "upstream-clear-mode"} id
+ *   | "settings-channel" | "settings-service" | "settings-wit-voice" | "slack-open-in" | "thread-select" | "upstream-clear-mode"} id
  * @returns {HTMLSelectElement}
  */
 /**
@@ -35787,20 +35787,85 @@ let browserVoiceProblem = "";
 function storedReadAudioSource() {
   try {
     const held = localStorage.getItem(READ_AUDIO_SOURCE_KEY);
-    return held === "agent" || held === "device" ? held : null;
+    return held === "agent" || held === "device" || held === "wit" ? held : null;
   } catch (_error) {
     return null;
   }
 }
 
+// `#552 wit-tts-provider`. When the server's read-aloud backend is Wit.ai,
+// Settings offers its catalogue: a voice the reader picks here rides on
+// every speech preparation, and the server's configured voice is the
+// fallback the empty choice names.
+const WIT_VOICE_KEY = "vibe-talk.voice.wit-voice";
+let witReadAloud = null;
+let witVoice = "";
+
+function storedWitVoice() {
+  try {
+    return localStorage.getItem(WIT_VOICE_KEY) || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+/** Choose the Wit.ai voice for later reads; the configured voice when cleared. */
+function setWitVoice(name, announce = true) {
+  witVoice = String(name || "");
+  try {
+    if (witVoice) localStorage.setItem(WIT_VOICE_KEY, witVoice);
+    else localStorage.removeItem(WIT_VOICE_KEY);
+  } catch (_error) {
+    // The choice still applies to this page when storage is unavailable.
+  }
+  el("settings-wit-voice").value = witVoice;
+  forgetPreparedSpeech();
+  if (announce) {
+    setStatus(witVoice ? `Wit.ai voice set to ${witVoice}.` : "Wit.ai will use the configured voice.");
+  }
+}
+
+/** Fill the Wit.ai voice picker from the server's catalogue. */
+async function loadWitVoices() {
+  if (!witReadAloud) return;
+  try {
+    const answer = await api("/api/v1/read-aloud/voices");
+    const voices = Array.isArray(answer && answer.voices) ? answer.voices : [];
+    const picker = el("settings-wit-voice");
+    picker.replaceChildren();
+    const configured = document.createElement("option");
+    configured.value = "";
+    configured.textContent = "Configured voice";
+    picker.append(configured);
+    for (const voice of voices) {
+      const name = String(voice && voice.name || "");
+      if (!name) continue;
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name.replace(/^wit\$/u, "");
+      picker.append(option);
+    }
+    picker.value = witVoice;
+    el("wit-voice-state").textContent = voices.length > 0
+      ? `${voices.length} Wit.ai voices available.`
+      : "Wit.ai listed no voices for this app.";
+  } catch (_error) {
+    el("wit-voice-state").textContent =
+      "Wit.ai voices could not be listed; the configured voice will be used.";
+  }
+}
+
 /** Select where message audio is produced. The toggle itself never waits for either provider. */
 function setReadAudioSource(source, announce = true) {
-  readAudioSource = source === "agent" && agentReadAloud ? "agent" : "device";
+  readAudioSource = source === "wit" && witReadAloud ? "wit"
+    : source === "agent" && agentReadAloud ? "agent" : "device";
   stopReading();
   forgetPreparedSpeech();
-  if (readAudioSource === "agent") {
-    readAloudPlayback = String(agentReadAloud.playback || "audio");
-    readAloudLabel = String(agentReadAloud["label"] || "Agent voice");
+  const serverSpeech = readAudioSource === "wit" ? witReadAloud
+    : readAudioSource === "agent" ? agentReadAloud : null;
+  if (serverSpeech) {
+    readAloudPlayback = String(serverSpeech.playback || "audio");
+    readAloudLabel = String(serverSpeech["label"] || "Agent voice");
   } else {
     readAloudPlayback = "browser";
     readAloudLabel = "Device voice";
@@ -35811,7 +35876,7 @@ function setReadAudioSource(source, announce = true) {
   } catch (_error) {
     // The selection still applies to this page when storage is unavailable.
   }
-  const agent = readAudioSource === "agent";
+  const agent = readAudioSource !== "device";
   el("audio-source").setAttribute("aria-checked", agent ? "true" : "false");
   el("audio-source").setAttribute(
     "aria-label", agent ? `Read messages with ${readAloudLabel}` : "Read messages with device audio"
@@ -35820,8 +35885,11 @@ function setReadAudioSource(source, announce = true) {
     ? `${readAloudLabel}. Tap to use device audio.`
     : `Device audio. Tap to use ${agentReadAloud ? agentReadAloud["label"] : "the configured agent"}.`;
   el("settings-audio-source").value = readAudioSource;
-  el("settings-agent-audio").toggleAttribute("hidden", agentReadAloud === null);
-  el("settings-agent-audio").toggleAttribute("disabled", agentReadAloud === null);
+  el("settings-agent-audio").toggleAttribute("hidden", agentReadAloud === null || witReadAloud !== null);
+  el("settings-agent-audio").toggleAttribute("disabled", agentReadAloud === null || witReadAloud !== null);
+  el("settings-wit-audio").toggleAttribute("hidden", witReadAloud === null);
+  el("settings-wit-audio").toggleAttribute("disabled", witReadAloud === null);
+  el("wit-voice-picker").toggleAttribute("hidden", witReadAloud === null);
   // The icons are <svg>, and `hidden` reflects only on HTMLElement: assigning `.hidden` here would
   // set an expando and leave the phone icon showing in agent mode.
   el("audio-device-icon").toggleAttribute("hidden", agent);
@@ -36340,6 +36408,7 @@ async function requestPreparedSpeech(channel, ids, signal = null) {
     const batch = await api(
       `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
       { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
+        ...(readAudioSource === "wit" && witVoice ? { voice: witVoice } : {}),
         ...(threadId ? { thread_id: threadId } : {}) }, ...(signal ? { signal } : {}) }
     );
     // Cancelled while it was answered: its tickets may be for a pace or a screen that has gone.
@@ -55140,7 +55209,13 @@ function applyClientConfig(config) {
   // Device speech is always a local browser choice. A configured server-audio provider adds the
   // other side of the bar toggle; its label comes from the provider trait and is never guessed.
   agentReadAloud = String(effectiveSpeech.playback) === "audio" ? effectiveSpeech : null;
-  setReadAudioSource(storedReadAudioSource() || (agentReadAloud ? "agent" : "device"), false);
+  // `#552 wit-tts-provider`. A Wit.ai backend is server audio too, but
+  // Settings names it as its own choice and offers its voice catalogue.
+  witReadAloud = String(effectiveSpeech.backend || "") === "wit" ? effectiveSpeech : null;
+  if (witReadAloud && !witVoice) witVoice = storedWitVoice();
+  setReadAudioSource(
+    storedReadAudioSource() || (witReadAloud ? "wit" : agentReadAloud ? "agent" : "device"), false);
+  if (witReadAloud) void loadWitVoices();
   applyReadSpeed(readSpeed);
   threadingSupported = config.threading_supported === true;
   deploymentCapabilities.threading = threadingSupported;
@@ -55595,6 +55670,8 @@ const SYNCED_SETTING_KEYS = [
   "vibe-talk.voice.relay",
   "vibe-talk.voice.read-audio-source",
   "vibe-talk.voice.read-speed",
+  // `#552 wit-tts-provider`. The Wit.ai voice chosen in Settings.
+  "vibe-talk.voice.wit-voice",
   "vibe-talk.voice.prompts",
   "vibe-talk.voice.mic",
   "vibe-talk.voice.read-mode",
@@ -55722,6 +55799,7 @@ function applySyncedSetting(key) {
       case CARD_MAX_LINES_KEY: keepingCardPlace(() => applyCardMaxLines(storedCardMaxLines())); break;
       case READ_SPEED_KEY: applyReadSpeed(storedReadSpeed()); break;
       case READ_AUDIO_SOURCE_KEY: setReadAudioSource(storedReadAudioSource(), false); break;
+      case WIT_VOICE_KEY: setWitVoice(storedWitVoice(), false); break;
       case MIC_SETTINGS_KEY: {
         const held = storedMicSettings();
         for (const [id, name] of MIC_TOGGLES) {
@@ -56508,7 +56586,10 @@ el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("dismiss-error").addEventListener("click", clearError);
 el("retry-start").addEventListener("click", retryStart);
 el("audio-source").addEventListener("click", () =>
-  setReadAudioSource(readAudioSource === "device" ? "agent" : "device")
+  setReadAudioSource(readAudioSource === "device" ? (witReadAloud ? "wit" : "agent") : "device")
+);
+el("settings-wit-voice").addEventListener("change", () =>
+  setWitVoice(el("settings-wit-voice").value)
 );
 el("settings-audio-source").addEventListener("change", () =>
   setReadAudioSource(el("settings-audio-source").value)

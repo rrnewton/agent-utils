@@ -680,6 +680,14 @@ async fn main() -> anyhow::Result<()> {
                 config.elevenlabs.clone(),
             ))
         }
+        ReadAloudBackend::Wit => {
+            let client = vibe_talk::wit::http::HttpWitClient::new(&config.wit.api_base)
+                .map_err(|error| anyhow::anyhow!("wit client: {error}"))?;
+            Arc::new(vibe_talk::wit::speech::WitSpeech::new(
+                Arc::new(client),
+                config.wit.clone(),
+            ))
+        }
     };
     let read_aloud = speech.describe();
     tracing::info!(

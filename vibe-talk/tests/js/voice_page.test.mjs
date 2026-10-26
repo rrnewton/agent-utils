@@ -64597,7 +64597,7 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
  * settings-collapsible` made each group's heading the button that folds it, a stop before its `?`.
  */
 const SETTINGS_TAB_STOPS = ["fold-resuming", "help-link-resuming", "resume-toggle", "fold-relay", "help-link-live-messages",
-  "relay-to-agent", "fold-reading-full", "settings-audio-source", "help-link-speech-prep"];
+  "relay-to-agent", "fold-reading-full", "settings-audio-source", "settings-wit-voice", "help-link-speech-prep"];
 
 /**
  * Where the markup breaks `stops` as consecutive Tab stops on Settings, as sentences. The focus order
@@ -64633,7 +64633,7 @@ test("`#332 settings-voice-agent-section`: Tab goes through the three in the ord
   assert.notEqual(above, HTML, "the negative control changed nothing");
   assert.deepStrictEqual(tabStopProblems(above, SETTINGS_TAB_STOPS).map((problem) => problem.replace(/^(<[a-z]+ [^ ]+ [^ ]+ id="[^"]+")[^>]*>/, "$1>")), [
     '<button class="help-link help-link-text" id="help-link-speech-prep"> stands between #fold-reading-full and #settings-audio-source',
-    "#help-link-speech-prep comes before #settings-audio-source",
+    "#help-link-speech-prep comes before #settings-wit-voice",
   ]);
   // ...and Canned prompts put back between Arriving messages and the reading picker.
   const canned = `${settingsGroup("Canned prompts")}</section>`;

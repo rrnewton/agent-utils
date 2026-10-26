@@ -944,6 +944,7 @@ async fn an_authorized_caller_still_gets_the_parsers_answer() {
         said: "hello".to_owned(),
         blocks: Vec::new(),
         speed: None,
+        voice: None,
         observation: "observation-1".to_owned(),
         preparation_ms: 0,
     });
@@ -1147,6 +1148,7 @@ async fn every_api_answer_is_no_store_whoever_asks_and_however() {
         said: "hello".to_owned(),
         blocks: Vec::new(),
         speed: None,
+        voice: None,
         observation: "observation-1".to_owned(),
         preparation_ms: 0,
     });

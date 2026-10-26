@@ -72,6 +72,9 @@ pub struct Prepared {
     pub blocks: Vec<String>,
     /// The pace the reader had chosen when this was minted, if they had chosen one.
     pub speed: Option<f64>,
+    /// The voice the reader had chosen in Settings when this was minted,
+    /// for a provider with a catalogue. `#552 wit-tts-provider`.
+    pub voice: Option<String>,
     /// Opaque correlation key for content-free server and browser timing records.
     pub observation: String,
     /// Message lookup and normalization, ending before provider connection or readiness begins.
@@ -264,6 +267,7 @@ mod tests {
             said: format!("the text of {message}"),
             blocks: Vec::new(),
             speed: None,
+            voice: None,
             observation: fresh_observation(),
             preparation_ms: 1,
         }
