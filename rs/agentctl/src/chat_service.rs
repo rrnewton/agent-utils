@@ -8551,6 +8551,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     shutdown_grace_millis: 0,
                 }),
                 reply_alias_range: None,
+                slack_format: None,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state without opening helper");
@@ -8568,6 +8570,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 Some(thread),
                 "123e4567-e89b-42d3-a456-426614174000",
                 "operator message",
+                None,
             )
             .expect_err("thread outside the channel");
             assert!(
@@ -8583,6 +8586,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             Some("spaces/allowed/threads/one\ntwo"),
             "123e4567-e89b-42d3-a456-426614174000",
             "operator message",
+            None,
         )
         .expect_err("multiline thread");
         assert!(
@@ -8641,6 +8645,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     shutdown_grace_millis: 50,
                 }),
                 reply_alias_range: None,
+                slack_format: None,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state");
@@ -8652,6 +8658,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             Some("spaces/allowed/threads/root"),
             request_id,
             "operator check",
+            None,
         )
         .expect("publish thread reply");
         assert_eq!(
