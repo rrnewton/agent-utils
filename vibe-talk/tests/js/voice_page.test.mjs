@@ -2535,6 +2535,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     speechBlocks: {},
     /** Content-free browser playback timing reports, kept apart from synthesis calls. */
     speechTimingCalls: [],
+    /** `#548 cloud-read-failures`: every failure the page reported, by ticket. */
+    speechFailureCalls: [],
+    speechFailureLookups: [],
+    ticketRefusal: null,
+    ticketFailure: null,
     /** Make preparing fail, to prove the tap still works by the older, slower route. */
     prepareFails: false,
     /**
@@ -3443,7 +3448,24 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         const signal = options && options.signal;
         if (signal) signal.addEventListener("abort", () => controller.drop());
         page.audioStreams.push({ url: String(path), options, controller });
-        return { ok: page.ticketStatus < 400, status: page.ticketStatus, body };
+        // `#548 cloud-read-failures`: a refusal's JSON, as the server answers one, when a test sets it.
+        return { ok: page.ticketStatus < 400, status: page.ticketStatus, body,
+          json: async () => { if (!page.ticketRefusal) throw new Error("no JSON"); return page.ticketRefusal; } };
+      }
+      const speechFailure = /^\/api\/v1\/speech\/([^/?]+)\/failure(?:\?(.*))?$/.exec(String(path));
+      if (speechFailure && !(options && options.method === "POST")) {
+        // Why the read's stream failed, as the server kept it, when a test sets it.
+        page.speechFailureLookups.push({ ticket: speechFailure[1], query: speechFailure[2] || "" });
+        return page.ticketFailure ? json(200, page.ticketFailure)
+          : json(404, { error: "no_speech_failure", detail: "that read's audio stream has not failed" });
+      }
+      if (speechFailure) {
+        page.speechFailureCalls.push({
+          ticket: speechFailure[1],
+          query: speechFailure[2] || "",
+          failure: JSON.parse((options && options.body) || "{}"),
+        });
+        return json(204, {});
       }
       const speechTiming = /^\/api\/v1\/speech\/([^/]+)\/timing$/.exec(String(path));
       if (speechTiming) {
@@ -4767,6 +4789,10 @@ const TUNING_BANDS = {
     "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
   BROWSER_SPEECH_FINISH_MS: [30000, 120000,
     "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
+  READ_NO_SPEECH_MS: [2500, 10000,
+    "how long a part of a cloud read may go with no speech before it is stopped (#548 " +
+    "cloud-read-failures): speech follows the first frame by under a second, so less stops a slow but " +
+    "working voice, and more leaves a reader in a car listening to nothing"],
   SPEECH_ONSET_WAIT_MS: [1500, 15000,
     "how long a read's timing report waits after `playing` to learn when speech began (#191 " +
     "read-aloud-first-lag). Speech follows the first frame by 0.55 to 0.8 s in every read measured, " +
@@ -34101,7 +34127,7 @@ test("a streamed read CUT OFF part-way, or refused, says so and archives nothing
     page.audioStreams.at(-1).controller.fail();
     await page.settle();
   }
-  assert.match(page.el("status").textContent, /could not be played/);
+  assert.match(page.el("status").textContent, /Cloud voice: the connection to it kept dropping\. The message was not archived\./);
   assert.equal(rowState(page, 0).reading, "false", "the row is stuck looking like it is speaking");
 
   // Refused outright, not lost: said at once, and not tried again.
@@ -34110,9 +34136,169 @@ test("a streamed read CUT OFF part-way, or refused, says so and archives nothing
   await rows[1].dispatch("click", {});
   await page.settle();
   assert.equal(page.audio.sources.length, 1, "a refused read played something");
-  assert.match(page.el("status").textContent, /could not be played/);
+  assert.match(page.el("status").textContent, /Cloud voice: it could not play this message\./);
   assert.equal(page.audioStreams.length, asked + 1, "a refused read was asked for again");
   assert.deepEqual(page.dismissCalls, [], "a read nobody heard to the end was archived");
+});
+
+// --- `#548 cloud-read-failures`: a cloud read the voice fails stops and says why ----------------------
+
+/** `count` samples of digital silence, and of a tone loud enough to be speech. */
+const silentPcm = (count) => pcm(...new Array(count).fill(0));
+const loudPcm = (count) => pcm(...Array.from({ length: count }, (_, at) => (at % 2 ? 3000 : -3000)));
+
+async function cloudReadPage() {
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableDeviceSpeech();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", author_id: "1000000000000000011", content: "A message the voice will not say." }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "Another message." }),
+  ]);
+  return { page, rows };
+}
+
+test("`#548 cloud-read-failures`: a cloud read answered with silence stops, says so, reports it, and offers the device voice", async () => {
+  const { page, rows } = await cloudReadPage();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  // What a voice service denied speech access sends: about 0.85 s of zeros, then the end of the turn.
+  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), silentPcm(20400)));
+  page.audioStreams[0].controller.drop();
+  await page.settle();
+  assert.match(page.el("error").textContent, /^Cloud voice isn't producing audio: it sent silence/);
+  assert.equal(page.el("error-wrap").hidden, false);
+  assert.equal(page.el("read-on-device").hidden, false, "the device voice was not offered");
+  assert.equal(rowState(page, 0).reading, "false", "the read went on in silence");
+  assert.equal(page.el("read-aloud-label").text(), "Stop", "the read is still in progress");
+  assert.deepEqual(page.dismissCalls, [], "a message nobody heard was archived");
+  assert.deepEqual(page.speechFailureCalls.map((call) => call.failure.reason), ["silent"]);
+  assert.match(page.speechFailureCalls[0].failure.detail, /sent silence/);
+
+  // Read with device voice: that message, by the device voice, this once.
+  await page.el("read-on-device").click();
+  await page.settle();
+  assert.deepEqual(page.deviceSpeech.utterances.map((one) => one.text), ["A message the voice will not say."]);
+  assert.equal(page.el("read-on-device").hidden, true);
+  assert.equal(page.el("error-wrap").hidden, true);
+  page.deviceSpeech.utterances[0].end();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }], "the device voice's read was not archived");
+  // The voice selected is still the cloud's: the next tap streams.
+  const streams = page.audioStreams.length;
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.audioStreams.length, streams + 1, "Read with device voice changed the selected voice");
+  assert.equal(page.deviceSpeech.utterances.length, 1);
+});
+
+test("`#548 cloud-read-failures`: no speech within a few seconds stops a cloud read, but a held read waits and a read with speech goes on", async () => {
+  const { page, rows } = await cloudReadPage();
+  const limit = sourceConstant("READ_NO_SPEECH_MS");
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  // A voice slow to answer is not a voice producing silence: the wait counts from the first audio.
+  page.expireTimers(limit);
+  await page.settle();
+  assert.equal(page.el("error").textContent, "", "a read was stopped before its first audio came");
+  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), loudPcm(2400)));
+  await page.settle();
+  page.expireTimers(limit);
+  await page.settle();
+  assert.equal(page.el("error").textContent, "", "a read with speech in it was stopped");
+  assert.equal(rowState(page, 0).reading, "true");
+
+  // The second message: a header, and a tenth of a second of silence, and then nothing.
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  page.audioStreams.at(-1).controller.bytes(joined(wavHeader(24000, 1), silentPcm(2400)));
+  await page.settle();
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the premise: the read is held");
+  page.expireTimers(limit);
+  await page.settle();
+  assert.equal(page.el("error").textContent, "", "a held read was judged for its silence");
+  await page.el("read-aloud").click();
+  await page.settle();
+  page.expireTimers(limit);
+  await page.settle();
+  assert.match(page.el("error").textContent, /^Cloud voice isn't producing audio: no speech came within 4 seconds of its first audio/);
+  assert.equal(rowState(page, 1).reading, "false");
+  assert.deepEqual(page.speechFailureCalls.map((call) => call.failure.reason), ["no_audio"]);
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("`#548 cloud-read-failures`: a read the voice cut off naming why stops at once with that reason, and one merely dropped is tried again", async () => {
+  const { page, rows } = await cloudReadPage();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  // The private bridge: silent audio, then an error naming the cause, then the socket closed; the
+  // server can only cut the response off, and keeps why under the ticket.
+  page.ticketFailure = {
+    error: "conversation_speech_error",
+    detail: "Test agent read-aloud session failed: the agent reported: the speech service denied access " +
+      "(ACL TIER:example); no audio was produced (speech_access_denied)",
+  };
+  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), silentPcm(9600)));
+  await page.settle();
+  page.audioStreams[0].controller.fail();
+  await page.settle();
+  // The answer to the question, then what it says.
+  await page.settle();
+  assert.equal(page.speechFailureLookups.length, 1, "the server was not asked why the read was cut off");
+  assert.equal(page.el("error").textContent, "Cloud voice: speech access denied (ACL). The message was not archived.");
+  assert.equal(page.audioStreams.length, 1, "a read the voice refused was tried again");
+  assert.doesNotMatch(page.el("status").textContent, /trying again/);
+  assert.equal(page.el("read-on-device").hidden, false);
+  assert.deepEqual(page.speechFailureCalls.map((call) => call.failure.reason), ["refused"]);
+  assert.deepEqual(page.dismissCalls, []);
+
+  // The server's own judgement of a turn of silence is said as the silence it is.
+  page.ticketFailure = {
+    error: "conversation_speech_silent",
+    detail: "Test agent answered the read with silence: no speech was produced (conversation_speech_silent)",
+  };
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  page.audioStreams.at(-1).controller.bytes(joined(wavHeader(24000, 1), silentPcm(9600)));
+  await page.settle();
+  page.audioStreams.at(-1).controller.fail();
+  await page.settle();
+  await page.settle();
+  assert.match(page.el("error").textContent, /^Cloud voice isn't producing audio: it sent silence/);
+  assert.deepEqual(page.speechFailureCalls.map((call) => call.failure.reason), ["refused", "silent"]);
+
+  // A connection merely dropped: nothing kept, and the read is tried again (`#487`).
+  page.ticketFailure = null;
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  page.audioStreams.at(-1).controller.bytes(joined(wavHeader(24000, 1), loudPcm(2400)));
+  await page.settle();
+  page.audioStreams.at(-1).controller.fail();
+  await page.settle();
+  await page.settle();
+  assert.match(page.el("status").textContent, /cut off; trying again/);
+});
+
+test("`#548 cloud-read-failures`: a refused cloud read says the voice's reason in short words", async () => {
+  const { page, rows } = await cloudReadPage();
+  page.ticketStatus = 502;
+  page.ticketRefusal = {
+    error: "conversation_speech_error",
+    detail: "Test agent read-aloud connection failed: the agent reported: speech access denied (speech_access_denied)",
+  };
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("error").textContent, "Cloud voice: speech access denied (ACL). The message was not archived.");
+  assert.equal(page.el("read-on-device").hidden, false);
+  assert.deepEqual(page.speechFailureCalls.map((call) => call.failure.reason), ["refused"]);
+  // A reason no pattern knows is said as it came.
+  page.ticketRefusal = { error: "conversation_speech_error", detail: "the voice is on fire" };
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("error").textContent, "Cloud voice: the voice is on fire. The message was not archived.");
 });
 
 // --- `#487 read-aloud-recovery`: a read whose server went away ---------------------------------------
@@ -34161,7 +34347,7 @@ test("a tap after a read that could not be played prepares again, rather than pl
     assert.equal(page.expireTimers(wait), 1);
     await page.settle();
   }
-  assert.match(page.el("status").textContent, /could not be played/);
+  assert.match(page.el("status").textContent, /Cloud voice: the connection to it kept dropping\./);
   // The server is back. A tap on the other row asks for a fresh ticket first.
   page.ticketStatus = 200;
   page.speechTicketSuffix = "-fresh";
@@ -34234,7 +34420,7 @@ test("a streamed read that ENDS PART-WAY through a sample did not arrive whole, 
       continue;
     }
     assert.equal(page.audio.sources[0].halted, true, `${ending} played on`);
-    assert.match(page.el("status").textContent, /could not be played/, `${ending} passed as a clean end`);
+    assert.match(page.el("status").textContent, /Cloud voice: it could not play this message\./, `${ending} passed as a clean end`);
     assert.equal(rowState(page, 0).reading, "false", `${ending} left the row looking like it is speaking`);
     assert.deepEqual(page.dismissCalls, [], `${ending} was archived as heard`);
   }

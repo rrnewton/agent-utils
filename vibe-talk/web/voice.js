@@ -207,7 +207,7 @@ const ALL_CHANNELS = "*";
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "own-read-apply" | "own-read-undo" | "page-update"
  *   | "pair-confirm" | "pair-dismiss"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-prev" | "read-speed" | "read-steer-grip" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-on-device" | "read-prev" | "read-speed" | "read-steer-grip" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send"
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
@@ -523,6 +523,8 @@ function showError(text, options) {
   const box = el("error-wrap");
   // Try again is offered by one error only, and it shows it after this; see `reportUnreachable`.
   el("retry-start").hidden = true;
+  // So is Read with device voice, by a cloud read that failed (`cloudReadFailed`).
+  el("read-on-device").hidden = true;
   holdingReader(() => {
     el("error").textContent = redact(text);
     el("error").hidden = false;
@@ -539,6 +541,7 @@ function clearError() {
   errorTimer = null;
   // `#209 voice-socket-open`. Try again belongs to the one error that offers it.
   el("retry-start").hidden = true;
+  el("read-on-device").hidden = true;
   // Most callers clear on the way into an action — Read, Talk, sign-in — whether or not anything is
   // showing. With nothing to take away there is nothing to hold, and holding anyway would snap a
   // reader within BOTTOM_SLACK_PX of the newest line down onto it.
@@ -2384,7 +2387,8 @@ function showScreen(name) {
   // ...and only now the screen itself (`#280 scroll-stability`, above).
   el(`screen-${name}`).hidden = false;
   if (!main) {
-    if (readAloudPlayback === "browser") stopReading();
+    // And a device-voice read Read with device voice started under the cloud voice (`#548`).
+    if (readAloudPlayback === "browser" || (nowPlaying !== null && nowPlaying.playback === "browser")) stopReading();
     disarmClear();
   }
   // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed is Settings', and goes with it.
@@ -36181,7 +36185,9 @@ function readWithBrowserSpeech(parts, id, ticket) {
     utterance.onstart = () => {
       if (!isCurrentPart()) return;
       watch(BROWSER_SPEECH_FINISH_MS, "speech-timeout");
-      if (pendingRead === id) setStatus(`Reading with ${readAloudLabel}.`);
+      // The device voice by name: it may be reading one message in place of the cloud voice
+      // (`#548 cloud-read-failures`), which stays the voice selected.
+      if (pendingRead === id) setStatus("Reading with Device voice.");
       pendingRead = null;
       setReadState("ready");
       eachColumn(renderChannelRows);
@@ -36670,6 +36676,99 @@ function speechSelection() {
   return `tap-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
+/**
+ * `#548 cloud-read-failures`. Tell the server why the page stopped a read, under the read's ticket,
+ * so the failure is in its log and diagnostics as well as on the phone. Never fails the page.
+ */
+function reportSpeechFailure(url, reason, detail, block = null) {
+  if (typeof url !== "string" || !url.startsWith("/api/v1/speech/")) return;
+  fetch(`${url}/failure${block === null ? "" : `?block=${block}`}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason: String(reason).replace(/[^a-z0-9_-]/gu, "") || "failed", detail: String(detail).slice(0, 300) }),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+/**
+ * `#548 cloud-read-failures`. Why the server says this read's audio stream failed, when it kept a
+ * reason (the voice failed the read after its first audio); null when it kept none, or cannot say.
+ *
+ * @param {string | undefined} url the read's prepared URL
+ * @param {number | null} block the block read, or null for the whole message
+ * @returns {Promise<string | null>}
+ */
+async function speechStreamFailure(url, block) {
+  if (typeof url !== "string" || !url.startsWith("/api/v1/speech/")) return null;
+  try {
+    const response = await fetch(`${url}/failure${block === null ? "" : `?block=${block}`}`, { cache: "no-store" });
+    if (!response.ok) return null;
+    const answer = JSON.parse(await response.text());
+    const detail = String((answer && answer.detail) || "").trim();
+    return detail || null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** What the reader is told of a cloud read that failed for `reason`, with the voice's `detail`. */
+function cloudFailureText(reason, detail) {
+  if (reason === "silent") return CLOUD_SILENT;
+  if (reason === "no_audio") return CLOUD_NO_AUDIO;
+  const raw = String(detail || "").replace(/\s+/gu, " ").trim();
+  const known = CLOUD_CAUSES.find(([pattern]) => pattern.test(raw));
+  const cause = known ? known[1]
+    : raw ? raw.slice(0, 160)
+    : reason === "lost" ? "the connection to it kept dropping"
+    : "it could not play this message";
+  return `Cloud voice: ${cause}. The message was not archived.`;
+}
+
+/** The message the last failed cloud read was of, for Read with device voice; null when none. */
+let deviceRetryParts = null;
+
+/**
+ * `#548 cloud-read-failures`. The owner, 2026-10-26: with the voice's speech access expired, the
+ * page opened the scrubber and "read" through the message in silence. A cloud read the voice fails —
+ * silence, no speech in time, an error answer — STOPS: the scrubber closes, nothing is archived, the
+ * reason is said in short words and stays up, and Read with device voice reads that message by the
+ * phone's own voice. `report` tells the server (`reportSpeechFailure`).
+ */
+function cloudReadFailed(reason, detail, parts, report = null) {
+  stopReading();
+  if (readingMode) setReadState("failed");
+  // The server's own word for a turn of silence (`conversation_speech_silent`), or the voice's
+  // (`speech_silent`), is the silence this page detects itself, and is said and reported as one.
+  if (/speech_silent/u.test(String(detail))) reason = "silent";
+  const text = cloudFailureText(reason, detail);
+  setStatus(text);
+  showError(text, { stay: true });
+  deviceRetryParts = Array.isArray(parts) && parts.length > 0 ? parts.slice() : null;
+  el("read-on-device").hidden = deviceRetryParts === null || browserSpeechEngine() === null;
+  if (report) report(reason, text);
+}
+
+/**
+ * Read with device voice: the message whose cloud read failed, by the device voice, this once. The
+ * voice selected stays the cloud's; the switch beside Read changes it for every read.
+ */
+function readOnDevice() {
+  const parts = deviceRetryParts;
+  deviceRetryParts = null;
+  clearError();
+  if (!parts) return;
+  const held = { playback: readAloudPlayback, voiceName: readAloudLabel };
+  readAloudPlayback = "browser";
+  readAloudLabel = "Device voice";
+  try {
+    // Everything that reads the selection happens before `readAloud` first awaits.
+    guardQuietly(() => readAloud(parts))();
+  } finally {
+    readAloudPlayback = held.playback;
+    readAloudLabel = held.voiceName;
+  }
+}
+
 function reportSpeechPlayback(url, timing, block = null) {
   if (typeof url !== "string" || !url.startsWith("/api/v1/speech/")) return;
   // `#376 read-aloud-blocks`. A block is its own request, with its own server timing.
@@ -36717,9 +36816,35 @@ const STREAM_HEADER_LIMIT_BYTES = 64 * 1024;
 const SPEECH_ONSET_LEVEL = 0.02;
 /** How long a report waits, after `playing`, to learn when speech began before it goes anyway. */
 const SPEECH_ONSET_WAIT_MS = 5000;
-/** What the reader is told when a part of a read arrives whole with no speech in it (`#540`). */
-const SILENT_READ = "The voice sent silence for that message, so it was not archived. Tap it again, " +
-  "or switch Read to the device voice.";
+/**
+ * `#548 cloud-read-failures`. A 10 ms window of a read's PCM whose RMS is above this (of full scale:
+ * 500 of 32768) is speech. A voice service whose speech access is denied answers with about 0.85 s
+ * of silent PCM and a completed turn, never an error, so loudness is the evidence, not bytes.
+ */
+const SPEECH_RMS_LEVEL = 500 / 0x8000;
+/** How long a part of a cloud read may go with no speech arrived before the read is stopped. */
+const READ_NO_SPEECH_MS = 4000;
+/**
+ * What the reader is told when a cloud read fails: a part arrived with no speech in it (`#540`), no
+ * speech arrived in time, or the audio request was answered with an error.
+ */
+const CLOUD_SILENT = "Cloud voice isn't producing audio: it sent silence for this message (its speech " +
+  "access may have expired), so the message was not archived.";
+const CLOUD_NO_AUDIO = "Cloud voice isn't producing audio: no speech came within " +
+  `${READ_NO_SPEECH_MS / 1000} seconds of its first audio, so the message was not archived.`;
+/**
+ * A cloud voice's reason, in short words: the first pattern its detail matches. Else the detail.
+ * @type {Array<[RegExp, string]>}
+ */
+const CLOUD_CAUSES = [
+  [/speech_access_denied|\bACL\b|access denied/iu,
+    "speech access denied (ACL)"],
+  [/speech_silent|silence|no_audio|without returning audio|no audio/iu, "it is not producing audio"],
+  [/timed? ?out|not acknowledged|within \d+/iu, "it did not answer in time"],
+  [/could not open|connection|closed the session|reset|unreachable|lost the session|session ended/iu,
+    "the connection to it failed"],
+  [/not configured|not_configured/iu, "it is not configured on this server"],
+];
 
 let readAloudContext = null;
 
@@ -36815,6 +36940,8 @@ function streamingPlayer(url, context, clock = readClock()) {
   let loaded = false;
   let announced = false;
   let spoke = false;
+  // `#548 cloud-read-failures`. Whether any sample that has arrived, played or not, was speech.
+  let voiced = false;
   let drained = false;
   // Where this part's audio begins and ends on the audio clock, as far as it has arrived.
   let firstAt = null;
@@ -36839,10 +36966,10 @@ function streamingPlayer(url, context, clock = readClock()) {
   };
   // `#487 read-aloud-recovery`. Why, for the read to tell a part that was cut off or whose ticket is
   // gone ("lost": worth starting again) from one refused or malformed (which would only fail again).
-  const fail = (why = "refused") => {
+  const fail = (why = "refused", detail = "") => {
     if (over) return;
     silence();
-    emit("error", why);
+    emit("error", why, detail);
   };
   const endIfDone = () => {
     if (over || !finished || !wanted || waiting.length > 0 || sounding.size > 0) return;
@@ -36939,6 +37066,20 @@ function streamingPlayer(url, context, clock = readClock()) {
     }
     return first;
   };
+  /** Whether any 10 ms window of `buffer`, in any channel, is loud enough to be speech. */
+  const voicedIn = (buffer) => {
+    const window = Math.max(1, Math.round(buffer.sampleRate / 100));
+    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+      const samples = buffer.getChannelData(channel);
+      for (let start = 0; start < samples.length; start += window) {
+        const end = Math.min(samples.length, start + window);
+        let energy = 0;
+        for (let frame = start; frame < end; frame += 1) energy += samples[frame] * samples[frame];
+        if (Math.sqrt(energy / (end - start)) > SPEECH_RMS_LEVEL) return true;
+      }
+    }
+    return false;
+  };
   const decode = (bytes, channels, rate) => {
     const frames = Math.floor(bytes.length / (2 * channels));
     const buffer = context.createBuffer(channels, frames, rate);
@@ -36962,7 +37103,20 @@ function streamingPlayer(url, context, clock = readClock()) {
     if (over) return;
     if (!response.ok || !response.body || typeof response.body.getReader !== "function") {
       // A ticket the server does not know: it ended, or the server restarted and forgot it.
-      fail(response.status === 404 || response.status === 410 ? "lost" : "refused");
+      if (response.status === 404 || response.status === 410) {
+        fail("lost");
+        return;
+      }
+      // `#548 cloud-read-failures`. Refused: the server's reason goes with it, for the reader.
+      let detail = "";
+      try {
+        const answer = await response.json();
+        detail = String((answer && (answer.detail || answer.error)) || "");
+      } catch (_error) {
+        // No reason to be had: the status alone says it was refused.
+      }
+      if (over) return;
+      fail("refused", detail);
       return;
     }
     const reader = response.body.getReader();
@@ -36990,6 +37144,7 @@ function streamingPlayer(url, context, clock = readClock()) {
         carry = bytes.slice(whole);
         if (whole === 0) continue;
         const buffer = decode(bytes.subarray(0, whole), layout.channels, layout.rate);
+        if (!voiced) voiced = voicedIn(buffer);
         if (!loaded) {
           loaded = true;
           emit("loadeddata");
@@ -37018,9 +37173,12 @@ function streamingPlayer(url, context, clock = readClock()) {
     url,
     /** This player can tell when speech begins, and says so with a `speech` event. */
     hearsSpeech: true,
-    /** Whether any sample that has arrived was loud enough to be speech (`SPEECH_ONSET_LEVEL`). */
+    /**
+     * Whether any audio that has arrived was speech: a 10 ms window above `SPEECH_RMS_LEVEL`
+     * (`#548 cloud-read-failures`; `SPEECH_ONSET_LEVEL` still times where speech begins).
+     */
     heardSpeech() {
-      return spoke;
+      return voiced;
     },
     /**
      * `#379 read-aloud-sentences`. Where this part plays on the audio clock: when its first sample
@@ -38304,11 +38462,41 @@ async function readAloud(ids, from = null) {
       addPlayer(at + 1);
     }
   };
+  // `#548 cloud-read-failures`. Where the voice failed this read, reported under the part's ticket.
+  const reportFailure = (at) => (reason, detail) => {
+    const url = ready[segments[at].part] && ready[segments[at].part].url;
+    reportSpeechFailure(url, reason, detail, segments[at].block);
+  };
+  // `#548 cloud-read-failures`. A part with no speech arrived READ_NO_SPEECH_MS after its first audio
+  // stops the read: silence slower than `drained` can say so. Counted from the first audio of a part
+  // that has been started (`maybeGuardSpeech`), never from the request: a cold session or a busy
+  // voice may take seconds to answer, which the server's own first-audio limit judges. Held, the
+  // wait waits too. An `<audio>` element cannot hear its samples, and is not judged.
+  const guarded = sources.map(() => false);
+  const maybeGuardSpeech = (at) => {
+    if (!streamed || guarded[at] || !started[at] || loadedAt[at] === null) return;
+    guarded[at] = true;
+    guardSpeech(at);
+  };
+  const guardSpeech = (at) => {
+    const check = () => {
+      const player = players[at];
+      if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id || !player) return;
+      if (!("heardSpeech" in player) || player.heardSpeech()) return;
+      if (nowPlaying.paused) {
+        setTimeout(check, READ_NO_SPEECH_MS);
+        return;
+      }
+      cloudReadFailed("no_audio", "", parts, reportFailure(at));
+    };
+    setTimeout(check, READ_NO_SPEECH_MS);
+  };
   const startPlayer = (at) => {
     started[at] = true;
     playInvokedAt[at] = speechTimingNow();
     const begun = players[at].play();
     prefetchAfter(at);
+    maybeGuardSpeech(at);
     return begun;
   };
   // The next part, once the one before it is all scheduled or has ended. `play()` answers with a
@@ -38337,6 +38525,7 @@ async function readAloud(ids, from = null) {
     audio.addEventListener("loadeddata", () => {
       if (ticket !== readingTicket || loadedAt[at] !== null) return;
       loadedAt[at] = speechTimingNow();
+      maybeGuardSpeech(at);
       // The next part is asked for as soon as this one has audio: on a provider with one session
       // it queues behind this one there, and is generated the moment this one is.
       prefetchAfter(at);
@@ -38349,10 +38538,7 @@ async function readAloud(ids, from = null) {
       // the voice answered with silence. Going on raced the light through every block in silence and
       // then archived the message as heard; it stops here, says so, and archives nothing.
       if ("heardSpeech" in audio && !audio.heardSpeech()) {
-        stopReading();
-        if (readingMode) setReadState("failed");
-        setStatus(SILENT_READ);
-        showError(SILENT_READ);
+        cloudReadFailed("silent", "", parts, reportFailure(at));
         return;
       }
       learnSpeakingRate(audio, segments[at], blocks);
@@ -38398,13 +38584,16 @@ async function readAloud(ids, from = null) {
       // archiving only the first would leave its own tail in the queue.
       guardQuietly(() => dismissMessages({ messages: parts }))();
     });
-    audio.addEventListener("error", (why) => {
+    audio.addEventListener("error", (why, detail) => {
       if (ticket !== readingTicket) {
         return;
       }
       // `#487 read-aloud-recovery`: the streamed player says why it failed; an `<audio>` element
       // hands an event, which says nothing this can act on.
       const lost = /** @type {unknown} */ (why) === "lost";
+      // `#548 cloud-read-failures`: an `<audio>` element hands an Event, which names no reason.
+      const reason = typeof why === "string" ? why : "refused";
+      const said = typeof detail === "string" ? detail : "";
       // `#434 read-aloud-pause`: a part that fails while the read is HELD (its stream timed out
       // under the pause, its ticket went) does not end the read the reader only paused. It is
       // marked stale, and the resume reads the held block again on a fresh ticket.
@@ -38419,23 +38608,48 @@ async function readAloud(ids, from = null) {
         restartHeldBlock(nowPlaying);
         return;
       }
-      // `#487 read-aloud-recovery`. A streamed part that fails was most often cut off by the server
-      // going away (a restart forgets every ticket it minted) or by its connection dropping: the read
-      // is started again from that part on fresh tickets, a few times, before it is given up. A part
-      // fetched ahead that fails while the one before it is still heard starts the read again from
-      // the one being heard, so nothing is skipped.
-      if (streamed && lost && recovery < READ_RECOVERY_WAITS_MS.length) {
-        const heard = nowPlaying !== null && nowPlaying.id === id && !started[at] ? nowPlaying.segment : at;
-        const segment = segments[heard] || segments[at];
-        recoverRead(parts, { part: segment.part, block: segment.block, recovery: recovery + 1 },
-          READ_RECOVERY_WAITS_MS[recovery]);
+      const giveUpOrTryAgain = () => {
+        // `#487 read-aloud-recovery`. A streamed part that fails was most often cut off by the server
+        // going away (a restart forgets every ticket it minted) or by its connection dropping: the read
+        // is started again from that part on fresh tickets, a few times, before it is given up. A part
+        // fetched ahead that fails while the one before it is still heard starts the read again from
+        // the one being heard, so nothing is skipped.
+        if (streamed && lost && recovery < READ_RECOVERY_WAITS_MS.length) {
+          const heard = nowPlaying !== null && nowPlaying.id === id && !started[at] ? nowPlaying.segment : at;
+          const segment = segments[heard] || segments[at];
+          recoverRead(parts, { part: segment.part, block: segment.block, recovery: recovery + 1 },
+            READ_RECOVERY_WAITS_MS[recovery]);
+          return;
+        }
+        // `#487`: and what was prepared before a lost part with it, so the next tap prepares again
+        // rather than playing another URL as dead as this one.
+        if (streamed && lost) forgetPreparedSpeech();
+        // `#548 cloud-read-failures`. The voice's reason, in short words, and the device voice offered.
+        if (streamed) {
+          cloudReadFailed(reason, said, parts, reportFailure(at));
+          return;
+        }
+        stopReading();
+        setStatus("that message could not be played.");
+      };
+      // `#548 cloud-read-failures`. Cut off, the read may have been failed by the voice, naming why
+      // (speech access denied, say), which another try would only repeat: the server kept why under
+      // the ticket (`speechStreamFailure`), and is asked first. A dropped connection or a restarted
+      // server has nothing kept, and the read is tried again as before.
+      // An `<audio>` element's failure says nothing either, and is asked about the same way.
+      if (streamed && (lost || typeof why !== "string")) {
+        const entry = ready[segments[at].part];
+        speechStreamFailure(entry && entry.url, segments[at].block).then((reason) => {
+          if (ticket !== readingTicket) return;
+          if (reason) {
+            cloudReadFailed("refused", reason, parts, reportFailure(at));
+            return;
+          }
+          giveUpOrTryAgain();
+        });
         return;
       }
-      stopReading();
-      // `#487`: and what was prepared before a lost part with it, so the next tap prepares again
-      // rather than playing another URL as dead as this one.
-      if (streamed && lost) forgetPreparedSpeech();
-      setStatus("that message could not be played.");
+      giveUpOrTryAgain();
     });
     return audio;
   };
@@ -56591,6 +56805,7 @@ el("post-confirm-more").addEventListener("click", () => {
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("dismiss-error").addEventListener("click", clearError);
 el("retry-start").addEventListener("click", retryStart);
+el("read-on-device").addEventListener("click", readOnDevice);
 el("audio-source").addEventListener("click", () =>
   setReadAudioSource(readAudioSource === "device" ? (witReadAloud ? "wit" : "agent") : "device")
 );

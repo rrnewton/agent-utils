@@ -3570,6 +3570,100 @@ async fn a_speech_ticket_plays_and_reports_timing_without_a_header_and_a_wrong_o
     assert_eq!(body["error"], "unknown_speech_ticket");
 }
 
+/// `#548 cloud-read-failures`: a read the page stopped because the voice failed it is reported under
+/// the same ticket, with no bearer header, and diagnostics then shows the last such failure.
+#[tokio::test]
+async fn a_failed_read_is_reported_under_its_ticket_and_shown_in_diagnostics() {
+    let (harness, _store, ids) = todo_harness();
+    let (status, prepared) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/speech/prepare"),
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "ids": [ids[0].clone()] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let url = prepared["prepared"][0]["url"].as_str().expect("a url");
+
+    let (status, body) = call(
+        &harness,
+        "GET",
+        "/api/v1/diagnostics",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let failures = |body: &serde_json::Value| {
+        body["checks"]
+            .as_array()
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .find(|check| check["id"] == "read_aloud_failures")
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no read_aloud_failures check in {body}"))
+    };
+    let before = failures(&body).to_string();
+    assert!(
+        before.contains("no read-aloud has been reported failed"),
+        "{before}"
+    );
+
+    let (status, body) = call(
+        &harness,
+        "POST",
+        &format!("{url}/failure?block=1"),
+        None,
+        Some(serde_json::json!({
+            "reason": "silent",
+            "detail": "Cloud voice isn't producing audio: it sent silence for this message."
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, body) = call(
+        &harness,
+        "GET",
+        "/api/v1/diagnostics",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = failures(&body).to_string();
+    assert!(
+        after.contains("1 read-aloud(s) failed")
+            && after.contains("(silent)")
+            && after.contains("sent silence for this message"),
+        "{after}"
+    );
+
+    // A reason that is not a slug is refused, and a ticket nobody minted is unknown.
+    let (status, body) = call(
+        &harness,
+        "POST",
+        &format!("{url}/failure"),
+        None,
+        Some(serde_json::json!({ "reason": "Not A Slug", "detail": "" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/speech/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/failure",
+        None,
+        Some(serde_json::json!({ "reason": "silent" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "unknown_speech_ticket");
+}
+
 /// `#191 read-aloud-first-lag`: the page may add when speech itself began, under the same bound
 /// as every other clock, and an older page that cannot tell still reports.
 #[tokio::test]

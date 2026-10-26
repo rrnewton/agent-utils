@@ -331,6 +331,18 @@ fn inventory() -> Vec<Route> {
         ),
         route(
             "POST",
+            "/api/v1/speech/{ticket}/failure",
+            Ticket,
+            Json(r#"{"reason":"silent","detail":"Cloud voice isn't producing audio"}"#),
+        ),
+        route(
+            "GET",
+            "/api/v1/speech/{ticket}/failure",
+            Ticket,
+            Query("?block=0", "?block=x"),
+        ),
+        route(
+            "POST",
             "/api/v1/channels",
             Write,
             Json(r#"{"channel_id":"4444444444"}"#),
