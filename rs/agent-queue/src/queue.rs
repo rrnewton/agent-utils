@@ -15,7 +15,8 @@ use serde_json::{json, Map, Value};
 use crate::error::{io_error, Error, ErrorKind, Result};
 use crate::fsio::{
     atomic_json, atomic_json_create, create_private_directory, lock_exclusive, open_private_lock,
-    read_json, sync_directory, transition, validate_private_directory, Waiter,
+    read_json, repair_private_directory, sync_directory, transition, validate_private_directory,
+    Waiter,
 };
 
 /// Longest message identifier, in bytes.
@@ -162,12 +163,21 @@ pub fn prepare(root: &Path) -> Result<QueueDirectories> {
     for path in directories.all() {
         create_private_directory(path, "queue state directory", true, true)?;
     }
+    // A lane is created only when needed, sometimes by another program; one made under a 022
+    // umask would stop every read-only lookup, so a writer repairs it here.
+    for path in directories.lanes() {
+        if fs::symlink_metadata(path).is_ok() {
+            repair_private_directory(path, "queue lane directory")?;
+        }
+    }
     sync_directory(root)?;
     Ok(directories)
 }
 
 /// Require an existing queue and its existing phase directories to be private; a queue or
-/// phase that does not exist yet passes.
+/// phase that does not exist yet passes. Nothing is changed: a status read stays read-only, and
+/// the error names the mode and the repair. Any send, drain, enqueue or cancel ([`prepare`])
+/// repairs a directory only its owner can write to.
 pub fn validate_existing_queue(root: &Path) -> Result<()> {
     match fs::symlink_metadata(root) {
         Ok(_) => validate_private_directory(root, "queue directory", false)?,
@@ -970,6 +980,43 @@ mod tests {
         enqueue(root, Some(id), serialize, &Blocking, |id| {
             plain_item(id, "hello")
         })
+    }
+
+    #[test]
+    fn a_lane_another_program_made_under_umask_022_is_reported_then_repaired_by_a_writer() {
+        // As agent-teams once did: cancel/ created 0755 with a 0644 tombstone in it.
+        let queue = TestQueue::new();
+        let root = &queue.0;
+        put(root, "a-1", true).unwrap();
+        let cancel = root.join(CANCEL);
+        fs::create_dir(&cancel).unwrap();
+        fs::set_permissions(&cancel, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(cancel.join("other.json"), b"{}").unwrap();
+
+        // A read-only lookup changes nothing and says what to do.
+        let error = message_state(root, "a-1").unwrap_err().to_string();
+        assert!(
+            error.contains("queue state directory is not private"),
+            "{error}"
+        );
+        assert!(error.contains("mode 0755"), "{error}");
+        assert!(error.contains("chmod 700"), "{error}");
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&cancel), 0o755);
+
+        // The next writer repairs it, and lookups work again.
+        put(root, "a-2", false).unwrap();
+        assert_eq!(mode(&cancel), 0o700);
+        assert_eq!(
+            message_state(root, "a-1").unwrap(),
+            Some(MessageState::Pending)
+        );
+
+        // A lane others can write to is never repaired silently.
+        fs::set_permissions(&cancel, fs::Permissions::from_mode(0o777)).unwrap();
+        let error = put(root, "a-3", false).unwrap_err().to_string();
+        assert!(error.contains("group or others can write"), "{error}");
+        assert_eq!(mode(&cancel), 0o777);
     }
 
     #[test]

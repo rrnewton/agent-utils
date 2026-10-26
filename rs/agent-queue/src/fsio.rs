@@ -77,17 +77,64 @@ pub fn validate_private_directory(path: &Path, purpose: &str, tighten: bool) -> 
             path.display()
         )));
     }
-    if metadata.permissions().mode() & 0o077 != 0 {
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
         if !tighten {
             return Err(Error::unsafe_path(format!(
-                "{purpose} is not private: {}",
-                path.display()
+                "{purpose} is not private: {} has mode {mode:04o}; {}",
+                path.display(),
+                private_remedy(path, mode)
             )));
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|error| io_error(&format!("make {purpose} private"), path, error))?;
     }
     Ok(())
+}
+
+/// Require `path` to be a directory owned by the caller, making it private (mode 0700) when it
+/// is only readable or searchable by others: nobody else could have written into it, so the
+/// repair is safe. A directory group or others can write to is refused, because someone else may
+/// have put files in it; the error says how to check and repair it by hand. A writer uses this
+/// to recover from a program that created a queue directory under the usual 022 umask.
+pub fn repair_private_directory(path: &Path, purpose: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error(&format!("inspect {purpose}"), path, error))?;
+    if !metadata.file_type().is_dir() || metadata.uid() != uid() {
+        return Err(Error::unsafe_path(format!(
+            "unsafe {purpose}: {}",
+            path.display()
+        )));
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    if mode & 0o022 != 0 {
+        return Err(Error::unsafe_path(format!(
+            "{purpose} is not private: {} has mode {mode:04o}; {}",
+            path.display(),
+            private_remedy(path, mode)
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| io_error(&format!("make {purpose} private"), path, error))
+}
+
+/// How to repair the directory `path` of mode `mode`, which is not private.
+fn private_remedy(path: &Path, mode: u32) -> String {
+    if mode & 0o022 != 0 {
+        format!(
+            "group or others can write to it, so check that every file in it is yours, then run: \
+             chmod 700 {}",
+            path.display()
+        )
+    } else {
+        format!(
+            "only its owner can write to it, so it is safe to run: chmod 700 {}",
+            path.display()
+        )
+    }
 }
 
 /// Open (creating it, mode 0600, if absent) the lock file at `path` without following a link,

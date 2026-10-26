@@ -1607,7 +1607,7 @@ fn cmd_hook(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             }
         }
         let claimed_dir = inbox.join("claimed");
-        std::fs::create_dir_all(&claimed_dir)?;
+        crate::jsonfile::create_private_dir_all(&claimed_dir)?;
         let Ok(files) = std::fs::read_dir(&inbox) else {
             continue;
         };

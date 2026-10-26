@@ -63,12 +63,19 @@ pub fn self_binary() -> PathBuf {
         .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent-teams")))
 }
 
-/// Write `<dir>/<id>.json` by temp file plus `link()`; fails if present.
+/// Write `<dir>/<id>.json`, mode 0600 in a private directory, by temp file plus `link()`;
+/// fails if present.
 fn link_into(dir: &Path, id: &str, contents: &[u8]) -> std::io::Result<bool> {
-    std::fs::create_dir_all(dir)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    crate::jsonfile::create_private_dir_all(dir)?;
     let tmp = dir.join(format!(".tmp-{id}-{}", std::process::id()));
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         file.write_all(contents)?;
         file.sync_all()?;
     }
