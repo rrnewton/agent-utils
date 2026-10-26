@@ -223,7 +223,7 @@ steps:
       resources: {cargo-target: 1}
       est_duration_s: 120
       classification: cpu-bound
-      preferred_inner_jobs: 8
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 2147483648
 
   - group: agent-teams
