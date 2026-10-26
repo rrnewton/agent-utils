@@ -28,6 +28,7 @@ from wrkviz.pipeline import (
     ingest_claude,
     ingest_claude_history,
     ingest_codex,
+    ingest_muse,
     ingest_orc,
 )
 from wrkviz.transcript_export import (
@@ -39,7 +40,7 @@ from wrkviz.window import DateWindow, parse_date_window
 
 PROJECT_INGEST_SCHEMA_VERSION = 1
 _TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-Provider = Literal["codex", "claude", "orc", "claude-history"]
+Provider = Literal["codex", "claude", "orc", "claude-history", "muse"]
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,13 @@ class ClaudeProjectSource:
     """One canonical Claude coordinator JSONL file."""
 
     session_file: Path
+
+
+@dataclass(frozen=True)
+class MuseProjectSource:
+    """One Muse session directory (its session.jsonl and subagent/ tree)."""
+
+    session_dir: Path
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,7 @@ class OrcProjectSource:
 ProjectSource = (
     CodexProjectSource
     | ClaudeProjectSource
+    | MuseProjectSource
     | OrcProjectSource
     | ClaudeHistoryProjectSource
 )
@@ -550,6 +559,18 @@ def _claude_source(
     )
 
 
+def _muse_source(
+    value: dict[str, JsonValue], where: str, config_path: Path
+) -> MuseProjectSource:
+    _check_fields(value, where, frozenset({"session_dir"}))
+    return MuseProjectSource(
+        _source_path(
+            config_path,
+            _required_string(value.get("session_dir"), where + ".session_dir"),
+        )
+    )
+
+
 def _claude_history_source(
     value: dict[str, JsonValue], where: str, config_path: Path
 ) -> ClaudeHistoryProjectSource:
@@ -640,9 +661,9 @@ def _team_config(
             f"{where}.slug: expected 1-64 lowercase letters/digits separated by hyphens"
         )
     raw_provider = _required_string(obj.get("provider"), where + ".provider")
-    if raw_provider not in ("codex", "claude", "orc", CLAUDE_HISTORY_PROVIDER):
+    if raw_provider not in ("codex", "claude", "orc", "muse", CLAUDE_HISTORY_PROVIDER):
         raise ValueError(
-            f"{where}.provider: expected codex, claude, orc, or {CLAUDE_HISTORY_PROVIDER}"
+            f"{where}.provider: expected codex, claude, orc, muse, or {CLAUDE_HISTORY_PROVIDER}"
         )
     provider = cast(Provider, raw_provider)
     source_value = as_object(obj.get("source"), where + ".source")
@@ -651,6 +672,8 @@ def _team_config(
         source = _codex_source(source_value, where + ".source", config_path)
     elif provider == "claude":
         source = _claude_source(source_value, where + ".source", config_path)
+    elif provider == "muse":
+        source = _muse_source(source_value, where + ".source", config_path)
     elif provider == CLAUDE_HISTORY_PROVIDER:
         source = _claude_history_source(source_value, where + ".source", config_path)
     else:
@@ -820,6 +843,16 @@ def _ingest_team(
         _, report = ingest_claude(
             output,
             source.session_file,
+            team.slug,
+            team.timezone,
+            team.date_window,
+            team.identity_overrides,
+            snapshot_root,
+        )
+    elif isinstance(source, MuseProjectSource):
+        _, report = ingest_muse(
+            output,
+            source.session_dir,
             team.slug,
             team.timezone,
             team.date_window,

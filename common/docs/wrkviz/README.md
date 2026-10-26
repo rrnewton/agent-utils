@@ -1,6 +1,6 @@
 # wrkviz
 
-Build a self-contained, zoomable website from Codex, Claude Code, or Orc coordinator and subagent
+Build a self-contained, zoomable website from Codex, Claude Code, Muse, or Orc coordinator and subagent
 transcripts. Provider importers reconstruct the fork/join tree, agent lifetimes, tool/wait/idle
 intervals, interaction edges, and full message views; cached model summaries add phrase,
 paragraph, hourly, daily, weekly, monthly, and quarterly levels of detail.

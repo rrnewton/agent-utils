@@ -59,6 +59,12 @@ from wrkviz.codex import (
     snapshot_codex_lineage,
 )
 from wrkviz.compressed_sources import resolve_source
+from wrkviz.muse import (
+    MuseParseError,
+    MuseSourceCopy,
+    load_muse_team,
+    snapshot_muse_lineage,
+)
 from wrkviz.claude import (
     ClaudeParseError,
     ClaudeSourceCopy,
@@ -1637,6 +1643,108 @@ def ingest_claude(
         return _ingest_claude_locked(
             archive,
             session_file,
+            team_slug,
+            display_timezone,
+            date_window,
+            identity_overrides,
+            snapshot_root,
+        )
+
+
+def _load_muse_source_manifest(
+    archive: Path,
+    team_slug: str,
+    root_session_id: str,
+    date_window: DateWindow | None,
+) -> tuple[MuseSourceCopy, ...]:
+    path = _source_manifest_path(archive, team_slug)
+    if not path.is_file():
+        return ()
+    obj = as_object(read_json(path), str(path))
+    if obj.get("schema_version") != 1 or obj.get("provider") != "muse":
+        raise MuseParseError(f"invalid Muse source manifest at {path}")
+    recorded_root = as_string(obj.get("root_thread_id"), f"{path}: root_thread_id")
+    if recorded_root != root_session_id:
+        raise MuseParseError(
+            f"source manifest belongs to root {recorded_root!r}, not {root_session_id!r}"
+        )
+    _validate_manifest_window(obj.get("date_window"), date_window, str(path), MuseParseError)
+    raw_sources = as_array(obj.get("sources"), f"{path}: sources")
+    return tuple(
+        MuseSourceCopy.from_json_obj(
+            as_object(raw_source, f"{path}: sources[{index}]"), f"{path}: sources[{index}]"
+        )
+        for index, raw_source in enumerate(raw_sources)
+    )
+
+
+def _ingest_muse_locked(
+    archive: Path,
+    session_dir: Path,
+    team_slug: str,
+    display_timezone: str,
+    date_window: DateWindow | None,
+    identity_overrides: IdentityOverrides | None,
+    requested_snapshot_root: Path | None,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize one Muse session and the subagents it spawned."""
+
+    root_session_id = session_dir.name
+    _ensure_archive(archive, team_slug, create=True)
+    changed = int(_ensure_bulk_content_ignored(archive))
+    previous_sources = _load_muse_source_manifest(
+        archive, team_slug, root_session_id, date_window
+    )
+    location = _source_snapshot_location(archive, team_slug, requested_snapshot_root)
+    snapshot_root = location.root
+    source_copies = snapshot_muse_lineage(session_dir, snapshot_root, previous_sources, utc_now())
+    changed += source_copies.files_changed
+    allowed_sources = tuple(source.snapshot_path for source in source_copies.sources)
+    team = apply_date_window(
+        load_muse_team(
+            snapshot_root,
+            root_session_id,
+            team_slug,
+            display_timezone,
+            source_paths=allowed_sources,
+        ),
+        date_window,
+    )
+    changed += _record_site_identity(archive, team, ((), ()), identity_overrides)
+    source_manifest: dict[str, object] = {
+        "schema_version": 1,
+        "provider": "muse",
+        "root_thread_id": root_session_id,
+        "source_root": str(session_dir.resolve()),
+        "snapshot_root": location.archive_relative,
+        "date_window": date_window.to_json_obj() if date_window is not None else None,
+        "sources": [source.to_json_obj() for source in source_copies.sources],
+    }
+    changed += int(
+        _write_json_durable(_source_manifest_path(archive, team_slug), narrow_json(source_manifest))
+    )
+    team, report = _write_ingested_team(archive, team_slug, team, date_window, changed, location)
+    return team, replace(report, upstream_retired_sources=source_copies.upstream_retired)
+
+
+def ingest_muse(
+    archive: Path,
+    session_dir: Path,
+    team_slug: str,
+    display_timezone: str,
+    date_window: DateWindow | None = None,
+    identity_overrides: IdentityOverrides | None = None,
+    snapshot_root: Path | None = None,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize one Muse session as one serialized transaction.
+
+    *session_dir* is the directory holding ``session.jsonl``; its name is the session id.
+    """
+
+    with archive_writer_lock(archive):
+        return _ingest_muse_locked(
+            archive,
+            session_dir,
             team_slug,
             display_timezone,
             date_window,

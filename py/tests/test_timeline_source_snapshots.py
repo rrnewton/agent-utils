@@ -35,8 +35,9 @@ from wrkviz.compressed_sources import (
     resolve_source,
 )
 from wrkviz.model import TeamData
+from wrkviz.muse import MuseParseError
 from wrkviz.orc import OrcParseError, snapshot_orc_lineage
-from wrkviz.pipeline import IngestReport, ingest_codex, ingest_orc
+from wrkviz.pipeline import IngestReport, ingest_codex, ingest_muse, ingest_orc
 from wrkviz.phases import build_phases
 from wrkviz.pipeline import _phase_jobs
 from wrkviz.summarize import _input_hash
@@ -1661,3 +1662,196 @@ def test_claude_subagents_keep_being_read_after_the_root_retires(tmp_path: Path)
     child_relative = child.relative_to(root.parent).as_posix()
     before = {copy.source_path: copy for copy in first.sources}
     assert copies[child_relative].copied_bytes > before[child_relative].copied_bytes
+
+
+# --- Muse provider ---------------------------------------------------------------------------
+#
+# A redacted Muse session in the shapes the runtime writes: an event-sourced session.jsonl whose
+# records carry recorded_at (microseconds), payload_type and payload; one subagent spawned through
+# subagent_spawn and bound by child_session_bound; and one runtime observer under subagent/ that
+# was never bound, which must stay out of the team.
+
+MUSE_ROOT = "01a10000-0000-7000-8000-000000000001"
+MUSE_CHILD = "01a10000-0000-7000-8000-000000000002"
+MUSE_OBSERVER = "01a10000-0000-7000-8000-000000000003"
+MUSE_RUN = "01a10000-0000-7000-8000-0000000000a1"
+MUSE_CHILD_RUN = "01a10000-0000-7000-8000-0000000000b1"
+
+
+def _muse_record(seconds: float, payload_type: str, payload: dict[str, object]) -> bytes:
+    record = {
+        "schema_version": 1,
+        "id": f"rec-{payload_type}-{seconds}",
+        "recorded_at": int((1_790_000_000 + seconds) * 1_000_000),
+        "record_type": "event",
+        "payload_type": payload_type,
+        "payload": payload,
+    }
+    return json.dumps(record, sort_keys=True).encode("utf-8") + b"\n"
+
+
+def _muse_run(seconds: float, run_id: str, event: dict[str, object]) -> bytes:
+    return _muse_record(seconds, "runtime.session", {"kind": "run", "run_id": run_id, "event": event})
+
+
+def _muse_root_log() -> bytes:
+    return b"".join(
+        (
+            _muse_record(0, "runtime.session.route_facts",
+                         {"kind": "route_facts", "record": {"cwd": "/work/project"}}),
+            _muse_record(1, "runtime.user_intent.accepted", {
+                "intent_id": MUSE_RUN,
+                "model_messages": [{"content": [{"kind": "text", "text": "Review the parser."}]}],
+            }),
+            _muse_run(1.1, MUSE_RUN, {"kind": "hook_run_started", "event": "SessionStart"}),
+            _muse_run(2, MUSE_RUN, {
+                "kind": "assistant_tool_calls_committed", "message_id": "batch-1",
+                "tool_calls": [
+                    {"call_id": "call-read", "id": "fc-read", "name": "read_file",
+                     "args": "{\"path\": \"src/parser.rs\"}"},
+                    {"call_id": "call-spawn", "id": "fc-spawn", "name": "subagent_spawn",
+                     "args": "{\"role\": \"adversarial reviewer\", \"objective\": \"Try to break the parser.\"}"},
+                ],
+            }),
+            _muse_record(2.1, "tool_batch.effect.started", {"kind": "tool_batch_effect", "record": {
+                "call_id": "call-read", "kind": "started", "tool_name": "read_file"}}),
+            _muse_record(2.4, "tool_batch.effect.terminal", {"kind": "tool_batch_effect", "record": {
+                "call_id": "call-read", "kind": "terminal", "tool_name": "read_file",
+                "outcome": {"kind": "completed"}}}),
+            _muse_record(2.5, "tool_batch.effect.started", {"kind": "tool_batch_effect", "record": {
+                "call_id": "call-spawn", "kind": "started", "tool_name": "subagent_spawn"}}),
+            _muse_record(2.6, "subagent.control.child_session_bound", {"kind": "subagent_control", "record": {
+                "child_session_id": MUSE_CHILD, "kind": "child_session_bound", "subagent_id": "sub-1"}}),
+            _muse_record(2.7, "subagent.control.start_attested", {"kind": "subagent_control", "record": {
+                "dispatched_via_tool_call_id": "call-spawn", "kind": "start_attested",
+                "subagent_session_id": MUSE_CHILD}}),
+            _muse_record(3, "tool_batch.effect.terminal", {"kind": "tool_batch_effect", "record": {
+                "call_id": "call-spawn", "kind": "terminal", "tool_name": "subagent_spawn",
+                "outcome": {"kind": "completed"}}}),
+            _muse_run(3.1, MUSE_RUN, {
+                "kind": "tool_result_batch_committed", "batch_id": "batch-1",
+                "results": [{"text": "fn parse() {}"}, {"text": "spawned"}],
+            }),
+            _muse_run(40, MUSE_RUN, {
+                "kind": "inbox_item_drained",
+                "delivery_snapshot": {"body": "Subagent result ready\nsource: subagent_result"},
+            }),
+            _muse_run(41, MUSE_RUN, {
+                "kind": "assistant_message_committed", "message_id": "m-1",
+                "text": "The parser accepts trailing commas; the reviewer agrees.",
+            }),
+            _muse_run(42, MUSE_RUN, {"kind": "terminal", "terminal": "completed",
+                                     "time_to_first_token_ms": 500, "turn_duration_ms": 41000}),
+        )
+    )
+
+
+def _muse_child_log() -> bytes:
+    return b"".join(
+        (
+            _muse_run(2.8, MUSE_CHILD_RUN, {"kind": "started", "prompt": "Try to break the parser."}),
+            _muse_run(30, MUSE_CHILD_RUN, {
+                "kind": "assistant_message_committed", "message_id": "c-1",
+                "text": "Trailing commas parse; nothing else breaks.",
+            }),
+            _muse_run(31, MUSE_CHILD_RUN, {"kind": "terminal", "terminal": "completed"}),
+        )
+    )
+
+
+def _muse_observer_log() -> bytes:
+    return _muse_run(5, "observer-run", {"kind": "started", "prompt": "You are a reminder observer."})
+
+
+def _muse_session(tmp_path: Path) -> Path:
+    session = tmp_path / "muse" / "2026" / "01" / "05" / MUSE_ROOT
+    (session / "subagent" / MUSE_CHILD).mkdir(parents=True)
+    (session / "subagent" / MUSE_OBSERVER).mkdir(parents=True)
+    (session / "session.jsonl").write_bytes(_muse_root_log())
+    (session / "subagent" / MUSE_CHILD / "session.jsonl").write_bytes(_muse_child_log())
+    (session / "subagent" / MUSE_OBSERVER / "session.jsonl").write_bytes(_muse_observer_log())
+    return session
+
+
+def test_muse_session_ingests_turns_tools_and_its_spawned_subagent(tmp_path: Path) -> None:
+    session = _muse_session(tmp_path)
+
+    team, report = ingest_muse(tmp_path / "archive", session, "muse-test", "UTC")
+
+    assert team.provider == "muse"
+    assert report.sources == 2  # the observer that was never bound is not part of the team
+    assert {agent.thread_id: agent.parent_thread_id for agent in team.agents} == {
+        MUSE_ROOT: None,
+        MUSE_CHILD: MUSE_ROOT,
+    }
+    child = next(agent for agent in team.agents if agent.thread_id == MUSE_CHILD)
+    assert child.agent_path == "/root/adversarial-reviewer"
+    (edge,) = team.edges
+    assert (edge.kind, edge.call_id, edge.message_text) == (
+        "spawn", "call-spawn", "Try to break the parser.",
+    )
+    tools = {tool.call_id: tool for tool in team.tool_calls}
+    read = tools["call-read"]
+    assert read.ended_at_ms is not None
+    assert (read.name, read.status, read.ended_at_ms - read.started_at_ms) == ("read_file", "completed", 300)
+    kinds = sorted((event.thread_id == MUSE_CHILD, event.kind) for event in team.events)
+    assert kinds == [
+        (False, "assistant_message"), (False, "system_input"), (False, "user_prompt"),
+        (True, "assistant_message"), (True, "user_prompt"),
+    ]
+    root_turn = next(turn for turn in team.turns if turn.turn_id == MUSE_RUN)
+    assert root_turn.status == "completed"
+    assert root_turn.last_agent_message == "The parser accepts trailing commas; the reviewer agrees."
+
+
+def test_muse_logs_are_append_only_retired_and_read_compressed(tmp_path: Path) -> None:
+    session = _muse_session(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_muse(archive, session, "muse-test", "UTC")
+
+    log = session / "session.jsonl"
+    extra = _muse_run(50, MUSE_RUN, {"kind": "assistant_message_committed", "text": "One more note."})
+    log.write_bytes(log.read_bytes() + extra)
+    team, _ = ingest_muse(archive, session, "muse-test", "UTC")
+    assert any(event.text == "One more note." for event in team.events)
+
+    if ZSTD is not None:
+        _compress_in_place(log)
+        _, unchanged = ingest_muse(archive, session, "muse-test", "UTC")
+        assert unchanged.upstream_retired_sources == ()
+
+    shutil.rmtree(session)
+    retired_team, retired = ingest_muse(archive, session, "muse-test", "UTC")
+    assert set(retired.upstream_retired_sources) == {
+        "session.jsonl", f"subagent/{MUSE_CHILD}/session.jsonl",
+    }
+    assert any(event.text == "One more note." for event in retired_team.events)
+
+
+def test_muse_log_rewritten_in_place_refuses(tmp_path: Path) -> None:
+    session = _muse_session(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_muse(archive, session, "muse-test", "UTC")
+    log = session / "session.jsonl"
+    log.write_bytes(log.read_bytes().replace(b"Review the parser.", b"Review the lexer.."))
+
+    with pytest.raises(MuseParseError, match="truncated or rewritten"):
+        ingest_muse(archive, session, "muse-test", "UTC")
+
+
+def test_muse_team_through_project_config_and_cli(tmp_path: Path) -> None:
+    session = _muse_session(tmp_path)
+    config = tmp_path / "project.json"
+    config.write_text(json.dumps({
+        "schema_version": 1,
+        "output": "archive",
+        "timezone": "UTC",
+        "teams": [{"slug": "muse-team", "provider": "muse",
+                   "source": {"session_dir": str(session)}}],
+    }), encoding="utf-8")
+
+    assert timeline_main(["ingest-project", "--config", str(config)]) == 0
+    assert timeline_main([
+        "ingest-muse", "--output", str(tmp_path / "cli-archive"), "--team", "muse-cli",
+        "--timezone", "UTC", "--session-dir", str(session),
+    ]) == 0

@@ -45,6 +45,7 @@ from wrkviz.pipeline import (
     ingest_claude,
     ingest_claude_history,
     ingest_codex,
+    ingest_muse,
     ingest_orc,
     load_archived_team,
     record_run,
@@ -279,6 +280,21 @@ def _add_claude_ingest(parser: argparse.ArgumentParser) -> None:
         "--session-file",
         required=True,
         help="Claude coordinator JSONL; nested subagents are discovered beside it",
+    )
+    _add_date_window(parser)
+    _add_site_identity(parser)
+
+
+def _add_muse_ingest(parser: argparse.ArgumentParser) -> None:
+    _add_archive(parser)
+    _add_snapshot_root(parser)
+    parser.add_argument(
+        "--session-dir",
+        required=True,
+        help=(
+            "Muse session directory, the one holding session.jsonl (its name is the session "
+            "id); subagents it spawned are read from its subagent/ directory"
+        ),
     )
     _add_date_window(parser)
     _add_site_identity(parser)
@@ -597,6 +613,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_claude_history_ingest(ingest_claude_history_parser)
     ingest_claude_history_parser.set_defaults(handler="ingest_claude_history")
+
+    ingest_muse_parser = sub.add_parser(
+        "ingest-muse",
+        help="normalize a Muse session and its subagents; do not call a model",
+        description=(
+            "snapshot and normalize one Muse session log and the logs of the subagents it "
+            "spawned; does not call a model. Example: wrkviz ingest-muse --session-dir "
+            "~/.local/share/muse/sessions/2026/10/20/SESSION-ID --team muse-lane "
+            "--output ./timelines/widget"
+        ),
+    )
+    _add_muse_ingest(ingest_muse_parser)
+    ingest_muse_parser.set_defaults(handler="ingest_muse")
 
     ingest_orc_parser = sub.add_parser(
         "ingest-orc", help="snapshot and normalize Orc SQLite logs; do not call a model",
@@ -2323,6 +2352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ingest_claude",
             "refresh_claude",
             "ingest_claude_history",
+            "ingest_muse",
             "ingest_orc",
             "refresh_orc",
         )
@@ -2344,6 +2374,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _, ingest_report = ingest_claude(
                     archive,
                     _path(str(ns.session_file)),
+                    team_slug,
+                    str(ns.timezone),
+                    date_window,
+                    identity_overrides,
+                    requested_snapshot_root,
+                )
+            elif handler == "ingest_muse":
+                _, ingest_report = ingest_muse(
+                    archive,
+                    _path(str(ns.session_dir)),
                     team_slug,
                     str(ns.timezone),
                     date_window,

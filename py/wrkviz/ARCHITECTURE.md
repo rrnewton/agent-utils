@@ -747,6 +747,20 @@ predecessor point to the successor start. It is structural in the site, but it i
 the renderer does not invent a child-to-parent lifetime return or progress messages for the
 successor coordinator.
 
+## Muse snapshot contract
+
+Muse ingestion treats a session directory as the source: its event-sourced `session.jsonl` and
+the `subagent/<child>/session.jsonl` logs of children bound to a spawn by a
+`subagent.control.child_session_bound` record, followed transitively. Every selected log is
+snapshotted as a newline-complete prefix with the same append-only rules, retirement and `.zst`
+reading as Claude transcripts, and parsing reads only the copies. One run (`run_id`) is one turn;
+the agent's messages, tool calls (`assistant_tool_calls_committed`, timed by
+`tool_batch.effect.started`/`.terminal`, with results aligned by batch), delivered prompts
+(`runtime.user_intent.accepted`, or a subagent run's `started` prompt) and mid-turn runtime notices
+(`inbox_item_drained`, kept as system inputs) are the only records read; hook runs, context
+diagnostics and encrypted reasoning are not. A spawn edge carries the `subagent_spawn` call id that
+`start_attested` names and the spawn's objective as its message.
+
 ## Tool payloads are stored, not deferred to the vendor logs
 
 Until this contract existed, ingest deleted the two largest fields in the model. `_archive_team`

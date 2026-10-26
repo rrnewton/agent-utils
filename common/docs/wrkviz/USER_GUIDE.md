@@ -277,7 +277,8 @@ The parser rejects missing and unknown keys, unknown providers, duplicate team s
 continuations, absolute output paths, invalid identity, and invalid time bounds. Provider `source`
 objects are exact: Codex accepts `sessions_root`, `root_session`, and optional ordered
 `continuation_sessions`; Claude accepts only `session_file`; `claude-history` accepts
-`history_file`, `project_pattern`, and optional `covered_sessions`; Orc accepts `source_root` and
+`history_file`, `project_pattern`, and optional `covered_sessions`; Muse accepts only
+`session_dir`; Orc accepts `source_root` and
 `root_session`, plus optional ordered `continuation_sessions`. An Orc continuation is either a
 whole-root session-ID string or an exact object containing `session_id` and `start_message_id`.
 
@@ -504,6 +505,16 @@ and for how an existing archive moves them.
 Use `ingest-claude --session-file FILE` for a Claude lineage. Like Codex ingestion, it is offline and
 does not invoke a model.
 
+Use `ingest-muse --session-dir DIR` for a Muse session, where `DIR` is the directory holding its
+`session.jsonl` (its name is the session id). Muse writes an event-sourced log; ingestion reads the
+prompts delivered to the session, the agent's committed messages, its tool calls with their start,
+end and outcome, runtime notices delivered mid-turn (kept as system inputs, not prompts), and the
+subagents the session spawned with `subagent_spawn`, each from its own log under `subagent/`. The
+runtime's own observer agents also log under `subagent/` but are never bound to a spawn, so they are
+left out. Each run is one turn. Like the other providers it is offline, snapshots before parsing,
+accepts only appends, and retires a log upstream no longer has. In a project config the team is
+`"provider": "muse"` with `"source": {"session_dir": "..."}`.
+
 The Orc equivalent is `ingest-orc --source-root ROOT --root-session UUID`. It opens source
 databases read-only, uses SQLite's online backup API for consistent copies, and parses only those
 archive-local snapshots. Coordinator content blocks provide prompts, responses, and condensed tool
@@ -540,7 +551,7 @@ and each ingest is an incremental read of the feed from the archive's last check
   imported now differ, or a file shrank below the checkpoint, ingest refuses that team and leaves
   its archive byte-identical, exactly as before. That is the one case retention cannot explain.
 
-Retirement works file by file for Codex rollouts and Claude transcripts; a Claude lineage whose
+Retirement works file by file for Codex rollouts, Claude transcripts and Muse logs; a Claude lineage whose
 root transcript has retired still reads the subagent files upstream keeps. For Orc, a lineage whose
 root session database is gone upstream is re-normalized from its verified snapshots, listed in
 `upstream_retired_sources`, and frozen there (child sessions that outlive the root are not
@@ -1744,6 +1755,8 @@ HTML. Review repository visibility before committing an archive.
 - Claude Code provider: implemented, including nested subagents and bounded local-date archives.
 - Orc provider: implemented, including read-only SQLite snapshots, agent incarnations, nested
   coordinators when lineage is recorded, and bounded local-date archives.
+- Muse provider: implemented, including spawned subagents, tool timing, and bounded local-date
+  archives. Reasoning is not imported (Muse records it encrypted).
 - Multiple teams: the website schema and team filter are ready; one refresh currently writes one
   team archive. Merging team indexes is a follow-up.
 - Additional adapters such as Gas Town should emit the same provider-neutral
