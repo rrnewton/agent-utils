@@ -81273,6 +81273,83 @@ test("`#528 thread-card-markdown-and-cap`: a first paragraph longer than K lines
   assert.equal(bodyOf(first).text(), words, "the root under a clamped card is not whole");
 });
 
+// --- `#533 card-split-atomic-blocks` -------------------------------------------------------------
+//
+// The owner, 2026-10-26, of a nightly report with a 7x6 table: it "bounced to being a thread card and it
+// turned into a giant card that split every cell of the table into a separate line... It should go
+// straight to our split prefix+postfix view of the message. And THAT should split at line granularity
+// and not break tables or code blocks". The real table's shape, its words scrubbed.
+
+const TABLE_HEAD = ["Suite", "Runs", "Passed", "Failed", "Flaky", "Wall time", "Notes"];
+const TABLE_ROWS = [["unit", "412", "412", "0", "0", "6m", "clean"], ["integration", "88", "86", "1", "1", "41m", "retried"],
+  ["browser", "57", "57", "0", "0", "19m", "clean"], ["packaging", "12", "11", "1", "0", "8m", "timeout"],
+  ["soak", "3", "3", "0", "0", "3h", "flat"]];
+/** The table as the server renders it: a newline between every element, as comrak writes it. */
+const reportTableHtml = (rows = TABLE_ROWS) => "<table>\n<thead>\n<tr>\n" + TABLE_HEAD.map((cell) => `<th>${cell}</th>\n`).join("") +
+  "</tr>\n</thead>\n<tbody>\n" + rows.map((row) => "<tr>\n" + row.map((cell) => `<td>${cell}</td>\n`).join("") + "</tr>\n").join("") +
+  "</tbody>\n</table>\n";
+const reportTableText = (rows = TABLE_ROWS) => [`| ${TABLE_HEAD.join(" | ")} |`, `|${"---|".repeat(7)}`,
+  ...rows.map((row) => `| ${row.join(" | ")} |`)].join("\n");
+/** The table's cells in a drawn body, row by row. */
+const tableCells = (node) => node.descendants().filter((kid) => kid.tagName === "tr")
+  .map((row) => row.children.filter((cell) => ["td", "th"].includes(cell.tagName)).map((cell) => cell.text()));
+
+test("`#533 card-split-atomic-blocks`: where the card stops counts a table a line a row and code a line a line, and a first such block too tall is a cut before it, not a clamp", () => {
+  const page0 = newPage();
+  const cut = (lines, marks, wholes) => JSON.parse(JSON.stringify(page0.pure("cutForCard")(lines, marks, wholes)));
+  assert.deepStrictEqual(cut([6, 1], [1, 0], [true, false]), { head: 0, whole: false, stub: true },
+    "a table too tall for the card first was clamped");
+  assert.deepStrictEqual(cut([9, 1], [0, 0], [false, false]), { head: 1, whole: true }, "a long first paragraph is no longer clamped");
+  assert.deepStrictEqual(cut([1, 6, 1], [0, 1, 0], [false, true, false]), { head: 1, whole: false });
+});
+
+test("`#533 card-split-atomic-blocks`: a root opening with a 7x6 table says it on its card in one line, and the continuation draws it whole, as a table", async () => {
+  const { page } = await markdownCardPage({ content: `${reportTableText()}\n\nAll green but packaging.`,
+    html: `${reportTableHtml()}<p>All green but packaging.</p>\n` });
+  const row = cardRow(page, BIG);
+  assert.ok(row.hasAttribute("data-split-card"), "the card is not split before the table");
+  assert.ok(!row.hasAttribute("data-card-clamp"), "the table was clamped on the card");
+  assert.deepStrictEqual(cardLinesOf(page, BIG), ["Table (7 columns × 6 rows) …"], "the card does not stand for the table in a line");
+  assert.ok(!cardWords(page, BIG).descendants().some((node) => ["table", "td", "th"].includes(node.tagName)),
+    "the card draws the table's cells");
+  await unpackCard(page, BIG);
+  const [rest] = unpackRows(page, BIG);
+  assert.ok(rest.hasAttribute("data-root-continuation"), "the table is not in the continuation under the card");
+  const body = bodyOf(rest).descendants().find((node) => node.className === "md");
+  assert.deepStrictEqual(tableCells(body), [TABLE_HEAD, ...TABLE_ROWS], "the continuation does not draw the table whole");
+  assert.ok(body.descendants().some((node) => node.tagName === "p" && node.text() === "All green but packaging."),
+    "the words after the table were lost");
+});
+
+test("`#533 card-split-atomic-blocks`: a line before the table is the card, and the table goes whole into the continuation; one that fits is drawn on the card as a table", async () => {
+  const lead = "Nightly deep test, night of 10-25:";
+  const { page } = await markdownCardPage({ content: `${lead}\n\n${reportTableText()}\n\nAll green but packaging.`,
+    html: `<p>${lead}</p>\n${reportTableHtml()}<p>All green but packaging.</p>\n` });
+  assert.ok(cardRow(page, BIG).hasAttribute("data-split-card"));
+  assert.deepStrictEqual(cardLinesOf(page, BIG), [`${lead}…`], "the card does not stop before the table");
+  await unpackCard(page, BIG);
+  const body = bodyOf(unpackRows(page, BIG)[0]).descendants().find((node) => node.className === "md");
+  assert.deepStrictEqual(tableCells(body), [TABLE_HEAD, ...TABLE_ROWS], "the table was cut between the card and its continuation");
+  // Two rows of it fit K (5) with the line before it: drawn on the card, as itself.
+  const small = await markdownCardPage({ content: `${lead}\n\n${reportTableText(TABLE_ROWS.slice(0, 1))}\n\nAll green.\n\nMore.\n\nAnd more.`,
+    html: `<p>${lead}</p>\n${reportTableHtml(TABLE_ROWS.slice(0, 1))}<p>All green.</p>\n<p>More.</p>\n<p>And more.</p>\n` });
+  assert.deepStrictEqual(tableCells(cardWords(small.page, BIG)), [TABLE_HEAD, TABLE_ROWS[0]], "a table that fits is not drawn on the card");
+});
+
+test("`#533 card-split-atomic-blocks`: a long code block first says its first line on the card; a long quote its first line", async () => {
+  const code = Array.from({ length: 9 }, (_, at) => `step ${at + 1}: cargo test --release`).join("\n");
+  const { page } = await markdownCardPage({ content: `\`\`\`\n${code}\n\`\`\`\n\nDone.`,
+    html: `<pre><code>${code}\n</code></pre>\n<p>Done.</p>\n` });
+  assert.ok(cardRow(page, BIG).hasAttribute("data-split-card") && !cardRow(page, BIG).hasAttribute("data-card-clamp"));
+  assert.deepStrictEqual(cardLinesOf(page, BIG), ["step 1: cargo test --release …"], "the card does not stand for the code by its first line");
+  await unpackCard(page, BIG);
+  const body = bodyOf(unpackRows(page, BIG)[0]).descendants().find((node) => node.className === "md");
+  assert.equal(body.descendants().find((node) => node.tagName === "pre").text(), `${code}\n`, "the code is not whole in the continuation");
+  const quote = Array.from({ length: 6 }, (_, at) => `<p>quoted paragraph ${at + 1} of the report</p>`).join("\n");
+  const quoted = await markdownCardPage({ content: "> quoted", html: `<blockquote>\n${quote}\n</blockquote>\n<p>After.</p>\n` });
+  assert.deepStrictEqual(cardLinesOf(quoted.page, BIG), ["quoted paragraph 1 of the report …"]);
+});
+
 /** `bigCardData`'s big root, its record naming its thread as a page of Main brings it. */
 const NAMED = { display_name: "cache-tier-deploy", summary: "The cache tier deploy, pool by pool." };
 

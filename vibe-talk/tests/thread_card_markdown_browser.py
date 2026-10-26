@@ -23,6 +23,9 @@ renders it, with one reply, as on Slack:
 * load: with the name filed and every read taking `--latency` seconds, a fresh load draws the summary
   card with the same read that draws the thread's card (the root's own record names it), and a reload
   whose reads are held draws the summary card from the device's copy before any read answers.
+* table (`#533 card-split-atomic-blocks`): a nightly report opening with a 7x6 table, as the server renders it.
+  From the first frame the card is drawn it says "Table (7 columns × 6 rows) …" on one line, split and never
+  clamped, no cell of the table on it; unpacked, the continuation draws the table whole, seven cells to a row.
 * build (`#529 page-build-stale-notice`): a read saying the server serves the page's own script shows
   nothing; one saying another shows "New version — reload" on the line over the list, inside the
   window and clear of the freshness pill, and a press reloads the page.
@@ -87,11 +90,12 @@ class MarkdownApi(FakeApi):
     """One thread opened by `MD_ROOT` with one reply, and Main's announcement. `recent` puts the reply
     a second ago; `names` says the server names threads; `latency` holds every timeline read that long."""
 
-    def __init__(self, *, recent: bool = False, names: bool = False, latency: float = 0.0) -> None:
+    def __init__(self, *, recent: bool = False, names: bool = False, latency: float = 0.0,
+                 text: str = MD_ROOT, html: str = MD_ROOT_HTML) -> None:
         super().__init__()
         record = {"id": SNAPSHOT, "root_message_id": "201", "is_root": True, "reply_count": 1,
                   "reply_count_exact": True}
-        root = {**message(1, MD_ROOT, record), "content_html": MD_ROOT_HTML}
+        root = {**message(1, text, record), "content_html": html}
         reply = message(2, "Which of these should land first?", {**record, "is_root": False})
         if recent:
             now = datetime.now(timezone.utc)
@@ -233,7 +237,7 @@ def arguments() -> argparse.Namespace:
                         help="loopback port for the fake server (default: 0, any free port)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable (default: all of them)")
-    parser.add_argument("--only", choices=("format", "pending", "load", "build"), action="append",
+    parser.add_argument("--only", choices=("format", "pending", "load", "table", "build"), action="append",
                         help="run only these parts of the walk, repeatable (default: all of them)")
     parser.add_argument("--latency", type=float, default=0.6,
                         help="seconds every timeline read takes in the load part (default: 0.6)")
@@ -253,7 +257,7 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     fixture.WEB_ROOT = args.web_root.resolve()
     report: list[str] = []
-    parts = args.only or ["format", "pending", "load", "build"]
+    parts = args.only or ["format", "pending", "load", "table", "build"]
     with sync_playwright() as playwright:
         for label, width, height, touch in SIZES:
             if args.size and label not in args.size:
@@ -292,6 +296,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, part: str, label: str,
 def walk_part(chromium: BrowserType, args: argparse.Namespace, part: str, label: str, width: int, height: int,
               touch: bool) -> str:
     api = (MarkdownApi() if part == "format" else MarkdownApi(recent=True, names=True) if part == "pending"
+           else MarkdownApi(text=TABLE_ROOT, html=TABLE_ROOT_HTML) if part == "table"
            else MarkdownApi(names=True, latency=args.latency))
     if part == "load":
         api.file_name(NAMED)
@@ -317,6 +322,8 @@ def walk_part(chromium: BrowserType, args: argparse.Namespace, part: str, label:
                 pending_walk(desk, api)
             elif part == "build":
                 build_walk(desk, api)
+            elif part == "table":
+                table_walk(desk)
             else:
                 load_walk(desk, api, args, server.server_port)
             check(not errors, f"{label}: the page threw: {errors}")
@@ -355,6 +362,49 @@ def format_walk(desk: Desk) -> None:
     desk.shot("1-split-formatted")
     desk.notes.append(f"the split card draws {lines:.2f} lines (K = {K}) as paragraphs and a list, cut after item 1; "
                       f"the continuation's list starts at {rest['start']} with {rest['items']} items")
+
+
+# `#533 card-split-atomic-blocks`. The owner's nightly report's shape, a 7x6 table first, its words scrubbed.
+TABLE_HEAD = ["Suite", "Runs", "Passed", "Failed", "Flaky", "Wall time", "Notes"]
+TABLE_ROWS = [["unit", "412", "412", "0", "0", "6m", "clean"], ["integration", "88", "86", "1", "1", "41m", "retried"],
+              ["browser", "57", "57", "0", "0", "19m", "clean"], ["packaging", "12", "11", "1", "0", "8m", "timeout"],
+              ["soak", "3", "3", "0", "0", "3h", "flat"]]
+TABLE_ROOT = "\n".join([f"| {' | '.join(TABLE_HEAD)} |", "|" + "---|" * 7, *[f"| {' | '.join(row)} |" for row in TABLE_ROWS],
+                        "", "All green but packaging; the mirror timed out once."])
+TABLE_ROOT_HTML = ("<table>\n<thead>\n<tr>\n" + "".join(f"<th>{cell}</th>\n" for cell in TABLE_HEAD) + "</tr>\n</thead>\n<tbody>\n"
+                   + "".join("<tr>\n" + "".join(f"<td>{cell}</td>\n" for cell in row) + "</tr>\n" for row in TABLE_ROWS)
+                   + "</tbody>\n</table>\n<p>All green but packaging; the mirror timed out once.</p>\n")
+
+# Every frame from the Threads view chosen: how the snapshot's card is drawn, while it is.
+FRAMES_JS = """(id) => { window.__cardFrames = []; const look = () => {
+    const card = document.querySelector(`#side-cards > li[data-card][data-id='${id}']`);
+    if (card) window.__cardFrames.push([card.hasAttribute('data-split-card'), card.hasAttribute('data-card-clamp'),
+        card.querySelectorAll('.side-card-text td, .side-card-text th').length, card.querySelector('.side-card-text').innerText]);
+    if (window.__cardFrames.length < 120) requestAnimationFrame(look); };
+  requestAnimationFrame(look); }"""
+
+
+def table_walk(desk: Desk) -> None:
+    page = desk.page
+    page.evaluate(FRAMES_JS, SNAPSHOT)
+    to_threads(desk)
+    page.wait_for_timeout(500)
+    frames = page.evaluate("() => window.__cardFrames")
+    assert isinstance(frames, list)
+    desk.check(len(frames) > 0, "the snapshot's card was never drawn")
+    stub = "Table (7 columns × 6 rows) …"
+    bad = [frame for frame in frames if not frame[0] or frame[1] or frame[2] or str(frame[3]).strip() != stub]
+    desk.check(not bad, f"a frame drew the card other than split on one line: {bad[:3]} of {len(frames)}")
+    found = card(desk)
+    desk.check(number(found, "lines") <= 1.5, f"the card draws {number(found, 'lines'):.2f} lines, not one")
+    desk.shot("1-card")
+    unpack_all(desk)
+    cells = page.evaluate(f"""() => [...document.querySelectorAll("#side-cards > li[data-unpack-thread='{SNAPSHOT}'][data-root-continuation] .md tr")]
+        .map((row) => [...row.querySelectorAll('td, th')].map((cell) => cell.innerText))""")
+    desk.check(cells == [TABLE_HEAD, *TABLE_ROWS], f"the continuation does not draw the table whole: {cells}")
+    desk.shot("2-unpacked")
+    desk.notes.append(f"{len(frames)} frames of the card, every one split on one line ({stub!r}); "
+                      f"the continuation draws the table's {len(cells)} rows whole")
 
 
 def pending_walk(desk: Desk, api: MarkdownApi) -> None:

@@ -1,6 +1,6 @@
 ---
 title: 'card-split-atomic-blocks: a split thread card never cuts inside a table, code block, quote or list item'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 depends_on:
   agent-utils-528: related
 created_at: 2026-10-26T14:50:42.483175269+00:00
-updated_at: 2026-10-26T14:50:42.483175269+00:00
+updated_at: 2026-10-26T15:24:00.599298439+00:00
+closed_at: 2026-10-26T15:24:00.599298319+00:00
 ---
 
 # Description

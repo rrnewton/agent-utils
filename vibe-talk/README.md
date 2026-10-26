@@ -109,7 +109,9 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   formatted, a numbered list going on with its numbers: the first message's own row, its author and
   time, with no buttons of its own, so a reply, a reaction or Done from it is the first message's. A
   first paragraph longer than the card on its own is not split: the card shows its first lines, clamped,
-  and the whole message is under it. A link to the first message, opened over these cards, lands on
+  and the whole message is under it. A table, a code block or a quote is never cut or clamped: one too
+  tall for the card at the head of the message is one line there, "Table (7 columns × 6 rows) …" or its
+  first line and **…**, and is drawn whole, as itself, in the row under the card. A link to the first message, opened over these cards, lands on
   its card.
 * **Two columns**, on a desk at least 1000px wide, put Main on the left and the same thread list on
   the right, where a thread chosen from it opens under its own card, moved up to the top of the column,
