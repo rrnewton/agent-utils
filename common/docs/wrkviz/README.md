@@ -33,7 +33,7 @@ web server.
 - A zero-model `responsiveness` report for persistent-agent teams: how long children waited for the
   coordinator after each turn end, by notification path, harness, and whether the parent was busy.
 - A zero-model `discover-agents` report: every agent session under a project's coordinators across
-  Claude Code, Codex, Orc and Muse logs and agentctl registries, with the sessions that ran in the
+  Claude Code, Codex, Orc and Muse logs and an agent manager's registries, with the sessions that ran in the
   project but that no coordinator reaches listed as orphans.
 - A self-contained static website served by a built-in loopback server, with backwards-compatible
   range-sharded timeline loading, deterministic gzip sidecars, immutable digest URLs, strong

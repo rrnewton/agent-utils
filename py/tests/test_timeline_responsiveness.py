@@ -416,11 +416,11 @@ def test_discover_agents_follows_every_link_and_lists_orphans(tmp_path: Path) ->
     links = {key: tree.sessions[key].link for key in tree.descendants("claude:coord-1")}
     assert links == {
         "claude-subagent:coord-1/helper": "claude-subagent",
-        "codex:lane-a-1": "agentctl-launch",
-        "codex:lane-b-1": "agentctl-launch",
+        "codex:lane-a-1": "manager-launch",
+        "codex:lane-b-1": "manager-launch",
         "codex:lane-a-child": "codex-spawn",
         "codex:lane-a-review": "shell-exec",
-        "codex:lane-a-2": "agentctl-restart",
+        "codex:lane-a-2": "manager-restart",
     }
     assert tree.sessions["codex:lane-a-2"].parent == "codex:lane-a-1"
     assert tree.orphans == ["codex:stray"]
@@ -470,5 +470,5 @@ def test_discover_agents_reads_unit_variant_sources_and_creator_objects(tmp_path
     )
 
     assert tree.sessions["codex:lane-c-1"].parent == "codex:lane-b-1"
-    assert tree.sessions["codex:lane-c-1"].link == "agentctl-created-by"
+    assert tree.sessions["codex:lane-c-1"].link == "manager-created-by"
     assert "codex:review" in tree.orphans

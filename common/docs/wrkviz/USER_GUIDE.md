@@ -522,7 +522,7 @@ and each ingest is an incremental read of the feed from the archive's last check
 - **New records are appended.** Upstream bytes past the checkpoint are copied into the archive's
   snapshot and the checkpoint advances. Bytes the archive already holds are compared, not
   re-imported.
-- **A file upstream no longer has is retired, not lost.** When a previously imported file is gone
+- **A file upstream no longer has is retired, not lost.** When an already imported file is gone
   upstream (absent in both spellings below), ingest verifies the archive's own snapshot against its
   checkpoint and keeps it, never rewriting it. A file that is still present but no longer reads as
   the same lineage is not retired; it is changed content, refused below. The run succeeds; the manifest records `upstream_retired_at` on that
@@ -1494,7 +1494,7 @@ plaintext; encrypted instruction bodies remain unavailable to the archive.
 
 A coordinator that runs for weeks leaves its work spread across logs no single tool reads together:
 its own Claude Code transcript, Task subagents beside it, Codex and Muse lanes it started through
-agentctl, the subagents those lanes spawned, and one-shot reviewers a lane ran from its shell.
+an agent manager, the subagents those lanes spawned, and one-shot reviewers a lane ran from its shell.
 `discover-agents` rebuilds that tree without a model, so you can see every session that belongs in
 a project before registering teams or summarizing a week.
 
@@ -1502,7 +1502,7 @@ a project before registering teams or summarizing a week.
 wrkviz discover-agents \
   --home hostA=/archive/hostA --home hostB=/archive/hostB \
   --muse-sessions hostA=/archive/hostA/muse-sessions \
-  --registry hostA=~/project/.agentctl --registry hostB=/copies/hostB/.agentctl \
+  --registry hostA=~/project/.manager --registry hostB=/copies/hostB/.manager \
   --cwd-prefix /home/me/project \
   --root claude:COORDINATOR-SESSION-UUID --root claude:SECOND-COORDINATOR-UUID \
   --since 2026-10-01 --json tree.json
@@ -1519,9 +1519,9 @@ host. Each child is attached to its parent by one of these links, recorded on ev
 | `claude-subagent` | a file under the session's `subagents/` directory |
 | `codex-spawn` | the child rollout's recorded parent thread |
 | `orc-parent` | the Orc session index's `parent_id` |
-| `agentctl-launch` | an `agentctl ... start NAME` (or `$VAR start NAME` on a line naming agentctl) in the parent's log, the registry record of NAME created within 15 minutes after it, and that record's log: its recorded native session id, else the same harness, host and working directory starting within 5 minutes of the record |
-| `agentctl-created-by` | a registry record's `created_by` or `managed_by` (its `agent` field) |
-| `agentctl-restart` | a log whose first prompt was queued to a registered agent, or is addressed to it (`→ NAME`, `SENDER -> NAME`, `You are NAME`), attached to that agent's earlier session |
+| `manager-launch` | a `<manager> ... start NAME` command (or `$VAR start NAME` on a line naming the manager) in the parent's log, the registry record of NAME created within 15 minutes after it, and that record's log: its recorded native session id, else the same harness, host and working directory starting within 5 minutes of the record |
+| `manager-created-by` | a registry record's `created_by` or `managed_by` (its `agent` field) |
+| `manager-restart` | a log whose first prompt was queued to a registered agent, or is addressed to it (`→ NAME`, `SENDER -> NAME`, `You are NAME`), attached to that agent's earlier session |
 | `shell-exec` | an unlinked log that starts within 2 minutes after a reached session ran `codex exec`, `claude -p` or `muse exec` on the same host; skipped when two sessions ran one within a second of each other |
 
 The last two are inferences from timing and wording rather than recorded links, which is why they

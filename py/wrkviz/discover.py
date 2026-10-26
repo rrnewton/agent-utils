@@ -1,14 +1,14 @@
 """Discover a project's agent tree from its coordinators and its working directories.
 
 A project run by persistent coordinators spreads its sessions across harnesses and hosts: a
-Claude Code coordinator starts Codex and Muse lanes through agentctl, a lane starts its own
+Claude Code coordinator starts Codex and Muse lanes through an agent manager, a lane starts its own
 sub-agents, Claude Code keeps Task subagents beside the session, and Codex records each spawned
 child in the child's own rollout. No single log holds the tree. This module rebuilds it, without a
-model, from what the logs and the agentctl registry do record:
+model, from what the logs and the agent manager's registry do record:
 
 * **native links** -- a Claude Code session's ``<session>/subagents/agent-*.jsonl`` files, a
   Codex rollout's ``thread_spawn.parent_thread_id``, an Orc session's ``parent_id``;
-* **agentctl launches** -- an ``agentctl ... start NAME`` command inside a session's log, matched
+* **manager launches** -- a ``<manager> ... start NAME`` command inside a session's log, matched
   to the registry record of that name created within :data:`LAUNCH_WINDOW_S` after it, and from the
   record to the child's own log: by its recorded native session id when there is one, otherwise by
   the harness, working directory and a start within :data:`START_WINDOW_S` of the record.
@@ -81,12 +81,14 @@ class Session:
 
     @property
     def key(self) -> str:
+        """``provider:session-id``, the session's identity in the tree and the report."""
+
         return f"{self.provider}:{self.session_id}"
 
 
 @dataclass(frozen=True)
 class RegistryAgent:
-    """One agentctl registry record, live or archived."""
+    """One agent-manager registry record, live or archived."""
 
     host: str
     name: str
@@ -256,7 +258,7 @@ def scan_muse(host: str, root: Path) -> list[Session]:
 
 
 def load_registry(host: str, registry: Path) -> list[RegistryAgent]:
-    """Every agent record in an agentctl registry, live and archived."""
+    """Every agent record in an agent manager's registry, live and archived."""
 
     agents = []
     for path in sorted([*registry.glob("*/agent.json"), *registry.glob("archive/**/agent.json")]):
@@ -380,7 +382,7 @@ def _log_lines(path: Path) -> Iterator[bytes]:
 
 
 def launches(path: Path) -> list[tuple[float, str]]:
-    """``(when, NAME)`` for every ``agentctl ... start NAME`` in a log, from its records' times."""
+    """``(when, NAME)`` for every manager ``... start NAME`` command in a log, from its records' times."""
 
     found: list[tuple[float, str]] = []
     for line in _log_lines(path):
@@ -433,6 +435,8 @@ class Discovery:
     ignored_mentions: int = 0
 
     def descendants(self, key: str) -> list[str]:
+        """Every session below *key*, breadth first."""
+
         seen: list[str] = []
         queue = deque(self.sessions[key].children)
         while queue:
@@ -444,6 +448,8 @@ class Discovery:
         return seen
 
     def to_json_obj(self) -> dict[str, object]:
+        """The full report: roots with counts, every tree node, orphans, unresolved launches."""
+
         def row(key: str) -> dict[str, object]:
             session = self.sessions[key]
             return {
@@ -597,7 +603,7 @@ def discover(
                      else "no matching log"}
                 )
                 continue
-            attach(resolved[launched], parent_key, "agentctl-launch")
+            attach(resolved[launched], parent_key, "manager-launch")
 
     def reached_from_roots() -> set[str]:
         found: set[str] = set(roots)
@@ -646,7 +652,7 @@ def discover(
             ]
             if earlier:
                 original = max(earlier, key=lambda item: sessions[item].started_at or 0.0)
-                attach(key, original, "agentctl-restart")
+                attach(key, original, "manager-restart")
                 session.name = session.name or owner
                 sessions_by_agent.setdefault((session.host, owner), []).append(key)
                 changed = True
@@ -675,7 +681,7 @@ def discover(
     by_agent_name = {(agent.host, agent.name): key for agent, key in resolved.items()}
     for agent, key in resolved.items():
         if agent.created_by and (agent.host, agent.created_by) in by_agent_name:
-            attach(key, by_agent_name[(agent.host, agent.created_by)], "agentctl-created-by")
+            attach(key, by_agent_name[(agent.host, agent.created_by)], "manager-created-by")
 
     reached: set[str] = set(roots)
     for root in roots:
