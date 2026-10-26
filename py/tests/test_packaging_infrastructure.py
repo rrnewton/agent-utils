@@ -27,6 +27,10 @@ def _collect_lifecycle_tests(mark_expression: str | None = None) -> set[str]:
         "--strict-markers",
         "-p",
         "no:cacheprovider",
+        # Collection needs no assertion rewriting. Rewriting this 57,000-line module took a
+        # 450 MiB child beside this run, past the step's memory cap; plain asserts take 66 MiB
+        # and collect the same IDs.
+        "--assert=plain",
         "-c",
         "pyproject.toml",
         "--rootdir=.",
