@@ -70,6 +70,8 @@ impl Scratch {
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
+                slack_format: None,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
         .expect("initialize state");
