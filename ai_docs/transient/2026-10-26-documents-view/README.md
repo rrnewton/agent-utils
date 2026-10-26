@@ -35,7 +35,8 @@ client-side rendering.
    What is new:
    - a recognizer and a fetcher with credentials;
    - a second, document render profile with its own sanitizer settings;
-   - speech sections cut from the parsed tree;
+   - a numbered section tree over the blocks the server already cuts, and a hierarchical
+     navigator for them;
    - endpoints, and a pane.
 2. **Recognizing the links is easy and reliable for two kinds.** Over 12 days of the owner's Slack
    channels, the document links were almost all of two shapes: GitHub `blob/…/*.md` pages (50
@@ -48,19 +49,21 @@ client-side rendering.
      documents changed afterwards;
    - relative links: 32 of 50 documents link to sibling files, 544 links to other Markdown files;
    - length: the median is about 4,000 words, roughly 27 minutes aloud;
+   - navigating hundreds of blocks: the flat block timeline does not scale, and the § navigator
+     section proposes numbered sections and a focus-plus-context row;
    - read-aloud that survives a locked phone in a car.
 4. **Recommendation: start with design A+, then B, then C.**
    - **A+ (the MVP):** the documents list is built on demand from the message cache, which is
      already cross-channel and already filled only by the owner's reads. Fetched documents are
      kept in a bounded cache, not a new durable index. The MVP is the three-way switcher, GitHub
-     Markdown, the list, the reader and Read by section.
+     Markdown, the list, the reader and Read with the hierarchical navigator.
    - **B (a durable document index):** only when a deployment needs documents without a message
      cache, or versions that survive restarts.
    - **C (logbook):** when that storage layer exists.
 
    Render on the server, cache the result per version, and send the page sanitized HTML and an
-   outline. The MVP is about two weeks of lane time (§ Phased plan), more than the switcher alone
-   suggests.
+   outline. The MVP is about 12–17 lane-days, one to two weeks elapsed with two paired lanes
+   (§ Phased plan), more than the switcher alone suggests.
 
 ## Findings
 
@@ -151,7 +154,7 @@ Other facts that shape the design:
 | Mark a link so the page can take the tap | `#543 in-app-message-links` (in flight): the renderer marks message permalinks with an attribute, and the page decides whether to make the tap a jump | the same, for document links |
 | Find every document link across channels | the message cache: every message's text with a trigram full-text index, filled only by write-scope and server-owned reads | a query over it (design A+) |
 | Render Markdown safely | `render.rs` pipeline; the ammonia allowlist is the security boundary; server highlighting (`#531`) | a document profile with its own sanitizer settings (listed below) |
-| Read text aloud | `speakable.rs`, a line-by-line stripper over raw text (code blocks over three lines named, tables announced, addresses said as pages, times made relative); browser and server read-aloud backends; the read strip with Pace and prev/next | sections cut from the parsed tree (new code), a resume position, background audio |
+| Read text aloud | blocks cut from the parsed tree (`render::source_blocks`); `speakable.rs`, a line-by-line stripper over each block's text (code blocks over three lines named, tables announced, addresses said as pages, times made relative); browser and server read-aloud backends; the read strip with Pace, Previous and Next, the `#380` block timeline, and media keys (`#434`) | document bounds for the blocks, a numbered section tree, the hierarchical navigator, a resume position |
 | Jump with Back | `#423 back-key-consistency` places, `#304` history entries, `#462 webapp-deep-links` (`?v=…&m=…`) | a `docs` view and a `d=` parameter |
 | A list of cards | the thread list (`#279`, `#407`) | a document card |
 | A local copy on the phone | the saved-messages snapshot (`localStorage`, about 600,000 characters in total) | too small for documents: use IndexedDB |
@@ -413,13 +416,26 @@ The list reuses the thread list's card styles:
 ### Read-aloud for long documents
 
 The median document is about 27 minutes aloud, and the 90th percentile over two hours. The
-read-aloud has to be navigable, not one long utterance.
+read-aloud has to be navigable, not one long utterance. Much of what that needs is already in the
+read strip:
 
-- **Sections.** The server cuts the parsed tree at headings into sections, and sections into
-  paragraph chunks. That is new code: `speakable.rs` works on raw text, line by line, and knows only
-  backtick fences. The cut structure is cached per version.
-- **Speech is prepared when it is spoken, not cached.** Each chunk goes through `speakable.rs` at
-  speak time:
+- **Blocks.** The server already cuts a message into blocks from the parsed tree
+  (`render::source_blocks`: paragraphs, headings, list items, quotes, code, tables). The page reads
+  them one by one and lights the one being read. `#380 read-aloud-timeline` draws them as a row of
+  buttons, one per block, as wide as what it says, and a tap reads from there. Previous and Next
+  step a block. The sentence being said is highlighted.
+- **Media keys.** A steering wheel's or a headset's previous and next already reach the read
+  through the Media Session (`#434 read-aloud-pause`). A silent looping media element keeps the
+  page the browser's media target while a server-synthesized read plays.
+
+What documents add:
+
+- **Bounds.** `source_blocks` goes through the chat renderer, which gives up at 16 KiB. Documents
+  need the document profile's bounds, the same as their HTML.
+- **Sections over blocks.** A section tree over those blocks, numbered, drives the navigator in the
+  next section.
+- **Speech is prepared when it is spoken, not cached.** Each block's text goes through
+  `speakable.rs` at speak time:
   - code blocks over the short threshold are named rather than read;
   - tables are announced by their keys;
   - addresses are said as pages.
@@ -427,24 +443,243 @@ read-aloud has to be navigable, not one long utterance.
   It cannot be cached, for two reasons. `speakable.rs` makes times relative to now ("three hours
   ago"). And it names hashes from a table shared across the server (at most 4,096 entries), so
   the letters must belong to the listener's session. Naming every fetched document in advance would
-  also fill that table.
-- **Controls** are the read strip's own, plus:
-  - **Next / Previous section**, beside Pace;
-  - tap a paragraph to read from there;
-  - a "Skip code" setting, on by default.
-- **Resume.** A resume position (section and paragraph) is saved per document version, and offered
-  when the document is reopened.
-- **Follow along.** The paragraph being read is highlighted and kept in view, as the row being read
-  is today.
-- **In the car**, the screen is off or another app is in front. Web Speech, the device voice, is not
-  guaranteed to keep speaking then (the README already says so). Durable background playback needs
-  audio in an `<audio>` element with the Media Session API:
-  - Android then keeps playing with the screen locked and shows media controls;
-  - a car's steering-wheel "next track" can map to **next section**.
+  also fill that table. The block structure, by contrast, is cached per version.
+- **Skip code.** A setting, on by default for documents.
+- **Resume.** A resume position (a block, with its section number and heading path) is saved per
+  document version. It is offered when the document is reopened, and found again by heading path
+  in a newer version.
+- **In the car**, the screen is off or another app is in front. Web Speech, the device voice, is
+  not guaranteed to keep speaking then (the README already says so). The server-synthesized read
+  with its keeper element is the path built for that. Whether it keeps a 30-minute document going
+  with the screen locked has not been verified on a phone. Server synthesis also raises the
+  question of which voice service may receive a private document (question 3). The MVP uses the
+  device voice with the screen on. Phase 3 verifies and hardens the locked-screen path.
 
-  That means server-side synthesis of each chunk, which raises the question of which voice service
-  may receive a private document (question 3). The MVP uses the device voice with the screen on.
-  Phase 3 adds the audio path.
+## Navigating long documents: a hierarchical chunk navigator
+
+The owner, 2026-10-26, on the `#380` timeline:
+
+> Clicking chunks for random access, Previous and Next, and the little timeline are great, but a
+> giant document of H1 sections holding H2 sections holding paragraphs will not fit in one flat
+> scrubber.
+
+The owner's proposals:
+
+- number the sections automatically, even when the source does not;
+- when the chunks would overflow, show only the current section's chunks, with a small
+  placeholder for the next section at the edge;
+- aggregate chunks to paragraphs past some density;
+- or stack scrubbers, one per level;
+- or draw one bar of nested boxes.
+
+The owner asked for precedents and a principled algorithm. This applies to long chat messages too, though
+they rarely need it. In the Slack sample, chat messages had a median of 1 block, a 99th percentile
+of 10, and a maximum of 24, because Slack splits long posts. Only 2 of 1,784 messages had more than
+15. Documents are another matter.
+
+### The shapes to design for
+
+Measured with a rough block splitter on 55 agent-written design documents in this repository
+(`ai_docs/transient`, a public proxy for the owner's private reports, which are larger):
+
+| | Value |
+|---|---|
+| Blocks per document | median 54, p90 252, max 622 |
+| Blocks under one heading, the largest in each document | median 9, p90 33, max 118 |
+| Files with exactly one H1, of all 68, by a rough count | 64 (the H1 is the title) |
+| Typical heading shape | one H1, then 5–15 H2s, then 0–25 H3s |
+| vibe-talk's own README, an extreme | 1,833 blocks; 1 H1, 35 H2, 138 H3, 1 H4 |
+
+Three conclusions follow:
+
+- **Heading levels are not the hierarchy.** The `#` count says little about depth. Almost every
+  document has a single H1, its title, so an "H1 scrubber" would hold one box.
+- **Leaf sections can be huge.** A section of 118 blocks overflows any bar on a phone, so the
+  algorithm must make levels up as well as drop them.
+- **The tree is shallow in practice** (two or three real levels), but the width varies widely.
+
+### Section numbers
+
+Numbers come from the normalized section tree, not from the `#` count:
+
+1. **The title is not numbered.** When the document opens with the only heading at its top level,
+   that heading is the title, as LaTeX's `\title` is. Its level is dropped from the numbering.
+2. **Depth is the rank among a heading's ancestors**, so an H2 followed directly by an H4 gives
+   `3` and `3.1`, not `3.0.1`.
+3. **Text before the first numbered section is section 0**, shown as "Introduction" when it has no
+   heading.
+4. **The author's numbers win.** When every heading at a level already starts with a number
+   (`3.`, `3.2`, `III.`), those are shown, and no second numbering appears beside them.
+
+The numbers appear in three places: the contents drawer, a small gutter label beside each heading
+in the reader, and the navigator. A block's address is then `3.2 ¶ 4`, which can be spoken ("section
+three point two") and remembered, and the resume position and deep links use the same address.
+
+### Precedents
+
+None of these is exactly the owner's idea, but each solves part of it:
+
+- **Video chapter bars.** YouTube divides one progress bar into chapter segments. That is one level
+  of nested boxes in a single bar (idiom 3). For precision, phone video players offer fine scrubbing
+  by dragging or swiping while scrubbing, rather than by smaller targets.
+- **Audiobook and podcast players.** Audiobook apps commonly show progress within the chapter and
+  in the whole book, and a chapter list. That is two stacked levels (idiom 2). Podcast apps draw
+  chapter marks on the scrubber.
+- **Ebook readers.** They show progress in the book and time left in the chapter, with chapter
+  marks on the progress bar, and a contents list for jumps.
+- **Code editors.** Breadcrumbs (the path of nested symbols above the editor, each opening its
+  siblings), sticky scroll (the enclosing scopes' headers pinned at the top), and the minimap.
+  Breadcrumbs are the current-section window (idiom 1) in text form.
+- **Icicle plots and treemaps** (hierarchical partition charts). An icicle plot is exactly stacked,
+  aligned bars, one row per level, widths proportional to size. Its zoomable form makes a clicked
+  node's children fill the width, which is idiom 2 with zoom. A treemap is idiom 3.
+- **Overview and detail in audio and video editors.** A full-length overview strip with a window
+  marked on it, over a zoomed detail view. That is the classic focus-plus-context pattern behind
+  idiom 2.
+
+### The three candidate idioms
+
+Phone width (about 360 px for the strip), reading block 4 of section 3.3, in a document whose
+sections are 1–6, with 3 holding 3.1–3.4:
+
+**Idiom 1: the current section's window, with the next section as a placeholder.**
+
+```
+3.3 Relative links and refs                       3.4
+▕██▕██▕▓▓▕██▕░░▕░░▕░░▕░░▕░░▕░░▕░░▕           ▕··▏
+◀ Prev           3.3 ¶ 4 of 11            Next ▶
+```
+
+- Simple, and the boxes keep a usable size.
+- But it shows nothing about where 3.3 sits in the document, and only one neighbour.
+
+**Idiom 2: stacked scrubbers (a zoomed icicle).** Each row is the children of the current node on
+the path to the reading position:
+
+```
+ 1    2   ┌─3──┐  4    5    6          ← sections
+ ▕██▕██▕██▕▓▓▓▓▕░░▕░░▕░░▕
+ 3.1  3.2 ┌3.3┐ 3.4                    ← inside 3
+ ▕████▕████▕▓▓▓▓▕░░░░▕
+ ▕██▕██▕▓▓▕██▕░░▕░░▕░░▕░░▕░░▕░░▕░░▕      ← blocks of 3.3
+```
+
+- Every level stays clickable at a good size, and the position is clear at a glance.
+- But it costs a row per level: about 5 mm each on a phone, above a list that already competes for
+  room (`channel-bars-layout`).
+
+**Idiom 3: one bar of nested boxes.**
+
+```
+┌─1──┐┌─2──┐┌─3───────────────────┐┌─4──┐┌─5─┐┌6┐
+│▕█▕█││▕█▕█││▕██▕██▕▓▓▕░░│▕░▕░▕░▕░││▕░▕░││▕░││░│
+└────┘└────┘└──3.1─3.2─3.3──3.4───┘└────┘└───┘└┘
+```
+
+- One row, and the outline is visible.
+- But the fine boxes become far too small to tap as soon as the document is more than a few
+  dozen blocks, unless the current box is magnified.
+
+### Recommendation: a focus-plus-context row over the block row
+
+Combine the three:
+
+- **The bottom row is today's `#380` row**, limited to the current leaf section, or to a virtual
+  part of it (below). Narrow placeholders at either edge carry the previous and next section's
+  numbers (idiom 1). Tapping one goes to the start of that section.
+- **Above it, a context row** shows the siblings at the level above as compact numbered boxes. The
+  current one is expanded to hold its own children as nested boxes (idiom 3, applied only where the
+  reader is). This is a fisheye: everything is reachable, and only the current part takes room.
+- **On a desk, the algorithm may add one more context row** (idiom 2) when the tree is deep enough
+  to need it.
+- **Anything above the rows shown** becomes a breadcrumb line ("3 Storage core › 3.3"). Tapping it
+  opens the contents drawer.
+
+```
+phone (about 360 px)
+3 Storage core › 3.3 Relative links and refs
+ 1  2 ┌3──────────────────────┐ 4  5  6 … 15
+ ▕▕ ▕▕ │3.1 │3.2 │▐3.3▌│ 3.4 │ ▕▕ ▕▕ ▕▕   ▕▕       ← context row
+▕3.2▏▕██▕██▕▓▓▕██▕░░▕░░▕░░▕░░▕░░▕░░▕░░▕▕3.4▏         ← block row, placeholders at the edges
+◀ Prev            3.3 ¶ 4 of 11             Next ▶
+
+desk (about 720 px): the same, plus a third row when the leaf was split into parts
+```
+
+On a phone that is two rows, against today's one. If the owner holds the strip to one row, the
+context row becomes the breadcrumb line alone, which is idiom 1.
+
+### The algorithm
+
+Inputs:
+
+- the blocks `b1 … bn`, each with a weight (its characters, a proxy for time aloud), a kind, and its
+  list or quote run;
+- the normalized section tree (above);
+- the strip width `W`.
+
+Parameters, from the width:
+
+- `K_target = ⌊W / 24 px⌋`, a comfortable tap target (24 px is WCAG 2.2's minimum target size);
+- `K_hard = ⌊W / 14 px⌋`, the most boxes a row may hold before it must be split. Dragging along the
+  row, with a floating label (`3.3 ¶ 7`), makes those smaller boxes usable, as video scrubbing does.
+- `R`, the number of rows: 2 on a phone, 3 on a desk.
+
+So a phone (W ≈ 360 px) gets 15 and 25 boxes, and a desk (W ≈ 720 px) gets 30 and 51. That fits
+the owner's suggested 8 to 40.
+
+The steps:
+
+1. **Normalize the tree once per version.**
+   - Splice out every node whose only content is one child section: the title case, and an H2
+     wrapping a lone H3.
+   - Content before a node's first child section becomes a pseudo-child, "intro".
+   - Levels the document skipped are not levels.
+2. **Balance once per version and width, bottom up.** Give every node `c` units: its child sections,
+   or for a leaf section its blocks.
+   - **Aggregate first.** When a leaf has more than `K_hard` blocks, merge each list, quote or table
+     run into one unit, and keep a heading with what follows it. That is the owner's "aggregate up
+     to the paragraph level".
+   - **Then synthesize levels.** If a node still has `c > K_hard` units, insert
+     `g = ⌈c / K_target⌉` virtual children of consecutive units. Choose the boundaries to minimize
+     the heaviest group (a linear partition, solvable exactly by dynamic programming, or greedily
+     at this size). They are labelled `3.3 (2/4)`. Repeat while `g > K_hard`.
+
+     So a leaf of 118 blocks on a phone becomes 8 parts of about 15. A document with no headings
+     and 600 blocks becomes 3 to 4 parts of about 11 groups of about 15. That is two virtual
+     levels: one breadcrumb and two rows.
+3. **Choose rows whenever the path to the reading position changes.**
+   - Every node on the path with two or more units contributes a row of its units.
+   - The deepest row (blocks, or a virtual part's blocks) is always shown.
+   - If there are more rows than `R`, the nearest row above is drawn as the expanded box of its
+     parent's row, provided the parent row has at most about 8 units and the expansion fits
+     `K_hard` in total. That is the context row's nesting.
+   - Rows still left over become the breadcrumb line.
+4. **Draw each row as a window.** Widths are proportional to weight, with a minimum width per box.
+   The siblings of the row's node appear as placeholders at the edges. Units already heard are
+   tinted, and the current one is filled, as `#380` does now.
+
+Every step is linear in the number of blocks, except the optional exact partition, which is
+`O(c² · g)` on one node. Steps 1 and 2 run once per version and width, and step 3 only when the
+reader crosses a section boundary.
+
+### How it drives the read
+
+- **One position:** the current block. Every row is derived from it, so a tap on any box moves the
+  read to that unit's first block, and the rows follow.
+- **Previous and Next** keep stepping one block, as now. The edge placeholders and a long press on
+  Next step a section.
+- **A steering wheel's next track** steps a block today (`#434`). In the documents reader, a setting
+  makes it step a section instead: in a car, a block is too fine and the screen is out of reach.
+  Should that be the default? That is question 10.
+- **Entering a section is announced** by its heading, as heading blocks already are, prefixed with
+  its number when the setting for spoken numbers is on.
+- **Resume, deep links and the reader's scroll place** all use the same block address
+  (`3.3 ¶ 4`), with the heading path stored beside it so that a newer version of the document
+  finds the same place.
+- **Chat.** A long message with headings gets the same rows. A message within `K_target` blocks
+  sees exactly today's single row. A combined row of several messages treats each message as a
+  unit above its blocks.
 
 ## The challenging issues
 
@@ -514,7 +749,8 @@ one agent, rough, and include tests and browser walks. For scale, the message ca
 is about 29,000 lines.
 
 **Phase 1, MVP (A+): switcher, GitHub Markdown, list, reader, Read.** Two paired lanes, about
-5–7 lane-days on the server and 5–8 on the page, so one to two weeks elapsed.
+5–7 lane-days on the server and 7–10 on the page (the navigator is about 2 of those), so one to
+two weeks elapsed.
 
 - **Server:**
   - `documents::recognize` and the document key for `github.com/OWNER/REPO/blob/REF/PATH.md`
@@ -523,7 +759,7 @@ is about 29,000 lines.
   - the GitHub fetcher, with a token from a file, conditional requests and a byte-bounded cache;
   - the document render profile and its sanitizer allowlist: bounds, prefixed anchors, links,
     relative links, outline;
-  - section cutting from the tree, and speech per chunk at speak time;
+  - blocks under document bounds, the numbered section tree, and speech per block at speak time;
   - the endpoints, owner scope only;
   - tests, including a fixture repository with relative links, a `..` escape attempt, a branch name
     with a slash, a heading that collides with a page id, and a document link in a message over
@@ -533,7 +769,8 @@ is about 29,000 lines.
   - the Documents pane: cards, filters, the "covers …" line;
   - the reader: header, body, contents drawer, Linked in…, anchor positions, Back through `#423`;
   - document links in messages open in-app (on top of `#543`);
-  - Read by section with the device voice;
+  - Read with the device voice, and the hierarchical navigator: context row, block row, section
+    numbers;
   - browser walks at 393×852 and on a desk.
 
 **Phase 2: pastes, versions, the car copy.** About 3–5 lane-days on each side.
@@ -545,11 +782,11 @@ is about 29,000 lines.
   token like the saved messages. Opening a document saved for the car works with no signal.
 - **Resume positions.**
 
-**Phase 3: listening in the car.** About 3–5 lane-days.
+**Phase 3: listening in the car.** About 2–4 lane-days.
 
-- Server-synthesized audio per chunk, through the deployment's chosen speech service.
-- `<audio>` plus Media Session, so playback continues with the screen locked.
-- Next and previous track mean next and previous section.
+- The server-synthesized read (with its keeper element and media keys) verified and hardened for a
+  long document with the screen locked, through the deployment's chosen speech service.
+- The steering wheel's next and previous track step a section, as a setting.
 - An optional image proxy, if documents have started carrying figures.
 
 **Phase B, only if needed: the durable index.** About a week more. It covers deployments without a
@@ -597,7 +834,8 @@ Public systems only.
 
 1. **Scope of the list.** One list across every channel on the server (recommended, with a channel
    filter), or per channel like the other views? Documents linked by anyone, or only by agents and
-   you?
+   you? Should a document move back to the top each time it is linked again (recommended: newest
+   mention first)?
 2. **Which version.** Show the newest version with "updated after it was linked" (recommended),
    or the version current when it was linked?
 3. **What Read means, and which voice may hear a private document.** Plain read-aloud by section
@@ -620,5 +858,7 @@ Public systems only.
    GitHub issue and pull-request descriptions count as documents? Should links to code files inside
    a document (109 to `.json` in the sample) open on GitHub (recommended), or in the reader as
    highlighted code?
-10. **Order.** Should a document jump back to the top each time it is linked again (recommended:
-    newest mention), or stay where it was first linked?
+10. **The navigator.** Is the focus-plus-context row over the block row right, at two rows on a
+    phone? Or do you prefer idiom 1 (one row, with a breadcrumb) or idiom 2 (stacked rows)? Should
+    sections be numbered when the author did not number them? Should the steering wheel's next
+    track step a section in the documents reader?
