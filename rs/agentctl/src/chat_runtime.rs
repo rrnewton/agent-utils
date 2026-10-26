@@ -15210,28 +15210,48 @@ fn outbound_text(agent_label: &str, body: &str) -> String {
     let prefix = format!("[{agent_label}]");
     if body.starts_with(&prefix) {
         body.to_owned()
-    } else if starts_with_markdown_heading(body) {
-        // On the heading's line the label would make it a paragraph that starts with `#`, so the
-        // label is a paragraph of its own (`#551 headings-real-headings`).
+    } else if starts_with_markdown_block(body) {
+        // On the first line the label would turn a heading, a fence, a quote, a list or a table
+        // into a paragraph that merely starts with its marker (a fence worst of all: its closing
+        // line would open one), so the label is a paragraph of its own
+        // (`#551 headings-real-headings`).
         format!("{prefix}\n\n{body}")
     } else {
         format!("{prefix} {body}")
     }
 }
 
-/// Whether `body` opens with a Markdown ATX heading: up to three spaces, one to six `#`, then a
-/// space, a tab or the end of the line.
-fn starts_with_markdown_heading(body: &str) -> bool {
+/// Whether `body` opens with a Markdown block that must start its own line: after up to three
+/// spaces, an ATX heading (one to six `#`, then a space, a tab or the end of the line), a code
+/// fence, a block quote, a list item (`-`, `*` or `+`, or a number with `.` or `)`, then a
+/// space), or a table row.
+fn starts_with_markdown_block(body: &str) -> bool {
     let line = body.lines().next().unwrap_or_default();
     let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return false;
+    }
     let rest = &line[indent..];
+    let spaced = |after: &str| after.is_empty() || after.starts_with([' ', '\t']);
     let marks = rest.len() - rest.trim_start_matches('#').len();
-    indent <= 3
-        && (1..=6).contains(&marks)
-        && rest[marks..]
-            .chars()
-            .next()
-            .is_none_or(|c| c == ' ' || c == '\t')
+    if (1..=6).contains(&marks) && spaced(&rest[marks..]) {
+        return true;
+    }
+    if rest.starts_with("```")
+        || rest.starts_with("~~~")
+        || rest.starts_with('>')
+        || rest.starts_with('|')
+    {
+        return true;
+    }
+    if let Some(after) = rest.strip_prefix(['-', '*', '+']) {
+        return !after.is_empty() && spaced(after);
+    }
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    (1..=9).contains(&digits)
+        && rest[digits..]
+            .strip_prefix(['.', ')'])
+            .is_some_and(|after| !after.is_empty() && spaced(after))
 }
 
 fn validate_outbound_body(agent_label: &str, body: &str) -> Result<()> {
@@ -31322,7 +31342,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     }
 
     #[test]
-    fn the_agent_label_never_turns_an_opening_heading_into_a_paragraph() {
+    fn the_agent_label_never_turns_an_opening_block_into_a_paragraph() {
         // `#551 headings-real-headings`.
         assert_eq!(
             outbound_text("coord", "# Weekly report\n\nAll green."),
@@ -31342,6 +31362,35 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             outbound_text("coord", "[coord] # As written"),
             "[coord] # As written"
         );
+        // The other blocks a first line can open, each kept a block.
+        for opening in [
+            "```sh\nmake\n```",
+            "~~~\ncode\n~~~",
+            "> quoted",
+            "- item",
+            "* item",
+            "1. first",
+            "12) twelfth",
+            "| a | b |\n|---|---|",
+        ] {
+            assert_eq!(
+                outbound_text("coord", opening),
+                format!("[coord]\n\n{opening}"),
+                "{opening:?}"
+            );
+        }
+        // Sentences that only look like it stay on the label's line.
+        for sentence in [
+            "-5 degrees",
+            "*bold* start",
+            "2026 was fine",
+            "3.5 is the ratio",
+        ] {
+            assert_eq!(
+                outbound_text("coord", sentence),
+                format!("[coord] {sentence}")
+            );
+        }
     }
 
     #[test]

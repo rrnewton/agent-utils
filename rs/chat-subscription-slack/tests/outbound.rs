@@ -1108,3 +1108,25 @@ fn converted_replies_without_headings_and_markdown_replies_carry_no_blocks() {
     assert_eq!(posts[1].format, TextFormat::Markdown);
     assert_eq!(posts[1].blocks, None);
 }
+
+#[test]
+fn refused_blocks_fall_back_to_the_text_alone_instead_of_losing_the_reply() {
+    // `#551 headings-real-headings`: Slack may count a header's characters differently; the mrkdwn
+    // text alone is always a valid post, so the chunk is said as text rather than lost.
+    let ledger = ledger("converted-blocks-refused");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    fake.push_post_failure(FakePostFailure::Refuse(TransportError::not_applied(
+        "invalid_blocks",
+        "invalid_blocks",
+        false,
+    )));
+    let mut request = send(ID, Some("1792000801.000100"), "# Report\n\nbody");
+    request["slack_format"] = json!("converted");
+    let response = run(&config, &fake, &request, 1_000);
+    assert_eq!(response["ok"], json!(true), "{response}");
+    let posts = &fake.state().posts;
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].text, "*Report*\n\nbody");
+    assert_eq!(posts[0].blocks, None);
+}

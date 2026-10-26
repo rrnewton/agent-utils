@@ -10,13 +10,15 @@
 //! what Slack stores.
 //!
 //! Headings (`#551 headings-real-headings`). A part of a message that holds a
-//! heading of levels 1 to 3, of at most [`MAX_HEADER_CHARS`] characters, is
+//! heading of levels 1 to 3, of at most [`MAX_HEADER_CHARS`] characters
+//! (counted long: UTF-16 units of its escaped text) and with no link, is
 //! also given Block Kit blocks ([`ConvertedPart::blocks`]): each such heading
 //! a `header` block, which Slack's own client draws as a heading and its
 //! history returns as one, and the mrkdwn between them `section` blocks. The
 //! mrkdwn above stays the message text, which Slack shows in notifications and
-//! the client's stored text returns. A deeper or longer heading stays a bold
-//! line, and a part whose blocks would pass [`MAX_BLOCKS`] is posted as its
+//! the client's stored text returns (with its newlines as spaces). A deeper or
+//! longer heading, or one with a link, stays a bold line; a heading never ends
+//! a part that has more after it; and a part whose blocks would pass [`MAX_BLOCKS`] is posted as its
 //! mrkdwn alone. Slack's header block has no level, so every header is one
 //! heading level to a reader.
 
@@ -138,7 +140,24 @@ pub fn convert_and_split_parts(markdown: &str, limit: usize) -> Vec<ConvertedPar
             continue;
         }
         if !current.is_empty() {
+            // A heading never ends a part with more after it: it heads nothing there, so it
+            // opens the next part with the block it heads.
+            let carried = (current.len() > 1
+                && current.last().is_some_and(|last| last.header.is_some()))
+            .then(|| current.pop())
+            .flatten();
             parts.push(std::mem::take(&mut current));
+            if let Some(heading) = carried {
+                let joined = heading.text.len() + 2 + unit.text.len();
+                current_bytes = heading.text.len();
+                current.push(heading);
+                if joined <= limit {
+                    current_bytes = joined;
+                    current.push(unit);
+                    continue;
+                }
+                parts.push(std::mem::take(&mut current));
+            }
         }
         if unit.text.len() <= limit {
             current_bytes = unit.text.len();
@@ -187,10 +206,14 @@ fn convert_units(markdown: &str) -> Vec<Unit> {
         if block.trim().is_empty() {
             continue;
         }
+        // A heading with a link stays a bold line, where the link can still be followed: a
+        // header block is plain text.
         let header = match &child.data.borrow().value {
-            NodeValue::Heading(heading) if heading.level <= MAX_HEADER_LEVEL => {
+            NodeValue::Heading(heading)
+                if heading.level <= MAX_HEADER_LEVEL && !has_link(child) =>
+            {
                 let plain = heading_plain(child);
-                (plain.chars().count() <= MAX_HEADER_CHARS).then_some(plain)
+                (slack_length(&escape_text(&plain)) <= MAX_HEADER_CHARS).then_some(plain)
             }
             _ => None,
         };
@@ -208,6 +231,18 @@ fn convert_units(markdown: &str) -> Vec<Unit> {
         }
     }
     units
+}
+
+/// A length as Slack may count it against a block's limit, erring long: UTF-16 code units, the
+/// way a JavaScript string counts, over the text as escaped for the wire.
+fn slack_length(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// Whether `node` holds a link or an autolink anywhere inside it.
+fn has_link<'a>(node: &'a AstNode<'a>) -> bool {
+    node.descendants()
+        .any(|inner| matches!(inner.data.borrow().value, NodeValue::Link(_)))
 }
 
 /// A heading's words as plain text, its inline markup dropped.
@@ -244,15 +279,15 @@ fn blocks_for(units: &[Unit]) -> Option<String> {
             }));
             continue;
         }
-        let pieces = if unit.text.chars().count() <= MAX_SECTION_CHARS {
+        let pieces = if slack_length(&unit.text) <= MAX_SECTION_CHARS {
             vec![unit.text.clone()]
         } else {
-            // Byte-bounded, so each piece is within the character cap too.
+            // Byte-bounded, so each piece is within the UTF-16 cap too.
             split_oversize_block(&unit.text, MAX_SECTION_CHARS)
         };
         for piece in pieces {
             if !section.is_empty()
-                && section.chars().count() + 2 + piece.chars().count() > MAX_SECTION_CHARS
+                && slack_length(&section) + 2 + slack_length(&piece) > MAX_SECTION_CHARS
             {
                 flush(&mut section, &mut blocks);
             }
@@ -792,6 +827,37 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["type"], "header");
         assert_eq!(blocks[1]["text"]["text"], format!("*{long}*\n\nbody"));
+    }
+
+    #[test]
+    fn a_heading_with_a_link_or_past_the_counted_cap_stays_a_bold_line() {
+        let linked = convert_and_split_parts("# See [docs](https://example.com/a)\n\nbody", 4_000);
+        assert_eq!(linked[0].blocks, None);
+        // 146 characters, but `&&` is 10 on the wire: over 150.
+        let heading = format!("{}&&", "x".repeat(MAX_HEADER_CHARS - 4));
+        let parts = convert_and_split_parts(&format!("# {heading}\n\nbody"), 4_000);
+        assert_eq!(parts[0].blocks, None);
+        // An astral emoji is two UTF-16 units.
+        let heading = format!("{}🚀", "x".repeat(MAX_HEADER_CHARS - 1));
+        assert_eq!(
+            convert_and_split_parts(&format!("# {heading}\n\nbody"), 4_000)[0].blocks,
+            None
+        );
+    }
+
+    #[test]
+    fn a_heading_never_ends_a_part_with_more_after_it() {
+        let para = "word ".repeat(150).trim_end().to_owned(); // 749 bytes
+        let md = format!("{para}\n\n# Next\n\n{para}");
+        let parts = convert_and_split_parts(&md, 800);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0].text, para);
+        assert!(parts[1].text.starts_with("*Next*\n\n"), "{}", parts[1].text);
+        assert!(parts[1].blocks.is_some());
+        assert_eq!(
+            convert_and_split(&md, 800),
+            vec![parts[0].text.clone(), parts[1].text.clone()]
+        );
     }
 
     #[test]

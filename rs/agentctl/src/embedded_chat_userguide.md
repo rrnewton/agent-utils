@@ -2052,8 +2052,9 @@ the mrkdwn between them `section` blocks of at most 3,000 characters, with
 the mrkdwn (headings as bold lines) as the notification fallback and the
 stored text. A deeper or longer heading stays a bold line, and a part whose
 blocks would pass 50 is posted as mrkdwn alone. Slack's header block has no
-level. On every provider, a reply that opens with a heading gets its
-`[agent_label]` prefix as a paragraph of its own, so the heading stays one. The helper writes the blocks to a new owner-only file in the
+level. On every provider, a reply that opens with a Markdown block (a heading, a
+code fence, a quote, a list item or a table row) gets its `[agent_label]`
+prefix as a paragraph of its own, so the block stays one. The helper writes the blocks to a new owner-only file in the
 temporary directory for the client's `--blocks=file://…`, and deletes it once
 the client exits; the warm worker leaves posts with blocks to a new client
 run. Select it, in the order that wins: an

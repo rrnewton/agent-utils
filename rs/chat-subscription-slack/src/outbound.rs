@@ -1299,14 +1299,32 @@ fn send(
         }
         record.chunks[index].intent_millis = Some(now_millis());
         save_ledger(directory, id, &record)?;
-        let posted = transport.post_message(&PostMessage {
+        let blocks = chunk_blocks.get(index).and_then(Option::as_deref);
+        let mut posted = transport.post_message(&PostMessage {
             app_id,
             channel_id,
             thread_ts,
             text: chunk,
             format: post_format,
-            blocks: chunk_blocks.get(index).and_then(Option::as_deref),
+            blocks,
         });
+        // Blocks Slack refuses (a limit it counts differently, say) were not posted, and the
+        // text alone always is a valid post: say the chunk as text rather than lose it.
+        if blocks.is_some()
+            && matches!(&posted, Err(error) if error.outcome == Outcome::NotApplied && error.code == "invalid_blocks")
+        {
+            diagnostics.log(&format!(
+                "send {id} chunk {index}: blocks refused; posting the text alone"
+            ));
+            posted = transport.post_message(&PostMessage {
+                app_id,
+                channel_id,
+                thread_ts,
+                text: chunk,
+                format: post_format,
+                blocks: None,
+            });
+        }
         match posted {
             Ok(ts) if ids::valid_ts(&ts) => {
                 diagnostics.log(&format!(

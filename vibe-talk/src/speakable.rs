@@ -401,10 +401,11 @@ fn strip_line(line: &str) -> String {
     // pause between list items is what a reader hears anyway.
     let body = trimmed
         .trim_start_matches('>')
+        .trim_start()
         .trim_start_matches('#')
         .trim_start();
     let words = strip_inline(body);
-    if is_atx_heading(trimmed) {
+    if is_atx_heading(trimmed.trim_start_matches('>').trim_start()) {
         return end_heading_sentence(words);
     }
     words
@@ -1127,6 +1128,10 @@ mod tests {
         );
         assert_eq!(say("### Done!"), "Done!");
         assert_eq!(say("## Next steps:"), "Next steps:");
+        assert_eq!(
+            say("> ## Quoted heading\n> under it"),
+            "Quoted heading. under it"
+        );
         // Not a heading: a channel name, seven marks, and a bare mark with no words.
         assert_eq!(say("#general is busy"), "general is busy");
         assert_eq!(say("####### seven"), "seven");
