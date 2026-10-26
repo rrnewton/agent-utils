@@ -1,12 +1,13 @@
 ---
 title: 'wrkviz-archive-at-scale: archive-primary ingest, compressed upstream sources, and site responsiveness at months-long scale'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - wrkviz
 created_at: 2026-10-26T15:03:24.361338515+00:00
-updated_at: 2026-10-26T15:03:24.361338515+00:00
+updated_at: 2026-10-26T22:51:30.476918698+00:00
+closed_at: 2026-10-26T22:51:30.476918357+00:00
 ---
 
 # Description
