@@ -1,12 +1,13 @@
 ---
 title: 'server-side-syntax-highlight: highlight fenced code blocks on the server, with class spans the stylesheet colours'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-26T14:33:49.925519289+00:00
-updated_at: 2026-10-26T14:33:49.925519289+00:00
+updated_at: 2026-10-26T15:33:22.213625183+00:00
+closed_at: 2026-10-26T15:33:22.213624792+00:00
 ---
 
 # Description
