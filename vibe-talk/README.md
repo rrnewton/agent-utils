@@ -2502,6 +2502,7 @@ model provider or a real gateway.
 | Conversation WebSocket | `conversation.websocket_url` | — | required for the `websocket` backend; keep private endpoints in deployment configuration. A path such as `/ws?mode=…` means the page's own host, so one configuration serves every host that puts a bridge behind its front door at that path |
 | Conversation label | `conversation.label` | — | provider name shown in the UI and its connection errors |
 | Prepare bodies for speech | `speakable.enabled` | `VIBE_TALK_SPEAKABLE` | **on by default**; off relays exactly what was typed. Does not affect the time-zone conversion. A value that is neither `true` nor `false` refuses to start |
+| Single newlines in a message | `render.single_newline` | — | `"soft"` (default): a single newline inside a paragraph is a space and the screen wraps the lines; `"hard"`: every newline is a line break, chat's old rule. See "How message text is drawn" |
 | ElevenLabs API key | `elevenlabs.api_key` | `VIBE_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and for the ElevenLabs read-aloud backend |
 | Your own Discord user id | `discord.owner_user_id` | `VIBE_TALK_DISCORD_OWNER_USER_ID` | public; **cannot be derived** — see below. Without it, messages you type into Discord yourself are drawn as a third party |
 | Your coding agents' accounts | `discord.coding_agent_user_ids` | — | public; a list of account ids, at most 32. The channel view draws each as the coding agent and no other bot; unset, the one bot in a channel besides this server is guessed to be it. See [Who the coding agent is](#who-the-coding-agent-is) |
@@ -6753,9 +6754,10 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    becomes a link named by its label — or, when the label is the address itself, a link whose
    text is its address — except inside code, where it is shown as written.
 2. [comrak](https://github.com/kivikakk/comrak) parses GitHub-flavoured Markdown — tables,
-   strikethrough, task lists, and bare `https://…` and `www.…` addresses as links — with chat's two
-   line rules: a single newline is a line break, and only a blank line starts a paragraph. A line
-   of `---` under a sentence is a rule, not a heading.
+   strikethrough, task lists, and bare `https://…` and `www.…` addresses as links. Only a blank
+   line starts a paragraph, and a **single newline is a space** (standard Markdown's soft break):
+   the lines of a paragraph are joined and the screen wraps them. A line of `---` under a sentence
+   is a rule, not a heading. See "Single newlines" below.
 3. On Google Chat and Slack, where `*a*` means bold, an asterisk emphasis is drawn bold; `_a_` stays
    italic and `**a**` is bold everywhere. Neither service has a double-underscore bold, so there
    `__init__.py` is the file it names; on Discord it reads as CommonMark reads it, with "init" in
@@ -6804,6 +6806,34 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
 8. Raw HTML written in a message is shown as the characters it is, and
    [ammonia](https://github.com/rust-ammonia/ammonia) then keeps only a short allowlist of
    elements and attributes; see [Security](#security).
+
+**Single newlines** (`markdown-tables-render`). Chat's old rule drew every newline as a line
+break. The owner changed that on 2026-10-26: agents' Markdown is often hard-wrapped, by its writer
+at a fixed width or by the terminal pane a reply was captured from, and drawn line for line it read
+as prose broken in the middle of sentences. Standard Markdown joins such lines. So a single newline
+is now a space for every message; `[render] single_newline = "hard"` puts the old rule back
+([Configuration](#configuration)), and a per-sender or per-message choice can be added later in
+one place (`newline_rule` in `src/render.rs`). Three kinds of line stay lines under the soft rule:
+
+- a line typed as a bullet, `• item` or `    ◦ item` (how Slack's own text writes a list), is drawn
+  as a list item, nested by its indent;
+- a line naming a file a Slack message carries (`📎 …`) under another one keeps its own line;
+- an agent's title line, `[name] Title`, still ends where it was written.
+
+A message written as a sequence of short lines with no Markdown, such as an address, now reads as
+one paragraph. Copy text, speech and search read `content` as before. A thread card's raw root
+(`#528`) stops only between units: a paragraph joined from wrapped lines is one unit, so a long one
+is clamped rather than cut between its lines.
+
+**A table whose line breaks were lost is repaired.** Slack stores an agent's Markdown table that
+was nested under a bullet with its header row glued to the line before it and the next paragraph
+glued to its last row: `…scorecard):| Backend | Runs |` and `| alpha | 3 |Most gaps are…`. GFM
+draws that as rows of pipes, and a table whose last row carries glued prose would silently drop
+the prose as an extra cell. When the line under such a header is a delimiter row with a leading
+pipe (`|---|:-:|`) whose cell count the glued row matches exactly, the header is moved onto a line
+of its own. Text glued straight after a row's last cell, with no pipe in it, becomes a paragraph
+after the table. Code is never touched, and if any repaired header still does not start a table,
+nothing is repaired.
 
 **A plain message carries no HTML.** When drawing the text as paragraphs would look the same —
 most chat — `content_html` is left off and the page draws `content` itself, so a window of messages

@@ -178,6 +178,8 @@ pub struct Config {
     pub read_aloud: ReadAloudConfig,
     /// Whether message bodies are rewritten for speech before anything says them.
     pub speakable: SpeakableConfig,
+    /// How message bodies are drawn: `[render]`. `markdown-tables-render`.
+    pub render: RenderConfig,
     /// Who the owner is. `#438 voice-owner-identity`.
     pub owner: OwnerConfig,
     /// ElevenLabs wiring, when configured.
@@ -406,6 +408,21 @@ impl Default for SpeakableConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+/// `[render]`: how message bodies are drawn on the page. `markdown-tables-render`.
+///
+/// `single_newline` is what a single newline inside a paragraph is: `"soft"` (a space; the lines of
+/// a paragraph are joined and the screen wraps them, as standard Markdown has it) or `"hard"` (a
+/// line break, chat's old rule). Soft by default since 2026-10-26, when the owner chose it for every
+/// message after agents' hard-wrapped Markdown drew as lines broken mid-sentence; to be revisited,
+/// perhaps per sender or per message. See [`crate::render::SingleNewline`].
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenderConfig {
+    /// What a single newline inside a paragraph is. Defaults to soft.
+    #[serde(default)]
+    pub single_newline: crate::render::SingleNewline,
 }
 
 /// `serde` needs a function, not a literal, for a field that defaults to on.
@@ -1212,6 +1229,8 @@ struct FileConfig {
     #[serde(default)]
     speakable: SpeakableConfig,
     #[serde(default)]
+    render: RenderConfig,
+    #[serde(default)]
     owner: FileOwner,
     #[serde(default)]
     storage: FileStorage,
@@ -1709,6 +1728,7 @@ impl Config {
                 websocket_url: file.read_aloud.websocket_url,
             },
             speakable,
+            render: file.render,
             owner: owner_config(file.owner)?,
             elevenlabs: ElevenLabsConfig {
                 agent_id: get(ENV_ELEVENLABS_AGENT_ID)
@@ -4732,6 +4752,25 @@ provider = "slack"
         let text = format!("{FULL}\n[speakable]\n");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
         assert!(cfg.speakable.enabled);
+    }
+
+    #[test]
+    fn a_single_newline_is_soft_unless_the_render_section_says_hard() {
+        use crate::render::SingleNewline;
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.render.single_newline, SingleNewline::Soft);
+        for (raw, expected) in [("soft", SingleNewline::Soft), ("hard", SingleNewline::Hard)] {
+            let text = format!("{FULL}\n[render]\nsingle_newline = \"{raw}\"\n");
+            let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+            assert_eq!(cfg.render.single_newline, expected);
+        }
+        for bad in ["single_newline = \"wrap\"", "newlines = \"hard\""] {
+            let text = format!("{FULL}\n[render]\n{bad}\n");
+            assert!(
+                Config::from_toml_and_env(&text, &env(&[])).is_err(),
+                "{bad} was accepted"
+            );
+        }
     }
 
     #[test]

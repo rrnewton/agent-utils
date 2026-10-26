@@ -150,14 +150,17 @@ const SEEDED_BACKLOG: &[(&str, &str)] = &[
     // a blank line, and two closing paragraphs. The server renders it, so the screenshot walk
     // photographs the server's rendering (`41-message-blocks`). Under the summary threshold below,
     // so the long entry after it is still the only one a summary is written for, and over the
-    // page's fold, as such an answer is.
+    // page's fold, as such an answer is. The second item is long enough to wrap even at desktop
+    // width once its two lines are joined (single newlines are soft, `markdown-tables-render`), so
+    // the picture still shows a wrapped line hanging under the item's text.
     (
         "claude-integ",
         "seeded: where the release stands this morning:\n\n\
          - the build is green on both runners\n\
-         - the flaky ordering test is quarantined\n  and has an issue filed against it\n\
-         - the docs are updated\n\
-         - the release notes are drafted\n\
+         - the flaky ordering test is quarantined until the loaded-host repro is understood\n  \
+         and has an issue filed against it, with both logs\n\
+         - docs are updated\n\
+         - release notes drafted\n\
          - the tag is not pushed yet\n  because it waits on your review\n\
          - nothing else is open\n\n\n\
          I will push the tag when you say so.\n\nThanks!",
@@ -343,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
     // everything through the environment, and that is a supported deployment rather than an error.
     // It is announced loudly either way; see `Config::discover`.
     let config = Config::discover(args.config, args.overlays)?;
+    vibe_talk::render::set_single_newline(config.render.single_newline);
 
     let providers: Arc<ChatRouter> = if args.fake_discord {
         tracing::warn!(

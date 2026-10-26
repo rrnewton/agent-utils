@@ -5634,11 +5634,24 @@ a.search-hit-link {
 
 /* THE GAP AT A BLANK LINE: between any two blocks, at every depth — paragraphs, a list after its
    introduction, the paragraph after a list, two parts of a combined row. Less than a full line,
-   the way a chat client spaces paragraphs rather than the way a document does. */
+   the way a chat client spaces paragraphs rather than the way a document does. 0.8em since
+   `markdown-tables-render` (2026-10-26): at 0.55em an agent's long report of paragraphs, lists and
+   tables read as one squeezed block ("pretty squished together without much spacing around
+   paragraphs and bullets", the owner), where a document renderer puts a full line between blocks. */
 .md > * + *,
 .md + .md,
 .md :is(li, blockquote) > * + * {
-  margin-top: 0.55em;
+  margin-top: 0.8em;
+}
+
+/* A heading after anything is set further from what it ends than from what it starts, so it reads
+   as the head of the part below it. */
+.md > * + :is(h1, h2, h3, h4) {
+  margin-top: 1.15em;
+}
+
+.md > :is(h1, h2, h3, h4) + * {
+  margin-top: 0.35em;
 }
 
 /* HANGING INDENT. The marker sits in the padding, outside the text, so a second line of an item —
@@ -5690,7 +5703,7 @@ a.search-hit-link {
 
 .md li + li,
 .md li > :is(ul, ol) {
-  margin-top: 0.25em;
+  margin-top: 0.3em;
 }
 
 .md li::marker {

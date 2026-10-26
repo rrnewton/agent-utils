@@ -1227,9 +1227,12 @@ async fn a_paragraph_of_typed_bullets_is_prepared_and_played_piece_by_piece() {
         .iter()
         .map(|block| json!([block["element"], block["piece"], block["pieces"]]))
         .collect();
+    // Under the soft single-newline rule (`markdown-tables-render`) the typed bullets are list
+    // items and the line after them a paragraph of its own, so each is a block, read whole; under
+    // the hard rule they were lines of one paragraph, read as its four pieces. Heard the same.
     assert_eq!(
         Value::Array(pieces),
-        json!([[0, 0, 4], [0, 1, 4], [0, 2, 4], [0, 3, 4], [1, 0, 1]]),
+        json!([[0, 0, 1], [1, 0, 1], [2, 0, 1], [3, 0, 1], [4, 0, 1]]),
         "{prepared}"
     );
     let url = prepared["prepared"][0]["url"].as_str().expect("ticket");

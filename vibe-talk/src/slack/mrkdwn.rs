@@ -487,7 +487,8 @@ mod tests {
             crate::render::Markup::Slack,
         );
         assert!(
-            swallowed.contains("today?<br />\nYes") || swallowed.contains("today?<br>\nYes"),
+            swallowed.starts_with("<blockquote>\n<p>Should we ship it today?")
+                && swallowed.ends_with("Yes, after the smoke test.</p>\n</blockquote>\n"),
             "{swallowed}"
         );
     }

@@ -16,6 +16,7 @@
   {
     "author": "build-bot",
     "content": "[build-bot coordinator] Report (11:58 AM ET):\nThe nightly run finished. Two jobs were retried and both came back green.",
+    "content_html": "<p><span class=\"rh-src\">[build-bot coordinator] Report (11:58 AM ET):<br>\n</span>The nightly run finished. Two jobs were retried and both came back green.</p>\n",
     "heading": {
       "cut": 45,
       "tag": "build-bot coordinator",
@@ -37,6 +38,7 @@
   {
     "author": "build-bot",
     "content": "(ops2) Midday summary, 15:05Z.\nNothing is stuck; the backlog cleared by 06:10Z.",
+    "content_html": "<p><span class=\"rh-src\">(ops2) Midday summary, 15:05Z.<br>\n</span>Nothing is stuck; the backlog cleared by 06:10Z.</p>\n",
     "heading": {
       "cut": 30,
       "tag": "ops2",
@@ -58,6 +60,7 @@
   {
     "author": "build-bot",
     "content": "[build-bot coordinator] 3:20 PM ET:\nAll shards idle.",
+    "content_html": "<p><span class=\"rh-src\">[build-bot coordinator] 3:20 PM ET:<br>\n</span>All shards idle.</p>\n",
     "heading": {
       "cut": 35,
       "tag": "build-bot coordinator",
@@ -94,6 +97,7 @@
   {
     "author": "build-bot",
     "content": "[build-bot coordinator] Merged 2c94a99229cf0cb59720f5094fd658b6d3cbfb34432720925fe692db30e41e4d.\nNext merge is queued.",
+    "content_html": "<p><span class=\"rh-src\">[build-bot coordinator] Merged 2c94a99229cf0cb59720f5094fd658b6d3cbfb34432720925fe692db30e41e4d.<br>\n</span>Next merge is queued.</p>\n",
     "heading": {
       "cut": 96,
       "tag": "build-bot coordinator",

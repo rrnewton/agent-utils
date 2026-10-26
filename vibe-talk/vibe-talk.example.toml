@@ -244,6 +244,14 @@ backend = "elevenlabs"
 # hello that asks the bridge whether it takes a recap (see [replay]), whatever the backend above.
 # websocket_url = "ws://127.0.0.1:7070/ws?mode=voice"
 
+# [render] says how message bodies are drawn on the page. Absent, single newlines are soft.
+# [render]
+# What a single newline inside a paragraph is. "soft": a space, as standard Markdown has it, so the
+# lines of a paragraph are joined and the screen wraps them (an agent's hard-wrapped prose reads as
+# prose). "hard": a line break, chat's old rule, so every line is drawn as the line it was written
+# on. A blank line starts a new paragraph either way, and lines typed as "•" bullets stay lines.
+# single_newline = "soft"
+
 [speakable]
 # Rewrite message bodies before anything says them out loud. ON when this section is absent.
 #

@@ -20,8 +20,12 @@
 //!
 //! 1. The provider's own link syntax becomes Markdown, and where the provider ends a list at an
 //!    unindented line, so does the text ([`Markup::prepare`]).
-//! 2. comrak parses GFM — tables, strikethrough, task lists, bare-URL autolinks — with chat's two
-//!    line rules: a single newline is a line break, and a blank line separates paragraphs.
+//!    Under the soft single-newline rule, a line typed as a `•` bullet is made a Markdown item
+//!    ([`soft_rule_lines`]), and a table whose line breaks were lost before it got here is put
+//!    back on its lines ([`repair_glued_tables`]).
+//! 2. comrak parses GFM — tables, strikethrough, task lists, bare-URL autolinks. A blank line
+//!    separates paragraphs; a single newline is a space or a line break, as `[render]
+//!    single_newline` says ([`SingleNewline`]; soft, a space, since 2026-10-26).
 //! 3. The parsed tree is adjusted ([`adjust`]): a list the writer indented under an item is nested
 //!    in it ([`nest_lists`], `#237 nested-lists`), mentions become chips, an image becomes a link
 //!    to it, a deep heading is held at the fourth level, where the service writes bold with one
@@ -229,8 +233,10 @@ pub struct SearchText {
 }
 
 impl SearchText {
-    /// The label of the rules this indexes by.
-    pub const VERSION: &'static str = "render-1";
+    /// The label of the rules this indexes by, under the soft single-newline rule; the hard rule
+    /// indexes under it with `+hard` after it. `render-2`: single newlines soft, `•` lines items,
+    /// glued tables repaired (`markdown-tables-render`).
+    pub const VERSION: &'static str = "render-2";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -274,7 +280,10 @@ impl SearchText {
 
 impl crate::cache::SearchTextSource for SearchText {
     fn version(&self) -> String {
-        Self::VERSION.to_owned()
+        match single_newline() {
+            SingleNewline::Soft => Self::VERSION.to_owned(),
+            SingleNewline::Hard => format!("{}+hard", Self::VERSION),
+        }
     }
 
     fn rendered(&self, provider_key: &str, message: &Message) -> crate::cache::Rendered {
@@ -558,6 +567,11 @@ fn mark_restated(
         let (gap, after) = rest.split_at(spaces);
         if let Some(after) = after.strip_prefix("<br>\n") {
             format!("<p>{open}{words}{gap}<br>\n</span>{after}")
+        } else if let Some(after) = after.strip_prefix('\n') {
+            // A soft line break ([`SingleNewline::Soft`]): the heading's line still ends where it
+            // was written, as it did under the hard rule, so the words after it do not run on
+            // from the agent's title when the heading is not shown.
+            format!("<p>{open}{words}{gap}<br>\n</span>{after}")
         } else if spaces > 0 {
             format!("<p>{open}{words}{gap}</span>{after}")
         } else {
@@ -593,11 +607,12 @@ pub fn to_html(text: &str, markup: Markup) -> String {
 /// Answered from [`RENDERED`] when the same body was rendered recently.
 #[must_use]
 pub fn to_html_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
-    if let Some(html) = RENDERED.get(text, markup, mentions) {
+    let rule = newline_rule(text, markup);
+    if let Some(html) = RENDERED.get(text, markup, rule, mentions) {
         return html;
     }
     let html = render_named(text, markup, mentions);
-    RENDERED.put(text, markup, mentions, &html);
+    RENDERED.put(text, markup, rule, mentions, &html);
     html
 }
 
@@ -616,8 +631,9 @@ pub const RENDERED_GENERATION_BYTES: usize = 8 * 1024 * 1024;
 /// messages render each of them once. `#531 server-side-syntax-highlight`: highlighting a long
 /// code block costs milliseconds, and the timeline sends the same window again on every refresh.
 ///
-/// What a body renders to depends only on its text, its markup and the names of its mentions, so
-/// those are the key, compared in full: a hash only finds the candidates. Two generations, each
+/// What a body renders to depends only on its text, its markup, the single-newline rule it is drawn
+/// under and the names of its mentions, so those are the key, compared in full: a hash only finds
+/// the candidates. Two generations, each
 /// bounded by [`RENDERED_GENERATION_BYTES`]: a body is put in the young one, and when that is full
 /// it becomes the old one and the oldest are dropped. A body found in the old generation moves to
 /// the young one, so what is still being read stays.
@@ -638,14 +654,21 @@ struct Generations {
 
 struct RenderedBody {
     markup: Markup,
+    rule: SingleNewline,
     text: String,
     mentions: Vec<MentionName>,
     html: String,
 }
 
 impl RenderedBody {
-    fn is(&self, text: &str, markup: Markup, mentions: &[MentionName]) -> bool {
-        self.markup == markup && self.text == text && self.mentions == mentions
+    fn is(
+        &self,
+        text: &str,
+        markup: Markup,
+        rule: SingleNewline,
+        mentions: &[MentionName],
+    ) -> bool {
+        self.markup == markup && self.rule == rule && self.text == text && self.mentions == mentions
     }
 
     /// What the entry holds, counted generously: its strings, its mentions, and a fixed allowance
@@ -663,9 +686,16 @@ impl RenderedBody {
 }
 
 impl RenderCache {
-    fn key(&self, text: &str, markup: Markup, mentions: &[MentionName]) -> u64 {
+    fn key(
+        &self,
+        text: &str,
+        markup: Markup,
+        rule: SingleNewline,
+        mentions: &[MentionName],
+    ) -> u64 {
         self.hasher.hash_one((
             markup,
+            rule,
             text,
             mentions
                 .iter()
@@ -674,33 +704,47 @@ impl RenderCache {
         ))
     }
 
-    fn get(&self, text: &str, markup: Markup, mentions: &[MentionName]) -> Option<String> {
-        let key = self.key(text, markup, mentions);
+    fn get(
+        &self,
+        text: &str,
+        markup: Markup,
+        rule: SingleNewline,
+        mentions: &[MentionName],
+    ) -> Option<String> {
+        let key = self.key(text, markup, rule, mentions);
         let mut generations = self
             .generations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(found) = generations
-            .young
-            .get(&key)
-            .and_then(|bodies| bodies.iter().find(|body| body.is(text, markup, mentions)))
-        {
+        if let Some(found) = generations.young.get(&key).and_then(|bodies| {
+            bodies
+                .iter()
+                .find(|body| body.is(text, markup, rule, mentions))
+        }) {
             return Some(found.html.clone());
         }
         let bodies = generations.old.get_mut(&key)?;
         let at = bodies
             .iter()
-            .position(|body| body.is(text, markup, mentions))?;
+            .position(|body| body.is(text, markup, rule, mentions))?;
         let body = bodies.swap_remove(at);
         let html = body.html.clone();
         generations.insert(key, body);
         Some(html)
     }
 
-    fn put(&self, text: &str, markup: Markup, mentions: &[MentionName], html: &str) {
-        let key = self.key(text, markup, mentions);
+    fn put(
+        &self,
+        text: &str,
+        markup: Markup,
+        rule: SingleNewline,
+        mentions: &[MentionName],
+        html: &str,
+    ) {
+        let key = self.key(text, markup, rule, mentions);
         let body = RenderedBody {
             markup,
+            rule,
             text: text.to_owned(),
             mentions: mentions.to_vec(),
             html: html.to_owned(),
@@ -717,7 +761,7 @@ impl Generations {
         let bodies = self.young.entry(key).or_default();
         if bodies
             .iter()
-            .any(|have| have.is(&body.text, body.markup, &body.mentions))
+            .any(|have| have.is(&body.text, body.markup, body.rule, &body.mentions))
         {
             return;
         }
@@ -730,6 +774,12 @@ impl Generations {
     }
 }
 
+/// [`to_html`] under the single-newline rule `rule`, whatever this process was configured with.
+#[must_use]
+pub fn to_html_as(text: &str, markup: Markup, rule: SingleNewline) -> String {
+    render_visiting_as(text, markup, &[], rule, |_, _| ()).0
+}
+
 /// [`to_html_named`], handing the parsed and adjusted tree, and the text it was parsed from, to
 /// `visit` before it is written. `visit` runs only when the body is rendered: not when a bound
 /// draws it as [`plain_html`] instead, and then its answer is `None`.
@@ -739,11 +789,35 @@ fn render_visiting<T>(
     mentions: &[MentionName],
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
+    render_visiting_as(text, markup, mentions, newline_rule(text, markup), visit)
+}
+
+/// [`render_visiting`] under the single-newline rule `rule`.
+fn render_visiting_as<T>(
+    text: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+    rule: SingleNewline,
+    visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
+) -> (String, Option<T>) {
     if text.len() > MAX_RENDERED_BYTES {
         return (plain_html(text), None);
     }
-    let options = options(table_cells_bound(text) <= MAX_TABLE_CELLS);
+    let tables = table_cells_bound(text) <= MAX_TABLE_CELLS;
+    let options = options(tables, rule);
     let mut source = markup.prepare(text, &options);
+    if rule == SingleNewline::Soft {
+        if let Some(listed) = soft_rule_lines(&source, &options, markup) {
+            source = Cow::Owned(listed);
+        }
+    }
+    if tables {
+        if let Some(repaired) = repair_glued_tables(&source, &options) {
+            if table_cells_bound(&repaired) <= MAX_TABLE_CELLS {
+                source = Cow::Owned(repaired);
+            }
+        }
+    }
     let arena = Arena::new();
     let mut root = comrak::parse_document(&arena, &source, &options);
     if deeper_than(root, MAX_DEPTH) {
@@ -1446,9 +1520,9 @@ fn escape_text(out: &mut String, text: &str) {
     }
 }
 
-/// comrak's settings, with or without tables. A function rather than a static because they are a
-/// handful of booleans.
-fn options(tables: bool) -> Options<'static> {
+/// comrak's settings, with or without tables, under one single-newline rule. A function rather
+/// than a static because they are a handful of booleans.
+fn options(tables: bool, rule: SingleNewline) -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
     // Off only for a message whose tables would cost more than they show: see `MAX_TABLE_CELLS`.
@@ -1461,14 +1535,432 @@ fn options(tables: bool) -> Options<'static> {
     // Every line is its own line here (below), so a setext heading would turn an ordinary
     // sentence into a title because somebody drew a line under it.
     options.parse.ignore_setext = true;
-    // Chat's line rule: a newline is a line break, and only a blank line starts a new paragraph.
-    options.render.hardbreaks = true;
+    // Only a blank line starts a new paragraph. Whether a single newline inside one is a line break
+    // or a space is the configured rule: see `SingleNewline`.
+    options.render.hardbreaks = rule == SingleNewline::Hard;
     // Raw HTML in a message is shown as the text it is. Never passed through: a message is not
     // markup, and the sanitizer below would remove it anyway, along with its content's meaning.
     options.render.escape = true;
     // Classes the stylesheet uses to drop the bullet beside a checkbox.
     options.render.tasklist_classes = true;
     options
+}
+
+// --- single newlines: `markdown-tables-render` ------------------------------------------------
+//
+// Chat's old line rule was that every newline is a line break. The owner revisited it on
+// 2026-10-26, of agent posts whose prose broke in the middle of sentences: an agent's Markdown is
+// often hard-wrapped (by its writer at a fixed width, or by a terminal it was captured from), and
+// standard Markdown joins those lines and lets the screen wrap them. "For now let's just soft wrap
+// all single newlines and I'll revisit later." So the rule is a setting, `[render]
+// single_newline`, soft by default, with the hard rule kept and tested; and `newline_rule` is the
+// one place a later per-message choice (an "is this Markdown?" guess, or the sender) would go.
+//
+// Under the soft rule a line typed as a bullet would join the line above it, so such lines are
+// made Markdown list items first (`soft_rule_lines`): a Slack message's "•" lines, which is
+// how Slack's own text writes a list, stay one line each, as items. So do the lines naming the
+// files a Slack message carries.
+
+/// What a single newline inside a paragraph is. A blank line starts a new paragraph under both.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum SingleNewline {
+    /// A space, as CommonMark has it: the lines of a paragraph are joined and the screen wraps
+    /// them. The default since 2026-10-26.
+    #[default]
+    Soft,
+    /// A line break, chat's old rule: every line is drawn as the line it was written on.
+    Hard,
+}
+
+/// The rule this process renders with: [`SingleNewline::Soft`] until [`set_single_newline`].
+static SINGLE_NEWLINE_HARD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Render every body after this with `rule`, as `[render] single_newline` configures it. Called
+/// once at startup; a test that needs the other rule asks for it with [`to_html_as`] instead.
+pub fn set_single_newline(rule: SingleNewline) {
+    SINGLE_NEWLINE_HARD.store(
+        rule == SingleNewline::Hard,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own rule, on its own thread, so tests of either rule run side by side.
+    static TEST_SINGLE_NEWLINE: std::cell::Cell<Option<SingleNewline>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// This thread renders under a test's own rule until the guard is dropped.
+#[cfg(test)]
+pub(crate) struct SingleNewlineGuard(Option<SingleNewline>);
+
+#[cfg(test)]
+impl SingleNewlineGuard {
+    pub(crate) fn set(rule: SingleNewline) -> Self {
+        Self(TEST_SINGLE_NEWLINE.with(|cell| cell.replace(Some(rule))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for SingleNewlineGuard {
+    fn drop(&mut self) {
+        TEST_SINGLE_NEWLINE.with(|cell| cell.set(self.0));
+    }
+}
+
+/// The configured rule. See [`set_single_newline`].
+#[must_use]
+pub fn single_newline() -> SingleNewline {
+    #[cfg(test)]
+    if let Some(rule) = TEST_SINGLE_NEWLINE.with(std::cell::Cell::get) {
+        return rule;
+    }
+    if SINGLE_NEWLINE_HARD.load(std::sync::atomic::Ordering::Relaxed) {
+        SingleNewline::Hard
+    } else {
+        SingleNewline::Soft
+    }
+}
+
+/// The rule one body is drawn with. Today the configured rule for every body; the place for a
+/// choice per message — by its sender, or by whether its text reads as Markdown — if the owner
+/// wants one later.
+fn newline_rule(_text: &str, _markup: Markup) -> SingleNewline {
+    single_newline()
+}
+
+/// `text` with the lines the soft rule must keep as lines marked so in Markdown, or `None` when
+/// it has none outside code and raw HTML:
+///
+/// - a line that begins with a typed bullet ([`READ_BULLETS`]), a space and some text — in a quote
+///   too, after its `>` — is begun with a Markdown bullet instead, keeping its indent, so that it
+///   is a list item rather than a line of a paragraph. Slack writes a list in its text as `• item`
+///   lines, and a nested one as `    ◦ item`, which CommonMark nests under the item above it once
+///   both are Markdown items.
+/// - on Discord, a line of prose at the margin straight after such items gets a blank line before
+///   it, so it stays a line of its own rather than more of the last item, unless it reads as the
+///   rest of the item's sentence ([`continues_item`]) or the blank line would change what the
+///   message shows (an emphasis or a link running across it, [`shown_text`]). Google Chat and
+///   Slack end a list there already ([`end_lists_at_unindented_lines`]), with the same checks. Not
+///   a row of a table (`|`), which a later repair may need right where it is.
+/// - a line naming a file a message carries ([`crate::slack::files::FILE_MARK`]) under another
+///   such line ends that line with a backslash, Markdown's line break, so each file is still drawn
+///   on a line of its own.
+fn soft_rule_lines(text: &str, options: &Options, markup: Markup) -> Option<String> {
+    use crate::slack::files::FILE_MARK;
+    // Where a line's typed bullet is, after any quote markers and indent, and how wide it is.
+    let bullet_at = |line: &str| {
+        let lead = line.len() - line.trim_start_matches(['>', ' ', '\t']).len();
+        let mut rest = line[lead..].chars();
+        let glyph = rest.next().filter(|glyph| READ_BULLETS.contains(glyph))?;
+        let after = &line[lead + glyph.len_utf8()..];
+        (after.starts_with([' ', '\t']) && !after.trim().is_empty())
+            .then_some((lead, glyph.len_utf8()))
+    };
+    let file_line = |line: &str| line.starts_with(FILE_MARK);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let marked = |index: usize| {
+        bullet_at(lines[index]).is_some()
+            || (index > 0 && file_line(lines[index]) && file_line(lines[index - 1]))
+    };
+    if !(0..lines.len()).any(marked) {
+        return None;
+    }
+    let protected = protected_ranges(text, options);
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut at = 0;
+    for line in &lines {
+        starts.push(at);
+        at += line.len() + 1;
+    }
+    let outside = |index: usize, column: usize| {
+        !protected
+            .iter()
+            .any(|range| range.contains(&(starts[index] + column)))
+    };
+    let separate = !markup.list_ends_at_unindented_line();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut joined: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut item: Option<&str> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((lead, width)) = bullet_at(line).filter(|&(lead, _)| outside(index, lead)) {
+            let converted = format!("{}-{}", &line[..lead], &line[lead + width..]);
+            out.push(converted.clone());
+            joined.push(converted);
+            changed = true;
+            item = (lead == 0).then_some(*line);
+            continue;
+        }
+        if let Some(previous) = item.take() {
+            if separate
+                && line.starts_with(|c: char| !c.is_whitespace() && c != '|' && c != '>')
+                && outside(index, 0)
+                && !continues_item(previous, line)
+            {
+                out.push(String::new());
+            }
+        }
+        if index > 0
+            && file_line(line)
+            && file_line(lines[index - 1])
+            && outside(index - 1, 0)
+            && !lines[index - 1].trim_end_matches('\r').ends_with('\\')
+        {
+            for written in [&mut out, &mut joined] {
+                if let Some(previous) = written.last_mut() {
+                    let end = previous.trim_end_matches('\r').len();
+                    previous.insert(end, '\\');
+                }
+            }
+            changed = true;
+        }
+        out.push((*line).to_owned());
+        joined.push((*line).to_owned());
+    }
+    if !changed {
+        return None;
+    }
+    if out.len() != joined.len() {
+        let arena = Arena::new();
+        let separated = out.join("\n");
+        let together = joined.join("\n");
+        let same = shown_text(comrak::parse_document(&arena, &separated, options))
+            == shown_text(comrak::parse_document(&arena, &together, options));
+        return Some(if same { separated } else { together });
+    }
+    Some(out.join("\n"))
+}
+
+/// Where `text` holds code or raw HTML, by byte: [`code_ranges`], and each block of raw HTML as the
+/// whole lines it spans.
+fn protected_ranges(text: &str, options: &Options) -> Vec<Range<usize>> {
+    let mut ranges = code_ranges(text, options);
+    let arena = Arena::new();
+    let root = comrak::parse_document(&arena, text, options);
+    let lines = line_starts(text);
+    let line_start = |line: usize| lines.get(line.wrapping_sub(1)).copied();
+    for node in root.descendants() {
+        let ast = node.data.borrow();
+        if matches!(ast.value, NodeValue::HtmlBlock(_)) {
+            ranges
+                .extend(line_start(ast.sourcepos.start.line).map(|from| {
+                    from..line_start(ast.sourcepos.end.line + 1).unwrap_or(text.len())
+                }));
+        }
+    }
+    ranges
+}
+
+// --- a table whose line breaks were lost: `markdown-tables-render` ----------------------------
+//
+// A GFM table needs its header row on a line of its own, and nothing after its last row's closing
+// pipe. A message whose line breaks were lost before it got here — Slack's own conversion of an
+// agent's Markdown stored one as `…scorecard):| Backend | Two runs |` and `| alpha | 1 | 2 |Most
+// gaps are…` — draws as rows of pipes, or worse, as a table that silently drops the prose glued
+// to its last row, which GFM reads as an extra cell. Each is repaired, and only where the reading
+// is unambiguous:
+//
+// - the line under it is a delimiter row written with a leading pipe, `|---|:-:|`, of N cells;
+// - a glued header: a line that does not already start a table, whose text before its first pipe
+//   is prose glued to that pipe (no space between them, not only a list marker, and the pipe
+//   outside any code span), and from that pipe on is a row of exactly N cells ending in a pipe.
+//   No row under it may have more cells than N, which GFM would drop. The row goes on a line of
+//   its own after a blank line;
+// - a glued last row: the last row of such a table, or of one that already parses, starting with
+//   a pipe, whose (N + 1)th pipe is followed at once, with no space, by text holding no other
+//   pipe. That text goes into a paragraph of its own after a blank line.
+//
+// Code and raw HTML are left alone, a text with a lone carriage return (which comrak counts as a
+// line end where this does not) is not repaired, and the result is parsed again: every repaired
+// header must now start a table, and the code must be the same code, or nothing is repaired.
+
+/// The byte offsets of `line`'s pipes that are not escaped with a backslash, as GFM splits cells.
+fn unescaped_pipes(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    (0..bytes.len())
+        .filter(|&at| bytes[at] == b'|' && (at == 0 || bytes[at - 1] != b'\\'))
+        .collect()
+}
+
+/// The number of cells of a GFM delimiter row written with a leading pipe, such as `|---|:-:|`.
+fn delimiter_cells(line: &str) -> Option<usize> {
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let body = line[indent..].strip_prefix('|')?;
+    let body = body.strip_suffix('|').unwrap_or(body);
+    let cells: Vec<&str> = body.split('|').collect();
+    cells
+        .iter()
+        .all(|cell| {
+            let cell = cell.trim_matches([' ', '\t']);
+            let cell = cell.strip_prefix(':').unwrap_or(cell);
+            let cell = cell.strip_suffix(':').unwrap_or(cell);
+            !cell.is_empty() && cell.bytes().all(|byte| byte == b'-')
+        })
+        .then_some(cells.len())
+}
+
+/// Whether `line` starts, after at most three spaces, with a pipe: a row of a table written with
+/// leading pipes.
+fn starts_row(line: &str) -> bool {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    indent <= 3 && line[indent..].starts_with('|')
+}
+
+/// Whether `prefix`, the text before a glued header row, is only a list marker, a typed bullet or
+/// quote markers: the row then starts the item or the quote, and is not glued to anything.
+fn only_marker(prefix: &str) -> bool {
+    let prefix = prefix.trim_start_matches(['>', ' ', '\t']).trim_end();
+    prefix.is_empty()
+        || line_marker(prefix).is_some_and(|marker| marker.empty)
+        || (prefix.chars().count() == 1 && prefix.starts_with(READ_BULLETS))
+}
+
+/// What a parse of `text` says about its lines: the 1-based lines a code block or a block of raw
+/// HTML holds, the lines a table starts on, and the code it shows.
+fn table_facts(text: &str, options: &Options) -> (HashSet<usize>, HashSet<usize>, Vec<String>) {
+    let arena = Arena::new();
+    let root = comrak::parse_document(&arena, text, options);
+    let (mut code, mut tables, mut literals) = (HashSet::new(), HashSet::new(), Vec::new());
+    for node in root.descendants() {
+        let ast = node.data.borrow();
+        match &ast.value {
+            NodeValue::CodeBlock(block) => {
+                code.extend(ast.sourcepos.start.line..=ast.sourcepos.end.line);
+                literals.push(block.literal.clone());
+            }
+            NodeValue::HtmlBlock(block) => {
+                code.extend(ast.sourcepos.start.line..=ast.sourcepos.end.line);
+                literals.push(block.literal.clone());
+            }
+            NodeValue::Code(span) => literals.push(span.literal.clone()),
+            NodeValue::Table(_) => {
+                tables.insert(ast.sourcepos.start.line);
+            }
+            _ => {}
+        }
+    }
+    (code, tables, literals)
+}
+
+/// `text` with each table whose line breaks were lost put back on its lines, or `None` when there
+/// is none to repair. See the section note.
+fn repair_glued_tables(text: &str, options: &Options) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let delimiters: Vec<(usize, usize)> = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(index, line)| delimiter_cells(line).map(|cells| (index, cells)))
+        .collect();
+    if delimiters.is_empty() || text.replace("\r\n", "").contains('\r') {
+        return None;
+    }
+    let (code, tables, literals) = table_facts(text, options);
+    let in_code = |index: usize| code.contains(&(index + 1));
+    let spans = code_ranges(text, options);
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut at = 0;
+    for line in &lines {
+        starts.push(at);
+        at += line.len() + 1;
+    }
+    // The rows under a delimiter: the lines after it that start with a pipe, up to the next
+    // delimiter row.
+    let rows_after = |delimiter: usize| {
+        (delimiter + 1..lines.len())
+            .take_while(|&index| {
+                starts_row(lines[index])
+                    && !in_code(index)
+                    && delimiter_cells(lines[index]).is_none()
+            })
+            .collect::<Vec<_>>()
+    };
+    // Per line: the text that replaces it, as one or more lines.
+    let mut replaced: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut headers = Vec::new();
+    for (delimiter, cells) in delimiters {
+        let header = delimiter - 1;
+        if in_code(delimiter) || in_code(header) || replaced.contains_key(&header) {
+            continue;
+        }
+        let rows = rows_after(delimiter);
+        if !tables.contains(&(header + 1)) {
+            let line = lines[header];
+            let pipes = unescaped_pipes(line);
+            let Some(&first) = pipes.first() else {
+                continue;
+            };
+            let prefix = &line[..first];
+            let row = line[first..].trim_end_matches([' ', '\t', '\r']);
+            let glued = prefix.ends_with(|c: char| !c.is_whitespace()) && !only_marker(prefix);
+            // In a code span, closed or (to CommonMark, which then shows the backtick) not.
+            let in_span = prefix.matches('`').count() % 2 == 1
+                || spans
+                    .iter()
+                    .any(|range| range.contains(&(starts[header] + first)));
+            let row_cells = unescaped_pipes(row).len().saturating_sub(1);
+            let wider = rows
+                .iter()
+                .any(|&index| unescaped_pipes(lines[index]).len() > cells + 1);
+            if !glued || in_span || !row.ends_with('|') || row_cells != cells || wider {
+                continue;
+            }
+            replaced.insert(
+                header,
+                vec![prefix.trim_end().to_owned(), String::new(), row.to_owned()],
+            );
+            headers.push(header);
+        }
+        let Some(&last) = rows.last() else {
+            continue;
+        };
+        let line = lines[last];
+        let pipes = unescaped_pipes(line);
+        if pipes.len() != cells + 1 {
+            continue;
+        }
+        let close = pipes[cells];
+        let after = &line[close + 1..];
+        if after.starts_with(|c: char| !c.is_whitespace()) && !replaced.contains_key(&last) {
+            replaced.insert(
+                last,
+                vec![line[..=close].to_owned(), String::new(), after.to_owned()],
+            );
+        }
+    }
+    if replaced.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(lines.len() + 2 * replaced.len());
+    let mut header_lines = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        match replaced.get(&index) {
+            Some(parts) => {
+                if headers.contains(&index) {
+                    header_lines.push(out.len() + parts.len());
+                }
+                out.extend(parts.iter().map(String::as_str));
+            }
+            None => out.push(line),
+        }
+    }
+    let repaired = out.join("\n");
+    let (_, repaired_tables, repaired_literals) = table_facts(&repaired, options);
+    (repaired_literals == literals
+        && header_lines
+            .iter()
+            .all(|line| repaired_tables.contains(line)))
+    .then_some(repaired)
 }
 
 /// The only elements the page is ever sent.
@@ -2531,6 +3023,8 @@ mod tests {
 
     #[test]
     fn the_owners_message_draws_as_paragraphs_and_one_list_with_its_continuations_inside() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         // The shape of the message in `#217 markdown-blocks`: a paragraph, a blank line, six items
         // two of which run on to an indented second line, blank lines, and two closing
         // paragraphs. The page drew the items as literal dashes and ran the last two together.
@@ -2568,6 +3062,8 @@ mod tests {
 
     #[test]
     fn a_single_newline_is_a_line_break_and_a_blank_line_a_new_paragraph() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         assert_eq!(
             html("one\ntwo\n\nthree"),
             "<p>one<br>\ntwo</p>\n<p>three</p>\n"
@@ -2859,39 +3355,50 @@ mod tests {
     #[test]
     fn the_render_cache_answers_by_the_whole_key_and_drops_the_oldest() {
         use crate::model::MentionName;
+        const S: super::SingleNewline = super::SingleNewline::Soft;
         let cache = super::RenderCache::default();
         let ada = [MentionName {
             id: "U1".into(),
             name: "Ada".into(),
         }];
-        cache.put("<@U1> hi", Markup::Discord, &ada, "ada");
+        cache.put("<@U1> hi", Markup::Discord, S, &ada, "ada");
         assert_eq!(
-            cache.get("<@U1> hi", Markup::Discord, &ada),
+            cache.get("<@U1> hi", Markup::Discord, S, &ada),
             Some("ada".into())
         );
-        assert_eq!(cache.get("<@U1> hi", Markup::Discord, &[]), None);
-        assert_eq!(cache.get("<@U1> hi", Markup::Slack, &ada), None);
-        assert_eq!(cache.get("<@U1> hi!", Markup::Discord, &ada), None);
+        assert_eq!(cache.get("<@U1> hi", Markup::Discord, S, &[]), None);
+        assert_eq!(cache.get("<@U1> hi", Markup::Slack, S, &ada), None);
+        assert_eq!(cache.get("<@U1> hi!", Markup::Discord, S, &ada), None);
+        // `markdown-tables-render`: the single-newline rule is part of the key.
+        assert_eq!(
+            cache.get(
+                "<@U1> hi",
+                Markup::Discord,
+                super::SingleNewline::Hard,
+                &ada
+            ),
+            None
+        );
 
         // One body larger than a generation fills it at once and moves it to the old one, where
         // it is still found, and is brought back.
         let big = "x".repeat(super::RENDERED_GENERATION_BYTES);
-        cache.put(&big, Markup::Discord, &[], "big");
+        cache.put(&big, Markup::Discord, S, &[], "big");
         {
             let generations = cache.generations.lock().unwrap();
             assert!(generations.young.is_empty());
             assert_eq!(generations.old.values().map(Vec::len).sum::<usize>(), 2);
         }
         assert_eq!(
-            cache.get("<@U1> hi", Markup::Discord, &ada),
+            cache.get("<@U1> hi", Markup::Discord, S, &ada),
             Some("ada".into())
         );
         assert_eq!(cache.generations.lock().unwrap().young.len(), 1);
         // The next full generation drops what was not read again.
-        cache.put(&format!("{big}y"), Markup::Discord, &[], "bigger");
-        assert_eq!(cache.get(&big, Markup::Discord, &[]), None);
+        cache.put(&format!("{big}y"), Markup::Discord, S, &[], "bigger");
+        assert_eq!(cache.get(&big, Markup::Discord, S, &[]), None);
         assert_eq!(
-            cache.get("<@U1> hi", Markup::Discord, &ada),
+            cache.get("<@U1> hi", Markup::Discord, S, &ada),
             Some("ada".into())
         );
 
@@ -2902,6 +3409,8 @@ mod tests {
 
     #[test]
     fn google_chat_and_slack_read_one_asterisk_as_bold() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         for markup in [Markup::GoogleChat, Markup::Slack] {
             assert_eq!(
                 to_html("*bold* _it_ **strong** ~gone~ 2 * 3 * 4", markup),
@@ -2946,6 +3455,8 @@ mod tests {
 
     #[test]
     fn plain_sentences_send_no_html_and_anything_rendered_does() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         for text in [
             "",
             "   ",
@@ -3608,6 +4119,8 @@ mod tests {
 
     #[test]
     fn a_line_at_the_margin_after_a_list_is_a_new_paragraph_in_google_chat_and_slack() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         // The example a received message is given in Google Chat's own API guide: a list, then a
         // sentence, drawn as a list and then a sentence.
         let text = "I can meet there at:\n- Noon\n- 3 pm\n- 5 pm\nWhat time works for you?";
@@ -3640,6 +4153,8 @@ mod tests {
 
     #[test]
     fn only_prose_at_the_margin_ends_a_list() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         for text in [
             // An indented line is more of the item, as its writer indented it.
             "- a\n  and more of a",
@@ -3667,6 +4182,8 @@ mod tests {
 
     #[test]
     fn a_hard_wrapped_item_stays_one_item_in_every_markup() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         // The rest of a sentence an editor wrapped to the margin is more of the item, and the
         // numbered list goes on. Set apart, `2.` and `3.` could not start a list after the
         // paragraph and were drawn as its text.
@@ -3695,6 +4212,8 @@ mod tests {
 
     #[test]
     fn a_line_of_its_own_is_set_apart_only_where_nothing_else_changes() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         // Each of these lines reads as a line of its own, and stays more of its item.
         for text in [
             // The numbered list carries on after it, and `2.` cannot interrupt a paragraph.
@@ -3777,6 +4296,8 @@ mod tests {
 
     #[test]
     fn google_chat_draws_bullets_straight_under_a_numbered_line_as_its_steps() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         // The shape of the message in `#237 nested-lists`, with neutral words: numbered goals,
         // each with its bullets at the margin on the next line, a heading line after them, and
         // the goals apart by blank lines. Google Chat has no numbered lists, so `1.` is a line of
@@ -3856,7 +4377,11 @@ mod tests {
                 .collect()
         };
         let arena = comrak::Arena::new();
-        let parsed = comrak::parse_document(&arena, &stairs(24), &super::options(true));
+        let parsed = comrak::parse_document(
+            &arena,
+            &stairs(24),
+            &super::options(true, super::SingleNewline::Hard),
+        );
         assert!(
             !super::deeper_than(parsed, MAX_DEPTH),
             "the parse alone is within the bound"
@@ -3888,6 +4413,8 @@ mod tests {
 
     #[test]
     fn a_rendered_body_marks_the_words_its_heading_restates_and_changes_nothing_else() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         for (text, markup, expected) in [
             // The rest of the line goes on: the words and the space after them.
             (
@@ -3949,6 +4476,8 @@ mod tests {
 
     #[test]
     fn a_plain_body_stays_empty_and_carries_its_heading() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         let text = "[build-bot] Status, 9:05 AM ET. All green.\nNothing else.";
         let (html, heading) = headed(text, Markup::Discord);
         assert_eq!(html, "");
@@ -4084,10 +4613,16 @@ mod search_text_tests {
     /// Each `SearchText::VERSION` there has ever been, and the digest of the corpus under it. A
     /// change to what the index is given changes the digest: bump the version (a cache built under
     /// the old one then rebuilds its index text) and add a line, rather than editing one.
-    const PINNED: &[(&str, &str)] = &[(
-        "render-1",
-        "09987ed5048b1a31f6d567320deaf9fb276392766933c7a85a23eaef6bfe331c",
-    )];
+    const PINNED: &[(&str, &str)] = &[
+        (
+            "render-1",
+            "09987ed5048b1a31f6d567320deaf9fb276392766933c7a85a23eaef6bfe331c",
+        ),
+        (
+            "render-2",
+            "30ddda09e4cbb6fdbe5b174699e7015aebc3474454a1871f1db9f5be4189eb34",
+        ),
+    ];
 
     fn corpus_digest() -> String {
         let mut all = String::new();
@@ -4180,6 +4715,8 @@ mod read_aloud_blocks {
 
     #[test]
     fn a_plain_body_is_its_paragraphs_as_the_page_draws_them_from_the_text() {
+        // Pins line breaks as `<br>`: the hard single-newline rule.
+        let _rule = super::SingleNewlineGuard::set(super::SingleNewline::Hard);
         let text = "one\ntwo\n\n  \nthree";
         assert_eq!(body_html(text, Markup::Discord), "");
         let blocks = source_blocks(text, Markup::Discord, &[]);
@@ -4340,6 +4877,290 @@ mod read_aloud_blocks {
         assert_eq!(
             html_block_kinds(html),
             [Quote, Item, Item, Table, Code, Paragraph]
+        );
+    }
+}
+
+#[cfg(test)]
+mod single_newline_tests {
+    //! `markdown-tables-render`: the soft single-newline rule, the `•` lines it makes items, and
+    //! the hard rule kept beside it.
+
+    use super::{
+        body_html, headed_body, source_blocks, to_html, to_html_as, Markup, SingleNewline,
+        SingleNewlineGuard,
+    };
+
+    fn soft(text: &str, markup: Markup) -> String {
+        to_html_as(text, markup, SingleNewline::Soft)
+    }
+
+    #[test]
+    fn soft_is_the_default_and_joins_the_lines_of_a_paragraph() {
+        assert_eq!(super::single_newline(), SingleNewline::Soft);
+        assert_eq!(
+            to_html("one\ntwo\n\nthree", Markup::Discord),
+            "<p>one\ntwo</p>\n<p>three</p>\n"
+        );
+        assert_eq!(
+            to_html_as("one\ntwo\n\nthree", Markup::Discord, SingleNewline::Hard),
+            "<p>one<br>\ntwo</p>\n<p>three</p>\n"
+        );
+    }
+
+    #[test]
+    fn a_hard_wrapped_paragraph_is_sent_as_html_and_a_one_line_message_still_is_not() {
+        let wrapped = "Most gaps are named refusals, and the two runs agreed on two hundred\n\
+                       more cells, but the check that they were really intercepted failed.";
+        assert_eq!(
+            body_html(wrapped, Markup::Slack),
+            format!("<p>{wrapped}</p>\n"),
+            "joined, so the screen wraps it"
+        );
+        assert_eq!(
+            body_html("Sounds good, I'll take a look", Markup::Slack),
+            ""
+        );
+        let _rule = SingleNewlineGuard::set(SingleNewline::Hard);
+        assert_eq!(
+            body_html(wrapped, Markup::Slack),
+            "",
+            "the page draws its lines itself"
+        );
+    }
+
+    #[test]
+    fn typed_bullet_lines_stay_lines_as_list_items() {
+        let text = "Published:\n• one\n• two\n    ◦ two, part a\n• three\nAfter the list.";
+        assert_eq!(
+            soft(text, Markup::Slack),
+            "<p>Published:</p>\n<ul>\n<li>one</li>\n<li>two\n<ul>\n<li>two, part a</li>\n</ul>\n\
+             </li>\n<li>three</li>\n</ul>\n<p>After the list.</p>\n"
+        );
+        // Not a bullet: a glyph with no space after it, a glyph inside a line, and code.
+        assert_eq!(
+            soft("•not an item\nsay • here", Markup::Slack),
+            "<p>•not an item\nsay • here</p>\n"
+        );
+        assert_eq!(
+            soft("```\n• kept as written\n```", Markup::Slack),
+            "<pre><code>• kept as written\n</code></pre>\n"
+        );
+        // The hard rule leaves them as the lines they are.
+        assert_eq!(
+            to_html_as("• one\n• two", Markup::Slack, SingleNewline::Hard),
+            "<p>• one<br>\n• two</p>\n"
+        );
+    }
+
+    #[test]
+    fn an_agents_title_line_still_ends_where_it_was_written() {
+        let _rule = SingleNewlineGuard::set(SingleNewline::Soft);
+        let text = "[build-bot] Backup check, 10:52 PM\nAll green.\nNothing else.";
+        let (html, heading) = headed_body(text, Markup::Discord, true, &|_| false, &[]);
+        assert!(heading.is_some());
+        assert_eq!(
+            html,
+            "<p><span class=\"rh-src\">[build-bot] Backup check, 10:52 PM<br>\n</span>All green.\n\
+             Nothing else.</p>\n"
+        );
+    }
+
+    #[test]
+    fn read_aloud_blocks_follow_the_soft_rule() {
+        let _rule = SingleNewlineGuard::set(SingleNewline::Soft);
+        let blocks = source_blocks("one\ntwo\n\n• a\n• b", Markup::Slack, &[]);
+        let sources: Vec<&str> = blocks.iter().map(|block| block.source.as_str()).collect();
+        assert_eq!(sources, ["one\ntwo", "a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod glued_table_tests {
+    //! `markdown-tables-render`: a table whose line breaks were lost before it got here.
+
+    use super::{to_html_as, Markup, SingleNewline};
+
+    /// A message as Slack stored it, names and addresses scrubbed: its header row glued to the
+    /// line before it, and the paragraph after it glued to its last row.
+    const STORED: &str = include_str!("../tests/fixtures/slack_glued_table.md");
+
+    #[test]
+    fn the_stored_message_draws_its_table_under_either_rule() {
+        for rule in [SingleNewline::Soft, SingleNewline::Hard] {
+            let html = to_html_as(STORED, Markup::Slack, rule);
+            assert_eq!(html.matches("<table>").count(), 1, "{rule:?}: {html}");
+            assert_eq!(html.matches("<tr>").count(), 6, "{rule:?}");
+            assert!(html.contains("<th>Backend</th>\n<th align=\"right\">Two runs identical</th>"));
+            assert!(html.contains("<td>in-guest-trap</td>\n<td align=\"right\">302</td>"));
+            assert!(
+                html.contains("</table>\n<p>Most LiteInst and in-guest-trap gaps are named"),
+                "{rule:?}: the prose glued to the last row is a paragraph after the table"
+            );
+            assert!(
+                !html.contains("| Backend"),
+                "{rule:?}: no row is left as pipes"
+            );
+            assert!(
+                html.contains("scorecard</a>):"),
+                "{rule:?}: the line the header was glued to keeps its words"
+            );
+        }
+    }
+
+    /// Drawn exactly as the text would be with no repair at all.
+    fn unrepaired(text: &str) {
+        let options = super::options(true, SingleNewline::Soft);
+        assert_eq!(
+            super::repair_glued_tables(text, &options),
+            None,
+            "{text:?} was repaired"
+        );
+    }
+
+    #[test]
+    fn only_an_unambiguous_table_is_repaired() {
+        // A table already on its lines.
+        unrepaired("| a | b |\n|---|---|\n| 1 | 2 |");
+        // Cell counts that do not match the delimiter row.
+        unrepaired("Intro:| a | b |\n|---|---|---|\n| 1 | 2 | 3 |");
+        // A delimiter row without its leading pipe.
+        unrepaired("Intro: a | b\n---|---\n1 | 2");
+        // A header row that does not end in a pipe.
+        unrepaired("Intro:| a | b\n|---|---|\n| 1 | 2 |");
+        // The pipes are in a code span the text before them opened.
+        unrepaired("Use `x| a | b |\n|---|---|");
+        // Code.
+        unrepaired("```\nIntro:| a | b |\n|---|---|\n| 1 | 2 |tail\n```");
+        // Text after the last row's closing pipe that is not glued to it, or holds a pipe.
+        unrepaired("| a | b |\n|---|---|\n| 1 | 2 | more");
+        unrepaired("| a | b |\n|---|---|\n| 1 | 2 |x | y");
+        // Not a delimiter row at all.
+        unrepaired("Intro:| a | b |\n|---|--x|");
+    }
+
+    #[test]
+    fn a_glued_header_and_a_glued_last_row_are_each_repaired() {
+        let options = super::options(true, SingleNewline::Soft);
+        assert_eq!(
+            super::repair_glued_tables("Results:| a | b |\n|---|:-:|\n| 1 | 2 |", &options)
+                .as_deref(),
+            Some("Results:\n\n| a | b |\n|---|:-:|\n| 1 | 2 |")
+        );
+        // A table that parses without repair would drop the glued prose as an extra cell.
+        assert_eq!(
+            super::repair_glued_tables("| a | b |\n|---|---|\n| 1 | 2 |The end.", &options)
+                .as_deref(),
+            Some("| a | b |\n|---|---|\n| 1 | 2 |\n\nThe end.")
+        );
+        assert_eq!(
+            to_html_as(
+                "| a | b |\n|---|---|\n| 1 | 2 |The end.",
+                Markup::Discord,
+                SingleNewline::Soft
+            ),
+            "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n\
+             <td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table>\n<p>The end.</p>\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod repair_review_tests {
+    //! `markdown-tables-render`: the shapes an adversarial review of the repairs found, each kept
+    //! as the writer wrote it, or repaired only where nothing written is lost.
+
+    use super::{repair_glued_tables, soft_rule_lines, to_html_as, Markup, SingleNewline};
+
+    fn options() -> comrak::Options<'static> {
+        super::options(true, SingleNewline::Soft)
+    }
+
+    fn soft(text: &str, markup: Markup) -> String {
+        to_html_as(text, markup, SingleNewline::Soft)
+    }
+
+    #[test]
+    fn a_table_that_starts_an_item_or_already_draws_is_not_moved() {
+        for text in [
+            "- | a | b |\n  |---|---|\n  | 1 | 2 |",
+            "- | a | b |\n|---|---|\n| 1 | 2 |",
+            "> | a | b |\n|---|---|",
+        ] {
+            assert_eq!(repair_glued_tables(text, &options()), None, "{text:?}");
+        }
+        assert!(!soft("• | a | b |\n|---|---|\n| 1 | 2 |", Markup::Slack).contains("<li></li>"));
+    }
+
+    #[test]
+    fn no_repair_may_lose_a_cell_or_split_code() {
+        for text in [
+            // A space before the first pipe: a header of three cells, not prose and two.
+            "Name | Value | Notes |\n|---|---|\n| alice | 1 | ok |",
+            // A row under it wider than the delimiter row: GFM would drop its last cell.
+            "Name:| Value | Notes |\n|---|---|\n| alice | 1 | ok |",
+            // The first pipe is inside a double-backtick code span.
+            "Run ``x|y``:| a | b |\n|---|---|---|",
+            // A lone carriage return, which comrak counts as a line end, before a code block.
+            "a\rb\n```\n| a | b |\n|---|---|\n| 1 | 2 |tail\n```",
+            // Text glued to a row in the middle of a table, not its last.
+            "| a | b |\n|---|---|\n| 1 | 2 |.\n| 3 | 4 |",
+        ] {
+            assert_eq!(repair_glued_tables(text, &options()), None, "{text:?}");
+        }
+        // A table whose header has no leading pipe still keeps the prose glued to its last row.
+        assert_eq!(
+            repair_glued_tables("a | b\n|---|---|\n| 1 | 2 |tail", &options()).as_deref(),
+            Some("a | b\n|---|---|\n| 1 | 2 |\n\ntail")
+        );
+    }
+
+    #[test]
+    fn a_line_after_typed_bullets_is_set_apart_only_where_nothing_else_changes() {
+        // Emphasis and a link running across the line stay what they were.
+        let bold = soft("• **Important: the build\nis broken**", Markup::Discord);
+        assert!(
+            bold.contains("<strong>Important: the build\nis broken</strong>"),
+            "{bold}"
+        );
+        let link = soft(
+            "• See [the design\ndoc](https://example.org/) here",
+            Markup::Discord,
+        );
+        assert!(link.contains("<a href=\"https://example.org/\""), "{link}");
+        // The rest of an item's sentence stays in the item.
+        assert_eq!(
+            soft("• a long item\nthat continues", Markup::Discord),
+            "<ul>\n<li>a long item\nthat continues</li>\n</ul>\n"
+        );
+        // A line of its own is set apart.
+        assert_eq!(
+            soft("• one\n• two\nKnown limits: none.", Markup::Discord),
+            "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n<p>Known limits: none.</p>\n"
+        );
+    }
+
+    #[test]
+    fn typed_bullets_in_a_quote_are_its_items_and_in_raw_html_are_left_alone() {
+        assert_eq!(
+            soft("> • one\n> • two", Markup::Slack),
+            "<blockquote>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n</blockquote>\n"
+        );
+        assert_eq!(
+            soft_rule_lines("<div>\n• a\n</div>", &options(), Markup::Slack),
+            None
+        );
+        assert_eq!(
+            soft_rule_lines("text\n• \nmore", &options(), Markup::Slack),
+            None
+        );
+    }
+
+    #[test]
+    fn a_google_chat_outline_of_typed_bullets_draws_as_one_of_dashes() {
+        assert_eq!(
+            soft("1. Goal\n• a\nIn review:\n• b", Markup::GoogleChat),
+            soft("1. Goal\n- a\nIn review:\n- b", Markup::GoogleChat)
         );
     }
 }

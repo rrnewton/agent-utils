@@ -15910,7 +15910,10 @@ test("message text is styled as one block family: bullets, hanging indent, parag
   const indent = cssRules(CSS, ".md :is(ul").join("\n");
   assert.match(indent, /padding-left:\s*1\.35em/, "a list has no room for its markers");
   assert.match(indent, /list-style-position:\s*outside/, "a wrapped item would start under its bullet");
-  assert.match(cssBlock(".md > * + *"), /margin-top:\s*0\.55em/, "a blank line makes no gap");
+  assert.match(cssBlock(".md > * + *"), /margin-top:\s*0\.8em/, "a blank line makes no gap");
+  // `markdown-tables-render`: a heading is set further from the part it ends than from its own.
+  assert.match(cssRules(CSS, ".md > * + :is(h1").join("\n"), /margin-top:\s*1\.15em/);
+  assert.match(cssRules(CSS, ".md > :is(h1").join("\n"), /margin-top:\s*0\.35em/);
   assert.match(cssBlock(".md h1"), /font-size:\s*1\.25em/);
   // `#531 server-side-syntax-highlight`: an open message's code keeps its lines and scrolls sideways;
   // a folded one's wraps, so the clamp can count and cut its lines.
