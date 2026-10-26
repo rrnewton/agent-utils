@@ -2999,13 +2999,23 @@ a.search-hit-link {
  * the triangle's tip a few px below that card's bottom edge. The mark is centred across the
  * button, so the triangle is centred in the rounded rectangle its hover wash draws, and it
  * rests dimmed in the same hue — full strength under a resting pointer, on a press, and
- * under the keyboard's ring, where its states are drawn below. */
+ * under the keyboard's ring, where its states are drawn below.
+ *
+ * `pack-triangle-clear-bridge`. The owner, 2026-10-26: "they moved a bit up but i don't think they
+ * moved LEFT like I asked. They are still almost touching the vertical bridge. I want them to move
+ * left enough that the rounded rectangle button that comes up when I hover is not intersecting the
+ * bridge. Visual overlap between objects like that looks sloppy and bad." So the whole button — the
+ * rectangle its wash draws — stands left of the spine with room between them: the gutter square's
+ * right edge sits at the row's left edge, the spine 0.9rem plus half a stroke out from it, and
+ * 1.25rem further left leaves the rectangle about 4px clear of the line
+ * (tests/bridge_even_browser.py measures it). A phone's gutter is too narrow for that: see the
+ * phone rule at the foot of this file. */
 #side-cards .reply-ungather.unpack-pack {
   color: hsl(var(--thread-hue, 210) 55% 50%);
   min-width: 2rem;
   min-height: 2rem;
   top: -0.55rem;
-  transform: translateX(-0.375rem);
+  transform: translateX(-1.25rem);
 }
 
 #side-cards .unpack-pack-mark {
@@ -9969,9 +9979,12 @@ li.discord-message[data-root-continuation] > .thread-replies {
   }
 
   /* `#526 pack-triangle-dim`: at its 32px floor, so centred in the button (and shifted a
-     touch left with it, above) its ink still sits a few px from the screen's edge. */
+     touch left with it) its ink still sits a few px from the screen's edge. Only a touch:
+     the gutter left of the spine is narrower than the button and the room the rule above
+     keeps from the line (`pack-triangle-clear-bridge`), so here it stays where it was. */
   #side-cards .reply-ungather.unpack-pack {
     width: 2rem;
+    transform: translateX(-0.375rem);
   }
 
   /* The disc in its whole square, and the triangle in its slim one, by the arithmetic their own

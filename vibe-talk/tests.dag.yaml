@@ -1548,10 +1548,11 @@ steps:
   # an unpacked thread holding the owner's and others' rows, every row at one left edge and
   # every bridge connector one length, the owner's narrower and ragged on the right; the pack
   # triangle dimmed at rest, its tip against the card above, centred in its hover rectangle;
-  # gathered replies in All even too; the triangle still packing.
+  # gathered replies in All even too; the triangle still packing. `pack-triangle-clear-bridge`:
+  # the triangle's whole button, the rectangle its wash draws, clear of the bridge's line.
   - group: check
     job: bridge-even-browser
-    desc: even bridge connectors with the owner's rows left-justified, and the dimmed pack triangle centred against its card, in current Chromium at 393x852, 412x915 and 1280x800
+    desc: even bridge connectors with the owner's rows left-justified, and the dimmed pack triangle centred against its card with its rectangle clear of the bridge's line, in current Chromium at 393x852, 412x915, 768x1024 and 1280x800 in both schemes
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/bridge_even_browser.py
     jobs_flag: ""

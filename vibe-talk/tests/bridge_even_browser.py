@@ -11,8 +11,8 @@ the message. When I hover them they appear as a colored rounded rectangle. The
 arrow/triangle should be horizontally centered in that rectangle."
 
 Against the fake API of tests/threads_polish_browser.py with two of the runner thread's
-replies the owner's, in the Threads view with the runner unpacked, at 393x852, 412x915
-and 1280x800 (dark, and light on the desk):
+replies the owner's, in the Threads view with the runner unpacked, at 393x852, 412x915,
+768x1024 and 1280x800, each in dark and light:
 
 * every unpacked row starts at the same left edge and every bridge connector (the row's
   left edge back to its spine) is the same length, the owner's rows included; the owner's
@@ -22,6 +22,11 @@ and 1280x800 (dark, and light on the desk):
   its tip a few px below the bottom of the card above it, horizontally centred in its
   button's rectangle, its target at least 32px, on a phone its ink a few px from the
   screen edge (`#501 thread-bridge-gutter`);
+* `pack-triangle-clear-bridge` (2026-10-26, "I want them to move left enough that the rounded
+  rectangle button that comes up when I hover is not intersecting the bridge"): at 768 and
+  1280 wide the whole button, the rectangle its wash draws, stands at least 3px left of the
+  bridge's vertical line; on a phone, whose gutter is narrower than that, how far it meets the
+  line is recorded;
 * replies gathered under their root in All (Reply on the root, `#215 reply-coalesce`) keep
   one left edge and one connector length too;
 * the triangle still packs its thread.
@@ -48,8 +53,14 @@ from two_column_browser import RUNNER, Desk
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
 
-SIZES = (("phone-393", 393, 852, True, "dark"), ("phone-412", 412, 915, True, "dark"),
+SIZES = (("phone-393", 393, 852, True, "dark"), ("phone-393-light", 393, 852, True, "light"),
+         ("phone-412", 412, 915, True, "dark"), ("phone-412-light", 412, 915, True, "light"),
+         ("tablet-768", 768, 1024, True, "dark"), ("tablet-768-light", 768, 1024, True, "light"),
          ("desk", 1280, 800, False, "dark"), ("desk-light", 1280, 800, False, "light"))
+
+# `pack-triangle-clear-bridge`: the least room, in px, between the pack triangle's whole button — the
+# rounded rectangle its hover wash draws — and the bridge's vertical line to its right.
+BRIDGE_CLEARANCE_PX = 3
 
 # The runner's replies the owner wrote (message ids, from the columns fixture's plan).
 OWN_REPLIES = ("206", "217")
@@ -66,7 +77,11 @@ ROWS_JS = """(id) => {
     const triW = parseFloat(tri.borderLeftWidth) + parseFloat(tri.borderRightWidth);
     const triH = parseFloat(tri.borderBottomWidth);
     const markBox = box(mark);
-    return {card: box(card), overflow: document.documentElement.scrollWidth - window.innerWidth,
+    const bridge = first.querySelector(':scope > .reply-bridge');
+    const bridgeBox = box(bridge);
+    const stroke = parseFloat(getComputedStyle(bridge).borderLeftWidth);
+    return {card: box(card), spineLeft: bridgeBox.left, spineRight: bridgeBox.left + stroke,
+        spineTop: bridgeBox.top, spineBottom: bridgeBox.bottom, buttonRadius: getComputedStyle(button).borderTopLeftRadius, overflow: document.documentElement.scrollWidth - window.innerWidth,
         rows: rows.map((li) => ({id: li.getAttribute('data-id'), who: li.getAttribute('data-who'),
             box: box(li), bg: getComputedStyle(li).backgroundColor,
             bridge: box(li.querySelector(':scope > .reply-bridge'))})),
@@ -224,13 +239,37 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk.check(abs(float(str(found["inkCentre"])) - (button["left"] + button["width"] / 2)) <= 2,
                        f"the triangle is not centred in its rectangle: ink centre {found['inkCentre']}, "
                        f"button {button['left']}..{button['right']}")
+            # `pack-triangle-clear-bridge`. The owner, 2026-10-26: "I want them to move left enough that
+            # the rounded rectangle button that comes up when I hover is not intersecting the bridge.
+            # Visual overlap between objects like that looks sloppy and bad." The whole button is the
+            # wash's rectangle, its 32px phone floor included, and it stands beside the spine for its
+            # whole height, so its right edge must stop short of the spine's left edge.
+            clearance = float(str(found["spineLeft"])) - button["right"]
+            beside = (button["top"] < float(str(found["spineBottom"]))
+                      and button["bottom"] > float(str(found["spineTop"])))
+            desk.notes.append(f"rectangle {button['left']:.1f}..{button['right']:.1f}, {clearance:.1f}px clear of "
+                              f"the line at {float(str(found['spineLeft'])):.1f}")
+            if width >= 600:
+                desk.check(not beside or clearance >= BRIDGE_CLEARANCE_PX,
+                           f"the triangle's rectangle {button['left']:.1f}..{button['right']:.1f} comes within "
+                           f"{clearance:.1f}px of the bridge's line at {found['spineLeft']:.1f}")
+            else:
+                # A phone's gutter left of the line (about 28px) is narrower than the 32px target and the
+                # room, so the rectangle — drawn there only under a press, a phone having no hover — still
+                # meets the line until the owner chooses between a smaller wash and the bridge moving
+                # right. Recorded, not refused, and refused if it ever gets worse.
+                desk.check(not beside or clearance >= -5,
+                           f"the triangle's rectangle reaches {-clearance:.1f}px over the bridge's line")
+                desk.notes.append("phone: the rectangle meets the line, pending the owner's choice")
+            desk.check(button["left"] >= 0, f"the triangle's rectangle runs off the screen at {button['left']:.1f}px")
             gap = float(str(found["tipY"])) - card["bottom"]
             desk.check(-2 <= gap <= 10, f"the triangle's tip is {gap:.1f}px below the card above it")
             desk.check(float(str(found["markOpacity"])) <= 0.85,
                        f"the triangle rests at opacity {found['markOpacity']}, not dimmed")
             desk.check(str(found["markColor"]) == str(found["spine"]),
                        f"the triangle {found['markColor']} is not its bridge's hue {found['spine']}")
-            if touch:
+            if touch and width < 600:
+                # On a phone the gutter is the screen's edge (`#501 thread-bridge-gutter`).
                 ink_left = float(str(found["inkLeft"]))
                 desk.check(0 <= ink_left <= 8, f"the triangle's ink starts {ink_left:.1f}px from the left edge")
                 desk.check(button["left"] >= 0, f"the triangle's target runs off the screen at {button['left']:.1f}px")
