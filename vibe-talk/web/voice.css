@@ -7711,7 +7711,11 @@ textarea {
     padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :not(#hang-up, #read-aloud[data-active="true"], #read-aloud-stop) {
+  /* `#532 shift-o-latency`. Named by class, the tile's controls and its speed popover, never as a bare
+     `:not(…)`: a rule under `:root:has(…)` whose last part names no class, id or attribute is one the
+     browser can only check again on every element of the page, and it did so whenever anything on the
+     page was shown or hidden — a fold, a filter, a card unpacked — about 20 ms a time on a phone. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(.control, .popover):not(#hang-up, #read-aloud[data-active="true"], #read-aloud-stop) {
     display: none;
   }
 

@@ -1573,6 +1573,22 @@ steps:
       resources: {browser: 1}
       est_duration_s: 30
 
+  # `#532 shift-o-latency` in the browser engine: twenty threads of long replies unpacked in the Threads view;
+  # four Shift+O and four e, each drawn in the frame after its key, each handler held to a 50 ms budget at the
+  # median, and hiding one row restyling a few elements rather than the page (a #429 rule on a touch screen
+  # restyled about 5,000). Measured on 2026-10-26: about 20s wall.
+  - group: check
+    job: fold-latency-browser
+    desc: Shift+O and e in an unpacked Threads view each draw in the frame after the key within a 50 ms handler budget, and hiding a row restyles only what it touches (#532), in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/fold_latency_browser.py
+    jobs_flag: ""
+    timeout: 240
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+
   # `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in the browser engine, at 1280x800 with a mouse and
   # 393x852 by touch: a card packed at the foot of the Threads view by a click, its top the same in every
   # frame, held past the foot in room that a live reply fills and that scrolling up takes away for good; the
