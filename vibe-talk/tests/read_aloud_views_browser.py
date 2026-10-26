@@ -320,10 +320,11 @@ class Walk:
             moved = self.page.evaluate("() => window.audioProbe.contexts.slice(-1)[0].currentTime") - clock
             self.desk.check(moved > 0.15, f"{label}: the audio clock stood still ({moved:.3f}s in 300ms)")
         else:
-            words = json.dumps(self.message_words(message_id)[:30])
+            # The message's first sentence, or more (`#554 read-pause-reply-resume`: one sentence an utterance).
+            words = json.dumps(self.message_words(message_id))
             self.wait_for(f"{label}: the device voice did not start on {message_id}",
                           f"() => window.deviceSpeech.slice({device_before}).some((one) => one.started !== null"
-                          f" && one.text.startsWith({words}))")
+                          f" && one.text.length >= 10 && {words}.startsWith(one.text))")
         if blocks and self.voice == "agent":
             self.wait_for(f"{label}: no block lit in the drawn row {mark}",
                           f"() => [...document.querySelectorAll('[data-reading-block=\"current\"]')].some((n) =>"

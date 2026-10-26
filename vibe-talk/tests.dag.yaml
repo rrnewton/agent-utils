@@ -485,6 +485,24 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#554 read-pause-reply-resume` in the browser engine: on a phone, a read paused mid-message, the
+  # message answered from its Reply and sent, then resumed: the device voice (modelled on Chrome for
+  # Android, whose pause stops and whose resume does nothing) goes on from the sentence it was paused in,
+  # and the agent's voice from its block.
+  - group: check
+    job: read-pause-reply-browser
+    desc: a read paused, the message replied to and sent, then resumed, by both voices in current Chromium at 393x852 touch, the read going on from where it was held
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/read_pause_reply_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#49 post-confirmation-card-hold` in the browser engine: a real touch on Send the moment a first
   # card appears in a typed call commits nothing, and Send enables itself after the hold.
   - group: check

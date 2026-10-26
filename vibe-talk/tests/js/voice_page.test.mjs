@@ -4760,6 +4760,9 @@ const TUNING_BANDS = {
     "a browsed channel's label must fit the same 60 characters the Add form's field allows"],
   BROWSER_SPEECH_CHUNK_CHARS: [60, 300,
     "device voices need short utterances to avoid mobile synthesis stalls without pausing every word"],
+  BROWSER_SPEECH_SENTENCE_MIN_CHARS: [8, 60,
+    "a device-voice sentence shorter than this is said with the next (#554 read-pause-reply-resume): " +
+    "much less and an abbreviation stands alone, much more and a resume repeats more than its sentence"],
   BROWSER_SPEECH_START_MS: [5000, 20000,
     "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
   BROWSER_SPEECH_FINISH_MS: [30000, 120000,
@@ -11058,7 +11061,8 @@ for (const action of ["stop", "view", "settings"]) {
     await signIn(page);
     const rows = await inReadingMode(page, [message()]);
     await rows[0].dispatch("click", {});
-    if (action === "stop") await readButton(page).click();
+    // Stop, beside Read: Read itself is the read's Pause while it plays (`#434 read-aloud-pause`).
+    if (action === "stop") await page.el("read-aloud-stop").click();
     if (action === "view") await page.el("view-switch").click();
     if (action === "settings") await page.el("open-settings").click();
     page.deviceSpeech.utterances[0].end();
@@ -11986,7 +11990,9 @@ test("`#434 read-aloud-pause`: a resume after the speech ticket ended re-prepare
   assert.equal(page.el("read-aloud-label").text(), "Pause");
 });
 
-test("`#434 read-aloud-pause`: the device voice pauses and resumes the same utterance, from the Read button", async () => {
+test("`#434 read-aloud-pause`: the device voice stops at the sentence on Pause and says it again on Resume, from the Read button", async () => {
+  // `#554 read-pause-reply-resume`: never the engine's own pause, which Chrome on Android does not have
+  // (its pause stops the voice and its resume does nothing, so a resume that asked the engine was silent).
   const page = devicePage();
   await signIn(page);
   const rows = await inReadingMode(page, [message({ id: "1000000000000000001", content: "One short message." })]);
@@ -11996,22 +12002,66 @@ test("`#434 read-aloud-pause`: the device voice pauses and resumes the same utte
   assert.equal(page.el("read-aloud-label").text(), "Pause");
   await page.el("read-aloud").click();
   await page.settle();
-  assert.equal(page.deviceSpeech.pauses, 1, "Pause did not pause the device voice");
-  assert.equal(page.deviceSpeech.cancellations, 0, "Pause cancelled the utterance instead of holding it");
+  assert.equal(page.deviceSpeech.pauses, 0, "Pause asked the engine for a pause Chrome on Android does not have");
+  assert.equal(page.deviceSpeech.cancellations, 1, "Pause did not stop the device voice");
   assert.equal(page.el("read-aloud-label").text(), "Resume");
+  // The cancelled utterance's late events are not the read ending or failing.
+  page.deviceSpeech.utterances[0].fail("interrupted");
+  page.deviceSpeech.utterances[0].end();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the stopped utterance's events ended the held read");
   assert.deepEqual(page.dismissCalls, [], "a paused read was archived as heard");
   await page.el("read-aloud").click();
   await page.settle();
-  assert.equal(page.deviceSpeech.resumes, 1, "Resume did not resume the device voice");
-  assert.equal(page.deviceSpeech.utterances.length, 1, "Resume re-spoke the message from the start");
+  assert.equal(page.deviceSpeech.utterances.length, 2, "Resume said nothing");
+  assert.equal(page.deviceSpeech.utterances[1].text, "One short message.", "Resume did not say the paused sentence again");
+  assert.equal(page.el("read-aloud-label").text(), "Pause");
+  page.deviceSpeech.utterances[1].end();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }], "the resumed read did not finish as heard");
+});
+
+test("`#554 read-pause-reply-resume`: the device voice says one sentence at a time and resumes at the sentence it was paused in", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const sentences = [
+    "Before we cut the release, is the migration finished?",
+    // A sentence closed inside curly quotes ends there too.
+    "Whether the dashboards picked up the \u201cnew partitions.\u201d",
+    "Ok then.",
+    "And the alert we silenced on Friday should be back on.",
+  ];
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001", content: sentences.join(" ") })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const said = () => page.deviceSpeech.utterances.map((one) => one.text);
+  assert.deepEqual(said(), [sentences[0]], "the first utterance is not the first sentence alone");
   page.deviceSpeech.utterances[0].end();
+  await page.settle();
+  // A sentence too short to stand alone is said with the next.
+  assert.deepEqual(said(), [sentences[0], sentences[1]]);
+  await page.el("read-aloud").click();
+  await page.settle();
+  // The reader is away for as long as a reply takes: no watchdog gives the held read up meanwhile.
+  page.expireTimers(sourceConstant("BROWSER_SPEECH_FINISH_MS"));
+  await page.settle();
+  assert.equal(page.el("error").textContent, "", "the held read timed out");
+  assert.equal(page.el("read-aloud-label").text(), "Resume");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.deepEqual(said(), [sentences[0], sentences[1], sentences[1]], "Resume did not start the paused sentence again");
+  page.deviceSpeech.utterances[2].end();
+  await page.settle();
+  assert.equal(said().at(-1), `${sentences[2]} ${sentences[3]}`);
+  page.deviceSpeech.utterances.at(-1).end();
   await page.settle();
   assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }], "the resumed read did not finish as heard");
 });
 
 test("`#434 read-aloud-pause`: stopping a held device-voice read leaves the engine unpaused for the next", async () => {
   // An engine cancelled while paused can stay paused, and the next read would speak into that
-  // paused queue and die on its start watchdog. The mock models it: cancel keeps `paused`.
+  // paused queue and die on its start watchdog. `#554 read-pause-reply-resume`: a held read no
+  // longer pauses the engine at all, so the engine is left paused here as something else left it.
   const page = devicePage();
   await signIn(page);
   const rows = await inReadingMode(page, [
@@ -12022,7 +12072,8 @@ test("`#434 read-aloud-pause`: stopping a held device-voice read leaves the engi
   await page.settle();
   await page.el("read-aloud").click();
   await page.settle();
-  assert.equal(page.deviceSpeech.paused, true, "the premise: the engine is not held");
+  assert.equal(page.deviceSpeech.paused, false, "Pause held the engine, which Chrome on Android cannot resume");
+  page.deviceSpeech.paused = true;
   await page.el("discord-log").children[0].dispatch("click", {});
   await page.settle();
   assert.equal(page.deviceSpeech.paused, false, "stopping the held read left the engine paused");
