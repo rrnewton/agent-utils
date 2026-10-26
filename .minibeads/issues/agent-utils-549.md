@@ -1,13 +1,14 @@
 ---
 title: 'own-read-stored: own messages start read in the stored read state, then toggle like any other'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - read-state
 created_at: 2026-10-26T20:04:53.984929174+00:00
-updated_at: 2026-10-26T20:04:53.984929174+00:00
+updated_at: 2026-10-26T21:32:14.395572391+00:00
+closed_at: 2026-10-26T21:32:14.395572101+00:00
 ---
 
 # Description
