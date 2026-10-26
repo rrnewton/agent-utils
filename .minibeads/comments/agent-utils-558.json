@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-558-c47d79ef518",
+    "issue_id": "agent-utils-558",
+    "author": "cl-ownread2",
+    "body": "[opus 5.5] Landed 4cd48239: at 768x1024 and 1280x800 (dark and light) the button stands 1.25rem left of its gutter square, its rectangle 4.1px clear of the bridge's line, triangle centred, tip 6px below the card above. OPEN for phones (393, 412): the gutter left of the line is 28.3px, narrower than the 32px target floor plus 3px, so the rectangle (drawn only under a press there) still meets the line by 4.3px. Needs the owner's choice: (A) a smaller press wash, ~24px wide, drawn behind the triangle at 1..25px while the 32px target stays; or (B) the bridge and rows moving ~8px right on phones, rows ~8px narrower.",
+    "created_at": "2026-10-26T21:52:18.943370070Z",
+    "updated_at": "2026-10-26T21:52:18.943370070Z"
+  }
+]
