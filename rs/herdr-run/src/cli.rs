@@ -24,8 +24,8 @@ use crate::evict;
 use crate::output;
 use crate::readiness::{assess, infer_prompt_tail};
 use crate::reap::plan_reap;
-use crate::runner::{execute, result_json, write_meta, RunResult};
-use crate::session::{resolve_target, tab_label_for};
+use crate::runner::{execute, result_json, write_meta, RunResult, TAB_REASSIGNED};
+use crate::session::{resolve_target, tab_label_for, Target};
 use crate::sweep::{build_evidence, load_run_records, measure_occupancy};
 use crate::textfmt::{
     display, json_pretty, name_violation, os_error_text, quote, strip_space, whole_milliseconds,
@@ -1101,6 +1101,7 @@ fn command_config(config: &Config, agent: &str) -> Result<i32> {
         "deny_subcommand": config.deny_subcommand,
         "deny_subcommand_option": config.deny_subcommand_option,
         "idle_tab_ttl_seconds": config.idle_tab_ttl_seconds,
+        "max_idle_tabs": config.max_idle_tabs,
         "max_panes": config.max_panes,
         "prefixes": config.prefixes,
         "probe_remote": config.probe_remote,
@@ -1256,20 +1257,40 @@ fn run_command(config: &Config, agent: &str, json_output: bool, args: &RunOption
     };
     let ready_timeout = args.wait_ready.unwrap_or(config.ready_timeout_seconds);
     let timeout = args.timeout.unwrap_or(config.timeout_seconds);
-    let target = match resolve_target(&client, config, agent, !args.no_cache) {
+    let mut target = match resolve_target(&client, config, agent, !args.no_cache) {
         Ok(target) => target,
         Err(error) => return audited_error(&log, agent, command, error),
     };
-    let result = match execute(
-        &client,
-        config,
-        &target,
-        &admission,
-        agent,
-        &cwd,
-        ready_timeout,
-        timeout,
-    ) {
+    let run = |target: &Target| {
+        execute(
+            &client,
+            config,
+            target,
+            &admission,
+            agent,
+            &cwd,
+            ready_timeout,
+            timeout,
+        )
+    };
+    let mut outcome = run(&target);
+    if let Err(error) = &outcome {
+        // Idle tabs are closed or handed to other agents between resolution and the pane lock;
+        // the runner refuses such a tab before typing anything, and one fresh resolution (never
+        // from the cache, which named the lost tab) finds or makes this agent's tab.
+        if error.kind() == ErrorKind::Busy && error.message().contains(TAB_REASSIGNED) {
+            output::diagnostic(&format!(
+                "herdr-run: {} Resolving the tab again.",
+                error.message()
+            ));
+            target = match resolve_target(&client, config, agent, false) {
+                Ok(target) => target,
+                Err(error) => return audited_error(&log, agent, command, error),
+            };
+            outcome = run(&target);
+        }
+    }
+    let result = match outcome {
         Ok(result) => result,
         Err(error) if error.kind() == ErrorKind::Timeout => {
             // Emit whatever the command managed to print BEFORE reporting the timeout: dropping it
@@ -1457,6 +1478,7 @@ fn command_reap(config: &Config) -> Result<i32> {
 fn retired_document(retired: &evict::RetiredTab) -> Value {
     json!({
         "agent": retired.agent,
+        "cause": retired.cause.as_str(),
         "last_run": retired.last_run,
         "last_run_at": retired.last_run.as_deref().and_then(evict::run_time),
         "pane_id": retired.pane_id,
@@ -1471,10 +1493,11 @@ fn epoch_seconds_now() -> f64 {
         .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
-/// Close the workspace's tabs that are idle past `idle_tab_ttl_seconds`.
+/// Close the workspace's tabs that are idle past `idle_tab_ttl_seconds` or `max_idle_tabs`.
 ///
-/// The explicit form of the sweep a finished run performs in bounded form, for a timer or an
-/// operator. Unlike `reap` this ACTS: expiry only selects the candidates, and each close is
+/// The explicit form of the sweep every finished run performs, for a timer on a host where runs
+/// are rare, or an operator. Unlike `reap` this ACTS: expiry or rank only selects the
+/// candidates, and each close is
 /// still the cap's verdict — shell provably idle, taken under the pane lock immediately before
 /// `tab close` ([`evict::retire_idle_tabs`]). Every recorded pane that stays open carries its
 /// reason, because a sweep that closes nothing must say whether nothing was expired or
@@ -1490,7 +1513,6 @@ fn command_sweep(config: &Config, options: &SweepOptions) -> Result<i32> {
         epoch_seconds_now(),
         options.dry_run,
         None,
-        None,
         Path::new("/proc"),
     );
     let document = json!({
@@ -1505,6 +1527,7 @@ fn command_sweep(config: &Config, options: &SweepOptions) -> Result<i32> {
         "idle_tab_ttl_seconds": config.idle_tab_ttl_seconds,
         "kept": sweep.kept.iter().map(|(pane_id, reason)| json!({"pane_id": pane_id, "reason": reason})).collect::<Vec<_>>(),
         "listing_error": sweep.listing_error,
+        "max_idle_tabs": config.max_idle_tabs,
         "workspace": config.workspace,
         "would_close": sweep.would_close.iter().map(retired_document).collect::<Vec<_>>(),
     });
@@ -1512,20 +1535,17 @@ fn command_sweep(config: &Config, options: &SweepOptions) -> Result<i32> {
     Ok(0)
 }
 
-/// How many expired tabs one finished run may examine while sweeping opportunistically. Each
-/// examination probes a pane and scans `/proc`; the bound limits that probing after a
-/// caller's command (the listing and record read before it are bounded by the workspace and
-/// by retention), and leftovers are picked up by the next run or by `sweep --idle`.
-const OPPORTUNISTIC_SWEEP_LIMIT: usize = 4;
-
-/// Retire idle-expired tabs at the end of a run, without ever changing its result.
+/// Retire idle tabs at the end of a run, without ever changing its result.
 ///
-/// Pruned-on-write, like retention, so it cannot silently stop the way a timer can — but
-/// bounded ([`OPPORTUNISTIC_SWEEP_LIMIT`]) and never the tab the run just used. A failure to
-/// list the workspace is reported inside the sweep and ignored here, exactly as a failure to
-/// write the run's metadata is a warning beside a completed command.
+/// Pruned-on-write, like retention, so it cannot silently stop the way a timer can, and never
+/// the tab the run just used. The whole sweep, every time: it costs one listing and a spool
+/// read, plus one probe per tab it actually closes, because the tabs it keeps are counted from
+/// the run records rather than probed. Tabs left behind by a bound here were how a workspace
+/// came to hold 30 tabs idle far past the TTL. A failure to list the workspace is reported
+/// inside the sweep and ignored here, exactly as a failure to write the run's metadata is a
+/// warning beside a completed command.
 fn sweep_idle_best_effort(client: &HerdrClient, config: &Config, agent: &str, pane_id: &str) {
-    if config.idle_tab_ttl_seconds <= 0.0 {
+    if config.idle_tab_ttl_seconds <= 0.0 && config.max_idle_tabs == 0 {
         return;
     }
     let _sweep = evict::retire_idle_tabs(
@@ -1534,7 +1554,6 @@ fn sweep_idle_best_effort(client: &HerdrClient, config: &Config, agent: &str, pa
         agent,
         epoch_seconds_now(),
         false,
-        Some(OPPORTUNISTIC_SWEEP_LIMIT),
         Some(pane_id),
         Path::new("/proc"),
     );
@@ -1919,7 +1938,7 @@ fn subcommand_help_text(name: &str) -> String {
         }
         "sweep" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] sweep --idle [--dry-run]\n");
-            text.push_str("\nClose command tabs idle past idle_tab_ttl_seconds: every recorded run in the tab\nfinished, the last one more than the TTL ago, and its shell provably idle — the\nsame verdict the pane cap takes, under the pane lock, immediately before the\nclose. A tab running a command, holding a background job, locked by another\nrunner, or split into several panes is never closed. Tabs no run record names\nare left to 'reap'. Prints JSON: what closed, and why everything else stayed.\nWith idle_tab_ttl_seconds 0 the sweep is disabled and closes nothing. Runs also\nsweep a bounded number of tabs when they finish; this subcommand is the same\nsweep on demand, for a timer.\n");
+            text.push_str("\nClose idle command tabs on two bounds. idle_tab_ttl_seconds: every recorded run\nin the tab finished, the last one more than the TTL ago. max_idle_tabs: past that\nmany idle tabs, the least recently used are closed however recent they are; tabs\nwith a command in flight are never counted. Either way the shell must be provably\nidle — the same verdict the pane cap takes, under the pane lock, immediately\nbefore the close. A tab running a command, holding a background job, locked by\nanother runner, or split into several panes is never closed. Tabs no run record\nnames are left to 'reap'. Prints JSON: what closed and which bound chose it\n(cause), and why everything else stayed. A bound set to 0 is disabled. Every\nrun performs this same sweep when it finishes; this subcommand is for a timer on\na host where runs are rare.\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --idle                sweep by idle lifetime (required; the only sweep there is)\n  --dry-run             judge every tab and report; close nothing\n");
             text.push_str("\nExample:\n  herdr-run sweep --idle --dry-run\n");
         }

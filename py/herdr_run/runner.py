@@ -190,9 +190,19 @@ def _pane_lock(
     sleep: Callable[[float], None],
     poll_interval: float,
 ) -> Iterator[None]:
-    """Hold the per-pane launch/result lock, bounded by the readiness wait budget."""
-    path = pane_lock_path(target.pane_id)
-    handle = open_lock_file(path)
+    """Hold the per-pane launch/result lock, bounded by the readiness wait budget.
+
+    A tab handed over from another agent was judged idle under its pane lock, and that lock was
+    kept (:func:`herdr_run.evict.reuse_idle_tab`); letting go of it here and locking again would
+    open a window for the previous owner's cached target to type into the pane first. Locking the
+    reserved file again is a no-op while it is held, and a reservation already used up (closed)
+    is never mistaken for a held lock: the pane is locked afresh instead.
+    """
+    reservation = target.reservation
+    if reservation is not None and reservation.pane_id == target.pane_id and not reservation.lock.closed:
+        handle = reservation.lock
+    else:
+        handle = open_lock_file(pane_lock_path(target.pane_id))
     deadline = monotonic() + max(timeout, 0.0)
     try:
         while True:
@@ -214,6 +224,26 @@ def _pane_lock(
     finally:
         # Closing releases `flock` even when readiness, launch, or collection raised.
         handle.close()
+
+
+#: Words in the refusal :func:`_verify_tab_under_lock` raises, by which a caller recognises it and
+#: resolves the agent's tab again.
+TAB_REASSIGNED = "was closed or handed to another agent after it was resolved"
+
+
+def _verify_tab_under_lock(client: HerdrClient, target: Target) -> None:
+    """Refuse, before anything is typed, when the target's tab no longer carries its label.
+
+    A target is resolved under the session lock but the pane lock is taken afterwards, and idle
+    tabs are closed or handed to other agents in between (:mod:`herdr_run.evict`): a cached target
+    can name a tab that another agent now owns. Checked here, with the pane lock held, nothing can
+    change it before the command is typed. A refusal says :data:`TAB_REASSIGNED`; the CLI
+    resolves again once.
+    """
+    if client.tab_id_for_label(target.workspace_id, target.tab_label) != target.tab_id:
+        raise PaneBusy(
+            f"tab {target.tab_id} ({target.tab_label}) {TAB_REASSIGNED}. Nothing was executed."
+        )
 
 
 def wait_ready(
@@ -372,6 +402,7 @@ def execute(
         sleep=sleep,
         poll_interval=poll_interval,
     ):
+        _verify_tab_under_lock(client, target)
         elapsed_for_lock = max(0.0, monotonic() - lock_started)
         remaining_ready = max(0.0, ready_timeout - elapsed_for_lock)
         prompt_tail = infer_prompt_tail(config, home=home)
@@ -410,6 +441,19 @@ def execute(
 
         started = monotonic()
         client.run(target.pane_id, build_shell_command(admission, spool, cwd))
+        # Recorded as IN FLIGHT the moment it is typed, and rewritten when it finishes: the run
+        # records are how the idle sweeps count idle tabs, and a command that left no record until
+        # it finished would have its tab counted (and ranked) as idle by its PREVIOUS run.
+        _write_unfinished_meta(
+            run_id=run_id,
+            spool=spool,
+            agent=agent,
+            admission=admission,
+            config=config,
+            target=target,
+            readiness=readiness,
+            duration_seconds=0.0,
+        )
 
         deadline = started + max(timeout, 0.0)
         while True:
@@ -433,11 +477,11 @@ def execute(
                 break
             sleep(poll_interval)
 
-        # Record the run BEFORE reporting the timeout, with a null exit code. This is the only
-        # writer that can produce the state :mod:`herdr_run.reap` calls IN FLIGHT, and it is the
-        # literal truth: the command is still running in a pane this process does not own. Without
-        # it the reaper's "the agent is thinking" rule has no way of ever being true, and the one
-        # pane that provably still has work in it would be the one pane leaving no evidence.
+        # Record the run BEFORE reporting the timeout, still with a null exit code. That is the
+        # state :mod:`herdr_run.reap` calls IN FLIGHT, and it is the literal truth: the command is
+        # still running in a pane this process does not own. Without it the reaper's "the agent is
+        # thinking" rule could not outlive this process, and the one pane that provably still has
+        # work in it would be the one pane leaving no evidence.
         _write_unfinished_meta(
             run_id=run_id,
             spool=spool,
@@ -529,8 +573,12 @@ def _write_meta(
     encoded = (json_text(document, indent=2) + "\n").encode(
         "utf-8"
     )
+    # Written beside and renamed into place: the record is written twice per run (in flight, then
+    # finished) and read by other runners' sweeps meanwhile, which must never see it torn.
+    staging = os.path.join(spool.directory, ".meta.json.tmp")
     try:
-        _create_private_file(path, encoded)
+        _create_private_file(staging, encoded)
+        os.replace(staging, path)
     except OSError as exc:
         raise HerdrUnavailable(f"cannot write run metadata {path}: {os_error_text(exc)}") from exc
     return path
@@ -547,10 +595,10 @@ def _write_unfinished_meta(
     readiness: Readiness,
     duration_seconds: float,
 ) -> None:
-    """Record a run that timed out and is STILL RUNNING, with ``exit_code`` null.
+    """Record a run that is STILL RUNNING -- just typed, or timed out -- with ``exit_code`` null.
 
-    Best effort by construction: a failure to record the run must not replace the timeout the
-    caller actually needs to hear about. The reaper reads the null as IN FLIGHT and spares the
+    Best effort by construction: a failure to record the run must not replace the command or the
+    timeout the caller actually needs to hear about. The reaper reads the null as IN FLIGHT and spares the
     pane; :func:`herdr_run.sweep.load_run_records` later re-reads the spool's ``exit_code`` file,
     so a command that finishes after we stopped waiting stops looking in-flight forever.
     """

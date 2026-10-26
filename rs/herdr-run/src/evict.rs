@@ -258,7 +258,6 @@ pub fn evict_one<A: HerdrApi + ?Sized>(
 /// An under-lock re-judgement: given the pane as re-listed, a refusal reason or none.
 type Recheck<'a> = &'a dyn Fn(&Pane) -> Option<String>;
 
-#[allow(clippy::too_many_arguments)]
 fn try_evict<A: HerdrApi + ?Sized>(
     client: &A,
     config: &Config,
@@ -267,6 +266,27 @@ fn try_evict<A: HerdrApi + ?Sized>(
     recheck: Option<Recheck<'_>>,
     proc_root: &Path,
 ) -> std::result::Result<String, String> {
+    let (reason, lock) = claim_idle(client, config, candidate, workspace_id, recheck, proc_root)?;
+    client
+        .close_tab(&candidate.tab_id)
+        .map_err(|error| format!("tab close failed: {error}"))?;
+    drop(lock);
+    Ok(reason)
+}
+
+/// Take the candidate's pane lock without waiting and judge the tab idle under it.
+///
+/// On success the lock is returned still HELD, with the idle verdict: the caller acts on the
+/// tab (closes it, or renames it for another agent) before letting go, so nothing can start in
+/// the pane between the verdict and the action.
+fn claim_idle<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+    candidate: &Candidate,
+    workspace_id: &str,
+    recheck: Option<Recheck<'_>>,
+    proc_root: &Path,
+) -> std::result::Result<(String, std::fs::File), String> {
     require_unsplit(candidate)?;
     let lock = pane_lock_path(&candidate.pane_id)
         .and_then(|path| open_lock_file(&path))
@@ -314,11 +334,7 @@ fn try_evict<A: HerdrApi + ?Sized>(
         }
     }
     let reason = judge_shell(client, config, &fresh, proc_root)?;
-    client
-        .close_tab(&candidate.tab_id)
-        .map_err(|error| format!("tab close failed: {error}"))?;
-    drop(lock);
-    Ok(reason)
+    Ok((reason, lock))
 }
 
 fn require_unsplit(candidate: &Candidate) -> std::result::Result<(), String> {
@@ -340,10 +356,13 @@ fn judge_shell<A: HerdrApi + ?Sized>(
     let info = client
         .process_info(&candidate.pane_id)
         .map_err(|error| format!("process-info failed: {error}"))?;
-    let (idle, reason) = judge_idle(
-        &assess_process(&info, config),
-        &scan_session(info.shell_pid, proc_root),
-    );
+    let signal = assess_process(&info, config);
+    if !signal.idle {
+        // The session scan reads every process's `stat`; a shell that does not even own the
+        // foreground is busy whatever it would find.
+        return Err(signal.reason);
+    }
+    let (idle, reason) = judge_idle(&signal, &scan_session(info.shell_pid, proc_root));
     if idle {
         Ok(reason)
     } else {
@@ -441,27 +460,35 @@ fn log_eviction(config: &Config, workspace_id: &str, agent: &str, eviction: &Evi
     }
 }
 
-// --- idle lifetime: retire finished tabs after `idle_tab_ttl_seconds` ---------------------------
+// --- idle retention: retire finished tabs past `idle_tab_ttl_seconds` or `max_idle_tabs` -------
 //
 // The cap above only ever closes a tab to make room for a new one, so a workspace fills to
-// `max_panes` idle shells and stays there. Retirement is the deterministic counterpart: a tab
-// whose last recorded run FINISHED more than the TTL ago is closed as soon as anybody looks --
-// at the end of a run, or from `sweep --idle` on a timer. Everything that makes the cap safe
+// `max_panes` idle shells and stays there. Retirement is the deterministic counterpart, on two
+// bounds: a tab whose last recorded run FINISHED more than the TTL ago is closed, and past
+// `max_idle_tabs` idle tabs the least recently used ones are closed however recent they are --
+// at the end of every run, or from `sweep --idle` on a timer. Everything that makes the cap safe
 // makes this safe, and it reuses those exact parts rather than growing a second notion of idle:
 //
 // * the candidate set is the panes a surviving run record names, in scope by the same
 //   re-derivation `reap` applies ([`scope_of`]). A tab with no record is never a candidate here;
 //   `reap` judges those, and the cap replaces them first;
-// * a pane with ANY record lacking an exit code has work in flight and is kept -- reap's R1,
-//   read the same way, over every record. `from_cache` records count in full here: the flag
+// * a pane whose latest records lack an exit code has work in flight and is kept -- reap's R1,
+//   read over the records after the pane's last finished run (every run is recorded in flight
+//   the moment it is typed; a later finished run proves the earlier ones ended). `from_cache`
+//   records count in full here: the flag
 //   says the TARGET came from the session cache, and the command still ran and finished in this
-//   pane, which is all a finish time needs;
+//   pane, which is all a finish time needs. Such a pane is never COUNTED against
+//   `max_idle_tabs` either, so the idle cap never limits how many commands run at once;
 // * the finish is the completion marker's mtime, noted as `finished_at` by
 //   [`load_run_records`]. A finish that cannot be read is unknown, and an unknown finish keeps
-//   the tab;
+//   the tab and keeps it out of the count;
 // * the close itself is `try_evict`: unsplit tab, pane lock taken without waiting, idle verdict
-//   under that lock immediately before `tab close`. Expiry is only ever the reason to LOOK; it
-//   never authorises the close on its own.
+//   under that lock immediately before `tab close`. Expiry or rank is only ever the reason to
+//   LOOK; it never authorises the close on its own.
+//
+// The idle count is read from the records, not probed: the most recently used `max_idle_tabs`
+// settled tabs are kept without a control call, and only the ones past them are probed, so the
+// sweep at the end of a run costs one listing plus a probe per tab it actually closes.
 
 /// One live pane judged against the idle TTL, in listing order.
 #[derive(Clone, Debug, PartialEq)]
@@ -480,6 +507,9 @@ pub struct TtlCandidate {
     pub recorded: bool,
     /// When the most recent recorded run finished (epoch seconds), when knowable.
     pub finished_at: Option<f64>,
+    /// Whether every recorded run finished and the last finish is known: the tab counts as idle
+    /// for `max_idle_tabs` (subject to scope) and may be ranked by how recently it was used.
+    pub settled: bool,
     /// Whether that finish is more than the TTL before `now`.
     pub expired: bool,
     /// Why the pane is or is not expired, recorded so a kept tab is never silent.
@@ -489,8 +519,8 @@ pub struct TtlCandidate {
 /// Judge every listed pane against the idle TTL. Pure: no client, no clock of its own.
 ///
 /// `records` must be oldest run first, as [`load_run_records`] returns them, so the LAST record
-/// naming a pane is its most recent run. A pane is expired only when every record naming it
-/// recorded an exit code and the most recent one's `finished_at` is a finite number more than
+/// naming a pane is its most recent run. A pane is expired only when its most recent record
+/// recorded an exit code and that record's `finished_at` is a finite number more than
 /// `ttl_seconds` before `now` — exactly at the boundary is within the TTL. Scope is not judged
 /// here; [`retire_idle_tabs`] applies it before anything may close.
 #[must_use]
@@ -526,6 +556,7 @@ pub fn ttl_candidates(
                     tab_panes,
                     recorded: false,
                     finished_at: None,
+                    settled: false,
                     expired: false,
                     reason: "no recorded run".to_owned(),
                 };
@@ -534,10 +565,16 @@ pub fn ttl_candidates(
                 .get("finished_at")
                 .and_then(Value::as_f64)
                 .filter(|finished| finished.is_finite());
+            // Only runs AFTER the pane's last finished one can still be in flight: runs in one pane
+            // are serialised by its lock and by the idle check before each command, so a later
+            // run that finished proves every earlier one ended (or was killed with the shell's
+            // prompt back), even one whose own exit code never arrived.
             let unfinished = mine
                 .iter()
-                .filter(|record| matches!(record.get("exit_code"), None | Some(Value::Null)))
+                .rev()
+                .take_while(|record| matches!(record.get("exit_code"), None | Some(Value::Null)))
                 .count();
+            let settled = unfinished == 0 && finished_at.is_some();
             let (expired, reason) = if unfinished > 0 {
                 (
                     false,
@@ -571,11 +608,32 @@ pub fn ttl_candidates(
                 tab_panes,
                 recorded: true,
                 finished_at,
+                settled,
                 expired,
                 reason,
             }
         })
         .collect()
+}
+
+/// Why an idle sweep closed a tab.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetireCause {
+    /// Its last run finished more than `idle_tab_ttl_seconds` ago.
+    IdleTtl,
+    /// It was less recently used than the `max_idle_tabs` idle tabs kept.
+    MaxIdleTabs,
+}
+
+impl RetireCause {
+    /// The stable spelling used in JSON and the audit log.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdleTtl => "idle_tab_ttl_seconds",
+            Self::MaxIdleTabs => "max_idle_tabs",
+        }
+    }
 }
 
 /// One tab an idle sweep closed (or, in a dry run, would close), and why it may close.
@@ -589,6 +647,8 @@ pub struct RetiredTab {
     pub agent: Option<String>,
     /// Run ID of that run, if recorded.
     pub last_run: Option<String>,
+    /// Which bound selected the tab.
+    pub cause: RetireCause,
     /// Why the tab was judged idle.
     pub reason: String,
 }
@@ -596,9 +656,10 @@ pub struct RetiredTab {
 /// What one idle sweep did.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IdleSweep {
-    /// Tabs actually closed, oldest finish first.
+    /// Tabs actually closed: TTL expiries oldest finish first, then the idle cap's, least
+    /// recently used first.
     pub closed: Vec<RetiredTab>,
-    /// Tabs a dry run would have closed, oldest finish first.
+    /// Tabs a dry run would have closed, in the same order.
     pub would_close: Vec<RetiredTab>,
     /// Recorded panes left open, in listing order, each with its reason.
     pub kept: Vec<(String, String)>,
@@ -606,13 +667,63 @@ pub struct IdleSweep {
     pub listing_error: Option<String>,
 }
 
-/// Close every tab in `config`'s workspace that is idle past the TTL.
+/// List `config`'s workspace: its id and panes, or why that failed.
+fn list_workspace<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+) -> Result<(String, Vec<Pane>)> {
+    match client.workspace_id_for_label(&config.workspace)? {
+        Some(workspace_id) => {
+            let panes = client.panes(Some(&workspace_id))?;
+            Ok((workspace_id, panes))
+        }
+        None => Err(HerdrRunError::unavailable(format!(
+            "herdr has no workspace labelled {}",
+            quote(&config.workspace)
+        ))),
+    }
+}
+
+/// Why a recorded pane is not ours to manage under the current configuration, if it is not.
+fn scope_refusal(verdict: &TtlCandidate, records: &[Value], config: &Config) -> Option<String> {
+    let (in_scope, recorded_tab, tab_label, workspace_label) =
+        scope_of(&verdict.pane_id, records, config);
+    if !in_scope {
+        return Some(format!(
+            "tab {} in workspace {} is not one of ours",
+            quote_optional(tab_label.as_deref()),
+            quote_optional(workspace_label.as_deref())
+        ));
+    }
+    match recorded_tab {
+        Some(recorded_tab) if recorded_tab != verdict.tab_id => Some(format!(
+            "pane was recorded in tab {} but is now in tab {}; refusing to guess",
+            quote(&recorded_tab),
+            quote(&verdict.tab_id)
+        )),
+        _ => None,
+    }
+}
+
+/// Order settled tabs most recently used first: latest finish first, ties in listing order.
+fn most_recent_first(pool: &mut [&TtlCandidate]) {
+    pool.sort_by(|left, right| {
+        right
+            .finished_at
+            .unwrap_or(0.0)
+            .partial_cmp(&left.finished_at.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Close every tab in `config`'s workspace that is idle past the TTL, then every idle tab past
+/// the `max_idle_tabs` most recently used.
 ///
-/// Expired tabs are examined oldest finish first. `limit` bounds how many expired tabs one sweep
-/// EXAMINES (each examination probes a pane and scans `/proc`); the opportunistic sweep at the
-/// end of a run passes a small one so housekeeping can never stretch a caller's command, and
-/// `exclude_pane_id` keeps that sweep from closing the very tab the run just used. A dry run
-/// judges shells exactly as [`survey`] does — without the pane lock — and closes nothing.
+/// Expired tabs are examined oldest finish first. The idle cap then ranks the settled tabs still
+/// open by finish, newest first, keeps the first `max_idle_tabs` of them unprobed, and examines
+/// the rest least recently used first. `exclude_pane_id` keeps the sweep at the end of a run
+/// from closing the very tab the run just used (it still counts as idle). A dry run judges
+/// shells exactly as [`survey`] does — without the pane lock — and closes nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
     client: &A,
@@ -620,22 +731,10 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
     actor: &str,
     now: f64,
     dry_run: bool,
-    limit: Option<usize>,
     exclude_pane_id: Option<&str>,
     proc_root: &Path,
 ) -> IdleSweep {
-    let listing = client
-        .workspace_id_for_label(&config.workspace)
-        .and_then(|found| match found {
-            Some(workspace_id) => client
-                .panes(Some(&workspace_id))
-                .map(|panes| (workspace_id, panes)),
-            None => Err(HerdrRunError::unavailable(format!(
-                "herdr has no workspace labelled {}",
-                quote(&config.workspace)
-            ))),
-        });
-    let (workspace_id, panes) = match listing {
+    let (workspace_id, panes) = match list_workspace(client, config) {
         Ok(listed) => listed,
         Err(error) => {
             return IdleSweep {
@@ -648,45 +747,38 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
     let verdicts = ttl_candidates(&panes, &records, now, config.idle_tab_ttl_seconds);
 
     // First pass: scope and incarnation, which need no probing. Outcomes are keyed by pane so
-    // the kept list can be emitted in listing order even though expired tabs are examined in
-    // finish order.
+    // the kept list can be emitted in listing order even though tabs are examined in finish
+    // order.
     let mut kept_reasons: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut expired: Vec<&TtlCandidate> = Vec::new();
+    let mut pool: Vec<&TtlCandidate> = Vec::new();
     for verdict in &verdicts {
-        if !verdict.recorded || exclude_pane_id == Some(verdict.pane_id.as_str()) {
+        if !verdict.recorded {
             continue;
         }
-        let (in_scope, recorded_tab, tab_label, workspace_label) =
-            scope_of(&verdict.pane_id, &records, config);
-        if !in_scope {
-            kept_reasons.insert(
-                verdict.pane_id.clone(),
-                format!(
-                    "tab {} in workspace {} is not one of ours",
-                    quote_optional(tab_label.as_deref()),
-                    quote_optional(workspace_label.as_deref())
-                ),
-            );
-            continue;
-        }
-        if let Some(recorded_tab) = recorded_tab {
-            if recorded_tab != verdict.tab_id {
-                kept_reasons.insert(
-                    verdict.pane_id.clone(),
-                    format!(
-                        "pane was recorded in tab {} but is now in tab {}; refusing to guess",
-                        quote(&recorded_tab),
-                        quote(&verdict.tab_id)
-                    ),
-                );
-                continue;
+        let excluded = exclude_pane_id == Some(verdict.pane_id.as_str());
+        if let Some(refusal) = scope_refusal(verdict, &records, config) {
+            if !excluded {
+                kept_reasons.insert(verdict.pane_id.clone(), refusal);
             }
+            continue;
+        }
+        if excluded {
+            // The run that just finished here makes this the most recently used idle tab. It
+            // takes its place in the count and is never examined.
+            if verdict.settled && verdict.tab_panes == 1 {
+                pool.push(verdict);
+            }
+            continue;
         }
         if verdict.expired {
             expired.push(verdict);
-        } else {
-            kept_reasons.insert(verdict.pane_id.clone(), verdict.reason.clone());
+            continue;
+        }
+        kept_reasons.insert(verdict.pane_id.clone(), verdict.reason.clone());
+        if verdict.settled && verdict.tab_panes == 1 {
+            pool.push(verdict);
         }
     }
     expired.sort_by(|left, right| {
@@ -696,18 +788,31 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Second pass: the idle cap ranks what the TTL left. Kept within the cap means kept for the
+    // TTL's reason, which is still true; past it, the tab is examined like an expired one.
+    let mut over_cap: Vec<&TtlCandidate> = Vec::new();
+    if config.max_idle_tabs > 0 {
+        most_recent_first(&mut pool);
+        let keep = usize::try_from(config.max_idle_tabs).unwrap_or(usize::MAX);
+        over_cap = pool
+            .into_iter()
+            .skip(keep)
+            .filter(|verdict| exclude_pane_id != Some(verdict.pane_id.as_str()))
+            .collect();
+        over_cap.reverse();
+    }
+    let examine = expired
+        .into_iter()
+        .map(|verdict| (verdict, RetireCause::IdleTtl))
+        .chain(
+            over_cap
+                .into_iter()
+                .map(|verdict| (verdict, RetireCause::MaxIdleTabs)),
+        );
+
     let mut closed = Vec::new();
     let mut would_close = Vec::new();
-    let mut examined = 0usize;
-    for verdict in expired {
-        if let Some(limit) = limit.filter(|limit| examined >= *limit) {
-            kept_reasons.insert(
-                verdict.pane_id.clone(),
-                format!("not examined: this sweep's limit of {limit} tab(s) was reached"),
-            );
-            continue;
-        }
-        examined += 1;
+    for (verdict, cause) in examine {
         let candidate = Candidate {
             pane_id: verdict.pane_id.clone(),
             tab_id: verdict.tab_id.clone(),
@@ -720,20 +825,26 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
             tab_id: verdict.tab_id.clone(),
             agent: verdict.agent.clone(),
             last_run: verdict.last_run.clone(),
+            cause,
             reason,
         };
         if dry_run {
             match require_unsplit(&candidate)
                 .and_then(|()| judge_shell(client, config, &candidate, proc_root))
             {
-                Ok(reason) => would_close.push(retired(reason)),
+                Ok(reason) => {
+                    kept_reasons.remove(&verdict.pane_id);
+                    would_close.push(retired(reason));
+                }
                 Err(reason) => {
                     kept_reasons.insert(verdict.pane_id.clone(), reason);
                 }
             }
             continue;
         }
-        let recheck = |current: &Pane| recheck_still_expired(config, current, verdict, now);
+        let need_expired = cause == RetireCause::IdleTtl;
+        let recheck =
+            |current: &Pane| recheck_unchanged(config, current, verdict, now, need_expired);
         match try_evict(
             client,
             config,
@@ -743,6 +854,7 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
             proc_root,
         ) {
             Ok(reason) => {
+                kept_reasons.remove(&verdict.pane_id);
                 let tab = retired(reason);
                 log_retirement(config, &workspace_id, actor, &tab);
                 closed.push(tab);
@@ -769,18 +881,20 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
     }
 }
 
-/// Re-judge expiry under the pane lock, from a fresh spool load.
+/// Re-judge a candidate under the pane lock, from a fresh spool load.
 ///
-/// The sweep judged every candidate from one load, then examines them oldest first; a run
-/// that starts AND finishes on a later candidate while earlier ones are examined would leave
-/// it idle with a free lock, and the stale verdict would close a tab whose last run finished
-/// seconds ago. Reloading here — lock held, close imminent — is the same discipline the shell
-/// verdict already follows.
-fn recheck_still_expired(
+/// The sweep judged every candidate from one load, then examines them one by one; a run that
+/// starts AND finishes on a later candidate while earlier ones are examined would leave it idle
+/// with a free lock, and the stale verdict would close (or hand over) a tab whose last run
+/// finished seconds ago. Reloading here — lock held, action imminent — is the same discipline
+/// the shell verdict already follows. `need_expired` is the TTL's test; the idle cap and reuse
+/// need only that every run in the pane finished and its last run is still the one ranked.
+fn recheck_unchanged(
     config: &Config,
     current: &Pane,
     expected: &TtlCandidate,
     now: f64,
+    need_expired: bool,
 ) -> Option<String> {
     let fresh_records = load_run_records(config);
     let fresh = ttl_candidates(
@@ -794,25 +908,10 @@ fn recheck_still_expired(
     if !fresh.recorded {
         return Some("no recorded run".to_owned());
     }
-    let (in_scope, recorded_tab, tab_label, workspace_label) =
-        scope_of(&fresh.pane_id, &fresh_records, config);
-    if !in_scope {
-        return Some(format!(
-            "tab {} in workspace {} is not one of ours",
-            quote_optional(tab_label.as_deref()),
-            quote_optional(workspace_label.as_deref())
-        ));
+    if let Some(refusal) = scope_refusal(&fresh, &fresh_records, config) {
+        return Some(refusal);
     }
-    if let Some(recorded_tab) = recorded_tab {
-        if recorded_tab != fresh.tab_id {
-            return Some(format!(
-                "pane was recorded in tab {} but is now in tab {}; refusing to guess",
-                quote(&recorded_tab),
-                quote(&fresh.tab_id)
-            ));
-        }
-    }
-    if !fresh.expired {
+    if (need_expired && !fresh.expired) || !fresh.settled {
         return Some(fresh.reason);
     }
     if fresh.last_run != expected.last_run {
@@ -826,8 +925,18 @@ fn recheck_still_expired(
 
 fn log_retirement(config: &Config, workspace_id: &str, actor: &str, retired: &RetiredTab) {
     let last_run_at = retired.last_run.as_deref().and_then(run_time);
+    let bound = match retired.cause {
+        RetireCause::IdleTtl => format!(
+            "idle past the {}s TTL",
+            number_text(config.idle_tab_ttl_seconds)
+        ),
+        RetireCause::MaxIdleTabs => format!(
+            "less recently used than the {} idle tab(s) max_idle_tabs keeps",
+            config.max_idle_tabs
+        ),
+    };
     output::diagnostic(&format!(
-        "herdr-run: retired idle tab {} (pane {}, agent {}, last run {}) idle past the {}s TTL",
+        "herdr-run: retired idle tab {} (pane {}, agent {}, last run {}) {bound}",
         retired.tab_id,
         retired.pane_id,
         retired
@@ -836,7 +945,6 @@ fn log_retirement(config: &Config, workspace_id: &str, actor: &str, retired: &Re
             .filter(|name| !name.is_empty())
             .unwrap_or("unknown"),
         last_run_at.as_deref().unwrap_or("none recorded"),
-        number_text(config.idle_tab_ttl_seconds),
     ));
     let mut fields = Map::new();
     fields.insert("pane_id".to_owned(), Value::from(retired.pane_id.clone()));
@@ -845,6 +953,7 @@ fn log_retirement(config: &Config, workspace_id: &str, actor: &str, retired: &Re
     fields.insert("retired_agent".to_owned(), retired.agent.clone().into());
     fields.insert("last_run".to_owned(), retired.last_run.clone().into());
     fields.insert("last_run_at".to_owned(), last_run_at.into());
+    fields.insert("cause".to_owned(), Value::from(retired.cause.as_str()));
     let log = audit::audit_path(
         Path::new(&config.project_root),
         Path::new(&config.spool_dir),
@@ -855,6 +964,234 @@ fn log_retirement(config: &Config, workspace_id: &str, actor: &str, retired: &Re
         &format!("tab close {}", retired.tab_id),
         "RETIRED",
         &retired.reason,
+        fields,
+    ) {
+        output::diagnostic(&format!(
+            "herdr-run: WARNING: could not append audit record to {}",
+            log.display()
+        ));
+    }
+}
+
+// --- reuse: a new agent takes over the least recently used idle tab ----------------------------
+//
+// When a new agent needs a tab and the workspace already holds `max_idle_tabs` idle ones, a new
+// tab would only push the least recently used of them out at the end of the run. Renaming that
+// tab for the new agent reaches the same population without a close and a fresh shell. Below
+// the cap a new tab is opened as before, so an agent that pauses between commands finds its
+// own tab again. A command shares nothing with the previous one in the pane: the runner types
+// `command sh -c '...cd <dir> && <argv>...'` and collects output from its own spool files.
+//
+// The tab is claimed exactly as a close is: unsplit, pane lock taken without waiting, every run
+// in the pane finished and its last run unchanged from a fresh spool load, shell provably idle,
+// all under the lock. Before the rename the live tab must still carry its recorded label and the
+// shell must be the recorded process ([`same_incarnation`]), because a command is about to be
+// typed there. The lock is then KEPT and handed to the run ([`PaneReservation`]): between the
+// verdict and the command nothing else can type into the pane. The previous owner's cached target
+// still names the pane; its runner re-checks the tab's label once it holds the pane lock
+// ([`crate::runner::execute`]) and resolves again when the tab went to another agent.
+
+/// A pane lock held from the idle verdict that handed a tab over through the command typed into
+/// it. Shared, because the resolved target is cloned; the lock goes when the last copy does.
+#[derive(Clone, Debug)]
+pub struct PaneReservation {
+    /// The pane the lock was taken on.
+    pub pane_id: String,
+    /// The open, exclusively locked pane lock file.
+    pub lock: std::sync::Arc<std::fs::File>,
+}
+
+impl PartialEq for PaneReservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.pane_id == other.pane_id && std::sync::Arc::ptr_eq(&self.lock, &other.lock)
+    }
+}
+
+impl Eq for PaneReservation {}
+
+/// A recorded idle tab renamed for a new agent, with its pane lock still held.
+#[derive(Debug)]
+pub struct Reuse {
+    /// The tab handed over.
+    pub tab_id: String,
+    /// Its one pane.
+    pub pane_id: String,
+    /// The pane lock, held since the idle verdict.
+    pub reservation: PaneReservation,
+}
+
+/// Take over the least recently used idle tab for `agent` instead of opening another one, when
+/// the workspace already holds `max_idle_tabs` idle tabs.
+///
+/// `None` when the cap is disabled, when fewer idle tabs than the cap exist, when nothing can be
+/// listed, or when no candidate survives the under-lock verdict and the rename: the caller then
+/// opens a tab as it always has. Counted and ranked exactly as [`retire_idle_tabs`] counts and
+/// ranks, except that expired tabs count too: they are idle, and the least recently used.
+pub fn reuse_idle_tab<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+    workspace_id: &str,
+    agent: &str,
+    tab_label: &str,
+    now: f64,
+    proc_root: &Path,
+) -> Option<Reuse> {
+    if config.max_idle_tabs == 0 {
+        return None;
+    }
+    let panes = client.panes(Some(workspace_id)).ok()?;
+    let records = load_run_records(config);
+    let verdicts = ttl_candidates(&panes, &records, now, config.idle_tab_ttl_seconds);
+    let mut pool: Vec<&TtlCandidate> = verdicts
+        .iter()
+        .filter(|verdict| verdict.settled && verdict.tab_panes == 1)
+        .filter(|verdict| scope_refusal(verdict, &records, config).is_none())
+        .collect();
+    if (pool.len() as u64) < config.max_idle_tabs {
+        return None;
+    }
+    most_recent_first(&mut pool);
+    pool.reverse();
+    for verdict in pool {
+        let candidate = Candidate {
+            pane_id: verdict.pane_id.clone(),
+            tab_id: verdict.tab_id.clone(),
+            last_run: verdict.last_run.clone(),
+            agent: verdict.agent.clone(),
+            tab_panes: verdict.tab_panes,
+        };
+        let recheck = |current: &Pane| recheck_unchanged(config, current, verdict, now, false);
+        let Ok((reason, lock)) = claim_idle(
+            client,
+            config,
+            &candidate,
+            workspace_id,
+            Some(&recheck),
+            proc_root,
+        ) else {
+            continue;
+        };
+        if same_incarnation(client, config, &candidate, workspace_id, proc_root).is_err() {
+            continue;
+        }
+        if client.rename_tab(&candidate.tab_id, tab_label).is_err() {
+            // The control call may have failed AFTER the rename took (a timeout): look the label
+            // up rather than guess. Took: the tab is ours, lock still held. Did not: stop here,
+            // because opening a tab under a label that may already be applied would leave two.
+            match client.tab_id_for_label(workspace_id, tab_label) {
+                Ok(Some(found)) if found == candidate.tab_id => {}
+                _ => return None,
+            }
+        }
+        log_reuse(config, workspace_id, agent, tab_label, &candidate, &reason);
+        return Some(Reuse {
+            tab_id: candidate.tab_id,
+            pane_id: candidate.pane_id.clone(),
+            reservation: PaneReservation {
+                pane_id: candidate.pane_id,
+                lock: std::sync::Arc::new(lock),
+            },
+        });
+    }
+    None
+}
+
+/// Whether the live tab and shell are the very ones the pane's last run record describes.
+///
+/// Scope is judged from the records, and a record names a pane and tab by ID only. Before a tab
+/// is handed to another agent -- a command is about to be typed into it -- the live tab must
+/// still carry the label the record gave it (a human may have renamed and adopted it), and the
+/// pane's shell must be the recorded process: same pid, same start tick, same boot. A pane or
+/// tab ID Herdr reissued after a restart, or a shell that was replaced, fails here. Anything
+/// that cannot be read fails too.
+fn same_incarnation<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+    candidate: &Candidate,
+    workspace_id: &str,
+    proc_root: &Path,
+) -> std::result::Result<(), String> {
+    let records = load_run_records(config);
+    let latest = records
+        .iter()
+        .rfind(|record| record.get("pane_id").and_then(Value::as_str) == Some(&candidate.pane_id))
+        .ok_or("no recorded run")?;
+    let label = latest
+        .get("tab")
+        .and_then(|tab| tab.get("label"))
+        .and_then(Value::as_str)
+        .ok_or("the last run record names no tab label")?;
+    match client.tab_id_for_label(workspace_id, label) {
+        Ok(Some(found)) if found == candidate.tab_id => {}
+        _ => {
+            return Err(format!(
+                "tab {} no longer carries the label {}",
+                candidate.tab_id,
+                quote(label)
+            ))
+        }
+    }
+    let readiness = latest
+        .get("readiness")
+        .ok_or("the last run record names no shell")?;
+    let recorded_pid = readiness.get("shell_pid").and_then(Value::as_i64);
+    let recorded_ticks = readiness.get("shell_start_ticks").and_then(Value::as_u64);
+    let recorded_boot = readiness.get("boot_id").and_then(Value::as_str);
+    let info = client
+        .process_info(&candidate.pane_id)
+        .map_err(|error| format!("process-info failed: {error}"))?;
+    let live_ticks = crate::identity::process_start_ticks(info.shell_pid, proc_root);
+    let live_boot = crate::identity::current_boot_id(proc_root);
+    if recorded_pid != Some(info.shell_pid)
+        || recorded_ticks.is_none()
+        || recorded_ticks != live_ticks
+        || recorded_boot.is_none()
+        || recorded_boot != live_boot.as_deref()
+    {
+        return Err("the pane's shell is not the one its last run recorded".to_owned());
+    }
+    Ok(())
+}
+
+fn log_reuse(
+    config: &Config,
+    workspace_id: &str,
+    agent: &str,
+    tab_label: &str,
+    candidate: &Candidate,
+    reason: &str,
+) {
+    let last_run_at = candidate.last_run.as_deref().and_then(run_time);
+    output::diagnostic(&format!(
+        "herdr-run: reused idle tab {} (pane {}, agent {}, last run {}) for '{agent}' rather than open another past max_idle_tabs {}",
+        candidate.tab_id,
+        candidate.pane_id,
+        candidate
+            .agent
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown"),
+        last_run_at.as_deref().unwrap_or("none recorded"),
+        config.max_idle_tabs,
+    ));
+    let mut fields = Map::new();
+    fields.insert("pane_id".to_owned(), Value::from(candidate.pane_id.clone()));
+    fields.insert("tab_id".to_owned(), Value::from(candidate.tab_id.clone()));
+    fields.insert("tab_label".to_owned(), Value::from(tab_label));
+    fields.insert("workspace_id".to_owned(), Value::from(workspace_id));
+    fields.insert("previous_agent".to_owned(), candidate.agent.clone().into());
+    fields.insert("last_run".to_owned(), candidate.last_run.clone().into());
+    fields.insert("last_run_at".to_owned(), last_run_at.into());
+    let log = audit::audit_path(
+        Path::new(&config.project_root),
+        Path::new(&config.spool_dir),
+    );
+    if !audit::record(
+        &log,
+        agent,
+        &format!("tab rename {}", candidate.tab_id),
+        "REUSED",
+        reason,
         fields,
     ) {
         output::diagnostic(&format!(
@@ -929,7 +1266,11 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(
             directory.join("stat"),
-            format!("{pid} (proc {pid}) S 1 {pid} {sid} 0 0 0"),
+            // Field 22, the start tick, is the pid times seven: enough for an identity check.
+            format!(
+                "{pid} (proc {pid}) S 1 {pid} {sid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {} 0",
+                pid * 7
+            ),
         )
         .unwrap();
     }
@@ -960,6 +1301,13 @@ mod tests {
         /// on — a tab split or moved between a sweep's listing and its under-lock re-list.
         listings: Mutex<usize>,
         relist_add: Mutex<Vec<Pane>>,
+        /// Every `tab rename`, as (tab, label), and tabs whose rename fails.
+        renamed: Mutex<Vec<(String, String)>>,
+        failing_rename: Mutex<BTreeSet<String>>,
+        /// Tabs whose rename is applied but reported as failed, as a control-call timeout does.
+        lying_rename: Mutex<BTreeSet<String>>,
+        /// Tab labels, for the label lookups a takeover makes.
+        labels: Mutex<BTreeMap<String, String>>,
     }
 
     impl Fake {
@@ -996,14 +1344,40 @@ mod tests {
         fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
             unreachable!()
         }
-        fn tab_id_for_label(&self, _workspace_id: &str, _label: &str) -> Result<Option<String>> {
-            unreachable!()
+        fn tab_id_for_label(&self, _workspace_id: &str, label: &str) -> Result<Option<String>> {
+            Ok(self
+                .labels
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, value)| value.as_str() == label)
+                .map(|(tab, _)| tab.clone()))
         }
         fn create_tab(&self, _workspace_id: &str, _label: &str, _cwd: &str) -> Result<String> {
             unreachable!()
         }
-        fn rename_tab(&self, _tab_id: &str, _label: &str) -> Result<()> {
-            unreachable!()
+        fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
+            if self.lying_rename.lock().unwrap().contains(tab_id) {
+                self.labels
+                    .lock()
+                    .unwrap()
+                    .insert(tab_id.to_owned(), label.to_owned());
+                return Err(HerdrRunError::unavailable("tab rename: timed out"));
+            }
+            if self.failing_rename.lock().unwrap().contains(tab_id) {
+                return Err(HerdrRunError::unavailable(
+                    "tab rename: herdr is not answering",
+                ));
+            }
+            self.renamed
+                .lock()
+                .unwrap()
+                .push((tab_id.to_owned(), label.to_owned()));
+            self.labels
+                .lock()
+                .unwrap()
+                .insert(tab_id.to_owned(), label.to_owned());
+            Ok(())
         }
         fn close_tab(&self, tab_id: &str) -> Result<()> {
             if self.failing_close.lock().unwrap().contains(tab_id) {
@@ -1174,6 +1548,7 @@ mod tests {
             "tab_panes": candidate.tab_panes,
             "recorded": candidate.recorded,
             "finished_at": candidate.finished_at,
+            "settled": candidate.settled,
             "expired": candidate.expired,
             "reason": candidate.reason,
         })
@@ -1284,7 +1659,6 @@ mod tests {
             NOW,
             false,
             None,
-            None,
             &world.proc_root,
         );
         assert_eq!(sweep.closed.len(), 1);
@@ -1343,7 +1717,6 @@ mod tests {
             NOW,
             true,
             None,
-            None,
             &world.proc_root,
         );
         assert!(dry.closed.is_empty());
@@ -1367,7 +1740,6 @@ mod tests {
             "tester",
             NOW,
             false,
-            None,
             None,
             &world.proc_root,
         );
@@ -1407,7 +1779,6 @@ mod tests {
             NOW,
             false,
             None,
-            None,
             &world.proc_root,
         );
         assert!(sweep.closed.is_empty());
@@ -1444,6 +1815,407 @@ mod tests {
         fs::remove_dir_all(proc_root).unwrap();
     }
 
+    // --- idle cap and reuse ---------------------------------------------------------------------
+
+    /// Plant `count` settled idle tabs finishing one minute apart (oldest first) and return
+    /// their panes, oldest first.
+    fn idle_tabs(world: &World, prefix: &str, count: usize, first_pid: i64) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                let pid = first_pid + index as i64;
+                let pane = world.tab(&format!("{prefix}{index}"), Some(pid));
+                write_finished(
+                    &world.project,
+                    &format!("r-{prefix}{index}"),
+                    &pane,
+                    &format!("tab-{pane}"),
+                    &format!("{prefix}{index}"),
+                    NOW - 240.0 + 60.0 * index as f64,
+                    Some(0),
+                    true,
+                );
+                record_shell(world, &format!("r-{prefix}{index}"), pid, pid * 7);
+                world
+                    .fake
+                    .labels
+                    .lock()
+                    .unwrap()
+                    .insert(format!("tab-{pane}"), format!("{prefix}{index}"));
+                pane
+            })
+            .collect()
+    }
+
+    /// Add the shell identity a real run records to an already planted run record.
+    fn record_shell(world: &World, run_id: &str, pid: i64, ticks: i64) {
+        let path = world
+            .project
+            .join(".herdr-run")
+            .join("runs")
+            .join(run_id)
+            .join("meta.json");
+        let mut record: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        record["readiness"] =
+            json!({"shell_pid": pid, "shell_start_ticks": ticks, "boot_id": "boot-test"});
+        fs::write(&path, record.to_string()).unwrap();
+    }
+
+    fn sweep(world: &World, config: &Config, dry_run: bool, exclude: Option<&str>) -> IdleSweep {
+        retire_idle_tabs(
+            &world.fake,
+            config,
+            "tester",
+            NOW,
+            dry_run,
+            exclude,
+            &world.proc_root,
+        )
+    }
+
+    #[test]
+    fn past_max_idle_tabs_the_least_recently_used_idle_tabs_are_retired() {
+        let world = World::new("cap-close");
+        let panes = idle_tabs(&world, "a", 5, 301);
+        let config = Config {
+            max_idle_tabs: 3,
+            ..world.config.clone()
+        };
+        let result = sweep(&world, &config, false, None);
+        let closed: Vec<_> = result
+            .closed
+            .iter()
+            .map(|tab| tab.pane_id.clone())
+            .collect();
+        assert_eq!(closed, [panes[0].clone(), panes[1].clone()]);
+        assert!(result
+            .closed
+            .iter()
+            .all(|tab| tab.cause == RetireCause::MaxIdleTabs));
+        let kept: std::collections::HashMap<_, _> = result.kept.into_iter().collect();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[&panes[4]], "last run finished within the idle TTL");
+        let audit = world.audit();
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[0]["cause"], "max_idle_tabs");
+        assert_eq!(audit[0]["retired_agent"], "a0");
+
+        // Already within the cap: a second sweep closes nothing.
+        assert!(sweep(&world, &config, false, None).closed.is_empty());
+    }
+
+    #[test]
+    fn tabs_with_a_command_in_flight_are_never_counted_against_the_idle_cap() {
+        let world = World::new("cap-in-flight");
+        let idle = idle_tabs(&world, "idle", 2, 311);
+        for index in 0..3 {
+            let pane = world.tab(&format!("busy{index}"), None);
+            write_finished(
+                &world.project,
+                &format!("r-busy{index}"),
+                &pane,
+                &format!("tab-{pane}"),
+                &format!("busy{index}"),
+                NOW - 10.0,
+                None,
+                false,
+            );
+        }
+        let config = Config {
+            max_idle_tabs: 2,
+            ..world.config.clone()
+        };
+        let result = sweep(&world, &config, false, None);
+        assert!(result.closed.is_empty(), "{:?}", result.closed);
+        assert!(
+            world.fake.probed().is_empty(),
+            "kept tabs are counted, never probed"
+        );
+        assert_eq!(idle.len(), 2);
+    }
+
+    #[test]
+    fn a_busy_shell_past_the_idle_cap_is_kept_and_reported() {
+        let world = World::new("cap-busy");
+        let old_busy = world.tab("old-busy", None);
+        write_finished(
+            &world.project,
+            "r-old-busy",
+            &old_busy,
+            &format!("tab-{old_busy}"),
+            "human",
+            NOW - 280.0,
+            Some(0),
+            true,
+        );
+        let newer = idle_tabs(&world, "n", 1, 321);
+        let config = Config {
+            max_idle_tabs: 1,
+            ..world.config.clone()
+        };
+        let result = sweep(&world, &config, false, None);
+        assert!(result.closed.is_empty());
+        let kept: std::collections::HashMap<_, _> = result.kept.into_iter().collect();
+        assert!(
+            kept[&old_busy].contains("running: git"),
+            "{}",
+            kept[&old_busy]
+        );
+        assert_eq!(newer.len(), 1);
+    }
+
+    #[test]
+    fn the_tab_a_run_just_used_counts_as_idle_but_is_never_closed() {
+        let world = World::new("cap-exclude");
+        let panes = idle_tabs(&world, "e", 3, 331);
+        let config = Config {
+            max_idle_tabs: 1,
+            ..world.config.clone()
+        };
+        // The newest is the run's own: it fills the one slot, so both older tabs go.
+        let result = sweep(&world, &config, false, Some(&panes[2]));
+        let closed: Vec<_> = result
+            .closed
+            .iter()
+            .map(|tab| tab.pane_id.clone())
+            .collect();
+        assert_eq!(closed, [panes[0].clone(), panes[1].clone()]);
+        assert!(!result.kept.iter().any(|(pane, _)| pane == &panes[2]));
+        assert!(!world.fake.probed().contains(&panes[2]));
+    }
+
+    #[test]
+    fn a_zero_idle_cap_is_disabled_and_a_dry_run_names_the_cause() {
+        let world = World::new("cap-zero-dry");
+        let panes = idle_tabs(&world, "z", 3, 341);
+        let disabled = Config {
+            max_idle_tabs: 0,
+            ..world.config.clone()
+        };
+        assert!(sweep(&world, &disabled, false, None).closed.is_empty());
+        let capped = Config {
+            max_idle_tabs: 2,
+            ..world.config.clone()
+        };
+        let dry = sweep(&world, &capped, true, None);
+        assert!(dry.closed.is_empty());
+        assert_eq!(dry.would_close.len(), 1);
+        assert_eq!(dry.would_close[0].pane_id, panes[0]);
+        assert_eq!(dry.would_close[0].cause, RetireCause::MaxIdleTabs);
+        assert!(!dry.kept.iter().any(|(pane, _)| pane == &panes[0]));
+        assert!(world.fake.closed().is_empty());
+    }
+
+    #[test]
+    fn ttl_expiries_and_the_idle_cap_close_together_each_with_its_cause() {
+        let world = World::new("cap-and-ttl");
+        let expired = world.tab("expired", Some(351));
+        write_finished(
+            &world.project,
+            "r-expired",
+            &expired,
+            &format!("tab-{expired}"),
+            "old",
+            NOW - 5000.0,
+            Some(0),
+            true,
+        );
+        let fresh = idle_tabs(&world, "f", 3, 352);
+        let config = Config {
+            max_idle_tabs: 2,
+            ..world.config.clone()
+        };
+        let result = sweep(&world, &config, false, None);
+        let closed: Vec<_> = result
+            .closed
+            .iter()
+            .map(|tab| (tab.pane_id.clone(), tab.cause))
+            .collect();
+        assert_eq!(
+            closed,
+            [
+                (expired, RetireCause::IdleTtl),
+                (fresh[0].clone(), RetireCause::MaxIdleTabs)
+            ]
+        );
+    }
+
+    fn reuse(world: &World, config: &Config, label: &str) -> Option<Reuse> {
+        reuse_idle_tab(
+            &world.fake,
+            config,
+            "w1",
+            label,
+            label,
+            NOW,
+            &world.proc_root,
+        )
+    }
+
+    #[test]
+    fn below_the_idle_cap_no_tab_is_taken_over() {
+        let world = World::new("reuse-below");
+        idle_tabs(&world, "b", 2, 361);
+        let config = Config {
+            max_idle_tabs: 3,
+            ..world.config.clone()
+        };
+        assert!(reuse(&world, &config, "newcomer").is_none());
+        assert!(world.fake.renamed.lock().unwrap().is_empty());
+        assert!(world.fake.probed().is_empty());
+        let disabled = Config {
+            max_idle_tabs: 0,
+            ..world.config.clone()
+        };
+        idle_tabs(&world, "c", 3, 365);
+        assert!(reuse(&world, &disabled, "newcomer").is_none());
+    }
+
+    #[test]
+    fn at_the_idle_cap_the_least_recently_used_idle_tab_is_renamed_and_stays_locked() {
+        let world = World::new("reuse-at-cap");
+        let panes = idle_tabs(&world, "r", 3, 371);
+        let config = Config {
+            max_idle_tabs: 3,
+            ..world.config.clone()
+        };
+        let taken = reuse(&world, &config, "newcomer").expect("the oldest idle tab");
+        assert_eq!(taken.pane_id, panes[0]);
+        assert_eq!(taken.tab_id, format!("tab-{}", panes[0]));
+        assert_eq!(
+            *world.fake.renamed.lock().unwrap(),
+            [(format!("tab-{}", panes[0]), "newcomer".to_owned())]
+        );
+        // The verdict's lock is still held: nobody else can take the pane before the run.
+        let other = open_lock_file(&pane_lock_path(&panes[0]).unwrap()).unwrap();
+        assert_eq!(
+            other.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let audit = world.audit();
+        assert_eq!(audit[0]["verdict"], "REUSED");
+        assert_eq!(audit[0]["previous_agent"], "r0");
+        assert_eq!(audit[0]["tab_label"], "newcomer");
+        assert!(world.fake.closed().is_empty());
+        drop(taken);
+        // Polled briefly: a process another test forks in parallel holds a copy of every open
+        // descriptor, this lock's included, until it reaches `exec` and close-on-exec drops it.
+        let released = (0..200).any(|_| {
+            other.try_lock_exclusive().is_ok() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(released, "the reservation's lock outlived it");
+    }
+
+    #[test]
+    fn reuse_skips_busy_and_locked_tabs() {
+        let world = World::new("reuse-skips");
+        let busy = world.tab("busy", None);
+        write_finished(
+            &world.project,
+            "r-busy",
+            &busy,
+            &format!("tab-{busy}"),
+            "human",
+            NOW - 500.0,
+            Some(0),
+            true,
+        );
+        let panes = idle_tabs(&world, "s", 3, 381);
+        let config = Config {
+            max_idle_tabs: 2,
+            ..world.config.clone()
+        };
+        let held = open_lock_file(&pane_lock_path(&panes[0]).unwrap()).unwrap();
+        held.try_lock_exclusive().unwrap();
+        let taken = reuse(&world, &config, "newcomer").expect("the second idle tab");
+        assert_eq!(taken.pane_id, panes[1]);
+        drop(held);
+    }
+
+    #[test]
+    fn a_failed_rename_stops_reuse_unless_the_label_took() {
+        let world = World::new("reuse-rename");
+        let panes = idle_tabs(&world, "f", 2, 386);
+        let config = Config {
+            max_idle_tabs: 2,
+            ..world.config.clone()
+        };
+        // Refused outright: never try the next tab, the caller opens one of its own.
+        world
+            .fake
+            .failing_rename
+            .lock()
+            .unwrap()
+            .insert(format!("tab-{}", panes[0]));
+        assert!(reuse(&world, &config, "newcomer").is_none());
+        assert!(world.fake.renamed.lock().unwrap().is_empty());
+        // Applied but reported as failed: the label lookup finds it, and the tab is ours.
+        // A fresh world: the first attempt's pane lock may outlive its drop for a moment in a
+        // process another test forks in parallel (see the reservation test above).
+        let world = World::new("reuse-rename-took");
+        let panes = idle_tabs(&world, "g", 2, 388);
+        let config = Config {
+            max_idle_tabs: 2,
+            ..world.config.clone()
+        };
+        world
+            .fake
+            .lying_rename
+            .lock()
+            .unwrap()
+            .insert(format!("tab-{}", panes[0]));
+        let taken = reuse(&world, &config, "newcomer").expect("the rename took");
+        assert_eq!(taken.pane_id, panes[0]);
+    }
+
+    #[test]
+    fn a_tab_relabelled_or_a_shell_replaced_since_its_record_is_never_taken_over() {
+        let world = World::new("reuse-incarnation");
+        let panes = idle_tabs(&world, "i", 2, 391);
+        let config = Config {
+            max_idle_tabs: 2,
+            ..world.config.clone()
+        };
+        // A human renamed the oldest tab; the shell in the next is not the recorded one.
+        world
+            .fake
+            .labels
+            .lock()
+            .unwrap()
+            .insert(format!("tab-{}", panes[0]), "mine-now".to_owned());
+        record_shell(&world, "r-i1", 392, 1);
+        assert!(reuse(&world, &config, "newcomer").is_none());
+        assert!(world.fake.renamed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tabs_out_of_scope_or_in_flight_never_fill_the_idle_pool() {
+        let world = World::new("reuse-scope");
+        let mine = idle_tabs(&world, "m", 1, 395);
+        let foreign = world.tab("foreign", Some(396));
+        let directory = world
+            .project
+            .join(".herdr-run")
+            .join("runs")
+            .join("r-foreign");
+        fs::create_dir_all(&directory).unwrap();
+        let record = json!({
+            "agent": "x", "pane_id": foreign, "run_id": "r-foreign", "exit_code": 0,
+            "tab": {"id": format!("tab-{foreign}"), "label": "x"},
+            "workspace": {"id": "w1", "label": "someone-elses"},
+        });
+        fs::write(directory.join("meta.json"), record.to_string()).unwrap();
+        fs::write(directory.join("exit_code"), "0\n").unwrap();
+        let config = Config {
+            max_idle_tabs: 2,
+            ..world.config.clone()
+        };
+        assert!(reuse(&world, &config, "newcomer").is_none());
+        assert_eq!(mine.len(), 1);
+    }
+
     struct World {
         project: PathBuf,
         proc_root: PathBuf,
@@ -1455,8 +2227,14 @@ mod tests {
         fn new(name: &str) -> Self {
             let project = temporary_root(name);
             let proc_root = project.join("proc");
-            fs::create_dir_all(&proc_root).unwrap();
-            let config = config(&project);
+            fs::create_dir_all(proc_root.join("sys/kernel/random")).unwrap();
+            fs::write(proc_root.join(crate::identity::BOOT_ID_PATH), "boot-test\n").unwrap();
+            // The TTL cases below were written around a fifteen-minute TTL; pinned here so the
+            // shipped default can move without rewriting every boundary.
+            let config = Config {
+                idle_tab_ttl_seconds: 900.0,
+                ..config(&project)
+            };
             Self {
                 project,
                 proc_root,

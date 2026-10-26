@@ -25,6 +25,7 @@ from herdr_run.errors import HerdrUnavailable
 from herdr_run.evict import (
     Candidate,
     Eviction,
+    RetireCause,
     SessionScan,
     TtlCandidate,
     describe_skipped,
@@ -33,6 +34,7 @@ from herdr_run.evict import (
     lru_candidates,
     parse_session_id,
     retire_idle_tabs,
+    reuse_idle_tab,
     run_time,
     scan_session,
     survey,
@@ -123,7 +125,8 @@ class World:
         self.project = tmp_path / "project"
         self.project.mkdir()
         self.proc = tmp_path / "proc"
-        self.proc.mkdir()
+        (self.proc / "sys" / "kernel" / "random").mkdir(parents=True)
+        (self.proc / "sys" / "kernel" / "random" / "boot_id").write_text("boot-test\n")
         self.config = Config(project_root=str(self.project))
         self.fake = FakeHerdrClient()
         tabs = {f"t-{pane}": FakeTab(f"t-{pane}", pane, "w1", [pane]) for pane in panes}
@@ -139,7 +142,11 @@ class World:
     def write_stat(self, pid: int, sid: int) -> None:
         directory = self.proc / str(pid)
         directory.mkdir(exist_ok=True)
-        (directory / "stat").write_text(f"{pid} (bash) S 1 {pid} {sid} 34816 {pid} 4194560\n")
+        # Field 22, the start tick, is the pid times seven: enough for an identity check.
+        padding = " ".join(["0"] * 12)
+        (directory / "stat").write_text(
+            f"{pid} (bash) S 1 {pid} {sid} 34816 {pid} 4194560 {padding} {pid * 7} 0\n"
+        )
 
     def busy(self, pane: str) -> None:
         """The pane's shell is running a command in the foreground."""
@@ -641,7 +648,8 @@ def test_a_dry_run_judges_and_closes_nothing(tmp_path: Path) -> None:
     assert world.audit_entries() == []
 
 
-def test_the_limit_bounds_examination_oldest_finish_first(tmp_path: Path) -> None:
+def test_every_expired_tab_is_examined_oldest_finish_first(tmp_path: Path) -> None:
+    # No bound on the sweep: a bound of four per run is how 30 tabs came to sit idle past the TTL.
     world = TtlWorld(tmp_path, ["newest", "oldest", "middle"])
     for pane, run_id, age in (
         ("newest", "20261001T120000-n-1", 1000),
@@ -650,11 +658,224 @@ def test_the_limit_bounds_examination_oldest_finish_first(tmp_path: Path) -> Non
     ):
         world.idle(pane)
         world.finished(pane, run_id, pane, NOW - age)
-    result = world.retire(limit=2)
-    assert [tab.pane_id for tab in result.closed] == ["oldest", "middle"]
-    assert result.kept == (
-        ("newest", "not examined: this sweep's limit of 2 tab(s) was reached"),
+    result = world.retire()
+    assert [tab.pane_id for tab in result.closed] == ["oldest", "middle", "newest"]
+    assert {tab.cause for tab in result.closed} == {RetireCause.IDLE_TTL}
+    assert result.kept == ()
+
+
+# --- the idle cap and reuse ------------------------------------------------------------------------
+
+
+def _idle_tabs(world: TtlWorld, prefix: str, count: int) -> list[str]:
+    """Settled idle tabs finishing one minute apart, oldest first, all within the TTL."""
+    panes = []
+    for index in range(count):
+        pane = f"{prefix}{index}"
+        pid = world.idle(pane)
+        world.finished(pane, f"r-{pane}", pane, NOW - 240 + 60 * index)
+        _record_shell(world, f"r-{pane}", pid, pid * 7)
+        panes.append(pane)
+    return panes
+
+
+def _record_shell(world: TtlWorld, run_id: str, pid: int, ticks: int) -> None:
+    """Add the shell identity a real run records to an already planted run record."""
+    path = world.project / ".herdr-run" / "runs" / run_id / "meta.json"
+    record = json.loads(path.read_text())
+    record["readiness"] = {"shell_pid": pid, "shell_start_ticks": ticks, "boot_id": "boot-test"}
+    path.write_text(json.dumps(record))
+
+
+def test_past_max_idle_tabs_the_least_recently_used_idle_tabs_are_retired(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = TtlWorld(tmp_path, [f"a{index}" for index in range(5)])
+    panes = _idle_tabs(world, "a", 5)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=3)
+    result = world.retire()
+    assert [tab.pane_id for tab in result.closed] == panes[:2]
+    assert {tab.cause for tab in result.closed} == {RetireCause.MAX_IDLE_TABS}
+    assert dict(result.kept) == {pane: "last run finished within the idle TTL" for pane in panes[2:]}
+    entries = world.audit_entries()
+    assert [entry["cause"] for entry in entries] == ["max_idle_tabs", "max_idle_tabs"]
+    assert entries[0]["retired_agent"] == "a0"
+    assert "less recently used than the 3 idle tab(s) max_idle_tabs keeps" in capsys.readouterr().err
+    assert world.retire().closed == ()
+
+
+def test_tabs_with_a_command_in_flight_are_never_counted_against_the_idle_cap(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["idle0", "idle1", "busy0", "busy1", "busy2"])
+    _idle_tabs(world, "idle", 2)
+    for index in range(3):
+        world.finished(f"busy{index}", f"r-busy{index}", f"busy{index}", NOW - 10, exit_code=None, marker=False)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=2)
+    result = world.retire()
+    assert result.closed == ()
+    assert world.fake.probed == [], "kept tabs are counted, never probed"
+
+
+def test_a_busy_shell_past_the_idle_cap_is_kept_and_reported(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["human", "n0"])
+    world.finished("human", "r-human", "human", NOW - 280)
+    _idle_tabs(world, "n", 1)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=1)
+    result = world.retire()
+    assert result.closed == ()
+    assert "running: git" in dict(result.kept)["human"]
+
+
+def test_the_tab_a_run_just_used_counts_as_idle_but_is_never_closed(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["e0", "e1", "e2"])
+    panes = _idle_tabs(world, "e", 3)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=1)
+    result = world.retire(exclude_pane_id=panes[2])
+    assert [tab.pane_id for tab in result.closed] == panes[:2]
+    assert panes[2] not in dict(result.kept)
+    assert panes[2] not in world.fake.probed
+
+
+def test_a_zero_idle_cap_is_disabled_and_a_dry_run_names_the_cause(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["z0", "z1", "z2"])
+    panes = _idle_tabs(world, "z", 3)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=0)
+    assert world.retire().closed == ()
+    world.config = dataclasses.replace(world.config, max_idle_tabs=2)
+    dry = world.retire(dry_run=True)
+    assert dry.closed == ()
+    assert [(tab.pane_id, tab.cause) for tab in dry.would_close] == [(panes[0], RetireCause.MAX_IDLE_TABS)]
+    assert panes[0] not in dict(dry.kept)
+    assert world.fake.closed_tabs == []
+
+
+def test_ttl_expiries_and_the_idle_cap_close_together_each_with_its_cause(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["expired", "f0", "f1", "f2"])
+    world.idle("expired")
+    world.finished("expired", "r-expired", "old", NOW - 5000)
+    panes = _idle_tabs(world, "f", 3)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=2)
+    result = world.retire()
+    assert [(tab.pane_id, tab.cause) for tab in result.closed] == [
+        ("expired", RetireCause.IDLE_TTL),
+        (panes[0], RetireCause.MAX_IDLE_TABS),
+    ]
+
+
+def _reuse(world: TtlWorld, label: str = "newcomer"):  # type: ignore[no-untyped-def]
+    return reuse_idle_tab(
+        cast(HerdrClient, world.fake), world.config, "w1", label, label, now=NOW, proc_root=str(world.proc)
     )
+
+
+def test_below_the_idle_cap_no_tab_is_taken_over(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["b0", "b1", "c0", "c1", "c2"])
+    _idle_tabs(world, "b", 2)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=3)
+    assert _reuse(world) is None
+    assert not any(call.startswith("rename_tab") for call in world.fake.calls)
+    assert world.fake.probed == []
+    _idle_tabs(world, "c", 3)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=0)
+    assert _reuse(world) is None
+
+
+def test_at_the_idle_cap_the_least_recently_used_idle_tab_is_renamed_and_stays_locked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = TtlWorld(tmp_path, ["r0", "r1", "r2"])
+    panes = _idle_tabs(world, "r", 3)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=3)
+    taken = _reuse(world)
+    assert taken is not None
+    assert (taken.pane_id, taken.tab_id) == (panes[0], f"t-{panes[0]}")
+    assert world.fake.workspaces["w1"].tabs[f"t-{panes[0]}"].label == "newcomer"
+    with state.open_lock_file(state.pane_lock_path(panes[0])) as other:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        entries = world.audit_entries()
+        assert entries[0]["verdict"] == "REUSED"
+        assert entries[0]["previous_agent"] == "r0"
+        assert entries[0]["tab_label"] == "newcomer"
+        assert world.fake.closed_tabs == []
+        assert "reused idle tab t-r0" in capsys.readouterr().err
+        taken.reservation.lock.close()
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+class _RenameClient(FakeHerdrClient):
+    """``tab rename`` refused for some tabs, and applied-but-reported-failed for others."""
+
+    failing_rename: set[str]
+    lying_rename: set[str]
+
+    def rename_tab(self, tab_id: str, label: str) -> None:
+        if tab_id in self.failing_rename:
+            raise HerdrUnavailable("tab rename: herdr is not answering")
+        super().rename_tab(tab_id, label)
+        if tab_id in self.lying_rename:
+            raise HerdrUnavailable("tab rename: timed out")
+
+
+def _with_rename_client(world: TtlWorld) -> _RenameClient:
+    client = _RenameClient()
+    client.workspaces = world.fake.workspaces
+    client.busy_panes = world.fake.busy_panes
+    client.shell_pids = world.fake.shell_pids
+    client.failing_rename = set()
+    client.lying_rename = set()
+    world.fake = client
+    return client
+
+
+def test_reuse_skips_busy_and_locked_tabs(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["human", "s0", "s1", "s2"])
+    world.finished("human", "r-human", "human", NOW - 500)
+    panes = _idle_tabs(world, "s", 3)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=2)
+    with state.open_lock_file(state.pane_lock_path(panes[0])) as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        taken = _reuse(world)
+        assert taken is not None and taken.pane_id == panes[1]
+        taken.reservation.lock.close()
+
+
+def test_a_failed_rename_stops_reuse_unless_the_label_took(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["f0", "f1"])
+    client = _with_rename_client(world)
+    panes = _idle_tabs(world, "f", 2)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=2)
+    # Refused outright: never try the next tab, the caller opens one of its own.
+    client.failing_rename.add(f"t-{panes[0]}")
+    assert _reuse(world) is None
+    assert [call for call in client.calls if call.startswith("rename_tab")] == []
+    # Applied but reported as failed: the label lookup finds it, and the tab is ours.
+    client.failing_rename.clear()
+    client.lying_rename.add(f"t-{panes[0]}")
+    taken = _reuse(world)
+    assert taken is not None and taken.pane_id == panes[0]
+    taken.reservation.lock.close()
+
+
+def test_a_tab_relabelled_or_a_shell_replaced_since_its_record_is_never_taken_over(
+    tmp_path: Path,
+) -> None:
+    world = TtlWorld(tmp_path, ["i0", "i1"])
+    panes = _idle_tabs(world, "i", 2)
+    world.config = dataclasses.replace(world.config, max_idle_tabs=2)
+    # A human renamed the oldest tab; the shell in the next is not the recorded one.
+    world.fake.workspaces["w1"].tabs[f"t-{panes[0]}"].label = "mine-now"
+    _record_shell(world, f"r-{panes[1]}", world.fake.shell_pids[panes[1]], 1)
+    assert _reuse(world) is None
+    assert not any(call.startswith("rename_tab") for call in world.fake.calls)
+
+
+def test_tabs_out_of_scope_or_in_flight_never_fill_the_idle_pool(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["m0", "foreign"])
+    _idle_tabs(world, "m", 1)
+    world.idle("foreign")
+    world.finished("foreign", "r-foreign", "x", NOW - 100, workspace="someone-elses")
+    world.config = dataclasses.replace(world.config, max_idle_tabs=2)
+    assert _reuse(world) is None
 
 
 def test_an_out_of_scope_record_and_the_excluded_pane_are_kept(tmp_path: Path) -> None:

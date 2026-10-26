@@ -44,13 +44,14 @@ from herdr_run.errors import (
     ConfigError,
     HerdrRunError,
     HerdrUnavailable,
+    PaneBusy,
     Refused,
     RunTimeout,
 )
 from herdr_run.evict import RetiredTab, describe_skipped, retire_idle_tabs, run_time, survey_workspace
 from herdr_run import output
 from herdr_run.readiness import assess, infer_prompt_tail
-from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
+from herdr_run.runner import TAB_REASSIGNED, RunResult, execute, read_output_bytes, write_meta
 from herdr_run.session import resolve_target, tab_label_for
 from herdr_run.sweep import load_run_records, measure_occupancy, sweep
 from herdr_run.textfmt import (
@@ -777,15 +778,17 @@ _SUBCOMMAND_HELP: dict[str, str] = {
     ),
     "sweep": (
         "usage: herdr-run [GLOBAL OPTIONS] sweep --idle [--dry-run]\n"
-        "\nClose command tabs idle past idle_tab_ttl_seconds: every recorded run in the tab\n"
-        "finished, the last one more than the TTL ago, and its shell provably idle — the\n"
-        "same verdict the pane cap takes, under the pane lock, immediately before the\n"
-        "close. A tab running a command, holding a background job, locked by another\n"
-        "runner, or split into several panes is never closed. Tabs no run record names\n"
-        "are left to 'reap'. Prints JSON: what closed, and why everything else stayed.\n"
-        "With idle_tab_ttl_seconds 0 the sweep is disabled and closes nothing. Runs also\n"
-        "sweep a bounded number of tabs when they finish; this subcommand is the same\n"
-        "sweep on demand, for a timer.\n"
+        "\nClose idle command tabs on two bounds. idle_tab_ttl_seconds: every recorded run\n"
+        "in the tab finished, the last one more than the TTL ago. max_idle_tabs: past that\n"
+        "many idle tabs, the least recently used are closed however recent they are; tabs\n"
+        "with a command in flight are never counted. Either way the shell must be provably\n"
+        "idle — the same verdict the pane cap takes, under the pane lock, immediately\n"
+        "before the close. A tab running a command, holding a background job, locked by\n"
+        "another runner, or split into several panes is never closed. Tabs no run record\n"
+        "names are left to 'reap'. Prints JSON: what closed and which bound chose it\n"
+        "(cause), and why everything else stayed. A bound set to 0 is disabled. Every\n"
+        "run performs this same sweep when it finishes; this subcommand is for a timer on\n"
+        "a host where runs are rare.\n"
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
         "  --idle                sweep by idle lifetime (required; the only sweep there is)\n"
@@ -1084,6 +1087,7 @@ def _cmd_config(config: Config, agent: str) -> int:
         "retention_days": config.retention_days,
         "max_panes": config.max_panes,
         "idle_tab_ttl_seconds": config.idle_tab_ttl_seconds,
+        "max_idle_tabs": config.max_idle_tabs,
         "ready_timeout_seconds": config.ready_timeout_seconds,
         "readiness": config.readiness,
         "prompt_tail": config.prompt_tail,
@@ -1268,6 +1272,7 @@ def _retired_document(retired: RetiredTab) -> dict[str, object]:
         "pane_id": retired.pane_id,
         "tab_id": retired.tab_id,
         "agent": retired.agent,
+        "cause": retired.cause,
         "last_run": retired.last_run,
         "last_run_at": run_time(retired.last_run) if retired.last_run is not None else None,
         "reason": retired.reason,
@@ -1275,10 +1280,11 @@ def _retired_document(retired: RetiredTab) -> dict[str, object]:
 
 
 def _cmd_sweep(config: Config, environ: Mapping[str, str], options: _SweepOptions) -> int:
-    """Close the workspace's tabs that are idle past ``idle_tab_ttl_seconds``.
+    """Close the workspace's tabs that are idle past ``idle_tab_ttl_seconds`` or ``max_idle_tabs``.
 
-    The explicit form of the sweep a finished run performs in bounded form, for a timer or an
-    operator. Unlike ``reap`` this ACTS: expiry only selects the candidates, and each close is
+    The explicit form of the sweep every finished run performs, for a timer on a host where runs
+    are rare, or an operator. Unlike ``reap`` this ACTS: expiry or rank only selects the
+    candidates, and each close is
     still the cap's verdict -- shell provably idle, taken under the pane lock immediately before
     ``tab close`` (:func:`herdr_run.evict.retire_idle_tabs`). Every recorded pane that stays
     open carries its reason, because a sweep that closes nothing must say whether nothing was
@@ -1296,6 +1302,7 @@ def _cmd_sweep(config: Config, environ: Mapping[str, str], options: _SweepOption
     document = {
         "workspace": config.workspace,
         "idle_tab_ttl_seconds": config.idle_tab_ttl_seconds,
+        "max_idle_tabs": config.max_idle_tabs,
         "dry_run": options.dry_run,
         "listing_error": sweep_result.listing_error,
         "counts": {
@@ -1314,23 +1321,19 @@ def _cmd_sweep(config: Config, environ: Mapping[str, str], options: _SweepOption
     return 0
 
 
-#: How many expired tabs one finished run may examine while sweeping opportunistically. Each
-#: examination probes a pane and scans ``/proc``; the bound limits that probing after a
-#: caller's command (the listing and record read before it are bounded by the workspace and
-#: by retention), and leftovers are picked up by the next run or by ``herdr-run sweep --idle``.
-_OPPORTUNISTIC_SWEEP_LIMIT = 4
-
-
 def _sweep_idle_best_effort(
     client: HerdrClient, config: Config, agent: str, pane_id: str
 ) -> None:
-    """Retire idle-expired tabs at the end of a run, without ever changing its result.
+    """Retire idle tabs at the end of a run, without ever changing its result.
 
-    Pruned-on-write, like retention, so it cannot silently stop the way a timer can -- but
-    bounded (:data:`_OPPORTUNISTIC_SWEEP_LIMIT`) and never the tab the run just used. A failure
-    to tidy is a warning, exactly as a failure to write the run's metadata is.
+    Pruned-on-write, like retention, so it cannot silently stop the way a timer can, and never
+    the tab the run just used. The whole sweep, every time: it costs one listing and a spool
+    read, plus one probe per tab it actually closes, because the tabs it keeps are counted from
+    the run records rather than probed. Tabs left behind by a bound here were how a workspace
+    came to hold 30 tabs idle far past the TTL. A failure to tidy is a warning, exactly as a
+    failure to write the run's metadata is.
     """
-    if config.idle_tab_ttl_seconds <= 0:
+    if config.idle_tab_ttl_seconds <= 0 and config.max_idle_tabs <= 0:
         return
     try:
         retire_idle_tabs(
@@ -1338,7 +1341,6 @@ def _sweep_idle_best_effort(
             config,
             actor=agent,
             now=time.time(),
-            limit=_OPPORTUNISTIC_SWEEP_LIMIT,
             exclude_pane_id=pane_id,
         )
     except Exception as exc:  # housekeeping: nothing it hits may mask a completed command
@@ -1569,16 +1571,35 @@ def _run_command(
         client = _client(config, environ)
         cwd = _resolved_cwd(config, options.cwd)
         target = resolve_target(client, config, agent, use_cache=not options.no_cache)
-        result = execute(
-            client,
-            config,
-            target,
-            admission,
-            agent=agent,
-            cwd=cwd,
-            ready_timeout=ready_timeout,
-            timeout=timeout,
-        )
+        try:
+            result = execute(
+                client,
+                config,
+                target,
+                admission,
+                agent=agent,
+                cwd=cwd,
+                ready_timeout=ready_timeout,
+                timeout=timeout,
+            )
+        except PaneBusy as exc:
+            # Idle tabs are closed or handed to other agents between resolution and the pane lock;
+            # the runner refuses such a tab before typing anything, and one fresh resolution (never
+            # from the cache, which named the lost tab) finds or makes this agent's tab.
+            if TAB_REASSIGNED not in str(exc):
+                raise
+            output.diagnostic(f"herdr-run: {exc} Resolving the tab again.")
+            target = resolve_target(client, config, agent, use_cache=False)
+            result = execute(
+                client,
+                config,
+                target,
+                admission,
+                agent=agent,
+                cwd=cwd,
+                ready_timeout=ready_timeout,
+                timeout=timeout,
+            )
     except RunTimeout as exc:
         # Emit whatever the command managed to print BEFORE reporting the timeout. Dropping it would
         # make a partially-successful run look like one that produced nothing, and a caller cannot

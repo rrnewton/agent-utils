@@ -33,6 +33,7 @@ __all__ = [
     "CARGO_ALWAYS_DENIED",
     "CONFIG_FILENAMES",
     "DEFAULT_IDLE_TAB_TTL_SECONDS",
+    "DEFAULT_MAX_IDLE_TABS",
     "DEFAULT_MAX_PANES",
     "KNOWN_KEYS",
     "MAX_PANE_CAP",
@@ -90,10 +91,20 @@ MAX_PANE_CAP = 1_000_000
 #: shells and stays there -- measured 2026-10-21, one host's server held 123 panes, 64 of them idle
 #: shells left by finished commands, and was unresponsive under load. A tab whose last recorded run
 #: finished longer ago than this, and whose shell is provably idle by the same rules the cap uses
-#: (:mod:`herdr_run.evict`), is closed: opportunistically at the end of a run and by
-#: ``herdr-run sweep --idle``. Fifteen minutes is far longer than an agent pauses between commands
-#: in one piece of work, and a closed tab costs its agent one fresh shell, never its files.
-DEFAULT_IDLE_TAB_TTL_SECONDS = 900.0
+#: (:mod:`herdr_run.evict`), is closed: at the end of every run and by ``herdr-run sweep --idle``.
+#: Five minutes is longer than an agent pauses between commands in one piece of work, and a closed
+#: tab costs its agent one fresh shell, never its files. It was fifteen until 2026-10-25, when a
+#: workspace was found holding 30 tabs idle far past it.
+DEFAULT_IDLE_TAB_TTL_SECONDS = 300.0
+
+#: Default number of idle command tabs a workspace keeps, however recently they were used. The TTL
+#: bounds how LONG a finished tab lingers, not how MANY linger: a burst of agents leaves one idle
+#: tab each for the whole TTL, and every one of them is another pane the Herdr server tracks. Past
+#: this many, the least recently used idle tabs are closed at the end of every run and by
+#: ``herdr-run sweep --idle``, and a new agent takes over the least recently used idle tab instead
+#: of opening another (:func:`herdr_run.evict.reuse_idle_tab`). Tabs running commands are never
+#: counted, so the cap never limits how many commands run at once; ``max_panes`` does that.
+DEFAULT_MAX_IDLE_TABS = 3
 
 #: Largest command/readiness timeout accepted from either configuration or the CLI. Keeping this
 #: comfortably below platform ``Instant``/``time.monotonic`` limits means a finite value can never
@@ -277,6 +288,12 @@ class Config:
     #: ``retention_days`` bounds applies here too.
     idle_tab_ttl_seconds: float = DEFAULT_IDLE_TAB_TTL_SECONDS
 
+    #: Idle command tabs kept per workspace, least recently used closed or reused first
+    #: (:func:`herdr_run.evict.retire_idle_tabs`, :func:`herdr_run.evict.reuse_idle_tab`). ``0``
+    #: disables the cap, leaving only the TTL and ``max_panes`` to close idle tabs. Counted from the
+    #: run records: a tab with a command in flight is never counted.
+    max_idle_tabs: int = DEFAULT_MAX_IDLE_TABS
+
     #: Seconds to wait for the pane to become idle before giving up with :class:`PaneBusy`.
     ready_timeout_seconds: float = 0.0
 
@@ -332,6 +349,7 @@ KNOWN_KEYS: tuple[str, ...] = (
     "retention_days",
     "max_panes",
     "idle_tab_ttl_seconds",
+    "max_idle_tabs",
     "ready_timeout_seconds",
     "readiness",
     "prompt_tail",
@@ -665,6 +683,8 @@ def _parse_config(
             config = replace(config, max_panes=_bounded_count(raw, where, MAX_PANE_CAP, ""))
         elif key == "idle_tab_ttl_seconds":
             config = replace(config, idle_tab_ttl_seconds=_seconds(raw, where))
+        elif key == "max_idle_tabs":
+            config = replace(config, max_idle_tabs=_bounded_count(raw, where, MAX_PANE_CAP, ""))
         elif key == "ready_timeout_seconds":
             config = replace(config, ready_timeout_seconds=_seconds(raw, where))
         elif key == "readiness":

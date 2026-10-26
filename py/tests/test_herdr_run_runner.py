@@ -7,10 +7,12 @@ are actually executed.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shlex
 import threading
+import time
 from typing import cast
 
 import pytest
@@ -22,6 +24,7 @@ from herdr_run.config import MAX_TIMEOUT_SECONDS, Config
 from herdr_run.errors import ConfigError, HerdrUnavailable, PaneBusy, RunTimeout
 from herdr_run.reap import evidence_from_runs
 from herdr_run.runner import (
+    TAB_REASSIGNED,
     RunResult,
     build_shell_command,
     execute,
@@ -31,7 +34,7 @@ from herdr_run.runner import (
     wait_ready,
     write_meta,
 )
-from herdr_run.session import resolve_target
+from herdr_run.session import Target, resolve_target
 from tests.herdr_fake import FakeHerdrClient
 
 
@@ -463,6 +466,39 @@ def test_waits_for_a_pane_that_becomes_free(tmp_path: object) -> None:
         _client(fake), config, target, prompt_tail=None, timeout=10.0, sleep=fake_sleep, poll_interval=0.0
     )
     assert readiness.ready is True
+
+
+def test_a_tab_that_lost_its_label_after_resolution_is_refused_before_typing(tmp_path: object) -> None:
+    root = str(tmp_path)
+    config = _config(root)
+    fake = FakeHerdrClient()
+    target = resolve_target(cast(HerdrClient, fake), config, "agent")
+    fake.rename_tab(target.tab_id, "handed-to-someone-else")
+    admission = admit("git status", config)
+    with pytest.raises(PaneBusy, match=TAB_REASSIGNED):
+        execute(
+            cast(HerdrClient, fake), config, target, admission, agent="agent", cwd=root,
+            ready_timeout=0.0, timeout=5.0,
+        )
+    assert fake.commands == []
+
+
+def test_a_tab_taken_over_at_resolution_runs_under_the_lock_its_verdict_held(tmp_path: object) -> None:
+    """The reservation IS the pane lock: no wait, no second lock, released when the run is done."""
+    from herdr_run.evict import PaneReservation
+    from herdr_run.runner import _pane_lock
+
+    pane_id = "pane-reserved"
+    held = state.open_lock_file(state.pane_lock_path(pane_id))
+    fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    target = Target("w1", "t1", pane_id, "agent-cmds", "agent", (), False, PaneReservation(pane_id, held))
+    with _pane_lock(target, timeout=0.0, monotonic=time.monotonic, sleep=time.sleep, poll_interval=0.0):
+        with state.open_lock_file(state.pane_lock_path(pane_id)) as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert held.closed
+    with state.open_lock_file(state.pane_lock_path(pane_id)) as other:
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def test_per_pane_lock_prevents_two_concurrent_launches(tmp_path: object) -> None:

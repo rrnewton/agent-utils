@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -257,9 +258,22 @@ fn wait_ready_with<A: HerdrApi + ?Sized>(
     )))
 }
 
-fn acquire_pane_lock(target: &Target, timeout: f64) -> Result<File> {
-    let path = pane_lock_path(&target.pane_id)?;
-    let file = open_lock_file(&path)?;
+/// Lock the target's pane, on the lock file resolution already holds when it took the tab over.
+///
+/// A tab handed over from another agent was judged idle under its pane lock, and that lock was
+/// kept ([`crate::evict::reuse_idle_tab`]); letting go of it here and locking again would open
+/// a window for the previous owner's cached target to type into the pane first. Locking the
+/// reserved file again is a no-op while it is held and a real lock if it was released, so a
+/// reservation that was already used up is never mistaken for a held lock.
+fn acquire_pane_lock(target: &Target, timeout: f64) -> Result<Arc<File>> {
+    let file = match target
+        .reservation
+        .as_ref()
+        .filter(|held| held.pane_id == target.pane_id)
+    {
+        Some(held) => Arc::clone(&held.lock),
+        None => Arc::new(open_lock_file(&pane_lock_path(&target.pane_id)?)?),
+    };
     let deadline = Instant::now().checked_add(seconds_duration(timeout));
     loop {
         match file.try_lock_exclusive() {
@@ -280,6 +294,27 @@ fn acquire_pane_lock(target: &Target, timeout: f64) -> Result<File> {
                 )));
             }
         }
+    }
+}
+
+/// Words in the refusal [`verify_tab_under_lock`] returns, by which a caller recognises it and
+/// resolves the agent's tab again.
+pub const TAB_REASSIGNED: &str = "was closed or handed to another agent after it was resolved";
+
+/// Refuse, before anything is typed, when the target's tab no longer carries its label.
+///
+/// A target is resolved under the session lock but the pane lock is taken afterwards, and idle
+/// tabs are closed or handed to other agents in between ([`crate::evict`]): a cached target can
+/// name a tab that another agent now owns. Checked here, with the pane lock held, nothing can
+/// change it before the command is typed. A refusal says [`TAB_REASSIGNED`]; the CLI resolves
+/// again once.
+fn verify_tab_under_lock<A: HerdrApi + ?Sized>(client: &A, target: &Target) -> Result<()> {
+    match client.tab_id_for_label(&target.workspace_id, &target.tab_label)? {
+        Some(found) if found == target.tab_id => Ok(()),
+        _ => Err(HerdrRunError::busy(format!(
+            "tab {} ({}) {TAB_REASSIGNED}. Nothing was executed.",
+            target.tab_id, target.tab_label
+        ))),
     }
 }
 
@@ -358,6 +393,7 @@ pub fn execute<A: HerdrApi + ?Sized>(
     validate_timeout(timeout, "command timeout")?;
     let lock_started = Instant::now();
     let lock = acquire_pane_lock(target, ready_timeout)?;
+    verify_tab_under_lock(client, target)?;
     let elapsed = lock_started.elapsed().as_secs_f64();
     let remaining_ready = (ready_timeout - elapsed).max(0.0);
     let prompt_tail = infer_prompt_tail(config, None);
@@ -388,6 +424,22 @@ pub fn execute<A: HerdrApi + ?Sized>(
         &target.pane_id,
         &build_shell_command(admission, &spool, cwd)?,
     )?;
+    // Recorded as IN FLIGHT the moment it is typed, and rewritten when it finishes: the run records
+    // are how the idle sweeps count idle tabs, and a command that left no record until it finished
+    // would have its tab counted (and ranked) as idle by its PREVIOUS run. Best effort, like the
+    // record a timeout writes.
+    write_meta_document(
+        &run_id,
+        &spool,
+        agent,
+        admission,
+        config,
+        target,
+        &readiness,
+        Value::Null,
+        0.0,
+    )
+    .ok();
     let deadline = started.checked_add(seconds_duration(timeout));
     loop {
         if let Some(exit_code) = read_exit_code(&spool.exit_code) {
@@ -405,7 +457,7 @@ pub fn execute<A: HerdrApi + ?Sized>(
                 readiness,
                 duration_seconds: started.elapsed().as_secs_f64(),
             };
-            FileExt::unlock(&lock).ok();
+            FileExt::unlock(&*lock).ok();
             return Ok(result);
         }
         if deadline.is_some_and(|value| Instant::now() >= value) {
@@ -413,13 +465,13 @@ pub fn execute<A: HerdrApi + ?Sized>(
         }
         thread::sleep(Duration::from_millis(250));
     }
-    FileExt::unlock(&lock).ok();
-    // Record the run BEFORE reporting the timeout, with a null exit code. This is the only writer
-    // that can produce the state [`crate::reap`] calls IN FLIGHT, and it is the literal truth: the
-    // command is still running in a pane this process does not own. Without it the reaper's "the
-    // agent is thinking" rule has no way of ever being true, and the one pane that provably still
-    // has work in it would be the one pane leaving no evidence. Best effort: a failure to record
-    // must not replace the timeout the caller actually needs to hear about.
+    FileExt::unlock(&*lock).ok();
+    // Record the run BEFORE reporting the timeout, still with a null exit code. That is the state
+    // [`crate::reap`] calls IN FLIGHT, and it is the literal truth: the command is still running in
+    // a pane this process does not own. Without it the reaper's "the agent is thinking" rule could
+    // not outlive this process, and the one pane that provably still has work in it would be the
+    // one pane leaving no evidence. Best effort: a failure to record must not replace the timeout
+    // the caller actually needs to hear about.
     write_meta_document(
         &run_id,
         &spool,
@@ -506,7 +558,8 @@ pub fn write_meta(
     )
 }
 
-/// Write one run record. `exit_code` is `Value::Null` only for a run still running in the pane.
+/// Write one run record. `exit_code` is `Value::Null` only for a run still running in the pane:
+/// just typed, or past its timeout.
 #[allow(clippy::too_many_arguments)]
 fn write_meta_document(
     run_id: &str,
@@ -553,12 +606,17 @@ fn write_meta_document(
     });
     let mut encoded = json_pretty(&document).into_bytes();
     encoded.push(b'\n');
-    create_private_file(&path, &encoded).map_err(|error| {
-        HerdrRunError::unavailable(format!(
-            "cannot write run metadata {}: {error}",
-            path.display()
-        ))
-    })?;
+    // Written beside and renamed into place: the record is written twice per run (in flight,
+    // then finished) and read by other runners' sweeps meanwhile, which must never see it torn.
+    let staging = spool.directory.join(".meta.json.tmp");
+    create_private_file(&staging, &encoded)
+        .and_then(|()| fs::rename(&staging, &path))
+        .map_err(|error| {
+            HerdrRunError::unavailable(format!(
+                "cannot write run metadata {}: {error}",
+                path.display()
+            ))
+        })?;
     Ok(path)
 }
 
@@ -653,8 +711,9 @@ mod tests {
         fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
             unreachable!()
         }
-        fn tab_id_for_label(&self, _workspace: &str, _label: &str) -> Result<Option<String>> {
-            Ok(None)
+        /// The one tab the test target names, still carrying its label.
+        fn tab_id_for_label(&self, _workspace: &str, label: &str) -> Result<Option<String>> {
+            Ok((label == "agent").then(|| "t1".to_owned()))
         }
         fn create_tab(&self, _workspace: &str, _label: &str, _cwd: &str) -> Result<String> {
             unreachable!()
@@ -703,6 +762,7 @@ mod tests {
             tab_label: "agent".to_owned(),
             created: Vec::new(),
             from_cache: false,
+            reservation: None,
         }
     }
 
@@ -752,6 +812,44 @@ mod tests {
         let second = acquire_pane_lock(&target, 0.0).unwrap_err();
         assert_eq!(second.kind(), crate::error::ErrorKind::Busy);
         drop(first);
+    }
+
+    #[test]
+    fn a_tab_that_lost_its_label_after_resolution_is_refused_before_typing() {
+        let target = target();
+        verify_tab_under_lock(&FakeApi, &target).expect("still labelled");
+        let mut moved = target.clone();
+        moved.tab_label = "handed-to-someone-else".to_owned();
+        let refused = verify_tab_under_lock(&FakeApi, &moved).unwrap_err();
+        assert_eq!(refused.kind(), crate::error::ErrorKind::Busy);
+        assert!(refused.message().contains(TAB_REASSIGNED), "{refused}");
+        let mut renumbered = target;
+        renumbered.tab_id = "t9".to_owned();
+        assert!(verify_tab_under_lock(&FakeApi, &renumbered).is_err());
+    }
+
+    #[test]
+    fn a_tab_taken_over_at_resolution_runs_under_the_lock_its_verdict_held() {
+        let mut target = target();
+        target.pane_id = format!("pane-reserved-{}", std::process::id());
+        let held = open_lock_file(&pane_lock_path(&target.pane_id).unwrap()).unwrap();
+        held.try_lock_exclusive().unwrap();
+        let held = Arc::new(held);
+        target.reservation = Some(crate::evict::PaneReservation {
+            pane_id: target.pane_id.clone(),
+            lock: Arc::clone(&held),
+        });
+        // No wait at all, and no second lock: the run continues under the one already held.
+        let lock = acquire_pane_lock(&target, 0.0).expect("the reservation is the lock");
+        assert!(Arc::ptr_eq(&lock, &held));
+
+        // A reservation for some other pane is never mistaken for this one's.
+        let mut elsewhere = target.clone();
+        elsewhere.pane_id = format!("pane-unreserved-{}", std::process::id());
+        let other = open_lock_file(&pane_lock_path(&elsewhere.pane_id).unwrap()).unwrap();
+        other.try_lock_exclusive().unwrap();
+        let refused = acquire_pane_lock(&elsewhere, 0.0).unwrap_err();
+        assert_eq!(refused.kind(), crate::error::ErrorKind::Busy);
     }
 
     /// A pane whose shell is THIS process, so a recorded identity binds against the real `/proc`.

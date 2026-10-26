@@ -49,11 +49,21 @@ pub const MAX_PANE_CAP: u64 = 1_000_000;
 /// workspace fills to `max_panes` idle shells and stays there -- measured 2026-10-21, one host's
 /// server held 123 panes, 64 of them idle shells left by finished commands, and was unresponsive
 /// under load. A tab whose last recorded run finished longer ago than this, and whose shell is
-/// provably idle by the same rules the cap uses ([`crate::evict`]), is closed: opportunistically
-/// at the end of a run and by `sweep --idle`. Fifteen minutes is far longer than an agent pauses
-/// between commands in one piece of work, and a closed tab costs its agent one fresh shell,
-/// never its files.
-pub const DEFAULT_IDLE_TAB_TTL_SECONDS: f64 = 900.0;
+/// provably idle by the same rules the cap uses ([`crate::evict`]), is closed: at the end of
+/// every run and by `sweep --idle`. Five minutes is longer than an agent pauses between commands
+/// in one piece of work, and a closed tab costs its agent one fresh shell, never its files. It
+/// was fifteen until 2026-10-25, when a workspace was found holding 30 tabs idle far past it.
+pub const DEFAULT_IDLE_TAB_TTL_SECONDS: f64 = 300.0;
+
+/// Default number of idle command tabs a workspace keeps, however recently they were used.
+///
+/// The TTL bounds how LONG a finished tab lingers, not how MANY linger: a burst of agents leaves
+/// one idle tab each for the whole TTL, and every one of them is another pane the Herdr server
+/// tracks. Past this many, the least recently used idle tabs are closed at the end of every run
+/// and by `sweep --idle`, and a new agent takes over the least recently used idle tab instead
+/// of opening another ([`crate::evict::reuse_idle_tab`]). Tabs running commands are never
+/// counted, so the cap never limits how many commands run at once; `max_panes` does that.
+pub const DEFAULT_MAX_IDLE_TABS: u64 = 3;
 
 /// Cargo options refused in every argument position whatever `deny_global` says.
 ///
@@ -120,6 +130,12 @@ pub struct Config {
     /// Only tabs a surviving run record names are considered, so the window `retention_days`
     /// bounds applies here too.
     pub idle_tab_ttl_seconds: f64,
+    /// Idle command tabs kept per workspace, least recently used closed or reused first
+    /// ([`crate::evict::retire_idle_tabs`], [`crate::evict::reuse_idle_tab`]); `0` disables the
+    /// cap, leaving only the TTL and `max_panes` to close idle tabs.
+    ///
+    /// Counted from the run records: a tab with a command in flight is never counted.
+    pub max_idle_tabs: u64,
     /// Maximum seconds to wait for a pane to become ready.
     pub ready_timeout_seconds: f64,
     /// Readiness policy: `both` or `process`.
@@ -228,6 +244,7 @@ impl Default for Config {
             retention_days: crate::retention::RETENTION_DAYS,
             max_panes: DEFAULT_MAX_PANES,
             idle_tab_ttl_seconds: DEFAULT_IDLE_TAB_TTL_SECONDS,
+            max_idle_tabs: DEFAULT_MAX_IDLE_TABS,
             ready_timeout_seconds: 0.0,
             readiness: "both".to_owned(),
             prompt_tail: None,
@@ -245,7 +262,7 @@ impl Default for Config {
 /// Public because it is also the definition of "every knob", which the generated
 /// `.herdr-run.yaml` has to cover for the user guide to be able to point at that file instead of
 /// restating it.
-pub const KNOWN_KEYS: [&str; 22] = [
+pub const KNOWN_KEYS: [&str; 23] = [
     "workspace",
     "tab_name",
     "cwd",
@@ -262,6 +279,7 @@ pub const KNOWN_KEYS: [&str; 22] = [
     "retention_days",
     "max_panes",
     "idle_tab_ttl_seconds",
+    "max_idle_tabs",
     "ready_timeout_seconds",
     "readiness",
     "prompt_tail",
@@ -936,6 +954,9 @@ pub fn parse_config(
             "idle_tab_ttl_seconds" => {
                 config.idle_tab_ttl_seconds = require_seconds(value, &where_)?;
             }
+            "max_idle_tabs" => {
+                config.max_idle_tabs = require_bounded_count(value, &where_, MAX_PANE_CAP, "")?;
+            }
             "ready_timeout_seconds" => {
                 config.ready_timeout_seconds = require_seconds(value, &where_)?;
             }
@@ -1019,7 +1040,8 @@ mod tests {
         // production constant would agree with any value the constant ever takes, including a
         // typo, and so would pin nothing at all.
         assert_eq!(config.max_panes, 32);
-        assert_eq!(config.idle_tab_ttl_seconds, 900.0);
+        assert_eq!(config.idle_tab_ttl_seconds, 300.0);
+        assert_eq!(config.max_idle_tabs, 3);
         assert_eq!(config.readiness, "both");
         assert_eq!(config.broker, "direct");
     }
@@ -1056,13 +1078,14 @@ mod tests {
         found
     }
 
-    /// The guide restates three defaults in prose; those sentences must say what the code does.
+    /// The guide restates four defaults in prose; those sentences must say what the code does.
     #[test]
     fn user_guide_prose_defaults_are_the_built_in_defaults() {
         let expected: &[(&str, &str, u64)] = &[
             ("retention_days", "four", 4),
             ("max_panes", "32", 32),
-            ("idle_tab_ttl_seconds", "900 seconds", 900),
+            ("idle_tab_ttl_seconds", "300 seconds", 300),
+            ("max_idle_tabs", "3", 3),
         ];
         let config = Config::default();
         for (key, _spelling, number) in expected {
@@ -1071,6 +1094,7 @@ mod tests {
                 "max_panes" => config.max_panes,
                 // The exact float is asserted in the defaults test; here the prose number.
                 "idle_tab_ttl_seconds" => config.idle_tab_ttl_seconds as u64,
+                "max_idle_tabs" => config.max_idle_tabs,
                 other => panic!("nothing reads the default for {other}"),
             };
             assert_eq!(
