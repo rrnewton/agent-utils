@@ -149,7 +149,6 @@ pub fn convert_and_split_parts(markdown: &str, limit: usize) -> Vec<ConvertedPar
             parts.push(std::mem::take(&mut current));
             if let Some(heading) = carried {
                 let joined = heading.text.len() + 2 + unit.text.len();
-                current_bytes = heading.text.len();
                 current.push(heading);
                 if joined <= limit {
                     current_bytes = joined;
