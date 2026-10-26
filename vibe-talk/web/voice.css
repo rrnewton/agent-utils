@@ -10021,3 +10021,11 @@ li.discord-message[data-root-continuation] > .thread-replies {
   }
 
 }
+
+/* `#543 in-app-message-links`. A link to a message this app opens itself, where every other link leaves
+   for a new tab: a small hook before it says the tap stays here. Generated, so copying the text and a
+   screen reader (the empty alternative after the slash) still read the link's own words. */
+.md a[data-in-app]::before {
+  content: "\21AA\FE0E\00A0" / "";
+  opacity: 0.7;
+}

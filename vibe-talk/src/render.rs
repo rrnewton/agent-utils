@@ -31,16 +31,22 @@
 //!    to it, a deep heading is held at the fourth level, where the service writes bold with one
 //!    asterisk, an asterisk emphasis is bold, and a link whose text is its own address is drawn
 //!    with a short label made from it, `widgets#123` (`#227 github-link-abbrev`, see
-//!    [`crate::link_labels`]).
+//!    [`crate::link_labels`]). A Slack app link to a message stays a link, which no other
+//!    `slack:` address does (`#543 in-app-message-links`).
 //! 4. comrak writes HTML with raw HTML in the SOURCE escaped: it is shown as the characters it is,
 //!    as every chat client shows it, so the only markup in the output is markup comrak made.
 //! 5. ammonia keeps exactly [`TAGS`] and the attributes listed in [`SANITIZER`], and drops the
 //!    rest. A link keeps its address only when that is `http` or `https`, and every link opens in
 //!    a new tab with `noopener noreferrer nofollow`. A link may keep a `title`, which step 3
 //!    writes only onto a link it gave a short label, as the address beneath it.
+//! 6. A link to a chat message is marked with what it names, `data-msg`, so the page can open
+//!    the message itself rather than leave for the service (`#543 in-app-message-links`, see
+//!    [`crate::message_links`]). After the sanitizer, so only an address it kept is read.
 //!
 //! Step 5 is the boundary. Steps 1 to 4 decide what the message LOOKS like, and none of them is
-//! trusted to keep anything out: a mistake there is a rendering bug, never an injection.
+//! trusted to keep anything out: a mistake there is a rendering bug, never an injection. Step 6
+//! writes one attribute the sanitizer itself allows, its value percent-encoded ids, into a tag the
+//! sanitizer wrote; a body marked by it is sanitized again unchanged wherever it is checked.
 //!
 //! # What a body may cost
 //!
@@ -868,7 +874,39 @@ fn write_html<'a>(
     let mut html = String::new();
     comrak::format_html_with_plugins(root, options, &mut html, plugins)
         .expect("formatting into a String cannot fail");
-    SANITIZER.clean(&html).to_string()
+    mark_message_links(&SANITIZER.clean(&html).to_string())
+}
+
+/// `html`, sanitized, with every link to a chat message marked with what it names: the
+/// [`crate::message_links::ATTRIBUTE`] right after its `href`. `#543 in-app-message-links`.
+///
+/// After the sanitizer, so only an address it kept is read, as the browser will read it. Every
+/// `<a href="` in its output is a link comrak made — raw HTML in a message is escaped long before,
+/// and code is text — and the value written is percent-encoded, so it needs no escaping. The
+/// sanitizer keeps the attribute when it sees the body again ([`mark_restated`]).
+fn mark_message_links(html: &str) -> String {
+    const OPEN: &str = "<a href=\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = rest.find(OPEN) {
+        let start = at + OPEN.len();
+        let Some(end) = rest[start..].find('"').map(|end| start + end) else {
+            break;
+        };
+        out.push_str(&rest[..=end]);
+        let mut href = String::with_capacity(end - start);
+        push_decoded(&mut href, &rest[start..end]);
+        if let Some(target) = crate::message_links::recognize(&href) {
+            out.push_str(&format!(
+                " {}=\"{}\"",
+                crate::message_links::ATTRIBUTE,
+                target.attribute()
+            ));
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether the tree holds a fenced or indented code block.
@@ -2013,7 +2051,10 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
         .tags(HashSet::from(TAGS))
         .generic_attributes(HashSet::new())
         .tag_attributes(HashMap::from([
-            ("a", HashSet::from(["href", "title"])),
+            (
+                "a",
+                HashSet::from(["href", "title", crate::message_links::ATTRIBUTE]),
+            ),
             ("ol", HashSet::from(["start"])),
             ("input", HashSet::from(["checked"])),
         ]))
@@ -2053,8 +2094,10 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
         ]))
         // A URL is a sink. `javascript:` and `data:` execute, and a relative address resolves
         // against this origin and can be made to look like somewhere else entirely. Such a link
-        // keeps its text and loses its address, so the reader still sees what was written.
-        .url_schemes(HashSet::from(["http", "https"]))
+        // keeps its text and loses its address, so the reader still sees what was written. `slack`
+        // reaches here only on a link to a Slack message [`adjust`] kept, which opens Slack's app
+        // and nothing else (`#543 in-app-message-links`); every other one is shown as text there.
+        .url_schemes(HashSet::from(["http", "https", "slack"]))
         .url_relative(ammonia::UrlRelative::Deny)
         .link_rel(Some("noopener noreferrer nofollow"))
         .strip_comments(true);
@@ -2138,7 +2181,7 @@ fn adjust<'a>(
     for node in root.descendants().collect::<Vec<_>>() {
         let ast = node.data.borrow();
         match &ast.value {
-            NodeValue::Link(link) if !web_address(&link.url) => {
+            NodeValue::Link(link) if !web_address(&link.url) && !slack_app_link(&link.url) => {
                 let url = link.url.clone();
                 drop(ast);
                 unwrap_link(arena, node, url);
@@ -2174,6 +2217,15 @@ fn web_address(url: &str) -> bool {
     }
     let href = href.replace("&#x27;", "'").replace("&amp;", "&");
     url::Url::parse(&href).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+}
+
+/// Whether a link's address is one of Slack's app links to a message or a conversation, which a
+/// tap may follow: into the app here when the page serves the channel, into Slack's own app when it
+/// does not. `#543 in-app-message-links`. Any other `slack:` address is shown as text.
+fn slack_app_link(url: &str) -> bool {
+    url.get(..6)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("slack:"))
+        && crate::message_links::recognize(url).is_some()
 }
 
 /// Replace a link that may not be followed with its own text and, after it, the address it
@@ -5162,5 +5214,114 @@ mod repair_review_tests {
             soft("1. Goal\n• a\nIn review:\n• b", Markup::GoogleChat),
             soft("1. Goal\n- a\nIn review:\n- b", Markup::GoogleChat)
         );
+    }
+}
+
+/// `#543 in-app-message-links`: a link to a chat message is marked with what it names, so the page
+/// can keep the tap in the app. The shapes are `message_links`'s and tested there; here, that the
+/// mark reaches the page on every way of writing a link, and nowhere else.
+#[cfg(test)]
+mod message_link_tests {
+    use super::{headed_body, to_html, Markup};
+
+    const LINK: &str = r#"target="_blank" rel="noopener noreferrer nofollow""#;
+    const PERMALINK: &str = "https://acme.slack.com/archives/C0123ABCDE/p1700000000000100";
+
+    /// What a link to [`PERMALINK`] is marked with.
+    fn mark() -> String {
+        crate::message_links::recognize(PERMALINK)
+            .expect("a permalink")
+            .attribute()
+    }
+
+    #[test]
+    fn a_bare_a_named_and_an_angle_permalink_are_each_marked_and_keep_their_address() {
+        let mark = mark();
+        let bare = format!(r#"<a href="{PERMALINK}" data-msg="{mark}" {LINK}>{PERMALINK}</a>"#);
+        let named = format!(r#"<a href="{PERMALINK}" data-msg="{mark}" {LINK}>the plan</a>"#);
+        assert_eq!(
+            to_html(&format!("see {PERMALINK} above"), Markup::Discord),
+            format!("<p>see {bare} above</p>\n")
+        );
+        assert_eq!(
+            to_html(&format!("see <{PERMALINK}>"), Markup::Discord),
+            format!("<p>see {bare}</p>\n")
+        );
+        assert_eq!(
+            to_html(&format!("see [the plan]({PERMALINK})"), Markup::Discord),
+            format!("<p>see {named}</p>\n")
+        );
+        assert_eq!(
+            to_html(&format!("see <{PERMALINK}|the plan>"), Markup::Slack),
+            format!("<p>see {named}</p>\n")
+        );
+    }
+
+    #[test]
+    fn a_reply_link_is_marked_with_its_thread_and_its_query_kept() {
+        let reply = format!("{PERMALINK}?thread_ts=1699999999.000200&cid=C0123ABCDE");
+        let mark = crate::message_links::recognize(&reply)
+            .expect("a reply")
+            .attribute();
+        assert!(mark.ends_with(":1699999999.000200"), "{mark}");
+        let escaped = reply.replace('&', "&amp;");
+        assert_eq!(
+            to_html(&format!("[earlier]({reply})"), Markup::Discord),
+            format!("<p><a href=\"{escaped}\" data-msg=\"{mark}\" {LINK}>earlier</a></p>\n")
+        );
+    }
+
+    #[test]
+    fn a_permalink_in_code_is_text_and_any_other_link_is_unmarked() {
+        for text in [
+            format!("`{PERMALINK}`"),
+            format!("```\n{PERMALINK}\n```"),
+            format!("    {PERMALINK}"),
+        ] {
+            let html = to_html(&text, Markup::Slack);
+            assert!(
+                !html.contains("<a ") && !html.contains("data-msg"),
+                "{html}"
+            );
+        }
+        let other = to_html(
+            "https://example.com/archives/C0123ABCDE/p1700000000000100",
+            Markup::Slack,
+        );
+        assert!(
+            other.contains("<a ") && !other.contains("data-msg"),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn a_slack_app_link_to_a_message_stays_a_link_and_any_other_slack_address_is_text() {
+        let app = "slack://channel?team=T0123ABCD&id=C0123ABCDE&message=1700000000.000100";
+        let mark = crate::message_links::recognize(app)
+            .expect("an app link")
+            .attribute();
+        assert_eq!(
+            to_html(&format!("[in Slack]({app})"), Markup::Discord),
+            format!(
+                "<p><a href=\"{}\" data-msg=\"{mark}\" {LINK}>in Slack</a></p>\n",
+                app.replace('&', "&amp;")
+            )
+        );
+        assert_eq!(
+            to_html(
+                "[x](slack://user?team=T0123ABCD&id=U0123ABCD)",
+                Markup::Discord
+            ),
+            "<p>x (slack://user?team=T0123ABCD&amp;id=U0123ABCD)</p>\n"
+        );
+    }
+
+    #[test]
+    fn the_mark_survives_a_heading_being_marked_in_the_same_body() {
+        // `mark_restated` sanitizes the marked body again and keeps it only if nothing changed.
+        let text = format!("(plan) Status: done\nsee {PERMALINK}");
+        let (html, heading) = headed_body(&text, Markup::Discord, true, &|_| true, &[]);
+        assert!(heading.is_some(), "{html}");
+        assert!(html.contains(&format!("data-msg=\"{}\"", mark())), "{html}");
     }
 }

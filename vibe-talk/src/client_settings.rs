@@ -70,13 +70,15 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.read-speed",
     "vibe-talk.voice.prompts",
     "vibe-talk.voice.mic",
-    // Messages: own messages, empty, combining, rich headers, collapsed lines (moved
-    // here from Screen and keys), and the link kinds the search bar can hide.
+    // Messages: own messages, empty, combining, rich headers, message links (`#543
+    // in-app-message-links`), collapsed lines (moved here from Screen and keys), and the
+    // link kinds the search bar can hide.
     "vibe-talk.voice.read-mode",
     "vibe-talk.voice.mark-own-read",
     "vibe-talk.voice.hide-empty",
     "vibe-talk.voice.combine",
     "vibe-talk.voice.rich-headers",
+    "vibe-talk.voice.in-app-links",
     "vibe-talk.voice.collapsed-lines",
     "vibe-talk.voice.hidden-link-kinds",
     // Threads view: pack/unpack, each thread's own choice, main rows, order, card fold.

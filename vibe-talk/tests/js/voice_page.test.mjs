@@ -1340,10 +1340,11 @@ function commonAncestor(a, b) {
  * The attributes the server's sanitizer leaves on each element it keeps (src/render.rs,
  * `SANITIZER`), and the values it allows where it restricts them. Anything else is refused. A
  * link's `title` is the address of a link the server gave a short label
- * (`#227 github-link-abbrev`).
+ * (`#227 github-link-abbrev`), and its `data-msg` what a link to a chat message names
+ * (`#543 in-app-message-links`).
  */
 const SANITIZED_ATTRIBUTES = new Map([
-  ["a", new Set(["href", "title", "target", "rel"])],
+  ["a", new Set(["href", "title", "target", "rel", "data-msg"])],
   ["ol", new Set(["start", "class"])],
   ["ul", new Set(["class"])],
   ["li", new Set(["class"])],
@@ -1410,7 +1411,9 @@ function parseSanitizedHtml(html, host, record) {
       const allowed = SANITIZED_ATTRIBUTES.get(name);
       if (!allowed || !allowed.has(key)) throw new Error(`<${name}> carries ${key}, which the sanitizer drops`);
       const value = decodeEntities(raw);
-      if (key === "href" && !/^https?:\/\//i.test(value)) throw new Error(`a link to ${value} survived the sanitizer`);
+      // `#543 in-app-message-links`: and Slack's app link to a message, which the server keeps only marked.
+      const appLink = /^slack:\/\/channel\?/i.test(value) && /\sdata-msg="/.test(attributes);
+      if (key === "href" && !/^https?:\/\//i.test(value) && !appLink) throw new Error(`a link to ${value} survived the sanitizer`);
       if (key === "class") element.className = value;
       else element.setAttribute(key, value);
     }
@@ -18182,6 +18185,207 @@ test("`#462 webapp-deep-links`: a linked message further back than the loaded pa
   assert.match(statusText(page), /Here is the linked message/);
   const older = timelineReads(page).filter((path) => /[?&]before=/.test(path));
   assert.ok(older.length >= 3, `the walk read ${older.length} older pages for a message three pages back`);
+});
+
+// --- `#543 in-app-message-links` ----------------------------------------------------------------------
+//
+// The server marks a link to a chat message with what it names (src/message_links.rs, tested there);
+// these walks hand the page bodies as the server writes them and check what it does with the mark: a
+// link to a channel this server reads is drawn as the app's and jumps, every jump is one history entry,
+// and Back puts the reader back where they were, one jump at a time.
+
+const IN_APP_LINKS = "vibe-talk.voice.in-app-links";
+const MSG_LINK_ATTRS = 'target="_blank" rel="noopener noreferrer nofollow"';
+
+/** A message whose body is one link to `href`, marked `mark` as the server marks one, its text `text`. */
+function linkMessage(id, href, mark, text = href) {
+  const escaped = href.replace(/&/g, "&amp;");
+  return message({
+    id, content: `see ${href}`,
+    content_html: `<p>see <a href="${escaped}" data-msg="${mark}" ${MSG_LINK_ATTRS}>${text.replace(/&/g, "&amp;")}</a></p>\n`,
+  });
+}
+
+/** The mark of a link to `message` in `channel`, a reply in `thread` when there is one. */
+const msgMark = (channel, message, thread = "") =>
+  ["discord", channel, message, thread].map((part) => encodeURIComponent(part)).join(":");
+
+/** The first link drawn in `row`. */
+const linkIn = (row) => row.descendants().find((node) => node.tagName === "a");
+
+/** A tap on `anchor` as a finger makes it: what the page did with the browser's own act is returned. */
+async function tapLink(page, anchor, extra = {}) {
+  const event = { button: 0, prevented: false, preventDefault() { this.prevented = true; }, stopPropagation() {}, ...extra };
+  await anchor.dispatch("click", event);
+  await page.settle();
+  return event;
+}
+
+const REPLY_HREF = "https://discord.com/channels/100000000000000009/1110000000000000001/204";
+const ROOT_HREF = "https://discord.com/channels/100000000000000009/1110000000000000001/200";
+
+/**
+ * `threadData`'s channel, tall: a message linking to the second thread's answer (`204`), a dozen long
+ * fillers after it, so the reader is scrolled up to the link, and the answer itself linking back to the
+ * channel's first message (`200`) for a second jump.
+ */
+function linkedThreadData() {
+  const data = threadData();
+  const another = data.messages[4].thread;
+  data.messages[4] = linkMessage("204", ROOT_HREF, msgMark(CHANNEL.id, "200"));
+  data.messages[4].thread = another;
+  const link = linkMessage("300", REPLY_HREF, msgMark(CHANNEL.id, "204", "spaces/A/threads/another"));
+  const fillers = Array.from({ length: 12 }, (_unused, i) =>
+    message({ id: `${310 + i}`, content: longMessage(`filler ${i}`) }));
+  return { messages: [...data.messages, link, ...fillers], threads: data.threads };
+}
+
+/** A page on `linkedThreadData`'s channel that keeps a session history, scrolled up to the link. */
+async function linkedPage({ script = SCRIPT, stored = new Map() } = {}) {
+  const page = newPage(stored, script, (p) => p.enableHistory());
+  const data = linkedThreadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.settle();
+  const area = page.el("scroll-area");
+  const row = rowWithId(page, "300");
+  assert.ok(row, "fixture: the message with the link is not drawn");
+  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - 40;
+  await area.dispatch("scroll");
+  await page.settle();
+  return page;
+}
+
+test("`#543 in-app-message-links`: a marked link to a channel this app reads is drawn as the app's, named by where it goes; one to another channel, an unmarked one and every one with the switch off are left as written", async () => {
+  const page = newPage();
+  await signIn(page);
+  const elsewhere = "https://discord.com/channels/1/1999999999999999999/5";
+  const rows = await showDiscord(page, [
+    linkMessage("8000000000000000100", REPLY_HREF, msgMark(CHANNEL.id, "204", "spaces/A/threads/another")),
+    linkMessage("8000000000000000101", ROOT_HREF, msgMark(CHANNEL.id, "200"), "the plan"),
+    linkMessage("8000000000000000102", elsewhere, msgMark("1999999999999999999", "5")),
+    message({ id: "8000000000000000103", content: "x",
+      content_html: `<p><a href="https://example.com/a" ${MSG_LINK_ATTRS}>https://example.com/a</a></p>\n` }),
+  ]);
+  const [reply, named, other, plain] = rows.map(linkIn);
+  assert.ok(reply.hasAttribute("data-in-app"), "a link to a message here is not the app's");
+  assert.equal(reply.text(), "#lead team › reply", "a link whose text was its address is not named by where it goes");
+  assert.equal(reply.getAttribute("href"), REPLY_HREF, "the address under the link changed");
+  assert.match(reply.getAttribute("title"), /^Opens here — https:\/\/discord\.com\//);
+  assert.ok(named.hasAttribute("data-in-app"));
+  assert.equal(named.text(), "the plan", "a link its writer named lost the name");
+  assert.ok(!other.hasAttribute("data-in-app"), "a link to a channel this app does not read was taken");
+  assert.equal(other.text(), elsewhere);
+  assert.ok(!plain.hasAttribute("data-in-app"));
+  // A tap on the one to another channel is the browser's: nothing prevented.
+  assert.equal((await tapLink(page, other)).prevented, false, "a link to a channel not read was kept from leaving");
+  // A new tab asked for is the browser's too.
+  assert.equal((await tapLink(page, reply, { ctrlKey: true })).prevented, false, "Ctrl+click was taken from the browser");
+
+  // The switch, ON by default, and off: every link is as written again, and its tap leaves.
+  assert.equal(page.el("in-app-links").checked, true, "message links are not kept in the app by default");
+  await page.el("in-app-links").setChecked(false);
+  assert.equal(page.storage.get(IN_APP_LINKS), "0", "the choice was not kept");
+  const off = linkIn(rowWithId(page, "8000000000000000100"));
+  assert.ok(!off.hasAttribute("data-in-app"), "with the switch off a link was still the app's");
+  assert.equal(off.text(), REPLY_HREF);
+  assert.equal((await tapLink(page, off)).prevented, false, "with the switch off a tap was still kept in the app");
+  assert.ok(page.pure("SYNCED_SETTING_KEYS.includes(IN_APP_LINKS_KEY)"), "the switch is not one of the synced settings");
+  // The pure reading of a mark: four escaped parts, an absent one empty; nothing else is one.
+  assert.deepStrictEqual(JSON.parse(page.pure(`JSON.stringify(messageLinkRef("gchat:spaces%2FA:spaces%2FA%2Fmessages%2FT.M:"))`)),
+    { service: "gchat", channel: "spaces/A", message: "spaces/A/messages/T.M", thread: null });
+  assert.equal(page.pure(`messageLinkRef("slack:C1:2")`), null);
+  assert.equal(page.pure(`messageLinkRef(":C1::")`), null);
+});
+
+test("`#543 in-app-message-links`: a tap jumps to a reply — its thread opens over All and the message is landed — as ONE history entry, and Back puts the reader back in All on the message their eye was on, at the same height", async () => {
+  const page = await linkedPage();
+  const area = page.el("scroll-area");
+  const before = { length: page.history.length, facts: backFacts(page), top: rowWithId(page, "300").getBoundingClientRect().top,
+    scroll: area.scrollTop };
+  assert.equal(page.el("thread-select").value, "flat", "fixture: the channel did not open in All");
+  assert.ok(before.scroll > 0, "fixture: the reader is not scrolled up the list");
+  const tap = await tapLink(page, linkIn(rowWithId(page, "300")));
+  assert.equal(tap.prevented, true, "the tap was left to the browser, which would leave the app");
+  await untilDeepLink(page, () => rowWithId(page, "204")?.getAttribute("data-landed") === "true");
+  assert.equal(page.el("thread-heading").hidden, false, "the jump did not open the reply's thread");
+  assert.equal(page.el("thread-select").value, "thread:spaces/A/threads/another");
+  assert.equal(rowWithId(page, "204").getAttribute("data-landed"), "true", "the linked reply was not landed on");
+  assert.equal(page.history.length - before.length, 1, "the jump did not push exactly one entry");
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "jump" }, "the jump is not one level over the channel");
+
+  await page.browserBack();
+  await untilDeepLink(page, () => page.el("thread-heading").hidden && statusText(page) === "Back where you were.");
+  assert.equal(page.left, false, "Back after a jump left the app");
+  assert.equal(page.el("thread-heading").hidden, true, "Back did not close the thread the jump opened");
+  assert.equal(page.el("thread-select").value, "flat", "Back did not return to All");
+  assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
+  const back = rowWithId(page, "300");
+  assert.ok(back, "the message with the link is not drawn after Back");
+  assert.ok(Math.abs(back.getBoundingClientRect().top - before.top) <= 1,
+    `Back put the reader's message at ${back.getBoundingClientRect().top}, not ${before.top}`);
+  // At the top, Back is the browser's as ever: the jump left nothing behind to spend a press on.
+  await page.browserBack();
+  assert.equal(page.left, true, "a Back at the top after a jump and its return did not leave the app");
+
+  // NEGATIVE CONTROL: with no way back from a jump, Back lands and leaves the thread open.
+  const deaf = await linkedPage({ script: brokenScript('  else if (tag === "jump") returnFromLinkJump();\n', "\n") });
+  await tapLink(deaf, linkIn(rowWithId(deaf, "300")));
+  await untilDeepLink(deaf, () => rowWithId(deaf, "204")?.getAttribute("data-landed") === "true");
+  await deaf.browserBack();
+  await deaf.settle();
+  assert.equal(deaf.el("thread-heading").hidden, false, "the control without a return closed the thread anyway");
+});
+
+test("`#543 in-app-message-links`: JUMPS STACK — a link in the landed reply jumps on to a root in Main's view, two entries deep; Back returns to the reply in its thread, and Back again to All, one jump at a time", async () => {
+  const page = await linkedPage();
+  const start = rowWithId(page, "300").getBoundingClientRect().top;
+  await tapLink(page, linkIn(rowWithId(page, "300")));
+  await untilDeepLink(page, () => rowWithId(page, "204")?.getAttribute("data-landed") === "true");
+  // The second link, in the reply the first landed on: to the channel's first message, a root.
+  await tapLink(page, linkIn(rowWithId(page, "204")));
+  await untilDeepLink(page, () => page.el("thread-heading").hidden && rowWithId(page, "200")?.getAttribute("data-landed") === "true");
+  assert.equal(page.el("thread-heading").hidden, true, "a jump to a root stayed in the thread, which cannot show it");
+  assert.equal(page.el("thread-select").value, "flat", "a jump to a root from a thread opened from All did not go back to All");
+  assert.deepStrictEqual(backFacts(page), { depth: 2, tag: "jump" }, "the second jump is not a level over the first");
+
+  await page.browserBack();
+  await untilDeepLink(page, () => !page.el("thread-heading").hidden && rowWithId(page, "204"));
+  assert.equal(page.el("thread-select").value, "thread:spaces/A/threads/another", "the first Back did not return to the reply's thread");
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "jump" });
+  await page.browserBack();
+  await untilDeepLink(page, () => page.el("thread-heading").hidden && statusText(page) === "Back where you were.");
+  assert.equal(page.el("thread-select").value, "flat", "the second Back did not return to All");
+  assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
+  assert.ok(Math.abs(rowWithId(page, "300").getBoundingClientRect().top - start) <= 1,
+    "the second Back did not put the reader back on the message they started from");
+  assert.equal(page.left, false);
+});
+
+test("`#543 in-app-message-links`: what the reader opens after landing is a level over the jump, and the jump's own thread closed by its ← Back still leaves the jump for the gesture", async () => {
+  const page = await linkedPage();
+  await tapLink(page, linkIn(rowWithId(page, "300")));
+  await untilDeepLink(page, () => rowWithId(page, "204")?.getAttribute("data-landed") === "true");
+  // Settings over the landed reply: its own entry, closed first.
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.deepStrictEqual(backFacts(page), { depth: 2, tag: "settings" });
+  await page.browserBack();
+  assert.equal(page.screen(), "main", "the gesture did not close Settings first");
+  assert.equal(page.el("thread-heading").hidden, false, "closing Settings undid the jump too");
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "jump" });
+  // The thread the jump opened, left by its own ← Back: the jump still stands, and the gesture undoes it.
+  await page.el("thread-back").click();
+  await page.settle();
+  await page.traverse();
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "jump" }, "leaving the jump's thread took the jump's entry with it");
+  await page.browserBack();
+  await untilDeepLink(page, () => statusText(page) === "Back where you were.");
+  assert.equal(page.left, false);
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
 });
 
 test("mark read through here targets the newest part without archiving the row", async () => {
@@ -64023,9 +64227,10 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // `#386 hide-empty-messages` put Empty messages beside Mark-read automatically, the owner's place for it.
   // `#457 settings-server-side` moved Collapsed message lines here from Screen and keys:
   // it decides how much of a message is shown, so the server keeps it for every device,
-  // and Screen and keys is the one per-device section.
+  // and Screen and keys is the one per-device section. `#543 in-app-message-links` put Message links
+  // after Rich headers: whether a link to a message opens it here is a choice about drawing messages.
   assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Empty messages", "Combining messages",
-    "Rich headers", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
+    "Rich headers", "Message links", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -65350,7 +65555,7 @@ function foldProblems(html, css, script) {
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, SCRIPT_CODE), []);
   // 31 since `#481 slack-app-deep-link` added Opening links, counted and checked above.
-  assert.equal(scriptFolds(SCRIPT_CODE).length, 32, "a fold went missing from the list, or one was added unchecked");
+  assert.equal(scriptFolds(SCRIPT_CODE).length, 33, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {

@@ -68,6 +68,7 @@ pub mod live;
 pub mod live_tail;
 pub mod mcp;
 pub mod mention_defuse;
+pub mod message_links;
 pub mod model;
 pub mod noise;
 pub mod ops;
