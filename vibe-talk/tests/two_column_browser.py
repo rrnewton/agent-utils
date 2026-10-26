@@ -482,10 +482,11 @@ def columns_walk(desk: Desk) -> None:
     desk.settled()
     desk.check(page.is_visible("#side-list") and not page.is_visible("#side-pane"), "a click on a card entered its thread")
     lit = {str(card["id"]): card for card in desk.cards()}
-    # Whole: unclamped, every word it says drawn — for this question, split for its card (`#522`),
-    # those are its first thread card lines and "…", the rest under the card where it is unpacked.
-    desk.check(not lit[REPLICA]["clamped"] and (int(str(lit[REPLICA]["lines"])) > 3 or str(lit[REPLICA]["text"]).endswith("…")),
-               f"the card highlighted does not show its whole text: {lit[REPLICA]}")
+    # Whole, up to K: this question is one paragraph longer than a card shows (`#522 thread-card-max-lines`),
+    # so highlighted it opens to K = 5 lines and no further (`#528 thread-card-markdown-and-cap`), the
+    # whole question under the card where it is unpacked and in its thread.
+    desk.check(int(str(lit[REPLICA]["lines"])) == 5,
+               f"the card highlighted does not open to K lines: {lit[REPLICA]}")
     unlit = next(card for card in cards if card["id"] == CANARY)
     desk.check(round(float(str(lit[CANARY]["height"]))) == round(float(str(unlit["height"]))),
                f"a card not highlighted changed height: {lit[CANARY]}")

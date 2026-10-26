@@ -210,6 +210,17 @@ pub struct ClientConfigResponse {
     /// every long row fail one request at a time. Absent means summaries may work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summaries_unavailable: Option<String>,
+    /// Whether this server names threads and sums them up. `#528 thread-card-markdown-and-cap`.
+    ///
+    /// The page reads it as "a summary is coming": a thread whose first message is too long for
+    /// its card is named from its first reply (`#522 thread-card-max-lines`), so with this the
+    /// page draws such a thread in the summary's layout at once — its first message inward, whole,
+    /// as the card's first child — and only the card's words change when the summary lands.
+    /// Without it the page splits the first message, as it always did. Absent, from an older
+    /// server, from one that cannot name threads or whose summariser cannot work, and to a
+    /// read-scope caller (whose reads queue no naming), means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread_names_supported: bool,
     /// The scope of the token that asked.
     ///
     /// The caller's own scope, so it discloses nothing it did not already hold. The page needs it

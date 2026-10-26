@@ -9,14 +9,14 @@ the thread card and append "..." to the end. Then display the remainder of the m
 first child underneath with "..." prepended. So when I fully pack all threads I still get a fairly
 compact thread view without a giant thread card dominating it."
 
-Against the fake API of tests/threads_polish_browser.py, whose replica thread opens with a long
-question (356 characters, 11 card lines by the 36-character proxy) and has no summary, in
-the Threads view:
+Against the fake API of tests/threads_polish_browser.py, whose replica thread opens here with a long
+Markdown message (`#528 thread-card-markdown-and-cap`: two paragraphs, a numbered list of six and a
+closing line, tests/thread_card_markdown_browser.py's) and has no summary, in the Threads view:
 
 * packed, the replica's card is held to the collapsed lines as before, its words ending "…";
-* unpacked (Unpack all), the card shows at most K = 5 drawn lines where it used to show the whole
-  question, ending "…"; the first row under it is the question's continuation — the root's own row,
-  its author, starting "…" with the words the card left out, and none of the row buttons
+* unpacked (Unpack all), the card shows at most K = 5 drawn lines, cut between lines and ending "…";
+  the first row under it is the message's continuation — the root's own row, its author, starting
+  "…" with the lines the card left out, its list numbered on, and none of the row buttons
   (Reply, Done, Thread, ⋯) drawn — then the replies; no sideways scroll;
 * the pack triangle on the continuation still packs the thread with its card held still (`#440`,
   `#459`), and a tap on the bridge's spine from the thread's foot still goes back to the card
@@ -45,8 +45,9 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from inline_reply_browser import sign_in
 from offline_cache_browser import check, handler_for
+from thread_card_markdown_browser import MD_ITEMS, MD_ROOT, MD_ROOT_HTML
 from threads_polish_browser import PolishApi, to_threads, unpack_to
-from two_column_browser import LONG_FIRST, REPLICA, Desk
+from two_column_browser import REPLICA, Desk
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -82,6 +83,20 @@ CARD_JS = """(id) => {
 
 SUMMARY = {"display_name": "replica-before-release",
            "summary": "Whether the replica migration, the dashboards and the silenced alert are done before release."}
+
+
+class MarkdownReplicaApi(PolishApi):
+    """`PolishApi`, the replica's question a long Markdown message, rendered as the server renders it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        for index, row in enumerate(self.messages):
+            thread = row.get("thread")
+            if isinstance(thread, dict) and thread.get("id") == REPLICA and thread.get("is_root"):
+                self.messages[index] = {**row, "content": MD_ROOT, "content_html": MD_ROOT_HTML}
+                for at, held in enumerate(self.threads):
+                    if held["id"] == REPLICA:
+                        self.threads[at] = {**held, "root": self.messages[index]}
 
 
 def card(desk: Desk) -> dict[str, object]:
@@ -142,7 +157,7 @@ def main() -> int:
 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
          touch: bool) -> str:
-    api = PolishApi()
+    api = MarkdownReplicaApi()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -166,7 +181,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             packed = card(desk)
             desk.check(packed["state"] == "collapsed" and bool(packed["split"]),
                        f"the premise: the replica's card packed and split, found {packed['state']}, split {packed['split']}")
-            desk.check(str(packed["words"]).endswith("…"), f"the card's words do not end in …: {packed['words']!r}")
+            desk.check(str(packed["words"]).rstrip().endswith("…"), f"the card's words do not end in …: {packed['words']!r}")
             desk.check(number(packed, "lines") <= 3, f"the packed card shows {packed['lines']} lines")
             desk.shot("1-packed")
 
@@ -185,12 +200,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk.check(bool(rest["continuation"]) and bool(rest["child"]),
                        f"the first row under the card is not the question's continuation: {rest}")
             body = str(rest["body"]).strip()
-            head = str(opened["words"])[:-1]
+            head = str(opened["words"])
             desk.check(body.startswith("…"), f"the continuation does not start with …: {body[:60]!r}")
-            desk.check(LONG_FIRST.startswith(head.replace("\n", " ")),
-                       f"the card's words are not the question's opening: {head!r}")
-            desk.check(" ".join(body[1:].split()) == " ".join(LONG_FIRST[len(head):].split()),
-                       f"the continuation is not exactly the rest of the question: {body!r}")
+            desk.check(head.startswith("MORNING SNAPSHOT") and MD_ITEMS[0] in head and MD_ITEMS[1] not in head,
+                       f"the card's words are not the message's first lines, to its first item: {head!r}")
+            desk.check(MD_ITEMS[1] in body and "docs/plan.md" in body and "MORNING SNAPSHOT" not in body,
+                       f"the continuation is not exactly the rest of the message: {body!r}")
             desk.check(rest["author"] == "ci-bot", f"the continuation is not the question's author's row: {rest}")
             desk.check(not rest["actsShown"], "the continuation draws row buttons of its own")
             desk.shot("2-unpacked-split")
@@ -219,8 +234,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                        f"the card does not say the summary: {named['words']!r}")
             desk.check(bool(whole["child"]) and not whole["continuation"],
                        f"the whole question is not the first child: {whole}")
-            desk.check(" ".join(str(whole["body"]).split()).startswith(" ".join(LONG_FIRST.split())[:60]),
-                       f"the first child is not the whole question: {whole['body']!r}")
+            desk.check(str(whole["body"]).strip().startswith("MORNING SNAPSHOT"),
+                       f"the first child is not the whole message: {whole['body']!r}")
             desk.shot("3-summary-landed")
             desk.notes.append(f"the summary landed with the card moved {moved:.1f}px, the whole question its first child")
 

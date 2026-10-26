@@ -44,6 +44,8 @@ pub(crate) fn reply(id: &str, thread: &str, content: &str, created_ms: i64) -> M
     Message {
         thread: Some(MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: thread.to_owned(),
             root_message_id: Some(MessageId(thread.to_owned())),
             is_root: false,

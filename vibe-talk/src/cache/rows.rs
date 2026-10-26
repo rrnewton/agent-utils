@@ -273,6 +273,8 @@ mod tests {
         assert_eq!(thread_id(&message), None);
         message.thread = Some(MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: "t1".to_owned(),
             root_message_id: Some(MessageId("1".to_owned())),
             is_root: true,

@@ -421,11 +421,11 @@ def card_fit_walk(walk: Walk) -> None:
     page.click("#side-unpack")
     walk.settled()
     whole = walk.card(LONG_THREAD)
-    # Whole: unclamped and drawn to its words' own height. Those words are the long message's first
-    # thread card lines and "…" (`#522 thread-card-max-lines`), the rest unpacked under the card.
-    walk.check(whole["clamp"] == "none" and whole["natural"] - whole["textHeight"] <= whole["lineHeight"] + 0.5
-               and str(whole["said"]).endswith("…"),
-               f"unpacked, the long card is not whole past its clamp: {whole}")
+    # Whole, up to K: the long message is one paragraph longer than a card shows, so unpacked its card
+    # opens to K = 5 lines and no further, the whole message unpacked under it (`#522
+    # thread-card-max-lines`, `#528 thread-card-markdown-and-cap`).
+    walk.check(whole["clamp"] == "5" and abs(whole["textHeight"] - 5 * whole["lineHeight"]) <= 1,
+               f"unpacked, the long card is not opened to K lines: {whole}")
     short_whole = walk.card(READ_ONE)
     walk.check(abs(walk.lines(short_whole) - 1) <= 0.3,
                f"unpacked, the short card grew reserved room back: {short_whole}")

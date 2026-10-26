@@ -265,14 +265,19 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     desk.check(max(spines) - min(spines) <= 2, f"the bridge spine wanders: {spines}")
     desk.check(all(row["bridge"]["left"] < row["box"]["left"] + 40 for row in runner),
                "a bridge is not in its row's gutter")
-    # The long question is split for its card (`#522 thread-card-max-lines`): its first row is the
-    # rest of it, the root's own row, and no other row repeats the root.
+    # The long question, one paragraph longer than its card on its own, is clamped on the card and goes
+    # under it whole (`#528 thread-card-markdown-and-cap`; `#522 thread-card-max-lines` split it inside
+    # a line): its first row is the root's own row, and no other row repeats the root.
     replica = page.evaluate(STATE_JS, REPLICA)
-    desk.check(replica[0]["ids"] == ["209"] and bool(replica[0]["continuation"]),
-               f"the split question's block does not start with its continuation: {replica[0]}")
+    desk.check(replica[0]["ids"] == ["209"] and bool(replica[0]["rootChild"]) and not replica[0]["continuation"],
+               f"the clamped question's block does not start with the whole question: {replica[0]}")
     desk.check("209" not in [one for row in replica[1:] for one in row["ids"]], "the raw block duplicates the root on its card")
-    desk.check(not any(row["rootChild"] for row in replica[1:]), "a raw card grew a root child")
-    desk.check(len(ids_of(desk, CANARY)) == 2, "the third thread did not unpack its replies")
+    desk.check(not any(row["rootChild"] for row in replica[1:]), "a raw card grew a second root child")
+    # Its first message is one paragraph longer than a card shows, so it goes under its card whole
+    # (`#528 thread-card-markdown-and-cap`), then its two replies.
+    canary = page.evaluate(STATE_JS, CANARY)
+    desk.check(ids_of(desk, CANARY) == ["215", "216", "218"] and bool(canary[0]["rootChild"]),
+               f"the third thread did not unpack its whole first message and its replies: {ids_of(desk, CANARY)}")
     desk.shot("2-unpacked-show")
 
     page.click("#todo-filter")

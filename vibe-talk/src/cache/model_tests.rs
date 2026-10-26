@@ -444,6 +444,8 @@ fn a_new_reply_counts_on_its_held_root() {
     let mut root = message("1700000000.000100", "ada", "question", T0);
     root.thread = Some(crate::threads::MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         id: "1700000000.000100".to_owned(),
         root_message_id: Some(MessageId("1700000000.000100".to_owned())),
         is_root: true,

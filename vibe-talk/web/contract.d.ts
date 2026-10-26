@@ -378,6 +378,18 @@ declare namespace VibeTalk {
      */
     summaries_unavailable?: string | null;
     /**
+     * Whether this server names threads and sums them up. `#528 thread-card-markdown-and-cap`.
+     *
+     * The page reads it as "a summary is coming": a thread whose first message is too long for
+     * its card is named from its first reply (`#522 thread-card-max-lines`), so with this the
+     * page draws such a thread in the summary's layout at once — its first message inward, whole,
+     * as the card's first child — and only the card's words change when the summary lands.
+     * Without it the page splits the first message, as it always did. Absent, from an older
+     * server, from one that cannot name threads or whose summariser cannot work, and to a
+     * read-scope caller (whose reads queue no naming), means false.
+     */
+    thread_names_supported?: boolean;
+    /**
      * Whether the backend supports channel, thread-list, and flattened timelines.
      */
     threading_supported: boolean;
@@ -931,6 +943,14 @@ declare namespace VibeTalk {
    */
   interface MessageThread {
     /**
+     * On a thread's ROOT, the thread's name as [`ThreadSummary::display_name`] gives it: what a
+     * summariser filed, served by the same rule (`#484 summary-card-threshold`). `#528
+     * thread-card-markdown-and-cap`: a page that holds a root draws its thread's summary card from
+     * the read that brought the root, and from its saved copy on a reload, rather than waiting for
+     * a read of the thread list. Absent on replies, until named, and from an older server.
+     */
+    display_name?: string | null;
+    /**
      * The thread's colour, in whole degrees of hue (`0..360`), as THIS server assigned it.
      * `#427 server-thread-hues`; see [`crate::thread_hues`].
      *
@@ -963,6 +983,11 @@ declare namespace VibeTalk {
      * The original channel message, if this provider exposes one.
      */
     root_message_id: MessageId | null;
+    /**
+     * On a thread's root, the thread's sentence as [`ThreadSummary::summary`] gives it, under the
+     * same rule as `display_name`.
+     */
+    summary?: string | null;
   }
 
   /**

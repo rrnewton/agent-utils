@@ -95,6 +95,8 @@ fn threaded_message(id: &str) -> Message {
     Message {
         thread: Some(MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             id: "t1".into(),
             root_message_id: Some(MessageId("200".into())),
             is_root: false,
@@ -285,6 +287,7 @@ fn client_config(
             },
         ],
         summaries_unavailable: (!full).then(|| "elevenlabs.api_key is not configured".into()),
+        thread_names_supported: full,
         token_scope: scope,
         noise_rules: full.then(|| NoiseRules {
             rules: vec!["Working…".into(), "Thinking*".into()],

@@ -38,6 +38,8 @@ fn mid(ts: &str) -> MessageId {
 fn slack_thread(root_ts: &str, is_root: bool) -> MessageThread {
     MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         id: root_ts.to_owned(),
         root_message_id: Some(mid(root_ts)),
         is_root,
@@ -186,6 +188,8 @@ fn a_discord_clients_links_come_from_its_configured_guild() {
     // the parent finds no such message there.
     let thread = MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         id: "900000000000000004".to_owned(),
         root_message_id: Some(MessageId("900000000000000004".to_owned())),
         is_root: false,
@@ -201,6 +205,8 @@ fn a_discord_clients_links_come_from_its_configured_guild() {
     // Its root, a message of the parent channel itself, links by the parent.
     let root = MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         is_root: true,
         ..thread
     };
@@ -226,6 +232,8 @@ fn a_google_chat_bridges_links_come_from_its_resource_names() {
     let chan = ChannelId("spaces/AAAa1".to_owned());
     let thread = MessageThread {
         hue: None,
+        display_name: None,
+        summary: None,
         id: "spaces/AAAa1/threads/BBBb2".to_owned(),
         root_message_id: None,
         is_root: false,

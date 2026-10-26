@@ -817,6 +817,8 @@ impl Raw {
         let reply_count = is_root.then(|| self.reply_count());
         let thread = Some(MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             root_message_id: ids::message_id_from_ts(&thread_ts),
             id: thread_ts,
             is_root,
@@ -1474,6 +1476,8 @@ mod tests {
         );
         let thread = MessageThread {
             hue: None,
+            display_name: None,
+            summary: None,
             root_message_id: Some(root_id.clone()),
             id: "1700000000.000100".to_owned(),
             is_root: false,

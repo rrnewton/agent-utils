@@ -1010,6 +1010,11 @@ pub async fn client_config(
             .is_some_and(crate::config::ProviderConfig::coding_agents_named_only),
         providers,
         summaries_unavailable: state.summarizer.unavailable_reason(),
+        // `#528 thread-card-markdown-and-cap`: only where a summary can come for this caller: a
+        // summariser that works, and the write scope, the only one whose reads queue a naming.
+        thread_names_supported: scope >= Scope::Write
+            && state.summarizer.names_threads()
+            && state.summarizer.unavailable_reason().is_none(),
         token_scope: scope.into(),
         noise_rules: noise_rules_view(&state).await,
         voice_settings: Some(crate::send_approval::view(&state).await),
@@ -4709,6 +4714,8 @@ fn fill_pin_links<'p>(
             .as_deref()
             .map(|id| crate::threads::MessageThread {
                 hue: None,
+                display_name: None,
+                summary: None,
                 id: id.to_owned(),
                 root_message_id: None,
                 is_root: pin.snapshot.thread_root,

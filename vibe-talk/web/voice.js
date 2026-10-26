@@ -18135,8 +18135,8 @@ function stepCollapsedLines(direction) {
 //     card is drawn wider, the same words take fewer lines: never more than about K.
 //   * SUMMARISED, the root goes inward as the card's first child, exactly as under any summarised card
 //     (`#405 root-under-summary`): nothing new.
-//   * NOT SUMMARISED — summaries off, failing, or not back yet — THE ROOT IS SPLIT where the card's
-//     own words are (`cardLines`): the card says its first K lines and "…", and unpacked, the rest is
+//   * NOT SUMMARISED — summaries off, failing, or not back yet — THE ROOT IS SPLIT (`#528`: between
+//     lines of its formatted body, `cardUnits`): the card says its first K lines and "…", and unpacked, the rest is
 //     the first row under it, starting "…" (`cardSplit`). Not for one line left over, which the card
 //     shows: a row of its own for one line is less compact than the line. That row is the root's own row, its words cut
 //     to the rest: the same author and time, and no buttons of its own (web/voice.css), so a reply,
@@ -18180,6 +18180,8 @@ function applyCardMaxLines(value, redraw = true) {
   const n = clampCardMaxLines(value);
   const changed = redraw && n !== cardMaxLines;
   cardMaxLines = n;
+  // `#528 thread-card-markdown-and-cap`: what a card clamped to K lines is clamped to (web/voice.css).
+  document.documentElement.style.setProperty("--card-max-lines", String(n));
   el("card-max-lines").value = String(n);
   el("card-max-lines-smaller").disabled = n <= MIN_CARD_MAX_LINES;
   el("card-max-lines-larger").disabled = n >= MAX_CARD_MAX_LINES;
@@ -18235,20 +18237,20 @@ function stepCardMaxLines(direction) {
  *
  * @returns {Array<{text: string, cut: boolean}>}
  */
-function wrapCardLine(line) {
+function wrapCardLine(line, width = CARD_LINE_CHARS) {
   /** @type {Array<{text: string, cut: boolean}>} */
   const lines = [];
   let open = "";
   for (const word of line.split(/\s+/).filter(Boolean)) {
     let chars = [...word];
-    if (open && [...open].length + 1 + chars.length <= CARD_LINE_CHARS) {
+    if (open && [...open].length + 1 + chars.length <= width) {
       open += ` ${word}`;
       continue;
     }
     if (open) lines.push({ text: open, cut: false });
-    while (chars.length > CARD_LINE_CHARS) {
-      lines.push({ text: chars.slice(0, CARD_LINE_CHARS).join(""), cut: true });
-      chars = chars.slice(CARD_LINE_CHARS);
+    while (chars.length > width) {
+      lines.push({ text: chars.slice(0, width).join(""), cut: true });
+      chars = chars.slice(width);
     }
     open = chars.join("");
   }
@@ -18256,13 +18258,9 @@ function wrapCardLine(line) {
   return lines;
 }
 
-/** Wrapped lines put back together: by a space between words, by nothing inside a broken word. */
-const unwrapCardLines = (lines) =>
-  lines.map((line, at) => (at > 0 && !lines[at - 1].cut ? ` ${line.text}` : line.text)).join("");
-
-/** How many card lines `lines` take by the proxy, each wrapped by `wrapCardLine`. */
-function cardProxyLines(lines) {
-  return lines.reduce((sum, line) => sum + wrapCardLine(line).length, 0);
+/** How many card lines `lines` take by the proxy, each wrapped by `wrapCardLine` at `width`. */
+function cardProxyLines(lines, width = CARD_LINE_CHARS) {
+  return lines.reduce((sum, line) => sum + wrapCardLine(line, width).length, 0);
 }
 
 /** `text`'s lines as src/threads.rs `card_lines` counts them: blank ones dropped, white space closed up. */
@@ -18274,93 +18272,375 @@ function rootOverflowsCard(root) {
   return Boolean(root) && cardProxyLines(proxyLinesOf(rawTextOf(root))) > cardMaxLines;
 }
 
-/**
- * Each root's split as last worked out, and the K it was worked out at: a card asks for it several
- * times a pass (its words, its mark, its block's signature and its block). A root read again is a
- * new object, and is worked out afresh.
- *
- * @type {WeakMap<object, {lines: number, split: {head: string, rest: string} | null}>}
- */
-const cardSplits = new WeakMap();
+// `#528 thread-card-markdown-and-cap`. The owner, 2026-10-26: "a long message with markdown
+// formatting loses its formatting when it is promoted to a thread card", and of #522's split: "I
+// wanted to split only at the line granularity and always retain markdown formatting of course."
+//
+//   * THE CARD IS THE ROOT'S OWN BODY, drawn as its row draws it (`messageBody`): its lists, line
+//     breaks, code and links, where `#489 card-root-lines` drew plain lines. A link on the card looks
+//     like one but is not one (`unlinkCardBody`): the card is a button, and a press on it is the card's.
+//   * IT STOPS ONLY BETWEEN UNITS (`cardUnits`): a block at the top of the body, an item of a list
+//     there, or a line of a paragraph — never inside a line, an item, a code block, a quote or a table.
+//     A numbered list cut between items goes on, under the card, numbered from where it stopped
+//     (`start`), and the continuation is the same body from that unit on, formatted as the row is.
+//   * K HOLDS FOR WHAT THE CARD DRAWS, each unit counted by the proxy (a list's items and a quote at a
+//     narrower line, `CARD_INDENTED_CHARS`), so no raw card is ever longer than K lines however its
+//     text reached the page. A first unit longer than K on its own, one long paragraph, has no line to
+//     stop at: the card shows its first K lines, clamped (`data-card-clamp`), and the root goes inward
+//     whole as under a summary, so nothing is cut out or said by halves.
+//   * A SUMMARY ON ITS WAY IS WAITED FOR IN THE SUMMARY'S LAYOUT (`cardPending`): a root too long for
+//     its card is named from its first reply, so where the server names threads the card says the
+//     root's first lines meanwhile and the root goes inward whole at once. When the summary lands only
+//     the card's words change; the rows under it stay where they are. The Threads list is read again
+//     at short steps meanwhile (`watchPendingSummaries`), past its once-a-minute spacing, because that
+//     read is what both queues the thread for naming and brings the name. A summary that has not come
+//     within `SUMMARY_WAIT_MS` of the thread's last activity is not waited for: the card splits.
+
+/** The characters one card line of a list item or a quote is counted at: the card's 36, less its indent. */
+const CARD_INDENTED_CHARS = 32;
+
+/** How long after a thread's last activity a summary on its way is waited for in the summary's layout. */
+const SUMMARY_WAIT_MS = 60000;
+
+/** When, after a thread's last activity, the Threads list is read again for the summary on its way. */
+const SUMMARY_READ_STEPS_MS = [2000, 5000, 10000, 20000, 40000];
+
+/** Whether this server names threads (`thread_names_supported`): whether a summary may be on its way. */
+let threadNamesSupported = false;
+
+/** The block tags whose items, not themselves, are a card's units. */
+const CARD_LIST_TAGS = new Set(["ul", "ol"]);
+
+/** The blocks a card's "…" is written into, rather than after. */
+const CARD_TEXT_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li"]);
+
+/** A node's tag, lower case, or "" for a text node. */
+const tagNameOf = (node) => String((node && node.tagName) || "").toLowerCase();
+
+/** `parent`'s child nodes that say something: its elements, and any text not white space. */
+const sayingNodes = (parent) => [...parent.childNodes].filter((node) =>
+  node.nodeType === 1 || (node.nodeType === 3 && String(node.textContent).trim() !== ""));
+
+/** What one node says, as `renderedText` reads an element. */
+const nodeWords = (node) => (node.nodeType === 3 ? String(node.textContent) : renderedText(node));
 
 /**
- * Thread `choice`'s root split for its card, when it is longer than K lines and the card says no
- * summary: `head`, the card's words for its first K card lines, and `rest`, the words after them, as
- * the card draws them (`cardLines`); null otherwise. Lines are wrapped by `wrapCardLine`, so a line
- * that crosses K is cut where its K-th card line ends: between words, or inside a word too long for
- * a line. Null too where the drawn words fit after all — a root whose text is long only by markup
- * the page does not draw — so nothing is split into nothing, and where all the continuation would
- * hold is one line, which the card shows instead.
+ * The units of drawn body `box` a card may stop after, in order: each block at its top; each item of
+ * a list there, rather than the list; and each line of a paragraph, its line break included. Each
+ * with its block, its place in that block (`index`), its nodes, the card lines its words take, and
+ * `mark`, the line a "…" after it takes of its own (1 after a block with no line of words to end:
+ * code, a quote, a table, an item ending in a list of its own), else 0.
  *
- * @returns {{head: string, rest: string} | null}
+ * @returns {Array<{block: any, index: number, nodes: any[], lines: number, mark: number}>}
  */
-function cardSplit(choice) {
-  if (!choice || !choice.root || cardIsSummarized(choice)) return null;
-  const held = cardSplits.get(choice.root);
-  if (held && held.lines === cardMaxLines) return held.split;
-  const split = rootOverflowsCard(choice.root) ? splitForCard(cardLines(choice.root)) : null;
-  cardSplits.set(choice.root, { lines: cardMaxLines, split });
-  return split;
+function cardUnits(box) {
+  /** @type {Array<{block: any, index: number, nodes: any[], lines: number, mark: number}>} */
+  const units = [];
+  const unit = (block, index, nodes, width) => {
+    const words = nodes.map(nodeWords).join("");
+    const last = nodes.length === 1 ? nodes[0] : null;
+    const inner = last && tagNameOf(last) === "li" ? sayingNodes(last).pop() : null;
+    const mark = last && (!CARD_TEXT_TAGS.has(tagNameOf(last)) || (inner && CARD_LIST_TAGS.has(tagNameOf(inner)))) ? 1 : 0;
+    units.push({ block, index, nodes, lines: cardProxyLines(proxyLinesOf(words), width), mark });
+  };
+  for (const block of sayingNodes(box)) {
+    const tag = tagNameOf(block);
+    if (CARD_LIST_TAGS.has(tag)) {
+      [...block.childNodes].filter((node) => node.nodeType === 1)
+        .forEach((item, index) => unit(block, index, [item], CARD_INDENTED_CHARS));
+    } else if (tag === "p") {
+      let line = [];
+      let index = 0;
+      for (const node of [...block.childNodes]) {
+        line.push(node);
+        if (tagNameOf(node) === "br") {
+          unit(block, index, line, CARD_LINE_CHARS);
+          line = [];
+          index += 1;
+        }
+      }
+      if (line.length) unit(block, index, line, CARD_LINE_CHARS);
+    } else {
+      unit(block, 0, [block], tag === "blockquote" ? CARD_INDENTED_CHARS : CARD_LINE_CHARS);
+    }
+  }
+  return units;
 }
 
-/** `cardSplit`'s work on a root's card lines, `words`, at the K in force. */
-function splitForCard(words) {
-  const lines = words.split("\n").filter(Boolean);
-  /** @type {string[]} */
-  const head = [];
-  /** @type {string[]} */
-  let rest = [];
-  let room = cardMaxLines;
-  // Whether the card stops inside one of the message's lines rather than at its end, and inside a
-  // word broken across card lines there.
-  let inside = false;
-  let midWord = false;
-  for (let at = 0; at < lines.length; at += 1) {
-    const wrapped = wrapCardLine(lines[at]);
-    if (wrapped.length <= room) {
-      head.push(lines[at]);
-      room -= wrapped.length;
+/**
+ * Keep in body `box` only the units `keep` says, by their place among its units (`cardUnits`): the
+ * rest taken out, a list or paragraph left with none taken out with them, a numbered list that lost
+ * its first items numbered on from where they stopped, and a paragraph's last line break gone.
+ *
+ * @param {HTMLElement} box
+ * @param {(at: number) => boolean} keep
+ */
+function keepCardUnits(box, keep) {
+  /** @type {Map<any, number>} each block with units kept, and the place of its first kept one */
+  const kept = new Map();
+  cardUnits(box).forEach((unit, at) => {
+    if (keep(at)) {
+      if (!kept.has(unit.block)) kept.set(unit.block, unit.index);
+      return;
+    }
+    for (const node of unit.nodes) if (node.parentNode) node.parentNode.removeChild(node);
+  });
+  for (const block of sayingNodes(box)) {
+    const tag = tagNameOf(block);
+    if (!CARD_LIST_TAGS.has(tag) && tag !== "p") continue;
+    if (!kept.has(block)) {
+      box.removeChild(block);
       continue;
     }
-    // The card's last lines are this line's first ones; the rest of it, and every line after, is the
-    // continuation's.
-    if (room > 0) head.push(unwrapCardLines(wrapped.slice(0, room)));
-    inside = room > 0;
-    midWord = inside && wrapped[room - 1].cut;
-    rest = [unwrapCardLines(wrapped.slice(room)), ...lines.slice(at + 1)];
-    break;
+    const first = kept.get(block) || 0;
+    const start = Number.parseInt(String(block.getAttribute("start") || ""), 10);
+    if (tag === "ol" && first > 0) block.setAttribute("start", String((Number.isFinite(start) ? start : 1) + first));
+    const nodes = [...block.childNodes];
+    const last = nodes[nodes.length - 1];
+    if (tag === "p" && last && tagNameOf(last) === "br") block.removeChild(last);
   }
-  if (!head.length) return null;
-  // The "…" needs room on the card's last line: where that line is full, its last word goes on to the
-  // continuation — or, where the line is one word, its last character — which it then starts: on the
-  // line it was on, or as a line of its own where the card stopped at a line's end.
-  const ending = wrapCardLine(head[head.length - 1]);
-  const last = ending[ending.length - 1].text;
-  if ([...last].length + 1 > CARD_LINE_CHARS) {
-    const space = last.lastIndexOf(" ");
-    const kept = space > 0 ? last.slice(0, space) : [...last].slice(0, -1).join("");
-    const moved = space > 0 ? last.slice(space + 1) : [...last].slice(-1).join("");
-    const before = ending.slice(0, -1);
-    head[head.length - 1] = unwrapCardLines([...before, { text: kept, cut: false }]);
-    // A word moved goes before the rest with a space, unless the card stopped inside it; a character
-    // moved is the end of a word, which the rest goes on with.
-    const glue = space > 0 && !midWord ? " " : "";
-    rest = inside ? [`${moved}${glue}${rest[0]}`, ...rest.slice(1)] : [moved, ...rest];
+}
+
+/** Where a card's "…" goes at the `end` (or start) of `box`: the text block there, or null for none. */
+function cardMarkTarget(box, end) {
+  const pick = (nodes) => (end ? nodes[nodes.length - 1] : nodes[0]);
+  let at = pick(sayingNodes(box));
+  if (at && CARD_LIST_TAGS.has(tagNameOf(at))) at = pick([...at.childNodes].filter((node) => node.nodeType === 1));
+  // A loose list's item holds paragraphs: the mark goes in the paragraph, on its line.
+  if (at && tagNameOf(at) === "li") {
+    const inner = pick(sayingNodes(at));
+    if (inner && tagNameOf(inner) === "p") at = inner;
   }
-  const after = rest.filter(Boolean).join("\n");
-  // Nor one that would leave the continuation a single line: that line costs the card one line more,
-  // and costs a row of its own under the card, its header and its edges, several.
-  if (cardProxyLines(proxyLinesOf(after)) < 2) return null;
-  return { head: head.join("\n"), rest: after };
+  return at && CARD_TEXT_TAGS.has(tagNameOf(at)) ? at : null;
+}
+
+/** "…", marked so the stylesheet may draw it apart from the words. */
+const cardEllipsis = () => styled("span", "card-ellipsis", "…");
+
+/** "…" at the end of `box`: on its last line, or on a line of its own after a block that has no line to end. */
+function appendCardEllipsis(box) {
+  const into = cardMarkTarget(box, true);
+  if (into) {
+    into.append(cardEllipsis());
+    return;
+  }
+  const line = document.createElement("p");
+  line.append(cardEllipsis());
+  box.append(line);
+}
+
+/** "…" at the start of `box`, as `appendCardEllipsis` puts it at the end. */
+function prependCardEllipsis(box) {
+  const into = cardMarkTarget(box, false);
+  if (into) {
+    into.insertBefore(cardEllipsis(), into.firstChild);
+    return;
+  }
+  const line = document.createElement("p");
+  line.append(cardEllipsis());
+  box.insertBefore(line, box.firstChild);
+}
+
+/** Every link in `node` drawn as a link's words, not a link: the card it is on is a button. */
+function unlinkCardBody(node) {
+  for (const kid of [...node.childNodes]) {
+    if (kid.nodeType !== 1) continue;
+    if (tagNameOf(kid) !== "a") {
+      unlinkCardBody(kid);
+      continue;
+    }
+    const words = document.createElement("span");
+    words.className = "card-link";
+    words.append(...kid.childNodes);
+    kid.replaceWith(words);
+  }
 }
 
 /**
- * The root's row as its continuation under a split card: the root itself, its words cut to what the
- * card left out, starting "…". The same message — its id, author, time and reactions — so whatever is
- * done from the row is done to the root; drawn as plain lines, as the card's words are.
+ * Each root's cut as last worked out, the K it was worked out at, and the card's words for it: a card
+ * asks several times a pass (its words, its mark, its block's signature and its block). A root read
+ * again is a new object, and is worked out afresh.
+ *
+ * @type {WeakMap<object, {lines: number, cut: {head: number, whole: boolean} | null, text: string}>}
  */
-function continuationOf(root, rest) {
-  return { ...root, content: `…${rest}`, content_html: "", heading: null };
+const cardCuts = new WeakMap();
+
+/**
+ * Where a card stops in `root`: after its first `head` units (`cardUnits`), when its drawn body is
+ * longer than K card lines; null where it fits, or where all it would leave over is one line, which
+ * the card shows instead (`#522`: a row of its own for one line is less compact than the line).
+ * `whole` where even its first unit is longer than K: the card shows that unit clamped and the root
+ * goes inward whole.
+ *
+ * @returns {{head: number, whole: boolean} | null}
+ */
+function cardCut(root) {
+  return cardCutEntry(root).cut;
+}
+
+/** `cardCut`'s answer for `root` and the card's words with it, worked out once per root and K. */
+function cardCutEntry(root) {
+  const held = cardCuts.get(root);
+  if (held && held.lines === cardMaxLines) return held;
+  const units = cardUnits(messageBody(root));
+  const cut = cutForCard(units.map((unit) => unit.lines), units.map((unit) => unit.mark));
+  const entry = { lines: cardMaxLines, cut, text: foldedCardText(renderedText(cardHead(root, cut))) };
+  cardCuts.set(root, entry);
+  return entry;
+}
+
+/**
+ * `cardCut`'s work on the card lines of a root's units, in order, at the K in force; `marks`, the
+ * line each unit's "…" would take of its own (`cardUnits`), so the "…" never takes the card past K.
+ */
+function cutForCard(lines, marks = []) {
+  const total = lines.reduce((sum, n) => sum + n, 0);
+  if (total <= cardMaxLines) return null;
+  let head = 0;
+  let used = 0;
+  while (head < lines.length && used + lines[head] <= cardMaxLines) {
+    used += lines[head];
+    head += 1;
+  }
+  while (head > 0 && used + (marks[head - 1] || 0) > cardMaxLines) {
+    head -= 1;
+    used -= lines[head];
+  }
+  if (head === 0) return { head: 1, whole: true };
+  if (total - used < 2) return null;
+  return { head, whole: false };
+}
+
+/** A card's words as text: line by line, each line's white space closed up, blank lines dropped (`#489`). */
+const foldedCardText = (text) =>
+  String(text).split("\n").map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n");
+
+/** The card's body for `root` cut at `cut`: its first units and "…", or the whole root where it fits. */
+function cardHead(root, cut) {
+  const box = messageBody(root);
+  if (cut) {
+    keepCardUnits(box, (at) => at < cut.head);
+    if (!cut.whole) appendCardEllipsis(box);
+  }
+  unlinkCardBody(box);
+  return box;
+}
+
+/**
+ * The root's row as its continuation under a split card: the root itself, its body drawn from the
+ * unit the card stopped before (`messageBody` reads `cardRestFrom`), starting "…". The same message —
+ * its id, author, time and reactions — so whatever is done from the row is done to the root.
+ */
+function continuationOf(root, cut) {
+  // Its body is built as the card's was, from the root's own heading (`plainParagraphs` marks the words
+  // a heading restates, and where that mark ends decides the units), though the row shows no heading.
+  const heading = headingOf(root);
+  return { ...root, heading: null, cardRestFrom: cut.head, cardRestCut: heading ? heading.cut : 0 };
+}
+
+/**
+ * Whether thread `choice`'s summary is on its way: the server names threads, its root is too long for
+ * a card by the server's count (so it is named from its first reply), it has a reply, its card is cut,
+ * and its last activity is within `SUMMARY_WAIT_MS`.
+ */
+function cardPending(choice) {
+  if (!threadNamesSupported || !choice || !choice.root || cardIsSummarized(choice)) return false;
+  if (!Number.isFinite(choice.at) || Date.now() - choice.at >= SUMMARY_WAIT_MS) return false;
+  if (!cardCut(choice.root) || !rootOverflowsCard(choice.root)) return false;
+  return knownReplies(choice) > 0;
+}
+
+/** How many replies thread `choice` is known to have: reported, held, or on their way from here. */
+function knownReplies(choice) {
+  const reported = typeof choice.count === "number" ? choice.count : 0;
+  if (reported > 0) return reported;
+  const pending = pendingInto(choice.id);
+  if (pending > 0) return pending;
+  return channelCanon.messages.filter((held) => threadOf(held) === choice.id && held.thread.is_root !== true).length;
+}
+
+/**
+ * What thread `choice`'s card draws, and how its root is laid out under it. `mode` is "summary" (the
+ * summariser's name and sentence; the root inward), "pending" (a summary on its way, `cardPending`:
+ * the root's first lines, the root inward), "clamped" (a first unit longer than K, clamped; the root
+ * inward), "split" (the root's first units and "…", the rest its continuation), "root" (the whole
+ * root, short enough) or "name" (no words of a root to show). `text` is the card's words as text,
+ * which it is searched and signed by; `body()` a fresh element of its formatted words, or null where
+ * its words are that text.
+ *
+ * @returns {{mode: string, text: string, cut: {head: number, whole: boolean} | null, body: () => HTMLElement | null}}
+ */
+function cardView(choice) {
+  const words = threadWords(choice);
+  if (words.named && words.said) return { mode: "summary", text: `${words.named}: ${words.said}`, cut: null, body: () => null };
+  const root = choice.root;
+  const entry = root ? cardCutEntry(root) : null;
+  if (!entry || !entry.text) return { mode: "name", text: threadName(choice, Infinity), cut: null, body: () => null };
+  const { cut, text } = entry;
+  const mode = cut === null ? "root" : cardPending(choice) ? "pending" : cut.whole ? "clamped" : "split";
+  return { mode, text, cut, body: () => cardHead(root, cut) };
+}
+
+/** Whether thread `choice`'s root goes inward, whole, as its card's first child (`#405`, `#528`). */
+const rootInward = (choice) => ["summary", "pending", "clamped"].includes(cardView(choice).mode);
+
+/**
+ * Thread `choice`'s cut when its card is split, its root's rest the continuation under it
+ * (`#522 thread-card-max-lines`); null for every other layout.
+ *
+ * @returns {{head: number, whole: boolean} | null}
+ */
+function cardSplit(choice) {
+  if (!choice) return null;
+  const view = cardView(choice);
+  return view.mode === "split" ? view.cut : null;
+}
+
+/** The next moment a summary on its way is owed something — a read, or the end of its wait — and its timer. */
+let summaryWatch = { at: Infinity, timer: /** @type {any} */ (null) };
+
+/** By who draws cards — the cards, the card at the top of a thread — the next moment its cards are owed. */
+const summaryWatchNeeds = new Map();
+
+/**
+ * Arm one timer for the next moment any card waiting for a summary (`cardPending`) is owed something:
+ * a read of the Threads list at one of `SUMMARY_READ_STEPS_MS` after its thread's last activity, or the
+ * end of its wait, when its card splits. `choices` are what `source` draws now; the timer is for the
+ * soonest of every source's, and is armed again only where that moment changed.
+ *
+ * @param {Array<ReturnType<typeof threadChoice>>} choices
+ * @param {string} source
+ */
+function watchPendingSummaries(choices, source) {
+  const now = Date.now();
+  let owed = Infinity;
+  for (const choice of choices) {
+    if (!cardPending(choice)) continue;
+    const step = SUMMARY_READ_STEPS_MS.map((ms) => choice.at + ms).find((at) => at > now);
+    owed = Math.min(owed, step === undefined ? choice.at + SUMMARY_WAIT_MS : step);
+  }
+  summaryWatchNeeds.set(source, owed);
+  const next = Math.min(...summaryWatchNeeds.values());
+  if (next === summaryWatch.at) return;
+  if (summaryWatch.timer !== null) clearTimeout(summaryWatch.timer);
+  summaryWatch = { at: next, timer: null };
+  if (next === Infinity) return;
+  summaryWatch.timer = setTimeout(() => {
+    summaryWatch = { at: Infinity, timer: null };
+    summaryWatchNeeds.clear();
+    guardQuietly(summaryWatchFired)();
+  }, Math.max(0, next - now));
+}
+
+/** A summary on its way is owed a read: the Threads list read now, past its spacing, and the cards drawn again. */
+async function summaryWatchFired() {
+  if (currentView !== "discord") return;
+  threadDirectoryReadAt.delete(String(el("discord-channel").value));
+  await refreshThreadDirectory();
+  renderThreadHeading();
+  renderSideColumn();
+  // A thread open across the window: its root row is the card's inward child or not by the card's layout.
+  if (channelView === "thread") renderReplyLinks();
 }
 
 /**
@@ -22810,6 +23090,13 @@ function foldLiveMessage(message, live = false, replayed = false, read = null) {
   if (held && held.upstream_url && !kept.upstream_url) {
     kept = { ...kept, upstream_url: held.upstream_url };
   }
+  // `#528 thread-card-markdown-and-cap`. Nor does a root's copy whose record names nothing take its
+  // thread's name and sentence away: the stream's copies are never named, only a page's are.
+  const named = namedRecord(held);
+  if (named && kept.thread && kept.thread.is_root === true && String(kept.thread.id) === String(named.id) &&
+      kept.thread.display_name === undefined && kept.thread.summary === undefined) {
+    kept = { ...kept, thread: { ...kept.thread, display_name: named.display_name, summary: named.summary } };
+  }
   channelCanon.messages = inTimeOrder(
     [...channelCanon.messages.filter((candidate) => String(candidate.id) !== id), kept], "timestamp");
   // Where it stands in the order of reads (`copyOrder`, `#310 stale-live-read-flicker`): a copy a read
@@ -25448,11 +25735,54 @@ function threadChoice(id, summary = null, root = null) {
   return {
     id: String(id),
     summary,
+    // `#528 thread-card-markdown-and-cap`: the name and sentence a root's own record carries, served
+    // with every page that brings the root; `threadWords` reads them where the summary says none.
+    named: namedRecord(root) || namedRecord(first),
     root: first,
     count: summary ? summary.reply_count : record ? record.reply_count : null,
     at: summary ? timeOf(summary, "updated_at") : timeOf(root, "timestamp"),
     started: first ? timeOf(first, "timestamp") : NaN,
   };
+}
+
+/** `message`'s thread record where it names the thread (`#528`), else null. */
+function namedRecord(message) {
+  const record = message && message.thread;
+  return record && record.is_root === true && typeof record.display_name === "string" && record.display_name.trim()
+    ? record : null;
+}
+
+/**
+ * The summariser's name and sentence for thread `choice`, trimmed: from its thread list copy, else
+ * from its root's own record (`#528 thread-card-markdown-and-cap`), which a page of Main brings with
+ * the root, before any read of the thread list. `said` is "" unless one source gives both.
+ *
+ * @returns {{named: string, said: string}}
+ */
+function threadWords(choice) {
+  let named = "";
+  // The root's record only by the rule the server serves names by (`#484`, `#522`): one kept on a copy
+  // the stream or an older read left, of a thread under the threshold now, is not shown.
+  const fromRoot = choice && choice.named && rootNamesShown(choice) ? choice.named : null;
+  for (const source of [choice && choice.summary, fromRoot]) {
+    const name = source && typeof source.display_name === "string" ? source.display_name.trim() : "";
+    const said = source && typeof source.summary === "string" ? source.summary.trim() : "";
+    if (name && said) return { named: name, said };
+    if (!named) named = name;
+  }
+  return { named, said: "" };
+}
+
+/**
+ * Whether thread `choice`'s root may show its record's name, by the server's rule: three messages,
+ * or two under a root longer than a card shows (src/threads.rs `thread_summary_shown`).
+ */
+function rootNamesShown(choice) {
+  const record = choice.named;
+  if (record && record.reply_count_exact === false) return true;
+  const replies = Math.max(typeof choice.count === "number" ? choice.count : 0,
+    record && typeof record.reply_count === "number" ? record.reply_count : 0);
+  return replies + 1 >= (rootOverflowsCard(choice.root) ? 2 : 3);
 }
 
 /**
@@ -25472,7 +25802,7 @@ function threadChoice(id, summary = null, root = null) {
  */
 function threadName(choice, chars = THREAD_TITLE_CHARS) {
   const summary = choice ? choice.summary : null;
-  const named = summary && typeof summary.display_name === "string" ? summary.display_name : "";
+  const named = choice ? threadWords(choice).named : "";
   const title = summary && typeof summary.title === "string" && summary.title.trim() !== "Thread"
     ? summary.title : "";
   // The first message by what it SAYS, so a root that opens with `**Plan**` is named "Plan".
@@ -25532,7 +25862,10 @@ function threadIndex() {
       continue;
     }
     if (Number.isFinite(at)) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
-    if (root && !known.root) known.root = root;
+    // `#528 thread-card-markdown-and-cap`. The store's copy of the root over the thread list's: it is
+    // the copy the rows under the card draw, so the card and its continuation are cut from one body.
+    if (root) known.root = root;
+    if (namedRecord(root)) known.named = root.thread;
     if (root && !Number.isFinite(known.started)) known.started = at;
   }
   for (const [id, at] of pending) {
@@ -25749,6 +26082,8 @@ async function refreshThreadDirectory() {
       noteNewestThreadPage(channel, payload);
     }
     noteThreadListLanded(channel);
+    // `#528 thread-card-markdown-and-cap`: kept, so a reload draws the names it brought at once.
+    saveChannelScope();
     renderThreadSelect();
     renderThreadHeading();
     // Its summaries carry counts Main's roots are kept and counted by (`#222 unread-replies`).
@@ -25909,10 +26244,10 @@ function threadCard(summary, tally) {
   const title = document.createElement("strong");
   // `#194 thread-picker-polish`: the name the selector and the heading use, given the card's room.
   title.textContent = threadName(choice, Infinity);
-  const said = typeof summary.summary === "string" ? summary.summary.trim() : "";
+  const said = threadWords(choice).said;
   // `#489 card-root-lines`: its lines, as a list card's are; `#522 thread-card-max-lines`: K of them at most.
-  const split = cardSplit(choice);
-  const first = split ? `${split.head}…` : choice.root ? cardLines(choice.root) : "";
+  const view = cardView(choice);
+  const first = view.mode === "name" ? "" : view.text;
   const about = document.createElement("span");
   about.className = "thread-card-text";
   about.textContent = said || (first.replace(/\s+/g, " ") === title.textContent ? "" : first);
@@ -26401,7 +26736,7 @@ function readFilterKeeps(thread = channelView === "thread" ? openThreadChoice() 
   // the first child the card's words are about, and Hide read hiding it would leave the summary
   // heading a thread whose first message cannot be seen. A raw card already says the root.
   // `#522 thread-card-max-lines`: and under a split card, whose continuation is the root's row.
-  const keptRoot = thread && (cardIsSummarized(thread) || cardSplit(thread))
+  const keptRoot = thread && (rootInward(thread) || cardSplit(thread))
     ? (channelView === "thread" && thread.id === String(selectedThreadId) ? openThreadRootId()
       : thread.root ? String(thread.root.id) : null) : null;
   /** @type {ReplyTally | null} */
@@ -30973,7 +31308,15 @@ function messageBody(message) {
     insertSanitizedHtml(box, html);
   } else {
     const heading = headingOf(message);
-    plainParagraphs(box, rawTextOf(message), heading ? heading.cut : 0);
+    const cut = typeof message.cardRestCut === "number" ? message.cardRestCut : heading ? heading.cut : 0;
+    plainParagraphs(box, rawTextOf(message), cut);
+  }
+  // `#528 thread-card-markdown-and-cap`. A split root's continuation (`continuationOf`): the same
+  // body from the unit its card stopped before, formatted as the whole root is.
+  if (typeof message.cardRestFrom === "number") {
+    const from = message.cardRestFrom;
+    keepCardUnits(box, (at) => at >= from);
+    prependCardEllipsis(box);
   }
   return box;
 }
@@ -33871,7 +34214,7 @@ function renderReplyLinks() {
   // first child: one bridged row at the head, drawn as a gathered reply is. A raw card's root is
   // an ordinary row, the card already saying it, so nothing is duplicated.
   const rootId = channelView === "thread" ? openThreadRootId() : null;
-  const rootChild = rootId !== null && cardIsSummarized(openThreadChoice())
+  const rootChild = rootId !== null && rootInward(openThreadChoice())
     ? rows.find((row) => isOpenThreadRoot(row, rootId)) || null : null;
   let above = null;
   for (const row of rows) {
@@ -46312,15 +46655,9 @@ function setTextIfChanged(node, text) {
  * drawn whole besides (`#428 summary-cards-full`).
  */
 function sideCardText(choice) {
-  const summary = choice.summary;
-  const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
-  const said = summary && typeof summary.summary === "string" ? summary.summary.trim() : "";
-  if (named && said) return `${named}: ${said}`;
-  // `#522 thread-card-max-lines`: a root longer than the card shows, its first lines and "…".
-  const split = cardSplit(choice);
-  if (split) return `${split.head}…`;
-  const first = choice.root ? cardLines(choice.root) : "";
-  return first || threadName(choice, Infinity);
+  // `#522 thread-card-max-lines`, `#528 thread-card-markdown-and-cap`: a root longer than the card
+  // shows, its first lines and "…" (`cardView`).
+  return cardView(choice).text;
 }
 
 /**
@@ -46431,8 +46768,12 @@ function renderSideCards() {
   const tally = replyTally();
   // `#426 threads-sort-toggle`. In the order chosen over the Threads view's cards, else the default.
   const order = cardOrderOnScreen();
-  const cards = inThreadOrder(threadChoices(), order).map((choice) => ({
+  const choices = inThreadOrder(threadChoices(), order);
+  // `#528 thread-card-markdown-and-cap`. A card waiting for its summary reads the Threads list again soon.
+  watchPendingSummaries(choices, leftEl("side-cards").id);
+  const cards = choices.map((choice) => ({
     choice,
+    view: cardView(choice),
     text: sideCardText(choice),
     // `#428 summary-cards-full`. With the text, so a summary arriving with the same words as the
     // root's still redraws the card unclamped (below, and in the signature).
@@ -46448,8 +46789,8 @@ function renderSideCards() {
   const unpacked = cards.some((card) => card.state === "unpacked");
   // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
   const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
-  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpackMode, cards.map(({ choice, text, summarized, root, age, replies, unread, read, state, size }) =>
-    [choice.id, text, summarized, root, age, replies, unread, read, state, size.messages, size.exact,
+  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpackMode, cards.map(({ choice, view, text, summarized, root, age, replies, unread, read, state, size }) =>
+    [choice.id, view.mode, text, summarized, root, age, replies, unread, read, state, size.messages, size.exact,
       state === "unpacked" ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
   main.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
   main.length ? [readMode, combineMessages, nowPlaying ? nowPlaying.id : "", pendingRead] : ""]);
@@ -47118,9 +47459,7 @@ let unpackObserver = null;
 /** Whether `choice`'s card says a summary rather than its root's words (`#405 root-under-summary`). */
 const cardIsSummarized = (choice) => {
   if (!choice) return false;
-  const summary = choice.summary;
-  const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
-  const said = summary && typeof summary.summary === "string" ? summary.summary.trim() : "";
+  const { named, said } = threadWords(choice);
   // Exactly when `sideCardText` says the summary. Not "when the card's words are not the root's":
   // a split card's are not either (`#522 thread-card-max-lines`), and it says no summary.
   return Boolean(named && said);
@@ -47232,7 +47571,8 @@ function cardRow(id) {
  * collapsed, whole and unpacked; a summarized card, the same whole and collapsed, round two.
  */
 function cycleCardState(choice, row) {
-  const order = cardIsSummarized(choice) ? ["collapsed", "unpacked"] : CARD_STATES;
+  // `#528`: and a card waiting for its summary, which says no more whole; a clamped card still opens to K lines.
+  const order = ["summary", "pending"].includes(cardView(choice).mode) ? ["collapsed", "unpacked"] : CARD_STATES;
   const now = String(row.getAttribute("data-card-state") || "collapsed");
   const at = order.indexOf(now);
   const next = at < 0 ? "unpacked" : order[(at + 1) % order.length];
@@ -47316,9 +47656,9 @@ function unpackNeedsRead(choice, held) {
 /** What one block would draw, as a signature, so a pass that changes nothing rebuilds nothing. */
 function unpackSignature(choice, held) {
   const opened = openedReadRuns.get(viewKey("thread", choice.id));
-  const split = cardSplit(choice);
+  const view = cardView(choice);
   return JSON.stringify([choice.id, readMode, readRunsSuspended(), hideEmptyMessages, combineMessages,
-    cardIsSummarized(choice), split ? split.rest : "",
+    view.mode, view.cut ? view.cut.head : 0, view.cut && choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : "",
     held.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
     opened ? [...opened].sort() : [], unpackReads.get(choice.id) || "", nowPlaying ? nowPlaying.id : "", pendingRead]);
 }
@@ -47340,14 +47680,15 @@ function unpackSignature(choice, held) {
  */
 function unpackBlock(choice, tally) {
   const held = unpackHeldMessages(choice);
-  const summarized = cardIsSummarized(choice);
+  // `#528 thread-card-markdown-and-cap`: and under a card waiting for its summary, or one clamped.
+  const summarized = rootInward(choice);
   // `#522 thread-card-max-lines`. Under a split card the root's continuation is the first child: the
   // root's own row, alone in it, never joined to a reply by the same author.
   const split = summarized ? null : cardSplit(choice);
   const messages = unpackMessages(choice, held, summarized || split !== null);
   const root = split ? messages.find((message) => isThreadRoot(message, choice)) || null : null;
   const groups = root
-    ? [[continuationOf(root, split.rest)], ...glom(messages.filter((message) => message !== root))]
+    ? [[continuationOf(root, split)], ...glom(messages.filter((message) => message !== root))]
     : glom(messages);
   const rows = groups.map((group, at) => {
     const row = discordNode(group);
@@ -47867,7 +48208,7 @@ function foldCardRuns(list) {
  * but the button under it, which goes into the thread and says how many replies it has and how many of
  * them are unread (`cardOpener`). Beside that, how long since the thread moved.
  */
-function sideCard({ choice, text, summarized, root, age, replies, unread, read, state = "collapsed", size }) {
+function sideCard({ choice, view = cardView(choice), text, summarized, root, age, replies, unread, read, state = "collapsed", size }) {
   const row = document.createElement("li");
   row.className = "side-card-row";
   // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
@@ -47877,14 +48218,16 @@ function sideCard({ choice, text, summarized, root, age, replies, unread, read, 
   // collapsed-lines count: the summary is not raw text and is never clamped.
   if (summarized) row.setAttribute("data-summarised-card", "");
   // `#522 thread-card-max-lines`. A root split for the card, its words already K card lines and "…".
-  if (cardSplit(choice)) row.setAttribute("data-split-card", "");
+  // `#528 thread-card-markdown-and-cap`: or held to K lines by the stylesheet, its root inward whole;
+  // or saying its root's first lines while its summary is on its way.
+  markCardLayout(row, view.mode, view.cut);
   row.style.setProperty("--thread-hue", threadHue(choice.id));
   const button = document.createElement("button");
   button.className = "side-card";
   button.setAttribute("type", "button");
   const body = document.createElement("span");
   body.className = "side-card-text";
-  body.textContent = text;
+  fillCardText(body, view, text);
   button.append(body);
   // `#440 thread-card-pack-toggle`. In the Threads view a press goes round the card's states; in two
   // columns it highlights the card, as it always did (`#277 thread-card-focus`).
@@ -47925,6 +48268,41 @@ function sideCard({ choice, text, summarized, root, age, replies, unread, read, 
   // where the card says a summary of them. `#262 search-load-older`.
   searchable(row, text, threadName(choice, Infinity), root);
   return row;
+}
+
+/**
+ * Mark card `row` for the stylesheet by its layout (`cardView`): split, clamped to K lines, or waiting
+ * for its summary. `#528 thread-card-markdown-and-cap`. Written only where it changes.
+ *
+ * @param {HTMLElement} row
+ * @param {string} mode
+ */
+function markCardLayout(row, mode, cut = null) {
+  /** @type {Array<[string, boolean]>} */
+  const marks = [["data-split-card", mode === "split"],
+    ["data-card-clamp", mode === "clamped" || (mode === "pending" && Boolean(cut && cut.whole))],
+    ["data-summary-pending", mode === "pending"]];
+  for (const [attribute, on] of marks) {
+    if (row.hasAttribute(attribute) !== on) row.toggleAttribute(attribute, on);
+  }
+}
+
+/**
+ * Put a card's words in `node`: its root's formatted body where the card says the root, else `text`.
+ * `#528 thread-card-markdown-and-cap`.
+ *
+ * @param {HTMLElement} node
+ * @param {ReturnType<typeof cardView>} view
+ * @param {string} text
+ */
+function fillCardText(node, view, text) {
+  const body = view.body();
+  if (body) {
+    node.replaceChildren(body);
+    return;
+  }
+  node.replaceChildren();
+  node.textContent = text;
 }
 
 // --- one card highlighted ------------------------------------------------------------------------
@@ -48244,13 +48622,16 @@ function threadUnanswered(choice, tally) {
  */
 function paintThreadCard(card, choice, tally) {
   if (!choice) return;
-  const text = sideCardText(choice);
+  const view = cardView(choice);
+  const text = view.text;
   const age = briefAge(Number.isFinite(choice.at) ? choice.at : choice.started);
   const replies = sideCardReplies(choice, tally);
   const unread = sideCardUnread(choice, tally);
   const unanswered = threadUnanswered(choice, tally);
   const summarized = cardIsSummarized(choice);
-  const signature = JSON.stringify([choice.id, text, summarized, age, replies, unread, unanswered]);
+  // `#528 thread-card-markdown-and-cap`. Waiting for its summary, it reads the Threads list again soon.
+  watchPendingSummaries([choice], card.id);
+  const signature = JSON.stringify([choice.id, view.mode, text, summarized, age, replies, unread, unanswered]);
   if (threadCardsDrawn.get(card.id) === signature) return;
   threadCardsDrawn.set(card.id, signature);
   if (card.getAttribute("data-thread") !== choice.id) card.setAttribute("data-thread", choice.id);
@@ -48271,7 +48652,9 @@ function paintThreadCard(card, choice, tally) {
     words.className = "side-card-text";
     button.append(words);
   }
-  setTextIfChanged(words, text);
+  // `#528 thread-card-markdown-and-cap`: its root's formatted words, as a list card's.
+  markCardLayout(card, view.mode, view.cut);
+  fillCardText(words, view, text);
   if (button.getAttribute("title") !== text) button.setAttribute("title", text);
   setTextIfChanged(leftEl(`${card.id}-age`), age);
   // `#479 message-time-full-date`. Hovering the open thread's age says the day it last moved, whole.
@@ -53653,6 +54036,8 @@ function applyClientConfig(config) {
   applyReadSpeed(readSpeed);
   threadingSupported = config.threading_supported === true;
   deploymentCapabilities.threading = threadingSupported;
+  // `#528 thread-card-markdown-and-cap`: whether a long first message's summary may be on its way.
+  threadNamesSupported = config.thread_names_supported === true;
   learnProviders(config.providers);
   deploymentCodingAgents = codingAgentsFrom(config);
   // The selected backend owns its display name. An older server leaves it unspecified, so the

@@ -338,6 +338,10 @@
             "null"
           ]
         },
+        "thread_names_supported": {
+          "description": "Whether this server names threads and sums them up. `#528 thread-card-markdown-and-cap`.\n\nThe page reads it as \"a summary is coming\": a thread whose first message is too long for\nits card is named from its first reply (`#522 thread-card-max-lines`), so with this the\npage draws such a thread in the summary's layout at once — its first message inward, whole,\nas the card's first child — and only the card's words change when the summary lands.\nWithout it the page splits the first message, as it always did. Absent, from an older\nserver, from one that cannot name threads or whose summariser cannot work, and to a\nread-scope caller (whose reads queue no naming), means false.",
+          "type": "boolean"
+        },
         "threading_supported": {
           "description": "Whether the backend supports channel, thread-list, and flattened timelines.",
           "type": "boolean"
@@ -879,6 +883,13 @@
     "MessageThread": {
       "description": "Thread membership attached to a message without conflating it with a reply reference.",
       "properties": {
+        "display_name": {
+          "description": "On a thread's ROOT, the thread's name as [`ThreadSummary::display_name`] gives it: what a\nsummariser filed, served by the same rule (`#484 summary-card-threshold`). `#528\nthread-card-markdown-and-cap`: a page that holds a root draws its thread's summary card from\nthe read that brought the root, and from its saved copy on a reload, rather than waiting for\na read of the thread list. Absent on replies, until named, and from an older server.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "hue": {
           "description": "The thread's colour, in whole degrees of hue (`0..360`), as THIS server assigned it.\n`#427 server-thread-hues`; see [`crate::thread_hues`].\n\nFORMED BY THIS SERVER when a message is served to the page (and on the live stream's way\nout), from the durable assignment — never trusted from a provider, a bridge or an\nadapter, whose copies are overwritten, and absent where no assignment exists for the\nthread yet: an older bridge's answer, a read-scope caller meeting a thread the server has\nnot coloured, a deployment with no store. Absent is the page's cue to fall back to its own\nalgorithm for that thread, as every page did before `#427`; present, it is the colour on\nevery device, and the page never recolours it.",
           "format": "uint16",
@@ -920,6 +931,13 @@
             }
           ],
           "description": "The original channel message, if this provider exposes one."
+        },
+        "summary": {
+          "description": "On a thread's root, the thread's sentence as [`ThreadSummary::summary`] gives it, under the\nsame rule as `display_name`.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
