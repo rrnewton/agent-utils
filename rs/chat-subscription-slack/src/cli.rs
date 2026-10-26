@@ -32,7 +32,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -1179,12 +1179,15 @@ pub fn scan_page(document: &Value, channel_id: &str) -> Result<ScanPage, Transpo
 
 /// The client arguments of one post, whose body the client reads from standard input. `app`
 /// is the `--as` argument, if the client takes one: see [`ClientIdentity::app_argument`].
+/// `blocks_file`, a private file holding the post's Block Kit blocks, makes the body their
+/// notification fallback.
 #[must_use]
 pub(crate) fn post_arguments(
     app: Option<String>,
     channel_id: &str,
     thread_ts: Option<&str>,
     format: TextFormat,
+    blocks_file: Option<&Path>,
 ) -> Vec<String> {
     let body_flag = match format {
         TextFormat::Markdown => "--markdown=file://-",
@@ -1197,6 +1200,9 @@ pub(crate) fn post_arguments(
         format!("--channel-id={channel_id}"),
         body_flag.to_owned(),
     ];
+    if let Some(path) = blocks_file {
+        arguments.push(format!("--blocks=file://{}", path.display()));
+    }
     if let Some(thread_ts) = thread_ts {
         arguments.push(format!("--thread-ts={thread_ts}"));
     }
@@ -1227,6 +1233,43 @@ pub(crate) fn post_outcome(completed: &Completed) -> Result<String, TransportErr
                 "the client reported success without a message ts",
             )
         })
+}
+
+/// A post's Block Kit blocks in a new owner-only file under the temporary directory, for the
+/// client's `--blocks=file://…`, deleted when dropped.
+struct BlocksFile {
+    path: PathBuf,
+}
+
+impl BlocksFile {
+    fn create(blocks: &str) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "agentctl-slack-blocks-{}-{nanos}-{}.json",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let written = Self { path };
+        file.write_all(blocks.as_bytes())?;
+        file.sync_all()?;
+        Ok(written)
+    }
+}
+
+impl Drop for BlocksFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl CliTransport {
@@ -1284,11 +1327,25 @@ impl SlackTransport for CliTransport {
     }
 
     fn post_message(&mut self, post: &PostMessage<'_>) -> Result<String, TransportError> {
+        // Standard input carries the body, so the blocks go in a private file of their own,
+        // removed when the run ends. Neither is ever an argument a process listing shows.
+        let blocks_file = post
+            .blocks
+            .map(BlocksFile::create)
+            .transpose()
+            .map_err(|error| {
+                TransportError::not_applied(
+                    "blocks_file_failed",
+                    format!("the post's blocks could not be written for the client: {error}"),
+                    true,
+                )
+            })?;
         let arguments = post_arguments(
             self.options.identity.app_argument(post.app_id),
             post.channel_id,
             post.thread_ts,
             post.format,
+            blocks_file.as_ref().map(|file| file.path.as_path()),
         );
         let converted;
         let body: &[u8] = if post.format == TextFormat::Converted {

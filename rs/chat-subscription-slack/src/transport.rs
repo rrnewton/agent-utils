@@ -166,6 +166,9 @@ pub struct PostMessage<'a> {
     pub text: &'a str,
     /// Body format.
     pub format: TextFormat,
+    /// Block Kit blocks as a JSON array, drawn in place of `text`, which is then the
+    /// notification fallback (`#551 headings-real-headings`); `None` posts `text` alone.
+    pub blocks: Option<&'a str>,
 }
 
 /// One message from a history or thread listing.

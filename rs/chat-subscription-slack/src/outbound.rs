@@ -1168,14 +1168,22 @@ fn send(
     // configured format; the helper's format already reflects any
     // `AGENTCTL_SLACK_FORMAT` environment override.
     let format = slack_format.unwrap_or(config.format);
+    // Each chunk's Block Kit blocks, where the converted path gives it headings
+    // (`#551 headings-real-headings`); every other chunk posts its text alone.
+    let mut chunk_blocks: Vec<Option<String>> = Vec::new();
     let (chunks, post_format) = match format {
-        TextFormat::Converted => (
-            crate::mrkdwn::convert_and_split(
+        TextFormat::Converted => {
+            let parts = crate::mrkdwn::convert_and_split_parts(
                 text,
                 config.max_chunk_bytes.min(crate::mrkdwn::MAX_MRKDWN_BYTES),
-            ),
-            TextFormat::SlackMrkdwn,
-        ),
+            );
+            let mut chunks = Vec::with_capacity(parts.len());
+            for part in parts {
+                chunks.push(part.text);
+                chunk_blocks.push(part.blocks);
+            }
+            (chunks, TextFormat::SlackMrkdwn)
+        }
         TextFormat::SlackMrkdwn => (
             split_body(
                 text,
@@ -1186,9 +1194,13 @@ fn send(
         other => (split_body(text, config.max_chunk_bytes), other),
     };
     diagnostics.log(&format!(
-        "send {id}: slack_format={} chunks={}",
+        "send {id}: slack_format={} chunks={} with_blocks={}",
         format.name(),
-        chunks.len()
+        chunks.len(),
+        chunk_blocks
+            .iter()
+            .filter(|blocks| blocks.is_some())
+            .count()
     ));
     let mut record = match load_ledger(directory, id)? {
         Some(record) => {
@@ -1293,6 +1305,7 @@ fn send(
             thread_ts,
             text: chunk,
             format: post_format,
+            blocks: chunk_blocks.get(index).and_then(Option::as_deref),
         });
         match posted {
             Ok(ts) if ids::valid_ts(&ts) => {

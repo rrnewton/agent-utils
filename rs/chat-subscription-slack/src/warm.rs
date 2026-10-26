@@ -207,6 +207,10 @@ impl WarmClient {
         if post.app_id != &self.app_id || post.format != self.format {
             return WarmPost::NoSpare("the post does not match this worker client".to_owned());
         }
+        if post.blocks.is_some() {
+            // A spare already holds its body flag; blocks need a new client run.
+            return WarmPost::NoSpare("a post with blocks has no spares".to_owned());
+        }
         let Some(thread_ts) = post.thread_ts else {
             return WarmPost::NoSpare("only thread replies have spares".to_owned());
         };
@@ -947,6 +951,7 @@ impl Worker {
             &key.channel_id,
             Some(&key.thread_ts),
             self.format,
+            None,
         );
         let mut command = self.transport.client_command(&arguments);
         command
@@ -1344,6 +1349,7 @@ mod tests {
             thread_ts: Some("1700000000.000100"),
             text: "hello",
             format: TextFormat::Markdown,
+            blocks: None,
         }
     }
 
@@ -1492,6 +1498,7 @@ mod tests {
             thread_ts: Some("1700000000.000100"),
             text: "hello",
             format: TextFormat::Markdown,
+            blocks: None,
         };
         assert!(matches!(client.post(&post), WarmPost::NoSpare(_)));
         let other = AppId::new("A0OTHERAPP1").expect("app");

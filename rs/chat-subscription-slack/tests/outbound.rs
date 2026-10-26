@@ -1058,6 +1058,16 @@ fn converted_format_posts_converted_mrkdwn_and_env_overrides() {
         posts[0].text,
         "*Report*\n\n*Done* &amp; &lt;ok&gt;\n\n• ☑ shipped"
     );
+    // `#551 headings-real-headings`: the heading is also a header block, the text the fallback.
+    let blocks: Value =
+        serde_json::from_str(posts[0].blocks.as_deref().expect("blocks")).expect("blocks JSON");
+    assert_eq!(
+        blocks,
+        json!([
+            {"type": "header", "text": {"type": "plain_text", "text": "Report", "emoji": true}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*Done* &amp; &lt;ok&gt;\n\n• ☑ shipped"}}
+        ])
+    );
 
     // The environment override converts a plain helper configuration.
     let env_config = OutboundConfig::parse_with_environment(
@@ -1079,4 +1089,22 @@ fn converted_format_posts_converted_mrkdwn_and_env_overrides() {
         Some("bogus"),
     )
     .is_err());
+}
+
+#[test]
+fn converted_replies_without_headings_and_markdown_replies_carry_no_blocks() {
+    let ledger = ledger("converted-no-headings");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    let mut request = send(ID, Some("1792000801.000100"), "Plain **reply**.\n\n- one");
+    request["slack_format"] = json!("converted");
+    assert_eq!(run(&config, &fake, &request, 1_000)["ok"], json!(true));
+    let mut markdown = send(ID2, Some("1792000801.000100"), "# A heading\n\nbody");
+    markdown["slack_format"] = json!("markdown");
+    assert_eq!(run(&config, &fake, &markdown, 1_000)["ok"], json!(true));
+    let posts = &fake.state().posts;
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[0].blocks, None);
+    assert_eq!(posts[1].format, TextFormat::Markdown);
+    assert_eq!(posts[1].blocks, None);
 }

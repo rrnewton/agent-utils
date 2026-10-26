@@ -8,12 +8,54 @@
 //! monospace code block, and task boxes become `☐`/`☑`. The vendor
 //! `--slack-mrkdwn` body keeps every line break, so what is rendered here is
 //! what Slack stores.
+//!
+//! Headings (`#551 headings-real-headings`). A part of a message that holds a
+//! heading of levels 1 to 3, of at most [`MAX_HEADER_CHARS`] characters, is
+//! also given Block Kit blocks ([`ConvertedPart::blocks`]): each such heading
+//! a `header` block, which Slack's own client draws as a heading and its
+//! history returns as one, and the mrkdwn between them `section` blocks. The
+//! mrkdwn above stays the message text, which Slack shows in notifications and
+//! the client's stored text returns. A deeper or longer heading stays a bold
+//! line, and a part whose blocks would pass [`MAX_BLOCKS`] is posted as its
+//! mrkdwn alone. Slack's header block has no level, so every header is one
+//! heading level to a reader.
 
 use comrak::nodes::{AstNode, NodeValue, TableAlignment};
 use comrak::{Arena, Options};
+use serde_json::{json, Value};
 
 /// The vendor `--slack-mrkdwn` byte cap for one message.
 pub const MAX_MRKDWN_BYTES: usize = 4_000;
+
+/// Slack's cap on a header block's plain text, in characters.
+pub const MAX_HEADER_CHARS: usize = 150;
+
+/// Slack's cap on a section block's mrkdwn text, in characters.
+pub const MAX_SECTION_CHARS: usize = 3_000;
+
+/// The vendor client's cap on the Block Kit blocks of one message.
+pub const MAX_BLOCKS: usize = 50;
+
+/// The deepest heading posted as a header block; a deeper one stays a bold line.
+pub const MAX_HEADER_LEVEL: u8 = 3;
+
+/// One message of a converted reply: its mrkdwn text, and the Block Kit blocks
+/// that say the same with real headings, when it holds a heading that can be one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConvertedPart {
+    /// The mrkdwn body, at most the split limit in bytes; with blocks, the
+    /// notification fallback and the text Slack's history returns.
+    pub text: String,
+    /// The blocks as a JSON array, or `None` to post `text` alone.
+    pub blocks: Option<String>,
+}
+
+/// One blank-line separated block of converted mrkdwn, with the plain text of
+/// the header block it may be posted as when it is a heading that can be one.
+struct Unit {
+    text: String,
+    header: Option<String>,
+}
 
 fn options() -> Options<'static> {
     let mut options = Options::default();
@@ -69,39 +111,159 @@ pub fn convert_markdown(markdown: &str) -> String {
 /// [`crate::outbound::split_body`]).
 #[must_use]
 pub fn convert_and_split(markdown: &str, limit: usize) -> Vec<String> {
+    convert_and_split_parts(markdown, limit)
+        .into_iter()
+        .map(|part| part.text)
+        .collect()
+}
+
+/// [`convert_and_split`], each part with the Block Kit blocks that post its
+/// headings as headings, when it has one that can be (see the module notes).
+#[must_use]
+pub fn convert_and_split_parts(markdown: &str, limit: usize) -> Vec<ConvertedPart> {
     let limit = limit.clamp(1, MAX_MRKDWN_BYTES);
-    let converted = convert_markdown(markdown);
-    if converted.is_empty() {
-        return vec![String::new()];
-    }
-    let mut parts: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for block in split_blocks(&converted) {
-        let candidate = if current.is_empty() {
-            block.to_owned()
+    let units = convert_units(markdown);
+    let mut parts: Vec<Vec<Unit>> = Vec::new();
+    let mut current: Vec<Unit> = Vec::new();
+    let mut current_bytes = 0;
+    for unit in units {
+        let joined = if current.is_empty() {
+            unit.text.len()
         } else {
-            format!("{current}\n\n{block}")
+            current_bytes + 2 + unit.text.len()
         };
-        if candidate.len() <= limit {
-            current = candidate;
+        if joined <= limit {
+            current_bytes = joined;
+            current.push(unit);
             continue;
         }
         if !current.is_empty() {
             parts.push(std::mem::take(&mut current));
         }
-        if block.len() <= limit {
-            current = block;
+        if unit.text.len() <= limit {
+            current_bytes = unit.text.len();
+            current.push(unit);
         } else {
-            let mut chunks = split_oversize_block(&block, limit);
+            let mut chunks = split_oversize_block(&unit.text, limit);
             let last = chunks.pop().unwrap_or_default();
-            parts.extend(chunks);
-            current = last;
+            parts.extend(
+                chunks
+                    .into_iter()
+                    .map(|text| vec![Unit { text, header: None }]),
+            );
+            current_bytes = last.len();
+            current.push(Unit {
+                text: last,
+                header: None,
+            });
         }
     }
     if !current.is_empty() || parts.is_empty() {
         parts.push(current);
     }
     parts
+        .into_iter()
+        .map(|units| ConvertedPart {
+            text: units
+                .iter()
+                .map(|unit| unit.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            blocks: blocks_for(&units),
+        })
+        .collect()
+}
+
+/// The converted document as [`convert_markdown`] writes it, one unit per
+/// blank-line separated block, each top-level heading that can be a header
+/// block carrying its plain text.
+fn convert_units(markdown: &str) -> Vec<Unit> {
+    let arena = Arena::new();
+    let root = comrak::parse_document(&arena, markdown, &options());
+    let mut units = Vec::new();
+    for child in root.children() {
+        let block = render_block(child, 0);
+        let block = block.trim_matches('\n');
+        if block.trim().is_empty() {
+            continue;
+        }
+        let header = match &child.data.borrow().value {
+            NodeValue::Heading(heading) if heading.level <= MAX_HEADER_LEVEL => {
+                let plain = heading_plain(child);
+                (plain.chars().count() <= MAX_HEADER_CHARS).then_some(plain)
+            }
+            _ => None,
+        };
+        if header.is_some() {
+            units.push(Unit {
+                text: block.to_owned(),
+                header,
+            });
+        } else {
+            units.extend(
+                split_blocks(block)
+                    .into_iter()
+                    .map(|text| Unit { text, header: None }),
+            );
+        }
+    }
+    units
+}
+
+/// A heading's words as plain text, its inline markup dropped.
+fn heading_plain<'a>(node: &'a AstNode<'a>) -> String {
+    let mut inner = String::new();
+    for child in node.children() {
+        plain_inline(child, &mut inner);
+    }
+    inner.trim().to_owned()
+}
+
+/// The Block Kit blocks for one part's units: each header unit a `header`
+/// block and the mrkdwn between them `section` blocks, each at most
+/// [`MAX_SECTION_CHARS`]. `None` for a part with no header unit, so it posts as
+/// before, or one whose blocks would pass [`MAX_BLOCKS`].
+fn blocks_for(units: &[Unit]) -> Option<String> {
+    if !units.iter().any(|unit| unit.header.is_some()) {
+        return None;
+    }
+    let mut blocks: Vec<Value> = Vec::new();
+    let mut section = String::new();
+    let flush = |section: &mut String, blocks: &mut Vec<Value>| {
+        if !section.is_empty() {
+            let text = std::mem::take(section);
+            blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": text}}));
+        }
+    };
+    for unit in units {
+        if let Some(plain) = &unit.header {
+            flush(&mut section, &mut blocks);
+            blocks.push(json!({
+                "type": "header",
+                "text": {"type": "plain_text", "text": plain, "emoji": true}
+            }));
+            continue;
+        }
+        let pieces = if unit.text.chars().count() <= MAX_SECTION_CHARS {
+            vec![unit.text.clone()]
+        } else {
+            // Byte-bounded, so each piece is within the character cap too.
+            split_oversize_block(&unit.text, MAX_SECTION_CHARS)
+        };
+        for piece in pieces {
+            if !section.is_empty()
+                && section.chars().count() + 2 + piece.chars().count() > MAX_SECTION_CHARS
+            {
+                flush(&mut section, &mut blocks);
+            }
+            if !section.is_empty() {
+                section.push_str("\n\n");
+            }
+            section.push_str(&piece);
+        }
+    }
+    flush(&mut section, &mut blocks);
+    (blocks.len() <= MAX_BLOCKS).then(|| Value::Array(blocks).to_string())
 }
 
 /// Blocks of a converted document: blank-line separated, except that a
@@ -184,17 +346,12 @@ fn render_block<'a>(node: &'a AstNode<'a>, depth: usize) -> String {
             }
             out
         }
-        NodeValue::Heading(heading) => {
-            let mut inner = String::new();
-            for child in node.children() {
-                plain_inline(child, &mut inner);
-            }
-            let inner = inner.trim();
+        NodeValue::Heading(_) => {
+            let inner = heading_plain(node);
             if inner.is_empty() {
                 String::new()
             } else {
-                let _ = heading.level;
-                format!("*{inner}*")
+                format!("*{}*", escape_text(&inner))
             }
         }
         NodeValue::BlockQuote | NodeValue::MultilineBlockQuote(_) => {
@@ -581,5 +738,85 @@ mod tests {
         assert!(parts.len() > 1);
         assert!(parts.iter().all(|p| p.len() <= 4_000));
         assert_eq!(parts.join("\n\n"), convert_markdown(&md));
+    }
+
+    fn parsed_blocks(part: &ConvertedPart) -> Vec<Value> {
+        let blocks = part.blocks.as_deref().expect("blocks");
+        serde_json::from_str::<Vec<Value>>(blocks).expect("blocks JSON")
+    }
+
+    #[test]
+    fn headings_become_header_blocks_beside_unchanged_mrkdwn() {
+        // `#551 headings-real-headings`.
+        let md = "# Weekly report\n\nStatus is **green** & fine.\n\n## Numbers\n\n1. one\n2. two\n\n### Small & `plain`\n\nEnd.";
+        let parts = convert_and_split_parts(md, 4_000);
+        assert_eq!(parts.len(), 1);
+        // The text is exactly what the mrkdwn-only path posts.
+        assert_eq!(parts[0].text, convert_markdown(md));
+        assert_eq!(convert_and_split(md, 4_000), vec![parts[0].text.clone()]);
+        let blocks = parsed_blocks(&parts[0]);
+        let kinds: Vec<&str> = blocks.iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            ["header", "section", "header", "section", "header", "section"]
+        );
+        assert_eq!(
+            blocks[0]["text"],
+            json!({"type": "plain_text", "text": "Weekly report", "emoji": true})
+        );
+        assert_eq!(blocks[1]["text"]["type"], "mrkdwn");
+        assert_eq!(blocks[1]["text"]["text"], "Status is *green* &amp; fine.");
+        assert_eq!(blocks[3]["text"]["text"], "1. one\n2. two");
+        // A header is plain text: entities are mrkdwn's, so it keeps the character itself.
+        assert_eq!(blocks[4]["text"]["text"], "Small & plain");
+        assert!(
+            parts[0].text.contains("*Small &amp; plain*"),
+            "{}",
+            parts[0].text
+        );
+    }
+
+    #[test]
+    fn deep_long_or_absent_headings_post_mrkdwn_alone_or_as_bold_lines() {
+        // No heading at all: the post is unchanged, with no blocks.
+        let plain = convert_and_split_parts("Just a paragraph.\n\n- a list", 4_000);
+        assert_eq!(plain[0].blocks, None);
+        // Level 4 and beyond stay bold lines, so a part with only those has no blocks either.
+        let deep = convert_and_split_parts("#### Fourth\n\ntext", 4_000);
+        assert_eq!(deep[0].blocks, None);
+        assert_eq!(deep[0].text, "*Fourth*\n\ntext");
+        // A heading past Slack's header cap stays a bold line inside a section.
+        let long = "x".repeat(MAX_HEADER_CHARS + 1);
+        let parts = convert_and_split_parts(&format!("# Short\n\n# {long}\n\nbody"), 4_000);
+        let blocks = parsed_blocks(&parts[0]);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "header");
+        assert_eq!(blocks[1]["text"]["text"], format!("*{long}*\n\nbody"));
+    }
+
+    #[test]
+    fn blocks_respect_section_and_block_caps() {
+        // A section never passes Slack's 3,000 characters: long mrkdwn is split across sections.
+        let para = "word ".repeat(400).trim_end().to_owned();
+        let md = format!("# Head\n\n{para}\n\n{para}");
+        let parts = convert_and_split_parts(&md, 4_000);
+        for part in &parts {
+            if part.blocks.is_some() {
+                for block in parsed_blocks(part) {
+                    if block["type"] == "section" {
+                        let text = block["text"]["text"].as_str().unwrap();
+                        assert!(text.chars().count() <= MAX_SECTION_CHARS);
+                    }
+                }
+            }
+        }
+        // More than 50 blocks: that part posts its mrkdwn alone.
+        let many: String = (0..30)
+            .map(|n| format!("## H{n}\n\nline {n}\n\n"))
+            .collect();
+        let parts = convert_and_split_parts(&many, 4_000);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].blocks, None);
+        assert_eq!(parts[0].text, convert_markdown(&many));
     }
 }

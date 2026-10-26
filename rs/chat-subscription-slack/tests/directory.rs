@@ -29,6 +29,18 @@ case "$1 $2" in
     if [ -f "$FAKE_SLACK_DIR/reaction-slow" ]; then sleep 0.65; fi
     printf '%s\n' "$*" >> "$FAKE_SLACK_DIR/reactions.log"
     printf '%s\n' '{"status":"success","data":{"changed":true}}' ;;
+  "slack.message send")
+    cat > "$FAKE_SLACK_DIR/body.log"
+    for arg in "$@"; do
+      case "$arg" in
+        --blocks=file://*)
+          path=${arg#--blocks=file://}
+          printf '%s\n' "$path" > "$FAKE_SLACK_DIR/blocks.path"
+          stat -c %a "$path" > "$FAKE_SLACK_DIR/blocks.mode"
+          cp "$path" "$FAKE_SLACK_DIR/blocks.log" ;;
+      esac
+    done
+    printf '%s\n' '{"status":"success","message_ts":"1792000900.000100"}' ;;
   "slack.conversation members")
     page=members-first.json
     for arg in "$@"; do
@@ -753,4 +765,61 @@ fn bridge_grants_consume_the_native_slack_directory_protocol_and_keep_explicit_p
         !root.join("ledger").exists(),
         "directory reads have no write ledger"
     );
+}
+
+#[test]
+fn a_post_with_blocks_hands_them_over_in_a_private_file_removed_afterwards() {
+    // `#551 headings-real-headings`: the body stays on standard input and the blocks, also
+    // message text, go in an owner-only file, never in the client's arguments.
+    use chat_subscription_slack::outbound::OutboundConfig;
+    use chat_subscription_slack::transport::{PostMessage, TextFormat};
+    let root = workspace("post-with-blocks");
+    let config = OutboundConfig::parse(&arguments(&root)).unwrap();
+    let mut transport = config.transport().unwrap();
+    let blocks = r#"[{"type":"header","text":{"type":"plain_text","text":"Report"}}]"#;
+    let ts = transport
+        .post_message(&PostMessage {
+            app_id: config.app_id.as_ref().unwrap(),
+            channel_id: CHANNEL,
+            thread_ts: Some("1792000801.000100"),
+            text: "*Report*",
+            format: TextFormat::SlackMrkdwn,
+            blocks: Some(blocks),
+        })
+        .expect("posted");
+    assert_eq!(ts, "1792000900.000100");
+    assert_eq!(
+        fs::read_to_string(root.join("body.log")).unwrap(),
+        "*Report*"
+    );
+    assert_eq!(fs::read_to_string(root.join("blocks.log")).unwrap(), blocks);
+    assert_eq!(
+        fs::read_to_string(root.join("blocks.mode")).unwrap().trim(),
+        "600"
+    );
+    let path = fs::read_to_string(root.join("blocks.path")).unwrap();
+    assert!(
+        !Path::new(path.trim()).exists(),
+        "the blocks file outlived the post"
+    );
+    let argv = fs::read_to_string(root.join("argv.log")).unwrap();
+    assert!(argv.contains("--slack-mrkdwn=file://-"), "{argv}");
+    assert!(
+        !argv.contains("Report"),
+        "message text reached the arguments: {argv}"
+    );
+
+    // Without blocks, the arguments are as before.
+    fs::remove_file(root.join("blocks.path")).unwrap();
+    transport
+        .post_message(&PostMessage {
+            app_id: config.app_id.as_ref().unwrap(),
+            channel_id: CHANNEL,
+            thread_ts: None,
+            text: "plain",
+            format: TextFormat::SlackMrkdwn,
+            blocks: None,
+        })
+        .expect("posted");
+    assert!(!root.join("blocks.path").exists());
 }
