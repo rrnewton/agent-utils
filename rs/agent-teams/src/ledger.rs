@@ -4,7 +4,9 @@
 
 use crate::deliver::{Deliverer, Handover};
 use crate::envelope::{check_envelope, envelope_sender, render, sha256_hex};
-use crate::jsonfile::{write_json_atomic, write_new, write_new_atomic, DataResult};
+use crate::jsonfile::{
+    create_private_dir_all, write_json_atomic, write_new, write_new_atomic, DataResult,
+};
 use crate::model::Declaration;
 use crate::timeutil::{format_rfc3339_ms, now_unix_ms, parse_rfc3339_ms};
 use serde_json::{json, Value};
@@ -629,19 +631,29 @@ fn apply_supersede(
 }
 
 /// A lock-free tombstone beside the deliverer's store (section 12.2).
+///
+/// A queue's tombstone is written by the queue library itself, so its lane is private (a
+/// directory made under the usual 022 umask stops every reader of the queue) and an item still
+/// waiting is set aside at once when no drain holds the queue. A hook inbox's tombstone is a
+/// private file in a private directory.
 pub fn write_tombstone(deliverer: &dyn Deliverer, id: &str, reason: &str) {
     let target = deliverer.target();
-    let cancel_dir = match (&target.queue_dir, &target.inbox_dir) {
-        (Some(queue), _) => queue.join("cancel"),
-        (None, Some(inbox)) => inbox.join("cancel"),
-        _ => return,
-    };
-    if fs::create_dir_all(&cancel_dir).is_ok() {
-        let body = json!({"id": id, "reason": reason, "at": format_rfc3339_ms(now_unix_ms())});
-        let _ = write_new(
-            &cancel_dir.join(format!("{id}.json")),
-            body.to_string().as_bytes(),
-        );
+    match (&target.queue_dir, &target.inbox_dir) {
+        (Some(queue), _) => {
+            let _ = agent_queue::queue::cancel(queue, id, reason);
+        }
+        (None, Some(inbox)) => {
+            let cancel_dir = inbox.join("cancel");
+            if create_private_dir_all(&cancel_dir).is_ok() {
+                let body =
+                    json!({"id": id, "reason": reason, "at": format_rfc3339_ms(now_unix_ms())});
+                let _ = write_new(
+                    &cancel_dir.join(format!("{id}.json")),
+                    body.to_string().as_bytes(),
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -938,4 +950,85 @@ pub fn list_entries(state: &Path, team: &str) -> Vec<Value> {
 /// Body hash of an envelope file body, for fence calls from the outbox.
 pub fn body_hash(body: &str) -> String {
     sha256_hex(body.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deliver::{HandoverTarget, HookInboxDeliverer};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct QueueTarget(PathBuf);
+
+    impl Deliverer for QueueTarget {
+        fn kind(&self) -> &str {
+            "agentctl-queue"
+        }
+        fn target(&self) -> HandoverTarget {
+            HandoverTarget {
+                kind: self.kind().to_string(),
+                queue_dir: Some(self.0.clone()),
+                inbox_dir: None,
+            }
+        }
+        fn handover(&self, _id: &str, _envelope: &Value, _rendered: &str) -> Handover {
+            Handover::Refused("not used".to_string())
+        }
+        fn contains(&self, _id: &str) -> Option<bool> {
+            None
+        }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-teams-ledger-{name}-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #557 agent-teams-cancel-perms: under the usual 022 umask a tombstone once made the
+    /// queue's `cancel/` 0755 with a 0644 file, and every reader of the queue then refused it.
+    #[test]
+    fn tombstones_and_hook_inbox_items_are_private_under_umask_022() {
+        // SAFETY: umask has no preconditions; 022 is the usual default, so other tests are
+        // unaffected.
+        unsafe { libc::umask(0o022) };
+        let dir = scratch("tombstone");
+
+        let queue = dir.join("registry/coordinator/queue");
+        agent_queue::queue::prepare(&queue).unwrap();
+        write_tombstone(&QueueTarget(queue.clone()), "tm-a-1", "retracted");
+        let cancel = queue.join("cancel");
+        assert_eq!(mode(&cancel), 0o700);
+        assert_eq!(mode(&cancel.join("tm-a-1.json")), 0o600);
+        // The queue's own readers accept the result.
+        assert_eq!(
+            agent_queue::queue::message_state(&queue, "tm-a-1").unwrap(),
+            None
+        );
+
+        let inbox = dir.join("hook-inbox");
+        let hook = HookInboxDeliverer {
+            inbox_dir: inbox.clone(),
+            ledger_path: dir.join("ledger/tm-b-1.json"),
+        };
+        assert!(matches!(
+            hook.handover("tm-b-1", &json!({"id": "tm-b-1"}), "hello"),
+            Handover::Accepted
+        ));
+        write_tombstone(&hook, "tm-b-1", "retracted");
+        assert_eq!(mode(&inbox), 0o700);
+        assert_eq!(mode(&inbox.join("tm-b-1.json")), 0o600);
+        assert_eq!(mode(&inbox.join("cancel")), 0o700);
+        assert_eq!(mode(&inbox.join("cancel/tm-b-1.json")), 0o600);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -127,12 +127,38 @@ pub fn backup_path(path: &Path, stamp: i64) -> PathBuf {
     path.with_file_name(format!("{name}.{stamp}"))
 }
 
-/// Write a file only if it does not exist (`O_EXCL`); returns false when it already did.
+/// Create `path` and any missing parents as directories private to the caller (mode 0700),
+/// whatever the umask, and make `path` itself private if it already exists. A queue lane or
+/// hook inbox made with the usual 022 umask would be readable by everyone, and the queue
+/// library refuses to read a queue directory that is not private.
+pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "not a directory: {}",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Write a file, mode 0600 whatever the umask, only if it does not exist (`O_EXCL`); returns
+/// false when it already did.
 pub fn write_new(path: &Path, contents: &[u8]) -> io::Result<bool> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
     {
         Ok(mut file) => {
