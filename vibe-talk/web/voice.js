@@ -18796,6 +18796,9 @@ const CARD_WHOLE_TAGS = new Set(["table", "pre", "blockquote"]);
 /** The blocks a card's "…" is written into, rather than after. */
 const CARD_TEXT_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li"]);
 
+/** Headings, which a card never ends on: each goes with the part it heads (`#551 headings-real-headings`). */
+const CARD_HEADING_TAGS = new Set(["h1", "h2", "h3", "h4"]);
+
 /** A node's tag, lower case, or "" for a text node. */
 const tagNameOf = (node) => String((node && node.tagName) || "").toLowerCase();
 
@@ -18813,12 +18816,13 @@ const nodeWords = (node) => (node.nodeType === 3 ? String(node.textContent) : re
  * `mark`, the line a "…" after it takes of its own (1 after a block with no line of words to end:
  * code, a quote, a table, an item ending in a list of its own), else 0. A table counts a line a row and
  * code a line a line, as they draw them (`#533 card-split-atomic-blocks`); `whole` marks either, or a
- * quote, as a block the card never cuts into (`CARD_WHOLE_TAGS`).
+ * quote, as a block the card never cuts into (`CARD_WHOLE_TAGS`); `heading`, a heading, which a card
+ * never ends on (`CARD_HEADING_TAGS`).
  *
- * @returns {Array<{block: any, index: number, nodes: any[], lines: number, mark: number, whole: boolean}>}
+ * @returns {Array<{block: any, index: number, nodes: any[], lines: number, mark: number, whole: boolean, heading: boolean}>}
  */
 function cardUnits(box) {
-  /** @type {Array<{block: any, index: number, nodes: any[], lines: number, mark: number, whole: boolean}>} */
+  /** @type {Array<{block: any, index: number, nodes: any[], lines: number, mark: number, whole: boolean, heading: boolean}>} */
   const units = [];
   const unit = (block, index, nodes, width) => {
     const words = nodes.map(nodeWords).join("");
@@ -18829,7 +18833,7 @@ function cardUnits(box) {
     const lines = tag === "table" ? Math.max(1, tableShape(last).rows)
       : tag === "pre" ? Math.max(1, (String(last.textContent || "") || renderedText(last)).replace(/\n+$/, "").split("\n").length)
         : cardProxyLines(proxyLinesOf(words), width);
-    units.push({ block, index, nodes, lines, mark, whole: CARD_WHOLE_TAGS.has(tag) });
+    units.push({ block, index, nodes, lines, mark, whole: CARD_WHOLE_TAGS.has(tag), heading: CARD_HEADING_TAGS.has(tag) });
   };
   for (const block of sayingNodes(box)) {
     const tag = tagNameOf(block);
@@ -18971,7 +18975,8 @@ function cardCutEntry(root) {
   const held = cardCuts.get(root);
   if (held && held.lines === cardMaxLines) return held;
   const units = cardUnits(messageBody(root));
-  const cut = cutForCard(units.map((unit) => unit.lines), units.map((unit) => unit.mark), units.map((unit) => unit.whole));
+  const cut = cutForCard(units.map((unit) => unit.lines), units.map((unit) => unit.mark), units.map((unit) => unit.whole),
+    units.map((unit) => unit.heading));
   const entry = { lines: cardMaxLines, cut, text: foldedCardText(renderedText(cardHead(root, cut))) };
   cardCuts.set(root, entry);
   return entry;
@@ -18982,11 +18987,13 @@ function cardCutEntry(root) {
  * line each unit's "…" would take of its own (`cardUnits`), so the "…" never takes the card past K;
  * `wholes`, which units are blocks never cut into nor clamped. A first unit longer than K is clamped
  * (`whole`), but such a block, which is stood for on the card by one line (`stub`, `cardHead`) and goes
- * whole into the continuation: a cut before it (`#533 card-split-atomic-blocks`).
+ * whole into the continuation: a cut before it (`#533 card-split-atomic-blocks`). `headings`, which
+ * units are headings: a card never ends on one, which would head nothing there, so the cut moves back
+ * before it and the heading opens the continuation with its part (`#551 headings-real-headings`).
  *
  * @returns {{head: number, whole: boolean, stub?: boolean} | null}
  */
-function cutForCard(lines, marks = [], wholes = []) {
+function cutForCard(lines, marks = [], wholes = [], headings = []) {
   const total = lines.reduce((sum, n) => sum + n, 0);
   if (total <= cardMaxLines) return null;
   let head = 0;
@@ -18996,6 +19003,10 @@ function cutForCard(lines, marks = [], wholes = []) {
     head += 1;
   }
   while (head > 0 && used + (marks[head - 1] || 0) > cardMaxLines) {
+    head -= 1;
+    used -= lines[head];
+  }
+  while (head > 1 && headings[head - 1]) {
     head -= 1;
     used -= lines[head];
   }

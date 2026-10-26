@@ -81642,6 +81642,13 @@ test("`#522 thread-card-max-lines`: lines are counted by the server's proxy, wra
   const marked = (lines, marks) => JSON.parse(JSON.stringify(page0.pure("cutForCard")(lines, marks)));
   assert.deepStrictEqual(marked([2, 3, 4], [0, 1, 0]), { head: 1, whole: false }, "the … after code took the card past K");
   assert.deepStrictEqual(marked([2, 2, 4], [0, 1, 0]), { head: 2, whole: false });
+  // `#551 headings-real-headings`: a card never ends on a heading, which would head nothing there; the
+  // heading opens the continuation with the part it heads. A heading that is the first unit stays.
+  const headed = (lines, headings) => JSON.parse(JSON.stringify(page0.pure("cutForCard")(lines, [], [], headings)));
+  assert.deepStrictEqual(headed([2, 2, 1, 3], [false, false, true, false]), { head: 2, whole: false }, "the card ended on a heading");
+  assert.deepStrictEqual(headed([1, 2, 1, 1, 4], [true, false, true, true, false]), { head: 2, whole: false }, "two headings in a row both go on");
+  assert.deepStrictEqual(headed([1, 9], [true, false]), { head: 1, whole: false }, "a first heading alone is still the card");
+  assert.deepStrictEqual(headed([2, 2, 1, 3], [false, false, false, false]), { head: 3, whole: false });
 });
 
 // --- a thread card keeps its root's formatting (#528 thread-card-markdown-and-cap) -------------------

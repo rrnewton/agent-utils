@@ -3312,6 +3312,22 @@ mod tests {
     }
 
     #[test]
+    fn a_slack_bodys_markdown_headings_draw_as_headings_under_their_own_parts() {
+        // `#551 headings-real-headings`: the Slack shim writes a header block back as a Markdown
+        // heading, in a body that is otherwise Slack's mrkdwn (one-asterisk bold, `&amp;`).
+        let body = crate::slack::mrkdwn::to_markdown(
+            "## Weekly report\n\nStatus is *green* &amp; steady.\n\n## Numbers\n\n\
+             1. First\n2. Second\n\n### Small print\n\nEnd.",
+        );
+        assert_eq!(
+            to_html(&body, Markup::Slack),
+            "<h2>Weekly report</h2>\n<p>Status is <strong>green</strong> &amp; steady.</p>\n\
+             <h2>Numbers</h2>\n<ol>\n<li>First</li>\n<li>Second</li>\n</ol>\n\
+             <h3>Small print</h3>\n<p>End.</p>\n"
+        );
+    }
+
+    #[test]
     fn tables_and_task_lists_keep_only_their_alignment_and_their_ticks() {
         assert_eq!(
             html("| a | b |\n|:--|--:|\n| 1 | 2 |"),

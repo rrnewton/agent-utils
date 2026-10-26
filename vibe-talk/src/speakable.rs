@@ -403,7 +403,31 @@ fn strip_line(line: &str) -> String {
         .trim_start_matches('>')
         .trim_start_matches('#')
         .trim_start();
-    strip_inline(body)
+    let words = strip_inline(body);
+    if is_atx_heading(trimmed) {
+        return end_heading_sentence(words);
+    }
+    words
+}
+
+/// Whether `line` (its indent already taken off) is a Markdown heading: one to six `#`, then a
+/// space or nothing. `#general` is a channel name, not a heading.
+fn is_atx_heading(line: &str) -> bool {
+    let marks = line.len() - line.trim_start_matches('#').len();
+    (1..=6).contains(&marks) && line[marks..].chars().next().is_none_or(char::is_whitespace)
+}
+
+/// A heading's words as a sentence of their own (`#551 headings-real-headings`): the lines of a
+/// message are joined for the voice, so a heading with no stop of its own ran straight into the
+/// paragraph under it ("Weekly report Status is green"). A full stop gives it the pause a reader
+/// hears at a heading; one that already ends a sentence, or with a colon, is left as it is.
+fn end_heading_sentence(mut words: String) -> String {
+    let end = words.trim_end().chars().last();
+    if end.is_some_and(|c| !matches!(c, '.' | '!' | '?' | ':' | ';' | '…')) {
+        words.truncate(words.trim_end().len());
+        words.push('.');
+    }
+    words
 }
 
 /// Longest angle-bracket form read as one, in characters. Every Discord form is far shorter; the
@@ -1089,9 +1113,24 @@ mod tests {
         // The reported bug, verbatim: the voice said "asterisk asterisk" before every bold word.
         assert_eq!(say("the **deploy** is _done_"), "the deploy is done");
         assert_eq!(say("~~cancelled~~ and ||hidden||"), "cancelled and hidden");
-        assert_eq!(say("## A heading"), "A heading");
+        assert_eq!(say("## A heading"), "A heading.");
         assert_eq!(say("> quoted text"), "quoted text");
         assert_eq!(say("run `make validate` now"), "run make validate now");
+    }
+
+    #[test]
+    fn a_heading_is_read_as_a_sentence_of_its_own() {
+        // `#551 headings-real-headings`: the heading ran on into the paragraph under it.
+        assert_eq!(
+            say("# Weekly report\n\nStatus is **green**.\n\n## Numbers\n\n1. First item"),
+            "Weekly report. Status is green. Numbers. 1. First item"
+        );
+        assert_eq!(say("### Done!"), "Done!");
+        assert_eq!(say("## Next steps:"), "Next steps:");
+        // Not a heading: a channel name, seven marks, and a bare mark with no words.
+        assert_eq!(say("#general is busy"), "general is busy");
+        assert_eq!(say("####### seven"), "seven");
+        assert_eq!(say("#"), "");
     }
 
     #[test]
