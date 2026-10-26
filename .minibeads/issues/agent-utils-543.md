@@ -1,13 +1,14 @@
 ---
 title: 'in-app-message-links: chat permalinks open the message in vibe-talk, and Back returns'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - ui
 created_at: 2026-10-26T18:51:45.187487276+00:00
-updated_at: 2026-10-26T18:51:45.187487276+00:00
+updated_at: 2026-10-26T19:44:11.566109882+00:00
+closed_at: 2026-10-26T19:44:11.566109521+00:00
 ---
 
 # Description
