@@ -336,6 +336,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
     checks.extend(chat_heads(state, &deadline).await);
 
     checks.push(read_aloud_selection(state));
+    checks.push(read_aloud_failures(state));
 
     // `#552 wit-tts-provider`. Only a Wit.ai deployment spends this call:
     // it proves the token file's token is accepted and says how many
@@ -493,6 +494,35 @@ async fn local_sidecar(state: &AppState, deadline: &Deadline) -> Check {
         },
     };
     Check::new("local_tts.sidecar", "Local speech sidecar", diagnosis)
+}
+
+/// `#548 cloud-read-failures`. Reads the page stopped because the voice failed them — silence, no
+/// audio, an error answer — as the page reported them since this server started: the count and the
+/// last, with what the reader was told.
+fn read_aloud_failures(state: &AppState) -> Check {
+    let (count, last) = state.speech_tickets.failures();
+    let diagnosis = match last {
+        None => Diagnosis::Confirmed(
+            "no read-aloud has been reported failed since this server started".to_owned(),
+        ),
+        Some(last) => {
+            let at = jiff::Timestamp::try_from(last.at)
+                .map(|at| at.to_string())
+                .unwrap_or_else(|_| "an unknown time".to_owned());
+            // Informative, not a failed check: a read that failed earlier says nothing certain
+            // about the voice now, and anyone holding a speech ticket can report one.
+            Diagnosis::Confirmed(format!(
+                "{count} read-aloud(s) failed on the page since this server started; the last at \
+                 {at} ({}): {}",
+                last.reason, last.detail
+            ))
+        }
+    };
+    Check::new(
+        "read_aloud_failures",
+        "Read-aloud failures reported by the page",
+        diagnosis,
+    )
 }
 
 /// Which of a chat provider's checks a row is. `#325 provider-diagnostics-ids`.
@@ -868,8 +898,9 @@ mod tests {
         let report = run(&state).await;
         assert!(report.ok, "{:#?}", report.checks);
         assert_eq!(report.failed, 0);
-        // One token check, two channels, read-aloud selection, key, agent, voice, summaries, storage.
-        assert_eq!(report.checks.len(), 9, "{:#?}", report.checks);
+        // One token check, two channels, read-aloud selection and failures, key, agent, voice,
+        // summaries, storage.
+        assert_eq!(report.checks.len(), 10, "{:#?}", report.checks);
     }
 
     #[tokio::test]

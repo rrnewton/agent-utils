@@ -14,7 +14,7 @@ reader through, with real taps:
   enter Read -> tap A: audible within a second -> tap B while A streams: A's audio already queued
   is stopped and its response closed at once, and B is audible within a second -> a short message
   played to its end is archived, and only then -> a response cut off part-way is tried again, says
-  so, and once every try is cut off says it could not be played, and archives nothing -> leaving Read closes the response being read -> a read that opens
+  so, and once every try is cut off says the cloud voice's connection kept dropping, and archives nothing -> leaving Read closes the response being read -> a read that opens
   with silence reports when speech began, as well as when the first frame did.
 
 THE NEGATIVE CONTROL runs the same tap in a second browser with Web Audio taken away, so the page
@@ -555,7 +555,8 @@ def main() -> int:
                 timing_of("ticket-304")
                 wait_for(lambda: "trying again" in (page.text_content("#status") or ""), 15,
                          f"a cut-off read did not say it was trying again; status is {page.text_content('#status')!r}")
-                wait_for(lambda: "could not be played" in (page.text_content("#status") or ""), 60,
+                # `#548 cloud-read-failures`: said as the cloud voice's connection, in short words.
+                wait_for(lambda: "kept dropping" in (page.text_content("#status") or ""), 60,
                          f"a read cut off on every try did not say so; status is {page.text_content('#status')!r}")
                 tries = len(api.reads_of("304"))
                 check(tries == 4, f"a read cut off every time was asked for {tries} times, not once and three tries")

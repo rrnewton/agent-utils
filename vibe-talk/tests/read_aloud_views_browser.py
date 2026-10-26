@@ -33,7 +33,8 @@ block's length after block 1.
 THE NEGATIVE CONTROL is a message the agent's voice answers with silence: the read stops when the
 block has arrived, says so, and archives nothing — where the page used to step on through the blocks
 and archive it. A short message heard to its end is archived, so the control is not passing because
-nothing is ever archived.
+nothing is ever archived. (`#548 cloud-read-failures`: the stop names the cloud voice, offers Read with
+device voice, and reports the failure to the server under the read's ticket.)
 
 Pass --screenshots DIR to keep a PNG of each read, and --web-root DIR to run against another copy of
 the page (the one before #540 fails at the first card, by either voice).
@@ -185,6 +186,8 @@ class VoicesApi(ReplyColumnsApi):
             assert isinstance(root, dict)
             summary["root"] = by_id[str(root["id"])]
         self.opened: list[tuple[str, int | None, float]] = []
+        # `#548 cloud-read-failures`: what the page reported of a read the voice failed, by ticket.
+        self.failures: list[tuple[str, Json]] = []
 
     def client_config(self, scope: str) -> Json:
         return {**super().client_config(scope),
@@ -224,6 +227,15 @@ def handler(api: VoicesApi) -> type[BaseHTTPRequestHandler]:
             self.speech(ticket.group(1), None if block is None else int(block))
 
         def do_POST(self) -> None:  # noqa: N802
+            failed = re.fullmatch(r"/api/v1/speech/ticket-([0-9]+)/failure", unquote(urlsplit(self.path).path))
+            if failed:
+                report = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                with api.lock:
+                    api.failures.append((failed.group(1), report))
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if re.fullmatch(r"/api/v1/speech/ticket-[0-9]+/timing", unquote(urlsplit(self.path).path)):
                 self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 self.send_response(204)
@@ -466,7 +478,17 @@ def controls(walk_: Walk) -> None:
     desk.check(SHORT in walk_.api.archived(), "a short message heard to its end was not archived")
     walk_.click(f"#side-log > li[data-id='{SILENT}'] .body")
     walk_.wait_for("a read answered with silence did not stop and say so",
-                   "() => /sent silence/.test(document.getElementById('error').textContent)", 8)
+                   "() => /^Cloud voice isn't producing audio: it sent silence/.test(document.getElementById('error').textContent)", 8)
+    # `#548 cloud-read-failures`: the device voice offered for that message, and the failure told to the server.
+    desk.check(desk.page.evaluate("() => !document.getElementById('read-on-device').hidden"),
+               "a read answered with silence did not offer Read with device voice")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not walk_.api.failures:
+        desk.page.wait_for_timeout(50)
+    with walk_.api.lock:
+        failures = list(walk_.api.failures)
+    desk.check([(one, report.get("reason")) for one, report in failures] == [(SILENT, "silent")],
+               f"the silent read was not reported to the server as silent: {failures}")
     desk.page.wait_for_timeout(500)
     found = walk_.state(SILENT)
     desk.check(found["reading"] == [] and found["pending"] == [], f"the silent read is still lit: {found}")

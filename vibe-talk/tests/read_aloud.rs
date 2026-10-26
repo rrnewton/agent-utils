@@ -488,6 +488,76 @@ async fn a_queued_protocol_error_is_recovered_on_a_fresh_session() {
     server.await.expect("server exits");
 }
 
+/// `#546 read-aloud-silent-audio`, in `#548 cloud-read-failures`. A turn of silent PCM and a completed
+/// turn, as a voice service denied speech access sends, fails the read with its own code after the
+/// audio; a turn with speech in it still reads, on the same session.
+#[tokio::test]
+async fn a_turn_of_silence_fails_the_read_and_a_spoken_one_still_reads() {
+    let (listener, url) = bridge::listen().await;
+    let speech: Vec<u8> = (0..4_800_i16)
+        .flat_map(|at| (if at % 2 == 0 { 3_000_i16 } else { -3_000 }).to_le_bytes())
+        .collect();
+    let spoken = speech.clone();
+    let server = tokio::spawn(async move {
+        let mut socket = bridge::accept(&listener).await;
+        bridge::serve(&mut socket, "a denied read", &[0; 40_000], 1).await;
+        bridge::serve(&mut socket, "a spoken read", &spoken, 2).await;
+    });
+    let provider = provider(&url);
+    let denied = provider
+        .speak_stream("a denied read", None)
+        .await
+        .expect("the silent audio arrives");
+    let chunks: Vec<Result<bytes::Bytes, SpeechError>> = denied.chunks.collect().await;
+    assert!(
+        matches!(chunks.first(), Some(Ok(audio)) if audio.len() == 40_000),
+        "{chunks:?}"
+    );
+    let failure = chunks
+        .last()
+        .and_then(|last| last.as_ref().err())
+        .expect("the read failed after its audio");
+    assert_eq!(failure.code(), "conversation_speech_silent");
+    let read = provider
+        .speak_stream("a spoken read", None)
+        .await
+        .expect("a spoken read");
+    assert_eq!(collect(read).await, vec![speech]);
+    server.await.expect("server exits");
+}
+
+/// `#548 cloud-read-failures`. A provider's error frame may carry a code (`speech_access_denied`, say);
+/// it reaches the caller with the reason, so the page can say the cause in short words.
+#[tokio::test]
+async fn a_provider_error_code_reaches_the_caller_with_its_reason() {
+    let (listener, url) = bridge::listen().await;
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let mut socket = bridge::accept(&listener).await;
+            bridge::expect_prompt(&mut socket, "denied prompt").await;
+            socket
+                .send(Message::Text(
+                    json!({"type": "error", "message": "speech access denied", "code": "speech_access_denied"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("error frame");
+        }
+    });
+    let provider = provider(&url);
+    let error = provider
+        .speak_stream("denied prompt", None)
+        .await
+        .expect_err("a read the provider refused twice fails");
+    let detail = error.to_string();
+    assert!(
+        detail.contains("speech access denied") && detail.contains("(speech_access_denied)"),
+        "{detail}"
+    );
+    server.await.expect("server exits");
+}
+
 /// The first-audio watchdog used by the tests below, in place of the 15-second default.
 const WATCHDOG: Duration = Duration::from_millis(300);
 
@@ -929,6 +999,171 @@ impl SpeechProvider for IndependentSpeech {
             content_type: "audio/test".to_owned(),
         })
     }
+}
+
+/// `#548 cloud-read-failures`. A voice service that answers with silent audio and then fails the read,
+/// naming why, as the private bridge does when speech access is denied; once its access is restored
+/// (`restored`), it reads.
+#[derive(Default)]
+struct DeniedAfterAudio {
+    restored: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl SpeechProvider for DeniedAfterAudio {
+    fn describe(&self) -> Description {
+        Description {
+            backend: "denied-test",
+            label: "Denied test voice".to_owned(),
+            playback: Playback::Audio,
+            local_only: false,
+        }
+    }
+
+    async fn speak(&self, _text: &str, _speed: Option<f64>) -> Result<Speech, SpeechError> {
+        Err(SpeechError::Backend {
+            code: "conversation_speech_error",
+            detail: "unused".to_owned(),
+        })
+    }
+
+    async fn speak_stream_for_selection(
+        &self,
+        _text: &str,
+        _speed: Option<f64>,
+        _selection: Option<&str>,
+    ) -> Result<vibe_talk::speech::SpeechStream, SpeechError> {
+        let restored = self.restored.load(std::sync::atomic::Ordering::SeqCst);
+        let chunks: Vec<Result<bytes::Bytes, SpeechError>> = if restored {
+            vec![Ok(bytes::Bytes::from(vec![9_u8; 4_800]))]
+        } else {
+            vec![
+            Ok(bytes::Bytes::from(vec![0_u8; 4_800])),
+            Err(SpeechError::Backend {
+                code: "conversation_speech_error",
+                detail: "Denied test voice read-aloud session failed: the agent reported: the speech service \
+                         denied access (ACL TIER:example); no audio was produced (speech_access_denied)"
+                    .to_owned(),
+            }),
+        ]
+        };
+        Ok(vibe_talk::speech::SpeechStream {
+            content_type: "audio/wav".to_owned(),
+            preamble: None,
+            session: None,
+            chunks: futures_util::stream::iter(chunks).boxed(),
+        })
+    }
+}
+
+/// `#548 cloud-read-failures`: a read whose stream fails after its first audio is cut off, and why is
+/// kept under its ticket for the page to ask, with no bearer header; a read that did not fail has none.
+#[tokio::test]
+async fn why_a_cut_off_read_failed_is_kept_under_its_ticket() {
+    let (mut state, chat, _provider) =
+        testing::state_from_toml(&testing::config_toml_without_elevenlabs());
+    let voice = Arc::new(DeniedAfterAudio::default());
+    state.speech = voice.clone();
+    let id = chat.seed(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "Reader",
+        "Words the voice will not say",
+    );
+    let app = router(state);
+    let (status, bytes) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare"),
+        Some(json!({"ids": [id.0]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let prepared: Value = serde_json::from_slice(&bytes).expect("prepared response");
+    let url = prepared["prepared"][0]["url"]
+        .as_str()
+        .expect("ticket")
+        .to_owned();
+    let unauthenticated = |method: &str, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request")
+    };
+
+    // Asked before the read: nothing has failed.
+    let response = app
+        .clone()
+        .oneshot(unauthenticated("GET", &format!("{url}/failure")))
+        .await
+        .expect("router");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // The read starts, and is cut off after its silent first audio.
+    let response = app
+        .clone()
+        .oneshot(unauthenticated("GET", &url))
+        .await
+        .expect("router");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.into_body().collect().await.is_err(),
+        "a failed read's body ended cleanly"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(unauthenticated("GET", &format!("{url}/failure")))
+        .await
+        .expect("router");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let why: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(why["error"], "conversation_speech_error");
+    assert!(
+        why["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("(speech_access_denied)")),
+        "{why}"
+    );
+    // Per block: the whole message failed, block 0 was never asked for.
+    let response = app
+        .clone()
+        .oneshot(unauthenticated("GET", &format!("{url}/failure?block=0")))
+        .await
+        .expect("router");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Access restored within the ticket's life: the same ticket reads again, and what failed the
+    // earlier stream no longer answers for it.
+    voice
+        .restored
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let response = app
+        .clone()
+        .oneshot(unauthenticated("GET", &url))
+        .await
+        .expect("router");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.into_body().collect().await.is_ok(),
+        "the restored read was cut off"
+    );
+    let response = app
+        .clone()
+        .oneshot(unauthenticated("GET", &format!("{url}/failure")))
+        .await
+        .expect("router");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an earlier stream's failure answered for a new one"
+    );
 }
 
 struct SlowWarmSpeech;

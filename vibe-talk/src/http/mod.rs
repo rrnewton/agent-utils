@@ -353,6 +353,11 @@ fn routes(state: AppState) -> Router {
             "/api/v1/speech/{ticket}/timing",
             post(api::speech_playback_timing),
         )
+        // `#548 cloud-read-failures`. A read the page stopped because the voice failed it.
+        .route(
+            "/api/v1/speech/{ticket}/failure",
+            post(api::speech_playback_failure).get(api::speech_stream_failure),
+        )
         // Adding a channel from inside the app. WRITE scope, and deliberately NO MCP tool: this
         // widens what the bridge can read, and what it can say. See `api::add_channel`.
         .route("/api/v1/channels", post(api::add_channel))

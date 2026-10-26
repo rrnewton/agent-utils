@@ -109,12 +109,29 @@ struct Entry {
     minted: Instant,
     /// Per block read (`None` for the whole message), because each is its own request.
     server_timing: HashMap<Option<usize>, ServerTiming>,
+    /// `#548 cloud-read-failures`. Why a read's audio stream ended in an error, per block: the error's
+    /// code and its reason, for the page to ask after a read that was cut off.
+    stream_failures: HashMap<Option<usize>, (String, String)>,
+}
+
+/// `#548 cloud-read-failures`. A read-aloud that failed where the reader heard it, as the page reported
+/// it: what diagnostics shows of the last one, and how many there have been.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadFailure {
+    /// The page's short reason: `silent`, `no_audio`, `refused`, and so on.
+    pub reason: String,
+    /// What the reader was told, bounded.
+    pub detail: String,
+    /// When it was reported.
+    pub at: std::time::SystemTime,
 }
 
 /// A short-lived table of prepared messages, keyed by an unguessable ticket.
 #[derive(Debug)]
 pub struct SpeechTickets {
     held: Mutex<HashMap<String, Entry>>,
+    /// The last failed read, and how many have failed since the server started.
+    failures: Mutex<(u64, Option<ReadFailure>)>,
 }
 
 impl Default for SpeechTickets {
@@ -129,6 +146,7 @@ impl SpeechTickets {
     pub fn new() -> Self {
         Self {
             held: Mutex::new(HashMap::new()),
+            failures: Mutex::new((0, None)),
         }
     }
 
@@ -158,6 +176,7 @@ impl SpeechTickets {
                     prepared,
                     minted: now,
                     server_timing: HashMap::new(),
+                    stream_failures: HashMap::new(),
                 },
             );
         }
@@ -217,6 +236,62 @@ impl SpeechTickets {
             return None;
         }
         Some((entry.prepared.clone(), *entry.server_timing.get(&block)?))
+    }
+
+    /// `#548 cloud-read-failures`. Keep why the audio stream of this read (of `block`, or the whole
+    /// message) ended in an error: the voice service's code and reason.
+    pub fn record_stream_failure(
+        &self,
+        ticket: &str,
+        block: Option<usize>,
+        code: &str,
+        detail: &str,
+    ) {
+        if let Ok(mut held) = self.held.lock() {
+            if let Some(entry) = held.get_mut(ticket) {
+                entry
+                    .stream_failures
+                    .insert(block, (code.to_owned(), detail.to_owned()));
+            }
+        }
+    }
+
+    /// Forget why an earlier stream of this read failed: a new one has started, and only its own
+    /// failure may answer for it.
+    pub fn clear_stream_failure(&self, ticket: &str, block: Option<usize>) {
+        if let Ok(mut held) = self.held.lock() {
+            if let Some(entry) = held.get_mut(ticket) {
+                entry.stream_failures.remove(&block);
+            }
+        }
+    }
+
+    /// Why the audio stream of this read ended in an error, if it did and the ticket is live.
+    #[must_use]
+    pub fn stream_failure(&self, ticket: &str, block: Option<usize>) -> Option<(String, String)> {
+        let held = self.held.lock().ok()?;
+        let entry = held.get(ticket)?;
+        if Instant::now().duration_since(entry.minted) >= TICKET_TTL {
+            return None;
+        }
+        entry.stream_failures.get(&block).cloned()
+    }
+
+    /// `#548 cloud-read-failures`. Keep `failure` as the last failed read.
+    pub fn record_failure(&self, failure: ReadFailure) {
+        if let Ok(mut failures) = self.failures.lock() {
+            failures.0 += 1;
+            failures.1 = Some(failure);
+        }
+    }
+
+    /// How many reads have failed since the server started, and the last of them.
+    #[must_use]
+    pub fn failures(&self) -> (u64, Option<ReadFailure>) {
+        self.failures
+            .lock()
+            .map(|failures| failures.clone())
+            .unwrap_or((0, None))
     }
 
     /// How many tickets are held. For tests and the diagnostics line; not a stable API.

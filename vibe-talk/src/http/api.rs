@@ -5535,6 +5535,11 @@ pub async fn play_speech(
                 )
             })?,
     };
+    // `#548 cloud-read-failures`. A ticket plays again (a re-read, a jump back): what failed an
+    // earlier stream of this read does not answer for this one.
+    state
+        .speech_tickets
+        .clear_stream_failure(&ticket, query.block);
     let requested = std::time::Instant::now();
     let mut stream = state
         .speech
@@ -5620,8 +5625,29 @@ pub async fn play_speech(
         .into_iter()
         .map(Ok::<_, SpeechError>)
         .chain(std::iter::once(Ok(first_audio)));
-    let body =
-        axum::body::Body::from_stream(futures_util::stream::iter(prefix).chain(stream.chunks));
+    // `#548 cloud-read-failures`. A voice service that fails a read after its first audio (silent
+    // audio, then an error naming why) can only cut the response off. Its reason is kept under the
+    // ticket, where the page asks for it (`speech_stream_failure`) before trying the read again.
+    let tickets = std::sync::Arc::clone(&state.speech_tickets);
+    let failed_block = query.block;
+    let observation = prepared.observation.clone();
+    let chunks = stream.chunks.inspect(move |chunk| {
+        let Err(error) = chunk else { return };
+        // A read superseded by another selection was the reader's choice, not a failure.
+        if error.code() == "conversation_speech_superseded" {
+            return;
+        }
+        let detail = error.to_string();
+        tracing::warn!(
+            observation = observation.as_str(),
+            block = failed_block,
+            code = error.code(),
+            detail = detail.as_str(),
+            "a read-aloud's audio stream ended in an error"
+        );
+        tickets.record_stream_failure(&ticket, failed_block, error.code(), &detail);
+    });
+    let body = axum::body::Body::from_stream(futures_util::stream::iter(prefix).chain(chunks));
     Ok((
         [
             (header::CONTENT_TYPE, stream.content_type.as_str()),
@@ -5731,6 +5757,88 @@ pub async fn speech_playback_timing(
         tap_to_speech_ms = timing.tap_to_speech_ms,
         "read-aloud reached audible playback"
     );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `#548 cloud-read-failures`. Why this read's audio stream ended in an error, when it did: the page
+/// asks after a read that was cut off, so a voice that names its failure (speech access denied, say)
+/// is not taken for a dropped connection and tried again. `404 no_speech_failure` when the stream
+/// did not fail, or has not yet.
+///
+/// No bearer header: the ticket is the capability, as for the audio itself.
+pub async fn speech_stream_failure(
+    State(state): State<AppState>,
+    SpeechTicket(ticket): SpeechTicket,
+    Query(read): Query<TimingQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some((code, detail)) = state.speech_tickets.stream_failure(&ticket, read.block) else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_speech_failure",
+            "that read's audio stream has not failed",
+        ));
+    };
+    Ok(Json(serde_json::json!({ "error": code, "detail": detail })))
+}
+
+/// `#548 cloud-read-failures`. Why the page stopped a read of an already-authorized message.
+#[derive(Debug, Deserialize)]
+pub struct SpeechPlaybackFailure {
+    /// A short slug: `silent` (audio arrived, none of it speech), `no_audio` (no speech within the
+    /// page's limit), `refused` (the audio request was answered with an error), and so on.
+    pub reason: String,
+    /// What the reader was told. Bounded and logged as given; it names no message content.
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Record that the page stopped a read because the voice failed it, so the failure is in this
+/// server's log and its diagnostics and not only on the phone.
+///
+/// No bearer header, as for [`speech_playback_timing`]: the ticket is the capability, and the
+/// report carries a slug and a short sentence, never text to speak.
+pub async fn speech_playback_failure(
+    State(state): State<AppState>,
+    SpeechTicket(ticket): SpeechTicket,
+    Query(read): Query<TimingQuery>,
+    Json(failure): Json<SpeechPlaybackFailure>,
+) -> Result<StatusCode, ApiError> {
+    const MAX_REASON: usize = 32;
+    const MAX_DETAIL: usize = 300;
+    let reason = failure.reason.trim();
+    if reason.is_empty()
+        || reason.len() > MAX_REASON
+        || !reason
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err(ApiError::bad_request(
+            "reason must be 1 to 32 lowercase letters, digits, '_' or '-'",
+        ));
+    }
+    let detail: String = failure
+        .detail
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_DETAIL)
+        .collect();
+    let Some(prepared) = state.speech_tickets.claim(&ticket) else {
+        return Err(unknown_speech_ticket());
+    };
+    tracing::warn!(
+        observation = prepared.observation,
+        block = read.block,
+        reason,
+        detail = detail.as_str(),
+        "the page stopped a read-aloud the voice failed"
+    );
+    state
+        .speech_tickets
+        .record_failure(crate::speech_tickets::ReadFailure {
+            reason: reason.to_owned(),
+            detail,
+            at: std::time::SystemTime::now(),
+        });
     Ok(StatusCode::NO_CONTENT)
 }
 

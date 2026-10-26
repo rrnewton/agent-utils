@@ -80,6 +80,11 @@ fn needs_bearer(method: &Method, path: &str) -> bool {
         [Some("v1"), Some("speech"), Some(ticket), Some("timing"), None] if !ticket.is_empty() => {
             method == Method::POST
         }
+        // `#548 cloud-read-failures`: a read that failed is reported, and why its stream failed is
+        // asked, under the same ticket.
+        [Some("v1"), Some("speech"), Some(ticket), Some("failure"), None] if !ticket.is_empty() => {
+            method == Method::POST || method == Method::GET
+        }
         _ => false,
     };
     !own_credential
@@ -121,6 +126,12 @@ mod tests {
         assert!(!needs_bearer(&Method::HEAD, "/api/v1/speech/ticket"));
         assert!(needs_bearer(&Method::POST, "/api/v1/speech/ticket"));
         assert!(!needs_bearer(&Method::POST, "/api/v1/speech/ticket/timing"));
+        assert!(!needs_bearer(
+            &Method::POST,
+            "/api/v1/speech/ticket/failure"
+        ));
+        assert!(!needs_bearer(&Method::GET, "/api/v1/speech/ticket/failure"));
+        assert!(needs_bearer(&Method::PUT, "/api/v1/speech/ticket/failure"));
         assert!(needs_bearer(&Method::GET, "/api/v1/speech/ticket/timing"));
         assert!(needs_bearer(&Method::GET, "/api/v1/speech/ticket/other"));
         assert!(needs_bearer(&Method::GET, "/api/v1/speech/ticket/"));
