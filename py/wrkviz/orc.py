@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
+import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from wrkviz.compressed_sources import (
+    is_compressed,
+    materialize_source,
+    resolve_source,
+    source_exists,
+)
 from wrkviz.model import (
     Agent,
     Edge,
@@ -1872,7 +1881,50 @@ def _task_projection_relative(sha256: str) -> str:
     return f"{_TASK_PROJECTION_ROOT}/{sha256[:2]}/{sha256}.json"
 
 
+def _decompressed_database(physical: Path) -> Path:
+    """A plain copy of a compressed live database, decoded once per process and file version.
+
+    SQLite cannot open ``session.db.zst``. The copy lives in one private temporary directory per
+    process, removed at exit; it is keyed on the compressed file's size and mtime so a database
+    re-compressed mid-run is decoded again rather than served stale.
+    """
+
+    global _DECOMPRESSED_ROOT
+    metadata = physical.stat()
+    key = (str(physical), metadata.st_size, metadata.st_mtime_ns)
+    cached = _DECOMPRESSED_DATABASES.get(key)
+    if cached is not None and cached.is_file():
+        return cached
+    if _DECOMPRESSED_ROOT is None:
+        _DECOMPRESSED_ROOT = Path(tempfile.mkdtemp(prefix="wrkviz-orc-decompressed-"))
+        atexit.register(shutil.rmtree, _DECOMPRESSED_ROOT, True)
+    try:
+        copy = materialize_source(physical, _DECOMPRESSED_ROOT)
+    except OSError as error:
+        raise OrcParseError(f"cannot decompress Orc SQLite source {physical}: {error}") from error
+    _DECOMPRESSED_DATABASES[key] = copy
+    return copy
+
+
+def _logical_source_size(path: Path) -> int:
+    """The byte size of a live database as SQLite sees it, decompressing a ``.zst`` spelling."""
+
+    physical = resolve_source(path)
+    if physical is not None and physical != path and is_compressed(physical):
+        return _decompressed_database(physical).stat().st_size
+    return path.stat().st_size
+
+
+_DECOMPRESSED_ROOT: Path | None = None
+_DECOMPRESSED_DATABASES: dict[tuple[str, int, int], Path] = {}
+
+
 def _read_only(path: Path) -> sqlite3.Connection:
+    physical = resolve_source(path)
+    if physical is not None and physical != path and is_compressed(physical):
+        if not physical.is_file() or physical.is_symlink():
+            raise OrcParseError(f"Orc SQLite source is missing or not a regular file: {path}")
+        path = _decompressed_database(physical)
     if path.is_symlink() or not path.is_file():
         raise OrcParseError(f"Orc SQLite source is missing or not a regular file: {path}")
     try:
@@ -2149,7 +2201,7 @@ def _session_has_activity_at_or_after(
         path, meta, lineage_root_session_id
     ):
         task_path = _live_source_path(source_root, relative)
-        if not task_path.is_file() or task_path.is_symlink():
+        if not source_exists(task_path):
             continue
         connection = _read_only(task_path)
         try:
@@ -2179,7 +2231,7 @@ def _discover_sources(
     index_path = _live_source_path(source_root, ".orc/index.db")
     selected: set[str] | None = None
     index_parents: dict[str, str | None] | None = None
-    if index_path.is_file() and not index_path.is_symlink():
+    if source_exists(index_path):
         connection = _read_only(index_path)
         try:
             _require_tables(connection, ("sessions",), str(index_path))
@@ -2226,7 +2278,7 @@ def _discover_sources(
         database = _live_source_path(
             source_root, f".orc/sessions/{session_name}/session.db"
         )
-        if not database.is_file() or database.is_symlink():
+        if not source_exists(database):
             if selected is not None or session_name == root_id:
                 raise OrcParseError(f"selected Orc session database is missing: {database}")
             continue
@@ -2262,7 +2314,7 @@ def _discover_sources(
             session_database, meta, root_id
         ):
             task_path = _live_source_path(source_root, task_relative)
-            if not task_path.is_file() or task_path.is_symlink():
+            if not source_exists(task_path):
                 if required:
                     raise OrcParseError(
                         f"session {session_id!r} references task database "
@@ -4176,7 +4228,7 @@ def _plan_snapshot_sources(
         path
         for paths in session_task_paths.values()
         for path in paths
-        if _live_source_path(source_root, path).is_file()
+        if source_exists(_live_source_path(source_root, path))
     }
     discovered_live_task_paths = {
         item.source_path for item in live_discovered if item.kind == "task"
@@ -5748,7 +5800,7 @@ def snapshot_orc_lineage(
                         if kind == "session"
                         else None
                     ),
-                    source_size=source_path.stat().st_size,
+                    source_size=_logical_source_size(source_path),
                     snapshot_size=snapshot_size,
                     sha256=snapshot_sha256,
                     append_count=full.append_count,

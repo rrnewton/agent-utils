@@ -534,17 +534,16 @@ def test_real_ingest_retires_a_legacy_projection_and_says_so_on_stderr(
     assert "raw/messages" not in capsys.readouterr().err
 
 
-def test_disappeared_source_fails_and_preserves_snapshot(tmp_path: Path) -> None:
+def test_disappeared_source_is_retired_and_preserves_snapshot(tmp_path: Path) -> None:
+    # Upstream retention is expected; tests/test_timeline_upstream_retention.py covers the rest.
     sessions, archive, origin = _first_ingest(tmp_path)
     copied_before = _snapshot(archive).read_bytes()
-    manifest_before = _manifest(archive).read_bytes()
     origin.unlink()
 
-    with pytest.raises(CodexParseError, match="previously observed rollout disappeared"):
-        ingest_codex(archive, sessions, ROOT, "codex-test", "UTC")
+    _, report = ingest_codex(archive, sessions, ROOT, "codex-test", "UTC")
 
+    assert report.upstream_retired_sources == (origin.relative_to(sessions).as_posix(),)
     assert _snapshot(archive).read_bytes() == copied_before
-    assert _manifest(archive).read_bytes() == manifest_before
 
 
 def test_truncated_source_fails_and_preserves_snapshot(tmp_path: Path) -> None:

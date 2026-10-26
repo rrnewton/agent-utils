@@ -11,6 +11,12 @@ from pathlib import Path, PurePosixPath
 import re
 
 from wrkviz.archive import write_text_if_changed
+from wrkviz.compressed_sources import (
+    iter_logical_glob,
+    read_source_bytes,
+    resolve_source,
+    source_exists,
+)
 from wrkviz.model import (
     Agent,
     Edge,
@@ -48,11 +54,14 @@ class ClaudeSourceCopy:
     line_count: int
     sha256: str
     updated_at: str
+    # When an ingest first found the upstream file gone and kept the archive's snapshot as the
+    # record; ``None`` while upstream still has it. Emitted only when set (see the Codex record).
+    upstream_retired_at: str | None = None
 
     def to_json_obj(self) -> dict[str, object]:
         """Return this validated source-copy record as a JSON object."""
 
-        return {
+        result: dict[str, object] = {
             "source_path": self.source_path,
             "original_path": self.original_path,
             "snapshot_path": self.snapshot_path,
@@ -62,6 +71,9 @@ class ClaudeSourceCopy:
             "sha256": self.sha256,
             "updated_at": self.updated_at,
         }
+        if self.upstream_retired_at is not None:
+            result["upstream_retired_at"] = self.upstream_retired_at
+        return result
 
     @classmethod
     def from_json_obj(
@@ -81,6 +93,11 @@ class ClaudeSourceCopy:
         line_count = _required_int(raw.get("line_count"), where + ".line_count")
         sha256 = _required_string(raw.get("sha256"), where + ".sha256")
         updated_at = _required_string(raw.get("updated_at"), where + ".updated_at")
+        upstream_retired_at = (
+            _required_string(raw.get("upstream_retired_at"), where + ".upstream_retired_at")
+            if raw.get("upstream_retired_at") is not None
+            else None
+        )
         _safe_relative(source_path)
         if snapshot_path != source_path:
             raise ClaudeParseError(f"{where}: snapshot_path must equal source_path")
@@ -98,6 +115,7 @@ class ClaudeSourceCopy:
             line_count=line_count,
             sha256=sha256,
             updated_at=updated_at,
+            upstream_retired_at=upstream_retired_at,
         )
 
 
@@ -107,6 +125,8 @@ class ClaudeSnapshotResult:
 
     sources: tuple[ClaudeSourceCopy, ...]
     files_changed: int
+    # Every source kept from the archive because upstream no longer has it (see Codex).
+    upstream_retired: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -254,22 +274,24 @@ def _agent_id_from_path(path: Path) -> str | None:
 def discover_claude_sources(session_file: Path) -> tuple[Path, ...]:
     """Discover one root JSONL and its Claude-managed subagent files."""
 
-    if session_file.is_symlink() or not session_file.is_file():
+    if not source_exists(session_file):
         raise ClaudeParseError(f"Claude session is not a regular file: {session_file}")
     if session_file.suffix != ".jsonl":
         raise ClaudeParseError("Claude session filename must end in .jsonl")
     sources = [session_file]
     subagents = session_file.parent / session_file.stem / "subagents"
     if subagents.is_dir():
-        for path in sorted(subagents.rglob("agent-*.jsonl")):
-            if path.is_symlink() or not path.is_file():
+        for path in iter_logical_glob(subagents, "agent-*.jsonl"):
+            if not source_exists(path):
                 raise ClaudeParseError(f"Claude subagent source is not regular: {path}")
             sources.append(path)
             meta = path.with_suffix(".meta.json")
-            if meta.is_file():
-                if meta.is_symlink():
+            physical_meta = resolve_source(meta)
+            if physical_meta is not None:
+                if physical_meta.is_symlink():
                     raise ClaudeParseError(f"Claude agent metadata is a symlink: {meta}")
-                sources.append(meta)
+                if physical_meta.is_file():
+                    sources.append(meta)
     return tuple(sources)
 
 
@@ -1241,23 +1263,48 @@ def snapshot_claude_lineage(
     """Copy the latest append-only Claude lineage before parsing it."""
 
     source_root = session_file.parent
-    paths = discover_claude_sources(session_file)
+    previous_by_path = {source.source_path: source for source in previous_sources}
+    # A lineage whose root transcript upstream has retired entirely is still a lineage: the
+    # archive holds it. Only a never-imported session with no upstream file is an error.
+    paths = (
+        discover_claude_sources(session_file)
+        if source_exists(session_file) or not previous_by_path
+        else ()
+    )
     relative_to_path = {
         path.relative_to(source_root).as_posix(): path for path in paths
     }
-    previous_by_path = {source.source_path: source for source in previous_sources}
-    missing = sorted(set(previous_by_path) - set(relative_to_path))
-    if missing:
-        raise ClaudeParseError(
-            "append-only source violation: previously observed Claude source disappeared: "
-            + ", ".join(missing[:3])
-        )
     changed = 0
     copies: list[ClaudeSourceCopy] = []
+    retired: list[str] = []
+    # Upstream retention (rotation, size caps, deletion) is expected; the archive is the record.
+    # A source upstream no longer has keeps its archived snapshot, verified against its manifest
+    # entry, and the record is carried forward unchanged except for when retirement was noticed.
+    for relative in sorted(set(previous_by_path) - set(relative_to_path)):
+        recorded = previous_by_path[relative]
+        target = snapshot_root.joinpath(*_safe_relative(relative).parts)
+        if target.is_symlink() or not target.is_file():
+            raise ClaudeParseError(
+                "previously observed Claude source is gone upstream and the archive's own "
+                f"snapshot is missing too: {relative} (expected {target})"
+            )
+        held = target.read_bytes()
+        if (
+            len(held) < recorded.copied_bytes
+            or hashlib.sha256(held[: recorded.copied_bytes]).hexdigest() != recorded.sha256
+        ):
+            raise ClaudeParseError(
+                "previously observed Claude source is gone upstream and the archive's own "
+                f"snapshot does not match its manifest: {target}"
+            )
+        retired.append(relative)
+        copies.append(
+            replace(recorded, upstream_retired_at=recorded.upstream_retired_at or updated_at)
+        )
     root_id = session_file.stem
     for relative, source in sorted(relative_to_path.items()):
         _safe_relative(relative)
-        data = source.read_bytes()
+        data = read_source_bytes(source)
         complete = _complete_jsonl(data) if source.suffix == ".jsonl" else data
         target = snapshot_root.joinpath(*PurePosixPath(relative).parts)
         if target.is_symlink():
@@ -1307,7 +1354,9 @@ def snapshot_claude_lineage(
                 updated_at=copy_updated,
             )
         )
-    return ClaudeSnapshotResult(tuple(copies), changed)
+    return ClaudeSnapshotResult(
+        tuple(sorted(copies, key=lambda copy: copy.source_path)), changed, tuple(retired)
+    )
 
 
 __all__ = [

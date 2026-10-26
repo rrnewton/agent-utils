@@ -11,7 +11,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from wrkviz import __version__
@@ -58,6 +58,7 @@ from wrkviz.codex import (
     load_codex_team,
     snapshot_codex_lineage,
 )
+from wrkviz.compressed_sources import source_exists
 from wrkviz.claude import (
     ClaudeParseError,
     ClaudeSourceCopy,
@@ -103,6 +104,7 @@ from wrkviz.orc import (
     OrcContinuationLink,
     OrcContinuationSpec,
     OrcParseError,
+    OrcSnapshotResult,
     OrcSourceCopy,
     load_orc_team,
     prune_orc_staging,
@@ -406,6 +408,12 @@ class IngestReport:
     history_unmatched_prompts: int = 0
     history_covered_prompts: int = 0
     history_covered_sessions: int = 0
+    # Archived sources whose upstream file is gone -- rotated, size-capped or deleted -- and
+    # which this ingest kept from the archive's own snapshot instead. Upstream is a feed with its
+    # own retention and the archive is the record, so this is an inventory, not an error: every
+    # retired source is listed on every run, which makes "what is the archive the only copy of"
+    # answerable from any one receipt.
+    upstream_retired_sources: tuple[str, ...] = ()
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the ingest report as a JSON-serializable object."""
@@ -444,6 +452,7 @@ class IngestReport:
             "history_unmatched_prompts": self.history_unmatched_prompts,
             "history_covered_prompts": self.history_covered_prompts,
             "history_covered_sessions": self.history_covered_sessions,
+            "upstream_retired_sources": list(self.upstream_retired_sources),
         }
 
 
@@ -1508,9 +1517,10 @@ def _ingest_codex_locked(
             _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
         )
     )
-    return _write_ingested_team(
+    team, report = _write_ingested_team(
         archive, team_slug, team, date_window, changed, location
     )
+    return team, replace(report, upstream_retired_sources=source_copies.upstream_retired)
 
 
 def ingest_codex(
@@ -1606,9 +1616,10 @@ def _ingest_claude_locked(
             _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
         )
     )
-    return _write_ingested_team(
+    team, report = _write_ingested_team(
         archive, team_slug, team, date_window, changed, location
     )
+    return team, replace(report, upstream_retired_sources=source_copies.upstream_retired)
 
 
 def ingest_claude(
@@ -1952,16 +1963,29 @@ def _ingest_orc_locked(
     location = _source_snapshot_location(archive, team_slug, requested_snapshot_root)
     snapshot_root = location.root
     changed += prune_orc_staging(snapshot_root)
-    snapshot = snapshot_orc_lineage(
-        source_root,
-        root_session_id,
-        snapshot_root,
-        manifest_state.sources,
-        utc_now(),
-        manifest_state.continuation_specs,
-        manifest_state.continuation_links,
-        accept_prefix_rewrite,
+    retired_lineage = bool(manifest_state.sources) and not source_exists(
+        source_root / ".orc" / "sessions" / root_session_id / "session.db"
     )
+    if retired_lineage:
+        # The root session database is gone upstream in both spellings: the whole lineage has
+        # retired, and the archive's content-addressed snapshots are the record. Re-normalize
+        # from them -- after checking each against its manifest digest -- instead of refusing.
+        # Nothing new can arrive for a lineage whose root is gone, so the checkpoint stands.
+        _verify_retained_orc_snapshots(snapshot_root, manifest_state.sources)
+        snapshot = OrcSnapshotResult(
+            manifest_state.sources, 0, manifest_state.continuation_links
+        )
+    else:
+        snapshot = snapshot_orc_lineage(
+            source_root,
+            root_session_id,
+            snapshot_root,
+            manifest_state.sources,
+            utc_now(),
+            manifest_state.continuation_specs,
+            manifest_state.continuation_links,
+            accept_prefix_rewrite,
+        )
     changed += snapshot.files_changed
     resolved_specs = tuple(
         OrcContinuationSpec.from_value(
@@ -2032,7 +2056,31 @@ def _ingest_orc_locked(
         report,
         files_changed=report.files_changed + marker_changed + gc_changed,
         orc_prefix_overrides=snapshot.prefix_overrides,
+        upstream_retired_sources=(
+            tuple(sorted(source.source_path for source in snapshot.sources))
+            if retired_lineage
+            else ()
+        ),
     )
+
+
+def _verify_retained_orc_snapshots(
+    snapshot_root: Path, sources: Sequence[OrcSourceCopy]
+) -> None:
+    """Refuse a retired Orc lineage whose own snapshot objects are missing or altered."""
+
+    for source in sources:
+        path = snapshot_root.joinpath(*PurePosixPath(source.snapshot_path).parts)
+        if path.is_symlink() or not path.is_file():
+            raise OrcParseError(
+                "Orc lineage is gone upstream and the archive's own snapshot is missing too: "
+                f"{source.source_path} (expected {path})"
+            )
+        if _file_sha256(path) != source.sha256:
+            raise OrcParseError(
+                "Orc lineage is gone upstream and the archive's own snapshot does not match "
+                f"its manifest: {path}"
+            )
 
 
 def ingest_orc(

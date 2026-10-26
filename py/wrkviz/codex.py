@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -17,6 +17,13 @@ import stat
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from wrkviz.compressed_sources import (
+    iter_logical_glob,
+    logical_path,
+    read_first_line,
+    read_source_bytes,
+    resolve_source,
+)
 from wrkviz.model import (
     Agent,
     Edge,
@@ -48,11 +55,16 @@ class CodexSourceCopy:
     line_count: int
     sha256: str
     updated_at: str
+    # When this ingest's run first found the upstream rollout gone -- rotated away, size-capped,
+    # or deleted -- and kept the archive's own snapshot as the record instead. ``None`` while the
+    # upstream file is still present. Emitted only when set, so a manifest written before
+    # retirement existed stays byte-identical.
+    upstream_retired_at: str | None = None
 
     def to_json_obj(self) -> dict[str, object]:
         """Return the copied-source record as a JSON-serializable object."""
 
-        return {
+        result: dict[str, object] = {
             "source_path": self.source_path,
             "original_path": self.original_path,
             "snapshot_path": self.snapshot_path,
@@ -62,6 +74,9 @@ class CodexSourceCopy:
             "sha256": self.sha256,
             "updated_at": self.updated_at,
         }
+        if self.upstream_retired_at is not None:
+            result["upstream_retired_at"] = self.upstream_retired_at
+        return result
 
     @classmethod
     def from_json_obj(cls, raw: Mapping[str, object], where: str) -> CodexSourceCopy:
@@ -75,6 +90,10 @@ class CodexSourceCopy:
         line_count = _integer(raw.get("line_count"))
         sha256 = _string(raw.get("sha256"))
         updated_at = _string(raw.get("updated_at"))
+        raw_retired_at = raw.get("upstream_retired_at")
+        upstream_retired_at = _string(raw_retired_at)
+        if raw_retired_at is not None and upstream_retired_at is None:
+            raise CodexParseError(f"{where}: malformed upstream_retired_at")
         if (
             source_path is None
             or original_path is None
@@ -103,6 +122,7 @@ class CodexSourceCopy:
             line_count,
             sha256,
             updated_at,
+            upstream_retired_at,
         )
 
 
@@ -204,6 +224,10 @@ class CodexSnapshotResult:
     sources: tuple[CodexSourceCopy, ...]
     files_changed: int
     continuations: tuple[CodexContinuationLink, ...] = ()
+    # Source paths whose upstream rollout is gone and whose archived snapshot stood in for it on
+    # this run. A standing inventory, not a delta: it lists every retired source every run, so a
+    # receipt alone says what the archive is the only copy of.
+    upstream_retired: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -656,8 +680,7 @@ def _write_snapshot_file(
 
 def _first_metadata(path: Path) -> dict[str, object] | None:
     try:
-        with path.open("rb") as source:
-            line = source.readline()
+        line = read_first_line(path)
     except OSError:
         return None
     if not line:
@@ -683,7 +706,7 @@ def _discover_codex_lineage(
     candidates: list[tuple[Path, Mapping[str, object]]] = []
     excluded = exclude_root.resolve() if exclude_root is not None else None
     try:
-        paths = sorted(sessions_root.rglob("rollout-*.jsonl"))
+        paths = iter_logical_glob(sessions_root, "rollout-*.jsonl")
     except OSError as exc:
         raise CodexParseError(f"cannot scan Codex sessions root {sessions_root}: {exc}") from exc
     for path in paths:
@@ -866,14 +889,56 @@ def snapshot_codex_lineage(
             root_sources[lineage_root_id] = relative
         candidate_paths[relative] = (path, metadata)
 
-    missing = sorted(set(previous_by_path) - set(candidate_paths))
-    if missing:
-        rendered = ", ".join(repr(path) for path in missing[:3])
-        suffix = " ..." if len(missing) > 3 else ""
-        raise CodexParseError(
-            "append-only source violation: previously observed rollout disappeared: "
-            f"{rendered}{suffix}"
-        )
+    # A rollout the archive already holds and upstream no longer has is RETIRED, not lost:
+    # upstream is a feed with its own retention, and the archive is the record. The archived
+    # snapshot is verified against its manifest entry and then stands in for the upstream file,
+    # unchanged, so the lineage keeps every record it had. Only a snapshot that is itself missing
+    # or no longer matches its manifest is a refusal -- that is the archive's own copy failing.
+    retired_bytes: dict[str, bytes] = {}
+    for source_path in sorted(set(previous_by_path) - set(candidate_paths)):
+        recorded = previous_by_path[source_path]
+        held = _read_snapshot_file(snapshot_root, source_path)
+        target = _snapshot_target(snapshot_root, source_path)
+        if held is None:
+            raise CodexParseError(
+                "previously observed rollout is gone upstream and the archive's own snapshot "
+                f"is missing too: {source_path!r} (expected {target})"
+            )
+        data = held[0]
+        if (
+            len(data) < recorded.copied_bytes
+            or hashlib.sha256(data[: recorded.copied_bytes]).hexdigest() != recorded.sha256
+        ):
+            raise CodexParseError(
+                "previously observed rollout is gone upstream and the archive's own snapshot "
+                f"does not match its manifest record: {target}"
+            )
+        complete = data[: recorded.copied_bytes]
+        metadata_line = complete.split(b"\n", 1)[0]
+        record = _parse_json_object(metadata_line, f"{target}: archived metadata")
+        if record.get("type") != "session_meta":
+            raise CodexParseError(f"archived rollout {target} lacks session metadata")
+        metadata = _mapping(record.get("payload"))
+        lineage_root_id = _metadata_lineage_root(metadata, roots, source_path)
+        thread_id = _string(metadata.get("id"))
+        if thread_id is None or thread_id != recorded.thread_id:
+            raise CodexParseError(
+                f"archived rollout {target} thread identity disagrees with its manifest record"
+            )
+        prior_lineage = lineage_by_thread.get(thread_id)
+        if prior_lineage is not None and prior_lineage != lineage_root_id:
+            raise CodexParseError(
+                f"Codex thread {thread_id!r} occurs in multiple configured lineages"
+            )
+        lineage_by_thread[thread_id] = lineage_root_id
+        if thread_id == lineage_root_id:
+            if lineage_root_id in root_sources:
+                raise CodexParseError(
+                    f"configured Codex root {lineage_root_id!r} has multiple rollouts"
+                )
+            root_sources[lineage_root_id] = source_path
+        candidate_paths[source_path] = (Path(recorded.original_path), metadata)
+        retired_bytes[source_path] = complete
     missing_roots = [root for root in roots if root not in root_sources]
     if missing_roots:
         raise CodexParseError(
@@ -888,10 +953,14 @@ def snapshot_codex_lineage(
     metadata_by_path: dict[str, Mapping[str, object]] = {}
     for source_path in sorted(candidate_paths):
         path, metadata = candidate_paths[source_path]
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            raise CodexParseError(f"cannot read rollout {path}: {exc}") from exc
+        retired = source_path in retired_bytes
+        if retired:
+            data = retired_bytes[source_path]
+        else:
+            try:
+                data = read_source_bytes(path)
+            except OSError as exc:
+                raise CodexParseError(f"cannot read rollout {path}: {exc}") from exc
         complete = _complete_prefix(data)
         if not complete:
             raise CodexParseError(f"rollout {path} has no newline-complete metadata record")
@@ -936,6 +1005,16 @@ def snapshot_codex_lineage(
                     f"source snapshot does not match its manifest record: {target}"
                 )
 
+        if retired:
+            # A snapshot can be longer than its manifest record only by an interrupted write's
+            # tail, which the manifest never vouched for; the record keeps exactly what it had.
+            assert previous is not None
+            source = replace(
+                previous,
+                upstream_retired_at=previous.upstream_retired_at or updated_at,
+            )
+            pending.append(_PendingCopy(source, complete, existing))
+            continue
         baseline = existing or b""
         if len(complete) < len(baseline):
             raise CodexParseError(
@@ -957,7 +1036,7 @@ def snapshot_codex_lineage(
         )
         source = CodexSourceCopy(
             source_path=source_path,
-            original_path=str(path.resolve()),
+            original_path=str(logical_path(path).resolve()),
             snapshot_path=source_path,
             thread_id=thread_id,
             copied_bytes=len(complete),
@@ -987,7 +1066,10 @@ def snapshot_codex_lineage(
         for item in pending
     )
     return CodexSnapshotResult(
-        tuple(item.source for item in pending), changed, continuations
+        tuple(item.source for item in pending),
+        changed,
+        continuations,
+        tuple(sorted(retired_bytes)),
     )
 
 
@@ -1085,8 +1167,9 @@ def _read_rollout(
         data, file_stat = opened
     else:
         try:
-            data = path.read_bytes()
-            file_stat = path.stat()
+            data = read_source_bytes(path)
+            physical = resolve_source(path)
+            file_stat = (physical or path).stat()
         except OSError as exc:
             raise CodexParseError(f"cannot read rollout {path}: {exc}") from exc
 

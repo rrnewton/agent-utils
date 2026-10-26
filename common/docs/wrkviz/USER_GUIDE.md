@@ -509,6 +509,46 @@ databases read-only, uses SQLite's online backup API for consistent copies, and 
 archive-local snapshots. Coordinator content blocks provide prompts, responses, and condensed tool
 counts; agent blocks and task notes provide incarnation lifetimes and timestamped work updates.
 
+### The archive is the record; upstream is a feed
+
+Agent harnesses do not keep their transcripts forever: logs rotate, a size cap deletes the oldest,
+an operator compresses a log directory to reclaim disk. An archive kept for months should expect
+its earliest records to be gone upstream. wrkviz's own archive is therefore the primary record,
+and each ingest is an incremental read of the feed from the archive's last checkpoint:
+
+- **Checkpoint.** Each team's source manifest (`raw/source-manifest.json` in the build store)
+  records, for every upstream file, how many newline-complete bytes the archive holds and their
+  SHA-256. That is where the next ingest resumes.
+- **New records are appended.** Upstream bytes past the checkpoint are copied into the archive's
+  snapshot and the checkpoint advances. Bytes the archive already holds are compared, not
+  re-imported.
+- **A file upstream no longer has is retired, not lost.** When a previously imported file is gone
+  upstream (in either spelling below), ingest verifies the archive's own snapshot against its
+  checkpoint and keeps it. The run succeeds; the manifest records `upstream_retired_at` on that
+  source (the run that first noticed), and every run receipt lists every retired source under
+  `ingest.upstream_retired_sources`, so any one receipt answers "what is the archive the only
+  copy of". If upstream has the file again later, it is compared and appended as usual.
+- **A file compressed in place is the same file.** `X.zst` is read as `X`: ingest decodes it
+  (with Python 3.14's `compression.zstd`, the `zstandard` package, or the `zstd` command,
+  whichever is present) and the recorded digests keep matching, so compression is never mistaken
+  for a change. When both spellings exist the plain one wins, since a later copy can only be the
+  same bytes or longer. Orc's SQLite databases are decoded into a private temporary copy for the
+  read.
+- **Content changed in place is still refused.** If upstream bytes the archive has already
+  imported now differ, or a file shrank below the checkpoint, ingest refuses that team and leaves
+  its archive byte-identical, exactly as before. That is the one case retention cannot explain.
+
+Retirement works file by file for Codex rollouts and Claude transcripts. For Orc, a lineage whose
+root session database is gone upstream keeps its last normalized generation and is reported as
+retired; within a live Orc lineage, Orc's own rules for dereferenced task databases apply (see
+[Orc source semantics](#orc-source-semantics-and-limitations)).
+
+Two things still refuse, because they are the archive's own copy failing rather than upstream
+moving on: a retired source whose snapshot is missing from the snapshot store, and one whose
+snapshot no longer matches its checkpoint digest. Restore the store from a backup. Do not delete
+the manifest entry to make the error go away: that entry is the only statement of what the
+archive held.
+
 ### 2. Extract prompts and responses — no model calls
 
 After one or more teams have been ingested into the same durable archive, materialize the global
