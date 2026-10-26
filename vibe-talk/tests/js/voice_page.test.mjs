@@ -33708,10 +33708,11 @@ test("a streamed read that ENDS PART-WAY through a sample did not arrive whole, 
   // `#50 stream-trailing-byte`. A frame is two bytes a channel; a body that stops inside one was
   // cut short, or its length disagrees with its format, whatever the transport said about the end.
   const endings = [
-    ["whole stereo frames", 2, pcm(1, 2, 3, 4), true],
-    ["an odd trailing byte", 1, joined(pcm(1, 2, 3), new Uint8Array([7])), false],
-    ["half a stereo frame", 2, pcm(1, 2, 3, 4, 5), false],
-    ["a stereo frame short by one byte", 2, joined(pcm(1, 2, 3, 4, 5), new Uint8Array([7])), false],
+    // Samples loud enough to be speech: a part that is all silence is refused (`#540`, below).
+    ["whole stereo frames", 2, pcm(1000, 2000, 3000, 4000), true],
+    ["an odd trailing byte", 1, joined(pcm(1000, 2000, 3000), new Uint8Array([7])), false],
+    ["half a stereo frame", 2, pcm(1000, 2000, 3000, 4000, 5000), false],
+    ["a stereo frame short by one byte", 2, joined(pcm(1000, 2000, 3000, 4000, 5000), new Uint8Array([7])), false],
   ];
   for (const [ending, channels, samples, whole] of endings) {
     const page = newPage();
@@ -33737,6 +33738,28 @@ test("a streamed read that ENDS PART-WAY through a sample did not arrive whole, 
   }
 });
 
+test("a streamed part that arrives whole with no speech in it stops the read, says so, and archives nothing", async () => {
+  // `#540 read-aloud-desktop`. A voice that answered with silence: the page used to step on through every
+  // block in silence and then archive the message as heard.
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), pcm(0, 3, -2, 0)));
+  await page.settle();
+  page.audioStreams[0].controller.drop();
+  await page.settle();
+  assert.match(page.el("status").textContent, /sent silence/, "the reader was not told the voice was silent");
+  assert.match(page.el("error").textContent, /sent silence/);
+  assert.equal(page.audio.sources[0].halted, true, "the silent part played on");
+  assert.equal(rowState(page, 0).reading, "false", "the row still looks like it is speaking");
+  for (const source of page.audio.sources) source.onended();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [], "a message read in silence was archived as heard");
+});
+
 test("a streamed COMBINED row fetches its next part on the first part's audio and plays it after", async () => {
   const page = newPage();
   page.enableStreamedAudio();
@@ -33747,13 +33770,13 @@ test("a streamed COMBINED row fetches its next part on the first part's audio an
   await page.settle();
   assert.equal(page.audioStreams.length, 1, "the second part was requested before the first had audio");
   const audio = page.audio;
-  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), pcm(1, 2)));
+  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), pcm(1000, 2000)));
   await page.settle();
   assert.equal(page.audioStreams.length, 2, "the second part was never requested");
   const selection = (url) => new URL(url, "http://page").searchParams.get("selection");
   assert.equal(selection(page.audioStreams[1].url), selection(page.audioStreams[0].url));
 
-  page.audioStreams[1].controller.bytes(joined(wavHeader(24000, 1), pcm(3, 4)));
+  page.audioStreams[1].controller.bytes(joined(wavHeader(24000, 1), pcm(3000, 4000)));
   await page.settle();
   assert.equal(audio.sources.length, 1, "both parts played over each other");
 
@@ -33762,7 +33785,7 @@ test("a streamed COMBINED row fetches its next part on the first part's audio an
   audio.sources[0].onended();
   await page.settle();
   assert.equal(audio.sources.length, 2, "the second part never followed the first");
-  assert.deepEqual([...audio.sources[1].buffer.getChannelData(0)], [3 / 0x8000, 4 / 0x8000]);
+  assert.deepEqual([...audio.sources[1].buffer.getChannelData(0)], [3000 / 0x8000, 4000 / 0x8000]);
   assert.deepEqual(page.dismissCalls, [], "the row was filed away with half of it unheard");
 
   page.audioStreams[1].controller.drop();

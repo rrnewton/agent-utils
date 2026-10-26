@@ -9094,6 +9094,34 @@ li.discord-message[data-root-continuation] > .thread-replies {
   outline-offset: -2px;
 }
 
+/* `#540 read-aloud-desktop`. A card whose first message is being read (a press in reading mode reads
+   it), drawn as the message row being read is: the Stop colour's edge, inset bar and tint, at full
+   strength however read its thread is; and asked for, the pulsing outline of a row asked for. */
+#side-cards li.side-card-row[data-reading="true"] {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+  border-color: var(--warn);
+  box-shadow: inset 0.25rem 0 0 var(--warn);
+  background: color-mix(in srgb, var(--warn) 22%, var(--panel));
+}
+
+#side-cards li.side-card-row[data-pending="true"] {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  animation: pending-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #side-cards li.side-card-row[data-pending="true"] {
+    animation: none;
+    outline-color: var(--accent);
+  }
+}
+
 /* `#277 thread-card-focus`. The card highlighted: ringed and tinted in its thread's colour. */
 .side-card-row[data-highlighted] {
   border-color: hsl(var(--thread-hue, 210) 55% 50%);

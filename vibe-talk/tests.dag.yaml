@@ -435,6 +435,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#540 read-aloud-desktop` in the browser engine: a message read aloud from every view — Main, All,
+  # the thread list's cards, unpacked rows and Main rows, one thread, two columns — by the agent's voice
+  # and the device's, each with a clock this check reads; the light on the drawn row; silence stops a read.
+  - group: check
+    job: read-aloud-views-browser
+    desc: reading aloud from every view by both voices in current Chromium at 1280x800, audio started and the light on the message read, and a silent voice stopping the read unarchived
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/read_aloud_views_browser.py
+    jobs_flag: ""
+    timeout: 180
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 45
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#49 post-confirmation-card-hold` in the browser engine: a real touch on Send the moment a first
   # card appears in a typed call commits nothing, and Send enables itself after the hold.
   - group: check
