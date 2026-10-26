@@ -42,6 +42,30 @@ steps:
       hard_mem_max_bytes: 268435456
 
   - group: hygiene
+    job: editions-self-test
+    desc: prove the editions mirror-state guard can fail
+    cmd: python3 scripts/check_editions.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
+    job: editions
+    desc: editions mirror-state model matches the tracked tools
+    cmd: python3 scripts/check_editions.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
     job: case-timings
     desc: normalized per-case timing adapters and inventory verifier can fail
     cmd: python3 scripts/case_timings.py --self-test

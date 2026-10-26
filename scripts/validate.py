@@ -226,6 +226,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("validation.dag.yaml", frozenset(GROUPS)),
     ("validation/", frozenset(GROUPS)),
     # Their own group is always-on, so naming them here only stops them reading as unclassified.
+    ("scripts/check_editions.py", frozenset()),
     ("scripts/check_client_names.py", frozenset()),
     ("scripts/check_documented_defaults.py", frozenset()),
     ("scripts/check_site.py", frozenset()),

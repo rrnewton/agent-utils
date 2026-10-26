@@ -231,6 +231,7 @@
         "scripts/check_client_names.py",
         "scripts/check_deps.py",
         "scripts/check_documented_defaults.py",
+        "scripts/check_editions.py",
         "scripts/check_no_any.py",
         "scripts/check_python_packages.py",
         "scripts/check_rust_packages.py",
@@ -252,6 +253,7 @@
       "test_files": [
         "py/tests/test_agent_log_archive_fetcher.py",
         "py/tests/test_case_timings.py",
+        "py/tests/test_editions.py",
         "py/tests/test_engine_resolver_default.py",
         "py/tests/test_engine_resolver_source_pin.py",
         "py/tests/test_gh_resolve.py",

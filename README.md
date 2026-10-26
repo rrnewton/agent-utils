@@ -110,6 +110,32 @@ tools always run their Python entrypoint unless Rust is explicitly requested,
 which refuses. Every invocation logs the engine that won on standard error;
 there is never a silent fallback.
 
+### Mirror state
+
+The suite is moving to Rust-primary: each tool ends with a Rust primary
+edition and at most one Python mirror, so a slim Rust-only environment and a
+Python-only environment each get a complete suite without the other
+interpreter. The state of every tool — and of the agentctl subcommands that
+still exist only in Python — is recorded in
+[`validation/editions.json`](validation/editions.json): the primary edition,
+the mirror's state (`parity`, kept in lockstep by the named differential
+check; `paused`, frozen at a named commit; `archived`; or `absent`), and the
+parity check that enforces it. The dispatcher reads the generated
+`validation/editions.tsv` beside it (kept identical by the checker): asking
+explicitly for a paused, archived, or absent mirror refuses and names its
+state. `python3 scripts/check_editions.py` proves the file still matches the
+tracked entrypoints and the Rust editions' refusal lists, and runs as a
+validation hygiene check on every change.
+
+The same file inventories every on-disk and wire format (queue items,
+registry records, coordinator and landing-queue files, wrkslots state,
+wrkviz archives, chat bridge state, team declarations, validation records),
+where each definition lives today, which are duplicated — including
+duplicates between two Rust crates — and the plan to collapse each to one
+Rust type with a generated, versioned schema that any Python mirror
+validates against. The vibe-talk wire contract already works that way:
+one Rust type, a generated schema, and generated consumers.
+
 ### Python-only tools
 
 | Command | Purpose | Python distribution |

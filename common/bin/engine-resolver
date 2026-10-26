@@ -9,9 +9,13 @@
 #
 # Contract enforced here
 # ----------------------
-#   * DETERMINISTIC + TRACKED default: with no override, a tool that has a tracked Rust launcher
-#     ALWAYS runs it; a Python-only tool ALWAYS runs its tracked Python entrypoint. No probe of the
-#     host decides the engine — the tracked `rs/bin` link does.
+#   * DETERMINISTIC + TRACKED default: with no override, a tool runs its primary edition as
+#     declared in validation/editions.json (checked against the tracked links by
+#     scripts/check_editions.py); a partial checkout without that file falls back to the tracked
+#     `rs/bin` link's presence. No probe of the host decides the engine.
+#   * MIRROR STATE: an explicit request for the non-primary edition runs only when
+#     validation/editions.json says that mirror is at parity; a paused, archived, or absent
+#     mirror refuses (exit 127) and names its state.
 #   * The Rust default needs a Rust toolchain: its tracked launcher asks Cargo to validate the
 #     workspace cache and provenance before executing, building on first use. Without Cargo the
 #     launcher refuses and names the Python opt-in below; it never silently falls back.
@@ -38,10 +42,36 @@ if [[ "$TOOL" == "engine-resolver" ]]; then
     exit 2
 fi
 
-# Engine selection: an explicit override wins; otherwise Rust for a tool with a tracked Rust
-# launcher, Python for a Python-only tool. Pairing is decided by the tracked link's PRESENCE, not
-# its executability: a damaged (dangling or non-executable) link must fail closed in the Rust leg
-# below, never quietly run Python instead.
+# Mirror-state model (validation/editions.json, #539 rust-primary-mirror-state): the model is
+# authoritative for this tool's primary edition and mirror state. The dispatcher reads the
+# generated validation/editions.tsv (one tab-separated line per tool, kept byte-identical to
+# the JSON by scripts/check_editions.py) so no JSON parsing happens here. A checkout with the
+# JSON but no TSV is inconsistent and refuses; a partial checkout with neither (the resolver's
+# sandbox tests) keeps the presence-based fallback below.
+EDITIONS_JSON="$ROOT/validation/editions.json"
+EDITIONS_TSV="$ROOT/validation/editions.tsv"
+ED_PRIMARY=""
+ED_MIRROR_STATE=""
+ED_PAUSED_AT=""
+if [[ -f "$EDITIONS_JSON" && ! -f "$EDITIONS_TSV" ]]; then
+    echo "[$TOOL] validation/editions.json is present but its generated validation/editions.tsv is missing. Refusing to dispatch on an inconsistent checkout; regenerate it with python3 scripts/check_editions.py --write-tsv." >&2
+    exit 127
+fi
+if [[ -f "$EDITIONS_TSV" ]]; then
+    while IFS=$'\t' read -r ED_NAME ED_PRIMARY ED_MIRROR_STATE ED_PAUSED_AT; do
+        if [[ "$ED_NAME" == "$TOOL" ]]; then
+            break
+        fi
+        ED_PRIMARY=""
+        ED_MIRROR_STATE=""
+        ED_PAUSED_AT=""
+    done < "$EDITIONS_TSV"
+fi
+
+# Engine selection: an explicit override wins; otherwise the editions primary, else Rust for a
+# tool with a tracked Rust launcher, Python for a Python-only tool. Pairing in the fallback is
+# decided by the tracked link's PRESENCE, not its executability: a damaged (dangling or
+# non-executable) link must fail closed in the Rust leg below, never quietly run Python instead.
 ENGINE=""
 ENGINE_VAR=""
 if [[ -n "${DAGRUN_ENGINE:-}" ]]; then
@@ -50,10 +80,32 @@ if [[ -n "${DAGRUN_ENGINE:-}" ]]; then
 elif [[ -n "${AGENT_UTILS_ENGINE:-}" ]]; then
     ENGINE="$AGENT_UTILS_ENGINE"
     ENGINE_VAR="AGENT_UTILS_ENGINE"
+elif [[ -n "$ED_PRIMARY" ]]; then
+    ENGINE="$ED_PRIMARY"
 elif [[ -e "$ROOT/rs/bin/$TOOL" || -L "$ROOT/rs/bin/$TOOL" ]]; then
     ENGINE="rust"
 else
     ENGINE="python"
+fi
+
+# An explicit request for the mirror edition is honoured only at parity. A paused, archived, or
+# absent mirror refuses by name and state instead of silently running stale code.
+if [[ -n "$ENGINE_VAR" && -n "$ED_PRIMARY" && -n "$ED_MIRROR_STATE" ]]; then
+    case "$ENGINE" in
+        python|py) REQUESTED="python" ;;
+        rust|rs) REQUESTED="rust" ;;
+        *) REQUESTED="" ;;
+    esac
+    if [[ -n "$REQUESTED" && "$REQUESTED" != "$ED_PRIMARY" && "$ED_MIRROR_STATE" != "parity" ]]; then
+        DETAIL="a $ED_MIRROR_STATE mirror"
+        if [[ "$ED_MIRROR_STATE" == "absent" || "$ED_MIRROR_STATE" == "archived" ]]; then
+            DETAIL="an $ED_MIRROR_STATE mirror"
+        elif [[ "$ED_MIRROR_STATE" == "paused" && -n "$ED_PAUSED_AT" ]]; then
+            DETAIL="a paused mirror (paused at $ED_PAUSED_AT)"
+        fi
+        echo "[$TOOL] engine=$REQUESTED refused: the $REQUESTED edition of $TOOL is $DETAIL (primary: $ED_PRIMARY; see validation/editions.json). Refusing to silently fall back." >&2
+        exit 127
+    fi
 fi
 
 case "$ENGINE" in

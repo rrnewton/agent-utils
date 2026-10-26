@@ -1,0 +1,15 @@
+agentctl	rust	parity	
+cpuset-alloc	rust	parity	
+dagrun	rust	parity	
+herdr-agent	rust	parity	
+herdr-chat	python	absent	
+herdr-run	rust	parity	
+herdr-subagents	python	absent	
+parallel-experiment-runner	python	absent	
+pr-landing-planner	rust	parity	
+tick-hub	rust	parity	
+wrkslots	python	absent	
+wrkviz	python	absent	
+agent-teams	rust	absent	
+agent-usage	rust	absent	
+gh-paced	rust	absent	
