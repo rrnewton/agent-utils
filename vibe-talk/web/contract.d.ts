@@ -1831,6 +1831,16 @@ declare namespace VibeTalk {
      */
     observed_ms?: number | null;
     /**
+     * The content hash of the page script this server serves, the `v=` of `/voice.js?v=<hash>` in
+     * its shell. `#529 page-build-stale-notice`.
+     *
+     * On every read, newest page and delta alike, so a page left open across a deploy learns at its
+     * next refresh that it is running an older script than the server now serves, and offers a
+     * reload — never reloading by itself. Absent from an older server, which a page treats as
+     * saying nothing.
+     */
+    page_build?: string | null;
+    /**
      * The revision this channel's pins are at. `#206 pin-message`.
      *
      * On every read, newest page and delta alike, so a refresh that already happens is what tells

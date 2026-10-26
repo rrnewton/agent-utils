@@ -2230,6 +2230,7 @@ pub async fn timeline(
         page,
         dismissed,
         reply_dismissals,
+        page_build: Some(crate::http::assets::page_build()),
         untrusted_content_notice: untrusted::NOTICE,
     })))
 }

@@ -593,6 +593,15 @@ pub struct TimelineResponse {
     /// is the different answer that no bookmark is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bookmark: Option<crate::store::Bookmark>,
+    /// The content hash of the page script this server serves, the `v=` of `/voice.js?v=<hash>` in
+    /// its shell. `#529 page-build-stale-notice`.
+    ///
+    /// On every read, newest page and delta alike, so a page left open across a deploy learns at its
+    /// next refresh that it is running an older script than the server now serves, and offers a
+    /// reload — never reloading by itself. Absent from an older server, which a page treats as
+    /// saying nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_build: Option<&'static str>,
     /// Channel content remains untrusted data in every view.
     pub untrusted_content_notice: &'static str,
 }

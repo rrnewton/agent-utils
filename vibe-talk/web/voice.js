@@ -204,7 +204,7 @@ const ALL_CHANNELS = "*";
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
  *   | "message-cache-confirm-no" | "message-cache-confirm-yes" | "message-cache-erase"
  *   | "msg-scale-larger" | "msg-scale-smaller"
- *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
+ *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "page-update"
  *   | "pair-confirm" | "pair-dismiss"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-pause" | "read-prev" | "read-speed" | "read-steer-grip" | "read-stop" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send"
@@ -18145,6 +18145,52 @@ function stepCollapsedLines(direction) {
 //     says it, the root child taking the continuation's place, the card held where it stands
 //     (`keepingCardPlace`).
 
+// `#529 page-build-stale-notice`. The owner, 2026-10-26, of a thread card drawn the old way: "Maybe
+// I'm running a stale version". A launch always runs the deployed page — the shell is revalidated
+// every time (`#223 asset-caching`) — but a page left open across a deploy runs its old script until
+// it is reloaded, and nothing on it said so. Now every timeline read says which page script the
+// server serves (`page_build`, the content hash its shell names it by), and a page whose own script
+// was loaded under another hash shows "New version — reload" on the line over the list, and says
+// both builds in Settings' Server section. A press reloads; nothing reloads by itself, so no call,
+// draft or reading place is ever taken away unasked.
+
+/** This page's script's content hash: the `v=` of the address it was loaded from, or "" without one. */
+const PAGE_BUILD = (() => {
+  try {
+    const script = /** @type {HTMLScriptElement | null} */ (document.currentScript);
+    const src = script && typeof script.src === "string" ? script.src : "";
+    const found = /[?&]v=([0-9a-f]+)(?:&|#|$)/.exec(src);
+    return found ? found[1] : "";
+  } catch (_error) {
+    return "";
+  }
+})();
+
+/** The page build the server last said it serves (`page_build`), or "" before a read has said. */
+let serverPageBuild = "";
+
+/** Take what read `payload` says of the server's page build, and draw what it means for this page. */
+function noteServerPageBuild(payload) {
+  const build = payload && typeof payload.page_build === "string" ? payload.page_build : "";
+  if (!build || build === serverPageBuild) return;
+  serverPageBuild = build;
+  renderPageBuild();
+}
+
+/** Whether the server serves a newer page than this one runs: both builds known, and different. */
+const pageOutOfDate = () => PAGE_BUILD !== "" && serverPageBuild !== "" && serverPageBuild !== PAGE_BUILD;
+
+/** The reload chip shown exactly while this page is out of date, and Settings saying which build it is. */
+function renderPageBuild() {
+  const stale = pageOutOfDate();
+  const chip = el("page-update");
+  if (chip.hidden === stale) chip.hidden = !stale;
+  const short = (build) => build.slice(0, 8);
+  setTextIfChanged(el("settings-page-build"), PAGE_BUILD === "" ? "" : stale
+    ? `This page is build ${short(PAGE_BUILD)}; the server now serves ${short(serverPageBuild)}. Reload to run it.`
+    : `This page is build ${short(PAGE_BUILD)}.`);
+}
+
 /** The device's copy of K, kept on the server for every device (`#457 settings-server-side`). */
 const CARD_MAX_LINES_KEY = "vibe-talk.voice.thread-card-max-lines";
 const MIN_CARD_MAX_LINES = 1;
@@ -22632,6 +22678,8 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
  */
 function foldTimelinePage(payload, older, view = channelView, thread = selectedThreadId, held = null) {
   const channel = String(el("discord-channel").value);
+  // `#529 page-build-stale-notice`.
+  noteServerPageBuild(payload);
   // `#427 server-thread-hues`: the colours this read carries, taken before anything it brought
   // is drawn, so its rows never show a fallback colour the server has already decided.
   noteServerThreadHuesIn(payload.messages || [],
@@ -22945,6 +22993,8 @@ function staleAsOf(payload) {
  * `unchangedDeltas`, which is what lets a refresh with nothing new draw nothing (`rowsAsDrawn`).
  */
 function foldTimelineDelta(payload, sent, view = channelView, thread = selectedThreadId) {
+  // `#529 page-build-stale-notice`: a delta says which page the server serves as a full read does.
+  noteServerPageBuild(payload);
   // `#427 server-thread-hues`: a delta's new threads carry their colours, as a page's do.
   noteServerThreadHuesIn(payload.messages || [],
     [...(payload.threads || []), payload.thread].filter(Boolean));
@@ -55063,6 +55113,9 @@ el("collapsed-lines").addEventListener("input", () => collapsedLinesChanged(el("
 el("collapsed-lines-smaller").addEventListener("click", () => stepCollapsedLines(-1));
 el("collapsed-lines-larger").addEventListener("click", () => stepCollapsedLines(1));
 el("card-max-lines").addEventListener("input", () => cardMaxLinesChanged(el("card-max-lines").value));
+// `#529 page-build-stale-notice`. Only on the reader's press.
+el("page-update").addEventListener("click", () => window.location.reload());
+renderPageBuild();
 el("card-max-lines-smaller").addEventListener("click", () => stepCardMaxLines(-1));
 el("card-max-lines-larger").addEventListener("click", () => stepCardMaxLines(1));
 el("width-grip").addEventListener("pointerdown", onGripDown);

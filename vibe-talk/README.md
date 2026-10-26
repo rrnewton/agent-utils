@@ -627,7 +627,11 @@ stylesheet and icon the page names carries the hash of its own bytes (`/voice.js
 are revalidated on every load (`no-cache` with an ETag, answered `304` when unchanged). Launching
 the installed app therefore costs one small request for the page when nothing was deployed, and
 after a deploy only the files that changed. The plain URLs (`/voice.js`) still work, revalidated,
-for an app installed before this. The server applies `Cache-Control: no-store` centrally to all
+for an app installed before this. A page left open across a deploy keeps running its old script, so
+every timeline read says which script the server now serves (`page_build`, the same hash), and a page
+loaded under another one shows **New version — reload** on the line over the list and names both
+builds in Settings under Server (`#529 page-build-stale-notice`). It reloads only when pressed, never
+by itself. The server applies `Cache-Control: no-store` centrally to all
 `/api/` and `/mcp` responses, including errors. Transcripts, minted session URLs, and API responses
 are never placed in Cache Storage or any other browser-managed HTTP cache. The installed app still
 requires the server to be reachable to load at all.

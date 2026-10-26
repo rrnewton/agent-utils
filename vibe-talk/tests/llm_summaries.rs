@@ -781,6 +781,12 @@ async fn main_brings_a_named_threads_name_and_sentence_on_its_root() {
     );
     // The short root's thread, one reply and unnamed, is left alone (`#484`).
     assert_eq!(roots[1], ("root-1".to_owned(), None, None));
+    // `#529 page-build-stale-notice`: and every read says which page script this server serves.
+    assert_eq!(
+        after["page_build"],
+        json!(vibe_talk::http::assets::page_build()),
+        "a read does not say the page build"
+    );
     // A read token is served what is filed, as the thread list serves it.
     let (_, read) = call(&h.app, MAIN, READ_TOKEN).await;
     assert_eq!(

@@ -529,6 +529,14 @@ fn opaque(tag: &str) -> &str {
     tag.strip_prefix("W/").unwrap_or(tag)
 }
 
+/// The page script's content hash, the `v=` its URL carries in the shell this server generates.
+/// `#529 page-build-stale-notice`: a page loaded from an older deploy carries an older one, and
+/// says so when a read tells it this one ([`crate::contract::TimelineResponse::page_build`]).
+pub fn page_build() -> &'static str {
+    static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| digest(VOICE_JS.as_bytes()))
+}
+
 /// The first 128 bits of the SHA-256 of `bytes`, in lowercase hex.
 fn digest(bytes: &[u8]) -> String {
     let hash = ring::digest::digest(&ring::digest::SHA256, bytes);
@@ -598,6 +606,19 @@ mod tests {
         for (written, _) in manifest_spellings(&custom) {
             assert_eq!(MANIFEST.matches(written.as_str()).count(), 1, "{written}");
         }
+    }
+
+    #[test]
+    fn the_page_build_is_the_hash_the_shell_names_the_script_by() {
+        // `#529 page-build-stale-notice`: what a read reports is exactly the `v=` a page loaded
+        // from this server's shell finds on its own script's address.
+        let site = Site::new(SOURCES, Names::default());
+        let shell = String::from_utf8(site.entries["/"].body.to_vec()).expect("a text shell");
+        assert!(
+            shell.contains(&format!("src=\"/voice.js?v={}\"", page_build())),
+            "the shell names the script by another hash than the page build"
+        );
+        assert_eq!(page_build().len(), 32);
     }
 
     #[test]

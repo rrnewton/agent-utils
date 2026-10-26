@@ -368,6 +368,8 @@ fn timeline(view: TimelineView, page: TimelinePage) -> TimelineResponse {
         reply_dismissals: None,
         pins_revision: None,
         bookmark: None,
+        // `#529 page-build-stale-notice`.
+        page_build: Some("0123456789abcdef0123456789abcdef"),
         untrusted_content_notice: "third-party text",
     }
 }

@@ -1103,6 +1103,7 @@
       ],
       "next_before": "cursor",
       "notice": "scope note",
+      "page_build": "0123456789abcdef0123456789abcdef",
       "returned": 2,
       "thread": null,
       "threads": [],
@@ -1127,6 +1128,7 @@
       "messages": [],
       "next_before": null,
       "notice": null,
+      "page_build": "0123456789abcdef0123456789abcdef",
       "returned": 2,
       "thread": null,
       "threads": [
@@ -1221,6 +1223,7 @@
       ],
       "next_before": null,
       "notice": null,
+      "page_build": "0123456789abcdef0123456789abcdef",
       "returned": 1,
       "thread": {
         "id": "t1",
@@ -1262,6 +1265,7 @@
       "messages": [],
       "next_before": null,
       "notice": null,
+      "page_build": "0123456789abcdef0123456789abcdef",
       "returned": 0,
       "thread": null,
       "threads": [],
@@ -1308,6 +1312,7 @@
       "next_after": "forward",
       "next_before": null,
       "notice": null,
+      "page_build": "0123456789abcdef0123456789abcdef",
       "pins_revision": 1790000000000,
       "returned": 1,
       "thread": null,
@@ -1389,6 +1394,7 @@
       "next_after": "forward-2",
       "next_before": null,
       "notice": null,
+      "page_build": "0123456789abcdef0123456789abcdef",
       "reply_dismissals": {
         "from": "150",
         "messages": [
@@ -1430,6 +1436,7 @@
       "next_after": "forward-3",
       "next_before": null,
       "notice": null,
+      "page_build": "0123456789abcdef0123456789abcdef",
       "returned": 1,
       "thread": null,
       "threads": [

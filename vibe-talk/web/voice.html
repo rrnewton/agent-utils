@@ -220,6 +220,9 @@
           -->
           <div id="channel-freshness-anchor">
             <p id="channel-freshness" data-state="fresh" role="status" aria-live="polite" hidden></p>
+            <!-- `#529 page-build-stale-notice`. Shown only when a read says the server serves a newer
+                 page script than this page runs; a press reloads. Never reloads by itself. -->
+            <button id="page-update" class="chip" type="button" title="A newer version of this page is deployed: reload to run it" hidden>New version — reload</button>
             <!--
               `#129 message-search`, floating since `#197 floating-search`. Closed, this is the glass
               and nothing else. Open, it grows along the line into a bar across the top of the list
@@ -1058,6 +1061,8 @@
               <section class="settings-section" id="settings-server" aria-labelledby="settings-server-title">
                 <h2 id="settings-server-title">Server</h2>
                 <p id="settings-server-host" class="settings-server-host"></p>
+                <!-- `#529 page-build-stale-notice`. Which build of the page this is, and whether the server serves a newer one. -->
+                <p id="settings-page-build" class="hint"></p>
                 <!-- `#457 settings-server-side`. Quiet by design: it speaks only while a change is still on its way to the server, or cannot get there. -->
                 <p id="settings-sync-state" class="hint" aria-live="polite" hidden></p>
               </section>

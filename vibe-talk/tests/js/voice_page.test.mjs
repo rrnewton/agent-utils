@@ -2605,6 +2605,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   FakeElement.focusLost = 0;
   const document = {
     documentElement: page.documentElement,
+    // `#529 page-build-stale-notice`. The script element running the page, whose address names its
+    // build; null unless a test gives the page one (`page.scriptSrc`), as no page script is then known.
+    get currentScript() {
+      return page.scriptSrc ? { src: page.scriptSrc } : null;
+    },
     get activeElement() {
       return FakeElement.focused;
     },
@@ -3005,7 +3010,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     getSelection: () => page.selection,
     window: {
       AudioContext: function () { return new FakeAudioContext(page); },
-      location: { origin: "https://vibe.example" },
+      location: { origin: "https://vibe.example", reload: () => { page.reloads = (page.reloads || 0) + 1; } },
       // `#429 keyboard-hides-bar`. See `page.viewport`.
       get innerHeight() {
         return page.viewport.layout;
@@ -83323,4 +83328,51 @@ test("`#523 voice-self-hearing`: with echo cancellation refused, the microphone 
   const applied = await run(true);
   assert.equal(applied.during, 1, "with echo cancellation on, an answer could not be talked over");
   assert.doesNotMatch(applied.page.el("connection-detail").textContent, /echo cancellation is off/);
+});
+
+// --- a page running an older script than the server serves says so (#529 page-build-stale-notice) --------
+//
+// The owner, 2026-10-26, of a thread card drawn the old way: "Maybe I'm running a stale version". A page
+// left open across a deploy keeps its old script; every timeline read now says which one the server serves.
+
+test("`#529 page-build-stale-notice`: a read saying the server serves another page script shows New version — reload, which reloads only on a press", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => { p.scriptSrc = "https://vibe.example/voice.js?v=aaaaaaaa11111111"; });
+  const data = bigCardData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  const answer = server.answer;
+  let build = "aaaaaaaa11111111";
+  server.answer = async (path) => {
+    const response = await answer(path);
+    return json(response.status, { ...JSON.parse(await response.text()), page_build: build });
+  };
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.settle();
+  // The same build: nothing shown, and Settings names it.
+  assert.equal(page.el("page-update").hidden, true, "the page offered a reload of the build it runs");
+  assert.equal(page.el("settings-page-build").textContent, "This page is build aaaaaaaa.");
+  // A deploy: the next read says another build.
+  build = "bbbbbbbb22222222";
+  await reReadChannel(page);
+  assert.equal(page.el("page-update").hidden, false, "a page older than the server's did not say so");
+  assert.match(page.el("page-update").textContent, /New version/);
+  assert.match(page.el("settings-page-build").textContent, /build aaaaaaaa; the server now serves bbbbbbbb/);
+  assert.equal(page.reloads || 0, 0, "the page reloaded by itself");
+  await page.el("page-update").click();
+  assert.equal(page.reloads, 1, "the chip did not reload the page");
+  // A page that does not know its own build — loaded without a hashed address — never claims to be old.
+  const unknown = newPage(new Map());
+  unknown.threadingSupported = true;
+  unknown.threads = data.threads;
+  unknown.messages = data.messages;
+  const other = forwardTimeline(unknown);
+  const plain = other.answer;
+  other.answer = async (path) => json(200, { ...JSON.parse(await (await plain(path)).text()), page_build: "cccccccc33333333" });
+  await signIn(unknown);
+  await showDiscord(unknown, data.messages);
+  await unknown.settle();
+  assert.equal(unknown.el("page-update").hidden, true, "a page with no build of its own offered a reload");
 });

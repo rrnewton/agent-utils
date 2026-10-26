@@ -2096,6 +2096,13 @@
             "null"
           ]
         },
+        "page_build": {
+          "description": "The content hash of the page script this server serves, the `v=` of `/voice.js?v=<hash>` in\nits shell. `#529 page-build-stale-notice`.\n\nOn every read, newest page and delta alike, so a page left open across a deploy learns at its\nnext refresh that it is running an older script than the server now serves, and offers a\nreload — never reloading by itself. Absent from an older server, which a page treats as\nsaying nothing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "pins_revision": {
           "description": "The revision this channel's pins are at. `#206 pin-message`.\n\nOn every read, newest page and delta alike, so a refresh that already happens is what tells\na page another device pinned or unpinned something; the page reads `/pins` again only when\nthis differs from the revision of the list it holds. Absent when the store cannot say — no\nstorage configured, or a failing one — and from an older server.",
           "format": "int64",

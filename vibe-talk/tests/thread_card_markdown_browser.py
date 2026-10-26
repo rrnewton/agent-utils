@@ -23,6 +23,9 @@ renders it, with one reply, as on Slack:
 * load: with the name filed and every read taking `--latency` seconds, a fresh load draws the summary
   card with the same read that draws the thread's card (the root's own record names it), and a reload
   whose reads are held draws the summary card from the device's copy before any read answers.
+* build (`#529 page-build-stale-notice`): a read saying the server serves the page's own script shows
+  nothing; one saying another shows "New version — reload" on the line over the list, inside the
+  window and clear of the freshness pill, and a press reloads the page.
 
 Pass --screenshots DIR to keep a PNG of each state, and --web-root DIR to run against another copy
 of the page. --report-only measures the load part without failing on it, for an older page's numbers.
@@ -31,7 +34,9 @@ of the page. --report-only measures the load part without failing on it, for an 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -98,6 +103,8 @@ class MarkdownApi(FakeApi):
         self.names = names
         self.latency = latency
         self.named: Json | None = None
+        # `#529 page-build-stale-notice`: the page script every read says the server serves, if any.
+        self.page_build: str | None = None
 
     def client_config(self, scope: str) -> Json:
         config = super().client_config(scope)
@@ -114,6 +121,10 @@ class MarkdownApi(FakeApi):
         answer = super().timeline(query)
         with self.lock:
             named = dict(self.named) if self.named else None
+        with self.lock:
+            build = self.page_build
+        if build:
+            answer["page_build"] = build
         if named:
             # As the server serves it: on the thread list's copy, and on the root's own record.
             threads = answer["threads"]
@@ -222,7 +233,7 @@ def arguments() -> argparse.Namespace:
                         help="loopback port for the fake server (default: 0, any free port)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable (default: all of them)")
-    parser.add_argument("--only", choices=("format", "pending", "load"), action="append",
+    parser.add_argument("--only", choices=("format", "pending", "load", "build"), action="append",
                         help="run only these parts of the walk, repeatable (default: all of them)")
     parser.add_argument("--latency", type=float, default=0.6,
                         help="seconds every timeline read takes in the load part (default: 0.6)")
@@ -242,7 +253,7 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     fixture.WEB_ROOT = args.web_root.resolve()
     report: list[str] = []
-    parts = args.only or ["format", "pending", "load"]
+    parts = args.only or ["format", "pending", "load", "build"]
     with sync_playwright() as playwright:
         for label, width, height, touch in SIZES:
             if args.size and label not in args.size:
@@ -254,8 +265,32 @@ def main() -> int:
     return 0
 
 
+def hashed_web_root(source: Path, into: Path) -> Path:
+    """A copy of the page at `source` whose shell names its script by its content hash, as the server's
+    shell does (src/http/assets.rs): the fake server serves files as written, with no hash."""
+    shutil.copytree(source, into)
+    script = (into / "voice.js").read_bytes()
+    build = hashlib.sha256(script).hexdigest()[:32]
+    shell = into / "voice.html"
+    shell.write_text(shell.read_text().replace('src="/voice.js"', f'src="/voice.js?v={build}"'))
+    return into
+
+
 def walk(chromium: BrowserType, args: argparse.Namespace, part: str, label: str, width: int, height: int,
          touch: bool) -> str:
+    if part != "build":
+        return walk_part(chromium, args, part, label, width, height, touch)
+    served = fixture.WEB_ROOT
+    with tempfile.TemporaryDirectory(prefix="vibe-talk-hashed-web-") as copy:
+        fixture.WEB_ROOT = hashed_web_root(served, Path(copy) / "web").resolve()
+        try:
+            return walk_part(chromium, args, part, label, width, height, touch)
+        finally:
+            fixture.WEB_ROOT = served
+
+
+def walk_part(chromium: BrowserType, args: argparse.Namespace, part: str, label: str, width: int, height: int,
+              touch: bool) -> str:
     api = (MarkdownApi() if part == "format" else MarkdownApi(recent=True, names=True) if part == "pending"
            else MarkdownApi(names=True, latency=args.latency))
     if part == "load":
@@ -280,6 +315,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, part: str, label: str,
                 format_walk(desk)
             elif part == "pending":
                 pending_walk(desk, api)
+            elif part == "build":
+                build_walk(desk, api)
             else:
                 load_walk(desk, api, args, server.server_port)
             check(not errors, f"{label}: the page threw: {errors}")
@@ -354,6 +391,52 @@ def pending_walk(desk: Desk, api: MarkdownApi) -> None:
     desk.shot("2-summary-landed")
     desk.notes.append(f"waiting in the summary's layout; filed, the summary reached the card in {took:.1f}s, "
                       f"the card moved {moved:.1f}px and grew {card_grew:.0f}px, the row under it moved {row_moved:.1f}px")
+
+
+CHIP_JS = """() => {
+    const chip = document.getElementById('page-update');
+    const pill = document.getElementById('channel-freshness');
+    const box = (node) => { const r = node.getBoundingClientRect(); return {left: r.left, right: r.right, top: r.top, bottom: r.bottom}; };
+    return {shown: chip.getClientRects().length > 0, words: chip.textContent, chip: box(chip),
+            pill: pill.getClientRects().length > 0 ? box(pill) : null, width: window.innerWidth,
+            overflow: document.documentElement.scrollWidth - window.innerWidth};
+}"""
+
+
+def build_walk(desk: Desk, api: MarkdownApi) -> None:
+    page = desk.page
+    own = str(page.evaluate("() => PAGE_BUILD"))
+    desk.check(len(own) == 32, f"the page does not know its own build: {own!r}")
+    reread = "() => { threadDirectoryReadAt.clear(); return refreshThreadDirectory(); }"
+    with api.lock:
+        api.page_build = own
+    page.evaluate(reread)
+    desk.settled()
+    same = page.evaluate(CHIP_JS)
+    assert isinstance(same, dict)
+    desk.check(not same["shown"], "the page offered a reload of the build it runs")
+    with api.lock:
+        api.page_build = "f" * 32
+    page.evaluate(reread)
+    desk.wait_for("() => !document.getElementById('page-update').hidden", "a newer build did not show the chip")
+    desk.settled()
+    found = page.evaluate(CHIP_JS)
+    assert isinstance(found, dict)
+    chip = found["chip"]
+    pill = found["pill"]
+    assert isinstance(chip, dict)
+    desk.check(bool(found["shown"]) and "New version" in str(found["words"]), f"the chip is not drawn: {found}")
+    desk.check(0 <= float(chip["left"]) and float(chip["right"]) <= float(str(found["width"])) and float(str(found["overflow"])) <= 0,
+               f"the chip is outside the window: {found}")
+    desk.check(not isinstance(pill, dict) or float(pill["right"]) <= float(chip["left"]) + 0.5
+               or float(chip["right"]) <= float(pill["left"]) + 0.5, f"the chip covers the freshness pill: {found}")
+    desk.shot("1-new-version")
+    page.evaluate("() => { window.__beforeReload = true; }")
+    with page.expect_navigation():
+        page.click("#page-update")
+    desk.check(not page.evaluate("() => Boolean(window.__beforeReload)"), "the chip did not reload the page")
+    desk.notes.append(f"a newer build showed the chip at x {float(chip['left']):.0f}-{float(chip['right']):.0f}px "
+                      "beside the pill, and a press reloaded the page")
 
 
 def summarised_at(desk: Desk) -> str:

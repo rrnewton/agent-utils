@@ -1563,7 +1563,7 @@ steps:
   # reads are held draws it from the device's copy. Measured on 2026-10-26: about 25s wall.
   - group: check
     job: thread-card-markdown-browser
-    desc: a long Markdown first message's thread card keeps its formatting, splits only between lines, waits for its summary in the summary's layout, and draws a known summary with the page, in current Chromium at 393x852 and 1280x800
+    desc: a long Markdown first message's thread card keeps its formatting, splits only between lines, waits for its summary in the summary's layout, and draws a known summary with the page, and a page older than the server's offers a reload (#529), in current Chromium at 393x852 and 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/thread_card_markdown_browser.py
     jobs_flag: ""

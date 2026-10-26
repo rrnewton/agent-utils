@@ -4889,6 +4889,13 @@ a.search-hit-link {
   flex: 0 1 calc(var(--search-disc) + var(--float-gap));
 }
 
+/* `#529 page-build-stale-notice`. Beside the pill on its line, never shrunk by it. */
+#page-update {
+  flex: 0 0 auto;
+  margin-left: var(--float-gap);
+  pointer-events: auto;
+}
+
 /* Never shrunk by the line; capped at its width instead, which is where the ellipsis starts. */
 #channel-freshness {
   flex: 0 0 auto;
