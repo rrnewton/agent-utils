@@ -486,8 +486,40 @@ def _record_time(record: _Record) -> int:
     return record.timestamp_ms
 
 
+#: Fields Claude Code rewrites when it emits a record it has already written. A resumed session
+#: re-appends earlier records with the session's slug added (and sometimes re-parented), and a
+#: forked subagent's transcript starts with a copy of its parent's records stamped with the
+#: fork's own agentId, promptId and sidechain flag. A repeat that differs only in these is the
+#: same record; one that differs anywhere else is a conflict.
+_REWRITE_DECORATIONS = frozenset({"slug", "parentUuid", "agentId", "promptId", "isSidechain"})
+
+
+#: Inside `message`, what a copy taken while the response was still streaming lacks: a fork's
+#: copy of an assistant record can carry the stop reason and token usage of a partial stream.
+#: The content blocks are the record; these are accounting about it.
+_STREAMING_FIELDS = frozenset({"stop_reason", "stop_sequence", "usage"})
+
+
+def _record_identity(value: Mapping[str, object]) -> dict[str, object]:
+    identity = {
+        key: item for key, item in value.items() if key not in _REWRITE_DECORATIONS
+    }
+    message = identity.get("message")
+    if isinstance(message, dict):
+        identity["message"] = {
+            key: item for key, item in message.items() if key not in _STREAMING_FIELDS
+        }
+    return identity
+
+
+def _same_record(left: _Record, right: _Record) -> bool:
+    return left.raw == right.raw or _record_identity(left.value) == _record_identity(
+        right.value
+    )
+
+
 def _deduplicate(records: Sequence[_Record]) -> tuple[_Record, ...]:
-    seen: dict[tuple[str, str], bytes] = {}
+    seen: dict[tuple[str, str], _Record] = {}
     result: list[_Record] = []
     for record in records:
         uuid = _optional_string(record.value.get("uuid"))
@@ -497,13 +529,67 @@ def _deduplicate(records: Sequence[_Record]) -> tuple[_Record, ...]:
         key = (record.thread_id, uuid)
         previous = seen.get(key)
         if previous is None:
-            seen[key] = record.raw
+            seen[key] = record
             result.append(record)
-        elif previous != record.raw:
+        elif not _same_record(previous, record):
             raise ClaudeParseError(
                 f"{record.source_path}:{record.line}: conflicting duplicate UUID {uuid}"
             )
     return tuple(result)
+
+
+def _tool_use_ids(record: _Record) -> tuple[str, ...]:
+    message = record.value.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return ()
+    return tuple(
+        str(block["id"])
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
+    )
+
+
+def _drop_fork_prefixes(
+    records_by_thread: dict[str, list[_Record]],
+) -> dict[str, list[_Record]]:
+    """Keep each record once: in the first thread that has it, root first then path order.
+
+    A forked subagent's transcript begins with a verbatim copy of the conversation it was forked
+    from -- same UUIDs, same tool calls and results. Counting the copy would duplicate that work
+    in every fork and collide on tool-call identity, so a record already seen in an earlier thread
+    is dropped from a later one. A same-UUID record with different content is still a conflict.
+    """
+
+    first: dict[str, _Record] = {}
+    calls_by_thread: dict[str, str] = {}
+    result: dict[str, list[_Record]] = {}
+    for thread_id, records in records_by_thread.items():
+        kept: list[_Record] = []
+        for record in records:
+            calls = _tool_use_ids(record)
+            # A fork also opens with the parent's spawning call re-recorded under a new UUID.
+            # A record whose every tool call an earlier thread already made is that copy.
+            if calls and all(
+                calls_by_thread.get(call, thread_id) != thread_id for call in calls
+            ):
+                continue
+            for call in calls:
+                calls_by_thread.setdefault(call, thread_id)
+            uuid = _optional_string(record.value.get("uuid"))
+            previous = first.get(uuid) if uuid is not None else None
+            if previous is None or previous.thread_id == thread_id:
+                if uuid is not None and previous is None:
+                    first[uuid] = record
+                kept.append(record)
+                continue
+            if not _same_record(previous, record):
+                raise ClaudeParseError(
+                    f"{record.source_path}:{record.line}: conflicting duplicate UUID {uuid} "
+                    f"(first seen in {previous.source_path}:{previous.line})"
+                )
+        result[thread_id] = kept
+    return result
 
 
 def _extract(
@@ -832,6 +918,7 @@ def load_claude_team(
         agent_by_log[path.with_suffix("").as_posix()] = thread_id
     if root_thread_id not in records_by_thread:
         raise ClaudeParseError("Claude root transcript did not identify the root session")
+    records_by_thread = _drop_fork_prefixes(records_by_thread)
 
     metas: dict[str, _Meta] = {}
     for relative, path in meta_paths:
@@ -846,7 +933,7 @@ def load_claude_team(
 
     all_events: list[Event] = []
     tool_builders: list[_ToolBuilder] = []
-    result_by_call: dict[str, tuple[int, str, str | None]] = {}
+    results_by_call: dict[str, list[tuple[str, tuple[int, str, str | None]]]] = {}
     assistant_by_thread: dict[str, list[int]] = {}
     for thread_id, thread_records in records_by_thread.items():
         events, tools, results, assistant_times = _extract(thread_records)
@@ -854,11 +941,20 @@ def load_claude_team(
         tool_builders.extend(tools)
         assistant_by_thread[thread_id] = assistant_times
         for call_id, extracted_result in results.items():
-            if call_id in result_by_call:
-                raise ClaudeParseError(f"duplicate Claude tool result {call_id}")
-            result_by_call[call_id] = extracted_result
+            results_by_call.setdefault(call_id, []).append((thread_id, extracted_result))
     if len({tool.call_id for tool in tool_builders}) != len(tool_builders):
         raise ClaudeParseError("duplicate Claude tool-use id")
+    # A forked subagent's transcript opens with its own synthetic result for the parent's spawn
+    # call ("Fork started"), so one call can have a result in two threads. The result recorded by
+    # the thread that made the call is the real one; two results inside that thread still refuse.
+    caller_by_call = {tool.call_id: tool.thread_id for tool in tool_builders}
+    result_by_call: dict[str, tuple[int, str, str | None]] = {}
+    for call_id, candidates in results_by_call.items():
+        caller = caller_by_call.get(call_id)
+        own = [result for thread_id, result in candidates if thread_id == caller]
+        if len(own) > 1 or (caller is None and len(candidates) > 1):
+            raise ClaudeParseError(f"duplicate Claude tool result {call_id}")
+        result_by_call[call_id] = own[0] if own else candidates[0][1]
 
     turns_by_thread: dict[str, tuple[Turn, ...]] = {}
     for thread_id in records_by_thread:

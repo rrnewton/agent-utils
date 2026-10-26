@@ -446,3 +446,97 @@ def test_cli_exposes_bounded_claude_ingest(tmp_path: Path) -> None:
     assert raw["provider"] == "claude"
     assert raw["window_start_ms"] == DAY_TWO_MS
     assert raw["window_end_ms"] == DAY_THREE_MS
+
+
+def _jsonl(records: list[dict[str, object]]) -> str:
+    return "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records)
+
+
+def _fork_fixture(tmp_path: Path, *, conflicting: bool = False) -> Path:
+    """A resumed root and a forked subagent, in the shapes newer Claude Code writes."""
+
+    live = tmp_path / "live"
+    shutil.copytree(FIXTURE_ROOT, live)
+    root = _session(live)
+    root_records = [json.loads(line) for line in root.read_text(encoding="utf-8").splitlines()]
+    first_user = next(record for record in root_records if record["uuid"] == "root-user-1")
+    spawn = next(record for record in root_records if record["uuid"] == "root-spawn-1")
+    # A resume re-appends an earlier record with the session's slug added.
+    with root.open("a", encoding="utf-8") as handle:
+        handle.write(_jsonl([dict(first_user, slug="quiet-river")]))
+    copied_user = dict(first_user, agentId="a-fork", promptId="fork-prompt", isSidechain=True)
+    if conflicting:
+        copied_user["message"] = {"role": "user", "content": "A different request."}
+    fork = root.parent / root.stem / "subagents" / "agent-a-fork.jsonl"
+    fork.write_text(
+        _jsonl(
+            [
+                {"type": "fork-context-ref"},
+                # The parent's records, copied verbatim apart from the fork's own stamps...
+                copied_user,
+                # ...its spawning call again, under a new UUID and with a partial stream's usage...
+                dict(
+                    spawn,
+                    uuid="fork-copy-of-spawn",
+                    agentId="a-fork",
+                    isSidechain=True,
+                    message=dict(spawn["message"], stop_reason=None),
+                ),
+                # ...and the fork's own synthetic result for that call.
+                {
+                    "type": "user",
+                    "uuid": "fork-started",
+                    "parentUuid": "fork-copy-of-spawn",
+                    "sessionId": SESSION_ID,
+                    "isSidechain": True,
+                    "agentId": "a-fork",
+                    "timestamp": "2026-01-01T23:55:03.200Z",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tool-spawn-child",
+                                "content": [{"type": "text", "text": "Fork started"}],
+                            },
+                            {"type": "text", "text": "You are a worker fork."},
+                        ],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "fork-answer",
+                    "parentUuid": "fork-started",
+                    "sessionId": SESSION_ID,
+                    "isSidechain": True,
+                    "agentId": "a-fork",
+                    "timestamp": "2026-01-01T23:56:00.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Fork finished its part."}],
+                    },
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_resumed_and_forked_transcripts_count_each_record_once(tmp_path: Path) -> None:
+    baseline = load_claude_team(_session(), "claude-fixture", "UTC")
+    team = load_claude_team(_fork_fixture(tmp_path), "claude-fixture", "UTC")
+
+    assert "a-fork" in {agent.thread_id for agent in team.agents}
+    spawn_calls = [tool for tool in team.tool_calls if tool.call_id == "tool-spawn-child"]
+    assert len(spawn_calls) == 1 and spawn_calls[0].thread_id == SESSION_ID
+    assert [event.text for event in team.events].count("Build the release report.") == [
+        event.text for event in baseline.events
+    ].count("Build the release report.")
+    assert any(event.text == "Fork finished its part." for event in team.events)
+
+
+def test_forked_copy_with_different_content_still_refuses(tmp_path: Path) -> None:
+    with pytest.raises(ClaudeParseError, match="conflicting duplicate UUID root-user-1"):
+        load_claude_team(_fork_fixture(tmp_path, conflicting=True), "claude-fixture", "UTC")
