@@ -19,3 +19,5 @@ These two are pure readers (no network, no harness), so they can move first;
 python-primary until then. Remove history/context from the Rust edition's
 PYTHON_ONLY_CHAT_COMMANDS only when the Rust behavior matches, and update
 validation/editions.json in the same commit so the mirror model stays true.
+
+[muse watermelon] Slice landed (f66fd17a + b47763b2): Rust `chat history` only. `chat launch` and `chat context` remain python-primary (context needs live provider transport; launch is the polling supervisor) and are the next slices of milestone 2, so this issue stays open for them.
