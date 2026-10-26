@@ -1454,7 +1454,12 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Check {
             .get(key)
             .is_some_and(|value| !value.is_empty() && value != "infinity" && value != "0")
     };
-    if !scheduled("NextElapseUSecRealtime") && !scheduled("NextElapseUSecMonotonic") {
+    // While the service it triggered runs, a timer is in SubState=running and has no next
+    // elapse; systemd computes one when the service stops.
+    if !scheduled("NextElapseUSecRealtime")
+        && !scheduled("NextElapseUSecMonotonic")
+        && show(host, &timer.unit, &["SubState"])?["SubState"] != "running"
+    {
         return Ok(Some(
             "timer is active but will never fire again (no next elapse)".to_owned(),
         ));

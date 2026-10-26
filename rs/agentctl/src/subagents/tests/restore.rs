@@ -310,6 +310,14 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
         never,
         "",
     );
+    for _ in 0..2 {
+        host.answer(
+            "show observer.timer --timestamp=unix -p SubState",
+            0,
+            "SubState=waiting\n",
+            "",
+        );
+    }
     host.answer(
         "show observer.timer --timestamp=unix -p Triggers",
         0,
@@ -1260,5 +1268,41 @@ fn watch_does_not_repair_a_timer_whose_service_it_could_not_check() {
     let findings = watch_pass(&fixture, &host, &timer_config(&fixture, "tick.timer"));
     let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
     assert_eq!(timer["ok"], Value::Null, "{timer}");
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+}
+
+#[test]
+fn watch_leaves_a_timer_alone_while_the_service_it_triggered_runs() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    // Observed 2026-10-26 10:07:50: an OnCalendar=*:07 timer, 50 s into its service's run.
+    host.answer(
+        "show tick.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=0\nLastTriggerUSec=@1999999950\n",
+        "",
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p SubState",
+        0,
+        "SubState=running\n",
+        "",
+    );
+    host.answer(
+        "show tick.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=tick.service\n",
+        "",
+    );
+    host.answer(
+        "show tick.service",
+        0,
+        "ActiveState=active\nResult=success\nExecMainStatus=0\n",
+        "",
+    );
+    let findings = watch_pass(&fixture, &host, &timer_config(&fixture, "tick.timer"));
+    let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
+    assert_eq!(timer["ok"], true, "{timer}");
+    assert_eq!(timer["detail"], "keeps its schedule");
     assert!(!changed_anything(&host), "{:?}", host.commands());
 }
