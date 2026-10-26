@@ -219,7 +219,8 @@ messages (write-scope and server-owned reads, live pushes)
 mention(doc_key, provider, channel, message_id, thread_id, posted_ms, author, is_bot, label)
    │
    ▼                                   fetcher (per source kind; owner credentials; allowlisted)
-document(doc_key, kind, locator, title, newest_version, first_linked_ms, last_linked_ms)
+document(doc_key, kind, locator, title, newest_version, first_linked_ms, last_linked_ms,
+         created_ms, created_by, modified_ms, modified_by)      (see § Document metadata)
    │
    ▼
 version(doc_key, version_id, fetched_ms, bytes, raw, html, outline, section_structure, etag)
@@ -355,6 +356,83 @@ Specific choices:
   filter chip. A card says "linked 3×". The owner asks "what did my agents produce", not "what was
   posted here".
 
+### Document metadata and sort orders
+
+The owner, 2026-10-26:
+
+> Documents that link into git should carry a little more metadata, such as when they were first
+> committed and when they were most recently modified. That enables different sort orders in the
+> documents view. Other sources may or may not have that metadata; pastes do somewhere.
+
+Each source fills what it can. A field nobody can supply stays empty, and the card says nothing
+rather than guessing.
+
+| Field | Git (GitHub) | Paste | Any other source |
+|---|---|---|---|
+| First linked in chat, last linked, mention count | from the messages | from the messages | from the messages |
+| Created | the path's first commit: date and author | the paste's creation time, where its API gives one | — |
+| Last modified | the path's newest commit on the followed ref: date and author | the paste's modified time, where its API gives one | — |
+| Author | first commit's author; last commit's author | the paste's author, where given | the poster |
+| Title | front matter `title:`, else the first heading, else the link label, else the file name | first heading, else link label | link label |
+| Size and reading time | from the fetched version | from the fetched version | — |
+
+How each field is obtained:
+
+- **Git, last modified.** `history(path:, first: 1)` on the followed ref returns the newest commit
+  that touched the path, with its date and author. It costs nothing extra: it rides in the same
+  batched GraphQL query that checks every document's blob id (one request for all 50 in the
+  sample). It changes exactly when the blob does.
+- **Git, first committed.** The API lists a path's history newest first, so the oldest commit takes
+  one more request: the REST commits list for the path with one result per page, then its last
+  page. It never changes, so it is fetched once and kept.
+  - The API does not follow renames, so a report that was moved shows its move as its creation.
+  - A local clone with `git log --follow --diff-filter=A -- PATH` would follow renames. But
+    holding clones of the owner's repositories on the server is a much bigger step than a token
+    (disk, private source at rest, keeping it fetched). Reserve it for a deployment that already
+    has the clones.
+  - The sample's 17 changed documents had 1 to 29 later commits, so a path's history is short and
+    either request is cheap.
+- **Paste.** The CLI used for the probe returns content only, with no times. The paste service
+  itself likely has the metadata the owner remembers: Phabricator-style paste services, for
+  example, return creation and modification times, author, title and language from
+  their search API. The command source therefore gets an optional second template, a metadata
+  command printing JSON with any of `created`, `modified`, `author` and `title`, and the server
+  uses whichever fields come back. Which command serves that on the internal deployment is not
+  verified yet; it is a phase 2 task, and question 6 covers it.
+- **Others** (a future Google Docs source, a GitHub Pages page): posted time only, unless the source
+  gains a fetcher that knows more.
+
+**Where it lives.** It lives on the document record:
+
+```
+document(..., created_ms, created_by, modified_ms, modified_by, metadata_source, metadata_checked_ms)
+```
+
+- In A+, the bounded document cache holds it. Losing it on a restart costs one batched query plus
+  one request per document for the creation date, so the creation dates are the one thing worth
+  keeping in a small table even in A+.
+- In B, the store holds it.
+- **Last read is owner state, not document state.** "Opened or listened to, when, and how far" is a
+  small record per document. It goes in the owner store, beside read marks and bookmarks, so the
+  phone and the desk agree. It is the same record that holds the resume position.
+
+**Sort orders in the Documents view.** A sort control beside the filters offers:
+
+| Sort | Meaning | Documents without the field |
+|---|---|---|
+| **Newest mention** (default) | the latest time anyone linked it | — (every card has one) |
+| **First linked** | when it first appeared in chat | — |
+| **Last modified** | newest commit or modification at the source | sorted by first linked, after the dated cards, and marked "no source date" |
+| **First committed** | creation at the source | the same |
+| **Last read** | your most recent open or listen | unread cards last, newest mention first |
+
+The card shows the date the sort is by, so the order explains itself. For example:
+"modified 2 h ago · created 9 Oct".
+
+Paged results sorted by a source date need every candidate's metadata. A+ fetches it in batches
+for the documents in the cache's window, at most a few hundred in this sample's rate (about ten a
+day). It does not fetch it one page at a time.
+
 ## UI
 
 ### Three major views, and the interim switcher
@@ -385,6 +463,8 @@ The list reuses the thread list's card styles:
 └──────────────────────────────────────────────────────────┘
 ```
 
+- **Sort:** newest mention (default), first linked, last modified, first committed, or last read
+  (§ Document metadata and sort orders).
 - **Filters:** search over titles and sources, a channel chip, and "unread". Unread means never
   opened. Partly read shows the progress.
 - **Not fetched yet** (credentials missing, a fetch failed, a host with no fetcher): the card stays,
@@ -780,7 +860,9 @@ two weeks elapsed.
   refresh.
 - **Offline copy:** the newest N documents, with their HTML and outline in IndexedDB, tied to the
   token like the saved messages. Opening a document saved for the car works with no signal.
-- **Resume positions.**
+- **Resume positions and last read**, in the owner store.
+- **Source metadata:** git first-commit and last-modified dates, the paste metadata command, and
+  the sort orders that use them. Phase 1 sorts by mention time only.
 
 **Phase 3: listening in the car.** About 2–4 lane-days.
 
@@ -834,8 +916,7 @@ Public systems only.
 
 1. **Scope of the list.** One list across every channel on the server (recommended, with a channel
    filter), or per channel like the other views? Documents linked by anyone, or only by agents and
-   you? Should a document move back to the top each time it is linked again (recommended: newest
-   mention first)?
+   you? Which default sort: newest mention (recommended), last modified, or first committed?
 2. **Which version.** Show the newest version with "updated after it was linked" (recommended),
    or the version current when it was linked?
 3. **What Read means, and which voice may hear a private document.** Plain read-aloud by section
