@@ -47,7 +47,7 @@ def test_rust_history_matches_python_on_bridge_state(tmp_path: Path) -> None:
     record = _records(tmp_path)["one"]
     nonce = str(record["reply_nonce"])
     block = f"<CHAT_REPLY_{nonce}_1>\nretained body — café\n</CHAT_REPLY_{nonce}_1>"
-    bridge.capture_output(PaneOutputSnapshot("w1:p1", block, 0))
+    bridge.capture_output(PaneOutputSnapshot("w1:p1", block, False))
     key = str(record["key"])
 
     expected = read_reply_history(tmp_path, key[:12])

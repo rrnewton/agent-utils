@@ -1,14 +1,14 @@
 //! Rust edition of `agentctl chat history` (#545 rust-primary-agentctl-chat-readers).
 //!
 //! Reads every retained reply body for one request from the durable bridge
-//! state the Python polling bridge writes (`reply_storage` 2 artifacts under
+//! state the polling bridge writes (`reply_storage` 2 artifacts under
 //! `replies/items/`). This is a pure reader: it takes the same shared lock on
 //! `.bridge.lock`, validates the request summary and every reply artifact the
-//! way the Python reader does, and prints the same JSON document. The Python
+//! way the existing reader does, and prints the same JSON document. The other
 //! edition remains the writer until the launch slice moves; this reader must
 //! therefore treat its on-disk format as a foreign, versioned format — the
 //! reply item identity is a UUIDv5 derivation, implemented here (with the
-//! SHA-1 it needs) rather than hand-maintained a second time in Python terms.
+//! SHA-1 it needs) rather than hand-maintained a second time in the other edition's terms.
 
 use std::path::{Path, PathBuf};
 
@@ -70,7 +70,7 @@ impl Ordered {
         }
     }
 
-    /// Serialize like Python `json.dumps(..., indent=2)`: two-space indent and
+    /// Serialize like `json.dumps(..., indent=2)` in the other edition: two-space indent and
     /// `\uXXXX` escapes for every non-ASCII character.
     fn dump(&self, indent: usize, out: &mut String) {
         match self {
@@ -464,14 +464,14 @@ fn reply_identity(record: &Value, index: i64) -> Result<String> {
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("request request_id must be a string"))?;
     if index == 0 {
-        // Validate it is a UUID, then return it normalized like Python's UUID str.
+        // Validate it is a UUID, then return it normalized like the other edition's UUID string.
         return Ok(format_uuid(&uuid_bytes(base)?));
     }
     uuid5(base, &format!("reply:{index}"))
 }
 
 fn valid_timestamp(value: &str) -> bool {
-    // RFC3339 with timezone and at most nine fractional digits (the Python
+    // RFC3339 with timezone and at most nine fractional digits (the other edition's
     // `_RFC3339_TIMESTAMP` shape), with real calendar ranges.
     if value.len() > 128 {
         return false;
@@ -748,7 +748,7 @@ fn validate_reply_item(record: &Value, item: &Ordered, index: i64, space: &str) 
 }
 
 /// Read every retained reply body for one request; returns the JSON document
-/// the Python `chat history` prints (without the trailing newline).
+/// the other edition's `chat history` prints (without the trailing newline).
 pub fn read_reply_history(state: &Path, key: &str) -> Result<String> {
     let bridge = read_json_value(&state.join("bridge.json"))?;
     let space = bridge
@@ -815,9 +815,9 @@ mod tests {
 
     #[test]
     fn sha1_and_uuid5_match_python_vectors() {
-        // Python: uuid.uuid5(uuid.UUID("12345678-1234-5678-1234-567812345678"), "reply:1")
+        // Other edition: uuid.uuid5(uuid.UUID("12345678-1234-5678-1234-567812345678"), "reply:1")
         // and uuid.uuid5(uuid.NAMESPACE_DNS, "python.org") are published shapes;
-        // the namespace vector below is the RFC/Python-doc canonical example.
+        // the namespace vector below is the canonical published example.
         let dns = uuid5("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "python.org").expect("uuid5");
         assert_eq!(dns, "886313e1-3b8a-5372-9b90-0c9aee199e5d");
         let identity = reply_identity(
