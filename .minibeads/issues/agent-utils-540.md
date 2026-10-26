@@ -1,12 +1,13 @@
 ---
 title: 'read-aloud-desktop: reading aloud works the same in every view and on desktop'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-26T16:14:55.059361409+00:00
-updated_at: 2026-10-26T16:14:55.059361409+00:00
+updated_at: 2026-10-26T17:33:47.175883019+00:00
+closed_at: 2026-10-26T17:33:47.175882889+00:00
 ---
 
 # Description
