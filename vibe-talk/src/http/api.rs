@@ -4683,7 +4683,8 @@ pub struct OwnReadApplied {
 /// `POST /api/v1/own-read/apply`
 ///
 /// "Apply to existing messages", beside "Mark my own messages as read" in Settings: every message of
-/// the owner's this server has seen that is not Done now is marked read. `#549 own-read-stored`;
+/// the owner's whose first read state this server has decided, and that is not Done now, is marked
+/// read. `#549 own-read-stored`;
 /// see [`ops::apply_own_read`].
 pub async fn apply_own_read(
     State(state): State<AppState>,

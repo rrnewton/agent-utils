@@ -4903,6 +4903,11 @@ pub async fn restore(
     if wanted.len() > MAX_DISMISS_BATCH {
         return Err(OpError::InvalidRange);
     }
+    // `#549 own-read-stored`: a message of his the live hub saw, drawn read on the page at once, may
+    // be put back before its first read state reached the store. Decide what is waiting first, and
+    // hold off any decision on its way while the put back deletes, so none lands after it.
+    crate::own_read::decide_waiting(state).await;
+    let _deciding = state.own_read.hold_decisions().await;
     state.store.restore(&channel.id, wanted).await?;
     Ok(InboxChange {
         channel,

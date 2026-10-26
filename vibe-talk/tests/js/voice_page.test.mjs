@@ -4970,6 +4970,10 @@ const TUNING_BANDS = {
     "how close to the top counts as asking for more. At a viewport's worth EVERY scroll fires a " +
     "step — including one at the bottom — so a single flick walks the whole channel; at zero the " +
     "reader has to hit the top exactly"],
+  OWN_READ_APPLY_ARM_MS: [3000, 60000,
+    "how long a first press of Apply to existing messages waits for the second (#549 own-read-stored). " +
+    "Under a few seconds the reader cannot read what the first press says it will do before it is " +
+    "forgotten; past a minute a press long forgotten turns a later stray tap into the act itself"],
   PULL_ARM_PX: [24, 200,
     "how far past either end a finger has to travel before releasing refreshes. Below a couple " +
     "of dozen pixels an ordinary flick refreshes by accident — and at the top it throws the " +

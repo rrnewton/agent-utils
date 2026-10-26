@@ -1198,6 +1198,17 @@ pub const DEFAULT_MAX_SUMMARIES: u32 = 2_000;
 /// whose loss is most visible to the reader, because losing it puts a message he already dealt
 /// with back in front of him.
 pub const DEFAULT_MAX_DISMISSALS: u32 = 10_000;
+
+/// How many of the owner's messages the record of first read states decided keeps: ten times the
+/// dismissal bound, the oldest MESSAGES going first. `#549 own-read-stored`.
+///
+/// Larger than the marks', because a row past it is a message decided again at its next sight — Done
+/// again, if he put it back — so it must reach further back than any read he can make. Two ids and
+/// two numbers a row: a hundred thousand of them is a few megabytes.
+#[must_use]
+pub fn own_decided_bound(retention: Retention) -> u32 {
+    retention.max_dismissals.saturating_mul(10)
+}
 /// Default age limit, in days.
 pub const DEFAULT_RETAIN_DAYS: u16 = 30;
 
@@ -2148,8 +2159,9 @@ pub trait StateStore: Send + Sync {
     /// `#549 own-read-stored`.
     ///
     /// Its Done marks are held apart from the reader's own ([`Retention::max_dismissals`] for each),
-    /// so they never push one of his marks out; the record of what was decided is bounded by the
-    /// same count, the oldest going first.
+    /// so they never push one of his marks out, the oldest MESSAGE's going first; the record of what
+    /// was decided is bounded by [`own_decided_bound`], the oldest message's first too, so a walk
+    /// back through old history never pushes out what was decided of recent messages.
     ///
     /// # Errors
     ///

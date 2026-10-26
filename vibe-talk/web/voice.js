@@ -35539,7 +35539,7 @@ function disarmOwnReadApply() {
 }
 
 /**
- * "Apply to existing messages": every message of the reader's this server has seen and that is not
+ * "Apply to existing messages": every message of the reader's this server has decided and that is not
  * Done is marked read, in every channel. Pressed twice, the first press saying what the second does,
  * because it reaches messages the reader may have put back on purpose. `#549 own-read-stored`.
  */
@@ -35552,7 +35552,13 @@ async function applyOwnReadToExisting() {
     return;
   }
   disarmOwnReadApply();
-  const payload = await api("/api/v1/own-read/apply", { method: "POST" });
+  let payload;
+  try {
+    payload = await api("/api/v1/own-read/apply", { method: "POST" });
+  } catch (error) {
+    el("own-read-state").textContent = "Nothing was marked read: the server did not take it. Try again.";
+    throw error;
+  }
   const changes = payload && Array.isArray(payload.changes) ? payload.changes : [];
   const held = changes
     .map((change) => ({
@@ -35577,17 +35583,27 @@ async function applyOwnReadToExisting() {
 async function undoOwnReadApply() {
   const held = ownReadApplied;
   if (held === null) return;
-  ownReadApplied = null;
   el("own-read-undo").hidden = true;
   let count = 0;
-  for (const change of held) {
+  // Each batch leaves the held set as it lands, so an Undo that fails part way keeps the rest for the
+  // next press, and says how far it got.
+  while (ownReadApplied !== null && ownReadApplied.length > 0) {
+    const change = ownReadApplied[0];
     // As one restore may carry: the server's `MAX_DISMISS_BATCH`.
-    for (let at = 0; at < change.messages.length; at += 1000) {
-      const messages = change.messages.slice(at, at + 1000);
+    const messages = change.messages.slice(0, 1000);
+    try {
       await api(`/api/v1/channels/${encodeURIComponent(change.channel)}/restore`, { method: "POST", body: { messages } });
-      count += messages.length;
+    } catch (error) {
+      el("own-read-undo").hidden = false;
+      el("own-read-state").textContent =
+        `Put ${count} back; the rest could not be put back yet. Press Undo to try again.`;
+      throw error;
     }
+    count += messages.length;
+    change.messages = change.messages.slice(messages.length);
+    if (change.messages.length === 0) ownReadApplied.shift();
   }
+  ownReadApplied = null;
   const said = `Put ${count} of your message${count === 1 ? "" : "s"} back.`;
   el("own-read-state").textContent = said;
   setStatus(said);
@@ -35597,13 +35613,20 @@ async function undoOwnReadApply() {
 }
 
 /**
- * Whether `message` is one of the reader's own whose read state starts read, by the same accounts the
- * server asks (`isOwnerId`, who-is-who, this bridge's account): "Mark my own messages as read" on, his,
- * and not read as noise already. `#549 own-read-stored`.
+ * Whether `message` is one of the reader's own whose read state starts read: "Mark my own messages as
+ * read" on, not read as noise already, and his by the server's own order (src/own_read.rs
+ * `Choice::owns`) — who-is-who first, then the configured accounts (`isOwnerId`), then this bridge's
+ * account unless the configuration names it as a coding agent. That last is narrower than how a row
+ * is drawn (`bucketFor` draws the bridge's account as "me" regardless), because a guess wider than the
+ * server's would draw an agent's message read that the server leaves unread. `#549 own-read-stored`.
  */
 function startsRead(message) {
-  return markOwnRead && Boolean(message) && !isNoise(message) &&
-    bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) === "me";
+  if (!markOwnRead || !message || isNoise(message)) return false;
+  const id = String(message.author_id || "");
+  if (!id) return false;
+  if (identities[id]) return identities[id] === "me";
+  if (isOwnerId(id)) return true;
+  return isSelfId(id) && !codingAgentsOf(messageChannel(message)).ids.has(id);
 }
 
 /**

@@ -68,7 +68,7 @@ struct State {
     /// from his. `#549 own-read-stored`.
     own_marks: std::collections::BTreeSet<(String, String)>,
     /// `(channel, message)` to when its first read state was decided. `#549 own-read-stored`.
-    own_decided: BTreeMap<(String, String), i64>,
+    own_decided: BTreeMap<(String, String), u64>,
     /// Channel to `(alias, when it was set)`. `#39 channel-alias`.
     aliases: BTreeMap<String, (String, i64)>,
     /// Channels added from inside the app: id -> (label, writable, provider, added_at_ms).
@@ -233,9 +233,10 @@ fn orderable(messages: &[MessageId]) -> Result<Vec<(MessageId, u64)>, StoreError
         .collect()
 }
 
-/// Keep one class of dismissal under the count bound, the oldest going first: the reader's own
-/// (`own` false) or those "Mark my own messages as read" wrote (`own` true), each with a bound of
-/// its own, so neither ever evicts the other. `#549 own-read-stored`.
+/// Keep one class of dismissal under the count bound: the reader's own (`own` false), the oldest
+/// mark first, or those "Mark my own messages as read" wrote (`own` true), the oldest message first,
+/// each with a bound of its own, so neither ever evicts the other. `#549 own-read-stored`; the
+/// real store's `prune_dismissals` says why the orders differ.
 fn prune_dismissals(state: &mut State, retention: Retention, own: bool) {
     loop {
         let in_class = |slot: &(String, String)| state.own_marks.contains(slot) == own;
@@ -251,13 +252,33 @@ fn prune_dismissals(state: &mut State, retention: Retention, own: bool) {
             .dismissals
             .iter()
             .filter(|(slot, _)| in_class(slot))
-            .min_by_key(|(slot, (_, at))| (*at, (*slot).clone()))
+            .min_by_key(|(slot, (numeric, at))| {
+                (if own { *numeric } else { 0 }, *at, (*slot).clone())
+            })
             .map(|(slot, _)| slot.clone())
         else {
             return;
         };
         state.dismissals.remove(&oldest);
         state.own_marks.remove(&oldest);
+    }
+}
+
+/// Keep the record of decided messages under [`super::own_decided_bound`], the oldest message first.
+fn prune_own_decided(state: &mut State, retention: Retention) {
+    let bound = super::own_decided_bound(retention) as usize;
+    while state.own_decided.len() > bound {
+        let oldest = state
+            .own_decided
+            .iter()
+            .min_by_key(|(slot, numeric)| (**numeric, (*slot).clone()))
+            .map(|(slot, _)| slot.clone());
+        match oldest {
+            Some(slot) => {
+                state.own_decided.remove(&slot);
+            }
+            None => break,
+        }
     }
 }
 
@@ -831,26 +852,16 @@ impl StateStore for FakeStore {
             if state.own_decided.contains_key(&slot) {
                 continue;
             }
-            state.own_decided.insert(slot.clone(), at);
+            state.own_decided.insert(slot.clone(), numeric);
             if read && !state.dismissals.contains_key(&slot) {
                 state.dismissals.insert(slot.clone(), (numeric, at));
                 state.own_marks.insert(slot);
             }
             decided.push(message);
         }
-        prune_dismissals(&mut state, self.retention, true);
-        while state.own_decided.len() > self.retention.max_dismissals as usize {
-            let oldest = state
-                .own_decided
-                .iter()
-                .min_by_key(|(slot, at)| (**at, (*slot).clone()))
-                .map(|(slot, _)| slot.clone());
-            match oldest {
-                Some(slot) => {
-                    state.own_decided.remove(&slot);
-                }
-                None => break,
-            }
+        if !decided.is_empty() {
+            prune_dismissals(&mut state, self.retention, true);
+            prune_own_decided(&mut state, self.retention);
         }
         Ok(decided)
     }
@@ -897,7 +908,7 @@ impl StateStore for FakeStore {
         let mut marked = Vec::new();
         for (message, numeric) in ordered {
             let slot = (channel.as_str().to_owned(), message.as_str().to_owned());
-            state.own_decided.entry(slot.clone()).or_insert(at);
+            state.own_decided.entry(slot.clone()).or_insert(numeric);
             if state.dismissals.contains_key(&slot) {
                 continue;
             }
@@ -905,7 +916,10 @@ impl StateStore for FakeStore {
             state.own_marks.insert(slot);
             marked.push(message);
         }
-        prune_dismissals(&mut state, self.retention, true);
+        if !marked.is_empty() {
+            prune_dismissals(&mut state, self.retention, true);
+            prune_own_decided(&mut state, self.retention);
+        }
         Ok(marked)
     }
 

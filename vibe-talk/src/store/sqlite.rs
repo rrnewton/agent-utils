@@ -464,16 +464,21 @@ pub const MIGRATIONS: &[&str] = &[
     //
     // `own_decided` records which of his messages have had their first read state decided, Done
     // or not: decided once, never again, so one he put back stays unread across restarts and
-    // re-reads. Two ids and an instant, no message text, bounded by the same count, oldest first.
+    // re-reads. Two ids, the message's position and an instant, no message text, bounded by
+    // `super::own_decided_bound`, the OLDEST MESSAGES going first — not the oldest decisions, which
+    // a walk back through old history would make of recent messages' rows.
     "
     ALTER TABLE dismissals ADD COLUMN own INTEGER NOT NULL DEFAULT 0 CHECK (own IN (0, 1));
 
     CREATE TABLE own_decided (
         channel_id TEXT    NOT NULL,
         message_id TEXT    NOT NULL,
+        numeric    INTEGER NOT NULL,
         at_ms      INTEGER NOT NULL,
         PRIMARY KEY (channel_id, message_id)
     ) STRICT;
+
+    CREATE INDEX own_decided_by_position ON own_decided (numeric);
     ",
 ];
 
@@ -708,27 +713,36 @@ fn prune_summaries(
 /// oldest marks go first, which is the right end — the reader is never shown a message old enough
 /// for its mark to have been evicted, because the window this filters is the recent one.
 ///
-/// Per class (`own`, `#549 own-read-stored`): the reader's marks and those "Mark my own messages as
-/// read" wrote are each held under the bound apart, so neither ever evicts the other.
+/// Per class (`#549 own-read-stored`): the reader's marks and those "Mark my own messages as read"
+/// wrote are each held under the bound apart, so neither ever evicts the other. The reader's go by
+/// when he made them, as ever; the owner's own by the message's POSITION, oldest message first,
+/// because they are written as messages are first seen, and a walk back through old history would
+/// otherwise push out the marks of the newest messages he wrote.
 fn prune_dismissals(
     transaction: &rusqlite::Transaction<'_>,
     retention: Retention,
     own: bool,
 ) -> Result<(), StoreError> {
+    let order = if own {
+        "numeric DESC, rowid DESC"
+    } else {
+        "at_ms DESC, rowid DESC"
+    };
     transaction
         .execute(
-            "DELETE FROM dismissals WHERE own = ?2 AND rowid NOT IN (
-                 SELECT rowid FROM dismissals WHERE own = ?2
-                 ORDER BY at_ms DESC, rowid DESC LIMIT ?1
-             )",
+            &format!(
+                "DELETE FROM dismissals WHERE own = ?2 AND rowid NOT IN (
+                     SELECT rowid FROM dismissals WHERE own = ?2 ORDER BY {order} LIMIT ?1
+                 )"
+            ),
             rusqlite::params![i64::from(retention.max_dismissals), i64::from(own)],
         )
         .map_err(backend)?;
     Ok(())
 }
 
-/// Keep the record of the owner's messages whose first read state was decided under the dismissal
-/// bound, the oldest going first. `#549 own-read-stored`.
+/// Keep the record of the owner's messages whose first read state was decided under its bound
+/// ([`super::own_decided_bound`]), the oldest MESSAGES going first. `#549 own-read-stored`.
 fn prune_own_decided(
     transaction: &rusqlite::Transaction<'_>,
     retention: Retention,
@@ -736,9 +750,9 @@ fn prune_own_decided(
     transaction
         .execute(
             "DELETE FROM own_decided WHERE rowid NOT IN (
-                 SELECT rowid FROM own_decided ORDER BY at_ms DESC, rowid DESC LIMIT ?1
+                 SELECT rowid FROM own_decided ORDER BY numeric DESC, rowid DESC LIMIT ?1
              )",
-            [i64::from(retention.max_dismissals)],
+            [i64::from(super::own_decided_bound(retention))],
         )
         .map_err(backend)?;
     Ok(())
@@ -1976,9 +1990,10 @@ impl StateStore for SqliteStore {
             for (message, numeric) in &ordered {
                 let fresh = transaction
                     .execute(
-                        "INSERT INTO own_decided (channel_id, message_id, at_ms) VALUES (?1, ?2, ?3)
+                        "INSERT INTO own_decided (channel_id, message_id, numeric, at_ms)
+                         VALUES (?1, ?2, ?3, ?4)
                          ON CONFLICT(channel_id, message_id) DO NOTHING",
-                        rusqlite::params![channel.as_str(), message.as_str(), at],
+                        rusqlite::params![channel.as_str(), message.as_str(), numeric, at],
                     )
                     .map_err(backend)?
                     > 0;
@@ -1998,8 +2013,10 @@ impl StateStore for SqliteStore {
                 }
                 decided.push(message.clone());
             }
-            prune_dismissals(&transaction, retention, true)?;
-            prune_own_decided(&transaction, retention)?;
+            if !decided.is_empty() {
+                prune_dismissals(&transaction, retention, true)?;
+                prune_own_decided(&transaction, retention)?;
+            }
             transaction.commit().map_err(backend)?;
             Ok(decided)
         })
@@ -2059,9 +2076,10 @@ impl StateStore for SqliteStore {
             for (message, numeric) in &ordered {
                 transaction
                     .execute(
-                        "INSERT INTO own_decided (channel_id, message_id, at_ms) VALUES (?1, ?2, ?3)
+                        "INSERT INTO own_decided (channel_id, message_id, numeric, at_ms)
+                         VALUES (?1, ?2, ?3, ?4)
                          ON CONFLICT(channel_id, message_id) DO NOTHING",
-                        rusqlite::params![channel.as_str(), message.as_str(), at],
+                        rusqlite::params![channel.as_str(), message.as_str(), numeric, at],
                     )
                     .map_err(backend)?;
                 let added = transaction
@@ -2076,8 +2094,10 @@ impl StateStore for SqliteStore {
                     marked.push(message.clone());
                 }
             }
-            prune_dismissals(&transaction, retention, true)?;
-            prune_own_decided(&transaction, retention)?;
+            if !marked.is_empty() {
+                prune_dismissals(&transaction, retention, true)?;
+                prune_own_decided(&transaction, retention)?;
+            }
             transaction.commit().map_err(backend)?;
             Ok(marked)
         })
@@ -3721,6 +3741,30 @@ mod tests {
         assert!(
             !held.contains(&his_done[0]),
             "his own bound did not hold: {held:?}"
+        );
+        // An old message of his, met on a walk back through history, decided now: its mark is the
+        // one that goes, by the message's position, not the newest messages' marks.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let old = MessageId("1000000000000000050".to_owned());
+        store
+            .decide_own(&channel, std::slice::from_ref(&old), true)
+            .await
+            .expect("decide");
+        let held = store.dismissals(&channel).await.expect("read");
+        for newest in ["1000000000000000504", "1000000000000000503"] {
+            assert!(
+                held.contains(&MessageId(newest.to_owned())),
+                "an old message's first mark evicted {newest}: {held:?}"
+            );
+        }
+        assert!(!held.contains(&old));
+        assert_eq!(
+            store
+                .own_decided(&channel, std::slice::from_ref(&old))
+                .await
+                .expect("decided"),
+            vec![old],
+            "the record of decisions reaches further back than the marks"
         );
     }
 

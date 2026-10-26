@@ -31,9 +31,15 @@
 //!   message that arrived while this server was down is decided at the first read that meets it.
 //! - **A post** through this server decides what it posted.
 //!
-//! A read-scope read writes nothing durable, here as everywhere: it is answered as if the messages
-//! it meets that are not decided yet were decided now, and the next write-scope read or the hub
-//! decides them for real.
+//! A read-scope read writes nothing on its own account: it is answered as if the messages it meets
+//! that are not decided yet were decided now, and the next write-scope read or the hub decides them
+//! for real. (Before answering, any read lets the server decide what the hub has already queued:
+//! those are the server's own sightings, not the reader's.)
+//!
+//! A decision needs the owner's settings: when they cannot be read, nothing is decided, and the next
+//! sight decides. The record of decisions is bounded ([`crate::store::own_decided_bound`]), the
+//! oldest messages going first; a message older than everything it holds is decided again at its
+//! next sight.
 //!
 //! # Whose messages
 //!
@@ -202,6 +208,10 @@ pub struct OwnRead {
     choice: Mutex<(Option<Choice>, u64)>,
     /// Set once by the first ask that finds no store at all, so such a server is not asked again.
     unavailable: OnceLock<()>,
+    /// Held while a decision is written, and by a put back ([`crate::ops::restore`]) while it
+    /// deletes: a decision of a message already on its way to the store cannot land after the
+    /// owner put that message back, and mark it Done again. `#549 own-read-stored`.
+    deciding: tokio::sync::Mutex<()>,
 }
 
 impl OwnRead {
@@ -220,26 +230,33 @@ impl OwnRead {
     /// settings change. A store that cannot be read gives the default — on, nobody named — for this
     /// ask, which is what a page with nothing synced does, and is asked again next time.
     pub async fn choice(&self, store: &dyn StateStore) -> Choice {
+        self.read_choice(store).await.unwrap_or_default()
+    }
+
+    /// [`OwnRead::choice`], or `None` when the store failed to answer: a decision that is written
+    /// once and never again must not be made from a default stood in for a failed read. A server
+    /// with no store at all has the default, and has nothing to write a decision in either.
+    async fn read_choice(&self, store: &dyn StateStore) -> Option<Choice> {
         let generation = {
             let held = self
                 .choice
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(choice) = &held.0 {
-                return choice.clone();
+                return Some(choice.clone());
             }
             held.1
         };
         if self.unavailable.get().is_some() {
-            return Choice::default();
+            return Some(Choice::default());
         }
         let choice = match store.client_settings().await {
             Ok(settings) => Choice::from_settings(&settings),
             Err(crate::store::StoreError::Unavailable(_)) => {
                 let _ = self.unavailable.set(());
-                return Choice::default();
+                return Some(Choice::default());
             }
-            Err(_) => return Choice::default(),
+            Err(_) => return None,
         };
         let mut held = self
             .choice
@@ -249,7 +266,12 @@ impl OwnRead {
         if held.1 == generation {
             held.0 = Some(choice.clone());
         }
-        choice
+        Some(choice)
+    }
+
+    /// Hold off every decision while `restore` runs: see `deciding`.
+    pub async fn hold_decisions(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.deciding.lock().await
     }
 }
 
@@ -385,7 +407,10 @@ async fn decide(
     if sightings.is_empty() {
         return HashSet::new();
     }
-    let choice = state.own_read.choice(state.store.as_ref()).await;
+    let Some(choice) = state.own_read.read_choice(state.store.as_ref()).await else {
+        // The settings did not answer: nothing is decided now; the next sight decides.
+        return HashSet::new();
+    };
     let accounts = accounts_of(state);
     let mut his: Vec<MessageId> = sightings
         .iter()
@@ -419,6 +444,7 @@ async fn decide(
             HashSet::new()
         };
     }
+    let _deciding = state.own_read.hold_decisions().await;
     match state.store.decide_own(channel, &undecided, choice.on).await {
         Ok(fresh) if choice.on => fresh.into_iter().collect(),
         Ok(_) => HashSet::new(),

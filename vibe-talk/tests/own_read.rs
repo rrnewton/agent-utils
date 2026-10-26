@@ -595,3 +595,57 @@ async fn slack_a_thread_mixing_his_messages_and_the_apps_leaves_only_the_apps_to
         BTreeSet::from([id_of(&stamps.question), id_of(&stamps.follow_up)])
     );
 }
+
+#[tokio::test]
+async fn a_settings_read_that_fails_decides_nothing_and_the_next_sight_decides() {
+    // The review of #549 own-read-stored: a decision is written once, so it must never be made from
+    // the default stood in for a failed read — on, nobody named — when he had turned it off.
+    let b = bridge();
+    set(&b.state, &[("vibe-talk.voice.mark-own-read", "0")]).await;
+    b.state.own_read.forget();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let messages: Vec<_> = b
+        .owner
+        .iter()
+        .map(|id| b.discord.message(id).expect("held"))
+        .collect();
+    b.store.fail_next("the store is busy");
+    let done =
+        vibe_talk::own_read::settle(&b.state, vibe_talk::auth::Scope::Write, &channel, &messages)
+            .await;
+    assert!(done.is_empty(), "{done:?}");
+    assert!(b
+        .store
+        .own_decided(&channel, &b.owner)
+        .await
+        .expect("decided")
+        .is_empty());
+    // The next sight reads the setting as it is, off, and decides them unread.
+    let everything: BTreeSet<String> = set_of(b.owner.iter().chain(&b.agent));
+    assert_eq!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN).await, everything);
+    assert_eq!(
+        b.store
+            .own_decided(&channel, &b.owner)
+            .await
+            .expect("decided")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn one_of_his_put_back_before_its_live_decision_landed_stays_put_back() {
+    // Drawn read on the page as it arrives live, put back at once: the decision the hub queued must
+    // not land after the put back.
+    let b = bridge();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let pushed = b.discord.seed(&channel, "ada", "typed in the chat app");
+    b.state
+        .live
+        .publish(&channel, b.discord.message(&pushed).expect("held"));
+    put_back(&b.state, WRITE_CHANNEL, &[&pushed]).await;
+    vibe_talk::own_read::decide_waiting(&b.state).await;
+    assert!(todo(&b.state, WRITE_CHANNEL, WRITE_TOKEN)
+        .await
+        .contains(&pushed.0));
+}
