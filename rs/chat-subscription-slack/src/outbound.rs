@@ -979,6 +979,7 @@ struct LedgerRecord {
     channel_id: String,
     thread_ts: Option<String>,
     text_bytes: usize,
+    format: Option<String>,
     chunks: Vec<LedgerChunk>,
 }
 
@@ -989,6 +990,7 @@ impl LedgerRecord {
             "channel_id": self.channel_id,
             "thread_ts": self.thread_ts,
             "text_bytes": self.text_bytes,
+            "format": self.format,
             "chunks": self.chunks.iter().map(|chunk| json!({
                 "ts": chunk.ts,
                 "intent_millis": chunk.intent_millis,
@@ -1025,6 +1027,10 @@ impl LedgerRecord {
                 other => Some(other.as_str()?.to_owned()),
             },
             text_bytes: usize::try_from(value.get("text_bytes")?.as_u64()?).ok()?,
+            format: match value.get("format") {
+                Some(Value::String(format)) => Some(format.clone()),
+                _ => None,
+            },
             chunks,
         })
     }
@@ -1130,7 +1136,10 @@ fn fingerprint(text: &str, limit: usize) -> String {
         }
     }
     slack_visible.push_str(rest);
-    let visible = slack_visible;
+    let visible = slack_visible
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
     visible
         .chars()
         .filter(|character| character.is_alphanumeric())
@@ -1187,6 +1196,10 @@ fn send(
                 || record.thread_ts.as_deref() != thread_ts
                 || record.text_bytes != text.len()
                 || record.chunks.len() != chunks.len()
+                || record
+                    .format
+                    .as_deref()
+                    .is_some_and(|saved| saved != format.name())
             {
                 return Err(Refusal::not_applied(
                     "operation_conflict",
@@ -1200,6 +1213,7 @@ fn send(
             channel_id: channel_id.to_owned(),
             thread_ts: thread_ts.map(str::to_owned),
             text_bytes: text.len(),
+            format: Some(format.name().to_owned()),
             chunks: vec![
                 LedgerChunk {
                     ts: None,

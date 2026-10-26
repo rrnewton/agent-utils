@@ -90,10 +90,10 @@ fn main() -> ExitCode {
         }
         eprintln!(
             "live mode is not run unattended: post each corpus file with \
-             `meta slack.message send --channel-id={channel} --markdown=file://FILE --as=<APP>` and \
+             the vendor CLI's `slack.message send --channel-id={channel} --markdown=file://FILE --as=<APP>` and \
              with the converted mrkdwn from this harness's dry-run output via \
              `--slack-mrkdwn=file://-`, then read back with \
-             `meta slack.message list --channel-id={channel} --columns=message_ts,content \
+             the vendor CLI's `slack.message list --channel-id={channel} --columns=message_ts,content \
              --content-format=text` and compare blank lines, tables, headings and links"
         );
         return ExitCode::from(2);

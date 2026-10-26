@@ -40,7 +40,8 @@ pub fn escape_text(text: &str) -> String {
 }
 
 fn escape_url(url: &str) -> String {
-    url.replace('|', "%7C")
+    url.replace('&', "&amp;")
+        .replace('|', "%7C")
         .replace('>', "%3E")
         .replace('<', "%3C")
         .replace(' ', "%20")
@@ -75,7 +76,7 @@ pub fn convert_and_split(markdown: &str, limit: usize) -> Vec<String> {
     }
     let mut parts: Vec<String> = Vec::new();
     let mut current = String::new();
-    for block in converted.split("\n\n") {
+    for block in split_blocks(&converted) {
         let candidate = if current.is_empty() {
             block.to_owned()
         } else {
@@ -89,9 +90,9 @@ pub fn convert_and_split(markdown: &str, limit: usize) -> Vec<String> {
             parts.push(std::mem::take(&mut current));
         }
         if block.len() <= limit {
-            current = block.to_owned();
+            current = block;
         } else {
-            let mut chunks = crate::outbound::split_body(block, limit);
+            let mut chunks = split_oversize_block(&block, limit);
             let last = chunks.pop().unwrap_or_default();
             parts.extend(chunks);
             current = last;
@@ -99,6 +100,77 @@ pub fn convert_and_split(markdown: &str, limit: usize) -> Vec<String> {
     }
     if !current.is_empty() || parts.is_empty() {
         parts.push(current);
+    }
+    parts
+}
+
+/// Blocks of a converted document: blank-line separated, except that a
+/// blank line inside a code fence does not end the block.
+fn split_blocks(converted: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    for line in converted.split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if line.is_empty() && !in_fence {
+            if !current.is_empty() {
+                blocks.push(current.join("\n"));
+                current = Vec::new();
+            }
+        } else {
+            current.push(line);
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current.join("\n"));
+    }
+    blocks
+}
+
+/// Split one block that alone exceeds `limit`. A fenced block is split at
+/// line boundaries and every part is re-fenced, so no part opens or leaves
+/// a fence dangling; any other block splits at line boundaries.
+fn split_oversize_block(block: &str, limit: usize) -> Vec<String> {
+    let lines: Vec<&str> = block.lines().collect();
+    let fenced = lines.len() >= 2 && lines[0].trim_start().starts_with("```");
+    if !fenced {
+        return crate::outbound::split_body(block, limit);
+    }
+    let inner = &lines[1..lines.len()
+        - usize::from(
+            lines
+                .last()
+                .is_some_and(|line| line.trim_start().starts_with("```")),
+        )];
+    let budget = limit.saturating_sub(8).max(1);
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for line in inner {
+        let candidate = if current.is_empty() {
+            (*line).to_owned()
+        } else {
+            format!("{current}\n{line}")
+        };
+        if candidate.len() <= budget {
+            current = candidate;
+            continue;
+        }
+        if !current.is_empty() {
+            parts.push(format!("```\n{current}\n```"));
+            current = String::new();
+        }
+        if line.len() <= budget {
+            current = (*line).to_owned();
+        } else {
+            for chunk in crate::outbound::split_body(line, budget) {
+                parts.push(format!("```\n{chunk}\n```"));
+            }
+        }
+    }
+    if !current.is_empty() || parts.is_empty() {
+        parts.push(format!("```\n{current}\n```"));
     }
     parts
 }
@@ -115,7 +187,7 @@ fn render_block<'a>(node: &'a AstNode<'a>, depth: usize) -> String {
         NodeValue::Heading(heading) => {
             let mut inner = String::new();
             for child in node.children() {
-                render_inline(child, &mut inner);
+                plain_inline(child, &mut inner);
             }
             let inner = inner.trim();
             if inner.is_empty() {
@@ -239,6 +311,18 @@ fn plain_inline<'a>(node: &'a AstNode<'a>, out: &mut String) {
         NodeValue::Text(text) => out.push_str(text),
         NodeValue::Code(code) => out.push_str(&code.literal),
         NodeValue::SoftBreak | NodeValue::LineBreak => out.push(' '),
+        NodeValue::Link(link) | NodeValue::Image(link) => {
+            let mut label = String::new();
+            for child in node.children() {
+                plain_inline(child, &mut label);
+            }
+            out.push_str(label.trim());
+            let url = link.url.trim();
+            if !url.is_empty() && url != label.trim() {
+                out.push_str(&format!(" ({url})"));
+            }
+        }
+        NodeValue::HtmlInline(html) => out.push_str(html),
         _ => {
             for child in node.children() {
                 plain_inline(child, out);
@@ -308,7 +392,12 @@ fn render_table<'a>(node: &'a AstNode<'a>, alignments: &[TableAlignment]) -> Str
 
 fn render_inline<'a>(node: &'a AstNode<'a>, out: &mut String) {
     match &node.data.borrow().value {
-        NodeValue::Text(text) => out.push_str(&escape_text(text)),
+        NodeValue::Text(text) => {
+            // A literal asterisk in source text is not valid emphasis (the
+            // parser would have made it one), so keep it visible without
+            // letting Slack re-read it as a bold delimiter.
+            out.push_str(&escape_text(text).replace('*', "\u{2217}"));
+        }
         NodeValue::SoftBreak => out.push(' '),
         NodeValue::LineBreak => out.push('\n'),
         NodeValue::Code(code) => {
@@ -340,19 +429,19 @@ fn render_inline<'a>(node: &'a AstNode<'a>, out: &mut String) {
         NodeValue::Link(link) => {
             let mut label = String::new();
             for child in node.children() {
-                render_inline(child, &mut label);
+                plain_inline(child, &mut label);
             }
-            let label = label.trim().to_owned();
+            let label = label
+                .trim()
+                .replace(['|', '<', '>', '\n', '\r'], " ")
+                .replace("  ", " ");
             let url = escape_url(link.url.trim());
             if url.is_empty() {
-                out.push_str(&label);
-            } else if label.is_empty() {
+                out.push_str(&escape_text(&label));
+            } else if label.trim().is_empty() {
                 out.push_str(&format!("<{url}>"));
             } else {
-                // The label inside <url|label> must not carry mrkdwn markers
-                // that would break the link; keep its plain text.
-                let plain = label.replace('*', "").replace('_', "");
-                out.push_str(&format!("<{url}|{plain}>"));
+                out.push_str(&format!("<{url}|{}>", escape_text(label.trim())));
             }
         }
         NodeValue::Image(link) => {
@@ -440,6 +529,47 @@ mod tests {
         let out = convert_markdown(md);
         assert!(out.contains("Summary line.\n\n• item\n\n```"), "{out}");
         assert!(out.ends_with("After."), "{out}");
+    }
+
+    #[test]
+    fn heading_and_link_label_carry_no_nested_markers() {
+        assert_eq!(
+            convert_markdown("# **Bold** and `code` title"),
+            "*Bold and code title*"
+        );
+        assert_eq!(
+            convert_markdown("[la|bel](https://example.com/?a=1&b=2)"),
+            "<https://example.com/?a=1&amp;b=2|la bel>"
+        );
+        assert_eq!(convert_markdown("2 * 3"), "2 \u{2217} 3");
+    }
+
+    #[test]
+    fn table_cells_keep_link_urls() {
+        let out = convert_markdown(
+            "| Item | Note |\n|---|---|\n| [docs](https://example.com) | **bold** |\n",
+        );
+        assert!(out.contains("docs (https://example.com)"), "{out}");
+        assert!(out.contains("bold"), "{out}");
+    }
+
+    #[test]
+    fn oversize_table_and_code_split_into_refenced_parts() {
+        let rows = (0..300)
+            .map(|i| format!("| host{i} | {i} |"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let md = format!(
+            "| Host | p50 |\n|---|---|\n{rows}\n\n```\n{}\n```\n",
+            "x = 1;\n\n".repeat(600)
+        );
+        let parts = convert_and_split(&md, 4_000);
+        assert!(parts.len() > 1, "{parts:?}");
+        for part in &parts {
+            assert!(part.len() <= 4_000, "{} bytes", part.len());
+            let fences = part.matches("```").count();
+            assert_eq!(fences % 2, 0, "dangling fence in {part:?}");
+        }
     }
 
     #[test]

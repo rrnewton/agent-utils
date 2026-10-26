@@ -652,7 +652,7 @@ mod tests {
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
-                slack_format: crate::chat_runtime::SlackFormat::Markdown,
+                slack_format: Some(crate::chat_runtime::SlackFormat::Markdown),
                 slack_format_by_channel: std::collections::BTreeMap::new(),
             },
         )
