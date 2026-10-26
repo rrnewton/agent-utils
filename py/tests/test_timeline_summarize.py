@@ -413,6 +413,8 @@ for job in jobs:
         "paragraph": paragraph,
         "work_summary": work_summary,
     })
+if os.environ.get("FAKE_CODEX_DROP_FROM_BATCH") and len(summaries) > 1:
+    summaries.pop()
 output_path = Path(args[args.index("--output-last-message") + 1])
 output_path.write_text(json.dumps({"summaries": summaries}), encoding="utf-8")
 with Path(os.environ["FAKE_CODEX_LOG"]).open("a", encoding="utf-8") as handle:
@@ -1312,3 +1314,28 @@ def test_valid_backend_output_is_narrowed_to_frozen_types(tmp_path: Path) -> Non
     assert result.prompt_version == PROMPT_VERSION
     assert isinstance(result.work_summary, tuple)
     assert result.work_summary[-1].at_ms == job.end_ms - 1
+
+
+def test_batch_answer_missing_a_job_is_retried_one_job_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_codex.py"
+    log = tmp_path / "calls.log"
+    _write_fake_codex(fake)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    monkeypatch.setenv("FAKE_CODEX_DROP_FROM_BATCH", "1")
+    jobs = [_job("agent-a"), _job("agent-b"), _job("agent-c")]
+
+    results, stats = summarize_jobs(
+        jobs,
+        tmp_path / "cache",
+        backend="codex",
+        model="gpt-test",
+        max_workers=2,
+        batch_size=3,
+        codex_command=(sys.executable, str(fake)),
+    )
+
+    assert sorted(results) == sorted(job.key for job in jobs)
+    assert log.read_text(encoding="utf-8").count("CALL\n") == 4
+

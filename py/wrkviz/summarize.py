@@ -107,6 +107,11 @@ _ENCRYPTED_COLLABORATION_RE: Final = re.compile(
 )
 
 
+#: How a batch answer that left out some of its jobs is reported; summarize_jobs retries those
+#: batches one job at a time instead of abandoning the run.
+_OMISSION_PREFIX = "codex output: missing summaries for "
+
+
 class SummaryError(RuntimeError):
     """A summary backend or its strictly validated output failed."""
 
@@ -774,7 +779,7 @@ def _parse_backend_output_with_repairs(
         )
     missing = sorted(set(expected) - set(results))
     if missing:
-        raise SummaryError("codex output: missing summaries for " + ", ".join(missing))
+        raise SummaryError(_OMISSION_PREFIX + ", ".join(missing))
     return _ParsedBackendOutput(results=results, repairs=tuple(repairs))
 
 
@@ -1618,40 +1623,63 @@ def summarize_jobs(
         futures: dict[
             concurrent.futures.Future[_GeneratedBatch], tuple[_PendingJob, ...]
         ] = {}
+        def submit(
+            batch: tuple[_PendingJob, ...],
+        ) -> concurrent.futures.Future[_GeneratedBatch]:
+            future = executor.submit(
+                _run_backend_batch,
+                batch,
+                cache_dir=cache_dir,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=effective_service_tier,
+                codex_command=codex,
+                claude_command=claude,
+                processes=processes,
+            )
+            futures[future] = batch
+            return future
+
         try:
             for batch in batches:
-                future = executor.submit(
-                    _run_backend_batch,
-                    batch,
-                    cache_dir=cache_dir,
-                    backend=backend,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    service_tier=effective_service_tier,
-                    codex_command=codex,
-                    claude_command=claude,
-                    processes=processes,
-                )
-                futures[future] = batch
+                submit(tuple(batch))
             first_error: SummaryError | None = None
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    batch_result = future.result()
-                    generated.update(publish_batch(futures[future], batch_result))
-                except concurrent.futures.CancelledError:
-                    continue
-                except SummaryError as error:
-                    if first_error is None:
-                        first_error = error
-                        for other in futures:
-                            if other is not future:
-                                other.cancel()
-                except Exception as error:
-                    if first_error is None:
-                        first_error = SummaryError(f"summary backend failed: {error}")
-                        for other in futures:
-                            if other is not future:
-                                other.cancel()
+            outstanding = set(futures)
+            while outstanding:
+                done, outstanding = concurrent.futures.wait(
+                    outstanding, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    try:
+                        batch_result = future.result()
+                        generated.update(publish_batch(futures[future], batch_result))
+                    except concurrent.futures.CancelledError:
+                        continue
+                    except SummaryError as error:
+                        batch = futures[future]
+                        # A model that drops one job from a multi-job answer has still done
+                        # the others, but the answer is rejected whole. Asking again one job
+                        # at a time keeps a long run alive at the cost of re-asking that one
+                        # batch, instead of discarding every batch still in flight.
+                        if (
+                            first_error is None
+                            and len(batch) > 1
+                            and str(error).startswith(_OMISSION_PREFIX)
+                        ):
+                            outstanding.update(submit((item,)) for item in batch)
+                            continue
+                        if first_error is None:
+                            first_error = error
+                            for other in futures:
+                                if other is not future:
+                                    other.cancel()
+                    except Exception as error:
+                        if first_error is None:
+                            first_error = SummaryError(f"summary backend failed: {error}")
+                            for other in futures:
+                                if other is not future:
+                                    other.cancel()
             if first_error is not None:
                 raise first_error
             with defer_sigint_during_cleanup():
