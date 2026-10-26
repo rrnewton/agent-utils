@@ -28,8 +28,9 @@ use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 const TOKEN: &str = "wit-test-token-not-a-real-one";
 
 /// What the fake Wit.ai server answers, when a test has chosen.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum Mode {
+    #[default]
     Speak,
     /// 429 for the next `remaining` synthesize calls, then speak.
     RateLimit(u32),
@@ -55,12 +56,6 @@ struct Seen {
 struct FakeWitServer {
     mode: Mutex<Mode>,
     seen: Mutex<Vec<Seen>>,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Speak
-    }
 }
 
 impl FakeWitServer {
