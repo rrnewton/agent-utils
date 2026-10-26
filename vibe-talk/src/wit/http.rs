@@ -234,27 +234,50 @@ impl WitClient for HttpWitClient {
 
     async fn voices(&self, token: &Secret) -> Result<Vec<Voice>, WitError> {
         let request = voices_request(&self.api_base);
-        let response = self
-            .client
-            .get(&request.url)
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", token.expose()),
-            )
-            .send()
-            .await
-            .map_err(|e| WitError::Transport(super::redact(&e.to_string(), token)))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| WitError::Transport(super::redact(&e.to_string(), token)))?;
-        if !status.is_success() {
-            return Err(WitError::from_response(status.as_u16(), &text, token, 1));
+        // The same bounded 429 backoff as synthesis: the Settings picker
+        // and diagnostics call this, and a transient limit there is not a
+        // broken token.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let response = self
+                .client
+                .get(&request.url)
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose()),
+                )
+                .send()
+                .await
+                .map_err(|e| WitError::Transport(super::redact(&e.to_string(), token)))?;
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let text = response
+                .text()
+                .await
+                .map_err(|e| WitError::Transport(super::redact(&e.to_string(), token)))?;
+            if status.is_success() {
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| WitError::Shape(super::redact(&e.to_string(), token)))?;
+                return Ok(parse_voices(&value));
+            }
+            let error = WitError::from_response(status.as_u16(), &text, token, attempt);
+            let WitError::RateLimited { .. } = error else {
+                return Err(error);
+            };
+            if attempt >= MAX_ATTEMPTS {
+                return Err(error);
+            }
+            let wait = retry_after
+                .unwrap_or_else(|| FIRST_BACKOFF.saturating_mul(1 << (attempt - 1)))
+                .min(Duration::from_secs(30));
+            tokio::time::sleep(wait).await;
         }
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| WitError::Shape(super::redact(&e.to_string(), token)))?;
-        Ok(parse_voices(&value))
     }
 }
 

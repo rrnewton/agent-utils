@@ -441,10 +441,18 @@ async fn wit_token(state: &AppState, deadline: &Deadline) -> Check {
             crate::speech::SpeechError::Backend { code, .. } if *code == "wit_unreachable" => {
                 Diagnosis::Unreachable(error.to_string())
             }
-            crate::speech::SpeechError::Backend { .. } => Diagnosis::UnexpectedStatus {
-                status: 401,
-                body: error.to_string(),
-            },
+            crate::speech::SpeechError::Backend { code, .. } if *code == "wit_rate_limited" => {
+                Diagnosis::RateLimited
+            }
+            crate::speech::SpeechError::Backend { code, .. } if *code == "wit_unauthorized" => {
+                Diagnosis::UnexpectedStatus {
+                    status: 401,
+                    body: error.to_string(),
+                }
+            }
+            crate::speech::SpeechError::Backend { .. } => {
+                Diagnosis::Unintelligible(error.to_string())
+            }
             other => Diagnosis::Unintelligible(other.to_string()),
         },
     };

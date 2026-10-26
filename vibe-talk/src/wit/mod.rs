@@ -138,7 +138,13 @@ impl WitError {
     #[must_use]
     pub fn from_response(status: u16, body: &str, token: &Secret, attempts: u32) -> Self {
         let mut body = redact(body, token);
-        body.truncate(500);
+        // Truncate on a character boundary: the body is vendor text, and
+        // `String::truncate` panics mid-character.
+        let mut end = body.len().min(500);
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
         match status {
             401 | 403 => Self::Unauthorized { status, body },
             429 => Self::RateLimited { attempts, body },
@@ -277,6 +283,14 @@ mod tests {
         assert_eq!(speed_percent(Some(1.5)), Some(150));
         assert_eq!(speed_percent(Some(9.0)), Some(200));
         assert_eq!(speed_percent(Some(f64::NAN)), None);
+    }
+
+    #[test]
+    fn a_long_multibyte_error_body_truncates_without_panicking() {
+        let token = Secret::new("tok-secret-value");
+        let body = "€".repeat(400);
+        let error = WitError::from_response(401, &body, &token, 1);
+        assert!(error.to_string().len() < 700, "{error}");
     }
 
     #[test]

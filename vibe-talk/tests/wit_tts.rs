@@ -606,6 +606,22 @@ fn a_named_token_file_that_cannot_be_read_stops_startup() {
 }
 
 #[test]
+fn a_missing_token_file_does_not_stop_a_deployment_that_reads_another_way() {
+    let text = wit_toml(
+        "https://api.wit.ai",
+        std::path::Path::new("/tmp/vibe-talk-wit-no-such-file.txt"),
+    )
+    .replace("backend = \"wit\"", "backend = \"browser\"");
+    let config =
+        Config::from_toml_and_env(&text, &std::collections::BTreeMap::new()).expect("config");
+    assert_eq!(
+        config.read_aloud.backend,
+        vibe_talk::config::ReadAloudBackend::Browser
+    );
+    assert!(config.wit.token.is_none());
+}
+
+#[test]
 fn a_relative_token_file_is_refused() {
     let text = wit_toml(
         "https://api.wit.ai",
