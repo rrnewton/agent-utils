@@ -5003,6 +5003,10 @@ const TUNING_BANDS = {
     "how long a first press of Apply to existing messages waits for the second (#549 own-read-stored). " +
     "Under a few seconds the reader cannot read what the first press says it will do before it is " +
     "forgotten; past a minute a press long forgotten turns a later stray tap into the act itself"],
+  PASTE_ENTER_MS: [50, 1500,
+    "how long after a paste an Enter in the same box is the paste's own new line (paste-never-sends). " +
+    "Under a few dozen ms a loaded phone delivers the pasted Enter late and it sends what was pasted; " +
+    "past a second or so the reader's own Enter, pressed after pasting, is swallowed as a new line"],
   PULL_ARM_PX: [24, 200,
     "how far past either end a finger has to travel before releasing refreshes. Below a couple " +
     "of dozen pixels an ordinary flick refreshes by accident — and at the top it throws the " +
@@ -24618,6 +24622,69 @@ for (const [name, open] of Object.entries(ENTER_COMPOSERS)) {
       assert.equal(letter.defaulted, true, `a letter had its default taken away in the ${name} box`);
     });
   }
+}
+
+// `paste-never-sends`. The owner, 2026-10-26, on Android: "as soon as I press paste on Android, it is
+// sending it immediately without giving me a chance to edit ... Just pasting something should never
+// immediately send it." A keyboard's clipboard hands Chrome its text without a composition, and
+// Chrome on Android turns each newline the keyboard commits into a trusted Enter keydown. Every way a
+// paste can arrive, in every box: the text goes in, the box keeps it, nothing is sent; and the
+// reader's own Enter, a moment later, still sends.
+
+/** Each way pasted text reaches a box before the Enter its newline becomes. */
+const PASTES = [
+  { name: "a paste event", type: "paste", fields: {} },
+  { name: "beforeinput insertFromPaste", type: "beforeinput", fields: { inputType: "insertFromPaste", data: null } },
+  { name: "a keyboard's clipboard commit (insertText, no composition)", type: "beforeinput",
+    fields: { inputType: "insertText", data: "and the second half of", isComposing: false } },
+  { name: "a commit ending in a newline", type: "beforeinput",
+    fields: { inputType: "insertText", data: "copied from another app\n", isComposing: false } },
+  { name: "a drop", type: "beforeinput", fields: { inputType: "insertFromDrop", data: null } },
+  // The owner, later: copying from vibe-talk itself and pasting sent at once too, so it is the
+  // keyboard's paste, not the app copied from. A browser that reports the commit on `input` alone.
+  { name: "a commit reported on input alone", type: "input",
+    fields: { inputType: "insertText", data: "a message copied in vibe-talk\n", isComposing: false } },
+];
+
+for (const [name, open] of Object.entries(ENTER_COMPOSERS)) {
+  test(`PASTE NEVER SENDS from the ${name} box: the Enter a pasted newline becomes is a new line`, async () => {
+    const box = await open(true);
+    for (const paste of PASTES) {
+      const text = `half a message, then ${paste.name}`;
+      await box.ready(text);
+      const before = box.sent();
+      await box.page.el(box.field).dispatch(paste.type, { type: paste.type, ...paste.fields });
+      const enter = enterKey({});
+      await box.page.el(box.field).dispatch("keydown", enter);
+      await box.page.settle();
+      assert.equal(box.sent(), before, `${paste.name} sent from the ${name} box`);
+      assert.equal(box.page.el(box.field).value, text, `${paste.name} emptied the ${name} box`);
+      assert.equal(enter.defaulted, true, `the Enter after ${paste.name} was taken: the pasted new line is lost`);
+      // The reader's own Enter, once the paste is done, sends as ever.
+      box.page.setClock(box.page.clock() + sourceConstant("PASTE_ENTER_MS") + 1);
+      const own = enterKey({});
+      await box.page.el(box.field).dispatch("keydown", own);
+      await box.page.settle();
+      assert.equal(box.sent(), before + 1, `the reader's Enter after ${paste.name} did not send from the ${name} box`);
+      box.went(text);
+    }
+    // A word committed through a composition is typing, not a paste: the Enter right after it sends.
+    await box.ready("typed and composed");
+    const before = box.sent();
+    await box.page.el(box.field).dispatch("beforeinput",
+      { type: "beforeinput", inputType: "insertText", data: "composed", isComposing: true });
+    await box.page.el(box.field).dispatch("keydown", enterKey({}));
+    await box.page.settle();
+    assert.equal(box.sent(), before + 1, `an Enter after a composed word did not send from the ${name} box`);
+    // ...and one character typed outside a composition is a key, not a paste.
+    await box.ready("ends with a question?");
+    const after = box.sent();
+    await box.page.el(box.field).dispatch("beforeinput",
+      { type: "beforeinput", inputType: "insertText", data: "?", isComposing: false });
+    await box.page.el(box.field).dispatch("keydown", enterKey({}));
+    await box.page.settle();
+    assert.equal(box.sent(), after + 1, `an Enter after one typed character did not send from the ${name} box`);
+  });
 }
 
 test("ENTER TO SEND is a switch on the Settings screen, and it is on as the page is served", () => {

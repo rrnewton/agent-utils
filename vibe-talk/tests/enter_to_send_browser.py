@@ -12,8 +12,14 @@ the new line a key was left to make. This presses real keys on a real keyboard i
   Settings: turn Enter to send off, and the hint names the key that sends -> a real reload keeps it
   off -> Enter is a new line and posts nothing -> Ctrl+Enter posts both lines, once, as a reply.
 
+Then `paste-never-sends`, at 393x852 with touch, where the owner pasted on Android ("as soon as I
+press paste on Android, it is sending it immediately without giving me a chance to edit"): text
+put in as a keyboard's clipboard puts it (no composition) with the Enter each newline becomes
+straight after it, and a real clipboard paste followed at once by an Enter, each leave the pasted
+lines in the reply box and post nothing; the reader's own Enter after that posts them, once.
+
 It serves the checked-out assets and a small fake API from one loopback origin, at a desk's size,
-where a hardware keyboard is. Pass --web-root DIR to run the same check against another copy of the
+where a hardware keyboard is, and at a phone's. Pass --web-root DIR to run the same check against another copy of the
 page; against one from before the setting it fails at the first Enter.
 """
 
@@ -290,9 +296,59 @@ def main() -> int:
             browser_version = context.browser.version if context.browser else "Chromium"
             context.close()
 
+        # 5. `paste-never-sends`, on a phone with Enter to send on (a fresh profile: the default).
+        with sync_playwright() as playwright, tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+            context = playwright.chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": 393, "height": 852}, is_mobile=True, has_touch=True,
+                permissions=["clipboard-read", "clipboard-write"])
+            page = context.pages[0]
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url, wait_until="load")
+            page.fill("#api-token", TOKEN)
+            page.click("#save-token")
+            page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            before = len(api.sent())
+            open_reply(page)
+            page.keyboard.type("half a thought, ")
+            # A keyboard's clipboard: each line committed as text, outside any composition, and the
+            # newline after it handed over as an Enter keydown, at once — as Chrome on Android does.
+            page.keyboard.insert_text("copied from another app")
+            page.keyboard.press("Enter")
+            page.keyboard.insert_text("its second line")
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(500)
+            check(len(api.sent()) == before, f"a keyboard's paste posted from the reply box: {api.sent()[before:]}")
+            check(box(page) == "half a thought, copied from another app\nits second line\n",
+                  f"a keyboard's paste did not land in the reply box as it was: {box(page)!r}")
+            # A real clipboard paste, and an Enter straight after it.
+            page.evaluate("() => navigator.clipboard.writeText('a pasted line\\nand one more')")
+            page.keyboard.press("Control+V")
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(500)
+            check(len(api.sent()) == before, f"a clipboard paste posted from the reply box: {api.sent()[before:]}")
+            pasted = box(page)
+            check(isinstance(pasted, str) and pasted.startswith(
+                "half a thought, copied from another app\nits second line\na pasted line\nand one more"),
+                f"the clipboard paste did not land in the reply box: {pasted!r}")
+            check(page.locator("#column-reply").is_visible(), "a paste closed the reply")
+            # The reader's own Enter, after the paste, sends what the box holds: once.
+            page.keyboard.press("Enter")
+            posted(before + 1, page)
+            page.wait_for_timeout(300)
+            # The Enter straight after the paste was its new line, which a post leaves off its end.
+            check(isinstance(pasted, str) and pasted.endswith("\n"), f"the Enter after the paste made no new line: {pasted!r}")
+            check(api.sent()[before:] == [(str(pasted).rstrip("\n"), reply)],
+                  f"the reader's Enter after pasting did not post the reply once: {api.sent()[before:]}")
+            check(not errors, f"the page threw on the phone: {errors}")
+            context.close()
+
         print(f"{browser_version} at 1280x800 ({platform}): in the reply box Shift+Enter made a new line and"
               f" Enter posted the reply; with Enter to send off (hint: {hint!r}, kept across a reload)"
-              " Enter made a new line and posted nothing, and Ctrl+Enter posted the reply")
+              " Enter made a new line and posted nothing, and Ctrl+Enter posted the reply; at 393x852 with touch"
+              " a keyboard's paste with its newlines' Enters and a clipboard paste with an Enter after it"
+              " posted nothing, and the reader's own Enter then posted the reply once")
         return 0
     finally:
         server.shutdown()

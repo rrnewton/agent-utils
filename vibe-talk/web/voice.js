@@ -10815,22 +10815,88 @@ function renderEnterSends() {
  * swallowed there; a textarea's own Enter is a new line, which is what the setting being off asks
  * for, so nothing is swallowed anywhere now.
  *
+ *   * NEVER AS PART OF A PASTE (`paste-never-sends`). The owner, 2026-10-26, on Android: "as soon
+ *     as I press paste on Android, it is sending it immediately without giving me a chance to edit
+ *     ... Just pasting something should never immediately send it." A keyboard's clipboard paste
+ *     hands Chrome its text without a composition, and Chrome on Android turns each newline the
+ *     keyboard commits into a trusted Enter keydown: the paste typed its own Enter, and that Enter
+ *     sent. So an Enter arriving within `PASTE_ENTER_MS` of a paste, a drop, or text of more than
+ *     one character put in outside a composition (`noteBoxInsertion`) is that insertion's new line
+ *     and is left to the box. A word being composed is committed through a composition, so the
+ *     Enter pressed after typing one still sends.
+ *
  * Returns what `send` returned, or undefined when nothing was sent. A browser ignores a listener's
  * return value; the page suite awaits it, so a send is finished before the next assertion reads it.
  *
  * @param {KeyboardEvent} event
  * @param {() => unknown} send
+ * @param {any} [box] the box the key was pressed in: its own listener says, as `event.target` would
  * @returns {unknown}
  */
-function onComposerKey(event, send) {
+function onComposerKey(event, send, box = event && event.target) {
   if (!event || event.key !== "Enter") return undefined;
   if (event.isComposing || event.keyCode === 229) return undefined;
+  if (insertedJustNow(box)) return undefined;
   const chord = Boolean(event.ctrlKey || event.metaKey);
   const sends = chord || (enterSends && !event.shiftKey && !event.altKey);
   if (sends && event.preventDefault) {
     event.preventDefault();
   }
   return sends && !event.repeat ? send() : undefined;
+}
+
+/**
+ * How long after a paste, a drop or a run of text put in outside a composition an Enter in the same
+ * box is taken to be part of it, in milliseconds. `paste-never-sends`; see `onComposerKey`.
+ *
+ * Chrome delivers the Enter a pasted newline becomes in the same task as the text before it, so a few
+ * milliseconds would do; the rest is room for a loaded phone. A person tapping the clipboard and then
+ * Send's key takes far longer than this.
+ */
+const PASTE_ENTER_MS = 250;
+
+/**
+ * When each message box last took a paste, a drop or a run of text outside a composition, by box.
+ *
+ * @type {WeakMap<object, number>}
+ */
+const boxInsertedAt = new WeakMap();
+
+/**
+ * A message box's `beforeinput`, `input` or `paste`: note the moment text arrived in it other than by
+ * typing a key or composing a word — a paste or a drop of any length, or text of more than one
+ * character put in outside a composition, which is how a keyboard's clipboard hands over what it
+ * pastes, whatever it was copied from (vibe-talk's own Copy included). `input` as well as
+ * `beforeinput`, for a browser that reports an input method's commit on the one and not the other.
+ * `paste-never-sends`.
+ *
+ * @param {any} box
+ * @param {any} event
+ */
+function noteBoxInsertion(box, event) {
+  if (!box || !event) return;
+  const type = typeof event.inputType === "string" ? event.inputType : "";
+  const data = typeof event.data === "string" ? event.data : "";
+  const pasted = event.type === "paste" || /FromPaste$|FromDrop$|FromYank$/.test(type);
+  const run = type === "insertText" && !event.isComposing && (data.length > 1 || data.includes("\n"));
+  if (pasted || run) boxInsertedAt.set(box, Date.now());
+}
+
+/** Whether `box` took a paste or a run of text so lately that an Enter now is part of it. */
+function insertedJustNow(box) {
+  const at = box ? boxInsertedAt.get(box) : undefined;
+  return typeof at === "number" && Date.now() - at <= PASTE_ENTER_MS;
+}
+
+/**
+ * Listen to `box` for what `noteBoxInsertion` notes. Each message box, as it is given its Enter.
+ *
+ * @param {any} box
+ */
+function watchBoxInsertions(box) {
+  for (const type of ["beforeinput", "input", "paste"]) {
+    box.addEventListener(type, (event) => noteBoxInsertion(box, event));
+  }
 }
 
 // --- the keyboard -------------------------------------------------------------------------------
@@ -56786,7 +56852,10 @@ el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsOpen))
 setPromptsOpen(false);
 // `#225 enter-to-send`. One rule for every message box; see `onComposerKey`. A textarea since
 // `#241 voice-composer`, as the channel's box is, so with Enter to send off an Enter is a new line.
-el("compose-text").addEventListener("keydown", (event) => onComposerKey(event, guardQuietly(sendTyped)));
+el("compose-text").addEventListener("keydown", (event) =>
+  onComposerKey(event, guardQuietly(sendTyped), el("compose-text")));
+// `paste-never-sends`. Every message box: a paste only ever puts text in.
+watchBoxInsertions(el("compose-text"));
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
 el("post-confirm-send").addEventListener("click", sendPostProposal);
@@ -56869,8 +56938,9 @@ el("channel-compose-text").addEventListener("input", rememberChannelDraft);
 el("channel-send").addEventListener("click", guardQuietly(sendChannelMessage));
 // The channel's box, and a thread's, which is the same box posting somewhere else.
 el("channel-compose-text").addEventListener("keydown", (event) =>
-  onComposerKey(event, guardQuietly(sendChannelMessage))
+  onComposerKey(event, guardQuietly(sendChannelMessage), el("channel-compose-text"))
 );
+watchBoxInsertions(el("channel-compose-text"));
 let threadBackGesture = null;
 el("scroll-area").addEventListener("pointerdown", (event) => {
   if (channelView !== "thread" || event.pointerType === "mouse") return;
@@ -56920,8 +56990,10 @@ renderOrderToggle();
 inColumn(columns.side, () => {
   el("channel-compose-text").addEventListener("input", inThisColumn(rememberChannelDraft));
   el("channel-send").addEventListener("click", inThisColumn(guardQuietly(sendChannelMessage)));
-  el("channel-compose-text").addEventListener("keydown", inThisColumn((event) =>
-    onComposerKey(event, guardQuietly(sendChannelMessage))));
+  const sideBox = el("channel-compose-text");
+  sideBox.addEventListener("keydown", inThisColumn((event) =>
+    onComposerKey(event, guardQuietly(sendChannelMessage), sideBox)));
+  watchBoxInsertions(sideBox);
   el("load-older").addEventListener("click", inThisColumn(guardQuietly(olderControlPressed)));
   el("clear-backlog").addEventListener("click", inThisColumn(guardQuietly(clearBacklog)));
   // `#338 column-overscroll`. The reader's own way to the newest line lands on the foot, as End does.
@@ -57077,7 +57149,8 @@ el("reply-cancel").addEventListener("click", () => closeReply());
 el("reply-send").addEventListener("click", guardQuietly(sendReply));
 // `#225 enter-to-send`. The box that had no Enter handler at all, so the one the owner had to reach
 // for the mouse in.
-el("reply-text").addEventListener("keydown", (event) => onComposerKey(event, guardQuietly(sendReply)));
+el("reply-text").addEventListener("keydown", (event) => onComposerKey(event, guardQuietly(sendReply), el("reply-text")));
+watchBoxInsertions(el("reply-text"));
 // The tick is the draft's as the words are, so it is kept as it is changed, not only when the words
 // next are; and the note under the box says where the reply now goes. `#185 reply-new-thread`.
 el("reply-branch").addEventListener("change", () => {
