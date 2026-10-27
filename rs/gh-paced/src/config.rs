@@ -53,8 +53,9 @@ pub struct Config {
     pub lock_wait_secs: f64,
     /// Cooldown after GitHub reports a rate limit, abuse detection, or HTTP 429, in seconds.
     pub cooldown_secs: f64,
-    /// Cooldown after a plain HTTP 403 with no rate-limit wording, in seconds.
-    pub plain_403_cooldown_secs: f64,
+    /// How long a call that got an HTTP 403 with no rate-limit signal and no permission wording
+    /// waits before it returns, in seconds. Only that call waits: no cooldown starts.
+    pub unknown_403_backoff_secs: f64,
     /// Refresh the `GET /rate_limit` snapshot when it is at least this old, in seconds.
     pub rate_limit_refresh_secs: f64,
     /// Refresh the snapshot after this many admitted calls since the last refresh.
@@ -81,6 +82,10 @@ pub struct Config {
     /// estimated charge. Without it they are refused, because gh-paced cannot count the requests
     /// a watch makes.
     pub allow_watch: bool,
+    /// `GH_PACED_ALLOW_ADMIN_API=1`: send `gh api` calls to endpoints that need admin rights
+    /// (webhooks, Actions permissions, rulesets and branch protection changes, ...), which are
+    /// otherwise refused before they reach GitHub.
+    pub allow_admin_api: bool,
 }
 
 impl Default for Config {
@@ -114,7 +119,7 @@ impl Default for Config {
             git_credential_max_wait_secs: 30.0,
             lock_wait_secs: crate::state::LOCK_WAIT_SECS,
             cooldown_secs: 900.0,
-            plain_403_cooldown_secs: 900.0,
+            unknown_403_backoff_secs: 30.0,
             rate_limit_refresh_secs: 300.0,
             rate_limit_refresh_calls: 50,
             rate_limit_min_refresh_secs: 60.0,
@@ -127,6 +132,7 @@ impl Default for Config {
             allow_large_body: false,
             allow_fast_watch: false,
             allow_watch: false,
+            allow_admin_api: false,
         }
     }
 }
@@ -252,7 +258,10 @@ struct FileConfig {
     git_credential_max_wait_secs: Option<f64>,
     lock_wait_secs: Option<f64>,
     cooldown_secs: Option<f64>,
+    /// No longer used: a plain HTTP 403 starts no cooldown. Still accepted, and still checked,
+    /// so a configuration file written for an earlier version loads.
     plain_403_cooldown_secs: Option<f64>,
+    unknown_403_backoff_secs: Option<f64>,
     rate_limit_refresh_secs: Option<f64>,
     rate_limit_refresh_calls: Option<u32>,
     rate_limit_min_refresh_secs: Option<f64>,
@@ -287,6 +296,11 @@ fn finite_in(name: &str, value: f64, min: f64, max: f64) -> Result<f64, String> 
 pub mod floors {
     /// Shortest cooldown after GitHub pushback, seconds (the requested 15 minutes).
     pub const MIN_COOLDOWN_SECS: f64 = 900.0;
+    /// Shortest wait after an HTTP 403 that is neither a rate limit nor a permission denial,
+    /// seconds, so a caller retrying it in a loop still cannot hammer GitHub.
+    pub const MIN_UNKNOWN_403_BACKOFF_SECS: f64 = 1.0;
+    /// Longest such wait, seconds: it holds only the one call, which should fail promptly.
+    pub const MAX_UNKNOWN_403_BACKOFF_SECS: f64 = 300.0;
     /// Highest account-wide fraction at which blocking may start (default and floor 20%).
     pub const MIN_BLOCK_FRACTION: f64 = 0.2;
     /// Highest account-wide fraction at which halving may start (default and floor 50%).
@@ -437,11 +451,19 @@ impl FileConfig {
             )?;
         }
         if let Some(v) = self.plain_403_cooldown_secs {
-            c.plain_403_cooldown_secs = finite_in(
+            finite_in(
                 "plain_403_cooldown_secs",
                 v,
                 floors::MIN_COOLDOWN_SECS,
                 floors::MAX_DURATION_SECS,
+            )?;
+        }
+        if let Some(v) = self.unknown_403_backoff_secs {
+            c.unknown_403_backoff_secs = finite_in(
+                "unknown_403_backoff_secs",
+                v,
+                floors::MIN_UNKNOWN_403_BACKOFF_SECS,
+                floors::MAX_UNKNOWN_403_BACKOFF_SECS,
             )?;
         }
         if let Some(v) = self.rate_limit_refresh_secs {
@@ -640,6 +662,7 @@ fn apply_env(
     c.allow_large_body = env_flag(env, "GH_PACED_ALLOW_LARGE_BODY")?;
     c.allow_fast_watch = env_flag(env, "GH_PACED_ALLOW_FAST_WATCH")?;
     c.allow_watch = env_flag(env, "GH_PACED_ALLOW_WATCH")?;
+    c.allow_admin_api = env_flag(env, "GH_PACED_ALLOW_ADMIN_API")?;
     Ok(())
 }
 
@@ -678,6 +701,39 @@ mod tests {
         assert_eq!(c.max_body_bytes, 8192);
         assert_eq!(c.max_base64_run, 1000);
         assert_eq!(c.paginate_cost, 10);
+    }
+
+    /// #592 gh-paced-permission-403: a plain 403 starts no cooldown, so its old setting is
+    /// accepted (and still range-checked) but unused; the unknown-403 backoff holds one call
+    /// for 10 to 300 s, 30 by default; admin-only endpoints are refused unless
+    /// `GH_PACED_ALLOW_ADMIN_API=1`.
+    #[test]
+    fn plain_403_settings() {
+        let dir = std::env::temp_dir().join(format!("gh-paced-403-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        let env = env_of(&[]);
+        let load = |json: &str| {
+            std::fs::write(&path, json).unwrap();
+            Config::load(Some(&path), true, &env)
+        };
+        assert_eq!(Config::default().unknown_403_backoff_secs, 30.0);
+        assert!(!Config::default().allow_admin_api);
+        let (c, warnings) = load(r#"{"plain_403_cooldown_secs": 1800}"#).unwrap();
+        assert_eq!(c, Config::default(), "{warnings:?}");
+        let (c, _) = load(r#"{"unknown_403_backoff_secs": 60}"#).unwrap();
+        assert_eq!(c.unknown_403_backoff_secs, 60.0);
+        for bad in ["0", "0.5", "301", "1e308"] {
+            let json = format!("{{\"unknown_403_backoff_secs\": {bad}}}");
+            assert!(load(&json).is_err(), "accepted {json}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (c, _) =
+            Config::load(None, false, &env_of(&[("GH_PACED_ALLOW_ADMIN_API", "1")])).unwrap();
+        assert!(c.allow_admin_api);
+        assert!(
+            Config::load(None, false, &env_of(&[("GH_PACED_ALLOW_ADMIN_API", "yes")])).is_err()
+        );
     }
 
     #[test]

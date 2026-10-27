@@ -359,7 +359,9 @@ reads is still found. It looks for:
 
 - `secondary rate limit`, `rate limit` (including `API rate limit exceeded`),
   `HTTP 429`, the word `abuse`, `submitted too quickly`;
-- `HTTP 403` with none of the above;
+- `HTTP 403`, which by itself is not a rate limit (see
+  [How an HTTP 403 is classified](#how-an-http-403-is-classified)), and the
+  phrases with which GitHub says the account lacks permission;
 - a `Retry-After: N` value (the largest one seen). It is honoured in full up
   to 31,536,000 s (365 days). A longer value, or one too long to represent, is
   never shortened: it starts a cooldown with no end time, every paced call is
@@ -407,7 +409,10 @@ blank line. stdout itself is passed on unchanged.
   403 or 429 block, such a line (a `Retry-After` with thousands of leading
   zeros, or any other header that long) means the wait GitHub asked for cannot
   be read, so it starts a cooldown with no end time, as for a `Retry-After`
-  over 365 days above, never a shorter one. In any other block it ends the
+  over 365 days above, never a shorter one. In a 403 block with no
+  `Retry-After` line, this holds only when something else says the 403 was a
+  rate limit (see [How an HTTP 403 is classified](#how-an-http-403-is-classified)).
+  In any other block it ends the
   block. A status line that long (HTTP/1.1 lets the server choose its reason
   phrase) still opens its block. With `--paginate` a long line needs a CRLF
   ending to count. Before the block's first CRLF header line it also needs the
@@ -438,17 +443,18 @@ blank line. stdout itself is passed on unchanged.
   even when the block is cut later. With one response, a last line that ends
   in CR is whole: only its LF is missing. A cut before the status code arrives
   leaves nothing on stdout to read, so stderr decides, as for a call without
-  `-i`. So `gh api -i ... | head -n1` on a 403 or 429 can start a cooldown
-  with no end time, even for a 403 that was only a permission error. Once you
-  know it was not a limit, end it as described in
-  [Ending a cooldown by hand](#ending-a-cooldown-by-hand).
+  `-i`. A 403 block cut before any `Retry-After` line arrived is held to the
+  same rule as an over-long line in one: it makes the wait unknown only when
+  something else says the 403 was a rate limit. So `gh api -i ... | head -n1`
+  on a 429, or on a 403 that stderr calls a rate limit, starts a cooldown with
+  no end time; on a 403 that was a permission error it starts none.
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`
-and 900 s (`cooldown_secs`). A plain `HTTP 403` starts a cooldown of
-`plain_403_cooldown_secs`, also 900 s. Neither can be configured below 900 s:
-GitHub does not always say that a 403 is a rate limit, so every 403 is treated
-as one. During a cooldown, every paced call for that account on that host waits
+and 900 s (`cooldown_secs`), which cannot be configured below 900 s. An
+`HTTP 403` with none of these starts no cooldown; see
+[How an HTTP 403 is classified](#how-an-http-403-is-classified). During a
+cooldown, every paced call for that account on that host waits
 or is refused. A new cooldown only ever extends an existing one. gh's own output
 and exit status still pass through. The cooldown is recorded as soon as the
 signal is read from gh's output, before that output is passed on, so other
@@ -475,13 +481,82 @@ Apart from `--include` header blocks, gh-paced does not scan stdout. Error text
 from GitHub arrives on stderr, and stdout often carries the caller's data
 (`--json` output, `gh api` responses) that may legitimately contain these words.
 
+### How an HTTP 403 is classified
+
+GitHub answers HTTP 403 both when an account is rate limited and when it may
+not make a request at all. Only the first is pushback: a cooldown stops every
+paced call for the account on the host, the git credential helper included, so
+starting one for a missing permission would break every agent's `git fetch`
+and `git push` for 15 minutes and help nobody. So a 403 is put in one of three
+classes. gh prints GitHub's message on stderr for every failed request
+(`gh: Must have admin rights to Repository. (HTTP 403)` from `gh api`,
+`HTTP 403: ... (URL)` from other commands), with or without `--include`, so
+stderr decides:
+
+| Class | What gh-paced sees | What happens |
+| --- | --- | --- |
+| Rate limit | any limit signal above: `secondary rate limit`, `rate limit`, `abuse`, `submitted too quickly`, a `Retry-After` value, or `X-RateLimit-Remaining: 0` in an `--include` header block | the host-wide cooldown, honouring `Retry-After` (`GH-PACED PUSHBACK` banner) |
+| Permission denial | none of those, and one of: `Resource not accessible by integration`, `Resource not accessible by personal access token`, `Must have admin rights`, `Must have admin access`, `Must have push access`, `must be an admin`, `must be an organization owner`, `Write access to repository not granted`, `protected by organization SAML enforcement`, `OAuth App access restrictions`, `forbids access via a personal access token` (or a fine-grained one), `Not Found` | no cooldown; gh's output and status pass through at once, with a `GH-PACED FORBIDDEN` banner saying it was a permission denial |
+| Unknown | none of the above | no cooldown; only this call waits `unknown_403_backoff_secs` (default 30 s) before it returns, so a caller retrying it in a loop cannot hammer GitHub. A GIT_CREDENTIAL call never waits |
+
+A rate-limit signal always wins: a 403 whose output holds both permission
+wording and a limit signal starts the cooldown. Matching ignores case. Neither
+the permission denial nor the unknown 403 touches the state shared with other
+calls, so the git credential helper is refused only during a cooldown that a
+rate-limit signal (or state recovery) started. Both are written to the audit
+log as a `forbidden` record.
+
+The permission-denial banner looks like this:
+
+```text
+GH-PACED ********************************************************************
+GH-PACED FORBIDDEN [octocat] GitHub refused `api GET repos/o/r/actions/secrets` because this account may not make that request (HTTP 403, "must have admin rights"): a permission denial, not a rate limit
+GH-PACED FORBIDDEN [octocat] no cooldown was started; other gh calls on this host are not affected
+GH-PACED FORBIDDEN [octocat] Do not retry it: it fails until the account gets the access it needs (admin rights, a token scope, or an app permission). Tell your coordinator if the task needs it.
+GH-PACED ********************************************************************
+```
+
+A cooldown recorded by an earlier gh-paced, which started one for every 403,
+stays until it ends; see [Ending a cooldown by hand](#ending-a-cooldown-by-hand)
+to end one you know came from a permission error.
+
+### Endpoints that need admin rights
+
+Some `gh api` requests are served only to repository or organization
+administrators. gh-paced refuses them before they reach GitHub (exit 64), so a
+missing permission cannot even cost a request:
+
+| Request | Methods |
+| --- | --- |
+| `repos/OWNER/REPO` (repository settings: edit or delete) | `PATCH`, `DELETE` |
+| `repos/OWNER/REPO/actions/permissions...` | all |
+| `repos/OWNER/REPO/hooks...` | all |
+| `repos/OWNER/REPO/rulesets...` | writes |
+| `repos/OWNER/REPO/branches/BRANCH/protection...` | writes |
+| `repos/OWNER/REPO/collaborators...` | writes |
+| `orgs/ORG` (organization settings) | writes |
+| `orgs/ORG/actions/permissions...` | all |
+| `orgs/ORG/hooks...` | all |
+| `orgs/ORG/rulesets...` | writes |
+
+"Writes" are every method but `GET`, `HEAD` and `OPTIONS`. Reads that GitHub
+serves with read or push access (listing rulesets or collaborators, reading a
+branch) are not refused, and neither is GraphQL. The endpoint is matched after
+gh-paced drops its scheme, host, leading slash and query string, and gh's
+`{owner}` and `{repo}` placeholders count as names. An account that does have
+admin rights there sets `GH_PACED_ALLOW_ADMIN_API=1` for that one call:
+
+```sh
+GH_PACED_ALLOW_ADMIN_API=1 gh api repos/o/r/actions/permissions
+```
+
 ### Ending a cooldown by hand
 
 A cooldown with an end time ends by itself; wait for it. A cooldown with no end
 time (a `Retry-After` over 365 days, or a wait gh-paced could not read whole)
 lasts until a person ends it. End it only after checking with GitHub that the
 account is no longer limited, or once you know the refusal was not a limit (a
-403 for a missing permission, for example).
+403 for a missing permission recorded by an earlier gh-paced, for example).
 
 The cooldown is kept twice in the state directory: in `<account>.cooldown` and
 in the `cooldown` entry of `<account>.json`. Every load takes the later of the
@@ -812,7 +887,7 @@ push that may hold its caller's locks for as long as the helper sleeps:
   without sleeping, with one line that names the cause and the seconds left:
 
   ```text
-  GH-PACED REFUSED [octocat] cooldown after GitHub pushback (HTTP 403) on `api GET rate_limit`; 842 s left (ends 9:19 PM ET); a git credential helper never waits out a cooldown, so git fails now instead of holding its caller's locks; not running `auth git-credential get` (exit 75)
+  GH-PACED REFUSED [octocat] cooldown after GitHub pushback (secondary rate limit, HTTP 403) on `api GET rate_limit`; 842 s left (ends 9:19 PM ET); a git credential helper never waits out a cooldown, so git fails now instead of holding its caller's locks; not running `auth git-credential get` (exit 75)
   ```
 
 - otherwise it waits for its budget for at most `GH_PACED_GIT_MAX_WAIT`
@@ -929,7 +1004,7 @@ Config file keys, with defaults:
   "git_credential_max_wait_secs": 30,
   "lock_wait_secs": 30,
   "cooldown_secs": 900,
-  "plain_403_cooldown_secs": 900,
+  "unknown_403_backoff_secs": 30,
   "rate_limit_refresh_secs": 300,
   "rate_limit_refresh_calls": 50,
   "rate_limit_min_refresh_secs": 60,
@@ -942,6 +1017,10 @@ Config file keys, with defaults:
 }
 ```
 
+`plain_403_cooldown_secs` (at least 900, at most 604,800) is still accepted so
+that a file written for an earlier version loads, but it no longer does
+anything: a 403 that is not a rate limit starts no cooldown.
+
 The config file is checked against GitHub's documented ceilings. A READ, SEARCH
 or WRITE rate above GitHub's own number (for example WRITE above 80/min or
 500/hour) is clamped to it with a warning. A burst of more than ten minutes of
@@ -953,7 +1032,7 @@ its range is a configuration error (exit 78), not a silent clamp:
 | Key | Allowed range | Default |
 | --- | --- | --- |
 | `cooldown_secs` | at least 900 | 900 |
-| `plain_403_cooldown_secs` | at least 900 | 900 |
+| `unknown_403_backoff_secs` | 1 to 300 | 30 |
 | `block_below_fraction` | 0.2 to 0.9, and no larger than `halve_below_fraction` | 0.2 |
 | `halve_below_fraction` | 0.5 to 1.0 | 0.5 |
 | `max_body_bytes` | 256 to 8,192 | 8,192 |
@@ -983,6 +1062,7 @@ Environment variables:
 | `GH_PACED_ALLOW_LARGE_BODY` | `1` skips the content guard for this call |
 | `GH_PACED_ALLOW_WATCH` | `1` runs watch loops at their estimated charge (refused with exit 64 otherwise) |
 | `GH_PACED_ALLOW_FAST_WATCH` | `1` allows watch intervals under 30 s |
+| `GH_PACED_ALLOW_ADMIN_API` | `1` sends `gh api` calls to [endpoints that need admin rights](#endpoints-that-need-admin-rights) (refused with exit 64 otherwise) |
 | `GH_PACED_EDITOR` | set by gh-paced for its own editor guard: the editor gh would otherwise have used. Do not set it yourself |
 | `GH_PACED_STATE_DIR` | state directory (default `$XDG_STATE_HOME/gh-paced` or `~/.local/state/gh-paced`) |
 | `GH_PACED_CONFIG` | config file path |
@@ -1042,7 +1122,8 @@ that says which file was unusable and where it was moved. It clears itself
 after an hour; do not delete state files to get around it.
 
 Each audit line records the UTC and US Eastern time, host, PID, event
-(`admit`, `throttle`, `refuse`, `pushback`, `deadline`, `exit`, `refresh`),
+(`admit`, `throttle`, `refuse`, `pushback`, `forbidden`, `deadline`, `exit`,
+`refresh`),
 class, cost, command, a redacted argument summary, exit status, seconds waited,
 and a short detail. In the argument summary, inline bodies are replaced by
 `<N bytes>`, header values are redacted, and a `gh api` endpoint loses its host,
@@ -1076,7 +1157,7 @@ other process is stuck.
 | gh's own | the call ran; gh-paced returns gh's status, or dies by gh's signal |
 | 75 | refused: the wait would exceed `GH_PACED_MAX_WAIT` (`GH_PACED_GIT_MAX_WAIT` for GIT_CREDENTIAL, which then also prints `quit=1` on stdout, as it does when the call became admissible only after that bound), a GIT_CREDENTIAL call arrived during a cooldown, the cost is above the class's burst (not for a watch) or can never fit under the hourly cap, a watch ran past the deadline its cost paid for, or gh-paced is nested too deep |
 | 65 | refused by the write content guard: body too large, base64-looking content (in an argument, a file, stdin, or one of gh's alias expansions), a body gh would compose itself, or a body file that cannot be copied for inspection. Text refused by the editor guard makes the editor fail instead, so gh exits with its own status (usually 1) and sends nothing |
-| 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number, or one of gh's aliases gh-paced cannot resolve for certain; see [gh's own aliases](#ghs-own-aliases)) |
+| 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number, one of gh's aliases gh-paced cannot resolve for certain (see [gh's own aliases](#ghs-own-aliases)), or a `gh api` call to an [endpoint that needs admin rights](#endpoints-that-need-admin-rights) without `GH_PACED_ALLOW_ADMIN_API=1`) |
 | 70 | internal error: the pacing state cannot be read or written, or its lock was not obtained within `GH_PACED_LOCK_WAIT` (within what is left of `GH_PACED_GIT_MAX_WAIT` for a GIT_CREDENTIAL call, which then also prints `quit=1` on stdout), or a GIT_CREDENTIAL call could not set the timer for its sleep |
 | 78 | configuration error, `--real-gh` resolves to gh-paced, or gh's `config.yml` cannot be read and the command line names a command |
 | 127 | the real gh cannot be found or run (a GIT_CREDENTIAL call whose gh never started then also prints `quit=1` on stdout) |

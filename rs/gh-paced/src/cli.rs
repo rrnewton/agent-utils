@@ -94,6 +94,18 @@ DEFAULT BUDGETS (per host, per account; four hosts assumed)
   it they cost 20, an estimate, and are stopped (exit 75) once they outlast the
   polls that estimate allows; a large or failing run can make more requests.
 
+GITHUB PUSHBACK
+  A rate-limit signal in gh's output (secondary rate limit, rate limit, abuse,
+  HTTP 429, Retry-After, X-RateLimit-Remaining: 0) pauses every paced call for
+  the account on this host for max(Retry-After, 900 s). An HTTP 403 without one
+  starts no cooldown: a permission denial (`Must have admin rights`, `Resource
+  not accessible by integration`, ...) is reported and returns at once; any
+  other 403 holds only its own call for 30 s (unknown_403_backoff_secs; never a
+  GIT_CREDENTIAL call). `gh api` calls to endpoints that need admin rights
+  (webhooks, Actions permissions, rulesets, branch protection and collaborator
+  changes, repository or organization settings) are refused before they reach
+  GitHub (exit 64) unless GH_PACED_ALLOW_ADMIN_API=1.
+
 ENVIRONMENT
   GH_PACED_ACCOUNT           default for --account
   GH_PACED_REAL_GH           default for --real-gh
@@ -120,6 +132,8 @@ ENVIRONMENT
   GH_PACED_ALLOW_LARGE_BODY  1 = skip the write content guard for this call
   GH_PACED_ALLOW_WATCH       1 = run watch loops at their estimated charge
   GH_PACED_ALLOW_FAST_WATCH  1 = allow watch intervals under 30 s
+  GH_PACED_ALLOW_ADMIN_API   1 = send `gh api` calls to admin-only endpoints
+                             (for an account with admin rights there)
   GH_PACED_EDITOR            set by gh-paced for gh's editor guard: the
                              editor you would have had (GH_EDITOR, gh's
                              `editor` setting, GIT_EDITOR, VISUAL, EDITOR,
@@ -143,7 +157,8 @@ EXIT STATUS
       (gh reports its own status, usually 1) and sends nothing.
   64  usage error, or a refused command shape (a watch without
       GH_PACED_ALLOW_WATCH=1, a watch interval under 30 s, or one that is not
-      a plain positive whole number of seconds)
+      a plain positive whole number of seconds, or an admin-only `gh api`
+      endpoint without GH_PACED_ALLOW_ADMIN_API=1)
   70  internal error: pacing state cannot be read or written, or its lock was
       not obtained within GH_PACED_LOCK_WAIT (within what is left of
       GH_PACED_GIT_MAX_WAIT for GIT_CREDENTIAL)

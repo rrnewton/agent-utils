@@ -126,6 +126,9 @@ pub struct Scanner {
     pub http_429: bool,
     /// `HTTP 403`.
     pub http_403: bool,
+    /// The first of [`PERMISSION_PHRASES`] seen on stderr: GitHub said the account may not make
+    /// this request. Only an `HTTP 403` with no rate-limit signal is judged by it ([`Scanner::forbidden`]).
+    pub permission: Option<&'static str>,
     /// The word `abuse`.
     pub abuse: bool,
     /// `submitted too quickly`.
@@ -134,8 +137,8 @@ pub struct Scanner {
     pub retry_after: Option<f64>,
     /// A response header block reported `X-RateLimit-Remaining: 0`.
     pub remaining_zero: bool,
-    /// A 403 or 429 response block held a header line longer than [`MAX_HEADER_LINE`], so the
-    /// wait it asked for is not known.
+    /// A 429 response block, or a 403 block with a `Retry-After` line, held a header line longer
+    /// than [`MAX_HEADER_LINE`], so the wait it asked for is not known.
     pub overlong_header: bool,
     /// A `Retry-After` value on stderr ran on past the bytes kept between chunks, so it could not
     /// be read whole.
@@ -144,10 +147,17 @@ pub struct Scanner {
     /// stderr ([`Scanner::stderr_cut_off`]), so the rest of its digits are lost.
     pub cut_retry_after: bool,
     /// The end of stdout ([`Scanner::end_of_stdout`]) came inside a response header block
-    /// before the wait it asked for was read whole: a 403 or 429 block with no whole
-    /// `Retry-After` line yet, or a `Retry-After` line whose line end never arrived. The wait is
-    /// not known.
+    /// before the wait it asked for was read whole: a 429 block with no whole `Retry-After` line
+    /// yet, a 403 block whose `Retry-After` line was seen but not read whole, or a `Retry-After`
+    /// line (in a block of any status) whose line end never arrived. The wait is not known.
     pub cut_header_block: bool,
+    /// As [`Scanner::overlong_header`], in a 403 block with no `Retry-After` line seen. A 403 is
+    /// not a rate limit by itself, so this makes the wait unknown only when another rate-limit
+    /// signal is seen ([`Scanner::verdict`]).
+    pub overlong_403: bool,
+    /// As [`Scanner::cut_header_block`], in a 403 block with no `Retry-After` line seen; counted
+    /// only alongside another rate-limit signal, as [`Scanner::overlong_403`] is.
+    pub cut_403: bool,
     /// The line being read is the last stdout line, and its line end never arrived, so bytes of
     /// it may be missing.
     cut_line: bool,
@@ -185,6 +195,8 @@ struct HeaderBlock {
     first_line: bool,
     /// A `Retry-After` line of this block arrived whole, with its line end.
     retry_after_whole: bool,
+    /// A `Retry-After` line of this block was seen, whole, cut, or too long to keep.
+    retry_after_seen: bool,
     /// The end of the output cut this block short before the wait it asked for was read whole
     /// (see [`Scanner::cut_header_block`]).
     wait_cut: bool,
@@ -215,6 +227,38 @@ impl Pushback {
     pub fn has_no_end(&self) -> bool {
         has_no_end(self.cooldown_secs)
     }
+}
+
+/// Lower-case stderr phrases with which GitHub says the account may not make a request: a
+/// missing permission, scope, or role, an organization policy, or a resource hidden from this
+/// account. With none of the rate-limit signals, an `HTTP 403` carrying one of them is a
+/// permission denial ([`Forbidden::Permission`]): no cooldown starts, because waiting would not
+/// help and every other call on the host would pay for it.
+pub const PERMISSION_PHRASES: &[&str] = &[
+    "resource not accessible by integration",
+    "resource not accessible by personal access token",
+    "must have admin rights",
+    "must have admin access",
+    "must have push access",
+    "must be an admin",
+    "must be an organization owner",
+    "write access to repository not granted",
+    "protected by organization saml enforcement",
+    "oauth app access restrictions",
+    "forbids access via a personal access token",
+    "forbids access via a fine-grained personal access token",
+    "not found",
+];
+
+/// What an `HTTP 403` with no rate-limit signal was ([`Scanner::forbidden`]). Neither kind
+/// starts a cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forbidden {
+    /// GitHub said the account may not make this request; the phrase it used (one of
+    /// [`PERMISSION_PHRASES`]).
+    Permission(&'static str),
+    /// Neither a rate-limit signal nor a permission phrase: only this call backs off.
+    Unknown,
 }
 
 fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
@@ -298,6 +342,12 @@ impl Scanner {
         self.http_429 |= !find_all(&text, b"http 429").is_empty();
         self.http_403 |= !find_all(&text, b"http 403").is_empty();
         self.too_quickly |= !find_all(&text, b"submitted too quickly").is_empty();
+        if self.permission.is_none() {
+            self.permission = PERMISSION_PHRASES
+                .iter()
+                .copied()
+                .find(|p| !find_all(&text, p.as_bytes()).is_empty());
+        }
         for at in find_all(&text, b"abuse") {
             let before = at == 0 || !is_word_byte(text[at - 1]);
             let end = at + 5;
@@ -402,14 +452,17 @@ impl Scanner {
         // does. Once the block holds a CR LF header line it is in gh's header format, and a long
         // line in it, with or without a colon in the bytes kept, may hold or hide the wait.
         let single = self.single_response;
-        let colon = lower.contains(&b':');
+        let colon = lower.iter().position(|b| *b == b':');
         match self.pending.as_mut() {
             Some(block)
                 if can_ask_for_a_wait(block.status)
-                    && (single || colon || block.crlf_headers > 0) =>
+                    && (single || colon.is_some() || block.crlf_headers > 0) =>
             {
                 // The line, or one after it, may hold the Retry-After: the wait is not known.
                 block.overlong = true;
+                if colon.is_some_and(|at| lower[..at].trim_ascii() == b"retry-after") {
+                    block.retry_after_seen = true;
+                }
                 if self.single_response {
                     // gh's own block: commit it now; nothing after it can shorten the cooldown.
                     self.end_block(false);
@@ -563,6 +616,9 @@ impl Scanner {
         let number = text
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|n| n.is_finite() && *n >= 0.0);
+        if name == b"retry-after" {
+            block.retry_after_seen = true;
+        }
         match (name, number) {
             // Its line end never arrived, so digits may be missing: the wait is not known.
             (b"retry-after", _) if self.cut_line => block.wait_cut = true,
@@ -588,8 +644,15 @@ impl Scanner {
             self.retry_after = Some(self.retry_after.map_or(n, |old| old.max(n)));
         }
         self.remaining_zero |= block.remaining_zero;
-        self.overlong_header |= block.overlong;
-        self.cut_header_block |= block.wait_cut;
+        if block.status == 403 && !block.retry_after_seen {
+            // A 403 may be a permission denial: an unread wait matters only if something else
+            // says it was a rate limit.
+            self.overlong_403 |= block.overlong;
+            self.cut_403 |= block.wait_cut;
+        } else {
+            self.overlong_header |= block.overlong;
+            self.cut_header_block |= block.wait_cut;
+        }
     }
 
     /// A value that changes whenever the pushback signals seen so far change (a new pattern, or
@@ -625,7 +688,7 @@ impl Scanner {
         if self.remaining_zero {
             out.push("X-RateLimit-Remaining: 0");
         }
-        if self.overlong_header {
+        if self.overlong_header || self.overlong_403 {
             out.push("over-long header line");
         }
         if self.unread_retry_after {
@@ -634,28 +697,35 @@ impl Scanner {
         if self.cut_retry_after {
             out.push("Retry-After cut off");
         }
-        if self.cut_header_block {
+        if self.cut_header_block || self.cut_403 {
             out.push("header block cut off");
         }
         out
     }
 
     /// The cooldown this output calls for, if any: `max(Retry-After, cooldown_secs)` for a
-    /// rate-limit signal (wording, HTTP 429, `Retry-After`, or `X-RateLimit-Remaining: 0`),
-    /// `plain_403_cooldown_secs` for an HTTP 403 with no rate-limit signal. A `Retry-After`
-    /// longer than [`MAX_RETRY_AFTER_SECS`], or one that could not be read (an over-long header
-    /// line in a 403 or 429 response, a stderr value longer than the bytes kept between chunks,
-    /// a stderr value that runs up to where reading stopped, or a stdout header block that the
-    /// end of the output cut short before its `Retry-After` was read whole), gives a cooldown
-    /// with no end time ([`NO_END`]), never a shorter one.
+    /// rate-limit signal (wording, HTTP 429, `Retry-After`, or `X-RateLimit-Remaining: 0`). An
+    /// `HTTP 403` with none of them calls for no cooldown ([`Scanner::forbidden`] says what it
+    /// was). A `Retry-After` longer than [`MAX_RETRY_AFTER_SECS`], or one that could not be read
+    /// (an over-long header line in a 429 response, a stderr value longer than the bytes kept
+    /// between chunks, a stderr value that runs up to where reading stopped, or a stdout header
+    /// block that the end of the output cut short before its `Retry-After` was read whole), gives
+    /// a cooldown with no end time ([`NO_END`]), never a shorter one. In a 403 block with no
+    /// `Retry-After` line seen, an over-long line or a cut does so only alongside another
+    /// rate-limit signal.
     pub fn verdict(&self, cfg: &Config) -> Option<Pushback> {
         let reason = self.matched().join(", ");
-        if self.overlong_header
-            || self.unread_retry_after
-            || self.cut_retry_after
-            || self.cut_header_block
-        {
-            let why = if self.overlong_header {
+        let limit_signal = self.secondary
+            || self.rate_limit
+            || self.http_429
+            || self.abuse
+            || self.too_quickly
+            || self.retry_after.is_some()
+            || self.remaining_zero;
+        let overlong = self.overlong_header || (limit_signal && self.overlong_403);
+        let cut_block = self.cut_header_block || (limit_signal && self.cut_403);
+        if overlong || self.unread_retry_after || self.cut_retry_after || cut_block {
+            let why = if overlong {
                 format!(
                     "a header line of a 403 or 429 response is longer than the \
                      {MAX_HEADER_LINE} bytes gh-paced reads"
@@ -682,13 +752,6 @@ impl Scanner {
                 ),
             });
         }
-        let limit_signal = self.secondary
-            || self.rate_limit
-            || self.http_429
-            || self.abuse
-            || self.too_quickly
-            || self.retry_after.is_some()
-            || self.remaining_zero;
         if limit_signal {
             let secs = self.retry_after.unwrap_or(0.0).max(cfg.cooldown_secs);
             if secs > MAX_RETRY_AFTER_SECS {
@@ -706,13 +769,20 @@ impl Scanner {
                 reason,
             });
         }
-        if self.http_403 {
-            return Some(Pushback {
-                cooldown_secs: cfg.plain_403_cooldown_secs,
-                reason,
-            });
-        }
         None
+    }
+
+    /// What an `HTTP 403` that calls for no cooldown was: a permission denial when stderr held
+    /// one of [`PERMISSION_PHRASES`], otherwise unknown. `None` when there was no 403, or when
+    /// [`Scanner::verdict`] calls for a cooldown (a rate-limit signal always wins).
+    pub fn forbidden(&self, cfg: &Config) -> Option<Forbidden> {
+        if !self.http_403 || self.verdict(cfg).is_some() {
+            return None;
+        }
+        Some(match self.permission {
+            Some(phrase) => Forbidden::Permission(phrase),
+            None => Forbidden::Unknown,
+        })
     }
 }
 
@@ -794,22 +864,138 @@ mod tests {
         assert_eq!(s.retry_after, Some(3600.0));
     }
 
+    /// #592 gh-paced-permission-403. Each class of HTTP 403, as gh prints it on stderr (`gh:
+    /// MESSAGE (HTTP 403)` from `gh api`, `HTTP 403: MESSAGE (URL)` from other commands): a rate
+    /// limit starts the cooldown; a permission denial starts none and names its phrase; anything
+    /// else starts none and is unknown.
     #[test]
-    fn plain_403_uses_its_own_cooldown() {
-        // 1800 s: a value a configuration file may set (the floor is 900 s).
-        let cfg = Config {
-            plain_403_cooldown_secs: 1800.0,
-            ..Config::default()
+    fn a_403_is_classified_before_it_starts_a_cooldown() {
+        let cfg = Config::default();
+        for limit in [
+            "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you \
+             try again. (HTTP 403)\n",
+            "gh: API rate limit exceeded for user ID 1. (HTTP 403)\n",
+            "gh: You have triggered an abuse detection mechanism. (HTTP 403)\n",
+            "HTTP 403: API rate limit exceeded for installation ID 9. \
+             (https://api.github.com/repos/o/r/issues)\n",
+            // A rate-limit signal wins over permission wording in the same output.
+            "gh: Resource not accessible by integration. (HTTP 403)\ngh: secondary rate limit\n",
+            "gh: Not Found (HTTP 403)\nRetry-After: 60\n",
+        ] {
+            let s = scan(&[limit]);
+            let v = s
+                .verdict(&cfg)
+                .unwrap_or_else(|| panic!("{limit:?}: no cooldown"));
+            assert_eq!(v.cooldown_secs, 900.0, "{limit:?}");
+            assert_eq!(s.forbidden(&cfg), None, "{limit:?}");
+        }
+        for (denied, phrase) in [
+            (
+                "gh: Must have admin rights to Repository. (HTTP 403)\n",
+                "must have admin rights",
+            ),
+            (
+                "gh: Resource not accessible by integration (HTTP 403)\n",
+                "resource not accessible by integration",
+            ),
+            (
+                "HTTP 403: Resource not accessible by personal access token \
+                 (https://api.github.com/repos/o/r/hooks)\n",
+                "resource not accessible by personal access token",
+            ),
+            (
+                "gh: Must have push access to view repository collaborators. (HTTP 403)\n",
+                "must have push access",
+            ),
+            (
+                "gh: Resource protected by organization SAML enforcement. You must grant your \
+                 Personal Access token access to this organization. (HTTP 403)\n",
+                "protected by organization saml enforcement",
+            ),
+            ("gh: Not Found (HTTP 403)\n", "not found"),
+        ] {
+            // Split anywhere, the phrase is still found.
+            let mid = denied.len() / 2;
+            for s in [scan(&[denied]), scan(&[&denied[..mid], &denied[mid..]])] {
+                assert_eq!(s.verdict(&cfg), None, "{denied:?}: a cooldown");
+                assert_eq!(
+                    s.forbidden(&cfg),
+                    Some(Forbidden::Permission(phrase)),
+                    "{denied:?}"
+                );
+            }
+        }
+        for unknown in [
+            "gh: HTTP 403\n",
+            "gh: Forbidden (HTTP 403)\n",
+            "HTTP 403: Something new (https://api.github.com/repos/o/r)\n",
+        ] {
+            let s = scan(&[unknown]);
+            assert_eq!(s.verdict(&cfg), None, "{unknown:?}: a cooldown");
+            assert_eq!(s.forbidden(&cfg), Some(Forbidden::Unknown), "{unknown:?}");
+        }
+        // Permission wording without a 403 is nothing at all.
+        let s = scan(&["gh: Not Found (HTTP 404)\n"]);
+        assert_eq!((s.verdict(&cfg), s.forbidden(&cfg)), (None, None));
+    }
+
+    /// #592: with `--include`, a 403 block is a rate limit only with `Retry-After` or
+    /// `X-RateLimit-Remaining: 0`; otherwise stderr's wording decides. An over-long line or a cut
+    /// in a 403 block with no `Retry-After` line makes the wait unknown only alongside a
+    /// rate-limit signal; with one, or with a `Retry-After` line, it still gives a cooldown with
+    /// no end time.
+    #[test]
+    fn a_403_header_block_needs_a_rate_limit_signal() {
+        let cfg = Config::default();
+        let denied = b"gh: Must have admin rights to Repository. (HTTP 403)\n";
+        let limited = b"gh: You have exceeded a secondary rate limit. (HTTP 403)\n";
+        let block = |text: &str, err: &[u8]| {
+            let mut s = stream(Scanner::single_response(), &[text]);
+            s.feed(err);
+            s
         };
-        let s = scan(&["HTTP 403: Resource not accessible by integration\n"]);
-        let v = s.verdict(&cfg).expect("pushback");
-        assert_eq!(v.cooldown_secs, 1800.0);
-        assert_eq!(v.reason, "HTTP 403");
+        let plain = "HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 4999\r\n\r\n{}";
+        let s = block(plain, denied);
+        assert_eq!(s.verdict(&cfg), None);
         assert_eq!(
-            Config::default().plain_403_cooldown_secs,
-            900.0,
-            "the default plain-403 cooldown is the 15-minute floor"
+            s.forbidden(&cfg),
+            Some(Forbidden::Permission("must have admin rights"))
         );
+        assert_eq!(block(plain, b"").forbidden(&cfg), Some(Forbidden::Unknown));
+        for limit in [
+            "HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\n\r\n{}",
+            "HTTP/2.0 403 Forbidden\r\nRetry-After: 60\r\n\r\n{}",
+        ] {
+            let s = block(limit, denied);
+            assert_eq!(
+                s.verdict(&cfg).expect(limit).cooldown_secs,
+                900.0,
+                "{limit:?}"
+            );
+            assert_eq!(s.forbidden(&cfg), None);
+        }
+        let long = "x".repeat(MAX_HEADER_LINE + 10);
+        let overlong = format!("HTTP/2.0 403 Forbidden\r\nX-Long: {long}\r\n\r\n{{}}");
+        let cut = "HTTP/2.0 403 Forbidden\r\nX-Github-Request-Id: AB";
+        for text in [overlong.as_str(), cut] {
+            let s = block(text, denied);
+            assert_eq!(s.verdict(&cfg), None, "{text:.60}");
+            assert!(matches!(s.forbidden(&cfg), Some(Forbidden::Permission(_))));
+            assert_eq!(block(text, b"").forbidden(&cfg), Some(Forbidden::Unknown));
+            let v = block(text, limited).verdict(&cfg).expect("cooldown");
+            assert!(v.has_no_end(), "{text:.60}: {v:?}");
+        }
+        // A Retry-After line that is itself too long, or cut, is a rate-limit signal.
+        for text in [
+            format!(
+                "HTTP/2.0 403 Forbidden\r\nRetry-After: {}\r\n\r\n",
+                "0".repeat(9000)
+            ),
+            "HTTP/2.0 403 Forbidden\r\nRetry-After: 17".to_string(),
+        ] {
+            let v = block(&text, denied).verdict(&cfg).expect("cooldown");
+            assert!(v.has_no_end(), "{text:.60}: {v:?}");
+        }
     }
 
     /// Feed a whole stdout stream, then its end, to `s`.
@@ -829,6 +1015,16 @@ mod tests {
     /// A single-response call's stdout: only the block on the first line is read.
     fn single(chunks: &[&str]) -> Scanner {
         stream(Scanner::single_response(), chunks)
+    }
+
+    /// `s` after gh's stderr for a response of `status`, as a real rate limit gives it: a 403
+    /// is a rate limit only with its wording (#592), which gh prints on stderr whatever stdout
+    /// held.
+    fn as_limited(mut s: Scanner, status: &str) -> Scanner {
+        if status.starts_with("403") {
+            s.feed(b"gh: You have exceeded a secondary rate limit. (HTTP 403)\n");
+        }
+        s
     }
 
     /// `gh api --include` puts the status line and headers on stdout; a long `Retry-After`
@@ -984,7 +1180,8 @@ mod tests {
                     single(&chunks),
                     headers(&chunks),
                 ] {
-                    assert!(s.overlong_header, "{status}: {s:?}");
+                    assert!(s.overlong_header || s.overlong_403, "{status}: {s:?}");
+                    let s = as_limited(s, status);
                     let v = s.verdict(&cfg).expect("pushback");
                     assert!(v.has_no_end(), "{status}: {v:?}");
                     assert_eq!(v.cooldown_secs, NO_END);
@@ -1064,11 +1261,15 @@ mod tests {
             }
             // A long line with the colon in the bytes kept is still a header line.
             let text = format!("{healthy}HTTP/2.0 {status}\nX-Long: {filler}\r\n\r\n");
-            let v = headers(&[&text]).verdict(&cfg).expect("pushback");
+            let v = as_limited(headers(&[&text]), status)
+                .verdict(&cfg)
+                .expect("pushback");
             assert!(v.has_no_end(), "{status}: {v:?}");
             // Without --paginate the first block is gh's own, so the same colon-free line there
             // still hides what the block may hold: the cooldown has no end time.
-            let v = single(&[&body]).verdict(&cfg).expect("pushback");
+            let v = as_limited(single(&[&body]), status)
+                .verdict(&cfg)
+                .expect("pushback");
             assert!(v.has_no_end(), "{status}: {v:?}");
         }
     }
@@ -1141,8 +1342,8 @@ mod tests {
                 headers(&chunks_of(&after_header)),
             ]);
             for s in cases {
-                assert!(s.overlong_header, "{status}: {s:?}");
-                let v = s.verdict(&cfg).expect("pushback");
+                assert!(s.overlong_header || s.overlong_403, "{status}: {s:?}");
+                let v = as_limited(s, status).verdict(&cfg).expect("pushback");
                 assert!(v.has_no_end(), "{status}: {v:?}");
                 assert!(v.reason.contains("8192 bytes"), "{}", v.reason);
             }
@@ -1210,9 +1411,13 @@ mod tests {
                         } else {
                             headers(&[cut])
                         };
+                        let s = as_limited(s, status);
                         let v = s.verdict(&cfg);
                         let at = format!("{status} colour={colour} single={single_mode} {cut:?}");
-                        if k < "HTTP/2.0 429".len() {
+                        if k < "HTTP/2.0 429".len() && status.starts_with("403") {
+                            // No status yet: stderr's wording alone.
+                            assert_eq!(v.expect("pushback").cooldown_secs, 900.0, "{at}: {s:?}");
+                        } else if k < "HTTP/2.0 429".len() {
                             assert!(v.is_none(), "{at}: {s:?}");
                         } else if k < whole_from {
                             assert!(v.expect("pushback").has_no_end(), "{at}: {s:?}");

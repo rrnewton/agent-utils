@@ -1640,7 +1640,56 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
         c.reason = "fields or --input without -X GET make gh send a POST".into();
     }
     charge_pagination(&mut c, paginate, cfg);
+    if !cfg.allow_admin_api {
+        if let Some(what) = admin_only(&method, &endpoint) {
+            c.refusal = Some(format!(
+                "{} calls {what}, which GitHub serves only to an account with admin rights; \
+                 without them GitHub answers HTTP 403 or 404, so gh-paced does not send it. If \
+                 this account has admin rights there, set GH_PACED_ALLOW_ADMIN_API=1 for this \
+                 call",
+                c.command
+            ));
+        }
+    }
     c
+}
+
+/// What a REST call needs admin rights for, when `method` on `endpoint` (normalised by
+/// [`normalize_endpoint`]) is one of the requests GitHub serves only to repository or
+/// organization administrators. `{owner}`-style placeholders count as names. Reads that need
+/// only read or push access (listing rulesets or collaborators, reading a branch) are left
+/// alone; so is GraphQL.
+pub fn admin_only(method: &str, endpoint: &str) -> Option<&'static str> {
+    let write = !matches!(method, "GET" | "HEAD" | "OPTIONS");
+    let segs: Vec<String> = endpoint
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+    match segs.as_slice() {
+        ["repos", _, _] if matches!(method, "PATCH" | "DELETE") => {
+            Some("the repository's settings (editing or deleting the repository)")
+        }
+        ["repos", _, _, "actions", "permissions", ..] => {
+            Some("the repository's Actions permissions")
+        }
+        ["repos", _, _, "hooks", ..] => Some("the repository's webhooks"),
+        ["repos", _, _, "rulesets", ..] if write => Some("a change to the repository's rulesets"),
+        ["repos", _, _, "branches", rest @ ..]
+            if write && rest.len() >= 2 && rest[1..].contains(&"protection") =>
+        {
+            Some("a change to branch protection")
+        }
+        ["repos", _, _, "collaborators", ..] if write => {
+            Some("a change to the repository's collaborators")
+        }
+        ["orgs", _] if write => Some("the organization's settings"),
+        ["orgs", _, "actions", "permissions", ..] => Some("the organization's Actions permissions"),
+        ["orgs", _, "hooks", ..] => Some("the organization's webhooks"),
+        ["orgs", _, "rulesets", ..] if write => Some("a change to the organization's rulesets"),
+        _ => None,
+    }
 }
 
 /// Charge `paginate_cost` tokens for `--paginate` or `--slurp`, on every classification path.
@@ -2371,5 +2420,66 @@ mod tests {
         assert!(parse_api(&args("-i repos/o/r")).include);
         // `-hi=false`: help, then include false.
         assert!(!parse_api(&args("-hi=false repos/o/r")).include);
+    }
+
+    /// #592 gh-paced-permission-403: requests GitHub serves only to administrators are refused
+    /// before they reach GitHub, naming the override; reads that need only read or push access,
+    /// and GraphQL, are not.
+    #[test]
+    fn admin_only_endpoints_are_refused() {
+        for line in [
+            "api repos/o/r/actions/permissions",
+            "api -X GET /repos/{owner}/{repo}/actions/permissions/workflow",
+            "api https://api.github.com/repos/o/r/actions/permissions?x=1",
+            "api repos/o/r/hooks",
+            "api -X POST repos/o/r/hooks -f name=web",
+            "api -X DELETE repos/o/r/hooks/1",
+            "api -X PATCH repos/o/r -f description=x",
+            "api -X delete repos/o/r",
+            "api -X POST repos/o/r/rulesets -f name=x",
+            "api -X PUT repos/o/r/branches/main/protection --input p.json",
+            "api -X DELETE repos/o/r/branches/feat/x/protection/required_signatures",
+            "api -X PUT repos/o/r/collaborators/u",
+            "api -X DELETE repos/o/r/collaborators/u",
+            "api -X PATCH orgs/acme -f name=x",
+            "api orgs/acme/hooks",
+            "api orgs/acme/actions/permissions",
+            "api -X PUT orgs/acme/rulesets/1 --input r.json",
+        ] {
+            let c = cls(line);
+            let refusal = c
+                .refusal
+                .unwrap_or_else(|| panic!("{line:?} must be refused"));
+            assert!(
+                refusal.contains("GH_PACED_ALLOW_ADMIN_API=1"),
+                "{line:?}: {refusal}"
+            );
+            assert!(refusal.contains("admin rights"), "{line:?}: {refusal}");
+            let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+            let cfg = Config {
+                allow_admin_api: true,
+                ..Config::default()
+            };
+            assert!(
+                classify(&args, &cfg).refusal.is_none(),
+                "{line:?} with the override"
+            );
+        }
+        for line in [
+            "api repos/o/r",
+            "api repos/o/r/rulesets",
+            "api repos/o/r/rules/branches/main",
+            "api repos/o/r/collaborators",
+            "api repos/o/r/collaborators/u/permission",
+            "api repos/o/r/branches/main",
+            "api repos/o/r/branches/main/protection",
+            "api -X POST repos/o/r/branches/protection/rename -f new_name=x",
+            "api -X POST repos/o/r/issues -f title=t",
+            "api orgs/acme",
+            "api repos/o/hooks",
+            "api graphql -f query=mutation{x}",
+        ] {
+            assert!(cls(line).refusal.is_none(), "{line:?} must not be refused");
+        }
     }
 }

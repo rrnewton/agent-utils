@@ -12,7 +12,7 @@ use crate::cli::EXIT_CONFIG;
 use crate::clock::{Clock, RealClock};
 use crate::config::{ClassLimits, Config};
 use crate::guard::{self, Verdict};
-use crate::pushback::{has_no_end, Pushback, Scanner};
+use crate::pushback::{has_no_end, Forbidden, Pushback, Scanner};
 use crate::ratelimit;
 use crate::runner::{
     write_stderr_bounded, DrainCommand, Exit, Invocation, PushbackHook, Ran, Runner,
@@ -26,6 +26,14 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Whether a call that got an unknown HTTP 403 may wait before it returns: gh ran, the call is
+/// not a GIT_CREDENTIAL call (git may hold its caller's locks), and its caller has not asked it
+/// to stop.
+fn may_back_off(c: &Classification, ran: Option<Ran>) -> bool {
+    c.class != Class::GitCredential
+        && ran.is_some_and(|r| r.late_signal.is_none() && !r.deadline_hit)
+}
 
 /// Exit status when a budget, cooldown or recursion limit refuses the call.
 pub const EXIT_REFUSED: i32 = 75;
@@ -590,6 +598,11 @@ impl Wrapper<'_> {
         if let Err(e) = self.finish(&c, &summary, ran, &scanner, admitted) {
             self.loud("ERROR", &format!("bookkeeping after gh exited failed: {e}"));
         }
+        if self.unknown_403_backoff(&c, ran, &scanner) {
+            // Only this call waits, outside the lock, after saying why (#592).
+            self.flush();
+            self.clock.sleep(self.cfg.unknown_403_backoff_secs);
+        }
         if ran.is_some_and(|r| r.deadline_hit) {
             return Outcome::Exit(EXIT_REFUSED);
         }
@@ -996,6 +1009,73 @@ impl Wrapper<'_> {
         }
         self.write_audit(&r);
         state::save(&self.paths, &st)
+    }
+
+    /// Whether this call waits [`Config::unknown_403_backoff_secs`] before it returns: gh ran
+    /// and got an HTTP 403 that was neither a rate limit nor a permission denial. A
+    /// GIT_CREDENTIAL call never waits (git may hold its caller's locks), and neither does a
+    /// call its caller has already asked to stop.
+    fn unknown_403_backoff(&self, c: &Classification, ran: Option<Ran>, scanner: &Scanner) -> bool {
+        may_back_off(c, ran) && scanner.forbidden(&self.cfg) == Some(Forbidden::Unknown)
+    }
+
+    /// Report an HTTP 403 that started no cooldown (see [`Scanner::forbidden`]) and audit it as
+    /// a `forbidden` event. Other calls on the host are unaffected either way.
+    fn report_forbidden(
+        &mut self,
+        kind: Forbidden,
+        c: &Classification,
+        summary: &str,
+        ran: Option<Ran>,
+    ) {
+        let (detail, lines) = match kind {
+            Forbidden::Permission(phrase) => (
+                format!("permission denied (HTTP 403, \"{phrase}\"); no cooldown"),
+                vec![
+                    format!(
+                        "GitHub refused `{}` because this account may not make that request \
+                         (HTTP 403, \"{phrase}\"): a permission denial, not a rate limit",
+                        c.command
+                    ),
+                    "no cooldown was started; other gh calls on this host are not affected"
+                        .to_string(),
+                    "Do not retry it: it fails until the account gets the access it needs \
+                     (admin rights, a token scope, or an app permission). Tell your coordinator \
+                     if the task needs it."
+                        .to_string(),
+                ],
+            ),
+            Forbidden::Unknown => {
+                let wait = if may_back_off(c, ran) {
+                    format!(
+                        "this call alone waits {} s before returning, so a retry loop cannot \
+                         hammer GitHub",
+                        self.cfg.unknown_403_backoff_secs
+                    )
+                } else {
+                    "this call returns at once".to_string()
+                };
+                (
+                    "HTTP 403 with no rate-limit signal and no recognised reason; no cooldown"
+                        .to_string(),
+                    vec![
+                        format!(
+                            "GitHub refused `{}` with HTTP 403, with no rate-limit signal and \
+                             no reason gh-paced recognises",
+                            c.command
+                        ),
+                        format!("no host-wide cooldown was started; {wait}"),
+                        "Do not retry it in a loop. If it keeps happening, stop and tell your \
+                         coordinator."
+                            .to_string(),
+                    ],
+                )
+            }
+        };
+        self.banner("FORBIDDEN", &lines);
+        let mut r = self.record("forbidden", c, summary);
+        r.detail = detail;
+        self.write_audit(&r);
     }
 
     fn apply_pushback(&mut self, st: &mut State, pb: &Pushback, command: &str, now: f64) {
@@ -1563,6 +1643,8 @@ impl Wrapper<'_> {
             let mut r = self.record("pushback", c, summary);
             r.detail = pb.reason.clone();
             self.write_audit(&r);
+        } else if let Some(kind) = scanner.forbidden(&self.cfg) {
+            self.report_forbidden(kind, c, summary, ran);
         }
         if let Some(limit) = c
             .deadline_secs

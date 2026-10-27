@@ -12,8 +12,15 @@ budget is used up, printing a loud warning line on stderr. It also:
 
 - reads GitHub's own account-wide numbers (`GET /rate_limit`) and slows down or
   stops as the remaining allowance shrinks;
-- pauses every call for 15 minutes after any rate-limit, abuse or HTTP 403
-  response;
+- pauses every call for 15 minutes (or as long as `Retry-After` asks) after a
+  rate-limit or abuse response. An HTTP 403 counts only when it is a rate
+  limit: a permission denial (`Must have admin rights`, `Resource not
+  accessible by integration`, ...) is reported and starts no cooldown, and any
+  other 403 holds only its own call for 30 s, so a missing permission never
+  stops other agents' calls or git's credential helper;
+- refuses `gh api` calls to endpoints that need admin rights (webhooks,
+  Actions permissions, ruleset and branch protection changes, ...) before they
+  reach GitHub, unless `GH_PACED_ALLOW_ADMIN_API=1`;
 - refuses write bodies larger than 8 KiB or containing long base64 runs,
   whether they come from an argument, a file, stdin, one of gh's ordinary
   aliases (which gh-paced expands itself, so gh never sees the alias name, as

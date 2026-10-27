@@ -1364,8 +1364,14 @@ fn a_long_retry_after_is_never_shortened() {
 /// `var`) holds an over-long header line in a 429 or 403 response, and check that it starts a
 /// cooldown with no end time, never a shorter one: the banner names the two things a person
 /// removes to end it, both files record no end, and the next paced call is refused without
-/// running gh.
+/// running gh. A 403 response is a rate limit only with its wording, which gh prints on stderr
+/// (#592 gh-paced-permission-403), so a 403 response comes with it here.
 fn assert_overlong_header_starts_a_no_end_cooldown(name: &str, var: &str, out: &str) {
+    let err = if out.starts_with("HTTP/2.0 403") {
+        "gh: You have exceeded a secondary rate limit. (HTTP 403)"
+    } else {
+        ""
+    };
     let state = |sb: &Sandbox, name: &str| -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(sb.path(name)).unwrap()).unwrap()
     };
@@ -1374,7 +1380,10 @@ fn assert_overlong_header_starts_a_no_end_cooldown(name: &str, var: &str, out: &
         ("paginate", &["api", "-i", "--paginate", "repos/o/r"][..]),
     ] {
         let sb = Sandbox::new(&format!("{name}-{mode}"), FAST);
-        let o = sb.run(args, &[(var, out), ("FAKE_GH_EXIT", "1")]);
+        let o = sb.run(
+            args,
+            &[(var, out), ("FAKE_GH_STDERR", err), ("FAKE_GH_EXIT", "1")],
+        );
         let err = stderr(&o);
         assert_eq!(o.status.code(), Some(1), "{mode}: {err}");
         assert!(
@@ -3583,4 +3592,163 @@ fn late_output_past_the_elapsed_cutoff_is_delivered() {
     assert_eq!(status.code(), Some(0), "{err}");
     assert_lines_in_order(&err, 16);
     assert!(!err.contains("GH-PACED WARNING"), "{err}");
+}
+
+/// Whether the sandbox's account has a cooldown recorded, in either place it is kept.
+fn has_cooldown(sb: &Sandbox) -> bool {
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+            .unwrap();
+    !state["cooldown"].is_null() || sb.path("state/test.cooldown").exists()
+}
+
+/// #592 gh-paced-permission-403: the reported incident, replayed with gh's real output for an
+/// endpoint that needs admin rights. A permission denial passes gh's output and status through,
+/// says it was not a rate limit, and starts no cooldown, so the git credential helper and every
+/// other call keep working; it is audited as `forbidden`. With `--include` (headers on stdout,
+/// no rate-limit signal in them) it is the same.
+#[test]
+fn a_permission_403_starts_no_cooldown() {
+    let body = r#"{"message":"Must have admin rights to Repository.","documentation_url":"https://docs.github.com/rest/actions/secrets","status":"403"}"#;
+    let headed = format!(
+        "HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 4987\r\n\r\n{body}"
+    );
+    for (name, args, out) in [
+        (
+            "perm",
+            &["api", "repos/o/r/actions/secrets"][..],
+            body.to_string(),
+        ),
+        (
+            "perm-i",
+            &["api", "-i", "repos/o/r/actions/secrets"][..],
+            headed,
+        ),
+    ] {
+        let sb = Sandbox::new(name, FAST);
+        let started = Instant::now();
+        let o = sb.run(
+            args,
+            &[
+                ("FAKE_GH_STDOUT", out.as_str()),
+                (
+                    "FAKE_GH_STDERR",
+                    "gh: Must have admin rights to Repository. (HTTP 403)",
+                ),
+                ("FAKE_GH_EXIT", "1"),
+            ],
+        );
+        let err = stderr(&o);
+        assert_eq!(o.status.code(), Some(1), "{name}: {err}");
+        assert!(stdout(&o).contains("Must have admin rights"), "{name}");
+        assert!(err.contains("GH-PACED FORBIDDEN [test]"), "{name}: {err}");
+        assert!(
+            err.contains("a permission denial, not a rate limit"),
+            "{name}: {err}"
+        );
+        assert!(err.contains("no cooldown was started"), "{name}: {err}");
+        assert!(!err.contains("PUSHBACK"), "{name}: {err}");
+        assert!(
+            started.elapsed().as_secs_f64() < 20.0,
+            "{name}: it did not back off"
+        );
+        assert!(!has_cooldown(&sb), "{name}: a cooldown was recorded");
+        let audit = std::fs::read_to_string(sb.path("state/test.audit.jsonl")).unwrap();
+        assert!(audit.contains(r#""event":"forbidden""#), "{name}: {audit}");
+        assert!(audit.contains("permission denied"), "{name}: {audit}");
+        for next in [
+            &["auth", "git-credential", "get"][..],
+            &["api", "repos/o/r"],
+        ] {
+            let o = sb.run(next, &[]);
+            assert_eq!(o.status.code(), Some(0), "{name} {next:?}: {}", stderr(&o));
+        }
+        assert_eq!(sb.starts().len(), 3, "{name}: {:?}", sb.log());
+    }
+}
+
+/// #592: a 403 with no rate-limit signal and no permission wording holds only its own call for
+/// `unknown_403_backoff_secs` (1 s here), starts no cooldown, and leaves git working; a
+/// GIT_CREDENTIAL call never waits.
+#[test]
+fn an_unknown_403_backs_off_only_its_own_call() {
+    let config = r#"{"write": {"per_minute": 60, "burst": 1, "per_hour": 30, "max_in_flight": 1},
+                     "read": {"per_minute": 60, "burst": 10, "per_hour": 500},
+                     "unknown_403_backoff_secs": 1}"#;
+    let sb = Sandbox::new("unknown-403", config);
+    let started = Instant::now();
+    let o = sb.run(
+        &["api", "repos/o/r/pages"],
+        &[("FAKE_GH_STDERR", "gh: HTTP 403"), ("FAKE_GH_EXIT", "1")],
+    );
+    let took = started.elapsed().as_secs_f64();
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("GH-PACED FORBIDDEN [test]"), "{err}");
+    assert!(err.contains("no reason gh-paced recognises"), "{err}");
+    assert!(err.contains("this call alone waits 1 s"), "{err}");
+    assert!(took >= 1.0, "it backed off: {took}");
+    assert!(!has_cooldown(&sb));
+    let started = Instant::now();
+    let o = sb.run(
+        &["auth", "git-credential", "get"],
+        &[("FAKE_GH_STDERR", "gh: HTTP 403")],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("this call returns at once"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        started.elapsed().as_secs_f64() < 1.0,
+        "a credential call never waits"
+    );
+    assert!(!has_cooldown(&sb));
+    assert_eq!(sb.starts().len(), 2, "{:?}", sb.log());
+}
+
+/// #592: a primary rate limit reported as a 403 still starts the host-wide cooldown, even with
+/// permission-sounding text beside it, and the credential helper is then refused.
+#[test]
+fn a_rate_limit_403_still_starts_a_cooldown() {
+    let sb = Sandbox::new("limit-403", FAST);
+    let o = sb.run(
+        &["api", "repos/o/r/issues"],
+        &[
+            (
+                "FAKE_GH_STDERR",
+                "gh: API rate limit exceeded for user ID 1. Not Found (HTTP 403)",
+            ),
+            ("FAKE_GH_EXIT", "1"),
+        ],
+    );
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("GH-PACED PUSHBACK [test]"), "{err}");
+    assert!(!err.contains("FORBIDDEN"), "{err}");
+    assert!(has_cooldown(&sb));
+    let o = sb.run(&["auth", "git-credential", "get"], &[]);
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.log());
+}
+
+/// #592: a request GitHub serves only to administrators is refused before gh runs (exit 64),
+/// naming the override, and runs with `GH_PACED_ALLOW_ADMIN_API=1`.
+#[test]
+fn an_admin_only_endpoint_is_refused_before_github() {
+    let sb = Sandbox::new("admin-only", FAST);
+    let o = sb.run(&["api", "repos/o/r/actions/permissions"], &[]);
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(64), "{err}");
+    assert!(err.contains("Actions permissions"), "{err}");
+    assert!(err.contains("GH_PACED_ALLOW_ADMIN_API=1"), "{err}");
+    assert!(sb.starts().is_empty(), "{:?}", sb.log());
+    let o = sb.run(
+        &["api", "repos/o/r/actions/permissions"],
+        &[("GH_PACED_ALLOW_ADMIN_API", "1")],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 1, "{:?}", sb.log());
+    assert!(!has_cooldown(&sb));
 }
