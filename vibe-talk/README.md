@@ -856,6 +856,15 @@ as it generates pauses at each boundary for as long as its own first audio takes
 `make -C vibe-talk read-aloud-blocks-browser` walks a long message in a real Chromium and measures
 every boundary on the audio clock.
 
+A block of more than 60 words is read in **pieces** of whole sentences (`#486 read-aloud-pieces`; a
+line typed with a bullet glyph is a piece of its own), and the pieces of a paragraph are **balanced**
+(`read-chunk-balance`). For each number of pieces the server takes the most even cut, and accepts it
+when the paragraph's longest piece is at most twice its shortest. A paragraph of 61 words that greedy
+packing read as 53 words and 8 is now read as 23 and 38. A message that is one paragraph is cut finer,
+towards 15 words a piece, so a short message of a few sentences is a few steps rather than one, while
+the same paragraph inside a longer message stays one piece. `src/render.rs` (`balance_sentences`) and
+`web/voice.js` (`balanceSentences`) apply the same rule, held to `tests/fixtures/read_aloud_pieces.json`.
+
 Inside the block being read, the **sentence being said** is lit too (`#379 read-aloud-sentences`),
 underlined as well as coloured. Not by another request per sentence, which would pause at every
 full stop on a voice that speaks as it generates: the block's audio is one stream, and the sentence
@@ -866,8 +875,10 @@ that arrived whole. It uses the CSS Custom Highlight API and changes nothing in 
 browser without the API lights the block alone.
 
 Under Previous and Next the strip draws the read as a **timeline of its blocks**
-(`#380 read-aloud-timeline`), each as wide as what it says: the blocks heard tinted, the one being
-read filled. A tap on one reads from there.
+(`#380 read-aloud-timeline`), the longer ones wider: the blocks heard tinted, the one being read
+filled. A tap on one reads from there. Widths follow the square root of how long each block is, and
+none is more than twice the mean, so one long block cannot take most of the line
+(`read-chunk-balance`). The pieces of one block stand closer together than two blocks do.
 
 The strip reads Previous, `k of n` and Next, in that order on screen and for Tab
 (`#442 read-strip-order`); it has no Pause or Stop of its own (`#537 scrub-bar-no-play-pause`). While

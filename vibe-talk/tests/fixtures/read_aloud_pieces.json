@@ -1,5 +1,5 @@
 {
- "about": "#486 read-aloud-pieces: the pieces a block's text is read in. src/render.rs read_pieces and web/voice.js readPieces are both held to every case here.",
+ "about": "#486 read-aloud-pieces: the pieces a block's text is read in. src/render.rs read_pieces and web/voice.js readPieces are both held to every case here. A case with \"alone\": true is the whole of a message that is one block (read-chunk-balance).",
  "cases": [
   {
    "name": "typed bullets",
@@ -15,9 +15,9 @@
   {
    "name": "long paragraph",
    "pieces": [
-    "The cache follows the same rules as the store does. Newer content replaces older content whenever a read brings it, and a deletion leaves a contentless tombstone behind it. A pushed event can never resurrect a deleted message, and only a read that started after the deletion can bring it back. That keeps the two copies honest with each other.",
-    "Slack's forward feed is additions-only: what is new since a point never reports edits or deletes. An edit or delete of an older message is therefore noticed only when someone loads that range again, which can be hours later on a quiet channel.",
-    "The cheap improvement is to subscribe the hint to updates and deletions too, and re-read just the affected message."
+    "The cache follows the same rules as the store does. Newer content replaces older content whenever a read brings it, and a deletion leaves a contentless tombstone behind it.",
+    "A pushed event can never resurrect a deleted message, and only a read that started after the deletion can bring it back. That keeps the two copies honest with each other. Slack's forward feed is additions-only: what is new since a point never reports edits or deletes.",
+    "An edit or delete of an older message is therefore noticed only when someone loads that range again, which can be hours later on a quiet channel. The cheap improvement is to subscribe the hint to updates and deletions too, and re-read just the affected message."
    ],
    "text": "The cache follows the same rules as the store does. Newer content replaces older content whenever a read brings it, and a deletion leaves a contentless tombstone behind it. A pushed event can never resurrect a deleted message, and only a read that started after the deletion can bring it back. That keeps the two copies honest with each other. Slack's forward feed is additions-only: what is new since a point never reports edits or deletes. An edit or delete of an older message is therefore noticed only when someone loads that range again, which can be hours later on a quiet channel. The cheap improvement is to subscribe the hint to updates and deletions too, and re-read just the affected message."
   },
@@ -44,6 +44,40 @@
     "beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta! gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma?"
    ],
    "text": "alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha said \"stop.\" beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta! gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma?"
+  },
+  {
+   "alone": true,
+   "name": "read-chunk-balance: the owner's paragraph, a message alone (was 53 and 8 words)",
+   "pieces": [
+    "Fair, a hash says nothing. A worker is reading both Widget lanes' status files, briefs and the last 3 days of widget2 commits.",
+    "It will report what each lane has actually accomplished (capabilities, numbers, commit links), the crate layout, and specifically how far the page-protection-based lazy scanning scheme got and where it lives. I will reply here shortly with the substance."
+   ],
+   "text": "Fair, a hash says nothing. A worker is reading both Widget lanes' status files, briefs and the last 3 days of widget2 commits. It will report what each lane has actually accomplished (capabilities, numbers, commit links), the crate layout, and specifically how far the page-protection-based lazy scanning scheme got and where it lives. I will reply here shortly with the substance."
+  },
+  {
+   "name": "read-chunk-balance: the owner's paragraph inside a longer message",
+   "pieces": [
+    "Fair, a hash says nothing. A worker is reading both Widget lanes' status files, briefs and the last 3 days of widget2 commits.",
+    "It will report what each lane has actually accomplished (capabilities, numbers, commit links), the crate layout, and specifically how far the page-protection-based lazy scanning scheme got and where it lives. I will reply here shortly with the substance."
+   ],
+   "text": "Fair, a hash says nothing. A worker is reading both Widget lanes' status files, briefs and the last 3 days of widget2 commits. It will report what each lane has actually accomplished (capabilities, numbers, commit links), the crate layout, and specifically how far the page-protection-based lazy scanning scheme got and where it lives. I will reply here shortly with the substance."
+  },
+  {
+   "alone": true,
+   "name": "read-chunk-balance: a short paragraph alone is a few balanced steps",
+   "pieces": [
+    "The overnight run finished every lane that was queued before midnight on the shared host.",
+    "Two lanes failed their gates on a flaky browser walk and were retried once this morning.",
+    "Both retries passed, so everything has landed and the next deploy can go out at noon."
+   ],
+   "text": "The overnight run finished every lane that was queued before midnight on the shared host. Two lanes failed their gates on a flaky browser walk and were retried once this morning. Both retries passed, so everything has landed and the next deploy can go out at noon."
+  },
+  {
+   "name": "read-chunk-balance: the same paragraph inside a longer message is one piece",
+   "pieces": [
+    "The overnight run finished every lane that was queued before midnight on the shared host. Two lanes failed their gates on a flaky browser walk and were retried once this morning. Both retries passed, so everything has landed and the next deploy can go out at noon."
+   ],
+   "text": "The overnight run finished every lane that was queued before midnight on the shared host. Two lanes failed their gates on a flaky browser walk and were retried once this morning. Both retries passed, so everything has landed and the next deploy can go out at noon."
   }
  ]
 }

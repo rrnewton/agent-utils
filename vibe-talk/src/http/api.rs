@@ -5438,6 +5438,8 @@ fn spoken_blocks(
 ) -> Vec<SpokenBlock> {
     use crate::render::BlockKind;
     let blocks = crate::render::source_blocks(&message.content, markup, &message.mentions);
+    // `read-chunk-balance`: a message that is one block is cut finer than a block of a longer one.
+    let alone = blocks.len() == 1;
     let cut: Vec<(BlockKind, Vec<&str>)> = blocks
         .iter()
         .map(|block| {
@@ -5448,7 +5450,7 @@ fn spoken_blocks(
             let pieces = match block.kind {
                 BlockKind::Code | BlockKind::Table => vec![block.source.as_str()],
                 _ if fenced => vec![block.source.as_str()],
-                _ => crate::render::read_pieces(&block.source),
+                _ => crate::render::read_pieces(&block.source, alone),
             };
             // A block of nothing a piece can hold is still a block the page draws: kept whole.
             let pieces = if pieces.is_empty() {

@@ -37623,7 +37623,8 @@ const READING_BLOCK_ATTRIBUTE = "data-reading-block";
  *
  * `#486 read-aloud-pieces`. A prepared block is a PIECE of a drawn one (`element`, `piece` of
  * `pieces`); a server from before pieces lists one per drawn block, each its own element. Each entry
- * here is `{element, kind, piece, pieces}`: the drawn element it is lit as, and which of its pieces.
+ * here is `{element, kind, piece, pieces, alone}`: the drawn element it is lit as, which of its pieces,
+ * and whether it is the message's one block (`read-chunk-balance`).
  */
 function preparedBlocksOf(row, part) {
   const body = childByClass(row, "body");
@@ -37650,6 +37651,8 @@ function preparedBlocksOf(row, part) {
     kind: block.kind,
     piece: Number.isInteger(block.piece) ? block.piece : 0,
     pieces: Number.isInteger(block.pieces) ? block.pieces : 1,
+    // `read-chunk-balance`: the message is one block, which the server cut finer (`readPieces`).
+    alone: drawn.length === 1,
   }));
 }
 
@@ -37826,9 +37829,17 @@ function sentencesOf(element, within = null) {
 // a piece of its own and the lines between are one; a piece of more than `READ_PIECE_WORDS` words is
 // cut at sentence ends; only one sentence longer than that is cut into equal runs of words. The block
 // stays lit while its pieces are read, and the sentence light keeps inside the piece being read.
+//
+// `read-chunk-balance`: the sentences of a paragraph are cut into BALANCED pieces, against the
+// balance metric (`pieceSkewPasses`), and a message that is one paragraph is cut finer. See
+// src/render.rs, whose section note says why; `balanceSentences` is its `balance_sentences`.
 
 /** The most words one piece says, unless one sentence is longer. src/render.rs `READ_PIECE_WORDS`. */
 const READ_PIECE_WORDS = 60;
+/** The words a piece aims at in a message that is one paragraph. src/render.rs `READ_PIECE_ALONE_WORDS`. */
+const READ_PIECE_ALONE_WORDS = 15;
+/** The longest piece of a paragraph at most this many times its shortest. src/render.rs `READ_PIECE_SKEW`. */
+const READ_PIECE_SKEW = 2;
 /** The glyphs a typed bullet begins with. src/render.rs `READ_BULLETS`. */
 const READ_BULLETS = "•◦▪▫‣⁃●○■□▸▹►";
 
@@ -37839,12 +37850,14 @@ function wordCount(text) {
 
 /**
  * The pieces `text` is read in, in order, each as `{start, end}`, offsets into `text` with the white
- * space at either end left out. See the section note.
+ * space at either end left out. `alone`: `text` is the whole of a message that is one block, which is
+ * cut finer. See the section note.
  *
  * @param {string} text
+ * @param {boolean} [alone]
  * @returns {Array<{start: number, end: number}>}
  */
-function readPieces(text) {
+function readPieces(text, alone = false) {
   const groups = [];
   let run = null;
   let at = 0;
@@ -37861,29 +37874,38 @@ function readPieces(text) {
     }
   }
   if (run) groups.push(run);
+  // Cut finer only a paragraph alone: typed bullets keep the pieces they were typed as.
+  const finer = alone && groups.length === 1;
   const ranges = [];
   for (const [from, to] of groups) {
-    if (wordCount(text.slice(from, to)) <= READ_PIECE_WORDS) {
+    if (!finer && wordCount(text.slice(from, to)) <= READ_PIECE_WORDS) {
       ranges.push([from, to]);
       continue;
     }
-    let current = null;
+    // The sentences between the ones too long for a piece, each balanced on its own run.
+    let sentences = [];
+    const flush = () => {
+      let at = 0;
+      for (const size of balanceSentences(sentences.map((one) => one[2]), finer)) {
+        ranges.push([sentences[at][0], sentences[at + size - 1][1]]);
+        at += size;
+      }
+      sentences = [];
+    };
     let start = from;
     for (const end of sentenceEnds(text, from, to)) {
       const count = wordCount(text.slice(start, end));
       if (count > READ_PIECE_WORDS) {
-        if (current) ranges.push([current[0], current[1]]);
-        current = null;
+        flush();
         ranges.push(...evenRuns(text, start, end, count));
-      } else if (current && current[2] + count <= READ_PIECE_WORDS) {
-        current = [current[0], end, current[2] + count];
+      } else if (count === 0) {
+        if (sentences.length > 0) sentences[sentences.length - 1][1] = end;
       } else {
-        if (current) ranges.push([current[0], current[1]]);
-        current = [start, end, count];
+        sentences.push([start, end, count]);
       }
       start = end;
     }
-    if (current) ranges.push([current[0], current[1]]);
+    flush();
   }
   const pieces = [];
   for (let [start, end] of ranges) {
@@ -37892,6 +37914,81 @@ function readPieces(text) {
     if (end > start) pieces.push({ start, end });
   }
   return pieces;
+}
+
+/**
+ * `read-chunk-balance`. How many of the sentences of `counts` go in each piece, in order: the most even
+ * cut for each number of pieces, the first that passes the balance metric, tried from the number
+ * wanted down to the fewest that fit and then up. src/render.rs `balance_sentences`, the same rule step
+ * for step, ties included.
+ *
+ * @param {number[]} counts each sentence's words, none over `READ_PIECE_WORDS`.
+ * @param {boolean} alone
+ * @returns {number[]}
+ */
+function balanceSentences(counts, alone) {
+  const n = counts.length;
+  const total = counts.reduce((sum, count) => sum + count, 0);
+  if (n === 0) return [];
+  if (!alone && total <= READ_PIECE_WORDS) return [n];
+  const fewest = Math.max(1, Math.ceil(total / READ_PIECE_WORDS));
+  const wanted = Math.min(n, Math.max(fewest, alone ? Math.floor(total / READ_PIECE_ALONE_WORDS) : fewest));
+  const prefix = [0];
+  for (const count of counts) prefix.push(prefix[prefix.length - 1] + count);
+  const best = Array.from({ length: n + 1 }, () => new Array(n + 1).fill(null));
+  const from = Array.from({ length: n + 1 }, () => new Array(n + 1).fill(0));
+  best[0][0] = 0;
+  for (let j = 1; j <= n; j += 1) {
+    for (let i = j; i <= n; i += 1) {
+      for (let m = j - 1; m < i; m += 1) {
+        const words = prefix[i] - prefix[m];
+        if (words > READ_PIECE_WORDS || best[j - 1][m] === null) continue;
+        const sum = best[j - 1][m] + words * words;
+        if (best[j][i] === null || sum < best[j][i]) {
+          best[j][i] = sum;
+          from[j][i] = m;
+        }
+      }
+    }
+  }
+  const cut = (k) => {
+    if (best[k][n] === null) return null;
+    const sizes = [];
+    let i = n;
+    for (let j = k; j >= 1; j -= 1) {
+      sizes.push(i - from[j][i]);
+      i = from[j][i];
+    }
+    return sizes.reverse();
+  };
+  const order = [];
+  for (let k = wanted; k >= fewest; k -= 1) order.push(k);
+  for (let k = wanted + 1; k <= n; k += 1) order.push(k);
+  let least = null;
+  for (const k of order) {
+    const sizes = cut(k);
+    if (!sizes) continue;
+    let at = 0;
+    const words = sizes.map((size) => {
+      at += size;
+      return prefix[at] - prefix[at - size];
+    });
+    if (pieceSkewPasses(words)) return sizes;
+    const [longest, shortest] = longestAndShortest(words);
+    if (least === null || longest * least.shortest < least.longest * shortest) least = { sizes, longest, shortest };
+  }
+  return least ? least.sizes : counts.map(() => 1);
+}
+
+/** The longest and the shortest of `words`, at least 1 each. src/render.rs `longest_and_shortest`. */
+function longestAndShortest(words) {
+  return [Math.max(1, ...words), Math.max(1, Math.min(...words))];
+}
+
+/** The balance metric: the longest piece at most `READ_PIECE_SKEW` times the shortest. src/render.rs `piece_skew_passes`. */
+function pieceSkewPasses(words) {
+  const [longest, shortest] = longestAndShortest(words);
+  return longest <= READ_PIECE_SKEW * shortest;
 }
 
 /**
@@ -37931,11 +38028,11 @@ function evenRuns(text, from, to, count) {
  * Piece `block.piece` of the drawn block `block` as `{start, end}` in its shown text, when the page
  * cuts that block into as many pieces as the server read it in; else null.
  *
- * @param {{element: Element, piece: number, pieces: number}} block
+ * @param {{element: Element, piece: number, pieces: number, alone?: boolean}} block
  */
 function readPieceOf(block) {
   if (block.pieces < 2) return null;
-  const pieces = readPieces(shownTextOf(block.element).text);
+  const pieces = readPieces(shownTextOf(block.element).text, block.alone === true);
   return pieces.length === block.pieces ? pieces[block.piece] || null : null;
 }
 
@@ -38215,14 +38312,22 @@ function renderReadTimeline() {
   }
   if (readTimelineOf !== playing.segments) {
     readTimelineOf = playing.segments;
+    const listedOf = (segment) => (segment.block === null ? null
+      : playing.blocks && playing.blocks[segment.part] && playing.blocks[segment.part][segment.block]);
+    const weights = readTimelineWeights(playing.segments.map((segment) => {
+      const listed = listedOf(segment);
+      return Number(listed && listed.chars) || 1;
+    }));
     line.replaceChildren(...playing.segments.map((segment, index) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "read-timeline-block";
-      const listed = segment.block === null ? null
-        : playing.blocks && playing.blocks[segment.part] && playing.blocks[segment.part][segment.block];
-      const weight = Math.max(1, Number(listed && listed.chars) || 1);
-      button.setAttribute("style", `--block-weight: ${weight}`);
+      const listed = listedOf(segment);
+      button.setAttribute("style", `--block-weight: ${weights[index]}`);
+      // `read-chunk-balance`. A piece after the first of its drawn block stands closer to the one before:
+      // the line reads as the message's blocks, each of its pieces — a first step to the
+      // documents-view navigator's levels.
+      if (listed && Number.isInteger(listed.piece) && listed.piece > 0) button.setAttribute("data-continues", "");
       button.setAttribute("aria-label", `Read from block ${index + 1} of ${playing.segments.length}`);
       button.addEventListener("click", () => { jumpReading(index); });
       return button;
@@ -38232,6 +38337,20 @@ function renderReadTimeline() {
     button.setAttribute("aria-current", index === playing.segment ? "true" : "false");
     button.toggleAttribute("data-heard", index < playing.segment);
   });
+}
+
+/**
+ * `read-chunk-balance`. How wide each block of the timeline is, from how long each says (`chars`): by
+ * the square root, and none over twice the mean, so a long block reads as longer without taking the
+ * line. The owner, 2026-10-27: one block must not take most of the width. Rounded to thousandths.
+ *
+ * @param {number[]} chars
+ * @returns {number[]}
+ */
+function readTimelineWeights(chars) {
+  const roots = chars.map((count) => Math.sqrt(Math.max(1, count)));
+  const mean = roots.reduce((sum, root) => sum + root, 0) / Math.max(1, roots.length);
+  return roots.map((root) => Math.round(Math.min(root, 2 * mean) * 1000) / 1000);
 }
 
 /**

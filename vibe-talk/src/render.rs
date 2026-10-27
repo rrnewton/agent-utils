@@ -1154,14 +1154,33 @@ fn item_source(text: &str) -> String {
 // - a line that begins with a bullet glyph (`READ_BULLETS`) is a piece of its own, and the lines
 //   between such lines are one piece together, so a "•" list typed as text reads as a list;
 // - a piece of more than `READ_PIECE_WORDS` words is cut at sentence ends (the page's sentence rule,
-//   `sentencesOf`), as many whole sentences to a piece as fit;
+//   `sentencesOf`) into BALANCED pieces of whole sentences (`balance_sentences`, below);
 // - only a single sentence longer than that is cut inside, into equal runs of words.
 //
 // A code block and a table are said as a short description and are never cut.
+//
+// `read-chunk-balance`. The owner, 2026-10-27, of a single paragraph of four sentences read as one
+// huge piece and one tiny one (its last sentence): the cut had packed sentences greedily, as many as
+// fit in sixty words, and a paragraph of 61 left its last 8 words alone. So a paragraph is now cut
+// against an explicit BALANCE METRIC, its skew: the longest piece's words over the shortest's. A cut
+// passes at a skew of at most `READ_PIECE_SKEW` (53 and 8 is 6.6; the same paragraph now reads as
+// 23 and 38, 1.65). Typed bullets and other structure stay as skewed as they are written: only the
+// sentences of one paragraph are balanced. And a message that is ONE paragraph (`alone`) is cut
+// finer, towards `READ_PIECE_ALONE_WORDS` words a piece, so a short message fills the controller
+// with a few balanced steps rather than one, though the same paragraph inside a longer message is
+// one piece.
 
 /// The most words one piece of a block says, unless one sentence is longer. About twenty seconds of
 /// speech: short enough to step through, long enough that a paragraph of three sentences is one.
 pub const READ_PIECE_WORDS: usize = 60;
+
+/// `read-chunk-balance`. The words a piece aims at in a message that is one paragraph: about six
+/// seconds of speech, so a paragraph of a few sentences is a few steps.
+pub const READ_PIECE_ALONE_WORDS: usize = 15;
+
+/// `read-chunk-balance`. The most a paragraph's longest piece may be, in multiples of its shortest,
+/// for a cut to pass: the balance metric. See the section note.
+pub const READ_PIECE_SKEW: usize = 2;
 
 /// The glyphs a line typed as a bullet begins with. Not `-`, `*` or `+`, which Markdown already makes
 /// a list of, and not a dash, which begins sentences as often as items.
@@ -1169,9 +1188,10 @@ pub const READ_BULLETS: &[char] = &[
     '•', '◦', '▪', '▫', '‣', '⁃', '●', '○', '■', '□', '▸', '▹', '►',
 ];
 
-/// The pieces `text` is read in, in order, each a trimmed slice of it. See the section note.
+/// The pieces `text` is read in, in order, each a trimmed slice of it. `alone`: `text` is the whole
+/// of a message that is one block, which is cut finer. See the section note.
 #[must_use]
-pub fn read_pieces(text: &str) -> Vec<&str> {
+pub fn read_pieces(text: &str, alone: bool) -> Vec<&str> {
     let mut groups: Vec<(usize, usize)> = Vec::new();
     let mut run: Option<(usize, usize)> = None;
     let mut at = 0;
@@ -1188,9 +1208,11 @@ pub fn read_pieces(text: &str) -> Vec<&str> {
         }
     }
     groups.extend(run);
+    // Cut finer only a paragraph alone: typed bullets keep the pieces they were typed as.
+    let alone = alone && groups.len() == 1;
     let mut pieces = Vec::new();
     for (from, to) in groups {
-        pack_sentences(text, from, to, &mut pieces);
+        pack_sentences(text, from, to, alone, &mut pieces);
     }
     pieces
         .into_iter()
@@ -1208,31 +1230,155 @@ pub fn piece_source(piece: &str) -> &str {
         .trim_start()
 }
 
-/// Cut `text[from..to]` into pieces of whole sentences of at most [`READ_PIECE_WORDS`] words, a
-/// longer sentence into equal runs of words, and push their ranges.
-fn pack_sentences(text: &str, from: usize, to: usize, pieces: &mut Vec<(usize, usize)>) {
+/// Cut `text[from..to]` into balanced pieces of whole sentences of at most [`READ_PIECE_WORDS`]
+/// words ([`balance_sentences`]), a longer sentence into equal runs of words, and push their ranges.
+fn pack_sentences(
+    text: &str,
+    from: usize,
+    to: usize,
+    alone: bool,
+    pieces: &mut Vec<(usize, usize)>,
+) {
     let words = |a: usize, b: usize| text[a..b].split_whitespace().count();
-    if words(from, to) <= READ_PIECE_WORDS {
+    if !alone && words(from, to) <= READ_PIECE_WORDS {
         pieces.push((from, to));
         return;
     }
-    let mut current: Option<(usize, usize, usize)> = None;
+    // The sentences between the ones too long for a piece, as `(start, end, words)`: each such run
+    // is balanced on its own, and a sentence too long is cut into its runs between them.
+    let mut run: Vec<(usize, usize, usize)> = Vec::new();
+    let flush = |run: &mut Vec<(usize, usize, usize)>, pieces: &mut Vec<(usize, usize)>| {
+        let counts: Vec<usize> = run.iter().map(|&(_, _, count)| count).collect();
+        let mut at = 0;
+        for size in balance_sentences(&counts, alone) {
+            pieces.push((run[at].0, run[at + size - 1].1));
+            at += size;
+        }
+        run.clear();
+    };
     for (start, end) in sentence_ranges(text, from, to) {
         let count = words(start, end);
         if count > READ_PIECE_WORDS {
-            pieces.extend(current.take().map(|(a, b, _)| (a, b)));
+            flush(&mut run, pieces);
             even_runs(text, start, end, count, pieces);
-            continue;
-        }
-        current = match current {
-            Some((a, _, held)) if held + count <= READ_PIECE_WORDS => Some((a, end, held + count)),
-            held => {
-                pieces.extend(held.map(|(a, b, _)| (a, b)));
-                Some((start, end, count))
+        } else if count == 0 {
+            // Nothing but white space, after the last sentence end: part of the sentence before.
+            if let Some(last) = run.last_mut() {
+                last.1 = end;
             }
-        };
+        } else {
+            run.push((start, end, count));
+        }
     }
-    pieces.extend(current.map(|(a, b, _)| (a, b)));
+    flush(&mut run, pieces);
+}
+
+/// `read-chunk-balance`. How many of the sentences of `counts` (each one's words, none over
+/// [`READ_PIECE_WORDS`]) go in each piece, in order. The same rule as `balanceSentences` in
+/// web/voice.js.
+///
+/// For each number of pieces `k`, the cut with the least sum of squared piece words, no piece over
+/// [`READ_PIECE_WORDS`]: the most even cut into `k`. The first `k` whose cut passes the balance metric
+/// ([`piece_skew_passes`]) is taken, trying the `k` wanted first, then fewer down to the fewest
+/// that fit, then more. The `k` wanted is the fewest that fit, and in a message that is one paragraph
+/// (`alone`) one piece for every [`READ_PIECE_ALONE_WORDS`] words. When no cut passes, the least
+/// skewed, the earlier tried on a tie. A paragraph that fits one piece outside `alone` is one.
+#[must_use]
+pub fn balance_sentences(counts: &[usize], alone: bool) -> Vec<usize> {
+    let n = counts.len();
+    let total: usize = counts.iter().sum();
+    if n == 0 {
+        return Vec::new();
+    }
+    if !alone && total <= READ_PIECE_WORDS {
+        return vec![n];
+    }
+    let fewest = total.div_ceil(READ_PIECE_WORDS).max(1);
+    let wanted = if alone {
+        total / READ_PIECE_ALONE_WORDS
+    } else {
+        fewest
+    }
+    .clamp(fewest, n);
+    let mut prefix = vec![0; n + 1];
+    for (at, count) in counts.iter().enumerate() {
+        prefix[at + 1] = prefix[at] + count;
+    }
+    // best[j][i]: the least sum of squares putting the first `i` sentences in `j` pieces; from[j][i]:
+    // where its last piece begins (the earliest such place on a tie).
+    let mut best = vec![vec![None::<usize>; n + 1]; n + 1];
+    let mut from = vec![vec![0; n + 1]; n + 1];
+    best[0][0] = Some(0);
+    for j in 1..=n {
+        for i in j..=n {
+            for m in (j - 1)..i {
+                let words = prefix[i] - prefix[m];
+                if words > READ_PIECE_WORDS {
+                    continue;
+                }
+                if let Some(before) = best[j - 1][m] {
+                    let sum = before + words * words;
+                    if best[j][i].is_none_or(|held| sum < held) {
+                        best[j][i] = Some(sum);
+                        from[j][i] = m;
+                    }
+                }
+            }
+        }
+    }
+    let cut = |k: usize| -> Option<Vec<usize>> {
+        best[k][n]?;
+        let mut sizes = Vec::with_capacity(k);
+        let mut i = n;
+        for j in (1..=k).rev() {
+            sizes.push(i - from[j][i]);
+            i = from[j][i];
+        }
+        sizes.reverse();
+        Some(sizes)
+    };
+    let words_of = |sizes: &[usize]| -> Vec<usize> {
+        let mut at = 0;
+        sizes
+            .iter()
+            .map(|size| {
+                at += size;
+                prefix[at] - prefix[at - size]
+            })
+            .collect()
+    };
+    let order = (fewest..=wanted).rev().chain(wanted + 1..=n);
+    let mut least: Option<(Vec<usize>, usize, usize)> = None;
+    for k in order {
+        let Some(sizes) = cut(k) else { continue };
+        let words = words_of(&sizes);
+        if piece_skew_passes(&words) {
+            return sizes;
+        }
+        let (longest, shortest) = longest_and_shortest(&words);
+        if least
+            .as_ref()
+            .is_none_or(|&(_, l, s)| longest * s < l * shortest)
+        {
+            least = Some((sizes, longest, shortest));
+        }
+    }
+    least.map_or_else(|| vec![1; n], |(sizes, _, _)| sizes)
+}
+
+/// The longest and the shortest of `words`, at least 1 each.
+fn longest_and_shortest(words: &[usize]) -> (usize, usize) {
+    let longest = words.iter().copied().max().unwrap_or(1).max(1);
+    let shortest = words.iter().copied().min().unwrap_or(1).max(1);
+    (longest, shortest)
+}
+
+/// `read-chunk-balance`. The balance metric: do pieces of these word counts, the pieces of one
+/// paragraph, pass? Their longest is at most [`READ_PIECE_SKEW`] times their shortest.
+#[must_use]
+pub fn piece_skew_passes(words: &[usize]) -> bool {
+    let (longest, shortest) = longest_and_shortest(words);
+    longest <= READ_PIECE_SKEW * shortest
 }
 
 /// The sentences of `text[from..to]`: each ends at `.`, `!`, `?` or `…`, with any closing quote or
@@ -4889,7 +5035,8 @@ mod read_aloud_blocks {
                 .iter()
                 .map(|piece| piece.as_str().expect("a piece"))
                 .collect();
-            assert_eq!(read_pieces(text), wanted, "{}", case["name"]);
+            let alone = case["alone"].as_bool().unwrap_or(false);
+            assert_eq!(read_pieces(text, alone), wanted, "{}", case["name"]);
         }
     }
 
@@ -4897,18 +5044,54 @@ mod read_aloud_blocks {
     fn no_piece_is_longer_than_the_most_words_unless_it_is_one_sentence_cut_evenly() {
         let sentence = |words: usize| format!("{}.", vec!["w"; words].join(" "));
         let text = [sentence(30), sentence(31), sentence(59), sentence(1)].join(" ");
-        let pieces = read_pieces(&text);
+        let pieces = read_pieces(&text, false);
         let counts: Vec<usize> = pieces
             .iter()
             .map(|p| p.split_whitespace().count())
             .collect();
         assert_eq!(counts, [30, 31, 60], "{pieces:?}");
-        let counts: Vec<usize> = read_pieces(&vec!["w"; 121].join(" "))
+        let counts: Vec<usize> = read_pieces(&vec!["w"; 121].join(" "), false)
             .iter()
             .map(|p| p.split_whitespace().count())
             .collect();
         assert_eq!(counts, [41, 40, 40]);
-        assert!(read_pieces("  \n \n").is_empty());
+        assert!(read_pieces("  \n \n", false).is_empty());
+    }
+
+    /// `read-chunk-balance`. The owner's paragraph: four sentences of 5, 18, 30 and 8 words, 61 in
+    /// all. Packed greedily it was 53 and 8, which the balance metric fails; balanced it is 23 and
+    /// 38, alone or in a longer message. Alone, a paragraph of short sentences is a few steps.
+    #[test]
+    fn a_paragraph_is_cut_into_balanced_pieces_and_a_message_alone_finer() {
+        assert!(
+            !piece_skew_passes(&[53, 8]),
+            "the greedy cut passes the metric"
+        );
+        assert!(piece_skew_passes(&[23, 38]));
+        assert!(piece_skew_passes(&[30, 60]) && !piece_skew_passes(&[29, 60]));
+        assert_eq!(balance_sentences(&[5, 18, 30, 8], false), [2, 2]);
+        assert_eq!(balance_sentences(&[5, 18, 30, 8], true), [2, 2]);
+        // In a longer message a paragraph that fits one piece is one; alone, one a sentence here.
+        assert_eq!(balance_sentences(&[15, 16, 16], false), [3]);
+        assert_eq!(balance_sentences(&[15, 16, 16], true), [1, 1, 1]);
+        // Alone, a paragraph too short for two steps of its aim is one piece.
+        assert_eq!(balance_sentences(&[6, 7], true), [2]);
+        // Of two cuts as even, the one that breaks earlier.
+        assert_eq!(balance_sentences(&[40, 1, 40], false), [1, 2]);
+        // No cut passes (a one-word sentence between two that fill a piece): the least skewed.
+        assert_eq!(balance_sentences(&[60, 1, 60], false), [1, 1, 1]);
+        assert!(balance_sentences(&[], true).is_empty());
+        // Every sentence is in exactly one piece, in order, and no piece is over the most words.
+        let counts = [12, 3, 44, 9, 27, 31, 2, 50, 18, 7, 7, 40];
+        for alone in [false, true] {
+            let sizes = balance_sentences(&counts, alone);
+            assert_eq!(sizes.iter().sum::<usize>(), counts.len(), "{sizes:?}");
+            let mut at = 0;
+            for size in &sizes {
+                assert!(counts[at..at + size].iter().sum::<usize>() <= READ_PIECE_WORDS);
+                at += size;
+            }
+        }
     }
 
     /// From review: the source holds markup the page draws as something else, and a piece never
@@ -4921,10 +5104,10 @@ mod read_aloud_blocks {
             long("a"),
             long("b")
         );
-        let pieces = read_pieces(&text);
+        let pieces = read_pieces(&text, false);
         assert_eq!(pieces.len(), 2, "{pieces:?}");
         assert!(pieces[0].ends_with("then."), "{pieces:?}");
-        assert_eq!(read_pieces("> • a\n> • b").len(), 2);
+        assert_eq!(read_pieces("> • a\n> • b", false).len(), 2);
     }
 
     #[test]

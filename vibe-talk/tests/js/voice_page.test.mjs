@@ -5509,6 +5509,15 @@ const TUNING_BANDS = {
     "paragraph of short sentences into pieces of one or two, each a pause at the voice's first audio; " +
     "more leaves a long paragraph one stretch the controller cannot step through. src/render.rs " +
     "READ_PIECE_WORDS must say the same"],
+  // `read-chunk-balance`.
+  READ_PIECE_ALONE_WORDS: [8, 30,
+    "the words a piece aims at in a message that is one paragraph: fewer reads a short message as a " +
+    "pause between every sentence; more leaves it one step, the controller with nothing to step " +
+    "through. src/render.rs READ_PIECE_ALONE_WORDS must say the same"],
+  READ_PIECE_SKEW: [2, 3,
+    "the balance metric, the longest piece of a paragraph at most this many times its shortest: under " +
+    "two no cut of uneven sentences passes; more lets a paragraph end on a piece of a few words beside " +
+    "one of fifty, which the owner read as a broken cut. src/render.rs READ_PIECE_SKEW must say the same"],
   SENTENCE_STEP_MS: [50, 400,
     "how often the sentence being read aloud is looked for again (`#379 read-aloud-sentences`): " +
     "slower lights a sentence a word or more after the voice reaches it; faster redraws for nothing"],
@@ -12813,13 +12822,47 @@ const PIECES_FIXTURE = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixture
 test("THE PAGE CUTS A BLOCK INTO THE PIECES THE SERVER READS IT IN, case by case", () => {
   const page = newPage();
   const readPieces = page.pure("readPieces");
-  for (const { name, text, pieces } of PIECES_FIXTURE.cases) {
+  for (const { name, text, pieces, alone } of PIECES_FIXTURE.cases) {
     // Through JSON: the page's arrays are of its own realm.
-    assert.deepEqual(JSON.parse(JSON.stringify(readPieces(text).map(({ start, end }) => text.slice(start, end)))), pieces, name);
+    assert.deepEqual(JSON.parse(JSON.stringify(readPieces(text, alone === true).map(({ start, end }) => text.slice(start, end)))), pieces, name);
   }
   // The control: a bullet typed as a dash is a sentence, not a piece, and a short block is whole.
   assert.equal(readPieces("Intro.\n- a\n- b").length, 1);
   assert.equal(readPieces("").length, 0);
+});
+
+test("`read-chunk-balance`: a paragraph's sentences are cut into balanced pieces, as src/render.rs cuts them", () => {
+  // The owner's paragraph: sentences of 5, 18, 30 and 8 words, read greedily as 53 and 8. The same
+  // examples src/render.rs's `balance_sentences` test holds the server to.
+  const page = newPage();
+  const balance = (counts, alone) => JSON.parse(JSON.stringify(page.pure("balanceSentences")(counts, alone)));
+  const passes = page.pure("pieceSkewPasses");
+  assert.equal(passes([53, 8]), false, "the greedy cut passes the balance metric");
+  assert.equal(passes([23, 38]), true);
+  assert.ok(passes([30, 60]) && !passes([29, 60]));
+  assert.deepEqual(balance([5, 18, 30, 8], false), [2, 2]);
+  assert.deepEqual(balance([5, 18, 30, 8], true), [2, 2]);
+  assert.deepEqual(balance([15, 16, 16], false), [3]);
+  assert.deepEqual(balance([15, 16, 16], true), [1, 1, 1]);
+  assert.deepEqual(balance([6, 7], true), [2]);
+  assert.deepEqual(balance([40, 1, 40], false), [1, 2]);
+  assert.deepEqual(balance([60, 1, 60], false), [1, 1, 1]);
+  assert.deepEqual(balance([], true), []);
+});
+
+test("`read-chunk-balance`: no block of the timeline takes most of its width, and a block's pieces stand together", () => {
+  const page = newPage();
+  const weights = (chars) => JSON.parse(JSON.stringify(page.pure("readTimelineWeights")(chars)));
+  // The owner's read as it was: 53 words and 8, 325px and 45px of the line. By the square root it is
+  // under three to one; and one block among many short ones is held to twice the mean.
+  const [long, short] = weights([330, 45]);
+  assert.ok(long / (long + short) < 0.75, `the long block takes ${long / (long + short)} of the line`);
+  const many = weights([2000, 40, 40, 40, 40, 40]);
+  const mean = [2000, 40, 40, 40, 40, 40].map(Math.sqrt).reduce((a, b) => a + b) / 6;
+  assert.ok(Math.abs(many[0] - 2 * mean) < 0.001, `the long block is not held to twice the mean: ${many}`);
+  assert.ok(many[0] / many.reduce((a, b) => a + b) < 0.5, "one block of six takes most of the line");
+  assert.match(cssBlock(".read-timeline-block[data-continues]"), /margin-inline-start:\s*-0\.1rem;/,
+    "a block's pieces do not stand closer together than two blocks");
 });
 
 /** A page reading a paragraph of typed bullets as three pieces, and a list item after it as a fourth. */
@@ -12933,15 +12976,16 @@ test("a block of one sentence lights no sentence, and a browser without the high
 
 // --- `#380 read-aloud-timeline`: the read as a line of its blocks ----------------------------------
 
-test("THE TIMELINE shows the read's blocks as wide as they are long, marks where the read is, and jumps", async () => {
+test("THE TIMELINE shows the read's longer blocks wider, marks where the read is, and jumps", async () => {
   const { page, rows } = await blockedRead({ kinds: [{ kind: "paragraph", spoken: true, chars: 30 },
     { kind: "item", spoken: true, chars: 10 }, { kind: "item", spoken: true, chars: 20 }] });
   await rows[0].dispatch("click", {});
   await page.settle();
   const line = () => page.el("read-timeline").children;
   assert.equal(line().length, 3, "the timeline does not show the read's three blocks");
+  // `read-chunk-balance`: by the square root of how long each is (`readTimelineWeights`).
   assert.deepEqual(line().map((button) => button.getAttribute("style")),
-    ["--block-weight: 30", "--block-weight: 10", "--block-weight: 20"], "the blocks are not as wide as they are long");
+    ["--block-weight: 5.477", "--block-weight: 3.162", "--block-weight: 4.472"], "the longer blocks are not drawn wider");
   assert.deepEqual(line().map((button) => button.getAttribute("aria-current")), ["true", "false", "false"]);
 
   await line()[2].click();
