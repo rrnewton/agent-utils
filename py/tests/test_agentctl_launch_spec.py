@@ -427,3 +427,84 @@ def test_deliver_while_working_reaches_a_working_claude_behind_a_root_slot_relay
     result = sessions.drain("worker", ready_timeout=0, deliver_while_working=True)
     assert len(result.delivered) == 1, result
     assert typed == [("steer the busy lane", True)]
+
+
+#: An empty Codex composer with a recognised footer and no running turn.
+_RELAY_CODEX_IDLE = "• Done.\n\n» \x1b[2mAsk Codex to do anything\x1b[0m\n  ? for shortcuts\n"
+#: A Codex turn in progress, with its empty composer below the progress row.
+_RELAY_CODEX_WORKING = (
+    "• Working (12s • esc to interrupt)\n\n» \x1b[2mAsk Codex to do anything\x1b[0m\n"
+    "  ? for shortcuts\n"
+)
+
+
+def _relay_codex_screen(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeManagedClient, screen: list[str],
+) -> None:
+    monkeypatch.setattr(fake, "read_screen", lambda pane: screen[0], raising=False)
+    monkeypatch.setattr(fake, "read", lambda pane, *, source, lines: screen[0])
+
+
+def test_a_relayed_codex_that_herdr_reads_as_unknown_is_idle_on_an_empty_composer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Herdr's Codex rules have no idle verdict: `agent explain` reports an idle Codex as unknown
+    # (codex_state_ambiguous). The screen decides, as for a native Codex pane.
+    import agentctl.subagents as subagents_module
+    from agentctl.submission import SubmissionReceipt
+
+    sessions, fake, identity = relay_worker(tmp_path, monkeypatch)
+    monkeypatch.setattr(fake, "explain_agent", lambda pane: ("codex", "unknown"), raising=False)
+    monkeypatch.setattr(fake, "relay_process", lambda pane: identity, raising=False)
+    screen = ["• Done.\n\n» unsent draft\n  ? for shortcuts\n"]
+    _relay_codex_screen(monkeypatch, fake, screen)
+    typed: list[str] = []
+
+    def submit(terminal: object, pane_id: str, harness: str, text: str) -> SubmissionReceipt:
+        typed.append(text)
+        fake.transcripts.setdefault(pane_id, []).append(text)
+        return SubmissionReceipt("Enter", 1, 0.1, "prompt text appeared above the composer")
+
+    monkeypatch.setattr(subagents_module, "submit_verified", submit)
+    with pytest.raises(AgentDeliveryError, match="last status=unknown"):
+        sessions.send("worker", "first relay prompt", ready_timeout=0)
+    assert typed == []
+    screen[0] = _RELAY_CODEX_IDLE
+    result = sessions.drain("worker", ready_timeout=0)
+    assert len(result.delivered) == 1, result
+    assert typed == ["first relay prompt"]
+
+
+def test_a_working_relayed_codex_takes_a_follow_up_that_steers_its_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agentctl.subagents as subagents_module
+    from agentctl.submission import SubmissionReceipt, followup_requested
+
+    sessions, fake, identity = relay_worker(tmp_path, monkeypatch)
+    monkeypatch.setattr(fake, "explain_agent", lambda pane: ("codex", "working"), raising=False)
+    monkeypatch.setattr(fake, "relay_process", lambda pane: identity, raising=False)
+    _relay_codex_screen(monkeypatch, fake, [_RELAY_CODEX_WORKING])
+    typed: list[tuple[str, bool]] = []
+
+    def submit(terminal: object, pane_id: str, harness: str, text: str) -> SubmissionReceipt:
+        typed.append((text, followup_requested()))
+        fake.transcripts.setdefault(pane_id, []).append(text)
+        return SubmissionReceipt("Enter", 1, 0.1, "agent reports an active turn")
+
+    monkeypatch.setattr(subagents_module, "submit_verified", submit)
+    result = sessions.send("worker", "steer one", ready_timeout=0)
+    assert len(result.delivered) == 1, result
+    result = sessions.send("worker", "steer two", ready_timeout=0, deliver_while_working=True)
+    assert len(result.delivered) == 1, result
+    assert typed == [("steer one", True), ("steer two", True)]
+
+
+def test_a_goal_for_a_relayed_codex_is_refused_before_anything_is_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _identity = relay_worker(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="nothing was queued"):
+        sessions.goal("worker", "finish the brief", ready_timeout=0)
+    record = sessions.get("worker")
+    assert record.goal is None and record.goal_message_id is None

@@ -139,6 +139,11 @@ def withdraw_requested() -> bool:
     return _WITHDRAW_UNACCEPTED.get()
 
 
+def followup_requested() -> bool:
+    """Whether the current delivery submits a follow-up to a working pane (see :func:`working_followup`)."""
+    return _FOLLOWUP_KEY.get() is not None
+
+
 @contextmanager
 def working_followup(key: str | None) -> Iterator[None]:
     """Use the harness adapter's follow-up key without changing ordinary submissions."""
@@ -400,12 +405,78 @@ def _transcript_count(view: ComposerView, text: str) -> int:
     return _compact(view.transcript).count(_suffix(text, 40))
 
 
+#: Headings, lowercased, under which Codex lists the messages it holds while a turn runs: a
+#: prompt submitted with Enter mid-turn waits for the next tool call, one sent with Tab for the
+#: end of the turn.
+_CODEX_PENDING_HEADINGS = (
+    "messages to be submitted after next tool call", "messages to be submitted at end of turn",
+    "queued follow-up inputs", "queued follow-up messages",
+)
+#: Shortest pending-message preview, without blanks, that counts as the start of a longer prompt.
+_CODEX_PREVIEW_MIN_CHARS = 12
+#: Receipt evidence that Codex shows the prompt among the messages it holds for its turn.
+HELD_PROMPT_EVIDENCE = "Codex lists the prompt among the messages it holds for its turn"
+
+
+def codex_pending_previews(transcript: str) -> list[str]:
+    """The messages Codex lists as held in ``transcript``, each without blanks or its ``↳``.
+
+    Codex draws each held message as ``  ↳ `` and its first row, then up to two more wrapped
+    rows indented by four columns, and a ``    …`` row when it cut the rest, so a preview is
+    the start of the message and a long prompt held this way never shows its end.
+    """
+    previews: list[str] = []
+    current: str | None = None
+    in_block = False
+    for line in transcript.splitlines():
+        trimmed = line.lstrip()
+        if trimmed.startswith("•") and any(h in trimmed.lower() for h in _CODEX_PENDING_HEADINGS):
+            if current is not None:
+                previews.append(current)
+            current, in_block = None, True
+            continue
+        if not in_block:
+            continue
+        if line.startswith(" "):
+            if trimmed.startswith("↳"):
+                if current is not None:
+                    previews.append(current)
+                current = _compact(trimmed[1:])
+                continue
+            if line.startswith("    ") and trimmed and current is not None:
+                if trimmed == "…":
+                    previews.append(current)
+                    current = None
+                else:
+                    current += _compact(trimmed)
+                continue
+        if current is not None:
+            previews.append(current)
+        current, in_block = None, False
+    if current is not None:
+        previews.append(current)
+    return [preview for preview in previews if preview]
+
+
+def _codex_pending_copies(transcript: str, text: str) -> int:
+    prompt = _compact(text)
+    if not prompt:
+        return 0
+    return sum(
+        1 for preview in codex_pending_previews(transcript)
+        if preview == prompt
+        or (len(preview) >= _CODEX_PREVIEW_MIN_CHARS and prompt.startswith(preview))
+    )
+
+
 def _corroborated(before: ComposerView, after: ComposerView, text: str) -> str | None:
     if _transcript_count(after, text) > _transcript_count(before, text):
         return "prompt text appeared above the composer"
     if (len(_PASTE_PLACEHOLDER.findall(after.transcript))
             > len(_PASTE_PLACEHOLDER.findall(before.transcript))):
         return "pasted prompt appeared above the composer"
+    if _codex_pending_copies(after.transcript, text) > _codex_pending_copies(before.transcript, text):
+        return HELD_PROMPT_EVIDENCE
     screen = f"{after.transcript}\n{after.footer}"
     for marker in _QUEUE_MARKERS:
         if marker in screen:

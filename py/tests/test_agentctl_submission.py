@@ -1476,3 +1476,43 @@ def test_matching_draft_changed_before_submit_is_refused() -> None:
     with pytest.raises(AgentDeliveryError):
         answer(terminal, "w1:p1", adapter(), text="Exact answer", verify=lambda p: None)
     assert not terminal.keys and not terminal.texts
+
+
+_HELD_PROMPT = (
+    "Coordinator: queueing an owner request for after your hand-back. Every backend must refuse "
+    "an unacknowledged seccomp filter and record a probe hash before it runs the guest; read the "
+    "issue first and reply with a short plan."
+)
+
+
+def _held_codex_screen(held: bool) -> str:
+    rows = ["• Working (12s • esc to interrupt)"]
+    if held:
+        rows += [
+            "• Messages to be submitted after next tool call (press esc to interrupt and send "
+            "immediately)",
+            "  ↳ Coordinator: queueing an owner request for after your hand-back.",
+            "    Every backend must refuse an unacknowledged seccomp filter and",
+            "    record a probe hash before it runs the guest; read the",
+            "    …",
+            "  ⌥ + ↑ edit last queued message",
+        ]
+    rows += ["", "» \x1b[2mAsk Codex to do anything\x1b[0m", "  ? for shortcuts", ""]
+    return "\n".join(rows)
+
+
+def test_a_long_prompt_codex_holds_for_its_next_tool_call_is_printed_evidence() -> None:
+    # Enter in a busy Codex steers the turn: Codex holds the prompt until its next tool call and
+    # shows only its first three rows, so the prompt's end never shows before then.
+    from agentctl.submission import HELD_PROMPT_EVIDENCE, codex_pending_previews
+
+    before = composer_view("codex", _held_codex_screen(False))
+    after = composer_view("codex", _held_codex_screen(True))
+    assert before is not None and after is not None
+    previews = codex_pending_previews(after.transcript)
+    assert len(previews) == 1 and "".join(_HELD_PROMPT.split()).startswith(previews[0])
+    assert previews[0].endswith("readthe")
+    assert _corroborated(before, after, _HELD_PROMPT) == HELD_PROMPT_EVIDENCE
+    # A preview Codex already showed before typing is not evidence about this prompt.
+    assert _corroborated(after, after, _HELD_PROMPT) != HELD_PROMPT_EVIDENCE
+    assert codex_pending_previews("  ↳ Coordinator: queueing an owner request") == []

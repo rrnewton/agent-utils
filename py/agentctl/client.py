@@ -1679,6 +1679,21 @@ class HerdrClient:
             state = "unknown"
         return fields.get("agent") or None, state
 
+    @staticmethod
+    def relay_screen_state(kind: str, herdr_state: str, screen: str) -> str:
+        """The state of a harness behind a root slot relay.
+
+        ``herdr_state`` is Herdr's live screen-rule verdict and ``screen`` the pane's visible
+        rows read with their styling. Herdr's bundled Codex rules recognise only working and
+        blocked screens: an idle Codex matches no rule, and ``agent explain`` reports
+        ``unknown`` with ``fallback_reason: codex_state_ambiguous``. That ambiguity is settled
+        from the screen, as for a native Codex pane: an empty idle composer is idle. Any other
+        verdict is returned unchanged.
+        """
+        if kind == "codex" and herdr_state == "unknown" and codex_idle_composer(screen):
+            return "idle"
+        return herdr_state
+
     def start_relay_agent(
         self, kind: str, pane_id: str, command_line: str, *, timeout: float = 30.0,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
@@ -1722,10 +1737,11 @@ class HerdrClient:
                     f"{kind} workspace trust prompt requires human attention; no input was submitted"
                 )
             agent_kind, state = self.explain_agent(pane_id)
+            screen = self.read_screen(pane_id)
+            state = self.relay_screen_state(kind, state, screen)
             # Herdr's title rule can read idle before the harness has drawn
             # anything; the verified composer on screen is the ready signal.
-            if (agent_kind == kind and state == "idle"
-                    and composer_view(kind, self.read_screen(pane_id)) is not None):
+            if agent_kind == kind and state == "idle" and composer_view(kind, screen) is not None:
                 break
             if agent_kind == kind and state == "blocked":
                 raise HerdrUnavailable(

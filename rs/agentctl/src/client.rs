@@ -102,6 +102,23 @@ pub fn relay_trust_prompt(screen: &str) -> bool {
         || (screen.contains("Trust this folder?") && screen.contains("Trust and continue"))
 }
 
+/// The state of a harness behind a root slot relay, from Herdr's live screen-rule verdict
+/// `herdr_state` and the pane's visible rows `screen`, read with their styling.
+///
+/// Herdr's bundled Codex rules recognise only working and blocked screens. An idle Codex
+/// matches no rule, and `agent explain` reports `unknown` with `fallback_reason:
+/// codex_state_ambiguous`, which never becomes `idle`. Agentctl settles that ambiguity from the
+/// screen, as it does for a native Codex pane (`codex_idle_ready_with_cancellation`): an empty
+/// composer with a recognised footer and no running turn, dialog or queued message is idle. Any
+/// other verdict is returned unchanged.
+pub(crate) fn relay_screen_state(kind: &str, herdr_state: &str, screen: &str) -> String {
+    if kind == "codex" && herdr_state == "unknown" && crate::submission::codex_idle_composer(screen)
+    {
+        return "idle".to_owned();
+    }
+    herdr_state.to_owned()
+}
+
 /// Parent -> children for every visible process, from world-readable stat files. A root-owned
 /// process's own task directory is not readable by the user, so descendants of sudo are found
 /// through their parent links instead.
@@ -1717,7 +1734,7 @@ impl HerdrClient {
     /// Herdr cannot start an agent there (sudo, not a shell, is the pane's foreground
     /// process), so the boxed harness line is run directly, the relayed program is pinned,
     /// and readiness comes from Herdr's live screen rules, which Herdr applies once the pane
-    /// is reported as `kind`.
+    /// is reported as `kind`, with an idle Codex read from its screen ([`relay_screen_state`]).
     pub fn start_relay_agent(
         &self,
         kind: &str,
@@ -1778,16 +1795,13 @@ impl HerdrClient {
                 )));
             }
             let (agent, observed_state) = self.explain_agent(pane_id)?;
-            state = observed_state;
+            let screen = self.read_screen_with_cancellation(pane_id, &|| false)?;
+            state = relay_screen_state(kind, &observed_state, &screen);
             // Herdr's title rule can read idle before the harness has drawn anything; the
             // verified composer on screen is the ready signal.
             if agent.as_deref() == Some(kind)
                 && state == "idle"
-                && crate::submission::composer_view(
-                    kind,
-                    &self.read_screen_with_cancellation(pane_id, &|| false)?,
-                )
-                .is_some()
+                && crate::submission::composer_view(kind, &screen).is_some()
             {
                 break;
             }
@@ -4488,6 +4502,41 @@ mod tests {
         assert_eq!(
             executable.arguments(),
             serde_json::json!(["agent", "rename", "w1:p1", "reviewer"])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_idle_relayed_codex_is_read_from_its_screen_when_herdr_cannot_tell() {
+        // `herdr agent explain` for an idle Codex behind a root slot relay, as Herdr's bundled
+        // manifest 2026.09.23.1 answered it on 2026-10-26: no Codex rule matches an idle screen.
+        let executable = FakeExecutable::new(
+            "agent: codex\nstate: unknown\nmanifest: bundled 2026.09.23.1\nrule: none\n\
+             fallback_reason: codex_state_ambiguous\n",
+        );
+        let (agent, state) = executable.client().explain_agent("w1:p1").unwrap();
+        assert_eq!(
+            (agent.as_deref(), state.as_str()),
+            (Some("codex"), "unknown")
+        );
+        let idle = "• Done.\n\n» \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n  ? for shortcuts\n";
+        let working = "• Working (3s • esc to interrupt)\n\n\
+            » \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n  ? for shortcuts\n";
+        let draft = "• Done.\n\n» unsent draft\n  ? for shortcuts\n";
+        assert_eq!(relay_screen_state("codex", &state, idle), "idle");
+        assert_eq!(relay_screen_state("codex", &state, working), "unknown");
+        assert_eq!(relay_screen_state("codex", &state, draft), "unknown");
+        // Only an unknown Codex verdict is settled from the screen.
+        assert_eq!(relay_screen_state("claude", "unknown", idle), "unknown");
+        assert_eq!(relay_screen_state("codex", "working", idle), "working");
+        assert_eq!(relay_screen_state("codex", "blocked", idle), "blocked");
+        executable.set_response(
+            "agent: codex\nstate: working\nmanifest: bundled 2026.09.23.1\n\
+             rule: osc_title_working (region=osc_title priority=1050)\n",
+        );
+        assert_eq!(
+            executable.client().explain_agent("w1:p1").unwrap().1,
+            "working"
         );
     }
 }

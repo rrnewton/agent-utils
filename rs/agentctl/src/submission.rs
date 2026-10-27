@@ -75,6 +75,18 @@ const CODEX_QUEUE_HINT: &str = "tab to queue message";
 /// draw `›`; v0.159.1 draws `»`, and keeps `›` for selection lists such as its
 /// folder-trust prompt.
 const CODEX_COMPOSER_MARKERS: [char; 2] = ['›', '»'];
+/// Headings, lowercased, under which Codex lists the messages it holds while a turn runs: a
+/// prompt submitted with Enter mid-turn waits for the next tool call, one submitted with Tab for
+/// the end of the turn.
+const CODEX_PENDING_HEADINGS: [&str; 4] = [
+    "messages to be submitted after next tool call",
+    "messages to be submitted at end of turn",
+    "queued follow-up inputs",
+    "queued follow-up messages",
+];
+/// Shortest pending-message preview, without blanks, that counts as the start of a longer
+/// prompt. A shorter preview counts only when it is the whole prompt.
+const CODEX_PREVIEW_MIN_CHARS: usize = 12;
 
 /// Positive evidence that a staged prompt left the composer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,7 +100,8 @@ pub struct SubmissionReceipt {
     /// The screen observation that established the submission.
     pub evidence: String,
     /// Whether `evidence` is something the pane printed after the submission key: the prompt
-    /// or its paste placeholder above the composer, or a queued-message or running-turn marker
+    /// or its paste placeholder above the composer, Codex's preview of it among the messages it
+    /// holds for a running turn, or a queued-message or running-turn marker
     /// that no screen read before the key showed. A running-turn marker that was already
     /// showing, as it always is on a busy agent, proves only that the prompt left the composer.
     pub printed: bool,
@@ -699,6 +712,9 @@ struct ShownBefore {
     labels: Vec<(String, usize)>,
     /// The text above the composer before the paste, without its blanks.
     before_paste: String,
+    /// The most Codex pending-message previews that start the prompt any read showed: see
+    /// [`codex_pending_copies`].
+    pending_copies: usize,
 }
 
 impl ShownBefore {
@@ -713,6 +729,7 @@ impl ShownBefore {
     fn note_before_paste(&mut self, view: &ComposerView) {
         self.before_paste = compact(&view.transcript);
         self.prompt_copies = self.before_paste.matches(self.prompt.as_str()).count();
+        self.pending_copies = codex_pending_copies(&view.transcript, &self.prompt);
     }
 
     /// Note what a screen read after the paste and before the key took effect shows. A tall
@@ -736,6 +753,9 @@ impl ShownBefore {
                 self.labels.push((label, copies));
             }
         }
+        self.pending_copies = self
+            .pending_copies
+            .max(codex_pending_copies(&view.transcript, &self.prompt));
         let transcript = compact(&view.transcript);
         self.prompt_copies = self
             .prompt_copies
@@ -764,6 +784,73 @@ fn placeholder_labels(text: &str) -> Vec<String> {
         rest = &tail["[Pasted ".len()..];
     }
     labels
+}
+
+/// The messages Codex lists under one of [`CODEX_PENDING_HEADINGS`] in `transcript`, each
+/// without its blanks and without the `↳` that starts it.
+///
+/// Codex draws each held message as `  ↳ ` and its first row, then up to two more wrapped rows
+/// indented by four columns, and a `    …` row when it cut the rest. A preview is therefore the
+/// start of the message, not all of it, so a long prompt held this way never shows its end, which
+/// is what read-back looks for.
+fn codex_pending_previews(transcript: &str) -> Vec<String> {
+    let mut previews = Vec::new();
+    let mut in_block = false;
+    let mut current: Option<String> = None;
+    for line in transcript.lines() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_lowercase();
+        if trimmed.starts_with('•')
+            && CODEX_PENDING_HEADINGS
+                .iter()
+                .any(|heading| lower.contains(heading))
+        {
+            previews.extend(current.take());
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if line.starts_with(' ') {
+            if let Some(rest) = trimmed.strip_prefix('↳') {
+                previews.extend(current.take());
+                current = Some(compact(rest));
+                continue;
+            }
+            if line.starts_with("    ") && !trimmed.is_empty() {
+                if let Some(entry) = current.as_mut() {
+                    if trimmed == "…" {
+                        previews.extend(current.take());
+                    } else {
+                        entry.push_str(&compact(trimmed));
+                    }
+                    continue;
+                }
+            }
+        }
+        previews.extend(current.take());
+        in_block = false;
+    }
+    previews.extend(current);
+    previews.retain(|preview| !preview.is_empty());
+    previews
+}
+
+/// How many messages Codex lists as held in `transcript` whose preview is the prompt `prompt`
+/// (given without blanks) or, when at least [`CODEX_PREVIEW_MIN_CHARS`] long, its start.
+fn codex_pending_copies(transcript: &str, prompt: &str) -> usize {
+    if prompt.is_empty() {
+        return 0;
+    }
+    codex_pending_previews(transcript)
+        .iter()
+        .filter(|preview| {
+            preview.as_str() == prompt
+                || (preview.chars().count() >= CODEX_PREVIEW_MIN_CHARS
+                    && prompt.starts_with(preview.as_str()))
+        })
+        .count()
 }
 
 pub(crate) fn compact(text: &str) -> String {
@@ -837,7 +924,8 @@ fn corroborated(before: &ComposerView, after: &ComposerView, text: &str) -> Opti
 
 /// Describe what the pane printed after the submission key, if `after` shows any of it: more
 /// copies above the composer of the whole prompt, or of a numbered placeholder the composer
-/// showed for it, than any earlier read showed, or a marker that no earlier read showed. Each of
+/// showed for it, or of Codex's preview of it among held messages, than any earlier read showed,
+/// or a marker that no earlier read showed. Each of
 /// these names this prompt: another prompt's copy, even one built from the same template, is not
 /// the whole of this one, and another paste has another number. `shown` says what the earlier
 /// reads showed.
@@ -852,6 +940,9 @@ fn printed(after: &ComposerView, after_screen: &str, shown: &ShownBefore) -> Opt
         .any(|(label, copies)| transcript.matches(label.as_str()).count() > *copies)
     {
         return Some("pasted prompt appeared above the composer".to_owned());
+    }
+    if codex_pending_copies(&after.transcript, &shown.prompt) > shown.pending_copies {
+        return Some("Codex lists the prompt among the messages it holds for its turn".to_owned());
     }
     if !shown.queue_marker {
         if let Some(marker) = queue_marker(after_screen) {
@@ -2038,6 +2129,23 @@ mod tests {
             ])
         }
 
+        /// The working screen with `rows` drawn between the progress row and the composer, where
+        /// Codex lists the messages it holds for the running turn, and `draft` in the composer.
+        pub(super) fn working_with(rows: &[&str], draft: &str) -> String {
+            let composer = if draft.is_empty() {
+                EMPTY_COMPOSER.to_owned()
+            } else {
+                format!(
+                    "\u{1b}[0m\u{1b}[1m\u{1b}[38;2;190;142;250m\u{1b}[48;2;30;30;30m»\u{1b}[0m\
+                     \u{1b}[48;2;30;30;30m {draft}          \u{1b}[0m"
+                )
+            };
+            let mut all = vec![SUBMITTED_PROMPT, "", "", HOOK, " ", WORKING];
+            all.extend_from_slice(rows);
+            all.extend([" ", SHADED_BLANK, composer.as_str(), SHADED_BLANK, FOOTER]);
+            screen(&all)
+        }
+
         /// The working screen with its composer rows removed.
         pub(super) fn working_without_composer() -> String {
             screen(&[SUBMITTED_PROMPT, "", "", HOOK, " ", WORKING, " ", FOOTER])
@@ -3136,6 +3244,106 @@ mod tests {
         assert_eq!(receipt.elapsed, POLL);
         assert_eq!(took, POLL + PRINT_GRACE);
         assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    /// A prompt longer than Codex's three-row preview, and the rows Codex 0.159.1 draws for it
+    /// while it holds it for the next tool call of a running turn.
+    const HELD_PROMPT: &str = "Coordinator: queueing an owner request for after your hand-back. \
+        Every backend must refuse an unacknowledged seccomp filter and record a probe hash before \
+        it runs the guest; read the issue first and reply with a short plan.";
+
+    fn held_rows(first: &str) -> Vec<String> {
+        vec![
+            "\u{1b}[0m\u{1b}[2m• \u{1b}[0mMessages to be submitted after next tool call\u{1b}[2m \
+             (press \u{1b}[0m\u{1b}[1mesc\u{1b}[0m\u{1b}[2m to interrupt and send immediately)\u{1b}[0m"
+                .to_owned(),
+            format!("\u{1b}[0m\u{1b}[2m  ↳ {first}\u{1b}[0m"),
+            "\u{1b}[0m\u{1b}[2m    Every backend must refuse an unacknowledged seccomp filter and\u{1b}[0m"
+                .to_owned(),
+            "\u{1b}[0m\u{1b}[2m    record a probe hash before it runs the guest; read the\u{1b}[0m".to_owned(),
+            "\u{1b}[0m\u{1b}[2m    …\u{1b}[0m".to_owned(),
+            "\u{1b}[0m  \u{1b}[1m⌥ + ↑\u{1b}[0m edit last queued message".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn codex_pending_previews_read_each_held_message_up_to_its_cut() {
+        let first = "Coordinator: queueing an owner request for after your hand-back.";
+        let rows = held_rows(first);
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let screen = codex_v0_159_1::working_with(&rows, "");
+        let view = composer_view("codex", &screen).unwrap();
+        let previews = codex_pending_previews(&view.transcript);
+        assert_eq!(previews.len(), 1, "{previews:?}");
+        assert!(
+            compact(HELD_PROMPT).starts_with(&previews[0]),
+            "{previews:?}"
+        );
+        assert!(previews[0].ends_with("readthe"), "{previews:?}");
+        assert_eq!(
+            codex_pending_copies(&view.transcript, &compact(HELD_PROMPT)),
+            1
+        );
+        // Another prompt that shares only a short start is not this one.
+        assert_eq!(
+            codex_pending_copies(&view.transcript, &compact("Coordinator: something else")),
+            0
+        );
+        // Rows outside a held-message list are not previews.
+        assert!(codex_pending_previews("  ↳ Coordinator: queueing an owner request").is_empty());
+    }
+
+    #[test]
+    fn a_long_prompt_codex_holds_for_its_next_tool_call_is_printed_evidence() {
+        // Enter in a busy Codex steers the turn: Codex holds the prompt until its next tool call
+        // and shows only its first three rows, so the prompt's end never shows in the pane
+        // before then. The preview is the evidence that the prompt reached this pane.
+        let first = "Coordinator: queueing an owner request for after your hand-back.";
+        let rows = held_rows(first);
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let frames = Frames::new(
+            codex_v0_159_1::working_with(&[], ""),
+            codex_v0_159_1::working_with(&[], HELD_PROMPT),
+            vec![codex_v0_159_1::working_with(&rows, "")],
+        );
+        let clock = Clock::default();
+        let receipt = receipt(submit_verified(
+            &frames,
+            "w1:p1",
+            "codex",
+            HELD_PROMPT,
+            SubmitTimeouts::default(),
+            &clock,
+        ));
+        assert_eq!(
+            receipt.evidence,
+            "Codex lists the prompt among the messages it holds for its turn"
+        );
+        assert!(receipt.printed && receipt.settled, "{receipt:?}");
+        assert_eq!(frames.keys.lock().unwrap().as_slice(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_held_preview_codex_already_showed_is_not_printed_evidence() {
+        // The same prompt held from an earlier send is not evidence about this one.
+        let first = "Coordinator: queueing an owner request for after your hand-back.";
+        let rows = held_rows(first);
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let frames = Frames::new(
+            codex_v0_159_1::working_with(&rows, ""),
+            codex_v0_159_1::working_with(&rows, HELD_PROMPT),
+            vec![codex_v0_159_1::working_with(&rows, "")],
+        );
+        let clock = Clock::default();
+        let receipt = receipt(submit_verified(
+            &frames,
+            "w1:p1",
+            "codex",
+            HELD_PROMPT,
+            SubmitTimeouts::default(),
+            &clock,
+        ));
+        assert!(!receipt.printed, "{receipt:?}");
     }
 
     #[test]

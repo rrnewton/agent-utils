@@ -458,3 +458,119 @@ fn deliver_while_working_queues_behind_a_working_claude_behind_a_root_slot_relay
         .iter()
         .any(|text| text == "steer the busy lane"));
 }
+
+/// An empty Codex composer with a recognised footer and no running turn.
+const RELAY_CODEX_IDLE: &str =
+    "• Done.\n\n» \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n  ? for shortcuts\n";
+/// A Codex turn in progress, with its empty composer below the progress row.
+const RELAY_CODEX_WORKING: &str = "• Working (12s • esc to interrupt)\n\n\
+    » \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n  ? for shortcuts\n";
+
+#[test]
+fn a_relayed_codex_that_herdr_reads_as_unknown_is_idle_on_an_empty_composer() {
+    // Herdr's Codex rules have no idle verdict: `agent explain` reports an idle Codex as
+    // unknown (codex_state_ambiguous). The screen decides, as for a native Codex pane.
+    let (fixture, _) = relay_worker();
+    *fixture.client.relay_verdict.lock().unwrap() =
+        Some(("codex".to_owned(), "unknown".to_owned()));
+    let waiting = agent::DrainOptions {
+        ready_timeout: Duration::ZERO,
+        working_timeout: Duration::from_secs(1),
+        ..agent::DrainOptions::default()
+    };
+    *fixture.client.screen.lock().unwrap() =
+        Some("• Done.\n\n» draft text\n  ? for shortcuts\n".to_owned());
+    let refused = fixture
+        .manager()
+        .send("worker", "first relay prompt", waiting)
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("remains pending")
+            && refused.to_string().contains("last status=unknown"),
+        "{refused}"
+    );
+    assert!(!fixture
+        .client
+        .runs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|text| text == "first relay prompt"));
+    *fixture.client.screen.lock().unwrap() = Some(RELAY_CODEX_IDLE.to_owned());
+    *fixture.client.relay_verdict_after_prompt.lock().unwrap() =
+        Some(("codex".to_owned(), "working".to_owned()));
+    let delivered = fixture.manager().drain("worker", waiting).unwrap();
+    assert_eq!(delivered.delivered.len(), 1, "{delivered:?}");
+    let runs = fixture.client.runs.lock().unwrap().clone();
+    assert!(
+        runs.iter().any(|text| text == "first relay prompt"),
+        "{runs:?}"
+    );
+}
+
+#[test]
+fn a_working_relayed_codex_takes_a_follow_up_that_steers_its_turn() {
+    // A native Codex pane takes an ordinary follow-up while it works; so does a relayed one.
+    let (fixture, _) = relay_worker();
+    *fixture.client.relay_verdict.lock().unwrap() =
+        Some(("codex".to_owned(), "working".to_owned()));
+    *fixture.client.screen.lock().unwrap() = Some(RELAY_CODEX_WORKING.to_owned());
+    let options = agent::DrainOptions {
+        ready_timeout: Duration::ZERO,
+        working_timeout: Duration::from_secs(1),
+        ..agent::DrainOptions::default()
+    };
+    for (text, deliver_while_working) in [("steer one", false), ("steer two", true)] {
+        let delivered = fixture
+            .manager()
+            .send(
+                "worker",
+                text,
+                agent::DrainOptions {
+                    deliver_while_working,
+                    ..options
+                },
+            )
+            .unwrap();
+        assert_eq!(delivered.delivered.len(), 1, "{text}: {delivered:?}");
+        assert!(fixture
+            .client
+            .runs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|run| run == text));
+    }
+}
+
+#[test]
+fn a_goal_for_a_relayed_codex_is_refused_before_anything_is_queued() {
+    let (fixture, _) = relay_worker();
+    let error = fixture
+        .manager()
+        .goal(
+            "worker",
+            Some("finish the brief"),
+            agent::DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..agent::DrainOptions::default()
+            },
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("nothing was queued")
+            && error.to_string().contains("agentctl send"),
+        "{error}"
+    );
+    let record = fixture.manager().load("worker").unwrap();
+    assert!(
+        record.goal.is_none() && record.goal_message_id.is_none(),
+        "{record:?}"
+    );
+    let inbox = fixture.manager().queue("worker").unwrap().join("inbox");
+    assert!(
+        fs::read_dir(&inbox).map_or(true, |mut entries| entries.next().is_none()),
+        "nothing is queued"
+    );
+}

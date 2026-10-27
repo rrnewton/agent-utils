@@ -61,7 +61,8 @@ from agentctl.profiles import (
     wrkslots_for_registry,
 )
 from agentctl.submission import (
-    PromptNotStaged, SubmissionReceipt, _compact, submit_verified, withdraw_requested,
+    HELD_PROMPT_EVIDENCE, PromptNotStaged, SubmissionReceipt, _compact, followup_requested,
+    submit_verified, withdraw_requested,
 )
 
 _T = TypeVar("_T")
@@ -1057,7 +1058,8 @@ COUNTERMAND_ENV = "AGENTCTL_MISROUTE_COUNTERMAND"
 _COUNTERMAND_LOCK_SECONDS = 2.0
 #: Receipt evidence that already shows the prompt text in the target pane itself.
 _PRINTED_EVIDENCE = ("prompt text appeared above the composer",
-                     "pasted prompt appeared above the composer")
+                     "pasted prompt appeared above the composer",
+                     HELD_PROMPT_EVIDENCE)
 #: What a program that received someone else's prompt is told after being interrupted.
 MISROUTE_NOTE = "Ignore the previous message: it was sent to the wrong agent by agentctl."
 _NOTE_HARNESSES = ("claude", "codex", "muse")
@@ -1715,6 +1717,11 @@ class _WorkspaceClient:
                 )
             if RELAY_WORKING_MARKER in screen:
                 state = "working"
+        if state == "unknown":
+            # Herdr's Codex rules have no idle verdict; the screen settles it.
+            state = HerdrClient.relay_screen_state(
+                self.record.harness, state, self.client.read_screen(info.pane_id),
+            )
         if (state != info.status and not (state == "idle" and info.status == "done")
                 and state in ("idle", "working", "unknown")):
             self.client.report_pane_agent(info.pane_id, self.record.harness, state)
@@ -1752,8 +1759,15 @@ class _WorkspaceClient:
             # the submission to withdraw a prompt Claude Code never queues.
             queue_behind_turn = (status == "working" and self.record.harness == "claude"
                                  and withdraw_requested())
-            if status != "idle" and not queue_behind_turn:
-                raise HerdrUnavailable(f"relayed {self.record.harness} in pane {pane_id} is not idle")
+            # A working Codex takes a follow-up as a native Codex pane does: the drain passes
+            # its follow-up key (Enter), which steers the running turn. The submission still
+            # refuses a composer that holds text.
+            steer_turn = (status == "working" and self.record.harness == "codex"
+                          and followup_requested())
+            if status != "idle" and not queue_behind_turn and not steer_turn:
+                raise PromptNotStaged(
+                    f"relayed {self.record.harness} in pane {pane_id} is {status}, not idle"
+                )
             relay = self._guarded()
             return self._deliver_checked(
                 pane_id, command, relay,
@@ -5056,6 +5070,13 @@ class ManagedAgents:
         with self._lock(name):
             record = self._load(name)
             self._require_automation(record)
+            if record.adapter == "herdr-relay" and record.harness == "codex":
+                # Refused before anything is queued, rather than after waiting for the pane.
+                raise AgentDeliveryError(
+                    "a Codex goal is the slash command /goal, and slash commands cannot be "
+                    "delivered to a harness behind a root slot relay; nothing was queued. Send "
+                    "the objective as an ordinary prompt with `agentctl send` instead"
+                )
             record.goal, record.goal_delivery = text, "pending"
             identifier = f"{time.time_ns():020d}-{os.getpid()}"
             record.goal_message_id = identifier

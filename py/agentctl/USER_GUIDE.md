@@ -1312,10 +1312,16 @@ itself (adapter `herdr-relay`, Claude and Codex only). It pins the program behin
 the relay by kernel identity (the first process below the pane's shell that is
 yours and shares the slot's cgroup scope) and reports the pane to Herdr as that
 harness. It reads the harness state from Herdr's live screen rules
-(`herdr agent explain`) plus the harness's interrupt hint, and types prompts
-through the same screen-verified submission it uses for native Claude and Codex
-panes. Herdr's `agent start` and `agent prompt` do not apply to such a pane.
-Slash commands, and therefore goals, are refused. A workspace trust dialog
+(`herdr agent explain`) plus the harness's interrupt hint. Herdr's Codex rules
+have no idle verdict (an idle Codex reads as `unknown`), so a Codex whose
+screen shows an empty composer with no running turn, dialog or queued message
+counts as idle, both when the launch waits for readiness and before input. It
+types prompts through the same screen-verified submission it uses for native
+Claude and Codex panes, and, as for a native Codex, delivers an ordinary
+follow-up to a working Codex with Enter, which steers the running turn.
+Herdr's `agent start` and `agent prompt` do not apply to such a pane. Slash
+commands, and therefore goals, are refused; `goal` refuses a relayed Codex
+before it queues anything. A workspace trust dialog
 stops the launch for human attention. The pane closes when the harness exits.
 Slot problems are refused before any registry record or tab is created.
 

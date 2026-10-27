@@ -2607,6 +2607,13 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 state = "working".to_owned();
             }
         }
+        if state == "unknown" {
+            // Herdr's Codex rules have no idle verdict; the screen settles it.
+            let screen = self
+                .client
+                .read_screen_with_runtime(&info.pane_id, &agent::SystemRuntime::default())?;
+            state = crate::client::relay_screen_state(&self.record.harness, &state, &screen);
+        }
         if state != info.status
             && !(state == "idle" && info.status == "done")
             && matches!(state.as_str(), "idle" | "working" | "unknown")
@@ -3750,7 +3757,13 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             let queue_behind_turn = status == "working"
                 && self.record.harness == "claude"
                 && runtime.withdraw_unaccepted_prompt();
-            if status != "idle" && !queue_behind_turn {
+            // A working Codex takes a follow-up the way a native Codex pane does: the drain
+            // passes its follow-up key (Enter), which steers the running turn. The submission
+            // still refuses a composer that holds text, and withdraws a prompt Codex never takes.
+            let steer_turn = status == "working"
+                && self.record.harness == "codex"
+                && runtime.followup_key().is_some();
+            if status != "idle" && !queue_behind_turn && !steer_turn {
                 return Ok(Submission::NotStaged(format!(
                     "relayed {} in pane {pane_id} is {status}, not idle",
                     self.record.harness
@@ -9177,6 +9190,14 @@ its drain would type first, so it was not queued",
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
         record.input_allowed()?;
+        if record.adapter == "herdr-relay" && record.harness == "codex" {
+            // Refused before anything is queued, rather than after waiting for the pane.
+            return Err(fail(
+                "a Codex goal is the slash command /goal, and slash commands cannot be \
+                 delivered to a harness behind a root slot relay; nothing was queued. Send the \
+                 objective as an ordinary prompt with `agentctl send` instead",
+            ));
+        }
         record.goal = Some(text.to_owned());
         record.goal_delivery = Some("pending".to_owned());
         let timestamp = SystemTime::now()
@@ -10925,6 +10946,7 @@ pub(crate) mod tests {
                     harness_pids: Mutex::new(BTreeMap::new()),
                     command_lines: Mutex::new(BTreeMap::new()),
                     relay_verdict: Mutex::new(None),
+                    relay_verdict_after_prompt: Mutex::new(None),
                     missing_harness_identity: AtomicBool::new(false),
                     missing_terminal: AtomicBool::new(false),
                     replace_harness_after_pin: AtomicBool::new(false),
@@ -11365,6 +11387,8 @@ pub(crate) mod tests {
         command_lines: Mutex<BTreeMap<u64, Vec<String>>>,
         /// `agent explain` verdict for a relay pane, `(kind, state)`; default Codex idle.
         relay_verdict: Mutex<Option<(String, String)>>,
+        /// The relay verdict a prompt leaves, as a harness that starts its turn on it.
+        relay_verdict_after_prompt: Mutex<Option<(String, String)>>,
         missing_harness_identity: AtomicBool,
         missing_terminal: AtomicBool,
         replace_harness_after_pin: AtomicBool,
@@ -12141,6 +12165,9 @@ pub(crate) mod tests {
             _: &dyn agent::AgentRuntime,
         ) -> AdapterResult<()> {
             self.effect(pane, expect_terminal)?;
+            if let Some(verdict) = self.relay_verdict_after_prompt.lock().unwrap().take() {
+                *self.relay_verdict.lock().unwrap() = Some(verdict);
+            }
             if let Some((other, lines)) = self.scrollback_on_effect.lock().unwrap().take() {
                 self.scrollback.lock().unwrap().insert(other, lines);
             }
