@@ -204,8 +204,14 @@ lifecycle host shard 121, wrkslots 493+492, and all four vibe-talk
 browser checks). Upstream commits shared no files; rebased and
 pushed without a second gate.
 
-[muse watermelon] Slice 25 in progress: `wrkslotsd parse-storage-git`
+[muse watermelon] Slice 25 landed (ed6e32d3): `wrkslotsd parse-storage-git`
 reproduces the Git half of `_registry_storage_inconsistencies`
 (repository evidence, worktree registration, checkout identity) with
 the same controlled Git invocation. Filesystem findings remain in
-`parse-storage` (slice 24).
+`parse-storage` (slice 24). Adversarial review found the loose
+repository-path copy and error spelling, plus unreadable-slot
+inspectability; all fixed reusing the strict loader definitions
+(2 passed). Gate 36 failures were load flakes only (cross-skip+graph
+113 passed alone, scroll-stability browser passed alone, wrkslots
+shards 494 + 493 passed alone). Upstream agentctl commits shared no
+files; rebased and pushed without a second gate.
