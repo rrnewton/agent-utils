@@ -121,9 +121,15 @@ wrkslots shard 1 (468 passed alone) each passed in a solo rerun, so every
 selected step passed in some run. Next: further composed readers or the
 first writer slice.
 
-[muse watermelon] Slice 18 in progress: `wrkslotsd parse-global`
+[muse watermelon] Slice 18 landed (7fea9b49): `wrkslotsd parse-global`
 composes the per-machine shard readers as one registry (machine-shard
 and event-directory discovery, shard-set disagreement without history,
 cross-machine slot/agent uniqueness, active-versus-archived overlap) in
 snapshot/reference mode; EVENTS-derived machines refuse toward `rebuild`
-and the Python lock-based overlap re-read is not reproduced.
+and the Python lock-based overlap re-read is not reproduced. Adversarial
+review found the event-log entry classification, error precedence, and
+first-conflict ordering divergences; all fixed with differential cases
+(14 passed). Gate 29 failures were load flakes only (cross-skip 71
+passed alone; wrkslots shard 0 476 passed alone). Note: the landed
+`parse-states` (slice 17) keeps the simpler any-entry event check and
+should adopt the same classification. Next: slice 19 parse-holds.
