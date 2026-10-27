@@ -25,3 +25,5 @@ validation/editions.json in the same commit so the mirror model stays true.
 [muse watermelon] Context slice landed: Rust `chat context` over socket/command adapter transports (built-in provider transport refuses clearly). Remaining in milestone 2: `chat launch`, then mcp/migrate/reset/repair and headless workers. Issue stays open.
 
 [muse watermelon] MCP slice landed: `agentctl mcp` served by the Rust edition (thin JSON-RPC shell over this executable's CLI). Remaining python-only: chat launch, migrate, reset, repair (headless-worker operations). Issue stays open.
+
+[muse watermelon] Reset slice landed (native Rust reset; migrate/repair fold into the herdr-subagents port per coordinator decision). Python-only agentctl surface now: chat launch (held until the chat-delivery-latency lane lands), migrate, repair. Issue stays open.
