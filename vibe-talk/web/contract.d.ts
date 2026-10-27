@@ -515,6 +515,12 @@ declare namespace VibeTalk {
      */
     backend: string;
     /**
+     * The ordered voice labels a fallback chain will try, first first
+     * (`#563 read-aloud-fallback-chain`): Settings shows them in this
+     * order. Empty for a single provider.
+     */
+    chain?: string[];
+    /**
      * Human-readable provider name.
      */
     label: string;

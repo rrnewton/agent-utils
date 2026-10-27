@@ -309,6 +309,7 @@ pub trait SpeechProvider: Send + Sync {
         Ok(SpeechStream {
             content_type: spoken.content_type,
             preamble: None,
+            voice: None,
             session: None,
             chunks: Box::pin(futures_util::stream::once(async move {
                 Ok(bytes::Bytes::from(spoken.audio))

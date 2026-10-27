@@ -174,6 +174,7 @@ impl SpeechProvider for LocalSpeech {
             label: "Local voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            chain: Vec::new(),
         }
     }
 
@@ -199,6 +200,7 @@ impl SpeechProvider for LocalSpeech {
         Ok(SpeechStream {
             content_type: spoken.content_type,
             preamble: None,
+            voice: None,
             session: None,
             chunks: Box::pin(futures_util::stream::once(async move {
                 Ok(bytes::Bytes::from(spoken.audio))

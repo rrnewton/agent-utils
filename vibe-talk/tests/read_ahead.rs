@@ -275,6 +275,7 @@ impl SpeechProvider for TimedSpeech {
             label: "Timed test voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            chain: vec![],
         }
     }
 

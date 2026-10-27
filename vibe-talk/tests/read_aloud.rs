@@ -986,6 +986,7 @@ impl SpeechProvider for IndependentSpeech {
             label: "Independent voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            chain: vec![],
         }
     }
 
@@ -1017,6 +1018,7 @@ impl SpeechProvider for DeniedAfterAudio {
             label: "Denied test voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            chain: vec![],
         }
     }
 
@@ -1052,6 +1054,7 @@ impl SpeechProvider for DeniedAfterAudio {
             preamble: None,
             session: None,
             chunks: futures_util::stream::iter(chunks).boxed(),
+            voice: None,
         })
     }
 }
@@ -1179,6 +1182,7 @@ impl SpeechProvider for SlowWarmSpeech {
             label: "Timed test voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            chain: vec![],
         }
     }
 

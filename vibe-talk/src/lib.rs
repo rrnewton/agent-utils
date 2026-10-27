@@ -51,6 +51,7 @@ pub mod agent_backend;
 pub mod auth;
 pub mod bridge_dial;
 pub mod cache;
+pub mod chain;
 pub mod chat;
 pub mod client_settings;
 pub mod clock;

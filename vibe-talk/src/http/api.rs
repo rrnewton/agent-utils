@@ -5642,6 +5642,10 @@ pub async fn play_speech(
         .into_iter()
         .map(Ok::<_, SpeechError>)
         .chain(std::iter::once(Ok(first_audio)));
+    // `#563 read-aloud-fallback-chain`: when a chain chose the voice for
+    // this block, name it on the response, so the page can tell the
+    // reader who is speaking.
+    let spoken_by = stream.voice.clone();
     // `#548 cloud-read-failures`. A voice service that fails a read after its first audio (silent
     // audio, then an error naming why) can only cut the response off. Its reason is kept under the
     // ticket, where the page asks for it (`speech_stream_failure`) before trying the read again.
@@ -5665,7 +5669,7 @@ pub async fn play_speech(
         tickets.record_stream_failure(&ticket, failed_block, error.code(), &detail);
     });
     let body = axum::body::Body::from_stream(futures_util::stream::iter(prefix).chain(chunks));
-    Ok((
+    let mut response = (
         [
             (header::CONTENT_TYPE, stream.content_type.as_str()),
             (header::CACHE_CONTROL, "no-store"),
@@ -5679,7 +5683,18 @@ pub async fn play_speech(
         ],
         body,
     )
-        .into_response())
+        .into_response();
+    // `#563 read-aloud-fallback-chain`: when a chain chose the voice for
+    // this block, name it, so the page can tell the reader who is
+    // speaking. A label is public text; no credential can be one.
+    if let Some(voice) = spoken_by.as_deref() {
+        if let Ok(value) = axum::http::HeaderValue::from_str(voice) {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static("x-read-aloud-voice"), value);
+        }
+    }
+    Ok(response)
 }
 
 /// Browser-side milestones for one prepared audio element. Durations contain no page or message

@@ -42,6 +42,7 @@ impl SpeechProvider for ElevenLabsSpeech {
             label: "ElevenLabs".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            chain: Vec::new(),
         }
     }
 
@@ -74,6 +75,7 @@ impl SpeechProvider for ElevenLabsSpeech {
         Ok(SpeechStream {
             content_type: stream.content_type,
             preamble: stream.preamble,
+            voice: stream.voice,
             session: stream.session,
             chunks: stream
                 .chunks

@@ -339,6 +339,7 @@ impl SpeechProvider for WitSpeech {
             label: "Wit.ai voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            chain: Vec::new(),
         }
     }
 
@@ -365,6 +366,7 @@ impl SpeechProvider for WitSpeech {
         Ok(SpeechStream {
             content_type: spoken.content_type,
             preamble: None,
+            voice: None,
             session: None,
             chunks: Box::pin(futures_util::stream::once(async move {
                 Ok(bytes::Bytes::from(spoken.audio))

@@ -345,6 +345,14 @@ pub struct ReadAloudConfig {
     /// at each connection. `#553 voice-ws-relay-auth`.
     #[serde(default)]
     pub websocket_ca_file: Option<PathBuf>,
+    /// Ordered extra backends tried, in order, when the primary refuses
+    /// a block (`#563 read-aloud-fallback-chain`): for example
+    /// `fallback = ["wit", "conversation"]` after a local primary. The
+    /// device voice (`browser`) may appear, but only last: it is the
+    /// reader's own device, so no server voice can follow it. Empty (the
+    /// default) is the single-backend behaviour this field predates.
+    #[serde(default)]
+    pub fallback: Vec<ReadAloudBackend>,
 }
 
 /// Who the owner is: the person this deployment reads the chat FOR. `#438 voice-owner-identity`.
@@ -1897,6 +1905,7 @@ impl Config {
                 websocket_url: file.read_aloud.websocket_url,
                 websocket_token_file: file.read_aloud.websocket_token_file,
                 websocket_ca_file: file.read_aloud.websocket_ca_file,
+                fallback: fallback_checked(file.read_aloud.fallback, read_aloud_backend)?,
             },
             speakable,
             render: file.render,
@@ -2013,6 +2022,43 @@ fn wit_config(
             .or_else(|| text(file.api_base))
             .unwrap_or_else(|| DEFAULT_WIT_API_BASE.to_owned()),
     })
+}
+
+/// Check a read-aloud fallback list. `#563 read-aloud-fallback-chain`.
+///
+/// Refused, rather than silently tidied: a backend named twice (a list
+/// that tries the same voice again after it just refused), the primary
+/// named again among its own fallbacks, and the device voice anywhere
+/// but last — it is the page's own reader, so nothing can follow it.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming `read_aloud.fallback`.
+fn fallback_checked(
+    fallback: Vec<ReadAloudBackend>,
+    primary: ReadAloudBackend,
+) -> Result<Vec<ReadAloudBackend>, ConfigError> {
+    let invalid = |detail: String| ConfigError::Invalid {
+        field: "read_aloud.fallback".to_owned(),
+        detail,
+    };
+    let mut seen = vec![primary];
+    for (index, backend) in fallback.iter().enumerate() {
+        if seen.contains(backend) {
+            return Err(invalid(format!(
+                "{backend:?} is already in the chain; name each voice once, in the order to try them"
+            )));
+        }
+        if *backend == ReadAloudBackend::Browser && index + 1 != fallback.len() {
+            return Err(invalid(
+                "the device voice (browser) can only be the last fallback: it is the \
+                 reader's own device, so no server voice can follow it"
+                    .to_owned(),
+            ));
+        }
+        seen.push(*backend);
+    }
+    Ok(fallback)
 }
 
 /// Resolve and check `[local_tts]`. `#561 local-tts-provider`.

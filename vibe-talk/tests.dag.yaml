@@ -449,6 +449,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#563 read-aloud-fallback-chain` in the browser engine: Settings displays the configured
+  # voice order, a tap is heard, and the page names the fallback voice that spoke the block,
+  # at 393x852 and on a desktop.
+  - group: check
+    job: fallback-chain-browser
+    desc: read-aloud through a fallback chain in current Chromium, phone and desktop
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/fallback_chain_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#376 read-aloud-blocks` in the browser engine: a long message walked block by block against a
   # voice with one session that speaks at speaking pace -- the block lit and counted, a tap on another
   # block jumping there, Previous and Next, the media keys, and each boundary no longer than the

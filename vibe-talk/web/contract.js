@@ -753,7 +753,7 @@ return errors === 0;
 }
 validate25.evaluated = {"props":{"channel_discovery_supported":true,"channel_registration_supported":true,"coding_agent_ids":true,"coding_agents_named_only":true,"idempotent_posts_supported":true,"key":true,"live_delivery":true,"live_poll_seconds":true,"name":true,"owner_author_id":true,"replies_in_thread":true,"self_author_id":true,"threading_supported":true,"upstream_clear_supported":true,"upstream_read_mark_supported":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema43 = {"properties":{"backend":{"type":"string"},"label":{"type":"string"},"local_only":{"type":"boolean"},"playback":{"$ref":"#/$defs/Playback"}},"required":["backend","label","playback","local_only"],"type":"object"};
+const schema43 = {"properties":{"backend":{"type":"string"},"chain":{"items":{"type":"string"},"type":"array"},"label":{"type":"string"},"local_only":{"type":"boolean"},"playback":{"$ref":"#/$defs/Playback"}},"required":["backend","label","playback","local_only"],"type":"object"};
 const schema44 = {"oneOf":[{"const":"browser","type":"string"},{"const":"audio","type":"string"}]};
 
 function validate27(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -786,11 +786,29 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.label !== undefined){
+if(data.chain !== undefined){
+let data1 = data.chain;
 const _errs3 = errors;
-if(typeof data.label !== "string"){
-validate27.errors = [{instancePath:instancePath+"/label",schemaPath:"#/properties/label/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(errors === _errs3){
+if(Array.isArray(data1)){
+var valid1 = true;
+const len0 = data1.length;
+for(let i0=0; i0<len0; i0++){
+const _errs5 = errors;
+if(typeof data1[i0] !== "string"){
+validate27.errors = [{instancePath:instancePath+"/chain/" + i0,schemaPath:"#/properties/chain/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
+}
+var valid1 = _errs5 === errors;
+if(!valid1){
+break;
+}
+}
+}
+else {
+validate27.errors = [{instancePath:instancePath+"/chain",schemaPath:"#/properties/chain/type",keyword:"type",params:{type: "array"},message:"must be array"}];
+return false;
+}
 }
 var valid0 = _errs3 === errors;
 }
@@ -798,26 +816,38 @@ else {
 var valid0 = true;
 }
 if(valid0){
+if(data.label !== undefined){
+const _errs7 = errors;
+if(typeof data.label !== "string"){
+validate27.errors = [{instancePath:instancePath+"/label",schemaPath:"#/properties/label/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs7 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
 if(data.local_only !== undefined){
-const _errs5 = errors;
+const _errs9 = errors;
 if(typeof data.local_only !== "boolean"){
 validate27.errors = [{instancePath:instancePath+"/local_only",schemaPath:"#/properties/local_only/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid0 = _errs5 === errors;
+var valid0 = _errs9 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.playback !== undefined){
-let data3 = data.playback;
-const _errs7 = errors;
-const _errs9 = errors;
-let valid2 = false;
+let data5 = data.playback;
+const _errs11 = errors;
+const _errs13 = errors;
+let valid3 = false;
 let passing0 = null;
-const _errs10 = errors;
-if(typeof data3 !== "string"){
+const _errs14 = errors;
+if(typeof data5 !== "string"){
 const err0 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf/0/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err0];
@@ -827,7 +857,7 @@ vErrors.push(err0);
 }
 errors++;
 }
-if("browser" !== data3){
+if("browser" !== data5){
 const err1 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf/0/const",keyword:"const",params:{allowedValue: "browser"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err1];
@@ -837,13 +867,13 @@ vErrors.push(err1);
 }
 errors++;
 }
-var _valid0 = _errs10 === errors;
+var _valid0 = _errs14 === errors;
 if(_valid0){
-valid2 = true;
+valid3 = true;
 passing0 = 0;
 }
-const _errs12 = errors;
-if(typeof data3 !== "string"){
+const _errs16 = errors;
+if(typeof data5 !== "string"){
 const err2 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf/1/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err2];
@@ -853,7 +883,7 @@ vErrors.push(err2);
 }
 errors++;
 }
-if("audio" !== data3){
+if("audio" !== data5){
 const err3 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf/1/const",keyword:"const",params:{allowedValue: "audio"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err3];
@@ -863,18 +893,18 @@ vErrors.push(err3);
 }
 errors++;
 }
-var _valid0 = _errs12 === errors;
-if(_valid0 && valid2){
-valid2 = false;
+var _valid0 = _errs16 === errors;
+if(_valid0 && valid3){
+valid3 = false;
 passing0 = [passing0, 1];
 }
 else {
 if(_valid0){
-valid2 = true;
+valid3 = true;
 passing0 = 1;
 }
 }
-if(!valid2){
+if(!valid3){
 const err4 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf",keyword:"oneOf",params:{passingSchemas: passing0},message:"must match exactly one schema in oneOf"};
 if(vErrors === null){
 vErrors = [err4];
@@ -887,20 +917,21 @@ validate27.errors = vErrors;
 return false;
 }
 else {
-errors = _errs9;
+errors = _errs13;
 if(vErrors !== null){
-if(_errs9){
-vErrors.length = _errs9;
+if(_errs13){
+vErrors.length = _errs13;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs7 === errors;
+var valid0 = _errs11 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -915,7 +946,7 @@ return false;
 validate27.errors = vErrors;
 return errors === 0;
 }
-validate27.evaluated = {"props":{"backend":true,"label":true,"local_only":true,"playback":true},"dynamicProps":false,"dynamicItems":false};
+validate27.evaluated = {"props":{"backend":true,"chain":true,"label":true,"local_only":true,"playback":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema49 = {"properties":{"changeable":{"type":"boolean"},"delivery":{"$ref":"#/$defs/PromptDelivery"},"edited_from_version":{"format":"uint32","minimum":0,"type":["integer","null"]},"instructions":{"type":"string"},"max_instructions_chars":{"format":"uint32","minimum":0,"type":"integer"},"max_system_prompt_chars":{"format":"uint32","minimum":0,"type":"integer"},"prompt_version":{"format":"uint32","minimum":0,"type":"integer"},"system_prompt":{"type":"string"},"system_prompt_edited":{"type":"boolean"}},"required":["instructions","system_prompt","system_prompt_edited","prompt_version","max_instructions_chars","max_system_prompt_chars","changeable","delivery"],"type":"object"};
 const schema50 = {"oneOf":[{"const":"profile","type":"string"},{"const":"page","type":"string"}]};

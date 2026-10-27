@@ -487,6 +487,13 @@
           "description": "Stable provider identifier.",
           "type": "string"
         },
+        "chain": {
+          "description": "The ordered voice labels a fallback chain will try, first first\n(`#563 read-aloud-fallback-chain`): Settings shows them in this\norder. Empty for a single provider.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "label": {
           "description": "Human-readable provider name.",
           "type": "string"

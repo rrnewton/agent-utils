@@ -36007,6 +36007,31 @@ const WIT_VOICE_KEY = "vibe-talk.voice.wit-voice";
 let witReadAloud = null;
 let witVoice = "";
 
+// `#563 read-aloud-fallback-chain`. True when the server's configured
+// chain ends with the device voice: a server read that fails for good is
+// then read by this device instead of stopping.
+let chainDeviceTail = false;
+
+/**
+ * Read `parts` with the device voice as a chain's last resort, when the
+ * chain ends with it. False when it does not apply or the device cannot
+ * read either, so the caller keeps its ordinary failure.
+ *
+ * @param {Array<string>} parts
+ * @param {string} id
+ * @param {number} ticket
+ */
+function readWithDeviceTail(parts, id, ticket) {
+  if (!chainDeviceTail || readAloudPlayback !== "audio") return false;
+  try {
+    readWithBrowserSpeech(parts, id, ticket);
+    setStatus("Reading with the device voice.");
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
 function storedWitVoice() {
   try {
     return localStorage.getItem(WIT_VOICE_KEY) || "";
@@ -36099,6 +36124,12 @@ function setReadAudioSource(source, announce = true) {
   el("settings-wit-audio").toggleAttribute("hidden", witReadAloud === null);
   el("settings-wit-audio").toggleAttribute("disabled", witReadAloud === null);
   el("wit-voice-picker").toggleAttribute("hidden", witReadAloud === null);
+  // `#563 read-aloud-fallback-chain`: the configured order, first first.
+  const chainOrder = serverSpeech && Array.isArray(serverSpeech.chain) ? serverSpeech.chain : [];
+  el("settings-chain-order").toggleAttribute("hidden", chainOrder.length < 2);
+  if (chainOrder.length >= 2) {
+    el("settings-chain-order").textContent = `Voice order: ${chainOrder.join(" → ")}`;
+  }
   // The icons are <svg>, and `hidden` reflects only on HTMLElement: assigning `.hidden` here would
   // set an expando and leave the phone icon showing in agent mode.
   el("audio-device-icon").toggleAttribute("hidden", agent);
@@ -37318,6 +37349,13 @@ function streamingPlayer(url, context, clock = readClock()) {
       if (over) return;
       fail("refused", detail);
       return;
+    }
+    // `#563 read-aloud-fallback-chain`: a chain names the voice that is
+    // speaking this block; tell the reader when it is not the usual one.
+    const spokenBy = response.headers && typeof response.headers.get === "function"
+      ? response.headers.get("x-read-aloud-voice") : null;
+    if (spokenBy && (pendingRead !== null || nowPlaying !== null)) {
+      setStatus(`Reading with ${spokenBy}.`);
     }
     const reader = response.body.getReader();
     let head = new Uint8Array(0);
@@ -38711,6 +38749,9 @@ async function readAloud(ids, from = null) {
     const begun = startPlayer(at);
     if (begun && typeof begun.catch === "function") {
       begun.catch(() => {
+        // `#563 read-aloud-fallback-chain`: the device voice is the
+        // chain's last resort when the configured order ends with it.
+        if (readWithDeviceTail(parts, id, ticket)) return;
         stopReading();
         setStatus("that message could not be played.");
       });
@@ -38849,6 +38890,11 @@ async function readAloud(ids, from = null) {
         });
         return;
       }
+      // `#563 read-aloud-fallback-chain`: when the configured order ends
+      // with the device voice, it takes these parts now instead of the
+      // read stopping; without it, the cloud failure flow decides
+      // (offer the device voice, try again, give up).
+      if (readWithDeviceTail(parts, id, ticket)) return;
       giveUpOrTryAgain();
     });
     return audio;
@@ -55632,6 +55678,10 @@ function applyClientConfig(config) {
   // `#552 wit-tts-provider`. A Wit.ai backend is server audio too, but
   // Settings names it as its own choice and offers its voice catalogue.
   witReadAloud = String(effectiveSpeech.backend || "") === "wit" ? effectiveSpeech : null;
+  // `#563 read-aloud-fallback-chain`: the device voice is a chain's
+  // last resort only when the configured order ends with it.
+  const chainLabels = Array.isArray(effectiveSpeech.chain) ? effectiveSpeech.chain : [];
+  chainDeviceTail = chainLabels.length > 0 && chainLabels[chainLabels.length - 1] === "Device voice";
   if (witReadAloud && !witVoice) witVoice = storedWitVoice();
   setReadAudioSource(
     storedReadAudioSource() || (witReadAloud ? "wit" : agentReadAloud ? "agent" : "device"), false);

@@ -662,41 +662,55 @@ async fn main() -> anyhow::Result<()> {
 
     let bind = config.bind;
     let voice_bridge = Arc::new(vibe_talk::voice_bridge::BridgeHello::for_config(&config));
-    let speech: Arc<dyn SpeechProvider> = match config.read_aloud.backend {
-        ReadAloudBackend::Browser => Arc::new(vibe_talk::speech::BrowserSpeech),
-        ReadAloudBackend::Conversation => Arc::new(
-            vibe_talk::speech::ConversationSpeech::new(
-                &config.conversation,
-                config.read_aloud.websocket_url.as_deref(),
-            )
-            .with_credentials(vibe_talk::bridge_dial::Credentials::for_read_aloud(
-                &config.read_aloud,
-            ))
-            .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
-        ),
-        ReadAloudBackend::ElevenLabs => {
-            Arc::new(vibe_talk::elevenlabs::speech::ElevenLabsSpeech::new(
-                elevenlabs_client.clone(),
-                config.elevenlabs.clone(),
-            ))
-        }
-        ReadAloudBackend::Wit => {
-            let client = vibe_talk::wit::http::HttpWitClient::new(&config.wit.api_base)
-                .map_err(|error| anyhow::anyhow!("wit client: {error}"))?;
-            Arc::new(vibe_talk::wit::speech::WitSpeech::new(
-                Arc::new(client),
-                config.wit.clone(),
-            ))
-        }
-        ReadAloudBackend::Local => {
-            let endpoint = config.local_tts.endpoint.as_deref().unwrap_or_default();
-            let client = vibe_talk::local_tts::http::HttpLocalTtsClient::new(endpoint)
-                .map_err(|error| anyhow::anyhow!("local tts client: {error}"))?;
-            Arc::new(vibe_talk::local_tts::speech::LocalSpeech::new(
-                Arc::new(client),
-                config.local_tts.clone(),
-            ))
-        }
+    // One provider per backend the chain names, in trying order
+    // (`#563 read-aloud-fallback-chain`). A single-backend deployment
+    // builds exactly the provider it built before this field existed.
+    let mut chain: Vec<Arc<dyn SpeechProvider>> = Vec::new();
+    for backend in
+        std::iter::once(config.read_aloud.backend).chain(config.read_aloud.fallback.iter().copied())
+    {
+        let provider: Arc<dyn SpeechProvider> = match backend {
+            ReadAloudBackend::Browser => Arc::new(vibe_talk::speech::BrowserSpeech),
+            ReadAloudBackend::Conversation => Arc::new(
+                vibe_talk::speech::ConversationSpeech::new(
+                    &config.conversation,
+                    config.read_aloud.websocket_url.as_deref(),
+                )
+                .with_credentials(vibe_talk::bridge_dial::Credentials::for_read_aloud(
+                    &config.read_aloud,
+                ))
+                .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
+            ),
+            ReadAloudBackend::ElevenLabs => {
+                Arc::new(vibe_talk::elevenlabs::speech::ElevenLabsSpeech::new(
+                    elevenlabs_client.clone(),
+                    config.elevenlabs.clone(),
+                ))
+            }
+            ReadAloudBackend::Wit => {
+                let client = vibe_talk::wit::http::HttpWitClient::new(&config.wit.api_base)
+                    .map_err(|error| anyhow::anyhow!("wit client: {error}"))?;
+                Arc::new(vibe_talk::wit::speech::WitSpeech::new(
+                    Arc::new(client),
+                    config.wit.clone(),
+                ))
+            }
+            ReadAloudBackend::Local => {
+                let endpoint = config.local_tts.endpoint.as_deref().unwrap_or_default();
+                let client = vibe_talk::local_tts::http::HttpLocalTtsClient::new(endpoint)
+                    .map_err(|error| anyhow::anyhow!("local tts client: {error}"))?;
+                Arc::new(vibe_talk::local_tts::speech::LocalSpeech::new(
+                    Arc::new(client),
+                    config.local_tts.clone(),
+                ))
+            }
+        };
+        chain.push(provider);
+    }
+    let speech: Arc<dyn SpeechProvider> = if chain.len() == 1 {
+        chain.pop().expect("one provider")
+    } else {
+        Arc::new(vibe_talk::chain::ChainSpeech::new(chain))
     };
     let read_aloud = speech.describe();
     tracing::info!(

@@ -212,6 +212,7 @@ fn client_config(
                 Playback::Browser
             },
             local_only: !full,
+            chain: Vec::new(),
         },
         version: "0.0.0",
         replay_enabled: full,

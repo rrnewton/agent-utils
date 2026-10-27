@@ -244,6 +244,14 @@ writable = false
 # speech engine controls actual synthesis; check its offline voice settings if required.
 # Environment: VIBE_TALK_READ_ALOUD_BACKEND
 backend = "elevenlabs"
+# Ordered extra voices tried, per block, when the backend above refuses
+# it — an explicit error or silent audio (`#563 read-aloud-fallback-chain`).
+# For example backend = "local" with fallback = ["wit", "browser"] reads
+# on this machine first, then Wit.ai, then the reader's device voice
+# (browser is allowed only last; each voice may be named once). The page
+# names the voice that actually spoke each block, and Settings shows this
+# order. Absent, only the backend above is tried, as before.
+# fallback = ["wit"]
 # This server's own route to a conversation.backend = "websocket" bridge, when the browser reaches it
 # by another ingress or by a path: read-aloud with backend = "conversation" dials it, and so does the
 # hello that asks the bridge whether it takes a recap (see [replay]), whatever the backend above.

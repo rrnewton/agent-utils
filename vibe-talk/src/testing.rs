@@ -312,32 +312,48 @@ fn state_pieces_with(
         config.elevenlabs.clone(),
     );
     let voice_bridge = Arc::new(crate::voice_bridge::BridgeHello::for_config(&config));
-    let speech: Arc<dyn crate::speech::SpeechProvider> = match config.read_aloud.backend {
-        crate::config::ReadAloudBackend::Browser => Arc::new(crate::speech::BrowserSpeech),
-        crate::config::ReadAloudBackend::Conversation => Arc::new(
-            crate::speech::ConversationSpeech::new(
-                &config.conversation,
-                config.read_aloud.websocket_url.as_deref(),
-            )
-            .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
-        ),
-        crate::config::ReadAloudBackend::ElevenLabs => {
-            Arc::new(crate::elevenlabs::speech::ElevenLabsSpeech::new(
-                elevenlabs.clone(),
-                config.elevenlabs.clone(),
-            ))
-        }
-        crate::config::ReadAloudBackend::Wit => Arc::new(crate::wit::speech::WitSpeech::new(
-            wit_client.unwrap_or_else(|| Arc::new(crate::wit::fake::FakeWit::new())),
-            config.wit.clone(),
-        )),
-        crate::config::ReadAloudBackend::Local => {
-            Arc::new(crate::local_tts::speech::LocalSpeech::new(
-                local_client
-                    .unwrap_or_else(|| Arc::new(crate::local_tts::fake::FakeLocalTts::new())),
-                config.local_tts.clone(),
-            ))
-        }
+    // As `main` builds it: one fake-backed provider per backend the
+    // chain names, wrapped when the chain has more than one
+    // (`#563 read-aloud-fallback-chain`).
+    let mut chain: Vec<Arc<dyn crate::speech::SpeechProvider>> = Vec::new();
+    for backend in
+        std::iter::once(config.read_aloud.backend).chain(config.read_aloud.fallback.iter().copied())
+    {
+        chain.push(match backend {
+            crate::config::ReadAloudBackend::Browser => Arc::new(crate::speech::BrowserSpeech),
+            crate::config::ReadAloudBackend::Conversation => Arc::new(
+                crate::speech::ConversationSpeech::new(
+                    &config.conversation,
+                    config.read_aloud.websocket_url.as_deref(),
+                )
+                .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
+            ),
+            crate::config::ReadAloudBackend::ElevenLabs => {
+                Arc::new(crate::elevenlabs::speech::ElevenLabsSpeech::new(
+                    elevenlabs.clone(),
+                    config.elevenlabs.clone(),
+                ))
+            }
+            crate::config::ReadAloudBackend::Wit => Arc::new(crate::wit::speech::WitSpeech::new(
+                wit_client
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(crate::wit::fake::FakeWit::new())),
+                config.wit.clone(),
+            )),
+            crate::config::ReadAloudBackend::Local => {
+                Arc::new(crate::local_tts::speech::LocalSpeech::new(
+                    local_client
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(crate::local_tts::fake::FakeLocalTts::new())),
+                    config.local_tts.clone(),
+                ))
+            }
+        });
+    }
+    let speech: Arc<dyn crate::speech::SpeechProvider> = if chain.len() == 1 {
+        chain.pop().expect("one provider")
+    } else {
+        Arc::new(crate::chain::ChainSpeech::new(chain))
     };
     // The fake answers for the deployment's one provider, recorded under that provider's own
     // namespace exactly as `main` records a real client's.

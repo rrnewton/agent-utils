@@ -39,6 +39,11 @@ pub struct Description {
     /// Whether browser speech must select a voice advertised as running locally.
     /// This is the browser's `localService` flag; the device engine controls actual networking.
     pub local_only: bool,
+    /// The ordered voice labels a fallback chain will try, first first
+    /// (`#563 read-aloud-fallback-chain`): Settings shows them in this
+    /// order. Empty for a single provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain: Vec<String>,
 }
 
 /// One voice a provider offers, for a Settings picker.
@@ -118,6 +123,11 @@ pub struct SpeechStream<E = SpeechError> {
     /// Keeping these separate means the HTTP boundary can measure the first actual audio chunk,
     /// rather than declaring success merely because a container header was available.
     pub preamble: Option<bytes::Bytes>,
+    /// Which voice actually spoke this read, when a chain of providers
+    /// chose it (`#563 read-aloud-fallback-chain`): the label the page
+    /// names to the reader. `None` for a single provider, whose label the
+    /// page already has from the configuration.
+    pub voice: Option<String>,
     /// How a provider that keeps a session open served this read; `None` for one that does not.
     ///
     /// Reported explicitly rather than inferred from a zero connection time, because a rounded
@@ -205,6 +215,7 @@ pub trait SpeechProvider: Send + Sync {
         Ok(SpeechStream {
             content_type: spoken.content_type,
             preamble: None,
+            voice: None,
             session: None,
             chunks: Box::pin(futures_util::stream::once(async move {
                 Ok(bytes::Bytes::from(spoken.audio))
@@ -276,6 +287,7 @@ impl SpeechProvider for BrowserSpeech {
             label: "Device voice".to_owned(),
             playback: Playback::Browser,
             local_only: true,
+            chain: Vec::new(),
         }
     }
 
@@ -1142,6 +1154,7 @@ impl SpeechProvider for ConversationSpeech {
             label: self.label.clone(),
             playback: Playback::Audio,
             local_only: false,
+            chain: Vec::new(),
         }
     }
 
@@ -1207,6 +1220,7 @@ impl SpeechProvider for ConversationSpeech {
         Ok(SpeechStream {
             content_type: "audio/wav".to_owned(),
             preamble: Some(bytes::Bytes::from(wav_header(u32::MAX, 24_000))),
+            voice: None,
             session: Some(begun.session),
             chunks: Box::pin(
                 futures_util::stream::once(async move { Ok(begun.first) }).chain(rest),

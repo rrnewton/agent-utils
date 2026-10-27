@@ -574,6 +574,7 @@ impl SpeechProvider for HttpElevenLabsClient {
         Ok(super::SpeechStream {
             content_type,
             preamble: None,
+            voice: None,
             session: None,
             chunks,
         })
