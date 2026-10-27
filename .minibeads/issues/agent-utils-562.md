@@ -35,3 +35,8 @@ commands, caps, globs, hooks, disk thresholds, and representation/image/
 sandbox settings. Rust slice 2 = `wrkslotsd validate-config --root DIR`
 reproducing the resulting Config as canonical JSON for fixture roots built
 by the Python tests, error-for-error on the refusal cases. No mutation.
+
+[muse watermelon] Slice 2 landed (358be730): `wrkslotsd validate-config`
+reproduces `_load_config` validation as canonical JSON, error-for-error on
+refusals, over a Python-built fixture corpus (test_config_validate_rust.py).
+Next slice: a pure state reader (status/list JSON over fixture slot state).
