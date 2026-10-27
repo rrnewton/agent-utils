@@ -2903,7 +2903,7 @@ impl PathFailure {
 /// - `profile_policy`: `git check-ignore` stopped answering for the registry's profile config,
 ///   and its last answer that the config is ignored stands in until git answers again.
 ///
-/// A separate file from `provider-health.json`, so a binary that predates it ignores it.
+/// A separate file from `provider-health.json`, so a binary that does not know it ignores it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceHealthRecord {
