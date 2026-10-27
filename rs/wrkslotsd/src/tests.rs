@@ -5033,6 +5033,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "ensure-states",
             "explain",
             "hold",
+            "unhold",
             "parse-archive",
             "parse-handoff",
             "parse-hold",

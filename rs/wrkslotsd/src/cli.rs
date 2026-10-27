@@ -187,6 +187,17 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Release a slot hold (writer; fixture registries only until cutover)
+    Unhold {
+        /// Active slot name
+        slot: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Bootstrap the selected machine's shard pair and event log (writer; fixture registries only until cutover)
     EnsureStates {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -512,6 +523,23 @@ pub fn run() -> u8 {
                 }
             }
         }
+        Command::Unhold {
+            slot,
+            root,
+            machine,
+        } => match crate::hold_write::unhold_slot(root.as_deref(), machine.as_deref(), &slot) {
+            Ok(value) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
         Command::EnsureStates { root, machine } => {
             match crate::ensure_states::ensure_states(root.as_deref(), machine.as_deref()) {
                 Ok(value) => {

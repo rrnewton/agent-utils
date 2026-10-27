@@ -341,6 +341,7 @@
         "py/wrkslots/tests/test_status_state_rust.py",
         "py/wrkslots/tests/test_storage_state_rust.py",
         "py/wrkslots/tests/test_tool_authority.py",
+        "py/wrkslots/tests/test_unhold_write_rust.py",
         "py/wrkslots/tests/test_validate_batch_seal_ownership.py",
         "py/wrkslots/tests/test_validate_nested_git_policy.py",
         "py/wrkslots/tests/test_validation_run_liveness.py",
