@@ -115,7 +115,7 @@ impl Arrivals {
                     .map(|id| (id.as_str().to_owned(), at, false))
                     .collect()
             }
-            Observation::Threads { .. } => Vec::new(),
+            Observation::Threads { .. } | Observation::Frontier(_) => Vec::new(),
         };
         Noted { ids }
     }

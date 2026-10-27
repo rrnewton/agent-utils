@@ -37,12 +37,20 @@ vibe-talk — a chat bridge for a voice agent
 USAGE:
     vibe-talk [--config PATH] [--config-overlay PATH]... [--fake-discord] [--skip-startup-probe]
     vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
+    vibe-talk cache-stats PATH
 
 COMMANDS:
     (none)                run the server
     pair-link             print a one-time link, good for five minutes, that signs a phone in to
                           the server running on this host. Never prints the token. See
                           `vibe-talk pair-link --help`
+    cache-stats PATH      print, as JSON, what the message cache file at PATH holds and what its
+                          storage costs: bytes on disk, per table and index, and per message; and
+                          for each channel its messages, replies, text bytes, the span of days
+                          held and where its full-history walk stands. Opens the file read-only
+                          with the SQLite this binary bundles, so it works beside a running server
+                          and where the host's own sqlite3 is too old for the file. Prints channel
+                          ids and numbers, never message text
 
 OPTIONS:
     --config PATH         configuration file (default: $VIBE_TALK_CONFIG, else ./vibe-talk.toml)
@@ -327,8 +335,10 @@ fn log_in_colour(stream: &impl std::io::IsTerminal) -> bool {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1);
-    if argv.next().as_deref() == Some("pair-link") {
-        return pair_link(argv).await;
+    match argv.next().as_deref() {
+        Some("pair-link") => return pair_link(argv).await,
+        Some("cache-stats") => return cache_stats(argv),
+        _ => {}
     }
     tracing_subscriber::fmt()
         .with_ansi(log_in_colour(&std::io::stdout()))
@@ -890,14 +900,15 @@ async fn main() -> anyhow::Result<()> {
             vibe_talk::relist::relist_forever(state, interval, live_limit, threads).await;
         });
     }
-    // `#453 cache-backfill`. Walks each cached channel's history into the message cache while
-    // its provider is otherwise idle; returns at once with `backfill = "off"`.
+    // `#453 cache-backfill`, `#595 cache-full-history`. Walks each cached channel's history into
+    // the message cache while its provider is otherwise idle; returns at once with
+    // `backfill = "off"`.
     if state
         .message_cache
         .lifecycle()
         .is_some_and(|lifecycle| lifecycle.configured())
     {
-        tokio::spawn(vibe_talk::relist::backfill_forever(
+        tokio::spawn(vibe_talk::backfill::backfill_forever(
             state.clone(),
             live_limit,
         ));
@@ -967,6 +978,21 @@ async fn main() -> anyhow::Result<()> {
             "graceful shutdown deadline reached; closing remaining streaming connections"
         ),
     }
+    Ok(())
+}
+
+/// `vibe-talk cache-stats PATH`. `#595 cache-full-history`.
+fn cache_stats(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let path = match (args.next(), args.next()) {
+        (Some(flag), None) if flag == "--help" || flag == "-h" => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        (Some(path), None) => PathBuf::from(path),
+        _ => anyhow::bail!("usage: vibe-talk cache-stats PATH"),
+    };
+    let stats = vibe_talk::cache::stats::measure(&path).map_err(anyhow::Error::msg)?;
+    println!("{}", serde_json::to_string_pretty(&stats)?);
     Ok(())
 }
 

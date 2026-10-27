@@ -497,10 +497,37 @@ pub struct MessageCacheStatus {
     /// as an RFC 3339 instant in UTC. Absent while nothing is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_covered: Option<String>,
-    /// The server's age limit, in days: nothing older is kept.
+    /// The server's age limit, in days: nothing older is kept. 65535 means none: with
+    /// `history.mode` `full` and no age limit configured, every day is kept.
     pub max_days: u16,
     /// The server's size limit, in megabytes, the working files included.
     pub max_megabytes: u32,
+    /// How far back the server gathers each channel's history, and how much of it is whole.
+    /// Absent while no file is open, and from an older server. `#595 cache-full-history`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<MessageCacheHistory>,
+}
+
+/// `history` in [`MessageCacheStatus`]: the backfill's mode, and which channels the server holds
+/// whole back to their beginnings. `#595 cache-full-history`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct MessageCacheHistory {
+    /// `recent` (the last days of each channel, kept read), `full` (every channel's whole history,
+    /// gathered at a steady pace and read again every few days) or `off`.
+    pub mode: &'static str,
+    /// Channels the server holds anything of, and of those, how many it holds every message of
+    /// back to the channel's beginning ("complete history"). Counts only, as everywhere in this
+    /// status: no channel is named.
+    pub channels: u64,
+    /// See `channels`.
+    pub complete: u64,
+    /// The oldest message a full walk still under way has reached, RFC 3339 UTC. Absent when none
+    /// is under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached: Option<String>,
+    /// `storage` while the full walk waits for room under `max_megabytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<&'static str>,
 }
 
 /// `PUT /api/v1/message-cache`: the owner's switch. `#208 persistent-cache`.

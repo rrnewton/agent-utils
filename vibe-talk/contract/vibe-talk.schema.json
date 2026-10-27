@@ -809,6 +809,47 @@
       ],
       "type": "object"
     },
+    "MessageCacheHistory": {
+      "description": "`history` in [`MessageCacheStatus`]: the backfill's mode, and which channels the server holds\nwhole back to their beginnings. `#595 cache-full-history`.",
+      "properties": {
+        "channels": {
+          "description": "Channels the server holds anything of, and of those, how many it holds every message of\nback to the channel's beginning (\"complete history\"). Counts only, as everywhere in this\nstatus: no channel is named.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "complete": {
+          "description": "See `channels`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "description": "`recent` (the last days of each channel, kept read), `full` (every channel's whole history,\ngathered at a steady pace and read again every few days) or `off`.",
+          "type": "string"
+        },
+        "paused": {
+          "description": "`storage` while the full walk waits for room under `max_megabytes`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reached": {
+          "description": "The oldest message a full walk still under way has reached, RFC 3339 UTC. Absent when none\nis under way.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "channels",
+        "complete"
+      ],
+      "type": "object"
+    },
     "MessageCacheRequest": {
       "description": "`PUT /api/v1/message-cache`: the owner's switch. `#208 persistent-cache`.\n\nAn unknown field is ignored, as everywhere in the contract: a page may send one a later server\nreads without an older one refusing the switch.",
       "properties": {
@@ -845,8 +886,19 @@
           "description": "Whether the cache is switched on: the configuration enables it and the owner has not\nturned it off. True while `available` is false means it should be open and is not, and\n`reason` says why.",
           "type": "boolean"
         },
+        "history": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageCacheHistory"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How far back the server gathers each channel's history, and how much of it is whole.\nAbsent while no file is open, and from an older server. `#595 cache-full-history`."
+        },
         "max_days": {
-          "description": "The server's age limit, in days: nothing older is kept.",
+          "description": "The server's age limit, in days: nothing older is kept. 65535 means none: with\n`history.mode` `full` and no age limit configured, every day is kept.",
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,

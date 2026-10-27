@@ -245,6 +245,62 @@ pub fn timeline(
     out
 }
 
+/// What one step back of the full-history walk tells the cache (`#595 cache-full-history`): a
+/// page read with `before` set to the continuation the walk's previous page handed back, whose
+/// oldest message was written at `below_ms` (provider time). The provider listed every message
+/// older than that one down to this page's oldest, so the page is a listing of its scope over
+/// `[oldest, below_ms)`, from the scope's start when the provider says nothing is older: chained
+/// to the step before it, the walk proves its whole span page by page, and so a walk resumed after
+/// a restart proves what it reads from where it resumed. A page from a copy the provider could
+/// not bring up to date, with a notice, of a view that lists no scope whole (a bridge's Main or
+/// threads), or that reaches up to `below_ms` (a continuation that did not step back), is rows
+/// only.
+#[must_use]
+pub fn older(
+    shape: Shape,
+    request: &TimelineRequest,
+    page: &TimelinePage,
+    below_ms: i64,
+    observed_ms: i64,
+) -> Vec<Observation> {
+    let mut out = Vec::new();
+    let thread = request
+        .thread_id
+        .as_deref()
+        .filter(|thread| !thread.is_empty());
+    let thread_view = (request.view == TimelineView::Thread)
+        .then_some(thread)
+        .flatten();
+    let scope = view_scope(shape, request.view, thread_view);
+    let messages = &page.messages;
+    let stepped_back = newest(messages).is_none_or(|newest| newest < below_ms);
+    let proven = (page.as_of.is_none() && page.notice.is_none() && stepped_back)
+        .then(|| listed(shape, request.view, thread_view, messages))
+        .flatten();
+    match (proven, oldest(messages)) {
+        (Some((listed, start_from_has_more)), Some(oldest)) => {
+            let from = if start_from_has_more && !page.has_more {
+                ListStart::ScopeStart
+            } else {
+                ListStart::At(oldest)
+            };
+            out.push(listing(
+                shape,
+                listed,
+                messages,
+                thread_view,
+                observed_ms,
+                from,
+                ListEnd::Before(below_ms),
+                Source::Walk,
+            ));
+        }
+        _ => out.extend(rows(shape, messages, thread_view, scope, observed_ms)),
+    }
+    out.extend(threads(shape, page, observed_ms));
+    out
+}
+
 /// What a read of a channel's most recent messages tells the cache: `fetch_recent_dated`, which
 /// reads a bridge's Flat view when `via_flat`, or `fetch_recent` (never through Flat).
 ///
@@ -784,6 +840,37 @@ mod tests {
         }
     }
 
+    /// `#595 cache-full-history`: a step back of the full walk is a listing of its scope up to the
+    /// oldest message of the step before it, from the scope's start once nothing is older; a page
+    /// that did not step back, that proves nothing, or of a view that lists no scope whole, is
+    /// rows only.
+    #[test]
+    fn a_full_walk_step_back_lists_its_scope_up_to_the_step_before() {
+        use TimelineView::{Flat, Main};
+        let below = T + 1_000_000;
+        #[rustfmt::skip]
+        let cases: Vec<(Shape, TimelineView, i64, TimelinePage, Vec<&str>)> = vec![
+            (Shape::Slack, Main, below, page_of(main_rows(), true, false),
+             vec!["listing main [+0,+1000000) complete=false full=true Walk m100=main,m200=main,m300=thread:m200"]),
+            (Shape::Slack, Main, below, page_of(main_rows(), false, false),
+             vec!["listing main [start,+1000000) complete=false full=true Walk m100=main,m200=main,m300=thread:m200"]),
+            (Shape::Slack, Main, below, page_of(main_rows(), false, true),
+             vec!["rows in=main m100=main,m200=main,m300=thread:m200"]),
+            // A continuation that handed back the step before's own messages proves nothing.
+            (Shape::Slack, Main, T, page_of(main_rows(), false, false),
+             vec!["rows in=main m100=main,m200=main,m300=thread:m200"]),
+            (Shape::Bridge, Main, below, page_of(main_rows(), false, false),
+             vec!["rows in=main m100=flat,m200=flat,m300=flat"]),
+            (Shape::Bridge, Flat, below, page_of(main_rows(), false, false),
+             vec!["listing flat [+0,+1000000) complete=true full=true Walk m100=flat,m200=flat,m300=flat"]),
+            (Shape::Slack, Main, below, page_of(Vec::new(), false, false), vec![]),
+        ];
+        for (shape, view, below, page, want) in cases {
+            let got = older(shape, &request(view, None), &page, below, OBSERVED);
+            assert_eq!(describe(&got), want, "{shape:?} {view:?}");
+        }
+    }
+
     /// One line per observation: its kind, its scope or proof, and each row's home.
     fn describe(observations: &[Observation]) -> Vec<String> {
         let homes = |rows: &[Incoming]| {
@@ -826,6 +913,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(",")
                 ),
+                Observation::Frontier(frontier) => format!("frontier {:?}", frontier.cursor),
                 Observation::Threads { threads, .. } => format!(
                     "threads {}",
                     threads
@@ -861,6 +949,7 @@ mod tests {
                 | Observation::Deleted { observed_ms, .. }
                 | Observation::Threads { observed_ms, .. }
                 | Observation::Push { observed_ms, .. } => *observed_ms,
+                Observation::Frontier(frontier) => frontier.updated_ms,
             };
             assert_eq!(observed, at);
         }

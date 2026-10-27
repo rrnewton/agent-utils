@@ -227,6 +227,30 @@ pub const DEFAULT_MESSAGE_CACHE_MAX_DAYS: u16 = 90;
 /// Default `[message_cache] max_megabytes`: the ceiling on the cache file and its two working
 /// files together.
 pub const DEFAULT_MESSAGE_CACHE_MAX_MEGABYTES: u32 = 256;
+/// `[message_cache] max_days` under `backfill = "full"` when the table gives none: no age limit.
+/// Its cutoff lies before every provider's epoch, so nothing is ever too old to keep, and
+/// `max_megabytes` is the only bound. `#595 cache-full-history`.
+pub const NO_AGE_LIMIT_DAYS: u16 = u16::MAX;
+/// The most `max_days` may say under `backfill = "full"`: a hundred years.
+pub const FULL_HISTORY_MAX_DAYS: i64 = 36_500;
+/// The most `max_megabytes` may say under `backfill = "full"`; 4096 otherwise.
+pub const FULL_HISTORY_MAX_MEGABYTES: i64 = 16_384;
+/// `[message_cache] recent_days` under `backfill = "full"` when the table gives none: the full walk
+/// reads everything older. Otherwise it defaults to `max_days`, as far back as the walk it
+/// replaced went.
+pub const FULL_HISTORY_RECENT_DAYS: u16 = 14;
+/// Default `[message_cache] rewalk_hot_hours`: the stretch the hot walk re-reads.
+pub const DEFAULT_MESSAGE_CACHE_REWALK_HOT_HOURS: u16 = 24;
+/// Default `[message_cache] rewalk_hot_minutes`: how often the hot walk runs.
+pub const DEFAULT_MESSAGE_CACHE_REWALK_HOT_MINUTES: u32 = 60;
+/// Default `[message_cache] rewalk_recent_hours`: how often the recent walk runs.
+pub const DEFAULT_MESSAGE_CACHE_REWALK_RECENT_HOURS: u32 = 24;
+/// Default `[message_cache] full_reads_per_minute`: the deep walk's pace, per provider.
+pub const DEFAULT_MESSAGE_CACHE_FULL_READS_PER_MINUTE: u32 = 6;
+/// Default `[message_cache] full_cycle_hours`: how soon after one walk of a channel's whole
+/// history began the next begins. Well inside the week within which every held row must be read
+/// again or erased ([`crate::cache::REVALIDATE_WITHIN_MS`]).
+pub const DEFAULT_MESSAGE_CACHE_FULL_CYCLE_HOURS: u32 = 72;
 /// Default `[message_cache] timeline_fallback_ms`: how long a timeline read waits on the provider
 /// before a cached page may stand in for it.
 pub const DEFAULT_MESSAGE_CACHE_TIMELINE_FALLBACK_MS: u64 = 10_000;
@@ -246,12 +270,32 @@ pub struct MessageCacheConfig {
     /// Where the cache file lives. `None` means beside `[storage] path`, named after the store
     /// and this host.
     pub path: Option<PathBuf>,
-    /// Oldest message kept, in days from when it was written upstream: 1 to 365.
+    /// Oldest message kept, in days from when it was written upstream: 1 to 365, or up to
+    /// [`FULL_HISTORY_MAX_DAYS`] under `backfill = "full"`, where it defaults to
+    /// [`NO_AGE_LIMIT_DAYS`].
     pub max_days: u16,
-    /// Ceiling on the cache file plus its `-wal` and `-shm` files, in megabytes: 16 to 4096.
+    /// Ceiling on the cache file plus its `-wal` and `-shm` files, in megabytes: 16 to 4096, or
+    /// up to [`FULL_HISTORY_MAX_MEGABYTES`] under `backfill = "full"`.
     pub max_megabytes: u32,
-    /// Whether older history may be fetched in the background to fill the cache.
+    /// Whether, and how far, history is fetched in the background to fill the cache.
     pub backfill: CacheBackfill,
+    /// How far back the recent walk re-reads each channel, in days: 1 to 365. Never past
+    /// `max_days`; by default `max_days`, or [`FULL_HISTORY_RECENT_DAYS`] under `backfill = "full"`.
+    /// `#595 cache-full-history`.
+    pub recent_days: u16,
+    /// The stretch the hot walk re-reads, in hours back from the newest message: 1 to 168.
+    pub rewalk_hot_hours: u16,
+    /// How often the hot walk runs, in minutes: 5 to 1440.
+    pub rewalk_hot_minutes: u32,
+    /// How often the recent walk runs, in hours: 1 to 168.
+    pub rewalk_recent_hours: u32,
+    /// Under `backfill = "full"`, how many reads a minute the walk into older history (and the
+    /// threads it finds) makes of one provider: 1 to 50.
+    pub full_reads_per_minute: u32,
+    /// Under `backfill = "full"`, how soon after one walk of a channel's whole history began the
+    /// next begins, in hours: 24 to 144. Every held row must be read again within a week or it is
+    /// erased, so the whole history is walked again on this cycle, not once.
+    pub full_cycle_hours: u32,
     /// How long a timeline read waits on the provider before a cached page may answer instead,
     /// in milliseconds: 1,000 to 60,000.
     pub timeline_fallback_ms: u64,
@@ -267,7 +311,13 @@ impl Default for MessageCacheConfig {
             path: None,
             max_days: DEFAULT_MESSAGE_CACHE_MAX_DAYS,
             max_megabytes: DEFAULT_MESSAGE_CACHE_MAX_MEGABYTES,
-            backfill: CacheBackfill::Adaptive,
+            backfill: CacheBackfill::Recent,
+            recent_days: DEFAULT_MESSAGE_CACHE_MAX_DAYS,
+            rewalk_hot_hours: DEFAULT_MESSAGE_CACHE_REWALK_HOT_HOURS,
+            rewalk_hot_minutes: DEFAULT_MESSAGE_CACHE_REWALK_HOT_MINUTES,
+            rewalk_recent_hours: DEFAULT_MESSAGE_CACHE_REWALK_RECENT_HOURS,
+            full_reads_per_minute: DEFAULT_MESSAGE_CACHE_FULL_READS_PER_MINUTE,
+            full_cycle_hours: DEFAULT_MESSAGE_CACHE_FULL_CYCLE_HOURS,
             timeline_fallback_ms: DEFAULT_MESSAGE_CACHE_TIMELINE_FALLBACK_MS,
             channels: Vec::new(),
         }
@@ -286,15 +336,33 @@ impl MessageCacheConfig {
     }
 }
 
-/// `[message_cache] backfill`: whether older history may be fetched to fill the cache.
+/// `[message_cache] backfill`: whether, and how far, history is fetched to fill the cache. A
+/// choice made when the server is set up. `#595 cache-full-history`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheBackfill {
-    /// Fetch older history while nothing else is using the provider, one call at a time.
+    /// Keep the recent stretch of each channel (`recent_days`) read and re-read while nothing
+    /// else is using the provider, one call at a time. `adaptive`, its first name, still reads.
     #[default]
-    Adaptive,
+    #[serde(alias = "adaptive")]
+    Recent,
+    /// As `recent`, and walk on into older history at a steady pace until each channel's
+    /// beginning, resuming across restarts: the cache comes to hold every message.
+    Full,
     /// Cache only what reading brings in.
     Off,
+}
+
+impl CacheBackfill {
+    /// The word the configuration and the diagnostics use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Full => "full",
+            Self::Off => "off",
+        }
+    }
 }
 
 /// One `[[message_cache.channel]]` entry: a channel kept for less (or more) time than the default.
@@ -1375,6 +1443,12 @@ struct FileMessageCache {
     max_days: Option<i64>,
     max_megabytes: Option<i64>,
     backfill: Option<CacheBackfill>,
+    recent_days: Option<i64>,
+    rewalk_hot_hours: Option<i64>,
+    rewalk_hot_minutes: Option<i64>,
+    rewalk_recent_hours: Option<i64>,
+    full_reads_per_minute: Option<i64>,
+    full_cycle_hours: Option<i64>,
     timeline_fallback_ms: Option<i64>,
     #[serde(default)]
     channel: Vec<FileCacheChannel>,
@@ -2195,22 +2269,79 @@ fn message_cache_config(
         });
     }
     let narrow = |value: i64| u16::try_from(value).unwrap_or(u16::MAX);
-    let max_days = narrow(ranged(
-        "message_cache.max_days",
-        file.max_days.unwrap_or(i64::from(defaults.max_days)),
-        1,
-        365,
-        "days",
-    )?);
+    let backfill = file.backfill.unwrap_or(defaults.backfill);
+    let full = backfill == CacheBackfill::Full;
+    // `#595 cache-full-history`. A full history keeps every day unless the table says otherwise,
+    // and may say more than a year; its storage bound may be larger too.
+    let max_days = match file.max_days {
+        None if full => NO_AGE_LIMIT_DAYS,
+        days => narrow(ranged(
+            "message_cache.max_days",
+            days.unwrap_or(i64::from(defaults.max_days)),
+            1,
+            if full { FULL_HISTORY_MAX_DAYS } else { 365 },
+            "days",
+        )?),
+    };
     let max_megabytes = u32::try_from(ranged(
         "message_cache.max_megabytes",
         file.max_megabytes
             .unwrap_or(i64::from(defaults.max_megabytes)),
         16,
-        4096,
+        if full {
+            FULL_HISTORY_MAX_MEGABYTES
+        } else {
+            4096
+        },
         "megabytes",
     )?)
     .unwrap_or(u32::MAX);
+    let recent_days = match file.recent_days {
+        Some(days) => narrow(ranged("message_cache.recent_days", days, 1, 365, "days")?),
+        None if full => FULL_HISTORY_RECENT_DAYS,
+        None => max_days,
+    };
+    let rewalk_hot_hours = narrow(ranged(
+        "message_cache.rewalk_hot_hours",
+        file.rewalk_hot_hours
+            .unwrap_or(i64::from(defaults.rewalk_hot_hours)),
+        1,
+        168,
+        "hours",
+    )?);
+    let wide = |value: i64| u32::try_from(value).unwrap_or(u32::MAX);
+    let rewalk_hot_minutes = wide(ranged(
+        "message_cache.rewalk_hot_minutes",
+        file.rewalk_hot_minutes
+            .unwrap_or(i64::from(defaults.rewalk_hot_minutes)),
+        5,
+        1440,
+        "minutes",
+    )?);
+    let rewalk_recent_hours = wide(ranged(
+        "message_cache.rewalk_recent_hours",
+        file.rewalk_recent_hours
+            .unwrap_or(i64::from(defaults.rewalk_recent_hours)),
+        1,
+        168,
+        "hours",
+    )?);
+    let full_reads_per_minute = wide(ranged(
+        "message_cache.full_reads_per_minute",
+        file.full_reads_per_minute
+            .unwrap_or(i64::from(defaults.full_reads_per_minute)),
+        1,
+        50,
+        "reads a minute",
+    )?);
+    let full_cycle_hours = wide(ranged(
+        "message_cache.full_cycle_hours",
+        file.full_cycle_hours
+            .unwrap_or(i64::from(defaults.full_cycle_hours)),
+        24,
+        144,
+        "hours",
+    )?);
     let timeline_fallback_ms = u64::try_from(ranged(
         "message_cache.timeline_fallback_ms",
         file.timeline_fallback_ms
@@ -2253,7 +2384,13 @@ fn message_cache_config(
         path,
         max_days,
         max_megabytes,
-        backfill: file.backfill.unwrap_or(defaults.backfill),
+        backfill,
+        recent_days,
+        rewalk_hot_hours,
+        rewalk_hot_minutes,
+        rewalk_recent_hours,
+        full_reads_per_minute,
+        full_cycle_hours,
         timeline_fallback_ms,
         channels,
     })
@@ -5340,6 +5477,12 @@ provider = "slack"
                 "max_days",
                 "max_megabytes",
                 "backfill",
+                "recent_days",
+                "rewalk_hot_hours",
+                "rewalk_hot_minutes",
+                "rewalk_recent_hours",
+                "full_reads_per_minute",
+                "full_cycle_hours",
                 "timeline_fallback_ms",
                 "[[message_cache.channel]]",
                 "id",
@@ -5582,7 +5725,13 @@ provider = "slack"
         assert!(!defaults.serve, "#384 cache-serve: serving shipped off");
         assert_eq!(defaults.max_days, 90);
         assert_eq!(defaults.max_megabytes, 256);
-        assert_eq!(defaults.backfill, CacheBackfill::Adaptive);
+        assert_eq!(defaults.backfill, CacheBackfill::Recent);
+        assert_eq!(defaults.recent_days, 90, "as far back as max_days");
+        assert_eq!(defaults.rewalk_hot_hours, 24);
+        assert_eq!(defaults.rewalk_hot_minutes, 60);
+        assert_eq!(defaults.rewalk_recent_hours, 24);
+        assert_eq!(defaults.full_reads_per_minute, 6);
+        assert_eq!(defaults.full_cycle_hours, 72);
         assert_eq!(defaults.timeline_fallback_ms, 10_000);
         assert_eq!(defaults.path, None);
 
@@ -5615,6 +5764,92 @@ provider = "slack"
                 .storage
                 .retention
         );
+    }
+
+    #[test]
+    fn a_full_history_keeps_every_day_unless_told_and_its_walks_are_configurable() {
+        // `#595 cache-full-history`.
+        let read = |table: &str| -> Result<MessageCacheConfig, String> {
+            let text =
+                format!("{FULL}\n[storage]\npath = \"/data/s.sqlite3\"\n[message_cache]\n{table}");
+            match Config::from_toml_and_env(&text, &env(&[])) {
+                Ok(cfg) => Ok(cfg.message_cache.expect("present")),
+                Err(ConfigError::Invalid { field, .. }) => Err(field),
+                Err(ConfigError::Parse(_)) => Err("parse".to_owned()),
+                Err(other) => panic!("{table:?}: {other}"),
+            }
+        };
+        let full = read("backfill = \"full\"\n").expect("valid");
+        assert_eq!(full.backfill, CacheBackfill::Full);
+        assert_eq!(
+            full.max_days, NO_AGE_LIMIT_DAYS,
+            "no age limit unless one is given"
+        );
+        assert_eq!(full.max_days_for("any"), NO_AGE_LIMIT_DAYS);
+        assert_eq!(full.recent_days, FULL_HISTORY_RECENT_DAYS);
+        assert_eq!(
+            read("max_days = 14\n").expect("valid").recent_days,
+            14,
+            "the recent walk goes as far back as max_days, as the walk it replaced did"
+        );
+        assert_eq!(
+            read("backfill = \"adaptive\"\n").expect("valid").backfill,
+            CacheBackfill::Recent
+        );
+        assert_eq!(read("backfill = \"recent\"\n").expect("valid").max_days, 90);
+        let kept =
+            read("backfill = \"full\"\nmax_days = 730\nmax_megabytes = 16384\n").expect("valid");
+        assert_eq!((kept.max_days, kept.max_megabytes), (730, 16_384));
+        let tuned = read(
+            "recent_days = 7\nrewalk_hot_hours = 6\nrewalk_hot_minutes = 30\n\
+             rewalk_recent_hours = 12\nfull_reads_per_minute = 20\nfull_cycle_hours = 48\n",
+        )
+        .expect("valid");
+        assert_eq!(
+            (
+                tuned.recent_days,
+                tuned.rewalk_hot_hours,
+                tuned.rewalk_hot_minutes,
+                tuned.rewalk_recent_hours,
+                tuned.full_reads_per_minute,
+                tuned.full_cycle_hours
+            ),
+            (7, 6, 30, 12, 20, 48)
+        );
+        for (table, field) in [
+            ("max_days = 730\n", "message_cache.max_days"),
+            (
+                "backfill = \"full\"\nmax_days = 36501\n",
+                "message_cache.max_days",
+            ),
+            (
+                "backfill = \"full\"\nmax_days = 0\n",
+                "message_cache.max_days",
+            ),
+            ("max_megabytes = 16384\n", "message_cache.max_megabytes"),
+            (
+                "backfill = \"full\"\nmax_megabytes = 16385\n",
+                "message_cache.max_megabytes",
+            ),
+            ("recent_days = 0\n", "message_cache.recent_days"),
+            ("rewalk_hot_hours = 169\n", "message_cache.rewalk_hot_hours"),
+            (
+                "rewalk_hot_minutes = 4\n",
+                "message_cache.rewalk_hot_minutes",
+            ),
+            (
+                "rewalk_recent_hours = 0\n",
+                "message_cache.rewalk_recent_hours",
+            ),
+            (
+                "full_reads_per_minute = 51\n",
+                "message_cache.full_reads_per_minute",
+            ),
+            ("full_cycle_hours = 145\n", "message_cache.full_cycle_hours"),
+            ("full_cycle_hours = 23\n", "message_cache.full_cycle_hours"),
+        ] {
+            assert_eq!(read(table).expect_err(table), field, "{table:?}");
+        }
     }
 
     #[test]

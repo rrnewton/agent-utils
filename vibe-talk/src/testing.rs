@@ -1567,7 +1567,12 @@ pub fn install_message_cache(
         // system temporary directory's children are.
         path: dir.join("message-cache").join("message-cache.sqlite3"),
         store_path: None,
-        limits: crate::cache::Limits::default(),
+        // The table's bounds, as a server's own start reads them (`#595 cache-full-history`: a
+        // full history keeps every day).
+        limits: state.config.message_cache.as_ref().map_or_else(
+            crate::cache::Limits::default,
+            crate::cache::Limits::from_config,
+        ),
         search_text: search_text.clone(),
         clock: clock.clone(),
     };

@@ -520,11 +520,27 @@ enabled = true
 #                                   # beside the store: <store stem>.message-cache-<host>.sqlite3.
 #                                   # Name one the same way, so the canary preflight matches it
 # max_days = 90                     # 1 to 365, counted by each message's own time. 0 is refused,
-#                                   # not read as unlimited
-# max_megabytes = 256               # 16 to 4096: the file and its -wal and -shm together
-# backfill = "adaptive"             # "adaptive": walk each cached channel's newest pages back
-#                                   # into the cache while its provider is otherwise idle, one
-#                                   # page at a time (#453 cache-backfill). "off": no such reads
+#                                   # not read as unlimited. With backfill = "full": no age limit
+#                                   # unless given, and up to 36500
+# max_megabytes = 256               # 16 to 4096 (16384 with backfill = "full"): the file and its
+#                                   # -wal and -shm together
+# backfill = "recent"               # CHOSEN WHEN THE SERVER IS SET UP (#595 cache-full-history):
+#                                   # "recent": keep each cached channel's last recent_days read
+#                                   # and re-read while its provider is otherwise idle, one page at
+#                                   # a time (#453 cache-backfill; "adaptive" is its old name).
+#                                   # "full": the same, and walk on into older history at
+#                                   # full_reads_per_minute until each channel's beginning,
+#                                   # resuming after a restart, so the cache holds everything.
+#                                   # "off": no such reads
+# recent_days = 90                  # 1 to 365: how far back the recent walk re-reads. Default:
+#                                   # max_days, or 14 with backfill = "full"
+# rewalk_hot_hours = 24             # 1 to 168: the stretch the hot walk re-reads...
+# rewalk_hot_minutes = 60           # 5 to 1440: ...this often, and after a stream gap
+# rewalk_recent_hours = 24          # 1 to 168: how often the recent walk runs
+# full_reads_per_minute = 6         # 1 to 50 a provider: the pace of the walk into older history
+# full_cycle_hours = 72             # 24 to 144: how soon after a walk of the whole history began
+#                                   # the next begins. A held row not read again within a week is
+#                                   # erased, so the whole history is walked again, not once
 # timeline_fallback_ms = 10000      # 1000 to 60000. No effect in this build
 #
 # A conversation the provider keeps for less time can have its own age limit:

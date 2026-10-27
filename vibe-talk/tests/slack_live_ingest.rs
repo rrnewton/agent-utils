@@ -982,9 +982,10 @@ mod measure {
     use http_body_util::BodyExt as _;
     use serde_json::{json, Value};
     use tower::ServiceExt as _;
+    use vibe_talk::backfill::{Backfill, BackfillStep};
     use vibe_talk::model::ChannelId;
     use vibe_talk::providers::ChatRouter;
-    use vibe_talk::relist::{Backfill, BackfillStep, RelistOptions};
+    use vibe_talk::relist::RelistOptions;
     use vibe_talk::state::AppState;
     use vibe_talk::testing::{self, ManualClock, TempDir, READ_TOKEN, WRITE_TOKEN};
 
@@ -1161,7 +1162,10 @@ mod measure {
                 BackfillStep::Idle => break,
                 other => panic!("unexpected step {other:?}"),
             }
-            assert!(reads <= vibe_talk::relist::BACKFILL_PAGES, "the walk ends");
+            assert!(
+                reads <= vibe_talk::backfill::BACKFILL_PAGES,
+                "the walk ends"
+            );
         }
         // Pages of 50 rows (each read through as many 20-row bridge calls as it takes): three hold
         // all 120 messages, and the third says nothing is older.
@@ -1284,6 +1288,522 @@ mod measure {
             backfill.step(&state, LIMIT, Duration::ZERO).await,
             BackfillStep::Read
         );
+    }
+
+    // ---- `#595 cache-full-history` -------------------------------------------------------------
+
+    const FULL: &str = "\n[message_cache]\nbackfill = \"full\"\nfull_reads_per_minute = 50\n";
+
+    /// `count` messages `spacing` seconds apart, the newest a minute ago: a long history.
+    fn long_history(count: i64, spacing: i64) -> FakeState {
+        let mut state = FakeState::default();
+        let base = wall_secs() - 60 - (count - 1) * spacing;
+        let list: Vec<Value> = (0..count)
+            .map(|i| {
+                profiled(
+                    &format!("{}.000000", base + i * spacing),
+                    "UADA00001",
+                    "Ada",
+                    &format!("message {i}"),
+                )
+            })
+            .collect();
+        state.history.insert(CH.to_owned(), list);
+        state
+    }
+
+    fn frontier(state: &AppState) -> Option<vibe_talk::cache::Frontier> {
+        let cache = state.message_cache.cache().expect("a cache");
+        assert!(cache.quiesce_blocking(WAIT), "the writer caught up");
+        let chan = state.message_cache.chan_key(&channel()).expect("routed");
+        cache.frontier(&chan).served().expect("served")
+    }
+
+    /// Step until the full walk has read `pages` pages, the clock moved past each read's pace.
+    async fn full_pages(
+        backfill: &mut Backfill,
+        state: &AppState,
+        clock: &ManualClock,
+        pages: usize,
+    ) -> usize {
+        let mut read = 0;
+        let mut steps = 0;
+        while read < pages {
+            steps += 1;
+            assert!(steps < 10_000, "the walk stalled");
+            match backfill.step(state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Read => read += 1,
+                BackfillStep::Waiting => clock.advance(1_200),
+                BackfillStep::Idle => break,
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        read
+    }
+
+    /// The full walk reads a channel's whole history, page after page back to its beginning, with
+    /// no age limit; where it stands is kept in the cache file, so a backfill begun afresh (a
+    /// restart) goes on from there rather than from the newest page; and once it reaches the
+    /// beginning the channel is complete, Main covered from the scope's start.
+    #[tokio::test]
+    async fn the_full_walk_reads_a_long_history_to_its_beginning_and_resumes_after_a_restart() {
+        // 1,000 messages three hours apart: 125 days, ten pages of 100.
+        let fake = Fake::start(long_history(1_000, 3 * 3600), 100).await;
+        let (state, clock, _dir) = cached(&fake, "full-walk", FULL).await;
+        let mut backfill = Backfill::new();
+        // The recent walk comes first: back to fourteen days, three pages of 50.
+        for _ in 0..3 {
+            assert_eq!(
+                backfill.step(&state, LIMIT, Duration::ZERO).await,
+                BackfillStep::Read
+            );
+        }
+        assert_eq!(frontier(&state), None, "the full walk has not begun");
+        assert_eq!(full_pages(&mut backfill, &state, &clock, 4).await, 4);
+        let stopped = frontier(&state).expect("a record");
+        assert_eq!(stopped.cycle_pages, 4);
+        assert!(stopped.cursor.is_some());
+        assert_eq!(stopped.complete_ms, None);
+        // A restart: a backfill that remembers nothing goes on from the record.
+        let mut backfill = Backfill::new();
+        for _ in 0..3 {
+            assert_eq!(
+                backfill.step(&state, LIMIT, Duration::ZERO).await,
+                BackfillStep::Read,
+                "a start walks the recent days again"
+            );
+        }
+        let before = fake.calls("conversations.history");
+        assert_eq!(full_pages(&mut backfill, &state, &clock, 1).await, 1);
+        let resumed = frontier(&state).expect("a record");
+        assert_eq!(
+            resumed.cycle_pages, 5,
+            "the walk went on, not from the newest page"
+        );
+        assert_eq!(resumed.cycle_started_ms, stopped.cycle_started_ms);
+        assert!(resumed.below_ms < stopped.below_ms, "it read further back");
+        assert!(
+            fake.calls("conversations.history") - before <= 2,
+            "one page: the row past it that says more remain may take a second call"
+        );
+        // On to the beginning: five more pages, the last of them saying nothing is older.
+        assert_eq!(full_pages(&mut backfill, &state, &clock, 5).await, 5);
+        let done = frontier(&state).expect("a record");
+        assert_eq!(done.cursor, None);
+        assert_eq!(done.cycle_pages, 10);
+        assert_eq!(done.complete_pages, Some(10));
+        assert!(done.complete_ms.is_some());
+        assert_eq!(held(&state), 1_000, "nothing was too old to keep");
+        let cache = state.message_cache.cache().expect("a cache");
+        let chan = state.message_cache.chan_key(&channel()).expect("routed");
+        let covered = cache
+            .coverage(&chan, &vibe_talk::cache::Scope::Main)
+            .served()
+            .expect("coverage");
+        assert_eq!(covered.first().map(|i| i.t0_ms), Some(0), "{covered:?}");
+        assert!(
+            covered
+                .windows(2)
+                .all(|pair| pair[0].t1_ms >= pair[1].t0_ms),
+            "the walk's pages join into one stretch: {covered:?}"
+        );
+        let history = vibe_talk::backfill::history(&state).expect("a report");
+        assert_eq!(history.mode, "full");
+        assert_eq!(history.channels.len(), 1);
+        let channel_history = &history.channels[0];
+        assert!(channel_history.complete);
+        assert!(!channel_history.walking);
+        assert_eq!(channel_history.label.as_deref(), Some("team"));
+        assert_eq!(channel_history.messages, 1_000);
+        // Nothing more is due until the next walk, `full_cycle_hours` after this one began.
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Idle
+        );
+        clock.advance(72 * 3600 * 1000);
+        let mut walked = 0;
+        loop {
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Read => walked += 1,
+                BackfillStep::Waiting => clock.advance(1_200),
+                BackfillStep::Idle => break,
+                other => panic!("unexpected step {other:?}"),
+            }
+            if frontier(&state).is_some_and(|f| f.cycle_pages == 1 && f.cursor.is_some()) {
+                break;
+            }
+        }
+        assert!(walked >= 1, "the next walk began");
+        let next = frontier(&state).expect("a record");
+        assert_eq!(next.cycle_pages, 1, "from the newest page");
+        assert_eq!(
+            next.complete_pages,
+            Some(10),
+            "keeping what the last walk took"
+        );
+        assert!(
+            vibe_talk::backfill::history(&state)
+                .expect("a report")
+                .channels[0]
+                .complete,
+            "still complete: the last walk to reach the beginning began less than a week ago"
+        );
+    }
+
+    /// Each thread the full walk finds is read whole, a long one page by page, before it steps
+    /// back again; its reads keep to `full_reads_per_minute` of the provider; and like every
+    /// backfill read they wait while anything else reads the provider.
+    #[tokio::test]
+    async fn the_full_walk_reads_threads_whole_at_its_pace_and_yields() {
+        let mut fixture = long_history(250, 3600);
+        let mut list = fixture.history.remove(CH).expect("history");
+        for (index, count) in [(10_usize, 3_usize), (120, 150), (240, 2)] {
+            let root_secs: i64 = list[index]["ts"]
+                .as_str()
+                .expect("ts")
+                .split('.')
+                .next()
+                .expect("seconds")
+                .parse()
+                .expect("a number");
+            let replies: Vec<(String, String)> = (0..count)
+                // 170 seconds apart: settled below the newest one, and never at the instant of a
+                // message of the channel's own, an hour apart.
+                .map(|n| {
+                    let at = root_secs + 170 * (i64::try_from(n).expect("small") + 1);
+                    (format!("{at}.000000"), format!("reply {n}"))
+                })
+                .collect();
+            super::slack_fake::thread(&mut fixture, CH, &mut list[index], &replies);
+        }
+        fixture.history.insert(CH.to_owned(), list);
+        let fake = Fake::start(fixture, 100).await;
+        let table = "\n[message_cache]\nbackfill = \"full\"\nfull_reads_per_minute = 6\n";
+        let (state, clock, _dir) = cached(&fake, "full-threads", table).await;
+        let mut backfill = Backfill::new();
+        // The recent walk: back to fourteen days, which is all 250 hours of it, in five pages.
+        let mut recent = 0;
+        while recent < 20 {
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Read => recent += 1,
+                _ => break,
+            }
+            if frontier(&state).is_some() {
+                break;
+            }
+        }
+        // Pace: one full read, then nothing for ten seconds of the provider's clock.
+        let replies_before = fake.calls("conversations.replies");
+        let mut paced = 0;
+        while frontier(&state).is_none() || paced == 0 {
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Read => paced += 1,
+                BackfillStep::Waiting => break,
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Waiting,
+            "a second full read at once"
+        );
+        clock.advance(9_000);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Waiting,
+            "a second full read nine seconds on"
+        );
+        clock.advance(1_000);
+        // Yielding: while a page's read is in flight, the full walk adds none of its own.
+        fake.with(|fake| fake.delay = Some(Duration::from_millis(600)));
+        let reader = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                request(
+                    &state,
+                    "GET",
+                    &format!("/api/v1/channels/{CH}/timeline?view=main&limit=50"),
+                    WRITE_TOKEN,
+                    &Value::Null,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::from_secs(2)).await,
+            BackfillStep::Busy
+        );
+        assert_eq!(reader.await.expect("joined"), StatusCode::OK);
+        fake.with(|fake| fake.delay = None);
+        // On to the beginning, every thread read whole on the way.
+        let mut steps = 0;
+        while frontier(&state).is_none_or(|f| f.complete_ms.is_none()) {
+            steps += 1;
+            assert!(steps < 10_000, "the walk stalled");
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Read => {}
+                BackfillStep::Waiting => clock.advance(10_000),
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert!(
+            fake.calls("conversations.replies") - replies_before >= 4,
+            "three threads, the long one in two pages"
+        );
+        assert_eq!(
+            held(&state),
+            250 + 3 + 150 + 2,
+            "every reply of every thread is held"
+        );
+        let cache = state.message_cache.cache().expect("a cache");
+        let chan = state.message_cache.chan_key(&channel()).expect("routed");
+        let long_root =
+            fake.with(|fake| fake.history[CH][120]["ts"].as_str().expect("ts").to_owned());
+        let thread_covered = cache
+            .coverage(&chan, &vibe_talk::cache::Scope::Thread(long_root))
+            .served()
+            .expect("coverage");
+        assert!(
+            thread_covered
+                .windows(2)
+                .all(|pair| pair[0].t1_ms >= pair[1].t0_ms)
+                && !thread_covered.is_empty(),
+            "the long thread's two pages join into one stretch: {thread_covered:?}"
+        );
+    }
+
+    /// A full walk stopped part way starts again from the newest page when the cache no longer
+    /// holds where it stopped: after an erase of the channel, which takes its record with it, and
+    /// after its Main coverage is gone (here an erase of that scope; in service, the week's
+    /// revalidation after a long stop, or eviction), which leaves the record behind.
+    #[tokio::test]
+    async fn a_full_walk_whose_stopping_place_is_gone_starts_again_from_the_newest_page() {
+        let fake = Fake::start(long_history(1_000, 3 * 3600), 100).await;
+        let (state, clock, _dir) = cached(&fake, "full-gone", FULL).await;
+        let cache = state.message_cache.cache().expect("a cache");
+        let chan = state.message_cache.chan_key(&channel()).expect("routed");
+        let mut backfill = Backfill::new();
+        for _ in 0..3 {
+            backfill.step(&state, LIMIT, Duration::ZERO).await;
+        }
+        assert_eq!(full_pages(&mut backfill, &state, &clock, 3).await, 3);
+        assert_eq!(frontier(&state).expect("a record").cycle_pages, 3);
+        // The Main scope's claims go; the record stays, and says where the walk stopped.
+        cache.erase_scope(&chan, &vibe_talk::cache::Scope::Main);
+        assert!(cache.quiesce_blocking(WAIT));
+        assert_eq!(frontier(&state).expect("kept").cycle_pages, 3);
+        let mut backfill = Backfill::new();
+        let mut steps = 0;
+        while frontier(&state).expect("a record").cycle_pages == 3 {
+            steps += 1;
+            assert!(steps < 100, "the walk never went on");
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Waiting => clock.advance(1_200),
+                BackfillStep::Read | BackfillStep::Idle => {}
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert_eq!(
+            frontier(&state).expect("a record").cycle_pages,
+            1,
+            "the walk started again from the newest page, not from a stretch the cache lost"
+        );
+        // An erase of the channel takes the record with it.
+        assert_eq!(full_pages(&mut backfill, &state, &clock, 2).await, 2);
+        cache.erase_channels(std::slice::from_ref(&chan));
+        assert!(cache.quiesce_blocking(WAIT));
+        assert_eq!(frontier(&state), None, "the record went with the channel");
+        let mut steps = 0;
+        while frontier(&state).is_none() {
+            steps += 1;
+            assert!(steps < 100, "the walk never began again");
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Waiting => clock.advance(1_200),
+                BackfillStep::Read | BackfillStep::Idle => {}
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert_eq!(frontier(&state).expect("a record").cycle_pages, 1);
+    }
+
+    /// A continuation the provider no longer takes (a Discord cursor lives five minutes, and not
+    /// across a restart) is asked for twice, and then the walk starts again from the newest page
+    /// rather than asking for ever.
+    #[tokio::test]
+    async fn a_full_walk_whose_continuation_keeps_failing_starts_again_from_the_newest_page() {
+        let fake = Fake::start(long_history(1_000, 3 * 3600), 100).await;
+        let (state, clock, _dir) = cached(&fake, "full-refused", FULL).await;
+        let mut backfill = Backfill::new();
+        for _ in 0..3 {
+            backfill.step(&state, LIMIT, Duration::ZERO).await;
+        }
+        assert_eq!(full_pages(&mut backfill, &state, &clock, 3).await, 3);
+        fake.with(|fake| {
+            fake.fail.insert(
+                "conversations.history".to_owned(),
+                "invalid_cursor".to_owned(),
+            );
+        });
+        clock.advance(1_200);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Failed
+        );
+        clock.advance(61_000);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Failed
+        );
+        fake.with(|fake| {
+            fake.fail.remove("conversations.history");
+        });
+        clock.advance(1_200);
+        assert_eq!(full_pages(&mut backfill, &state, &clock, 1).await, 1);
+        assert_eq!(
+            frontier(&state).expect("a record").cycle_pages,
+            1,
+            "after two refusals the walk began again from the newest page"
+        );
+    }
+
+    /// A walk that gave up a thread reaches the beginning without making the channel complete.
+    #[tokio::test]
+    async fn a_full_walk_that_gave_up_a_thread_does_not_make_the_channel_complete() {
+        let mut fixture = long_history(50, 3600);
+        let mut list = fixture.history.remove(CH).expect("history");
+        let root_ts = list[20]["ts"].as_str().expect("ts").to_owned();
+        let replies = vec![(format!("{}.000000", wall_secs() - 30), "a reply".to_owned())];
+        super::slack_fake::thread(&mut fixture, CH, &mut list[20], &replies);
+        fixture.history.insert(CH.to_owned(), list);
+        fixture.fail_threads.insert(root_ts, 500);
+        let fake = Fake::start(fixture, 100).await;
+        let (state, clock, _dir) = cached(&fake, "full-gave-up", FULL).await;
+        let mut backfill = Backfill::new();
+        let mut steps = 0;
+        while frontier(&state).is_none_or(|f| f.cursor.is_some()) {
+            steps += 1;
+            assert!(steps < 200, "the walk never ended");
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Waiting => clock.advance(1_200),
+                // The channel waits ten minutes after each failed read of the thread.
+                BackfillStep::Failed | BackfillStep::Idle => clock.advance(600_000),
+                BackfillStep::Read => {}
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        let ended = frontier(&state).expect("a record");
+        assert!(ended.cycle_gaps >= 1, "{ended:?}");
+        assert_eq!(ended.complete_ms, None, "{ended:?}");
+        let history = vibe_talk::backfill::history(&state).expect("a report");
+        assert!(!history.channels[0].complete);
+        assert_eq!(history.summary().complete, 0);
+    }
+
+    /// A stream that lost records, or came back after a silence, asks for each of its channels' hot
+    /// walks at once, rather than at the next interval.
+    #[tokio::test]
+    async fn a_stream_gap_or_a_silence_asks_for_a_hot_walk_at_once() {
+        let fake = Fake::start(history(120, 60), 20).await;
+        let (state, clock, _dir) = cached(&fake, "rewalk-gap", "\n[message_cache]\n").await;
+        let mut backfill = Backfill::new();
+        while backfill.step(&state, LIMIT, Duration::ZERO).await == BackfillStep::Read {}
+        clock.advance(60_000);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Idle,
+            "nothing is due a minute after a start's walk"
+        );
+        state.live.request_rewalk(&channel());
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Read,
+            "the hot walk ran at once"
+        );
+        while backfill.step(&state, LIMIT, Duration::ZERO).await == BackfillStep::Read {}
+        // The ingest route: a record after half an hour's silence asks the same.
+        let t = 1_800_000_000_000;
+        assert!(
+            !state.live.note_stream_record(t),
+            "the first record ends no silence"
+        );
+        assert!(!state.live.note_stream_record(t + 29 * 60 * 1_000));
+        assert!(state.live.note_stream_record(t + 60 * 60 * 1_000));
+    }
+
+    /// Backfill page reads, and Web API calls, in one day of a channel that gets a message every
+    /// `every` seconds and already holds 30 days of them, under `table`: counted from the end of
+    /// the first hour, so the walk a start makes is left out. Each simulated minute the clock moves
+    /// on, a message arrives when one is due, and the backfill steps until nothing is due.
+    async fn day_of_reads(tag: &str, every: i64, table: &str) -> (usize, usize) {
+        let fake = Fake::start(long_history(30 * 86_400 / every, every), 20).await;
+        let (state, clock, _dir) = cached(&fake, tag, table).await;
+        let mut backfill = Backfill::new();
+        let (mut reads, mut calls_at_start) = (0, 0);
+        let mut next_message = clock.now() / 1_000 + every - 60;
+        for minute in 0..(25 * 60) {
+            clock.advance(60_000);
+            let now_secs = clock.now() / 1_000;
+            if now_secs >= next_message {
+                fake.with(|fake| {
+                    fake.history.get_mut(CH).expect("history").push(profiled(
+                        &format!("{now_secs}.000000"),
+                        "UADA00001",
+                        "Ada",
+                        "arrival",
+                    ));
+                });
+                next_message += every;
+            }
+            if minute == 60 {
+                calls_at_start = fake.calls("conversations.history");
+            }
+            loop {
+                match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                    BackfillStep::Read => {
+                        if minute >= 60 {
+                            reads += 1;
+                        }
+                    }
+                    BackfillStep::Idle => break,
+                    other => panic!("unexpected step {other:?}"),
+                }
+            }
+        }
+        (reads, fake.calls("conversations.history") - calls_at_start)
+    }
+
+    /// `#595 cache-full-history`: what the tiered re-walk costs against the single walk it
+    /// replaced, on the loopback fake, in pages of 50 a day (each page three calls of the fake's
+    /// 20 rows). Before: the whole recent stretch (14 days, at most 20 pages) every six hours.
+    /// After: the last 24 hours every hour, and the whole recent stretch once a day.
+    #[tokio::test]
+    async fn measure_backfill_reads_a_day_before_and_after_the_tiers() {
+        // `max_days = 14`, as on the live instance: the recent walk goes as far back as that, as
+        // the single walk did, and with both intervals at six hours this is that walk exactly.
+        const BEFORE: &str = "\n[message_cache]\nmax_days = 14\nrewalk_recent_hours = 6\n\
+                              rewalk_hot_minutes = 360\n";
+        const AFTER: &str = "\n[message_cache]\nmax_days = 14\n";
+        let mut figures = Vec::new();
+        for (channel, every) in [("busy", 300), ("quiet", 7_200)] {
+            let before = day_of_reads(&format!("tiers-before-{channel}"), every, BEFORE).await;
+            let after = day_of_reads(&format!("tiers-after-{channel}"), every, AFTER).await;
+            eprintln!(
+                "backfill reads a day, {channel} channel (a message every {every} s): before {} \
+                 pages ({} calls), after {} pages ({} calls)",
+                before.0, before.1, after.0, after.1
+            );
+            figures.push((channel, before, after));
+        }
+        // Busy: 288 messages a day, so the recent stretch is past 20 pages and the last day is
+        // six. Before, four walks of 20; after, 23 of six and one of 20.
+        let (_, busy_before, busy_after) = figures[0];
+        assert_eq!(busy_before.0, 4 * 20, "{figures:?}");
+        assert_eq!(busy_after.0, 23 * 6 + 20, "{figures:?}");
+        // Quiet: 12 a day, so the recent stretch is four pages and the last day one.
+        let (_, quiet_before, quiet_after) = figures[1];
+        assert_eq!(quiet_before.0, 4 * 4, "{figures:?}");
+        assert_eq!(quiet_after.0, 23 + 4, "{figures:?}");
     }
 
     /// The shadow's count for the newest timeline page.

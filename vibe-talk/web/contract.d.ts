@@ -880,6 +880,37 @@ declare namespace VibeTalk {
   }
 
   /**
+   * `history` in [`MessageCacheStatus`]: the backfill's mode, and which channels the server holds
+   * whole back to their beginnings. `#595 cache-full-history`.
+   */
+  interface MessageCacheHistory {
+    /**
+     * Channels the server holds anything of, and of those, how many it holds every message of
+     * back to the channel's beginning ("complete history"). Counts only, as everywhere in this
+     * status: no channel is named.
+     */
+    channels: number;
+    /**
+     * See `channels`.
+     */
+    complete: number;
+    /**
+     * `recent` (the last days of each channel, kept read), `full` (every channel's whole history,
+     * gathered at a steady pace and read again every few days) or `off`.
+     */
+    mode: string;
+    /**
+     * `storage` while the full walk waits for room under `max_megabytes`.
+     */
+    paused?: string | null;
+    /**
+     * The oldest message a full walk still under way has reached, RFC 3339 UTC. Absent when none
+     * is under way.
+     */
+    reached?: string | null;
+  }
+
+  /**
    * `PUT /api/v1/message-cache`: the owner's switch. `#208 persistent-cache`.
    *
    * An unknown field is ignored, as everywhere in the contract: a page may send one a later server
@@ -920,7 +951,13 @@ declare namespace VibeTalk {
      */
     enabled: boolean;
     /**
-     * The server's age limit, in days: nothing older is kept.
+     * How far back the server gathers each channel's history, and how much of it is whole.
+     * Absent while no file is open, and from an older server. `#595 cache-full-history`.
+     */
+    history?: MessageCacheHistory | null;
+    /**
+     * The server's age limit, in days: nothing older is kept. 65535 means none: with
+     * `history.mode` `full` and no age limit configured, every day is kept.
      */
     max_days: number;
     /**

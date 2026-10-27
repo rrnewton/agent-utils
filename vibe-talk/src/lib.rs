@@ -49,6 +49,7 @@
 pub mod access;
 pub mod agent_backend;
 pub mod auth;
+pub mod backfill;
 pub mod bridge_dial;
 pub mod cache;
 pub mod chain;

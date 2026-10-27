@@ -6145,6 +6145,11 @@ function searchEmptySentence(loaded) {
   } else {
     said = `Searched the ${messagesWords(loaded)} loaded in this browser${reachBackWords(oldestLoadedMs())}. None match.`;
   }
+  // `#595 cache-full-history`. When the browser's own search finds nothing, that the server holds
+  // every message of the channel is worth saying: a search there would be complete.
+  if (serverHoldsWholeHistory()) {
+    said += " This server holds the complete history of this channel, which this search does not reach yet.";
+  }
   // Main holds a thread's first message and nothing of the rest, and the cards on the right, or All,
   // are where a reply is found. Most of why a search on the left of two columns finds nothing.
   if (threadingSupported && channelView === "main") return `${said} Thread replies are not in Main.`;
@@ -46206,6 +46211,41 @@ function cacheSize(bytes) {
   return `${bytes === 0 ? 0 : Math.max(1, Math.ceil(bytes / 1024))} KB`;
 }
 
+/** `max_days` when the server keeps every day: a full history with no age limit. `#595 cache-full-history`. */
+const SERVER_CACHE_NO_AGE_LIMIT = 65535;
+
+/**
+ * Whether the server says it holds every message of every channel it caches back to its beginning,
+ * so of the one on screen too. The status counts channels and never names one, so a server still
+ * gathering one channel says this of none. `#595 cache-full-history`.
+ */
+function serverHoldsWholeHistory() {
+  const history = serverCache && serverCache.available ? serverCache.history : null;
+  return Boolean(history && history.mode === "full" && history.channels > 0 &&
+    history.complete === history.channels);
+}
+
+/**
+ * What the line under the switch says of how much history the server gathers: with a full history,
+ * how many channels it holds whole, how far back the walk still under way has reached, and that it
+ * waits when the size limit is near. Empty for the recent days alone. `#595 cache-full-history`.
+ *
+ * @param {VibeTalk.MessageCacheStatus} status
+ */
+function serverCacheHistory(status) {
+  const history = status.history;
+  if (!history || history.mode !== "full") return "";
+  const whole = history.channels > 0 && history.complete === history.channels
+    ? " Complete history of every channel."
+    : ` Complete history of ${history.complete} of ${nounCount(history.channels, "channel")}.`;
+  const reached = history.reached ? new Date(history.reached) : null;
+  const going = reached && !Number.isNaN(reached.getTime())
+    ? ` Gathering older messages, back to ${dayLabel(reached)} so far.`
+    : "";
+  const paused = history.paused === "storage" ? " Gathering waits: the size limit is nearly reached." : "";
+  return `${whole}${going}${paused}`;
+}
+
 /**
  * The one line under the switch: what the server holds, or why it holds nothing.
  *
@@ -46224,7 +46264,9 @@ function serverCacheLine(status) {
     const why = SERVER_CACHE_TROUBLE[status.reason];
     return `On, but no file is open, so nothing is being saved${why ? `: ${why}` : ""}.`;
   }
-  const limits = `It keeps at most ${nounCount(status.max_days, "day")} and ${status.max_megabytes} MB.`;
+  const limits = status.max_days === SERVER_CACHE_NO_AGE_LIMIT
+    ? `It keeps every day, up to ${status.max_megabytes} MB.`
+    : `It keeps at most ${nounCount(status.max_days, "day")} and ${status.max_megabytes} MB.`;
   if (status.messages === 0) return `On, and nothing is saved yet. ${limits}`;
   const held =
     `On: ${nounCount(status.messages, "message")} from ${nounCount(status.channels, "channel")}, ` +
@@ -46233,7 +46275,7 @@ function serverCacheLine(status) {
   const since = status.oldest_covered ? new Date(status.oldest_covered) : null;
   const whole =
     since && !Number.isNaN(since.getTime()) ? ` Complete in places back to ${dayLabel(since)}.` : "";
-  return `${held}${whole} ${limits}`;
+  return `${held}${whole}${serverCacheHistory(status)} ${limits}`;
 }
 
 /**
@@ -46274,7 +46316,8 @@ function renderServerCache(note = "") {
     return;
   }
   const status = serverCache;
-  el("message-cache-help-days").textContent = nounCount(status.max_days, "day");
+  el("message-cache-help-days").textContent =
+    status.max_days === SERVER_CACHE_NO_AGE_LIMIT ? "their whole history" : nounCount(status.max_days, "day");
   el("message-cache-help-megabytes").textContent = `${status.max_megabytes} MB`;
   const busy = serverCacheSending !== null;
   const box = el("message-cache-enabled");

@@ -587,16 +587,39 @@ impl Fill {
         self.rows
     }
 
-    /// Offer a `/timeline` page, raw, as the provider answered `request`.
+    /// Offer a `/timeline` page, raw, as the provider answered `request`. Whether every
+    /// observation it made was queued: a full queue, or a fill that writes no rows, leaves some
+    /// out (and the channel in doubt).
     pub fn offer_timeline(
         self,
         request: &TimelineRequest,
         read: TimelineRead,
         page: &TimelinePage,
-    ) {
+    ) -> bool {
         let observed_ms = self.observed(page.as_of.as_deref());
         let observations = observe::timeline(self.shape, request, read, page, observed_ms);
-        self.offer(observations);
+        self.offer(observations)
+    }
+
+    /// Offer one step back of the full-history walk: `page`, read with `request`'s `before`, the
+    /// continuation of a page whose oldest message was written at `below_ms`
+    /// ([`observe::older`]). `#595 cache-full-history`.
+    /// Whether every observation was queued, as [`Fill::offer_timeline`] says.
+    pub fn offer_older(
+        self,
+        request: &TimelineRequest,
+        page: &TimelinePage,
+        below_ms: i64,
+    ) -> bool {
+        let observed_ms = self.observed(page.as_of.as_deref());
+        let observations = observe::older(self.shape, request, page, below_ms, observed_ms);
+        self.offer(observations)
+    }
+
+    /// Record where the full-history walk of the channel stands, under the stamp of the read it
+    /// rests on: begin this fill before that read. `#595 cache-full-history`.
+    pub fn offer_frontier(self, frontier: super::Frontier) -> bool {
+        self.offer(vec![Observation::Frontier(frontier)])
     }
 
     /// Offer a read of the channel's most recent messages through `fetch_recent_dated`, which a
@@ -709,12 +732,13 @@ impl Fill {
     ///
     /// What is offered is noted by id, with who offered it, for the shadow's diagnostics: one
     /// brief lock, never a wait ([`Arrivals::note`]).
-    fn offer(self, observations: Vec<Observation>) {
+    fn offer(self, observations: Vec<Observation>) -> bool {
         let Some(cache) = self.cache.upgrade() else {
-            return;
+            return false;
         };
         let arrivals = self.arrivals.upgrade();
         let offered_ms = cache.now_ms();
+        let mut every = true;
         for observation in observations {
             if self.rows || observation.removes_only() {
                 // Noted only once queued: an offer dropped never reached the file.
@@ -729,11 +753,15 @@ impl Fill {
                     if let Some((arrivals, noted)) = noted {
                         arrivals.record(&self.chan, noted);
                     }
+                } else {
+                    every = false;
                 }
             } else {
+                every = false;
                 cache.mark_suspect(&self.chan);
             }
         }
+        every
     }
 }
 

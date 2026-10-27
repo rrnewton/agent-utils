@@ -4774,6 +4774,11 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // The bands are deliberately WIDE. They are not a second opinion about the tuning; they are the
 // boundary between a judgement and a different behaviour wearing the same name.
 const TUNING_BANDS = {
+  // `#595 cache-full-history`. Not a tuning at all: the value the server's contract sends as
+  // `max_days` for no age limit. Any other would read a real limit as none, or none as 65535 days.
+  SERVER_CACHE_NO_AGE_LIMIT: [65535, 65535,
+    "the max_days the server sends for a full history with no age limit (u16::MAX in src/config.rs); " +
+    "another value would call a real limit none, or say the server keeps 65535 days"],
   KEYBOARD_MIN_PX: [100, 220,
     "the least height an on-screen keyboard takes from the viewport before the page hides both bars for it: " +
     "lower takes a browser's toolbar sliding away, or a hardware keyboard's accessory strip, for a keyboard " +
@@ -73432,6 +73437,45 @@ test("`#208 persistent-cache`: the line under the switch says what the server ho
   const page = await messageCachePage(messageCacheStatus({ max_days: 30, max_megabytes: 512 }));
   assert.equal(page.el("message-cache-help-days").textContent, "30 days");
   assert.equal(page.el("message-cache-help-megabytes").textContent, "512 MB");
+});
+
+test("`#595 cache-full-history`: the line says how many channels the server holds whole and how far back it has reached, and the search says when the server holds every channel whole", async () => {
+  const full = (history) => messageCacheStatus({
+    max_days: 65535,
+    history: { mode: "full", channels: 3, complete: 1, ...history },
+  });
+  const held = "On: 1,200 messages from 3 channels, 3.4 MB. Complete in places back to Aug 10, Mon.";
+  let page = await messageCachePage(full({ reached: "2025-03-02T10:00:00Z" }));
+  assert.match(page.el("message-cache-state").textContent, new RegExp(`^${held.replace(/[.]/g, "\\.")} ` +
+    "Complete history of 1 of 3 channels\\. Gathering older messages, back to .+ so far\\. " +
+    "It keeps every day, up to 256 MB\\.$"));
+  assert.equal(page.el("message-cache-help-days").textContent, "their whole history");
+  page = await messageCachePage(full({ complete: 3, paused: "storage" }));
+  assert.equal(page.el("message-cache-state").textContent, `${held} Complete history of every channel. ` +
+    "Gathering waits: the size limit is nearly reached. It keeps every day, up to 256 MB.");
+  // The recent days alone say nothing new.
+  page = await messageCachePage(messageCacheStatus({
+    history: { mode: "recent", channels: 3, complete: 0 },
+  }));
+  assert.equal(page.el("message-cache-state").textContent, `${held} It keeps at most 14 days and 256 MB.`);
+
+  // A search the browser's messages do not answer says the server holds the channel whole: every
+  // channel it caches is, and the status names none.
+  for (const [complete, tail] of [
+    [3, " This server holds the complete history of this channel, which this search does not reach yet."],
+    [2, ""],
+  ]) {
+    const searching = newPage();
+    searching.messageCache = full({ complete });
+    const all = searchHistory(searching);
+    await signIn(searching);
+    await showDiscord(searching, searching.messages);
+    await search(searching, "engine");
+    await searching.settle();
+    const day = searchMoment(searching, all[20].timestamp);
+    assert.equal(searching.el("search-empty").textContent,
+      `Searched 4 messages in this browser, a complete history back to ${day} (no gaps). None match.${tail}`);
+  }
 });
 
 test("`#208 persistent-cache`: turning it off sends PUT only once the question is answered yes, and nothing on Keep", async () => {

@@ -1524,7 +1524,38 @@ impl Writer<'_> {
                 }
                 Ok(())
             }
+            Observation::Frontier(frontier) => self.store_frontier(chan_id, frontier),
         }
+    }
+
+    /// Record where the full-history walk of a channel stands. `#595 cache-full-history`.
+    fn store_frontier(&self, chan_id: i64, frontier: &super::Frontier) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO backfill (chan, cursor, below_ms, cycle_started_ms, cycle_pages,
+                                   cycle_gaps, complete_ms, complete_started_ms, complete_pages,
+                                   updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?10, ?6, ?7, ?8, ?9)
+             ON CONFLICT (chan) DO UPDATE SET
+                cursor = excluded.cursor, below_ms = excluded.below_ms,
+                cycle_started_ms = excluded.cycle_started_ms, cycle_pages = excluded.cycle_pages,
+                cycle_gaps = excluded.cycle_gaps,
+                complete_ms = excluded.complete_ms,
+                complete_started_ms = excluded.complete_started_ms,
+                complete_pages = excluded.complete_pages, updated_ms = excluded.updated_ms",
+            params![
+                chan_id,
+                frontier.cursor,
+                frontier.below_ms,
+                frontier.cycle_started_ms,
+                frontier.cycle_pages,
+                frontier.complete_ms,
+                frontier.complete_started_ms,
+                frontier.complete_pages,
+                frontier.updated_ms,
+                frontier.cycle_gaps
+            ],
+        )?;
+        Ok(())
     }
 
     fn listing(

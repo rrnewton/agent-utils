@@ -136,6 +136,7 @@ pub mod search;
 pub mod search_text;
 pub mod shadow;
 pub mod sink;
+pub mod stats;
 mod structure;
 mod writer;
 
@@ -428,6 +429,46 @@ pub struct ThreadRecord {
     pub last_activity_ms: i64,
 }
 
+/// Where the full-history walk of one channel stands: the `backfill` table's row
+/// (`#595 cache-full-history`, schema 4). Times are local unless they say provider time.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Frontier {
+    /// The provider's own continuation the walk reads next; `None` once it reached the beginning.
+    pub cursor: Option<String>,
+    /// Provider time of the oldest message the walk has proven.
+    pub below_ms: i64,
+    /// When the walk under way began.
+    pub cycle_started_ms: i64,
+    /// The channel's pages it has read.
+    pub cycle_pages: i64,
+    /// Its reads that proved nothing or were given up: a walk with any reaches the beginning
+    /// without making the channel complete.
+    pub cycle_gaps: i64,
+    /// When the latest walk that reached the channel's beginning ended.
+    pub complete_ms: Option<i64>,
+    /// When that walk began.
+    pub complete_started_ms: Option<i64>,
+    /// How many of the channel's pages it read.
+    pub complete_pages: Option<i64>,
+    /// When this record was written.
+    pub updated_ms: i64,
+}
+
+/// What the file holds of one channel. `#595 cache-full-history`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelStats {
+    /// The channel.
+    pub chan: ChanKey,
+    /// Messages held.
+    pub messages: u64,
+    /// Bytes of their text, as stored.
+    pub content_bytes: u64,
+    /// Provider time of the oldest and newest held, when any is.
+    pub oldest_ms: Option<i64>,
+    /// See `oldest_ms`.
+    pub newest_ms: Option<i64>,
+}
+
 /// A change from the live feed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Push {
@@ -484,6 +525,11 @@ pub enum Observation {
         /// Local time the read started.
         observed_ms: i64,
     },
+    /// Where the full-history walk of the channel now stands, offered after the reads it rests on
+    /// so that it lands no earlier than they do, and under their stamp, so that an erase since
+    /// they began drops it with them. Nothing an account could have read: times, a count and the
+    /// provider's own continuation.
+    Frontier(Frontier),
 }
 
 impl Observation {
@@ -547,6 +593,7 @@ impl Observation {
                 Push::Delete { id, .. } => 128 + id.0.len(),
             },
             Self::Threads { threads, .. } => 128 + threads.len() * 128,
+            Self::Frontier(frontier) => 128 + frontier.cursor.as_ref().map_or(0, String::len),
         }
     }
 }
@@ -2339,6 +2386,19 @@ impl MessageCache {
     #[must_use]
     pub fn counts(&self) -> Read<Counts> {
         self.read(None, reader::counts)
+    }
+
+    /// Where the full-history walk of one channel stands, if it has begun. `#595
+    /// cache-full-history`.
+    #[must_use]
+    pub fn frontier(&self, chan: &ChanKey) -> Read<Option<Frontier>> {
+        self.read(Some(chan), |connection| reader::frontier(connection, chan))
+    }
+
+    /// What the file holds of each channel. `#595 cache-full-history`.
+    #[must_use]
+    pub fn channel_stats(&self) -> Read<Vec<ChannelStats>> {
+        self.read(None, reader::channel_stats)
     }
 
     /// What a shadow evaluation reads of `chan` ([`shadow::Query`]), all of it in one snapshot of
