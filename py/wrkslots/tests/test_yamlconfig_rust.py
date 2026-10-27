@@ -16,7 +16,7 @@ from wrkslots import yamlconfig
 
 
 AU_ROOT = Path(__file__).resolve().parents[3]
-RUST_LAUNCHER = AU_ROOT / "rs" / "bin" / "wrkslotsd"
+CARGO = "cargo"
 
 VALID = [
     "schema: 2\nmachine: node-a\n",
@@ -46,7 +46,8 @@ def _rust_parse(tmp_path: Path, text: str) -> subprocess.CompletedProcess[str]:
     document = tmp_path / "config.yml"
     document.write_text(text)
     return subprocess.run(
-        [str(RUST_LAUNCHER), "parse-config", "--config", str(document)],
+        [CARGO, "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
+         "-p", "wrkslotsd", "--", "parse-config", "--config", str(document)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )
 
