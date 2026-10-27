@@ -71,7 +71,9 @@ phase/archive-id and optional evidence bundles). Other kinds still refuse.
 legacy-validate-remove journal kind (exact fields, actor identity,
 coordinator authorization flag).
 
-[muse watermelon] Slice 9 in progress: validation/editions.json now records the
+[muse watermelon] Slice 9 landed (648ee8a6): validation/editions.json now records the
 slice 1-8 format readers (the wrkslotsd tool note and the wrkslots format
 inventory entry name the Rust modules, the differential corpus, and the
 remaining ownerless/absent journal kinds).
+
+[muse watermelon] Next slice: extend `parse-journal` to the ownerless-validate-remove journal kind (shape level, including the exclusion path validation).
