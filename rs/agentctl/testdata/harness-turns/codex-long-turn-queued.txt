@@ -1,0 +1,23 @@
+• Ran /usr/local/bin/python3 -I -S -B - <<'PREFLIGHT_0266'
+  │ from pathlib import Path
+  │ import os,stat,hashlib,json,datetime
+  │ … +360 lines
+  └ EXACT_TEMPLATE {"prerequisites_personally_checked": null, "all_current_owned_charges_included": null,
+    "authorizes_exactly_one_observed_attempt": null, "authorizes_own_unit_properties_and_cgroup_closure_checks": null,
+    "original_record_negative_oracle_personally_qualified": null, "original_record_negative_oracle_qualification": {"lstat": {"bytes": 202800,
+    +5 lines (^t to view transcript)
+
+• Working (46h 54m 14s • esc to interrupt)
+
+• Queued follow-up inputs
+  ↳ coordinator: answered your current-main binary question as a NOTE line in the push-requests file: none available now; I can arrange a build on request.
+  ↳ coordinator: PHASE 2 from the owner. Read /work/scratch/dispatch/lane-a-phase2-brief.md and prioritize it over the tracing work. coordinator: BINDING
+    steering addendum at the end of lane-a-phase2-brief.md (13:10Z). Read it first. coordinator: steering addendum 2 at the end of lane-a-phase2-brief.md (1:20 PM ET). Read
+    …
+  ↳ coordinator: the owner wants a clean checkout. Please commit and push your round2 report edit and experiments dir within 30 min (see queue NOTE).
+  ↳ coordinator: owner question for you in the queue NOTE (bug population). Answer within 30 min.
+    shift+← edit last queued message
+
+» Ask Codex to do anything
+
+  GPT-6.1 Sol ultra · ~/work/project · Execute lane-a dispatch overnight · Main [default]                                                  ⚠ 1 warning · f2 to view

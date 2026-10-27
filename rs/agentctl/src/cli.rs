@@ -158,6 +158,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl hold cl-ingest --after cl-dedupe --note \"gate green, ready to push\"\n  agentctl --registry ~/project/.agentctl hold --list\n  agentctl --registry ~/project/.agentctl hold cl-ingest --release\n\nThe queue is REGISTRY/landing-queue.json (schema agentctl-landing-queue/v1). One hold per NAME: a new hold replaces the old.\nA chain (B after A, C after B) advances one step per finish. A released hold stays listed, with released_by and\nreleased_at, for a day. Prints the queue as JSON; --release exits 1 when NAME had no hold."
     )]
     Hold(Hold),
+    /// Declare what counts as progress for an agent, show it, or clear it: a file the agent updates (optionally only its lines containing --matching) or a command whose output is the metric. `watch-agents` tells the coordinator when the metric has not changed for --hours while the agent works; new output, status lines and heartbeats are activity, not progress
+    #[command(
+        after_help = "Examples:\n  agentctl progress lane-a --file status.md --matching 'crashes recorded' --hours 6\n  agentctl progress lane-a --command 'ls results/*.json | wc -l' --hours 4\n  agentctl progress lane-a\n  agentctl progress lane-a --clear\n\nThe declaration is REGISTRY/.progress/NAME.json (schema agentctl-progress/v1). A relative --file is read from the agent's\nworking directory; --command runs there with sh -c, for at most 30 s, once per watch-agents pass, and its standard output is\nthe metric (a failing command is no evidence of change). A dispatcher declares the metric right after `agentctl start`.\nPrints {name, progress} (null when none is declared) or, with --clear, {name, cleared} as JSON; --clear exits 1 when there\nwas nothing to clear. The Rust edition only."
+    )]
+    Progress(Progress),
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
@@ -404,6 +409,21 @@ struct WatchAgents {
     /// Minutes a sender may wait for an agent's lifecycle lock before the coordinator is told, from 0 to 1440 (default: 10; 0 turns the check off). Every managed send holds that lock until its delivery is confirmed, so messages to a busy agent wait in turn; the notice names the holder and the waiters, is sent once per jam, and goes ahead of ordinary sends
     #[arg(long, default_value = "10", value_parser = clap::value_parser!(u64).range(0..=1440), value_name = "MINUTES")]
     delivery_wait_minutes: u64,
+    /// Minutes a turn may run with input queued behind it (in the harness's own queue, such as Codex's queued follow-up inputs, which Codex submits only when the turn ends, or in agentctl's queue) before it is reported as turn-queued, from 1 to 10080 (default: 120). The turn's age is the harness's turn timer, else how long the watcher has seen the agent working
+    #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(1..=10080), value_name = "MINUTES")]
+    turn_minutes: u64,
+    /// Agent whose turn-queued episode is acted on as well as reported: the watcher presses Escape to interrupt the turn and Enter to submit the queued input, as `agentctl send --urgent` does, once per episode, and the notice says what happened; repeatable (default: none, report only)
+    #[arg(long = "auto-deliver", value_name = "NAME")]
+    auto_deliver: Vec<String>,
+    /// How many times in a row the same tool command, or in how many separate attempts the same error line, must show on screen to count as a loop, from 2 to 100 (default: 3)
+    #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(2..=100), value_name = "N")]
+    loop_repeats: u64,
+    /// Minutes a loop or a retry banner may hold before it is reported, from 1 to 1440 (default: 10)
+    #[arg(long, default_value = "10", value_parser = watch_minutes, value_name = "MINUTES")]
+    loop_minutes: u64,
+    /// A dagrun per-step profile CSV (columns step and elapsed_s) recording how long each gate step takes; a step running past the p95 of at least 5 recorded runs is reported as over-expected; repeatable (default: none, no step is judged against history)
+    #[arg(long = "step-history", value_name = "CSV")]
+    step_history: Vec<PathBuf>,
 }
 
 #[derive(Args)]
@@ -423,6 +443,32 @@ struct Hold {
     /// Print the landing queue and change nothing
     #[arg(long, conflicts_with = "name")]
     list: bool,
+}
+
+#[derive(Args)]
+struct Progress {
+    /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
+    name: String,
+    /// A file the agent updates; a relative path is read from the agent's working directory
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["command", "clear"])]
+    file: Option<PathBuf>,
+    /// Count only the lines of --file that contain this text, such as a counter's label (default: the whole file)
+    #[arg(long, value_name = "TEXT", requires = "file")]
+    matching: Option<String>,
+    /// A shell command whose standard output is the metric, run with sh -c in the agent's working directory
+    #[arg(
+        long = "command",
+        id = "command",
+        value_name = "COMMAND",
+        conflicts_with = "clear"
+    )]
+    shell: Option<String>,
+    /// Hours the metric may stay unchanged while the agent works before the coordinator is told, greater than 0 (default: 4)
+    #[arg(long, default_value = "4", value_parser = positive_hours, value_name = "HOURS")]
+    hours: f64,
+    /// Remove the declaration
+    #[arg(long)]
+    clear: bool,
 }
 
 #[derive(Args)]
@@ -779,8 +825,14 @@ struct Send {
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
     /// Seconds after which no drain types the prompt; an expired prompt is set aside in the queue's cancelled/ untyped. The prompt goes to the queue's inbox.v2/, which older agentctl binaries and the other edition never type (default: no expiry; interactive agents only)
-    #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
+    #[arg(long, value_name = "SECONDS", value_parser = positive_seconds, conflicts_with = "urgent")]
     ttl: Option<f64>,
+    /// Deliver now: type the prompt even while the agent works, wait up to --boundary-wait for its harness to take it at a tool boundary, and if it is still queued, interrupt the turn (Escape) and submit the queued input (Enter), so nobody drives those keys by hand. Codex holds follow-ups until its turn ends, Claude Code until a tool boundary, and Muse steers the running turn at once. The JSON gains an `urgent` object saying whether a turn was interrupted (default: off; interactive agents only)
+    #[arg(long)]
+    urgent: bool,
+    /// Seconds --urgent waits for the harness to take the prompt before it interrupts the turn (default: 60)
+    #[arg(long, default_value = "60", value_parser = seconds, value_name = "SECONDS", requires = "urgent")]
+    boundary_wait: f64,
     #[command(flatten)]
     delivery: Delivery,
 }
@@ -1311,6 +1363,13 @@ fn positive_seconds(value: &str) -> Result<f64, String> {
     }
     Ok(value)
 }
+fn positive_hours(value: &str) -> Result<f64, String> {
+    let hours: f64 = value.parse().map_err(|_| "expected a number of hours")?;
+    if !(hours.is_finite() && hours > 0.0) {
+        return Err("hours must be greater than zero".to_owned());
+    }
+    Ok(hours)
+}
 fn watch_minutes(value: &str) -> Result<u64, String> {
     let value: u64 = value.parse().map_err(|_| "expected a number of minutes")?;
     if !(1..=1440).contains(&value) {
@@ -1818,6 +1877,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 state_dir: value.state_dir,
                 landing_queue: Some(crate::landing_queue::path(&args.registry)),
                 delivery_wait: Duration::from_secs(value.delivery_wait_minutes * 60),
+                turn: Duration::from_secs(value.turn_minutes * 60),
+                auto_deliver: value.auto_deliver,
+                loop_repeats: usize::try_from(value.loop_repeats).unwrap_or(3),
+                loop_hold: Duration::from_secs(value.loop_minutes * 60),
+                step_history: crate::work_state::StepHistory::load(&value.step_history),
             };
             let mut probe = crate::agent_watch::ManagedProbe::new(
                 &client,
@@ -2310,20 +2374,48 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                             .to_owned(),
                     ));
                 }
+                if value.urgent {
+                    return Err(Failure::Usage(
+                        "--urgent applies to interactive agents; agentcloud journals the prompt at once"
+                            .to_owned(),
+                    ));
+                }
                 manager.send_cloud(&value.agent.name, &text, value.message_id.as_deref())?
+            } else if value.urgent {
+                manager.send_urgent(
+                    &value.agent.name,
+                    &text,
+                    value.delivery.options(),
+                    value.message_id.as_deref(),
+                    Duration::from_secs_f64(value.boundary_wait),
+                )?
             } else {
                 let not_after = value.ttl.map(|ttl| {
                     crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
                 });
-                json!(manager.send_identified(
+                let result = manager.send_identified(
                     &value.agent.name,
                     &text,
                     DrainOptions {
                         not_after,
                         ..value.delivery.options()
                     },
-                    value.message_id.as_deref()
-                )?)
+                    value.message_id.as_deref(),
+                )?;
+                let mut document = json!(result);
+                // A prompt typed into a busy harness can land in its queue, which counts as
+                // leaving the composer; say so instead of reporting a quiet delivery.
+                if result.outcome == crate::agent::QueueOutcome::Delivered {
+                    if let Ok(Some(turn)) = manager.turn(&value.agent.name) {
+                        if let Some(warning) = queued_warning(&value.agent.name, &turn) {
+                            eprintln!("agentctl send: {warning}");
+                            document["queued_behind_turn"] = json!(true);
+                            document["warning"] = json!(warning);
+                            document["turn"] = turn;
+                        }
+                    }
+                }
+                document
             }
         }
         Commands::Cancel(value) => {
@@ -2403,6 +2495,18 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             result
         }
         Commands::Reset(value) => manager.reset(&value.name)?,
+        Commands::Progress(value) => {
+            let result = manager.progress(
+                &value.name,
+                value.file,
+                value.matching,
+                value.shell,
+                value.hours,
+                value.clear,
+            )?;
+            write_json(&result).map_err(Failure::Output)?;
+            return Ok(i32::from(result["cleared"] == false));
+        }
         Commands::Pause(value) => manager.pause(&value.name, true)?,
         Commands::Resume(value) => manager.pause(&value.name, false)?,
         Commands::Capabilities
@@ -2429,6 +2533,44 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .any(|row| row.get("record_error").and_then(Value::as_bool) == Some(true))
     });
     Ok(i32::from(incomplete))
+}
+
+/// The warning `send` prints when its prompt is waiting in the harness's own queue behind a
+/// running turn (#570 agent-progress-monitoring), from the agent's `turn` view; `None` when the
+/// harness holds no queued input.
+fn queued_warning(name: &str, turn: &Value) -> Option<String> {
+    if turn["harness_queued"].as_u64().unwrap_or(0) == 0 {
+        return None;
+    }
+    let mut text = "queued: ".to_owned();
+    match turn["age_seconds"].as_f64() {
+        Some(age) => text.push_str(&format!(
+            "{name} has been inside one turn for {}",
+            crate::turn_state::format_age(age)
+        )),
+        None => text.push_str(&format!("{name} is inside a turn")),
+    }
+    let place = match turn["harness_queue"].as_str() {
+        Some("codex-end-of-turn") => {
+            "Codex's queued follow-up inputs, submitted only when the turn ends"
+        }
+        Some("codex-next-tool-call") => "Codex's queue for the next tool call",
+        Some("claude-queued") => "Claude Code's queued messages, taken at its next tool boundary",
+        Some("muse-queued") => "Muse's queued input, submitted when the turn ends",
+        _ => "the harness's queue",
+    };
+    text.push_str(&format!("; the prompt waits in {place}"));
+    let earlier = turn["undelivered"].as_u64().unwrap_or(0).saturating_sub(1);
+    if earlier > 0 {
+        text.push_str(&format!(
+            "; {earlier} earlier message{} also undelivered",
+            if earlier == 1 { " is" } else { "s are" }
+        ));
+    }
+    text.push_str(&format!(
+        ". `agentctl send {name} --urgent TEXT` interrupts the turn and submits them"
+    ));
+    Some(text)
 }
 
 /// Make `config` follow the registry's coordinator designation, or say why it cannot. A

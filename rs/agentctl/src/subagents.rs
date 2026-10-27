@@ -54,6 +54,10 @@ const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+/// Visible rows read to find a running turn and the input queued behind it.
+const TURN_SCREEN_LINES: usize = 200;
+/// How long an interrupted turn is given to stop, and a submitted input box to empty.
+const INTERRUPT_SETTLE: Duration = Duration::from_secs(30);
 /// The longest [`ManagedAgents::send_once_with_runtime`] waits for a queue's delivery lock to take
 /// back a prompt its send left in the inbox, even once its caller has cancelled it. Every managed
 /// drain also holds the agent's lifecycle lock, which the send holds, so normally nothing else
@@ -2692,6 +2696,52 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
         })
     }
 
+    /// Whether this record's pinned harness process is the foreground process of `pane_id`, its
+    /// recorded pane. That proves the recipient without Herdr's agent detection, which guesses
+    /// the agent kind from what runs in the pane: after a Claude Code agent ran Muse commands
+    /// inside its pane, Herdr reported the pane as a finished Muse agent, `agent get NAME` found
+    /// no agent of that name, and every send, status and watcher pass called a working agent
+    /// unreachable (#570 agent-progress-monitoring).
+    fn pinned_harness_owns(&self, pane_id: &str) -> crate::error::Result<bool> {
+        if Some(pane_id) != self.record.pane_id.as_deref() {
+            return Ok(false);
+        }
+        match self.record.harness_anchor() {
+            Some(anchor) => self.client.verify_harness_identity(pane_id, anchor),
+            None => Ok(false),
+        }
+    }
+
+    /// Replace what Herdr's detector got wrong about a pane whose pinned harness process
+    /// [`Self::pinned_harness_owns`] proved: the agent kind and the native session are the
+    /// record's, and the status is read from the screen (a running turn's row or its
+    /// `esc to interrupt` hint), since the status came from the wrong detector.
+    fn correct_misdetection(
+        &self,
+        pane_id: &str,
+        info: &mut AgentPaneInfo,
+    ) -> crate::error::Result<()> {
+        info.agent = Some(self.record.harness.clone());
+        if !session_matches(self.record, info) {
+            info.session_agent = self
+                .record
+                .session_agent
+                .clone()
+                .or_else(|| Some(self.record.harness.clone()));
+            info.session_value = self.record.observed_session_value().map(str::to_owned);
+        }
+        let screen = self
+            .client
+            .read(pane_id, "visible", Some(TURN_SCREEN_LINES))?;
+        info.status = if crate::turn_state::screen_running(&screen) {
+            "working"
+        } else {
+            "idle"
+        }
+        .to_owned();
+        Ok(())
+    }
+
     /// Prove that the pane still holds this record's recipient; called around each effect.
     ///
     /// `presentation = false` skips only the tab label and the Herdr name lookup, for
@@ -2706,16 +2756,33 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
             )));
         }
         let mut failures = Vec::new();
+        // A pinned harness process that is still the pane's foreground process proves the
+        // recipient even when Herdr's detector has renamed or relabelled the pane.
+        let pinned = record.adapter == "herdr" && self.pinned_harness_owns(pane_id)?;
         if record.adapter == "herdr" && presentation {
-            let identity = self.client.agent_identity(&record.name)?;
-            if Some(identity.pane_id.as_str()) != record.pane_id.as_deref() {
-                failures.push(format!(
-                    "Herdr agent '{}' is in pane {}",
-                    record.name, identity.pane_id
-                ));
+            match self.client.agent_identity(&record.name) {
+                Ok(identity) if Some(identity.pane_id.as_str()) != record.pane_id.as_deref() => {
+                    failures.push(format!(
+                        "Herdr agent '{}' is in pane {}",
+                        record.name, identity.pane_id
+                    ));
+                }
+                Ok(_) => {}
+                Err(_) if pinned => {}
+                Err(error) => return Err(error),
             }
         }
-        let info = self.client.pane_info(pane_id)?;
+        let mut info = self.client.pane_info(pane_id)?;
+        if pinned && info.agent.as_deref() != Some(record.harness.as_str()) {
+            info.agent = Some(record.harness.clone());
+            if !session_matches(record, &info) {
+                info.session_agent = record
+                    .session_agent
+                    .clone()
+                    .or_else(|| Some(record.harness.clone()));
+                info.session_value = record.observed_session_value().map(str::to_owned);
+            }
+        }
         if Some(&info.workspace_id) != record.workspace_id.as_ref() {
             failures.push(format!(
                 "workspace is '{}', recorded {}",
@@ -3969,13 +4036,17 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .collect())
     }
     fn pane_info(&self, pane_id: &str) -> crate::error::Result<AgentPaneInfo> {
-        if self.record.adapter == "herdr"
-            && Some(self.client.agent_pane(&self.record.name)?) != self.record.pane_id
-        {
-            return Err(crate::error::AdapterError::unavailable(format!(
-                "agent {:?} no longer owns its recorded pane",
-                self.record.name
-            )));
+        if self.record.adapter == "herdr" {
+            let named = self.client.agent_pane(&self.record.name);
+            if named.as_ref().ok() != self.record.pane_id.as_ref()
+                && !self.pinned_harness_owns(pane_id)?
+            {
+                named?;
+                return Err(crate::error::AdapterError::unavailable(format!(
+                    "agent {:?} no longer owns its recorded pane",
+                    self.record.name
+                )));
+            }
         }
         let mut info = self.client.pane_info(pane_id)?;
         if Some(&info.workspace_id) != self.record.workspace_id.as_ref() {
@@ -3985,6 +4056,12 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         self.validate_workspace_policy(&info)?;
+        if Some(pane_id) == self.record.pane_id.as_deref()
+            && info.agent.as_deref() != Some(self.record.harness.as_str())
+            && self.pinned_harness_owns(pane_id)?
+        {
+            self.correct_misdetection(pane_id, &mut info)?;
+        }
         if Some(pane_id) == self.record.pane_id.as_deref() {
             if self.record.goal_session_id.is_some()
                 && info.session_value.is_some()
@@ -4134,16 +4211,19 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         pane_id: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<AgentPaneInfo> {
-        if self.record.adapter == "herdr"
-            && Some(
-                self.client
-                    .agent_pane_with_runtime(&self.record.name, runtime)?,
-            ) != self.record.pane_id
-        {
-            return Err(crate::error::AdapterError::unavailable(format!(
-                "agent {:?} no longer owns its recorded pane",
-                self.record.name
-            )));
+        if self.record.adapter == "herdr" {
+            let named = self
+                .client
+                .agent_pane_with_runtime(&self.record.name, runtime);
+            if named.as_ref().ok() != self.record.pane_id.as_ref()
+                && !self.pinned_harness_owns(pane_id)?
+            {
+                named?;
+                return Err(crate::error::AdapterError::unavailable(format!(
+                    "agent {:?} no longer owns its recorded pane",
+                    self.record.name
+                )));
+            }
         }
         let mut info = self.client.pane_info_with_runtime(pane_id, runtime)?;
         if Some(&info.workspace_id) != self.record.workspace_id.as_ref() {
@@ -4153,6 +4233,12 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         self.validate_workspace_policy(&info)?;
+        if Some(pane_id) == self.record.pane_id.as_deref()
+            && info.agent.as_deref() != Some(self.record.harness.as_str())
+            && self.pinned_harness_owns(pane_id)?
+        {
+            self.correct_misdetection(pane_id, &mut info)?;
+        }
         if Some(pane_id) == self.record.pane_id.as_deref() {
             if self.record.goal_session_id.is_some()
                 && info.session_value.is_some()
@@ -8412,11 +8498,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         });
         match probe {
             Ok(status) => {
+                let pane = status.pane_id.clone();
                 result
                     .as_object_mut()
                     .expect("record object")
                     .extend(json!(status).as_object().expect("status object").clone());
                 result["probe_error"] = Value::Null;
+                if let Some(turn) = self.turn_view(record, &pane) {
+                    result["turn"] = turn;
+                }
             }
             Err(error) => {
                 result["agent_status"] = json!("unknown");
@@ -8424,6 +8514,69 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         Ok(result)
+    }
+
+    /// The running turn of an interactive agent whose verified pane is `pane_id`, as the `turn`
+    /// object of `status` and `list`: the turn's age, the input its harness holds for later, and
+    /// the agent's agentctl queue backlog (#570 agent-progress-monitoring). `None` when the
+    /// screen shows no running turn and nothing waits, or cannot be read.
+    fn turn_view(&self, record: &AgentRecord, pane_id: &str) -> Option<Value> {
+        let screen = self
+            .client
+            .read(pane_id, "visible", Some(TURN_SCREEN_LINES))
+            .ok()?;
+        let turn = crate::turn_state::read_screen(&screen);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+        let started = crate::turn_state::turn_age(&turn, None).map(|age| now - age);
+        let backlog = crate::turn_state::backlog(&self.queue(&record.name).ok()?, now, started);
+        crate::turn_state::turn_document(&turn, &backlog)
+    }
+
+    /// [`Self::turn_view`] for a registered interactive agent, read from its recorded pane;
+    /// `None` for an agentcloud agent or one with no pane.
+    pub fn turn(&self, agent_name: &str) -> Result<Option<Value>> {
+        let record = self.load(agent_name)?;
+        if record.is_cloud() {
+            return Ok(None);
+        }
+        Ok(record
+            .pane_id
+            .clone()
+            .and_then(|pane| self.turn_view(&record, &pane)))
+    }
+
+    /// Show, declare or clear a registered agent's progress metric (`agentctl progress`,
+    /// [`crate::progress_metric`]): with `clear`, remove it; with a file or a command, declare
+    /// it; with neither, show it.
+    pub fn progress(
+        &self,
+        agent_name: &str,
+        file: Option<PathBuf>,
+        matching: Option<String>,
+        command: Option<String>,
+        hours: f64,
+        clear: bool,
+    ) -> Result<Value> {
+        let record = self.load(agent_name)?;
+        if clear {
+            let cleared = crate::progress_metric::clear(&self.registry, &record.name)?;
+            return Ok(json!({"name": record.name, "cleared": cleared}));
+        }
+        let declaration = if file.is_none() && command.is_none() {
+            crate::progress_metric::load(&self.registry, &record.name)?
+        } else {
+            Some(crate::progress_metric::declare(
+                &self.registry,
+                &record.name,
+                file,
+                matching,
+                command,
+                hours,
+            )?)
+        };
+        Ok(json!({"name": record.name, "progress": declaration}))
     }
 
     /// List every registered agent, preserving records when Herdr is unavailable.
@@ -8578,6 +8731,176 @@ its drain would type first, so it was not queued",
             Err(error) => error,
         };
         take_back_unsent(&queue, message_id, error)
+    }
+
+    /// Read the visible screen of the agent's recorded pane.
+    fn turn_screen(&self, record: &AgentRecord) -> Result<String> {
+        let pane = record
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| fail(format!("agent {:?} has no confirmed pane", record.name)))?;
+        Ok(self.client.read(pane, "visible", Some(TURN_SCREEN_LINES))?)
+    }
+
+    /// Interrupt the agent's running turn and submit the input its harness held for later
+    /// (#570 agent-progress-monitoring): Escape, then, once the turn has stopped, Enter on
+    /// whatever the harness put back in its input box. Codex moves its queued follow-up inputs
+    /// there when a turn is interrupted, and Claude Code its queued messages; Muse submits its
+    /// queued input itself. Both keys go through the same recipient checks as a prompt, under
+    /// the agent's lifecycle lock, so no sender types in between. Nothing is pressed when the
+    /// screen shows neither a running turn nor queued input.
+    pub fn interrupt_and_submit(&self, agent_name: &str) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.input_allowed()?;
+        if record.is_cloud() {
+            return Err(fail(
+                "agentcloud agents take prompts through their journal; there is no turn to interrupt",
+            ));
+        }
+        let pane = record
+            .pane_id
+            .clone()
+            .ok_or_else(|| fail(format!("agent {agent_name:?} has no confirmed pane")))?;
+        let before = crate::turn_state::read_screen(&self.turn_screen(&record)?);
+        if !before.running && before.queued == 0 {
+            return Ok(json!({
+                "interrupted": false,
+                "submitted": false,
+                "detail": "no running turn and no queued input on screen; nothing was pressed",
+            }));
+        }
+        let client = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: None,
+            check_prompt: false,
+            expected_workspace: self.project_workspace()?,
+            readback: None,
+        };
+        let runtime = agent::SystemRuntime::default();
+        let guarded = client.guarded(&runtime)?;
+        guarded.send_keys(&pane, "Escape")?;
+        // The turn has stopped once its running row is gone, or once its queue has emptied (a
+        // harness that submits queued input itself starts the next turn at once).
+        let deadline = Instant::now() + INTERRUPT_SETTLE;
+        let mut screen = self.turn_screen(&record)?;
+        loop {
+            let now = crate::turn_state::read_screen(&screen);
+            if !now.running || (before.queued > 0 && now.queued == 0) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(fail(format!(
+                    "Escape did not stop {agent_name:?}'s turn within {} s; nothing was submitted",
+                    INTERRUPT_SETTLE.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            screen = self.turn_screen(&record)?;
+        }
+        let draft = crate::turn_state::composer_draft(&screen);
+        let mut submitted = false;
+        if draft.is_some() {
+            guarded.send_keys(&pane, "Enter")?;
+            let deadline = Instant::now() + INTERRUPT_SETTLE;
+            loop {
+                screen = self.turn_screen(&record)?;
+                if crate::turn_state::composer_draft(&screen).is_none()
+                    || crate::turn_state::read_screen(&screen).running
+                {
+                    submitted = true;
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        } else if crate::turn_state::read_screen(&screen).running {
+            // The harness submitted its queued input itself and is already working on it.
+            submitted = true;
+        }
+        let after = crate::turn_state::read_screen(&screen);
+        let turn = before.timer_seconds.map_or_else(String::new, |seconds| {
+            format!(" after {}", crate::turn_state::format_age(seconds as f64))
+        });
+        let detail = match (&draft, submitted) {
+            (Some(_), true) => format!(
+                "interrupted the turn{turn} and submitted the {} queued input(s) it put back in the input box",
+                before.queued
+            ),
+            (Some(_), false) => format!(
+                "interrupted the turn{turn}; Enter did not submit the input box within {} s, so the draft is still there",
+                INTERRUPT_SETTLE.as_secs()
+            ),
+            (None, true) => format!("interrupted the turn{turn}; the harness submitted its queued input itself"),
+            (None, false) => format!("interrupted the turn{turn}; nothing was left to submit"),
+        };
+        Ok(json!({
+            "interrupted": true,
+            "submitted": submitted,
+            "turn_seconds": before.timer_seconds,
+            "queued_before": before.queued,
+            "queued_after": after.queued,
+            "running_after": after.running,
+            "detail": detail,
+        }))
+    }
+
+    /// Deliver a prompt now (`agentctl send --urgent`, #570 agent-progress-monitoring): send it
+    /// as a follow-up the harness takes while working, wait up to `boundary_wait` for the
+    /// harness to take it at its next tool boundary (its queued-input block empties; Muse steers
+    /// at once, Claude Code takes queued messages between tool calls), and only if it is still
+    /// queued then interrupt the turn and submit it with [`Self::interrupt_and_submit`].
+    pub fn send_urgent(
+        &self,
+        agent_name: &str,
+        text: &str,
+        options: DrainOptions,
+        message_id: Option<&str>,
+        boundary_wait: Duration,
+    ) -> Result<Value> {
+        let result = self.send_identified(
+            agent_name,
+            text,
+            DrainOptions {
+                deliver_while_working: true,
+                ..options
+            },
+            message_id,
+        )?;
+        let mut value = json!(result);
+        if result.outcome != agent::QueueOutcome::Delivered {
+            value["urgent"] = json!({
+                "interrupted": false,
+                "detail": "the prompt was not typed, so no turn was interrupted",
+            });
+            return Ok(value);
+        }
+        let started = Instant::now();
+        loop {
+            let record = self.load(agent_name)?;
+            let screen = crate::turn_state::read_screen(&self.turn_screen(&record)?);
+            if screen.queued == 0 {
+                value["urgent"] = json!({
+                    "interrupted": false,
+                    "waited_seconds": started.elapsed().as_secs(),
+                    "detail": "the harness took the prompt without an interrupt",
+                });
+                return Ok(value);
+            }
+            if started.elapsed() >= boundary_wait {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1).min(boundary_wait));
+        }
+        let mut urgent = self.interrupt_and_submit(agent_name)?;
+        urgent["waited_seconds"] = json!(started.elapsed().as_secs());
+        value["urgent"] = urgent;
+        Ok(value)
     }
 
     /// Take the prompt `message_id` back out of the agent's queue inbox, untyped, as
@@ -10947,6 +11270,7 @@ pub(crate) mod tests {
                     replace_harness_before_effect: AtomicBool::new(false),
                     swap_terminal_before_effect: AtomicBool::new(false),
                     fail_rename_tab: AtomicBool::new(false),
+                    agent_get_missing: AtomicBool::new(false),
                     herdr_closed: Mutex::new(BTreeSet::new()),
                     print_after: Mutex::new(None),
                     printing: Mutex::new(Vec::new()),
@@ -11403,6 +11727,8 @@ pub(crate) mod tests {
         swap_terminal_before_effect: AtomicBool,
         /// Whether `rename_tab` fails, as a crash inside a rename would.
         fail_rename_tab: AtomicBool,
+        /// Whether `agent get NAME` fails with agent_not_found, as after Herdr re-detects a pane.
+        agent_get_missing: AtomicBool,
         /// Workspaces and panes Herdr has closed: lookups fail with its not-found codes.
         pub(crate) herdr_closed: Mutex<BTreeSet<String>>,
         /// How long after its submission a prompt shows in the pane's scrollback, as a harness
@@ -12425,6 +12751,11 @@ pub(crate) mod tests {
             Ok(proof)
         }
         fn agent_pane(&self, name: &str) -> AdapterResult<String> {
+            if self.agent_get_missing.load(Ordering::Relaxed) {
+                return Err(AdapterError::unavailable(format!(
+                    r#"agent get: {{"error": {{"code": "agent_not_found", "message": "agent {name} not found"}}}}"#
+                )));
+            }
             if self.fresh_presentations.load(Ordering::Relaxed) {
                 if let Some(pane) = self.herdr_names.lock().unwrap().get(name) {
                     return Ok(pane.clone());
@@ -17322,6 +17653,9 @@ fi
     mod muse_status;
     /// Nested agentctl-session/v2 and v3 rows: decode, write-back and anchor migration.
     mod nested;
+    /// Turn age and queued input in status and send, urgent delivery, and agents found by their
+    /// pinned harness when Herdr misdetects their pane.
+    mod progress;
     /// Recorded conversation and launch policy, with no status-time mutation.
     mod recovery_metadata;
     /// `agentctl restore` and `agentctl watch` against the fake Herdr and a scripted host.

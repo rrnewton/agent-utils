@@ -1,0 +1,15 @@
+• Ran /usr/local/bin/python3 -I -S -B - <<'PREFLIGHT_0266'
+  │ from pathlib import Path
+  │ import os,stat,hashlib,json,datetime
+  │ … +360 lines
+  └ EXACT_TEMPLATE {"prerequisites_personally_checked": null, "all_current_owned_charges_included": null,
+    +5 lines (^t to view transcript)
+
+■ Conversation interrupted - use /feedback if something went wrong
+
+
+» coordinator: answered your current-main binary question as a NOTE line in the push-requests file: none available now; I can arrange a build on request.
+  coordinator: PHASE 2 from the owner. Read /work/scratch/dispatch/lane-a-phase2-brief.md and prioritize it over the tracing work.
+  coordinator: the owner wants a clean checkout. Please commit and push your round2 report edit and experiments dir within 30 min (see queue NOTE).
+
+  GPT-6.1 Sol ultra · ~/work/project · Execute lane-a dispatch overnight · Main [default]                                                  ⚠ 1 warning · f2 to view

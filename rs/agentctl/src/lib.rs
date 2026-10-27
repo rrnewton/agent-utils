@@ -24,6 +24,7 @@ pub mod lock_wait;
 pub(crate) mod mcp;
 pub mod plugins;
 pub(crate) mod profiles;
+pub mod progress_metric;
 pub(crate) mod prompt_time;
 pub mod restore;
 pub(crate) mod skill_install;
@@ -32,7 +33,9 @@ pub mod subagents;
 pub mod submission;
 pub mod term;
 pub mod tui_prompts;
+pub mod turn_state;
 pub mod units;
+pub mod work_state;
 pub(crate) mod worker_reset;
 
 /// Reference for the canonical command and its supported adapters.
