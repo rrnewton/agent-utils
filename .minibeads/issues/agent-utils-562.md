@@ -288,3 +288,22 @@ load flakes only (repository-infrastructure 149, herdr-agent
 differential 103, wrkslots shards 511 + 511 passed alone).
 Upstream commits shared no files; rebased and pushed without a
 second gate.
+
+[muse watermelon] Slice 30 landed (41fbb81f): `wrkslotsd
+write-handoff`, the fifth writer slice, reproduces the handoff
+publication mutation (identity-bound source capture, canonical and
+outside-Git source checks, owner authorization, intent/completion
+publication events with writer and digest validation, the
+renameat2-no-replace sidecar write with post-write verification,
+and the `handoff-written` event) behind the fixture-only writer
+guard. Adversarial review found trusted forged intents, the
+unverified completion, the environment-sensitive Git probe, the
+missing committed-project HANDOFF.md case, and the barely-validated
+existing sidecar; all fixed with new differential cases (9 passed).
+Known divergences: duplicate-key JSON in an existing sidecar is
+not detected, the cleanup-create journal classification beside a
+seal stays approximated, and storage refusal text names the first
+finding. Gate 41 failures were load flakes only
+(repository-infrastructure 149, thread-card-header browser,
+wrkslots shards 516 + 515 passed alone). Upstream commits shared
+no files; rebased and pushed without a second gate.
