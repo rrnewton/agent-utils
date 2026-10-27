@@ -189,3 +189,9 @@ review found the machine-scoping divergence (default local machine,
 validation-graph 113 passed together alone; wrkslots shards 491 + 491
 passed alone). Upstream commits shared no files; rebased and pushed
 without a second gate.
+
+[muse watermelon] Slice 24 in progress: `wrkslotsd parse-storage`
+reproduces the filesystem half of `_registry_storage_inconsistencies`
+(slot-directory presence/safety, nested checkout entries, managed
+directory enumeration). Git registration/identity checks and slot
+image mount findings stay with the Python `status`.
