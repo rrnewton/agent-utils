@@ -1597,6 +1597,12 @@ a.search-hit-link {
   display: none;
 }
 
+/* `#575 mobile-keyboard-compose`. A box's new line for a phone's keyboard, whose return key sends: drawn only
+   while that keyboard is up, in the keyboard's block below. */
+.newline-key {
+  display: none;
+}
+
 /* ---------------------------------------------------------------------------------- reply -- */
 /*
  * `#410 inline-reply-editor`. The reply's box: the label and who it answers, the box, the `#185
@@ -7928,6 +7934,94 @@ textarea {
 
   :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > #read-aloud-stop {
     grid-column: 1;
+  }
+
+  /* `#575 mobile-keyboard-compose`. The owner, 2026-10-27, on Android and iOS: a tap in the box left Send and
+     "some useless white space" between it and the keyboard, "but on both Android and iOS, there's a send
+     button available on the keyboard ... scroll it so that the bottom of the text entry box is flush with
+     the top of the keyboard and there's no wasted space and the send button is off screen". So while the
+     keyboard is up and the box being written in has the focus:
+
+       * ITS FOOT IS THE KEYBOARD'S TOP. The composer keeps no room under itself but what the keyboard
+         covers of the list (`--keyboard-inset`: none where the browser resizes the content, as Chrome on
+         Android does; the keyboard's height where only the visual viewport shrinks, as in Safari), and
+         web/voice.js brings that foot to the keyboard's top as it comes up (`fitComposerToKeyboard`, told
+         by `--keyboard-fit` that the composer is laid out for it).
+       * SEND GOES WHILE ENTER SENDS. The keyboard's own key is the send then (`enterkeyhint="send"`, which
+         is what the box says while Enter to send is on). With it off, that key is a new line, so Send
+         stays, the last thing above the keyboard.
+       * A NEW-LINE KEY IN THE BOX'S CORNER, while Enter sends. A phone keyboard's Shift is its own: neither
+         Gboard nor iOS reports it on the return key, so Shift+Enter cannot reach the page from one. The
+         box keeps room on its right for the key, so no word is written under it. */
+  /* ...and the right column's list keeps none under it either: that list holds a reader at its very end
+     (`#280 scroll-stability`), which would leave its own padding between the box and the keys. The left
+     list's keepers leave the reader within its padding of the end, so its box is on the keys already, and
+     its padding is left as it is: taken away there, the reader was left far above the foot as the
+     keyboard went down (tests/keyboard_hides_bar_browser.py). */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #side-scroll:has(:is(#channel-compose-text, #side-compose-text):focus) {
+    padding-bottom: 0;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-composer, #side-composer):has(> textarea:focus) {
+    padding-bottom: var(--keyboard-inset, 0px);
+    --keyboard-fit: on;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus ~ :is(#channel-send, #side-send) {
+    display: none;
+  }
+
+  /* The box's state line, with nothing to say, is a row and a gap of nothing under the box. Something to
+     say (a send failed, a send waits) still shows, under the box. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text):focus ~ :is(#channel-compose-state, #side-compose-state):empty {
+    display: none;
+  }
+
+  /* Under a send card the box has Send's column beside it (`#screen-main[data-draft]`): one column, so the
+     box takes the row. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #channel-composer:has(> #channel-compose-text[enterkeyhint="send"]:focus) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus {
+    grid-row: 1;
+    grid-column: 1;
+    padding-right: 3.25rem;
+    resize: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-text[enterkeyhint="send"]:focus {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    padding-right: 3.25rem;
+    resize: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text, #reply-text)[enterkeyhint="send"]:focus ~ .newline-key {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    grid-row: 1;
+    grid-column: 1;
+    align-self: end;
+    justify-self: end;
+    z-index: 1;
+    /* 44px, the touch target iOS asks for. */
+    width: 2.75rem;
+    height: 2.75rem;
+    margin: 0 0.35rem 0.35rem 0;
+    padding: 0;
+    border-radius: 50%;
+    background: var(--panel);
+    color: var(--ink);
+    border: 1px solid var(--edge);
+    font-size: 1.25rem;
+    line-height: 1;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-text[enterkeyhint="send"]:focus ~ .newline-key {
+    grid-row: 2;
+    grid-column: 1 / -1;
   }
 }
 

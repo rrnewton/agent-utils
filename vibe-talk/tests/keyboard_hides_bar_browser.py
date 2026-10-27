@@ -18,7 +18,7 @@ threads), from one loopback origin. At 393x852 by touch, in All at the foot of t
 
   the bars up -> a tap in the channel's box with no keyboard (a keyboard plugged in): both bars still
   drawn -> the keyboard up: the control bar and the dock gone, the list reaching the foot of the window,
-  the box with Send and the message above it on screen, the reader still at the foot -> the keyboard
+  the box flush on the keys with the message above it, the reader still at the foot -> the keyboard
   down with the box still focused: both bars back, the reader at the foot -> up again, then the box
   losing the focus: both bars back at once, with the keyboard still up -> Reply on an old message mid-list,
   the keyboard up: the reply's box whole above the keys and the message on screen, moved up only as far as
@@ -28,8 +28,14 @@ threads), from one loopback origin. At 393x852 by touch, in All at the foot of t
   bars back, since the tap took the focus off the box. Then: the reader scrolled up to the message being
   answered with the keyboard up, the keyboard growing 44px (an emoji strip): the reader not moved; the
   phone turned to landscape and back with the keyboard up: the bars away throughout, back once it goes;
-  and the Threads view with Main messages (#419): the main channel's box among the cards, its Send above
+  and the Threads view with Main messages (#419): the main channel's box among the cards, its foot on
   the keys.
+
+`#575 mobile-keyboard-compose`, at 393x852 after all that and again at 412x915 (the owner's Android phone),
+in a thread and in Main (`compose_walk`): the keyboard up leaves the box's foot on the keyboard's top, Send
+gone (the keyboard's own key sends) and a new-line key in the box's corner, whose tap writes a new line and
+keeps the focus, after which the keyboard's Enter sends both lines once; with Enter to send off, Send stays
+as the last thing on the keys' top and Enter is a new line.
 
 At 1280x800 with a mouse, the box focused and the window 336px shorter: both bars still drawn, since the
 stylesheet takes them away only where the pointer is coarse. No page error and no sideways scroll at any
@@ -47,7 +53,7 @@ import tempfile
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import offline_cache_browser as fixture
 from inline_reply_browser import ReplyColumnsApi, sign_in
@@ -58,6 +64,8 @@ if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
 
 PHONE = (393, 852)
+# `#575 mobile-keyboard-compose`: the owner's Android phone, whose screenshot this walk was written from.
+ANDROID = (412, 915)
 DESK = (1280, 800)
 # An on-screen keyboard's height on a phone this size, with its suggestion strip.
 KEYBOARD_PX = 336
@@ -80,6 +88,7 @@ STATE_JS = """() => {
         said: document.documentElement.getAttribute('data-keyboard'),
         bar: drawn('control-bar'), dock: drawn('dock'), dockBox: rect('dock'), paneShown: shown,
         list: rect('scroll-area'), box: rect('channel-compose-text'), send: rect('channel-send'),
+        newline: rect('channel-newline'), state: rect('channel-compose-state'),
         gap: area.scrollHeight - area.scrollTop - area.clientHeight,
         viewport: window.visualViewport ? window.visualViewport.height : window.innerHeight,
         active: document.activeElement ? document.activeElement.id : null,
@@ -112,6 +121,7 @@ def main() -> int:
     report: list[str] = []
     with sync_playwright() as playwright:
         report.append(walk(playwright.chromium, args, "phone", *PHONE, touch=True))
+        report.append(walk(playwright.chromium, args, "android", *ANDROID, touch=True, walker=compose_walk))
         report.append(walk(playwright.chromium, args, "desk", *DESK, touch=False))
     for line in report:
         print(line)
@@ -129,7 +139,8 @@ def number(found: Json, *path: str) -> float:
     return float(value)
 
 
-def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, *, touch: bool) -> str:
+def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, *, touch: bool,
+         walker: Callable[[Desk, ReplyColumnsApi], None] | None = None) -> str:
     api = ReplyColumnsApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
@@ -147,8 +158,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk = Desk(page, args.screenshots, f"keyboard-bar-{label}", width, height)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             sign_in(desk)
-            if touch:
+            if walker is not None:
+                walker(desk, api)
+            elif touch:
                 phone_walk(desk)
+                compose_walk(desk, api)
             else:
                 desk_walk(desk)
             check(not errors, f"{label}: the page threw: {errors}")
@@ -195,6 +209,22 @@ def bars_gone(desk: Desk, found: Json, when: str) -> None:
                f"{when}: the list does not reach the foot of the window: {found}")
 
 
+def flush(desk: Desk, found: Json, when: str) -> None:
+    """`#575 mobile-keyboard-compose`: the box whole on screen with its foot on the keyboard's top, Send gone (the
+    keyboard's own key sends) and the new-line key drawn in the box's corner."""
+    viewport = number(found, "viewport")
+    desk.check(number(found, "box", "top") >= 0, f"{when}: the box's top is off screen: {found}")
+    desk.check(abs(number(found, "box", "bottom") - viewport) <= 1,
+               f"{when}: the box's foot is not on the keyboard's top, {viewport - number(found, 'box', 'bottom'):.0f}px "
+               f"wasted between them: {found}")
+    desk.check(found["send"] is None, f"{when}: Send is still drawn, though the keyboard's key sends: {found}")
+    desk.check(found["newline"] is not None, f"{when}: no new-line key: {found}")
+    key, box = found["newline"], found["box"]
+    assert isinstance(key, dict) and isinstance(box, dict)
+    desk.check(box["top"] <= key["top"] and key["bottom"] <= box["bottom"] and box["left"] <= key["left"]
+               and key["right"] <= box["right"], f"{when}: the new-line key is not in the box's corner: {found}")
+
+
 def phone_walk(desk: Desk) -> None:
     page = desk.page
     to_foot(desk)
@@ -216,9 +246,7 @@ def phone_walk(desk: Desk) -> None:
     found = keyboard(desk, True)
     bars_gone(desk, found, "keyboard up")
     desk.check(number(found, "gap") <= FOOT_SLACK_PX, f"keyboard up: the reader was moved off the foot: {found}")
-    for part in ("box", "send"):
-        desk.check(0 <= number(found, part, "top") and number(found, part, "bottom") <= number(found, "viewport") + 0.5,
-                   f"keyboard up: the {part} is not on screen: {found}")
+    flush(desk, found, "keyboard up")
     above = page.evaluate("""() => { const rows = [...document.querySelectorAll('#discord-log > li[data-id]')];
         const r = rows[rows.length - 1].getBoundingClientRect(); return {top: r.top, bottom: r.bottom}; }""")
     assert isinstance(above, dict)
@@ -354,7 +382,7 @@ def turned_walk(desk: Desk) -> None:
 
 def threads_walk(desk: Desk) -> None:
     """The Threads view with Main messages (`#419`): the main channel's box among the cards, in the right
-    column's list, kept above the keys with its Send as the keyboard comes up."""
+    column's list, its foot brought onto the keys as the keyboard comes up."""
     page = desk.page
     page.select_option("#thread-select", "threads")
     desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-card]').length === 3", "the Threads view did not open")
@@ -366,12 +394,100 @@ def threads_walk(desk: Desk) -> None:
     page.tap("#channel-compose-text")
     found = keyboard(desk, True)
     bars_gone(desk, found, "Threads view, keyboard up")
-    viewport = number(found, "viewport")
-    desk.check(0 <= number(found, "send", "top") and number(found, "send", "bottom") <= viewport + 0.5,
-               f"Threads view, keyboard up: Send is not on screen: {found}")
+    flush(desk, found, "Threads view, keyboard up")
     desk.shot("10-threads-keyboard-up")
     keyboard(desk, False)
-    desk.notes.append("in the Threads view the main channel's box and Send stay above the keys")
+    desk.notes.append("in the Threads view the main channel's box stays flush on the keys")
+
+
+def posted(api: ReplyColumnsApi) -> list[str]:
+    with api.lock:
+        return [str(reply.get("text", "")) for reply in api.replies]
+
+
+def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
+    """`#575 mobile-keyboard-compose`. The owner, 2026-10-27, on Android and iOS: a tap in the box left Send and
+    "some useless white space" between it and the keyboard, whose own send key makes Send needless; and
+    no way to write a new line, since the keyboard's Shift does not turn its send key into a return.
+
+    In a thread (the box saying "Reply in this thread…", as in the owner's screenshot) and in Main: the
+    keyboard up leaves the box's foot on the keyboard's top, Send gone, and a new-line key in the box's
+    corner. A tap on that key writes a new line where the caret is, keeps the focus and the keyboard,
+    sends nothing; the keyboard's Enter then sends both lines once. The keyboard down: Send back, the key
+    gone. With Enter to send off: the keyboard's key a return (`enterkeyhint`), Send kept as the last
+    thing above the keys, its foot on their top, no new-line key, and Enter a new line that sends nothing."""
+    page = desk.page
+    before = len(posted(api))
+    thread = page.evaluate("""() => [...document.getElementById('thread-select').options]
+        .map((o) => o.value).find((v) => !['main', 'flat', 'threads', 'columns', 'all'].includes(v) && v)""")
+    desk.check(isinstance(thread, str), "the picker offers no thread")
+    assert isinstance(thread, str)
+    page.select_option("#thread-select", thread)
+    desk.wait_for("() => document.getElementById('channel-compose-text').placeholder.startsWith('Reply in this thread')",
+                  "choosing a thread did not make the box a reply in it")
+    to_foot(desk)
+    page.tap("#channel-compose-text")
+    found = keyboard(desk, True)
+    bars_gone(desk, found, "in a thread, keyboard up")
+    flush(desk, found, "in a thread, keyboard up")
+    desk.shot("11-thread-keyboard-up")
+    wasted = number(found, "viewport") - number(found, "box", "bottom")
+
+    page.keyboard.type("first line")
+    page.tap("#channel-newline")
+    desk.settled()
+    found = state(desk)
+    value = page.evaluate("() => document.getElementById('channel-compose-text').value")
+    desk.check(value == "first line\n", f"the new-line key did not write a new line at the caret: {value!r}")
+    desk.check(found["active"] == "channel-compose-text" and found["said"] == "open",
+               f"the new-line key took the focus, and the keyboard with it: {found}")
+    desk.check(len(posted(api)) == before, f"the new-line key sent: {posted(api)}")
+    page.keyboard.type("second line")
+    desk.shot("12-thread-two-lines")
+    page.keyboard.press("Enter")
+    for _ in range(50):
+        if len(posted(api)) > before:
+            break
+        page.wait_for_timeout(100)
+    desk.check(posted(api)[before:] == ["first line\nsecond line"],
+               f"the keyboard's Enter did not send both lines once: {posted(api)[before:]}")
+    found = keyboard(desk, False)
+    desk.check(found["send"] is not None and found["newline"] is None,
+               f"keyboard down: Send not back, or the new-line key still drawn: {found}")
+
+    # Main, with Enter to send off: the keyboard's key is a return, so Send stays, at the keys' top.
+    page.select_option("#thread-select", "main")
+    desk.wait_for("() => document.getElementById('channel-compose-text').placeholder.startsWith('Message the main')",
+                  "choosing Main did not make the box Main's")
+    page.evaluate("() => document.getElementById('enter-sends').click()")
+    desk.check(page.evaluate("() => document.getElementById('channel-compose-text').getAttribute('enterkeyhint')") == "enter",
+               "with Enter to send off the keyboard is still told to draw a send key")
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    to_foot(desk)
+    page.tap("#channel-compose-text")
+    found = keyboard(desk, True)
+    bars_gone(desk, found, "Enter to send off, keyboard up")
+    viewport = number(found, "viewport")
+    desk.check(found["send"] is not None and abs(number(found, "send", "bottom") - viewport) <= 1,
+               f"Enter to send off, keyboard up: Send is not the last thing on the keys' top: {found}")
+    desk.check(number(found, "box", "top") >= 0, f"Enter to send off, keyboard up: the box's top is off screen: {found}")
+    desk.check(found["newline"] is None, f"Enter to send off, keyboard up: a new-line key beside a return key: {found}")
+    desk.shot("13-enter-off-keyboard-up")
+    sent = len(posted(api))
+    page.keyboard.type("one")
+    page.keyboard.press("Enter")
+    page.keyboard.type("two")
+    desk.settled()
+    value = page.evaluate("() => document.getElementById('channel-compose-text').value")
+    desk.check(value == "one\ntwo" and len(posted(api)) == sent,
+               f"Enter to send off: Enter did not write a new line, or sent: {value!r} {posted(api)[sent:]}")
+    page.evaluate("() => { const box = document.getElementById('channel-compose-text'); box.value = ''; "
+                  "box.dispatchEvent(new InputEvent('input', {bubbles: true})); }")
+    page.evaluate("() => document.getElementById('enter-sends').click()")
+    keyboard(desk, False)
+    desk.notes.append(f"in a thread with the keyboard up the box's foot is {abs(wasted):.0f}px from the keys, Send gone, "
+                      "the corner key's new line and Enter sending both lines once; with Enter to send off Send stays "
+                      "on the keys' top")
 
 
 def desk_walk(desk: Desk) -> None:

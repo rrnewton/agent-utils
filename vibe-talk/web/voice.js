@@ -10928,7 +10928,7 @@ function sendChordName() {
 function renderEnterSends() {
   el("enter-sends").checked = enterSends;
   el("enter-sends-hint").textContent = enterSends
-    ? "Shift+Enter starts a new line."
+    ? "Shift+Enter starts a new line, and on a phone's keyboard so does ↵ in the box's corner."
     : `${sendChordName()} sends. Enter starts a new line.`;
   for (const id of COMPOSER_FIELDS) {
     el(id).setAttribute("enterkeyhint", enterSends ? "send" : "enter");
@@ -11033,6 +11033,63 @@ function noteBoxInsertion(box, event) {
 function insertedJustNow(box) {
   const at = box ? boxInsertedAt.get(box) : undefined;
   return typeof at === "number" && Date.now() - at <= PASTE_ENTER_MS;
+}
+
+/**
+ * `#575 mobile-keyboard-compose`. Each box's new-line key, drawn in its corner while a phone's keyboard is up
+ * and Enter sends (web/voice.css), by the box it writes in.
+ *
+ * The owner, 2026-10-27: "I thought previously there was a way to put in new lines by pressing shift and
+ * having the send button turn into an enter button but that's not working for me. It just stays a send
+ * button and I have no way to place a new line." Whether a keyboard draws a return key under its Shift is
+ * the keyboard's own choice, and none tells the page: Gboard and iOS both send their return key as an
+ * Enter with no `shiftKey`, so from a phone's keys Shift+Enter is a bare Enter, and a bare Enter sends
+ * while Enter to send is on. Nothing in this page took the Shift away (`paste-never-sends` leaves a
+ * typed Enter as it was), and there was never a Shift to take. So the new line is a key of the page's.
+ */
+const NEWLINE_KEYS = [["channel-newline", "channel-compose-text"], ["side-newline", "side-compose-text"],
+  ["reply-newline", "reply-text"]];
+
+/**
+ * Put a new line in `box` where its caret is, over any selection, and tell the box as typing does, by an
+ * `input`, so its draft, its Grow and what its Send says follow. Never through `onComposerKey`: there is
+ * no Enter, so nothing here can send, and no paste is noted, so the reader's next Enter still sends.
+ *
+ * Through the browser's editor where it will (`insertLineBreak`, an `input` of that type, which
+ * `noteBoxInsertion` does not take for a paste), so the box's undo keeps the new line and a word an input
+ * method is still composing is committed by the editor rather than overwritten under it. Written into
+ * the value, with its `input` made here, where the editor will not.
+ *
+ * @param {any} box
+ */
+function insertNewline(box) {
+  const was = box.value;
+  if (typeof document.execCommand === "function" && document.activeElement === box &&
+    document.execCommand("insertLineBreak") && box.value !== was) return;
+  const value = String(box.value || "");
+  const start = typeof box.selectionStart === "number" ? box.selectionStart : value.length;
+  const end = typeof box.selectionEnd === "number" ? Math.max(start, box.selectionEnd) : start;
+  box.value = `${value.slice(0, start)}\n${value.slice(end)}`;
+  box.setSelectionRange(start + 1, start + 1);
+  box.dispatchEvent(typeof InputEvent === "function"
+    ? new InputEvent("input", { bubbles: true, inputType: "insertLineBreak" })
+    : { type: "input", inputType: "insertLineBreak", target: box });
+}
+
+/**
+ * Give `key` its box. The focus is kept in the box through the press — `mousedown`, which a tap is
+ * given too, would otherwise move it to the key and take the keyboard down — so the reader goes on
+ * typing on the next line with the keyboard where it was.
+ *
+ * @param {any} key
+ * @param {any} box
+ */
+function wireNewlineKey(key, box) {
+  key.addEventListener("mousedown", (event) => event.preventDefault());
+  key.addEventListener("click", () => {
+    insertNewline(box);
+    if (document.activeElement !== box) box.focus({ preventScroll: true });
+  });
 }
 
 /**
@@ -57425,9 +57482,13 @@ const KEYBOARD_MIN_SHARE = 0.2;
  *
  * `shown`: whether the page lays itself out for it (`data-keyboard`), which it does not for the pace box.
  *
- * @type {{up: boolean, shown: boolean, tallest: Map<number, number>, width: number, turnedAt: number | null}}
+ * `fitted`: the field the page last brought to the keyboard's top (`fitComposerToKeyboard`), so it is
+ * done once as the keyboard comes up or the focus moves, never under a reader scrolling with it up; and
+ * `inset`, what the keyboard covers of the layout viewport (`renderKeyboardInset`).
+ *
+ * @type {{up: boolean, shown: boolean, tallest: Map<number, number>, width: number, turnedAt: number | null, fitted: any, inset: number}}
  */
-const onScreenKeyboard = { up: false, shown: false, tallest: new Map(), width: -1, turnedAt: null };
+const onScreenKeyboard = { up: false, shown: false, tallest: new Map(), width: -1, turnedAt: null, fitted: null, inset: 0 };
 
 /**
  * Decide again whether the on-screen keyboard is up, as above, and tell the stylesheet when that
@@ -57463,15 +57524,83 @@ function noteKeyboard() {
   // `#567 pace-stepper`. The pace box raises the keyboard too, but what is being used then is its
   // popover and the bar it stands on: neither goes, as they do for a message being written.
   const shown = up && field !== el("read-speed-box");
-  if (up === onScreenKeyboard.up && shown === onScreenKeyboard.shown) return;
-  onScreenKeyboard.up = up;
-  onScreenKeyboard.shown = shown;
-  document.documentElement.setAttribute("data-keyboard", shown ? "open" : "closed");
-  if (shown && !el("speed-popover").hidden) closeSpeedPopover();
+  if (up !== onScreenKeyboard.up || shown !== onScreenKeyboard.shown) {
+    onScreenKeyboard.up = up;
+    onScreenKeyboard.shown = shown;
+    document.documentElement.setAttribute("data-keyboard", shown ? "open" : "closed");
+    if (shown && !el("speed-popover").hidden) closeSpeedPopover();
+  }
+  // `#575 mobile-keyboard-compose`. Once the stylesheet has the keyboard, so the box is measured as drawn for it.
+  renderKeyboardInset(shown ? keyboardInset(viewport) : 0);
+  const fit = shown ? field : null;
+  if (fit !== onScreenKeyboard.fitted) {
+    onScreenKeyboard.fitted = fit;
+    if (fit) fitComposerToKeyboard(fit);
+  }
+}
+
+/**
+ * `#575 mobile-keyboard-compose`. How much of the layout viewport's foot the keyboard covers, in CSS pixels:
+ * none where the browser resizes the content for it (Chrome on Android, told so by web/voice.html), and
+ * the keyboard's height where only the visual viewport shrinks (Safari), less however far the browser has
+ * panned the page up over it.
+ *
+ * @param {any} viewport `window.visualViewport`, where the browser has one
+ */
+function keyboardInset(viewport) {
+  if (!viewport) return 0;
+  const keysTop = (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0);
+  return Math.max(0, Math.round((window.innerHeight || 0) - keysTop));
+}
+
+/** Tell the stylesheet what the keyboard covers (`--keyboard-inset`), which a composer keeps as room under itself. */
+function renderKeyboardInset(inset) {
+  if (inset === onScreenKeyboard.inset) return;
+  onScreenKeyboard.inset = inset;
+  document.documentElement.style.setProperty("--keyboard-inset", `${inset}px`);
+}
+
+/** The channel's and the right column's box: each with its composer, its Send and its state line. */
+const KEYBOARD_FIT_PARTS = {
+  "channel-compose-text": ["channel-composer", "channel-send", "channel-compose-state"],
+  "side-compose-text": ["side-composer", "side-send", "side-compose-state"],
+};
+
+/**
+ * `#575 mobile-keyboard-compose`. Bring the foot of the composer `field` is written in to the keyboard's top:
+ * its box, or its Send where Send is still drawn (Enter to send off, when the keyboard's key is a new
+ * line), or its state line where that has something to say (a send failed, a send waits), so nothing of
+ * the list is wasted between the two and nothing below is left on screen. The owner: "scroll it so that
+ * the bottom of the text entry box is flush with the top of the keyboard".
+ *
+ * Only where the stylesheet lays the composer out for the keyboard (`--keyboard-fit`, which it sets under
+ * a coarse pointer alone): a desk's window made shorter with the box focused is left as it is. A list too
+ * short to scroll stays where it is. The list is the one the composer is in, not the one its box belongs
+ * to: the Threads view with Main's messages (`#419`) puts the channel's composer among the right column's
+ * cards.
+ *
+ * @param {any} field
+ */
+function fitComposerToKeyboard(field) {
+  const parts = KEYBOARD_FIT_PARTS[field.id];
+  if (!parts || typeof window.getComputedStyle !== "function") return;
+  const composer = leftEl(parts[0]);
+  if (window.getComputedStyle(composer).getPropertyValue("--keyboard-fit").trim() !== "on") return;
+  const area = ["scroll-area", "side-scroll"].map((id) => leftEl(id)).find((list) => nodeWithin(list, composer));
+  if (!area) return;
+  const drawn = (node) => node.getClientRects().length > 0;
+  const foot = [leftEl(parts[2]), leftEl(parts[1])].find(drawn) || field;
+  const viewport = window.visualViewport;
+  const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + viewport.height : window.innerHeight || 0;
+  const off = foot.getBoundingClientRect().bottom - Math.min(area.getBoundingClientRect().bottom, keysTop);
+  if (Math.abs(off) >= 1) area.scrollTop += off;
 }
 
 if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {
   window.visualViewport.addEventListener("resize", () => noteKeyboard());
+  // `#575 mobile-keyboard-compose`. Safari pans the page up over its keyboard by scrolling the visual
+  // viewport, after the resize, which changes what the keyboard covers (`keyboardInset`) and nothing else.
+  window.visualViewport.addEventListener("scroll", () => noteKeyboard());
 } else if (typeof window.addEventListener === "function") {
   window.addEventListener("resize", () => noteKeyboard());
 }
@@ -57494,6 +57623,7 @@ noteKeyboard();
 loadIdentities();
 renderIdentityRows();
 renderChannelRows();
+for (const [key, box] of NEWLINE_KEYS) wireNewlineKey(leftEl(key), leftEl(box));
 el("reply-cancel").addEventListener("click", () => closeReply());
 el("reply-send").addEventListener("click", guardQuietly(sendReply));
 // `#225 enter-to-send`. The box that had no Enter handler at all, so the one the owner had to reach
