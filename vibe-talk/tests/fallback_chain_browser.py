@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
+from browser_audio import CHROMIUM_AUDIO_ARGS
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -309,6 +311,7 @@ def main() -> int:
                 with tempfile.TemporaryDirectory(prefix="vibe-talk-chain-chrome-") as profile:
                     context = playwright.chromium.launch_persistent_context(
                         profile,
+                        args=CHROMIUM_AUDIO_ARGS,
                         headless=True,
                         executable_path=executable,
                         viewport={"width": width, "height": height},

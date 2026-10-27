@@ -68,6 +68,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, TypeVar
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from browser_audio import CHROMIUM_AUDIO_ARGS
+
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page
 
@@ -658,6 +660,7 @@ def main() -> int:
                           scheme: str = "light") -> tuple[BrowserContext, Page]:
                 context = playwright.chromium.launch_persistent_context(
                     profile,
+                    args=CHROMIUM_AUDIO_ARGS,
                     headless=True,
                     executable_path=args.browser_executable,
                     viewport={"width": width, "height": height},

@@ -824,6 +824,12 @@ server to interrupt the agent. A browser without streamed `fetch` bodies or Web 
 `<audio>`. `make -C vibe-talk read-aloud-browser` times tap to audible in a real Chromium against
 audio streamed at speaking pace, with that `<audio>` fallback as its negative control.
 
+The headless audio checks replace Chromium's final OS audio output stream with its test sink
+(`--disable-audio-output`). Decoding, Web Audio scheduling, its playback clock and media-element
+buffering remain real, including the slow negative controls. This prevents an unavailable host
+sound server from adding seconds to context creation or leaving playback suspended. Audible
+output through the phone's physical speaker remains a separate deployment check.
+
 A tap never waits for the whole screen to be prepared (`#191 read-aloud-first-lag`). Turning Read
 on prepares every visible message in the background. A tap on a row that is not ready yet sends a
 prepare request for that row alone and starts reading it, and the rest of the screen keeps
