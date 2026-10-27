@@ -112,6 +112,11 @@ complete journal coverage. After this, the remaining work toward a Rust
 wrkslots is composed read commands (list/status-style summaries over the
 validated formats), then writers.
 
-[muse watermelon] Slice 17 in progress: `wrkslotsd parse-states` composes
-the ACTIVE/ARCHIVED readers with `_ensure_state_shard`'s partial-shard
-pairing rule (snapshot mode; EVENTS derivation stays with `rebuild`).
+[muse watermelon] Slice 17 landed (1a1e6271): `wrkslotsd parse-states`
+composes the ACTIVE/ARCHIVED readers with `_ensure_state_shard`'s
+partial-shard pairing rule (snapshot mode; EVENTS derivation stays with
+`rebuild`). Gate 28 failures were load flakes only: cross-skip-accounting
+(71 passed alone), vibe-talk page-1 shift-o-latency (passes alone), and
+wrkslots shard 1 (468 passed alone) each passed in a solo rerun, so every
+selected step passed in some run. Next: further composed readers or the
+first writer slice.
