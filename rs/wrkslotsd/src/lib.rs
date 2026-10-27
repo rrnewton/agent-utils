@@ -48,6 +48,7 @@ pub mod cli;
 mod config;
 mod config_validate;
 mod doctor_state;
+mod ensure_states;
 mod evidence;
 mod git_storage_state;
 mod global_state;

@@ -5030,6 +5030,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
     assert_eq!(
         names,
         BTreeSet::from([
+            "ensure-states",
             "explain",
             "parse-archive",
             "parse-handoff",

@@ -21,6 +21,15 @@ type Result<T> = std::result::Result<T, String>;
 
 const SCHEMA: i64 = 2;
 
+pub(crate) fn normalize_archive_value(
+    cfg: &Cfg,
+    value: &Value,
+    selected: &str,
+    label_prefix: &str,
+) -> Result<Value> {
+    archive_from_obj(cfg, value, selected, label_prefix)
+}
+
 fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str) -> Result<Value> {
     let raw = as_mapping(value, label_prefix)?;
     exact_keys(

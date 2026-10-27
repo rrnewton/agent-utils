@@ -215,3 +215,9 @@ inspectability; all fixed reusing the strict loader definitions
 113 passed alone, scroll-stability browser passed alone, wrkslots
 shards 494 + 493 passed alone). Upstream agentctl commits shared no
 files; rebased and pushed without a second gate.
+
+[muse watermelon] Slice 26 in progress: `wrkslotsd ensure-states`,
+the first writer slice, reproduces `_ensure_state_shard` (shard-pair
+bootstrap plus `state-imported` event initialization) behind the
+registry locks with atomic writes. Differential-tested only on
+temporary fixture registries, never on a live registry.

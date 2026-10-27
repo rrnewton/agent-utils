@@ -955,6 +955,15 @@ pub(crate) struct RecordOrder {
     pub(crate) imported: bool,
 }
 
+pub(crate) fn normalize_active_value(
+    cfg: &Cfg,
+    value: &Value,
+    selected: &str,
+    label: &str,
+) -> Result<Value> {
+    Ok(active_from_obj(cfg, value, selected, label)?.0)
+}
+
 fn active_from_obj(
     cfg: &Cfg,
     value: &Value,
