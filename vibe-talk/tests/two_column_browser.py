@@ -1539,12 +1539,18 @@ def search_advance(chromium: BrowserType, args: argparse.Namespace, label: str, 
     thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-search-advance-") as profile:
-            options: dict[str, object] = {"viewport": {"width": width, "height": height}, "color_scheme": "dark",
-                                          "timezone_id": "UTC", "locale": "en-US"}
             if touch:
-                options.update(device_scale_factor=2.625, is_mobile=True, has_touch=True)
-            context = chromium.launch_persistent_context(profile, headless=True,
-                                                         executable_path=args.browser_executable, **options)
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark", timezone_id="UTC",
+                    locale="en-US", device_scale_factor=2.625, is_mobile=True, has_touch=True,
+                )
+            else:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark", timezone_id="UTC",
+                    locale="en-US",
+                )
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []
