@@ -52,7 +52,7 @@ in two columns with a mouse and the keys, and at a 412x915 phone in one column w
   scroll position chained steps back through the whole history — and the step back says "Search
   before …", a 44px target -> on the desk a wheel upward at the head of the emptied list reads nothing
   either, and how many scroll events it fired is said -> Enter in the search field on the desk, a tap on the
-  step back on the phone, the older reads held: "Searching… 1 of 5 · Stop" -> let go: the three
+  step back on the phone, the older reads held: "Fetching older messages… · Stop" -> let go: the three
   matches open under the step back, which has moved no more than the sentence above it that nothing
   matched, the reader still at the head of the list, the note saying what was found between it and
   them, and the line above the first match counting the unmatched messages it skips.
@@ -64,7 +64,7 @@ the thread list with a finger and its keyboard's Search key:
 
   the search finds nothing on the left and no card, and the head of the cards offers "Search replies before
   …", a 44px target inside the right column, reading nothing by itself -> pressed (Enter on the phone), the
-  older reads held: "Searching replies… 1 of 5 · Stop" -> let go: three of All's older pages read, the three
+  older reads held: "Fetching older messages… · Stop" -> let go: three of All's older pages read, the three
   threads' cards found, each saying "in replies", under a note between the control and the cards saying so
   -> the oldest found thread opened shows its matching reply, marked. Before the cards' walk, there was no
   control and nothing was found. And over sixteen threads at 1280x800, the word also in the first message of
@@ -72,6 +72,17 @@ the thread list with a finger and its keyboard's Search key:
   turned off (`overflow-anchor: none`), as in a browser that has none, the cards' walk ends with three more
   found and its note at their head, and the card the reader was on has not moved, nor the left column, and
   the search is still typed.
+
+`#578 search-status-clarity`, over a Slack channel of a hundred and twenty messages a minute apart, all of
+one day, ten to a page, nothing saying the word — in All at 1280x800 with a mouse and at a 393x852 phone with
+a finger:
+
+  the search empties the list, which says "Searched 10 messages in this browser: every top-level message
+  back to …", and the step back says "Search before <day>, <time>" -> pressed, the reads held: it says
+  "Fetching older messages… · Stop" -> let go: the control names an earlier time of the same day, the note
+  under it "None of the 50 older messages fetched from Slack, back to …, match.", the sentence "Searched 60
+  messages …" -> pressed again: an earlier time again, and 110 searched. Before, both presses left "Search
+  before <day>" and said nothing.
 
 Pass --screenshots DIR to keep a PNG of each state (the list, a selected thread, the links, the
 selection's link off screen and after its glide, at each size) for review; --web-root DIR to run the
@@ -245,6 +256,8 @@ def main() -> int:
             report.append(search_older(playwright.chromium, args, label, width, height, touch))
         for label, width, height, touch in REPLIES_SIZES:
             report.append(search_replies(playwright.chromium, args, label, width, height, touch))
+        for label, width, height, touch in ADVANCE_SIZES:
+            report.append(search_advance(playwright.chromium, args, label, width, height, touch))
         report.append(search_replies(playwright.chromium, args, *PLACE_SIZE, place=True))
     for line in report:
         print(line)
@@ -881,6 +894,10 @@ def links_walk(desk: Desk) -> None:
 # where the matches open, whether the step back holds still, and whether a wheel at the head of an emptied
 # list reads anything at all.
 
+# What a walk's control says while it fetches, as a regular expression in the page: how many older messages
+# have come, never "1 of 5" of nothing the reader can name (`#578 search-status-clarity`).
+FETCHING_JS = r"/^Fetching(?: older messages…|… \d+ older messages?) · Stop$/"
+
 # (label, width, height, touch): two columns on the laptop, one on the phone.
 OLDER_SIZES = (("search-older-1280", 1280, 800, False), ("search-older-phone", 412, 915, True))
 # The channel: this many messages, read this many at a time, the word in these.
@@ -1091,7 +1108,7 @@ def older_walk(desk: Desk, api: OlderApi, touch: bool) -> None:
     else:
         page.focus("#search-field")
         page.keyboard.press("Enter")
-    desk.wait_for("() => /^Searching… [1-5] of 5 · Stop$/.test(document.getElementById('load-older').textContent)",
+    desk.wait_for(f"() => {FETCHING_JS}.test(document.getElementById('load-older').textContent)",
                   "the step back does not say the walk is under way")
     desk.shot("2-searching")
     api.older_gate.set()
@@ -1109,7 +1126,7 @@ def older_walk(desk: Desk, api: OlderApi, touch: bool) -> None:
                f"the step back moved {moved:.1f}px while the matches arrived, more than the {room:.1f}px sentence above it")
     desk.check(float(str(found["scrolled"])) <= 1, "the walk moved the reader off the head of the list")
     note, first = found["note"], found["first"]
-    desk.check(note is not None and str(found["said"]).startswith("Found 3 in "),
+    desk.check(note is not None and str(found["said"]).startswith("Found 3 more matches among "),
                f"the note under the step back says {found['said']!r}")
     desk.check(edge(note, "top") >= edge(found["chip"], "bottom") - 0.5 and edge(note, "bottom") <= edge(first, "top") + 0.5,
                f"the note is not between the step back and the first match: {note} {first}")
@@ -1327,7 +1344,7 @@ def replies_walk(desk: Desk, api: RepliesApi, touch: bool) -> None:
         page.keyboard.press("Enter")
     else:
         page.click("#side-search-replies")
-    desk.wait_for("() => /^Searching replies… [1-5] of 5 · Stop$/.test(document.getElementById('side-search-replies').textContent)",
+    desk.wait_for(f"() => {FETCHING_JS}.test(document.getElementById('side-search-replies').textContent)",
                   "the cards' control does not say the walk is under way")
     desk.shot("2-searching-replies")
     api.older_gate.set()
@@ -1346,7 +1363,8 @@ def replies_walk(desk: Desk, api: RepliesApi, touch: bool) -> None:
                f"a found card does not say where: {hints}")
     desk.check(api.older_all_reads() == 3, f"the walk read {api.older_all_reads()} of All's older pages, not 3")
     said_text = str(found["said"])
-    desk.check(said_text.startswith("Found 3 threads in 3 pages (30 messages), back to "), f"the note says {said_text!r}")
+    desk.check(said_text.startswith("Found 3 threads in 30 older messages fetched from Discord, back to "),
+               f"the note says {said_text!r}")
     note, first = found["note"], found["first"]
     desk.check(edge(note, "top") >= edge(found["chip"], "bottom") - 0.5 and edge(note, "bottom") <= edge(first, "top") + 0.5,
                f"the note is not between the cards' control and the first card: {note} {first}")
@@ -1444,7 +1462,8 @@ def replies_place(desk: Desk) -> None:
     wanted = sorted(roots + [f"spaces/A/threads/r{t}" for t in (11, 12, 13)])
     desk.check(shown == wanted, f"the cards' walk showed {shown}, not {wanted}")
     said_text = str(found["said"])
-    desk.check(said_text.startswith("Found 3 threads in 4 pages (40 messages), back to "), f"the note says {said_text!r}")
+    desk.check(said_text.startswith("Found 3 threads in 40 older messages fetched from Discord, back to "),
+               f"the note says {said_text!r}")
     after = page.evaluate(script)
     moved = float(after["top"]) - float(before["top"])
     desk.check(abs(moved) <= 1.5, f"the cards' walk moved the card the reader was on by {moved:.1f}px")
@@ -1453,6 +1472,166 @@ def replies_place(desk: Desk) -> None:
     desk.shot("place")
     desk.notes.append(f"scrolled into the cards, the cards' walk found 3 more threads and the reader's card moved "
                       f"{moved:.1f}px: {said_text}")
+
+
+# `#578 search-status-clarity`. The owner, 2026-10-27: "it shows me no hits and a button 'Search before
+# October 25'. I press it and it does nothing for a while and then shows THE SAME button." In a busy channel
+# every older message a press brings can be of the same day, and the control named the day alone; over a list
+# the search had emptied, a walk that found nothing said nothing. This lays out the presses over such a
+# channel, in All on Slack, at a 393x852 phone with a finger and at 1280x800 with a mouse.
+
+# (label, width, height, touch).
+ADVANCE_SIZES = (("search-advance-1280", 1280, 800, False), ("search-advance-phone", 393, 852, True))
+# A hundred and twenty messages a minute apart, all on one day, read ten at a time; nothing says the word.
+ADVANCE_TOTAL = 120
+ADVANCE_TERM = "glacier"
+# The one small thread among the newest, so the channel is one with threads.
+ADVANCE_ROOT, ADVANCE_REPLY = 116, 117
+
+
+class AdvanceApi(OlderApi):
+    """`OlderApi`'s pages over a Slack channel of a hundred and twenty messages a minute apart."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.provider_name = "Slack"
+        thread = "spaces/A/threads/deploy"
+        self.messages = []
+        for index in range(ADVANCE_TOTAL):
+            row = said(index, f"Message {200 + index}. {FILLER}", "human" if index % 3 == 1 else "coder")
+            row["timestamp"] = (fixture.EPOCH + timedelta(minutes=index)).isoformat().replace("+00:00", "Z")
+            if index == ADVANCE_ROOT:
+                row["thread"] = thread_record(thread, ADVANCE_ROOT, 1)
+            elif index == ADVANCE_REPLY:
+                row["thread"] = thread_record(thread, ADVANCE_ROOT, 1, is_root=False)
+            self.messages.append(row)
+        self.threads = [{"id": thread, "root": self.messages[ADVANCE_ROOT], "title": "Deploy",
+                         "reply_count": 1, "reply_count_exact": True,
+                         "updated_at": self.messages[ADVANCE_REPLY]["timestamp"]}]
+
+
+# The control, the note under it, the sentence where the rows were, and whether anything overflows.
+ADVANCE_JS = """() => {
+    const box = (node) => {
+        if (!node || !node.getClientRects().length) return null;
+        const r = node.getBoundingClientRect();
+        return {top: r.top, bottom: r.bottom, left: r.left, right: r.right};
+    };
+    const chip = document.getElementById('load-older');
+    const note = document.getElementById('search-older-note');
+    const empty = document.getElementById('search-empty');
+    return {
+        label: chip.textContent, chip: box(chip), note: box(note), said: note.hidden ? '' : note.textContent,
+        sentence: empty.hidden ? '' : empty.textContent, sentenceBox: box(empty),
+        rows: document.querySelectorAll('#discord-log > li[data-id]').length,
+        overflow: document.documentElement.scrollWidth - window.innerWidth,
+    };
+}"""
+
+
+def search_advance(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+                   touch: bool) -> str:
+    """One reader pressing Search before over a channel whose every message is of one day."""
+    api = AdvanceApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-search-advance-") as profile:
+            options: dict[str, object] = {"viewport": {"width": width, "height": height}, "color_scheme": "dark",
+                                          "timezone_id": "UTC", "locale": "en-US"}
+            if touch:
+                options.update(device_scale_factor=2.625, is_mobile=True, has_touch=True)
+            context = chromium.launch_persistent_context(profile, headless=True,
+                                                         executable_path=args.browser_executable, **options)
+            version = context.browser.version if context.browser else "Chromium"
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            desk = Desk(page, args.screenshots, label, width, height)
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
+            advance_walk(desk, api, touch)
+            check(not errors, f"{label}: the page threw: {errors}")
+            context.close()
+            return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
+    finally:
+        api.stopping.set()
+        api.older_gate.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def advance_measure(desk: Desk) -> Json:
+    found = desk.page.evaluate(ADVANCE_JS)
+    assert isinstance(found, dict)
+    return {str(key): value for key, value in found.items()}
+
+
+def advance_press(desk: Desk, touch: bool) -> None:
+    chip = advance_measure(desk)["chip"]
+    if touch:
+        desk.page.touchscreen.tap((edge(chip, "left") + edge(chip, "right")) / 2,
+                                  (edge(chip, "top") + edge(chip, "bottom")) / 2)
+    else:
+        desk.page.click("#load-older")
+
+
+def advance_walk(desk: Desk, api: AdvanceApi, touch: bool) -> None:
+    page = desk.page
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    desk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {OLDER_PAGE}",
+                  "the channel did not open on All's newest page")
+    page.click("#search-toggle")
+    page.fill("#search-field", ADVANCE_TERM)
+    desk.wait_for("() => document.getElementById('load-older').textContent.startsWith('Search before ')",
+                  "the step back does not offer to search further back")
+    desk.settled()
+    page.wait_for_timeout(300)
+    labels: list[str] = []
+    found = advance_measure(desk)
+    labels.append(str(found["label"]))
+    # The day the whole channel is of, as the page says it: every label below names it, and a time in it.
+    day = str(found["label"]).removeprefix("Search before ").split(",")[0]
+    desk.check(str(found["sentence"]).startswith("Searched 10 messages in this browser: every top-level message back to "),
+               f"the sentence where the rows were says {found['sentence']!r}")
+    desk.shot("1-search-before")
+
+    for press in (1, 2):
+        api.older_gate.clear()
+        advance_press(desk, touch)
+        desk.wait_for(f"() => {FETCHING_JS}.test(document.getElementById('load-older').textContent)",
+                      f"press {press}: the step back does not say what it is fetching")
+        if press == 1:
+            desk.shot("2-fetching")
+        api.older_gate.set()
+        desk.wait_for("() => document.getElementById('load-older').textContent.startsWith('Search before ') && "
+                      "!document.getElementById('search-older-note').hidden",
+                      f"press {press}: the walk did not end with a note", seconds=20)
+        desk.settled()
+        page.wait_for_timeout(200)
+        found = advance_measure(desk)
+        label = str(found["label"])
+        desk.check(label not in labels, f"press {press}: the control still says {label!r}, as before the press")
+        desk.check(label.startswith(f"Search before {day}, "), f"press {press}: the control left the one day: {label!r}")
+        labels.append(label)
+        said_text = str(found["said"])
+        back = label.removeprefix("Search before ")
+        desk.check(said_text == f"None of the 50 older messages fetched from Slack, back to {back}, match.",
+                   f"press {press}: the note says {said_text!r}")
+        sentence = str(found["sentence"])
+        desk.check(sentence.startswith(f"Searched {10 + 50 * press} messages in this browser: every top-level message "
+                                       f"back to {back} (no gaps)"), f"press {press}: the sentence says {sentence!r}")
+        note, chip = found["note"], found["chip"]
+        desk.check(edge(note, "top") >= edge(chip, "bottom") - 0.5, f"press {press}: the note is not under the control")
+        overflow = found["overflow"]
+        desk.check(isinstance(overflow, (int, float)) and overflow <= 0, f"press {press}: the page scrolls sideways")
+        desk.shot(f"{2 + press}-pressed-{press}")
+    desk.notes.append(f"{'taps' if touch else 'clicks'} moved the control {' -> '.join(labels)}: {said_text}")
 
 
 if __name__ == "__main__":

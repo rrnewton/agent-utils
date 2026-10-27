@@ -6120,21 +6120,31 @@ function searchInAll() {
 
 /**
  * What `#search-empty` says over a channel's list whose loaded messages the search text matches none
- * of: how many are loaded and back to which day, or that all of them are; on Main, that thread replies
- * are not in it; and on a chat service without threads under Hide read, how to search what Hide read
- * leaves out. `#262
- * search-load-older`. Over the call's transcript, what it always said.
+ * of: how many it searched, and where — in this browser — and how far back with no gaps, in the
+ * owner's terms (`historyReach`, `#578 search-status-clarity`): "Searched 82 messages in this browser, a
+ * complete history back to Oct 26, 3:14 PM (no gaps), plus 4 scattered older ones. None match." On
+ * Main, that thread replies are not in it; and on a chat service without threads under Hide read, how
+ * to search what Hide read leaves out. `#262 search-load-older`. Over the call's transcript, what it
+ * always said.
  *
  * @param {number} loaded How many messages are loaded in this column, as the count says it.
  */
 function searchEmptySentence(loaded) {
   if (currentView !== "discord" || channelView === "threads") return SEARCH_EMPTY_LOADED;
   const view = channelViewWords();
-  const day = oldestLoadedDay();
-  const said = historyReadToStart()
-    ? `Nothing in ${view} matches that search — all of it is loaded.`
-    : `Nothing in the ${loaded} message${loaded === 1 ? "" : "s"} loaded so far` +
-      `${day === null ? "" : `, back to ${searchDayWords(day)},`} matches that search.`;
+  const reach = historyReach();
+  let said;
+  if (reach.whole && historyReadToStart()) {
+    said = `Searched all ${messagesWords(loaded)} of ${view} in this browser, back to the first one` +
+      `${reach.from === null ? "" : ` (${searchMomentWords(reach.from)})`}. None match.`;
+  } else if (reach.saved) {
+    said = `Searched ${messagesWords(loaded)} saved on this device${reachBackWords(reach.from)}, not yet checked ` +
+      "for gaps. None match.";
+  } else if (reach.proven) {
+    said = `Searched ${messagesWords(reach.dense)} in this browser${reach.topLevel ? ":" : ","} ${reachClause(reach)}. None match.`;
+  } else {
+    said = `Searched the ${messagesWords(loaded)} loaded in this browser${reachBackWords(oldestLoadedMs())}. None match.`;
+  }
   // Main holds a thread's first message and nothing of the rest, and the cards on the right, or All,
   // are where a reply is found. Most of why a search on the left of two columns finds nothing.
   if (threadingSupported && channelView === "main") return `${said} Thread replies are not in Main.`;
@@ -23331,7 +23341,9 @@ const cachedWireRowsValid = (rows, type) =>
 const coverageValid = (views) => views !== null && typeof views === "object" && !Array.isArray(views) &&
   Object.values(views).every((cover) => cover !== null && typeof cover === "object" &&
     (cover.floor === null || Number.isFinite(cover.floor)) && typeof cover.more === "boolean" &&
-    Number.isFinite(cover.at) && typeof cover.notice === "string");
+    Number.isFinite(cover.at) && typeof cover.notice === "string" &&
+    // Absent from a cover saved before `#578 search-status-clarity`, whose next read then joins nothing.
+    [cover.top, cover.dense].every((at) => at === undefined || at === null || Number.isFinite(at)));
 
 function validCacheEntry(entry) {
   if (entry === null || typeof entry !== "object" || !Number.isFinite(entry.usedAt) ||
@@ -23681,15 +23693,33 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
   const lower = (a, b) => (a === null || b === null ? null : Math.min(a, b));
   let more = hasMore;
   let floor = hasMore ? edge : null;
+  // `#578 search-status-clarity`. Where the stretch with no gaps begins when it is not the floor
+  // (`historyReach`), and the newest message any read of the view carried, which says whether the next
+  // newest read joins what is held. All's is its newest top-level message: its pages bring the replies
+  // of a few threads, which say nothing of the top-level messages between.
+  const counted = arriving.filter((item) => view !== "flat" || !threadOf(item) || item.thread.is_root === true ||
+    threadOf(item) === channelCanon.scope).map((item) => timeOf(item, timeField)).filter(Number.isFinite);
+  const pageTop = counted.length ? Math.max(...counted) : null;
+  let top = prior && Number.isFinite(prior.top) ? prior.top : null;
+  let dense = prior && Number.isFinite(prior.dense) ? prior.dense : null;
   if (hasMore && prior && !older) {
     // A refresh that stops short keeps the history already walked back to, as the rows do.
     more = prior.more;
     floor = prior.more ? lower(prior.floor, edge) : null;
+    // ...but joins it only where it reaches down to the newest message a read before it carried. One
+    // that does not — the page was away while more than a page arrived — leaves messages between that
+    // no read brought, and what is below them is scattered.
+    if (edge !== null && !(top !== null && edge <= top)) dense = edge;
   } else if (hasMore && prior && older) {
-    floor = lower(prior.floor, edge);
+    // A step back that brought nothing — a page served from the cache whose walk found nothing older
+    // yet — moves nothing: the floor is where the rows are, not "unknown".
+    floor = edge === null ? prior.floor : lower(prior.floor, edge);
+  } else if (!hasMore && !older) {
+    dense = null;
   }
+  if (pageTop !== null && (top === null || (!older && pageTop > top))) top = pageTop;
   channelCanon.views.set(key, {
-    floor, more, notice,
+    floor, more, notice, top, dense,
     at: older && prior ? prior.at : Date.now(),
     live: true,
     cursor: prior ? prior.cursor : null,
@@ -24095,12 +24125,18 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     unchangedDeltas.add(payload);
   }
   const asOf = staleAsOf(payload);
+  // `#578 search-status-clarity`. A delta continues the view up from where it was without a gap, so
+  // the newest message it carries is one the next newest read may join (`coverView`).
+  const carried = arriving.filter((message) => view !== "flat" || !threadOf(message) || message.thread.is_root === true)
+    .map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
+  const top = Math.max(Number.isFinite(cover.top) ? cover.top : -Infinity, ...carried);
   channelCanon.views.set(key, {
     ...cover,
     notice: payload.notice || "",
     at: asOf === null ? Date.now() : asOf,
     live: true,
     newest: payload.next_after || null,
+    top: Number.isFinite(top) ? top : cover.top ?? null,
   });
   channelCanon.complete = delta.complete === true;
   return true;
@@ -24439,7 +24475,8 @@ function saveChannelScope() {
     syncCanonDismissed();
     const views = {};
     for (const [view, cover] of channelCanon.views) {
-      views[view] = { floor: cover.floor, more: cover.more, at: cover.at, notice: cover.notice };
+      views[view] = { floor: cover.floor, more: cover.more, at: cover.at, notice: cover.notice,
+        top: Number.isFinite(cover.top) ? cover.top : null, dense: Number.isFinite(cover.dense) ? cover.dense : null };
     }
     const held = new Set(channelCanon.messages.map((message) => String(message.id)));
     const heldThreads = new Set(channelCanon.messages.map(threadOf).filter((id) => id !== null));
@@ -28945,8 +28982,9 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   holdingReplyArrows(renderChannelRows);
   renderChannelNavigation();
   renderOlderControl();
-  el("timeline-notice").textContent = payload.notice || "";
-  el("timeline-notice").hidden = !payload.notice;
+  const notice = allNoticeWords(payload.notice || "");
+  el("timeline-notice").textContent = notice;
+  el("timeline-notice").hidden = !notice;
   el("inbox-note").textContent = payload.read_state_notice || "";
   backlogSize = shown.length;
   renderTodoControls();
@@ -28957,6 +28995,38 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
       ? openThreadName() : channelName(payload.channel));
   renderChannelSeam(label);
   return channelView === "threads" ? timelineThreads : shown;
+}
+
+/**
+ * What the notice under the step back says over All of a page the server says it bounded: in threads,
+ * not pages (`#578 search-status-clarity`). The owner: "PAGES are not a concept in vibe talk. THREADS
+ * are." So it counts the threads on screen whose replies All has not all brought, by their exact counts
+ * (`exactReplyCount`), and says nothing once the reader has every one — opened, say. The server's own
+ * words where a count is not known; and the notice as it came everywhere else.
+ *
+ * @param {string} notice
+ */
+function allNoticeWords(notice) {
+  if (!notice || !threadingSupported || channelView !== "flat") return notice;
+  const tally = replyTally();
+  let lacking = 0;
+  let unknown = false;
+  for (const message of timelineMessages) {
+    const id = threadOf(message);
+    if (!id || message.thread.is_root !== true) continue;
+    const count = exactReplyCount(id, message, tally);
+    if (count === null) {
+      unknown = true;
+      continue;
+    }
+    const entry = tally.threads.get(id);
+    if (count > (entry ? entry.held : 0)) lacking += 1;
+  }
+  if (lacking > 0) {
+    return `${lacking} thread${lacking === 1 ? " here has replies" : "s here have replies"} All has not loaded; ` +
+      "open a thread to read all of it.";
+  }
+  return unknown ? notice : "";
 }
 
 /**
@@ -40941,8 +41011,20 @@ function copyThroughTextarea(value) {
 // `!== true` rather than `=== false`, so a server too old to send the field is treated as unknown.
 // It takes the label so every branch reads as a whole sentence. Appending " from <channel>" to a
 // summary that already ends in a clause produced "older ones are not loaded from lead team".
+//
+// `#578 search-status-clarity`. A total only where every message of the view is loaded (`historyReach`):
+// on All, the reads reaching its first top-level message is not enough while threads there lack replies
+// All never brought — the "112 messages" the owner was shown on 2026-10-25 (`#521 server-side-search`).
+// How far back the rest runs with no gaps is said by the search's own lines, which change as a walk
+// reads; this line holds still at the head of the list, where a change of height moves every row.
 function channelSummary(count, complete, label) {
-  if (complete !== true) {
+  const reach = complete === true ? historyReach() : null;
+  if (reach && reach.start && reach.topLevel && !reach.whole) {
+    const lacking = reach.threads - reach.full;
+    return `${label} — back to the first message; ${lacking} thread${lacking === 1 ? " here has" : "s here have"} ` +
+      "replies not loaded";
+  }
+  if (!reach || !reach.whole) {
     return `${label} — the most recent messages; older ones are not loaded`;
   }
   if (count === 0) {
@@ -41032,7 +41114,7 @@ function snowflakeOlder(a, b) {
 // why there might be more than this. Kept to a couple of clauses, and measured by the suite
 // alongside the other two seams.
 const CHANNEL_SEAM_DETAIL =
-  "Messages load a page at a time. A total appears only after you reach the beginning.";
+  "Older messages load as you scroll up. A total appears only once everything back to the first message is loaded.";
 
 /**
  * Put the channel's summary at the head of the channel view, replacing any that is already there.
@@ -41072,13 +41154,15 @@ function renderOlderControl() {
   if (button.disabled !== disabled) button.disabled = disabled;
   let label = olderFetchInFlight ? (walking ? "Loading earlier messages…" : "Loading older messages…") : "Older messages";
   if (walk) {
-    label = walk.stopping ? "Stopping…" : `Searching… ${Math.max(1, walk.pages)} of ${SEARCH_OLDER_PAGES} · Stop`;
+    label = walk.stopping ? "Stopping…" : searchWalkProgress(walk);
   } else if (offered) {
-    const day = oldestLoadedDay();
-    label = `Search ${channelView === "thread" ? "replies " : ""}${day === null ? "older messages" : `before ${searchDayWords(day)}`}`;
+    // `#578 search-status-clarity`. To the minute, so that every press that brings anything older moves it.
+    const sent = oldestLoadedMs();
+    label = `Search ${channelView === "thread" ? "replies " : ""}${sent === null ? "older messages" : `before ${searchMomentWords(sent)}`}`;
   }
   setTextIfChanged(button, label);
-  const name = offered ? `${label}: older pages, a few at a time. Enter in the search field does the same.` : "";
+  const name = offered ? `${label}: fetches up to ${SEARCH_OLDER_PAGES * DISCORD_PAGE_LIMIT} older messages from ` +
+    `${serviceWords()} and searches them here. Enter in the search field does the same.` : "";
   if ((button.getAttribute("aria-label") || "") !== name) {
     if (name) button.setAttribute("aria-label", name);
     else button.removeAttribute("aria-label");
@@ -41099,17 +41183,19 @@ function renderOlderControl() {
 // (`maybeLoadOlder`), and the search's walk below is the one way back, bounded, and the reader's.
 //
 // WHILE A FILTER CHOOSES ROWS (a term, Links or whose messages), each column's step back says "Search
-// before Oct 3", the day that column reaches back to. A tap on it, or Enter in the search field, walks
+// before Oct 3, 9:02 AM", the oldest message that column reaches back to (to the minute since `#578
+// search-status-clarity`). A tap on it, or Enter in the search field, walks
 // back AT MOST `SEARCH_OLDER_PAGES` older pages within `SEARCH_OLDER_MS`, and stops at the end of the
 // page that brings `SEARCH_OLDER_HITS` new matches. Every tap is the reader's consent to that much and
-// no more: nothing chains pages on its own. Meanwhile the control says "Searching… 2 of 5 · Stop", and a
-// tap on it stops the read on the wire. Any change to the search ends the walk, and so do closing the
+// no more: nothing chains pages on its own. Meanwhile the control says "Fetching… 50 older messages · Stop",
+// and a tap on it stops the read on the wire. Any change to the search ends the walk, and so do closing the
 // right column's thread, leaving two columns, another channel or view, a jump, and a filter change's
 // own walk back (`walkToFilterAnchor`). One walk at a time on the page.
 //
 // WHAT IT FOUND is counted only among messages older than where it started, so a message arriving
 // live, or a poll, can neither stop it nor be reported as found; and in messages, as the count is. It
-// is said once, under the control, until the search changes (`searchNote`). The matches appear under
+// is said once, under the control, until the search changes (`searchNote`), with what was fetched and
+// from where, or why nothing could be (`searchWalkNote`). The matches appear under
 // the control, which holds still while the walk runs, with `#250 date-separators`' line saying how many
 // unmatched messages are between, and `#249 search-highlight`'s marks on them.
 //
@@ -41152,12 +41238,11 @@ function channelViewWords() {
   return channelView === "thread" ? "this thread" : channelView === "flat" ? "All" : "Main";
 }
 
-/** The day of the oldest message loaded in the column being worked on, as `dayKeyOf` says it, or null. */
-function oldestLoadedDay() {
+/** When the oldest message loaded in the column being worked on was sent, in milliseconds, or null. */
+function oldestLoadedMs() {
   for (const row of el("discord-log").children) {
     if (!isMessageRow(row)) continue;
-    const day = rowDay(row);
-    if (day !== null) return day;
+    if (rowDay(row) !== null) return rowSentMs(row);
   }
   return null;
 }
@@ -41168,6 +41253,165 @@ function searchDayWords(key, clock = dayClock()) {
   if (key === clock.yesterday) return "yesterday";
   const { year, month, day } = dayParts(key);
   return `${DAY_MONTHS[month]} ${day}${year !== clock.year ? `, ${year}` : ""}`;
+}
+
+// --- how far back, with no gaps -------------------------------------------------------------------
+//
+// `#578 search-status-clarity`. The owner, 2026-10-27, of "Nothing in the 82 messages loaded so far,
+// back to yesterday": "It doesn't explain what are these 82 messages loaded. Is that a dense
+// chronological history from time T0-present? Or just whatever random sparse set we have loaded? I
+// think a dense suffix of messages is the easiest to reason about. You could even say that we have 'X
+// messages back to DATETIME with no gaps, plus Y scattered messages before that.'" So the channel's
+// summary, the sentence over a search that matched nothing, and what a walk further back found all say
+// it in those terms, from one account of the list (`historyReach`), to the minute: a day alone did not
+// move when a press brought fifty more messages of the same day, and the owner saw "THE SAME button".
+//
+// A STRETCH WITH NO GAPS IS ONE THE READS PROVED. Where the chat service has threads, the view's cover
+// in the channel's store says how far back its pages reach (`coverView`): each step back is read from
+// the cursor the one before it handed over, and a newest read that reaches down into what an earlier
+// read carried joins it. One that does not — the page was away while more than a page of messages
+// arrived — leaves a gap the rows do not show, and the cover keeps where it is (`cover.dense`): the
+// messages above it are the stretch, and those below are SCATTERED. Without threads, the plain page's
+// newest read does the same (`plainGapFrom`). Rows saved on this device that no read has checked claim
+// no stretch at all, nor does a list no read has said anything of.
+//
+// ALL ON A CHAT SERVICE WITH THREADS IS TOP-LEVEL MESSAGES FIRST. Its pages hold every top-level message
+// and, on Slack, the replies of at most ten of their threads; and a reply posted since in a thread
+// started further back is in no page of the stretch. So All claims its top-level messages, and says of
+// the threads started in the stretch how many it holds every reply of (`exactReplyCount`): "every
+// top-level message back to Oct 26, 3:14 PM (no gaps), and every reply in 20 of their 31 threads". It
+// is whole only when it reaches the start and holds every reply of every thread: the "112 messages …
+// all of it is loaded" the owner was shown on 2026-10-25 was the start of the top-level messages alone
+// (`#521 server-side-search`, its Phase 0).
+//
+// WHERE: the search runs in this browser, over what is loaded, and a walk further back fetches older
+// messages from the chat service through the server. The server's own search of its message cache,
+// and the chat services' search, are designed in `#521 server-side-search` and not built, so nothing
+// here says either searched.
+
+/**
+ * Without threads: the instant of the oldest message of the newest read that did not reach down into
+ * the rows already loaded, which are scattered below it; null while every row loaded is one stretch.
+ *
+ * @type {number | null}
+ */
+let plainGapFrom = null;
+
+/**
+ * @typedef {object} HistoryReach
+ * @property {number} total the messages loaded in the column being worked on, as the search counts them
+ * @property {boolean} proven whether a stretch with no gaps is known; else only `total` may be said
+ * @property {boolean} saved rows saved on this device that no read has checked since
+ * @property {number} dense of `total`, those in the stretch with no gaps
+ * @property {number} scattered of `total`, those older than the stretch, with messages unloaded between
+ * @property {number | null} from when the stretch's oldest message was sent; with `saved`, the oldest's
+ * @property {boolean} start the stretch reaches the view's first message (All: its first top-level one)
+ * @property {boolean} whole every message of the view is loaded
+ * @property {boolean} topLevel All in a channel with threads: the stretch is its top-level messages
+ * @property {number} threads with `topLevel`, the threads started in the stretch that have replies
+ * @property {number} full of those, the ones every reply of which is loaded
+ */
+
+/**
+ * What the column being worked on holds of its view, in the owner's terms: see the head of this section.
+ *
+ * @returns {HistoryReach}
+ */
+function historyReach() {
+  const rows = [...el("discord-log").children].filter((row) => isMessageRow(row) && !row.hasAttribute("data-absorbed"));
+  const weight = (row) => Math.max(1, idsOf(row).length);
+  const total = rows.reduce((sum, row) => sum + weight(row), 0);
+  // A channel with no thread at all has nothing in All but its top-level messages.
+  const topLevel = threadingSupported && channelView === "flat" && channelHasThreads;
+  /** @type {HistoryReach} */
+  const reach = { total, proven: false, saved: false, dense: 0, scattered: total, from: null, start: false,
+    whole: false, topLevel, threads: 0, full: 0 };
+  /** @type {number | null} below this instant, a row is scattered */
+  let floor = null;
+  if (threadingSupported) {
+    const cover = channelCanon.channel === String(el("discord-channel").value) ? channelCanon.views.get(viewKey()) : undefined;
+    if (!cover) return reach;
+    // Saved on this device and not read since: what it held when saved, and nothing it may have missed.
+    reach.saved = !cover.live;
+    const gap = Number.isFinite(cover.dense) ? cover.dense : null;
+    if (cover.more === false && gap === null) reach.start = true;
+    else if (reach.saved) floor = -Infinity;
+    else if (gap !== null) floor = Number.isFinite(cover.floor) ? Math.max(gap, cover.floor) : gap;
+    else if (cover.more === true && Number.isFinite(cover.floor)) floor = cover.floor;
+    else return reach;
+  } else {
+    // Hide read's own list is a to-do list, not a stretch of the channel (`loadTodo`).
+    if (todoMode || discordMoreAbove === undefined) return reach;
+    if (plainGapFrom !== null) floor = plainGapFrom;
+    else if (discordMoreAbove === false) reach.start = true;
+    else floor = -Infinity;
+  }
+  reach.proven = !reach.saved;
+  reach.scattered = 0;
+  const tally = topLevel ? replyTally() : null;
+  for (const row of rows) {
+    const sent = rowSentMs(row);
+    // A row whose time does not read is one the reads brought all the same, and counted with them.
+    if (floor !== null && sent < floor) {
+      reach.scattered += weight(row);
+      continue;
+    }
+    reach.dense += weight(row);
+    if (Number.isFinite(sent) && (reach.from === null || sent < reach.from)) reach.from = sent;
+    if (!tally) continue;
+    for (const message of rowMessages(row)) {
+      const id = threadOf(message);
+      if (!id || message.thread.is_root !== true) continue;
+      const count = exactReplyCount(id, message, tally);
+      if (count === 0) continue;
+      reach.threads += 1;
+      const entry = tally.threads.get(id);
+      if (count !== null && (entry ? entry.held : 0) >= count) reach.full += 1;
+    }
+  }
+  reach.whole = reach.start && reach.full === reach.threads;
+  return reach;
+}
+
+/** "1 message", "82 messages". */
+const messagesWords = (count) => `${count} message${count === 1 ? "" : "s"}`;
+
+/** An instant inside a sentence, to the minute: "today, 3:14 PM", "Oct 3, 9:02 AM", as each row says its time. */
+function searchMomentWords(ms, clock = dayClock()) {
+  const at = new Date(ms);
+  return `${searchDayWords(dayKeyOf(at), clock)}, ${shortTimeFormat().format(at)}`;
+}
+
+/** ", back to Oct 3, 9:02 AM", or nothing for an instant not known. */
+const reachBackWords = (ms) => (ms === null ? "" : `, back to ${searchMomentWords(ms)}`);
+
+/**
+ * The stretch `reach` proves, as a clause after its count: "a complete history back to Oct 26, 3:14 PM
+ * (no gaps), plus 4 scattered older ones"; on All, "every top-level message back to …, and every reply
+ * in 20 of their 31 threads". For a reach that is `proven`.
+ *
+ * @param {HistoryReach} reach
+ */
+function reachClause(reach) {
+  const at = reach.from === null ? "" : searchMomentWords(reach.from);
+  const back = reach.start
+    ? `back to the first one${at ? ` (${at})` : ""}`
+    : `back to ${at || "the oldest loaded"} (no gaps)`;
+  const scattered = reach.scattered > 0
+    ? `, plus ${reach.scattered} scattered older one${reach.scattered === 1 ? "" : "s"}` : "";
+  if (!reach.topLevel) return `${reach.start ? "the complete history" : "a complete history"} ${back}${scattered}`;
+  const replies = reach.threads === 0 ? ""
+    : reach.full === reach.threads
+      ? `, and every reply in their ${reach.threads === 1 ? "thread" : `${reach.threads} threads`}`
+      : `, and every reply in ${reach.full} of their ${reach.threads} thread${reach.threads === 1 ? "" : "s"}`;
+  return `every top-level message ${back}${replies}${scattered}`;
+}
+
+/** The chat service the channel on screen is read from, as a sentence names it: "Slack", or "the chat service". */
+function serviceWords() {
+  const provider = providerOfChannel(el("discord-channel").value);
+  const name = provider && typeof provider.name === "string" ? provider.name.trim() : "";
+  return name || chatProviderName || "the chat service";
 }
 
 /** What the last walk in the column being worked on found, under its control, until the search changes. */
@@ -41235,36 +41479,66 @@ function countSearchWalk(walk) {
   walk.arrived = arrived;
 }
 
-/** What a walk that has ended says under its control, or "" for nothing: see the head of this section. */
-function searchWalkNote(walk, reason) {
-  // A walk stopped during the read of Main's own newest page (`walkCursorOwed`) has read that one.
-  const read = Math.max(1, walk.pages);
-  const pages = `${read} page${read === 1 ? "" : "s"}`;
-  const messages = `${walk.arrived} message${walk.arrived === 1 ? "" : "s"}`;
-  const day = oldestLoadedDay();
-  const back = day === null ? "" : `, back to ${searchDayWords(day)}`;
-  // Nothing matching anywhere in the list: the empty sentence says how far back that is.
-  const emptied = listEmptied();
-  if (reason === "stopped") {
-    if (walk.found > 0) return `Stopped. Found ${walk.found} in ${pages} (${messages}).`;
-    // Never silent over matches: what it read, or that it read nothing. `#262`, round two.
-    if (emptied) return "";
-    if (walk.read === 0) return "Stopped before any older page was read.";
-    return `Stopped. Nothing more in ${walk.read} page${walk.read === 1 ? "" : "s"} (${messages})${back}.`;
+/**
+ * What the control says while a walk fetches: how many older messages have come so far — "Fetching… 52
+ * older messages · Stop" — and never a count of pages, which the reader has no notion of (`#578
+ * search-status-clarity`). Short, as the control is one line on a phone; where they came from and how
+ * far back they reach is the note's, when the walk ends (`searchWalkNote`).
+ *
+ * @param {{arrived: number}} walk
+ */
+function searchWalkProgress(walk) {
+  return walk.arrived > 0
+    ? `Fetching… ${walk.arrived} older message${walk.arrived === 1 ? "" : "s"} · Stop` : "Fetching older messages… · Stop";
+}
+
+/** What a failed read of older messages said went wrong, for a sentence: the server's own words where it gave some. */
+function failureWords(error) {
+  const said = error && typeof error === "object" ? String(error.detail || error.message || "") : String(error || "");
+  return said.trim().replace(/[.\s]+$/, "") || "no reason was given";
+}
+
+/**
+ * What a walk that has ended says under its control: see the head of this section. Always something,
+ * `#578 search-status-clarity`: a press that said nothing over a list the search had emptied — the
+ * sentence there saying how far back, and not that anything had happened — was the owner's "I press it
+ * and it does nothing for a while and then shows THE SAME button".
+ *
+ * @param {any} walk
+ * @param {string} reason
+ * @param {unknown} [failure] what the read that failed threw, with `reason` "failed"
+ */
+function searchWalkNote(walk, reason, failure = null) {
+  const service = serviceWords();
+  const fetched = `${walk.arrived} older message${walk.arrived === 1 ? "" : "s"} fetched from ${service}` +
+    `${reason === "budget" ? ` in ${Math.round(SEARCH_OLDER_MS / 1000)} s` : ""}`;
+  const at = oldestLoadedMs();
+  const back = reachBackWords(at);
+  const matches = `${walk.found} more match${walk.found === 1 ? "" : "es"}`;
+  if (reason === "failed") {
+    const before = walk.arrived > 0 ? ` Before that, ${fetched}${back}.` : " Nothing older was searched.";
+    return `Could not fetch older messages from ${service}: ${failureWords(failure)}.${before} Press the button ` +
+      "again to retry.";
   }
   // A list saying older history exists, with no place to go on from: nothing could be read.
-  if (reason === "nowhere") return "Nothing older can be searched: the chat service gave no way further back.";
+  if (reason === "nowhere") return `Nothing older can be fetched: ${service} gave no way further back.`;
+  if (reason === "stopped" && walk.arrived === 0 && walk.found === 0 && walk.read === 0) {
+    return "Stopped before any older messages arrived.";
+  }
+  const lead = reason === "stopped" ? "Stopped. " : "";
   if (reason === "start") {
-    if (walk.found > 0) return `Reached the start of ${channelViewWords()}. Found ${walk.found}.`;
-    return emptied ? "" : `Reached the start of ${channelViewWords()}; nothing older matches.`;
+    const first = `${lead}Reached the start of ${channelViewWords()}${at === null ? "" : ` (${searchMomentWords(at)})`}`;
+    if (walk.arrived === 0) return `${first}.`;
+    return walk.found > 0 ? `${first}. Found ${matches} among ${fetched}.` : `${first}; none of the ${fetched} match.`;
   }
-  if (walk.found === 0) return emptied ? "" : `Nothing more in ${pages} (${messages})${back}.`;
-  if (reason === "budget") {
-    const seconds = Math.round(SEARCH_OLDER_MS / 1000);
-    // Within, not in: the walk stopped because the next page would have ended past the budget.
-    return `Found ${walk.found} within ${seconds} s (${pages}, ${messages})${back}.`;
+  // The chat service sent nothing older, and still says there is more: said, so the press is not taken
+  // for one that did nothing.
+  if (walk.arrived === 0) {
+    return `${lead}${sentenceStart(service)} sent nothing older this time, though it says older messages exist. ` +
+      "Press the button again to keep going.";
   }
-  return `Found ${walk.found} in ${pages} (${messages})${back}.`;
+  if (walk.found > 0) return `${lead}Found ${matches} among ${fetched}${back}.`;
+  return `${lead}None of the ${fetched}${back}${back ? "," : ""} match.`;
 }
 
 /**
@@ -41314,6 +41588,8 @@ function searchOlder() {
   renderJumpNewest();
   walk.promise = (async () => {
     let reason = "done";
+    /** @type {unknown} what the read that failed threw */
+    let failure = null;
     try {
       if (others.length > 0) {
         steps.pause();
@@ -41364,6 +41640,8 @@ function searchOlder() {
         if (!(walk.controller && walk.controller.signal.aborted)) walk.read += 1;
         if (!searchWalkHolds(walk, column) || walk.stopping) break;
         countSearchWalk(walk);
+        // How many have come so far, on the control (`searchWalkProgress`).
+        renderOlderControl();
         if (walk.found >= SEARCH_OLDER_HITS) break;
       }
       if (walk.stopping) reason = "stopped";
@@ -41373,7 +41651,9 @@ function searchOlder() {
         reason = walk.stopping ? "stopped" : "done";
       } else {
         reason = "failed";
-        // The failure itself is reported where every failed read is; this says the search stopped.
+        failure = error;
+        // The failure itself is reported where every failed read is; this says the search stopped, and
+        // the note under the control says why, until the search changes (`searchWalkNote`).
         setStatus("Could not search further back — try again.");
         throw error;
       }
@@ -41381,10 +41661,10 @@ function searchOlder() {
       if (column.searchWalk === walk) {
         // A page that landed as Stop was pressed is counted with the rest. A walk another list or
         // another search has taken over from says nothing there.
-        const holds = reason !== "failed" && searchWalkHolds(walk, column);
+        const holds = searchWalkHolds(walk, column);
         if (holds) countSearchWalk(walk);
         column.searchWalk = null;
-        const text = holds ? searchWalkNote(walk, reason) : "";
+        const text = holds ? searchWalkNote(walk, reason, failure) : "";
         column.searchNote = text ? { key: walk.key, text } : null;
         const write = () => {
           renderOlderControl();
@@ -41472,7 +41752,7 @@ function searchOlderFromField() {
 // its newest page is read first, behind the rows as a read of All behind Main is, and is not counted.
 // The bounds are the walk's above, in threads: at most `SEARCH_OLDER_PAGES` pages, within
 // `SEARCH_OLDER_MS`, ending at the end of the page that brings `SEARCH_OLDER_HITS` threads. Meanwhile
-// the control says "Searching replies… 2 of 5 · Stop", and a tap on it stops the read on the wire.
+// the control says "Fetching… 50 older messages · Stop", and a tap on it stops the read on the wire.
 //
 // WHAT IT FOUND is the threads whose cards the filters show now and did not when it started, among those
 // a page it read brought a message of: a thread arriving live meanwhile is shown, but is not the walk's
@@ -41518,11 +41798,12 @@ function repliesSearchOffered() {
     channelCanon.channel === String(el("discord-channel").value) && !channelCanon.scope && !allLoaded();
 }
 
-/** The day All's pages reach back to, as `dayKeyOf` says it, or null where that is not known. */
-function repliesDay() {
+/** The instant All's pages reach back to, or null where that is not known. */
+function repliesFloor() {
   const cover = allCover();
-  return cover && cover.more !== false && Number.isFinite(cover.floor) ? dayKeyOf(new Date(cover.floor)) : null;
+  return cover && cover.more !== false && Number.isFinite(cover.floor) ? cover.floor : null;
 }
+
 
 /** The cards the search and the read mode show now, by thread id. */
 const cardsFound = () => /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
@@ -41563,10 +41844,11 @@ function renderRepliesSearch() {
   const offered = walk !== null || repliesSearchOffered();
   let label = button.textContent;
   if (walk) {
-    label = walk.stopping ? "Stopping…" : `Searching replies… ${Math.max(1, walk.pages)} of ${SEARCH_OLDER_PAGES} · Stop`;
+    label = walk.stopping ? "Stopping…" : searchWalkProgress(walk);
   } else if (offered) {
-    const day = repliesDay();
-    label = day === null ? "Search thread replies" : `Search replies before ${searchDayWords(day)}`;
+    // `#578 search-status-clarity`. To the minute, as the columns' control says it.
+    const floor = repliesFloor();
+    label = floor === null ? "Search thread replies" : `Search replies before ${searchMomentWords(floor)}`;
   }
   const said = repliesNote ? repliesNote.text : "";
   const draw = () => {
@@ -41578,7 +41860,8 @@ function renderRepliesSearch() {
   setTextIfChanged(button, label);
   const disabled = walk ? walk.stopping : false;
   if (button.disabled !== disabled) button.disabled = disabled;
-  const name = offered && !walk ? `${label}: older pages of the whole channel, replies and all, a few at a time.` : "";
+  const name = offered && !walk ? `${label}: fetches up to ${SEARCH_OLDER_PAGES * DISCORD_PAGE_LIMIT} older messages ` +
+    `of the whole channel, replies and all, from ${serviceWords()}, and searches them here.` : "";
   if ((button.getAttribute("aria-label") || "") !== name) {
     if (name) button.setAttribute("aria-label", name);
     else button.removeAttribute("aria-label");
@@ -41623,8 +41906,8 @@ function foldRepliesPage(payload, newest, held, walk) {
  * What a cards' walk that has ended says under its control: see the head of this section. And after it,
  * the matching replies it read in threads with no card (`repliesUnlisted`).
  */
-function repliesWalkNote(walk, reason) {
-  const said = repliesEndNote(walk, reason);
+function repliesWalkNote(walk, reason, failure = null) {
+  const said = repliesEndNote(walk, reason, failure);
   const unlisted = repliesUnlisted(walk);
   if (unlisted === 0) return said;
   const more = olderThreadsToRead() ? ": Older threads… loads more" : "";
@@ -41639,26 +41922,40 @@ function repliesUnlisted(walk) {
   return [...walk.matched].filter((id) => !carded.has(id)).length;
 }
 
-/** How cards' walk `walk` ended, and what it found: see the head of this section. */
-function repliesEndNote(walk, reason) {
-  const pages = `${walk.read} page${walk.read === 1 ? "" : "s"}`;
-  const messages = `${walk.arrived} message${walk.arrived === 1 ? "" : "s"}`;
-  const span = walk.read > 0 ? `${pages} (${messages})` : "All's newest page";
+/**
+ * How cards' walk `walk` ended, and what it found: see the head of this section. In messages fetched and
+ * threads found, never pages (`#578 search-status-clarity`), and always something, a failure with why.
+ *
+ * @param {any} walk
+ * @param {string} reason
+ * @param {unknown} [failure] what the read that failed threw, with `reason` "failed"
+ */
+function repliesEndNote(walk, reason, failure = null) {
+  const service = serviceWords();
+  const fetched = `${walk.arrived} older message${walk.arrived === 1 ? "" : "s"} fetched from ${service}` +
+    `${reason === "budget" ? ` in ${Math.round(SEARCH_OLDER_MS / 1000)} s` : ""}`;
+  const span = walk.read > 0 ? fetched : `All's newest messages, fetched from ${service}`;
   const threads = `${walk.found} thread${walk.found === 1 ? "" : "s"}`;
-  const day = repliesDay();
-  const back = day === null ? "" : `, back to ${searchDayWords(day)}`;
+  const floor = repliesFloor();
+  const back = reachBackWords(floor);
+  if (reason === "failed") {
+    return `Could not fetch older messages from ${service}: ${failureWords(failure)}.` +
+      `${walk.read > 0 ? ` Before that, ${fetched}${back}.` : ""} Press the button again to retry.`;
+  }
   if (reason === "stopped") {
-    if (walk.read === 0 && walk.found === 0) return "Stopped before any older page was read.";
-    return walk.found > 0 ? `Stopped. Found ${threads} in ${span}.` : `Stopped. Nothing more in ${span}${back}.`;
+    if (walk.read === 0 && walk.found === 0) return "Stopped before any older messages arrived.";
+    return walk.found > 0 ? `Stopped. Found ${threads} in ${span}.` : `Stopped. No more threads match in ${span}${back}.`;
   }
   if (reason === "start") {
     return walk.found > 0 ? `Reached the start of this channel. Found ${threads}.` : "Reached the start of this channel; no more threads match.";
   }
   // A page saying older history exists, with no place to go on from.
-  const stuck = reason === "nowhere" ? " The chat service gave no way further back." : "";
-  if (walk.found === 0) return `Nothing more in ${span}${back}.${stuck}`;
-  // Within, not in: the walk stopped because the next page would have ended past the budget.
-  if (reason === "budget") return `Found ${threads} within ${Math.round(SEARCH_OLDER_MS / 1000)} s (${pages}, ${messages})${back}.`;
+  const stuck = reason === "nowhere" ? ` ${sentenceStart(service)} gave no way further back.` : "";
+  if (walk.read > 0 && walk.arrived === 0 && walk.found === 0) {
+    return `${sentenceStart(service)} sent nothing older this time, though it says older messages exist. Press the ` +
+      `button again to keep going.${stuck}`;
+  }
+  if (walk.found === 0) return `No more threads match in ${span}${back}.${stuck}`;
   return `Found ${threads} in ${span}${back}.${stuck}`;
 }
 
@@ -41715,6 +42012,8 @@ function searchReplies() {
   };
   walk.promise = (async () => {
     let reason = "done";
+    /** @type {unknown} what the read that failed threw */
+    let failure = null;
     try {
       if (others.length > 0) await Promise.all(others.map((one) => one.catch(() => {})));
       let last = 0;
@@ -41751,6 +42050,8 @@ function searchReplies() {
           walk.arrived += (payload.messages || []).length;
         }
         count();
+        // How many have come so far, on the control (`searchWalkProgress`).
+        renderRepliesSearch();
         if (walk.stopping || walk.found >= SEARCH_OLDER_HITS) break;
       }
       if (walk.stopping) reason = "stopped";
@@ -41760,17 +42061,19 @@ function searchReplies() {
         reason = walk.stopping ? "stopped" : "done";
       } else {
         reason = "failed";
-        // The failure itself is reported where every failed read is; this says the search stopped.
+        failure = error;
+        // The failure itself is reported where every failed read is; this says the search stopped, and
+        // the note under the control says why (`repliesEndNote`).
         setStatus("Could not search further back — try again.");
         throw error;
       }
     } finally {
       if (repliesWalk === walk) {
         // A walk another search, another list or another channel has taken over from says nothing there.
-        const holds = reason !== "failed" && repliesWalkHolds(walk);
+        const holds = repliesWalkHolds(walk);
         if (holds) count();
         repliesWalk = null;
-        const text = holds ? repliesWalkNote(walk, reason) : "";
+        const text = holds ? repliesWalkNote(walk, reason, failure) : "";
         repliesNote = text ? { key: walk.key, text } : null;
         renderRepliesSearch();
       }
@@ -41817,10 +42120,20 @@ function applyNewestPage(payload, saved = false) {
     const ids = idsOf(li);
     return ids.length > 0 ? ids[ids.length - 1] : li.getAttribute("data-id");
   };
+  const before = [...list.children].filter(isMessageRow);
   const kept =
     payload.has_more === true && oldest
       ? [...list.children].filter((li) => snowflakeOlder(newestOf(li), oldest))
       : [];
+  // `#578 search-status-clarity`. Every message row kept is older than the whole page: none of it
+  // reaches down into what was loaded, so messages may lie between that no read brought, and the rows
+  // kept are scattered below the page (`historyReach`). Once a gap, always one, until a fresh list.
+  const keptRows = kept.filter(isMessageRow);
+  if (keptRows.length === 0) plainGapFrom = null;
+  else if (keptRows.length === before.length && messages.length > 0) {
+    const from = Date.parse(String(messages[0].timestamp || ""));
+    if (Number.isFinite(from)) plainGapFrom = plainGapFrom === null ? from : Math.max(plainGapFrom, from);
+  }
   list.replaceChildren(...kept, ...glom(messages).map(discordNode));
   // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
   // ids are still in the set from the read that brought them, so a reset here would un-grey them.

@@ -52716,7 +52716,8 @@ test("ALL'S PAGE SHORT OF A THREAD'S REPLIES, as Slack's gives the newest of eac
     const body = JSON.parse(await answer.text());
     const kept = body.messages.filter((m) => m.id !== inboxId(8));
     return json(200, { ...body, messages: kept, returned: kept.length,
-      notice: "Flat view includes replies for at most 10 threads per page and the newest 50 replies of each; open a thread to read all of it.",
+      notice: "Some threads' replies are not in All: it brings the replies of the 10 most active threads among " +
+        "each 50 top-level messages, and the newest 50 of each; open a thread to read all of it.",
       dismissed: body.dismissed.filter((id) => id !== inboxId(8)) });
   };
   await inboxOnMain(page, messages);
@@ -52925,8 +52926,8 @@ test("DONE FROM THE PINNED LIST on Main: a pinned reply dealt with there counts 
 // --- `#222 unread-replies`, after the post-land review -------------------------------------------
 
 const SLACK_IDS = { a: "1700000000.000200", b: "1700000000.000500", c: "1700000000.000700" };
-const BOUND_NOTICE = "Flat view includes replies for at most 10 threads per page and the newest 50 replies of each; " +
-  "open a thread to read all of it.";
+const BOUND_NOTICE = "Some threads' replies are not in All: it brings the replies of the 10 most active threads among " +
+  "each 50 top-level messages, and the newest 50 of each; open a thread to read all of it.";
 
 /**
  * From now on All's newest page leaves out every reply of the threads `left` names, as Slack's does
@@ -64437,13 +64438,13 @@ test("`#262 search-load-older`: the count is in messages, so what is shown and t
  * read whose signal aborts meanwhile fails as a browser's does; `page.olderTakes` is how many
  * milliseconds of the page's clock each older read takes.
  */
-function searchHistory(page, { pages = 6, size = 4, content = (i) => `message ${i}`, threads = false } = {}) {
+function searchHistory(page, { pages = 6, size = 4, content = (i) => `message ${i}`, threads = false, spacing = 3 * 3600000 } = {}) {
   const newest = Date.UTC(2026, 7, 19, 12, 0, 0);
   const total = pages * size;
   const all = [];
   for (let i = 0; i < total; i += 1) {
     all.push(message({ id: String(8700000000000000000n + BigInt(i)), content: content(i),
-      timestamp: new Date(newest - (total - 1 - i) * 3 * 3600000).toISOString() }));
+      timestamp: new Date(newest - (total - 1 - i) * spacing).toISOString() }));
   }
   page.messages = all;
   page.pagesServed = [];
@@ -64509,6 +64510,14 @@ const searchDay = (page, timestamp) => {
   return `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][at.getMonth()]} ${at.getDate()}`;
 };
 
+/**
+ * An instant on this device as the search says it inside a sentence, to the minute: "today, 09:00 AM",
+ * "Aug 17, 03:00 PM". `#578 search-status-clarity`: the day alone did not move when a press brought more
+ * of the same day.
+ */
+const searchMoment = (page, timestamp) =>
+  `${searchDay(page, timestamp)}, ${new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" }).format(new Date(timestamp))}`;
+
 /** The rows of `list` the filters let through, by id. */
 const matchedIds = (page, list = "discord-log") =>
   page.el(list).children.filter((li) => !li.hidden && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
@@ -64541,13 +64550,16 @@ test("`#262 search-load-older`: while a filter chooses rows the step back offers
   assert.equal(chip.getAttribute("aria-label"), null);
   await search(page, "engine");
   await page.settle();
-  const day = searchDay(page, all[20].timestamp);
+  const day = searchMoment(page, all[20].timestamp);
   assert.equal(chip.textContent, `Search before ${day}`);
   assert.equal(chip.disabled, false);
-  assert.match(chip.getAttribute("aria-label"), /^Search before .+Enter in the search field does the same\.$/);
-  // The empty sentence says how far back the search has looked, in messages.
+  assert.match(chip.getAttribute("aria-label"),
+    /^Search before .+: fetches up to 250 older messages from Discord and searches them here\. Enter in the search field does the same\.$/);
+  // `#578 search-status-clarity`. The empty sentence says how many it searched, where, and how far
+  // back with no gaps: a list read back from the newest page by cursor is one stretch.
   assert.equal(page.el("search-empty").hidden, false);
-  assert.equal(page.el("search-empty").textContent, `Nothing in the 4 messages loaded so far, back to ${day}, matches that search.`);
+  assert.equal(page.el("search-empty").textContent,
+    `Searched 4 messages in this browser, a complete history back to ${day} (no gaps). None match.`);
   assert.equal(page.el("search-in-all").hidden, true, "Search All was offered where there are no threads");
   // Links alone is a filter choosing rows; so is whose messages.
   await search(page, "");
@@ -64580,9 +64592,10 @@ test("`#262 search-load-older`: a tap reads older pages until one brings three n
   await settleWalk(page);
   assert.equal(searchReads(page).length, 3, "the walk did not stop at the end of the page that brought the third match");
   assert.deepStrictEqual(matchedIds(page), [16, 17, 21, 25].map((i) => all[i].id));
-  const day = searchDay(page, all[16].timestamp);
+  const day = searchMoment(page, all[16].timestamp);
   assert.equal(page.el("search-older-note").hidden, false);
-  assert.equal(page.el("search-older-note").textContent, `Found 4 in 3 pages (12 messages), back to ${day}.`);
+  assert.equal(page.el("search-older-note").textContent,
+    `Found 4 more matches among 12 older messages fetched from Discord, back to ${day}.`);
   assert.match(HTML_CODE, /<p id="search-older-note" class="hint search-older-note" role="status" hidden><\/p>/);
   assert.match(HTML_CODE, /<p id="side-search-older-note" class="hint search-older-note" role="status" hidden><\/p>/);
   assert.equal(page.el("load-older").textContent, `Search before ${day}`);
@@ -64606,15 +64619,25 @@ test("`#262 search-load-older`: a walk reads at most five pages, and one that fi
   await page.el("load-older").click();
   await settleWalk(page);
   assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "the walk was not bounded");
-  assert.equal(page.el("search-older-note").hidden, true, "a walk that found nothing said so twice");
+  // `#578 search-status-clarity`. A press that found nothing says what it fetched, and from where: over a
+  // list the search had emptied it used to say nothing, and the owner took it for a press that did nothing.
+  const back = searchMoment(page, all[16].timestamp);
+  assert.equal(page.el("search-older-note").hidden, false, "a walk that found nothing said nothing");
+  assert.equal(page.el("search-older-note").textContent,
+    `None of the 20 older messages fetched from Discord, back to ${back}, match.`);
   assert.equal(page.el("search-empty").textContent,
-    `Nothing in the 24 messages loaded so far, back to ${searchDay(page, all[16].timestamp)}, matches that search.`);
+    `Searched 24 messages in this browser, a complete history back to ${back} (no gaps). None match.`);
+  assert.equal(page.el("load-older").textContent, `Search before ${back}`, "the control did not move back");
   // Another tap is another walk, from where this one stopped.
   await page.el("load-older").click();
   await settleWalk(page);
   assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES + 4, "the second tap did not walk on to the start");
   assert.equal(page.el("load-older").hidden, true);
-  assert.equal(page.el("search-empty").textContent, "Nothing in this channel matches that search — all of it is loaded.");
+  const first = searchMoment(page, all[0].timestamp);
+  assert.equal(page.el("search-older-note").textContent,
+    `Reached the start of this channel (${first}); none of the 16 older messages fetched from Discord match.`);
+  assert.equal(page.el("search-empty").textContent,
+    `Searched all 40 messages of this channel in this browser, back to the first one (${first}). None match.`);
 });
 
 test("`#262 search-load-older`: the walk starts no page its last page's time says would end past fifteen seconds", async () => {
@@ -64626,7 +64649,7 @@ test("`#262 search-load-older`: the walk starts no page its last page's time say
   await settleWalk(page);
   assert.equal(searchReads(page).length, 2, "a page that would end past the budget was started");
   assert.equal(page.el("search-older-note").textContent,
-    `Found 1 within 15 s (2 pages, 8 messages), back to ${searchDay(page, all[28].timestamp)}.`);
+    `Found 1 more match among 8 older messages fetched from Discord in 15 s, back to ${searchMoment(page, all[28].timestamp)}.`);
 });
 
 test("`#262 search-load-older`: Enter in the search field walks back where the step back offers it, and not while composing", async () => {
@@ -64656,12 +64679,12 @@ test("`#262 search-load-older`: Stop aborts the read on the wire, says Stopping�
   page.olderHold = searchHold();
   void chip.click();
   await page.settle();
-  assert.equal(chip.textContent, "Searching… 1 of 5 · Stop");
+  assert.equal(chip.textContent, "Fetching older messages… · Stop");
   assert.equal(chip.disabled, false);
   // A double tap does not stop the walk it started.
   void chip.click();
   await page.settle();
-  assert.equal(chip.textContent, "Searching… 1 of 5 · Stop", "a second tap at once stopped the walk");
+  assert.equal(chip.textContent, "Fetching older messages… · Stop", "a second tap at once stopped the walk");
   page.setClock(page.clock() + SEARCH_OLDER_TAP_MS);
   void chip.click();
   assert.equal(chip.textContent, "Stopping…");
@@ -64672,7 +64695,7 @@ test("`#262 search-load-older`: Stop aborts the read on the wire, says Stopping�
   assert.equal(page.el("error").hidden, true, "Stop was reported as a failure");
   assert.match(chip.textContent, /^Search before /);
   assert.equal(chip.disabled, false);
-  assert.equal(page.el("search-older-note").hidden, true, "a stopped walk that found nothing said something");
+  assert.equal(page.el("search-older-note").textContent, "Stopped before any older messages arrived.");
 });
 
 test("`#262 search-load-older`: a message arriving mid-walk that matches neither stops it nor counts as found", async () => {
@@ -64691,7 +64714,7 @@ test("`#262 search-load-older`: a message arriving mid-walk that matches neither
   await settleWalk(page);
   assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "a live match stopped the walk, or one older match did");
   assert.equal(page.el("search-older-note").textContent,
-    `Found 1 in 5 pages (20 messages), back to ${searchDay(page, all[16].timestamp)}.`);
+    `Found 1 more match among 20 older messages fetched from Discord, back to ${searchMoment(page, all[16].timestamp)}.`);
 });
 
 test("`#262 search-load-older`: the step back holds still while the matches open under it, behind a line counting what they skip", async () => {
@@ -64802,11 +64825,11 @@ test("`#262 search-load-older`: in two columns the right column's thread walks i
   assert.equal(page.el("search-in-all").hidden, true, "Search All was offered in two columns");
   const chip = page.el("side-older");
   assert.equal(chip.hidden, false);
-  assert.equal(chip.textContent, `Search replies before ${searchDay(page, all[21].timestamp)}`);
+  assert.equal(chip.textContent, `Search replies before ${searchMoment(page, all[21].timestamp)}`);
   await chip.click();
   await settleWalk(page);
   assert.deepStrictEqual(matchedIds(page, "side-log"), [all[3].id], "the thread's walk did not find its older reply");
-  assert.match(page.el("side-search-older-note").textContent, /^Found 1 in \d pages \(\d+ messages\)/);
+  assert.match(page.el("side-search-older-note").textContent, /^Found 1 more match among \d+ older messages fetched from /);
   assert.equal(page.el("search-older-note").hidden, true, "the left column said what the right one found");
   // Enter walks the column that holds the keys: the left, given them back by [, which has nothing older
   // to search. (The card's replies button handed them to the right, `#298 thread-card-header`.)
@@ -64826,7 +64849,7 @@ test("`#262 search-load-older`: closing the right column's thread, or leaving tw
     const hold = page.olderHold;
     void page.el("side-older").click();
     await page.settle();
-    assert.equal(page.el("side-older").textContent, "Searching… 1 of 5 · Stop");
+    assert.equal(page.el("side-older").textContent, "Fetching older messages… · Stop");
     if (end === "close") await page.el("side-close").click();
     else await page.setDesk(false);
     await page.settle();
@@ -64854,7 +64877,8 @@ test("`#262 search-load-older`: Hide read steps aside under the search, so a wal
   await settleWalk(page);
   assert.deepStrictEqual(matchedIds(page), [all[17].id], "the walk under Hide read did not find a read match");
   assert.equal(rowWithId(page, all[17].id).getAttribute("data-archived"), "true");
-  assert.equal(page.el("search-older-note").textContent, `Found 1 in 5 pages (20 messages), back to ${searchDay(page, all[8].timestamp)}.`);
+  assert.equal(page.el("search-older-note").textContent,
+    `Found 1 more match among 20 older messages fetched from Discord, back to ${searchMoment(page, all[8].timestamp)}.`);
   // Closed, the search gives the list back to Hide read.
   await page.el("search-toggle").click();
   await page.settle();
@@ -64923,7 +64947,7 @@ test("`#262 search-load-older`: under a filter the scroll's own step back gives 
   assert.equal(page.el("load-older").disabled, false, "the step back was greyed out under the scroll's step");
   void page.el("load-older").click();
   await page.settle();
-  assert.equal(page.el("load-older").textContent, "Searching… 1 of 5 · Stop");
+  assert.equal(page.el("load-older").textContent, "Fetching older messages… · Stop");
   hold.open();
   await settleWalk(page);
   assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "the scroll's step was not the walk's first page");
@@ -64959,7 +64983,7 @@ test("`#262 search-load-older`: in one column on Main a search nothing matches o
   await page.settle();
   assert.deepStrictEqual(matchedIds(page), []);
   assert.equal(page.el("search-empty").hidden, false);
-  assert.match(page.el("search-empty").textContent, /^Nothing in .+ matches that search.* Thread replies are not in Main\.$/);
+  assert.match(page.el("search-empty").textContent, /^Searched .+ in this browser.+ None match\. Thread replies are not in Main\.$/);
   const all = page.el("search-in-all");
   assert.equal(all.hidden, false, "Main offered no way to the replies");
   assert.equal(all.textContent, "Search All — thread replies too");
@@ -64995,7 +65019,11 @@ test("`#262 search-load-older`: a page that fails ends the walk, said where ever
   assert.equal(page.el("error").hidden, false, "the failed page was not reported");
   assert.equal(page.el("status").textContent, "Could not search further back — try again.");
   assert.match(page.el("load-older").textContent, /^Search before /);
-  assert.equal(page.el("search-older-note").hidden, true);
+  // `#578 search-status-clarity`. And under the control, until the search changes, with the reason.
+  assert.equal(page.el("search-older-note").hidden, false);
+  assert.match(page.el("search-older-note").textContent, new RegExp("^Could not fetch older messages from Discord: " +
+    "the provider returned HTTP 502\\. Before that, 4 older messages fetched from Discord, back to .+\\. " +
+    "Press the button again to retry\\.$"));
 });
 
 test("`#262 search-load-older`: a finger on the glass holds the walk's next page until it lifts", async () => {
@@ -65120,7 +65148,7 @@ async function scrollingFromWalk(threads) {
   const hold = page.olderHold;
   void chip.click();
   await page.settle();
-  assert.equal(chip.textContent, "Searching… 1 of 5 · Stop");
+  assert.equal(chip.textContent, "Fetching older messages… · Stop");
   // The reader scrolls down the matches while the page is read: the step back goes off screen.
   area.scrollTop = 600;
   await area.dispatch("scroll");
@@ -65159,7 +65187,7 @@ test("`#262 search-load-older`: the sentence over a list the search emptied is w
   await page.settle();
   const sentence = page.el("search-empty");
   const before = sentence.textContent;
-  assert.match(before, /^Nothing in the 4 messages loaded so far/);
+  assert.match(before, /^Searched 4 messages in this browser/);
   // Every write of the live region, from here on.
   let text = before;
   const writes = [];
@@ -65184,7 +65212,7 @@ test("`#262 search-load-older`: the sentence over a list the search emptied is w
   second.open();
   await settleWalk(page);
   assert.deepStrictEqual(writes,
-    [`Nothing in the 24 messages loaded so far, back to ${searchDay(page, all[16].timestamp)}, matches that search.`],
+    [`Searched 24 messages in this browser, a complete history back to ${searchMoment(page, all[16].timestamp)} (no gaps). None match.`],
     "the sentence was not written exactly once, when the walk ended");
 });
 
@@ -65208,11 +65236,11 @@ test("`#262 search-load-older`: a walk in the other column ends this one, and re
   page.olderHold = hold;
   void left.click();
   await page.settle();
-  assert.equal(left.textContent, "Searching… 1 of 5 · Stop");
+  assert.equal(left.textContent, "Fetching older messages… · Stop");
   void right.click();
   for (let i = 0; i < 8; i += 1) await page.settle();
   assert.match(left.textContent, /^Search before /, "the left column's walk went on beside the right's");
-  assert.equal(right.textContent, "Searching… 1 of 5 · Stop");
+  assert.equal(right.textContent, "Fetching older messages… · Stop");
   assert.deepStrictEqual(searchReads(page).map(view), ["main"], "the right column read while the left column's read was on the wire");
   hold.open();
   await settleWalk(page);
@@ -65237,10 +65265,10 @@ test("`#262 search-load-older`: a reply's jump ends the walk, aborting its read,
     page.olderHold = hold;
     void page.el("load-older").click();
     await page.settle();
-    assert.equal(page.el("load-older").textContent, "Searching… 1 of 5 · Stop");
+    assert.equal(page.el("load-older").textContent, "Fetching older messages… · Stop");
     await tapArrow(page, rowWithId(page, all[39].id));
     assert.equal(page.olderOptions[0].signal.aborted, true, `threads ${threads}: the jump left the walk's read on the wire`);
-    assert.doesNotMatch(page.el("load-older").textContent, /^Searching/, `threads ${threads}: the walk went on under the jump`);
+    assert.doesNotMatch(page.el("load-older").textContent, /^Fetching/, `threads ${threads}: the walk went on under the jump`);
     // The step the walk had on the wire was the jump's first, and its abort no failure of the jump's.
     assert.equal(rowWithId(page, all[30].id).getAttribute("data-landed"), "true", `threads ${threads}: the jump did not arrive`);
     assert.match(statusText(page), /Here is the message it answers/);
@@ -65274,7 +65302,7 @@ test("`#262 search-load-older`: a filter's walk back to an old pin ends a walk i
   page.olderHold = hold;
   void page.el("side-older").click();
   await page.settle();
-  assert.equal(page.el("side-older").textContent, "Searching… 1 of 5 · Stop");
+  assert.equal(page.el("side-older").textContent, "Fetching older messages… · Stop");
   // Pinned off: the left column walks back to the pin, and one walk at a time is on the page.
   await page.el("pinned-filter").click();
   await page.settle();
@@ -65300,7 +65328,8 @@ test("`#262 search-load-older`: Main drawn from All reads its own newest page fi
   const reads = page.timelineCalls.slice(from).map((call) => [viewOf(call), beforeOf(call) !== null]);
   assert.deepStrictEqual(reads, [["main", false], ...Array(SEARCH_OLDER_PAGES).fill(["main", true])],
     "the walk did not read Main's newest page and then five older ones");
-  assert.match(page.el("search-empty").textContent, /^Nothing in the \d+ messages loaded so far/);
+  assert.match(page.el("search-empty").textContent,
+    /^Searched \d+ messages in this browser, a complete history back to .+ \(no gaps\)\. None match\. Thread replies are not in Main\.$/);
 });
 
 // --- searching the threads' replies further back ------------------------------------------------------
@@ -65435,8 +65464,9 @@ test("`#262 search-load-older`: one column on All walks back to three older repl
   const control = repliesControl(page);
   assert.ok(control && !control.hidden, "two columns offer no way to search the threads' older replies");
   const floor = all.length - 4;
-  assert.equal(control.textContent, `Search replies before ${searchDay(page, all[floor].timestamp)}`);
-  assert.match(control.getAttribute("aria-label"), /^Search replies before .+: older pages of the whole channel, replies and all, a few at a time\.$/);
+  assert.equal(control.textContent, `Search replies before ${searchMoment(page, all[floor].timestamp)}`);
+  assert.match(control.getAttribute("aria-label"),
+    /^Search replies before .+: fetches up to 250 older messages of the whole channel, replies and all, from Discord, and searches them here\.$/);
   await control.click();
   await settleWalk(page);
   // It read All's older pages from All's own cursor, and stopped at the end of the page bringing the third.
@@ -65444,9 +65474,9 @@ test("`#262 search-load-older`: one column on All walks back to three older repl
     [floor, floor - 4, floor - 8].map((i) => all[i].id), "the walk did not read All back three pages from its cursor");
   assert.deepStrictEqual(shownCards(page).sort(), [3, 4, 5].map(historyThread), "the cards did not find the three threads");
   for (const t of [3, 4, 5]) assert.equal(replyHint(page, historyThread(t)), "in replies");
-  const back = searchDay(page, all[floor - 12].timestamp);
+  const back = searchMoment(page, all[floor - 12].timestamp);
   assert.equal(page.el("side-replies-note").hidden, false);
-  assert.equal(page.el("side-replies-note").textContent, `Found 3 threads in 3 pages (12 messages), back to ${back}.`);
+  assert.equal(page.el("side-replies-note").textContent, `Found 3 threads in 12 older messages fetched from Discord, back to ${back}.`);
   assert.equal(control.textContent, `Search replies before ${back}`, "the control does not say how far back the next walk starts");
   assert.equal(page.el("side-list-state").hidden, true);
   assert.match(HTML_CODE, /<button id="side-search-replies" class="chip" type="button" hidden>/);
@@ -65468,8 +65498,8 @@ test("`#262 search-load-older`: the cards' walk reads at most five pages, and a 
   await settleWalk(page);
   const older = () => allReads(page).filter((before) => before !== null);
   assert.equal(older().length, SEARCH_OLDER_PAGES, "the cards' walk was not bounded");
-  const back = searchDay(page, all[all.length - 4 - 20].timestamp);
-  assert.equal(page.el("side-replies-note").textContent, `Nothing more in 5 pages (20 messages), back to ${back}.`);
+  const back = searchMoment(page, all[all.length - 4 - 20].timestamp);
+  assert.equal(page.el("side-replies-note").textContent, `No more threads match in 20 older messages fetched from Discord, back to ${back}.`);
   await repliesControl(page).click();
   await settleWalk(page);
   assert.equal(older().length, SEARCH_OLDER_PAGES + 3, "the second press did not walk on to the start");
@@ -65504,7 +65534,7 @@ test("`#262 search-load-older`: the cards' walk starts no page its last page's t
   await settleWalk(page);
   assert.equal(allReads(page).filter((before) => before !== null).length, 2, "a page that would end past the budget was started");
   assert.equal(page.el("side-replies-note").textContent,
-    `Found 1 thread within 15 s (2 pages, 8 messages), back to ${searchDay(page, all[all.length - 12].timestamp)}.`);
+    `Found 1 thread in 8 older messages fetched from Discord in 15 s, back to ${searchMoment(page, all[all.length - 12].timestamp)}.`);
 });
 
 test("`#262 search-load-older`: Stop aborts the cards' read on the wire, and a walk stopped with nothing found says so", async () => {
@@ -65515,7 +65545,7 @@ test("`#262 search-load-older`: Stop aborts the cards' read on the wire, and a w
   const hold = page.olderHold;
   void repliesControl(page).click();
   await page.settle();
-  assert.equal(repliesControl(page).textContent, "Searching replies… 1 of 5 · Stop");
+  assert.equal(repliesControl(page).textContent, "Fetching older messages… · Stop");
   // A second tap at once is the same tap again.
   await repliesControl(page).click();
   await page.settle();
@@ -65528,7 +65558,7 @@ test("`#262 search-load-older`: Stop aborts the cards' read on the wire, and a w
   await settleWalk(page);
   assert.equal(page.olderOptions.length, 1, "the walk read on after Stop");
   assert.equal(page.el("side-replies-note").hidden, false, "a walk stopped with nothing found said nothing");
-  assert.equal(page.el("side-replies-note").textContent, "Stopped before any older page was read.");
+  assert.equal(page.el("side-replies-note").textContent, "Stopped before any older messages arrived.");
   assert.equal(page.el("error").hidden, true, "Stop was reported as a failure");
   assert.match(repliesControl(page).textContent, /^Search replies before /);
 });
@@ -65604,7 +65634,7 @@ test("`#262 search-load-older`: over the thread list on a phone, Enter in the se
     .filter((query) => query.get("before") !== null).map((query) => query.get("view"));
   assert.deepStrictEqual(views, ["flat", "flat", "flat"], "Enter over the thread list did not walk All's replies");
   assert.deepStrictEqual(shownCards(page).sort(), [3, 4, 5].map(historyThread));
-  assert.match(page.el("side-replies-note").textContent, /^Found 3 threads in 3 pages \(12 messages\), back to /);
+  assert.match(page.el("side-replies-note").textContent, /^Found 3 threads in 12 older messages fetched from Discord, back to /);
   assert.equal(page.el("search-older-note").hidden, true, "Main, behind the list, was walked");
   void all;
 });
@@ -65647,7 +65677,7 @@ test("`#262 search-load-older`: with All never read, the cards' walk reads All's
   const reads = page.pagesServed.slice(from).map((path) => new URL(path, "http://fixture.test").searchParams)
     .filter((query) => query.get("view") === "flat").map((query) => query.get("before") !== null);
   assert.deepStrictEqual(reads, [false, true, true, true], "the walk did not read All's newest page and then three older ones");
-  assert.match(page.el("side-replies-note").textContent, /^Found 3 threads in 3 pages \(12 messages\)/);
+  assert.match(page.el("side-replies-note").textContent, /^Found 3 threads in 12 older messages fetched from Discord, back to /);
 });
 
 test("`#262 search-load-older`: a thread arriving live mid-walk whose first message matches is shown, but not counted as found by the cards' walk", async () => {
@@ -65675,7 +65705,7 @@ test("`#262 search-load-older`: a thread arriving live mid-walk whose first mess
   assert.deepStrictEqual(allReads(page).filter((before) => before !== null), [floor, floor - 4, floor - 8].map((i) => all[i].id),
     "a live match ended the cards' walk early");
   assert.equal(page.el("side-replies-note").textContent,
-    `Found 3 threads in 3 pages (12 messages), back to ${searchDay(page, all[floor - 12].timestamp)}.`);
+    `Found 3 threads in 12 older messages fetched from Discord, back to ${searchMoment(page, all[floor - 12].timestamp)}.`);
 });
 
 test("`#262 search-load-older`: a matching reply whose thread has no card is said, not passed over in \"Nothing more\"", async () => {
@@ -65702,7 +65732,7 @@ test("`#262 search-load-older`: a matching reply whose thread has no card is sai
   assert.ok(page.messages.includes(reply) && allReads(page).includes(all[33].id), "the walk did not read past the reply");
   assert.deepStrictEqual(shownCards(page), []);
   assert.equal(page.el("side-replies-note").textContent,
-    `Nothing more in 5 pages (20 messages), back to ${searchDay(page, all[17].timestamp)}. ` +
+    `No more threads match in 20 older messages fetched from Discord, back to ${searchMoment(page, all[17].timestamp)}. ` +
     "1 more thread with a matching reply is not among the threads loaded.");
 });
 
@@ -65722,6 +65752,10 @@ test("`#262 search-load-older`: a page of the cards' walk that fails ends it, sa
   assert.equal(page.el("error").hidden, false, "the failed page was not reported");
   assert.equal(page.el("status").textContent, "Could not search further back — try again.");
   assert.match(repliesControl(page).textContent, /^Search replies before /);
+  // `#578 search-status-clarity`. And under the control, with the reason.
+  assert.match(page.el("side-replies-note").textContent, new RegExp("^Could not fetch older messages from Discord: " +
+    "the provider returned HTTP 502\\. Before that, 4 older messages fetched from Discord, back to .+\\. " +
+    "Press the button again to retry\\.$"));
 });
 
 test("`#262 search-load-older`: Main's walk stopped with nothing more found says so, rather than nothing", async () => {
@@ -65745,7 +65779,7 @@ test("`#262 search-load-older`: Main's walk stopped with nothing more found says
   };
   void page.el("load-older").click();
   await page.settle();
-  assert.equal(page.el("load-older").textContent, "Searching… 2 of 5 · Stop");
+  assert.equal(page.el("load-older").textContent, "Fetching… 4 older messages · Stop");
   page.setClock(page.clock() + SEARCH_OLDER_TAP_MS);
   await page.el("load-older").click();
   hold.open();
@@ -65753,7 +65787,7 @@ test("`#262 search-load-older`: Main's walk stopped with nothing more found says
   assert.equal(reads, 2);
   assert.equal(page.el("search-older-note").hidden, false, "a walk stopped with nothing found said nothing");
   assert.equal(page.el("search-older-note").textContent,
-    `Stopped. Nothing more in 1 page (4 messages), back to ${searchDay(page, all[32].timestamp)}.`);
+    `Stopped. None of the 4 older messages fetched from Discord, back to ${searchMoment(page, all[32].timestamp)}, match.`);
   // Stopped before any page landed, it says that.
   const second = await searchPage({ pages: 10, content: (i) => (i === 38 ? "engine" : `message ${i}`) });
   second.page.enableAbort();
@@ -65765,7 +65799,151 @@ test("`#262 search-load-older`: Main's walk stopped with nothing more found says
   second.page.setClock(second.page.clock() + SEARCH_OLDER_TAP_MS);
   await second.page.el("load-older").click();
   await settleWalk(second.page);
-  assert.equal(second.page.el("search-older-note").textContent, "Stopped before any older page was read.");
+  assert.equal(second.page.el("search-older-note").textContent, "Stopped before any older messages arrived.");
+});
+
+// --- `#578 search-status-clarity` --------------------------------------------------------------------
+//
+// The owner, 2026-10-27: "nothing in the search loading view makes sense ... it shows me no hits and a
+// button 'Search before October 25'. I press it and it does nothing for a while and then shows THE SAME
+// button." A press over a busy channel brought fifty more messages of the same day, the control named the
+// day alone, and a walk that found nothing over a list the search had emptied said nothing at all. And
+// "Nothing in the 82 messages loaded so far" did not say whether those were a dense history or a sparse
+// set, nor "Searching… 1 of 5" one of five what.
+
+test("`#578 search-status-clarity`: every press that brings older messages of the same day moves the control, to the minute", async () => {
+  for (const threads of [false, true]) {
+    // Forty messages a minute apart: every one of them on the same day.
+    const { page, all } = await searchPage({ pages: 10, spacing: 60000, threads });
+    await search(page, "engine");
+    await page.settle();
+    const chip = page.el("load-older");
+    const at = (i) => searchMoment(page, all[i].timestamp);
+    assert.equal(searchDay(page, all[0].timestamp), searchDay(page, all[39].timestamp), "the premise: one day");
+    assert.equal(chip.textContent, `Search before ${at(36)}`);
+    await chip.click();
+    await settleWalk(page);
+    assert.equal(chip.textContent, `Search before ${at(16)}`, `threads ${threads}: the press did not move the control`);
+    assert.equal(page.el("search-older-note").textContent,
+      `None of the 20 older messages fetched from Discord, back to ${at(16)}, match.`);
+    assert.equal(page.el("search-empty").textContent,
+      `Searched 24 messages in this browser, a complete history back to ${at(16)} (no gaps). None match.`);
+    // The next press goes on from there, to the start.
+    await chip.click();
+    await settleWalk(page);
+    assert.equal(chip.hidden, true);
+    assert.match(page.el("search-older-note").textContent, /^Reached the start of /);
+  }
+});
+
+test("`#578 search-status-clarity`: a step back that brings nothing older says so, and the next press walks on", async () => {
+  for (const threads of [false, true]) {
+    const { page, all } = await searchPage({ pages: 10, threads });
+    // The server's walk below a page it served from its cache found nothing older yet: an empty page, a
+    // cursor to go on from. Five of those, then the history as it is.
+    const route = threads ? "timeline" : "channelPage";
+    const serve = page[route];
+    let empty = SEARCH_OLDER_PAGES;
+    page[route] = async (path, options) => {
+      const before = /[?&]before=([^&]+)/.exec(String(path));
+      if (!before || empty === 0) return serve(path, options);
+      empty -= 1;
+      page.pagesServed.push(String(path));
+      const cursor = decodeURIComponent(before[1]);
+      return threads
+        ? json(200, timelineAnswer({ view: "flat", messages: [], has_more: true, next_before: cursor }))
+        : json(200, { channel: CHANNEL, messages: [], returned: 0, limit: 4, has_more: true, next_before: cursor, dismissed: [] });
+    };
+    await search(page, "engine");
+    await page.settle();
+    const chip = page.el("load-older");
+    const before = chip.textContent;
+    await chip.click();
+    await settleWalk(page);
+    assert.equal(page.el("search-older-note").textContent,
+      "Discord sent nothing older this time, though it says older messages exist. Press the button again to keep going.",
+      `threads ${threads}: a press that brought nothing said nothing`);
+    assert.equal(chip.textContent, before, `threads ${threads}: the control moved over nothing`);
+    assert.equal(page.el("search-empty").textContent,
+      `Searched 4 messages in this browser, a complete history back to ${searchMoment(page, all[36].timestamp)} (no gaps). None match.`,
+      `threads ${threads}: an empty step back moved the stretch`);
+    await chip.click();
+    await settleWalk(page);
+    assert.equal(chip.textContent, `Search before ${searchMoment(page, all[16].timestamp)}`, `threads ${threads}: the next press stood still`);
+  }
+});
+
+test("`#578 search-status-clarity`: a newest read that reaches none of what is loaded leaves it scattered below, and says how much", async () => {
+  for (const threads of [false, true]) {
+    const { page, all } = await searchPage({ pages: 10, threads });
+    await search(page, "engine");
+    await page.settle();
+    await page.el("load-older").click();
+    await settleWalk(page);
+    // Six arrive while the page is away, more than a read holds: its next newest read is the newest four.
+    const later = Date.parse(all[all.length - 1].timestamp);
+    for (let i = 1; i <= 6; i += 1) {
+      all.push(message({ id: String(8700000000000000100n + BigInt(i)), content: `later ${i}`,
+        timestamp: new Date(later + i * 60000).toISOString() }));
+    }
+    await reReadChannel(page);
+    await page.settle();
+    assert.equal(page.el("search-empty").textContent,
+      `Searched 4 messages in this browser, a complete history back to ${searchMoment(page, all[all.length - 4].timestamp)} ` +
+      "(no gaps), plus 24 scattered older ones. None match.", `threads ${threads}: the gap was not said`);
+  }
+});
+
+test("`#578 search-status-clarity`: All says its top-level messages and, of their threads, how many it holds every reply of", async () => {
+  // Four threads of one reply each; All's newest page holds three of them whole, and older history.
+  const page = newPage();
+  const all = threadsHistory(page, { threads: 4, replies: 1, size: 6 });
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  await search(page, "engine");
+  await page.settle();
+  assert.equal(page.el("search-empty").textContent,
+    `Searched 6 messages in this browser: every top-level message back to ${searchMoment(page, all[2].timestamp)} (no gaps), ` +
+    "and every reply in their 3 threads. None match.");
+  // Bounded, as Slack's is: a page leaving out one thread's replies. All reaches the start, but is not whole.
+  const bounded = newPage();
+  const held = threadsHistory(bounded, { threads: 3, replies: 2, size: 50 });
+  allLeavingOut(bounded, [historyThread(1)]);
+  await signIn(bounded);
+  await showDiscord(bounded, bounded.messages);
+  assert.equal(channelSummaryText(bounded), "lead team — back to the first message; 1 thread here has replies not loaded");
+  assert.equal(bounded.el("timeline-notice").textContent,
+    "1 thread here has replies All has not loaded; open a thread to read all of it.");
+  await search(bounded, "engine");
+  await bounded.settle();
+  assert.equal(bounded.el("search-empty").textContent,
+    `Searched 7 messages in this browser: every top-level message back to the first one (${searchMoment(bounded, held[0].timestamp)}), ` +
+    "and every reply in 2 of their 3 threads. None match.");
+});
+
+test("`#578 search-status-clarity`: rows saved on this device claim no stretch until a read checks them", async () => {
+  const first = newPage();
+  const all = searchHistory(first, { threads: true, pages: 3 });
+  await signIn(first);
+  await showDiscord(first, first.messages);
+  let timeline = null;
+  const page = reloadPage(first.storage, (p) => {
+    searchHistory(p, { threads: true, pages: 3 });
+    timeline = gate(p.timeline);
+    p.timeline = timeline.respond;
+  });
+  await page.settle();
+  await search(page, "engine");
+  await page.settle();
+  const back = searchMoment(page, all[8].timestamp);
+  assert.equal(page.el("search-empty").textContent,
+    `Searched 4 messages saved on this device, back to ${back}, not yet checked for gaps. None match.`);
+  timeline.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.el("search-empty").textContent,
+    `Searched 4 messages in this browser, a complete history back to ${back} (no gaps). None match.`,
+    "a read that joined what was saved did not vouch for it");
 });
 
 // --- `#271 settings-groups` -----------------------------------------------------------------------
