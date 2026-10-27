@@ -345,7 +345,10 @@ pub fn initialize<A: ManagedApi + ?Sized>(
     let configuration = BridgeConfiguration::load_private(configuration_path)?;
     let inventory = crate::plugins::discover();
     let _pinned = chat_runtime::select_plugin(&inventory, &configuration)?;
-    let _target = manager.pane_info(&configuration.agent_name)?;
+    // A headless coordinator has no pane; `chat run` delivers to its queue instead.
+    if !manager.is_headless(&configuration.agent_name)? {
+        let _target = manager.pane_info(&configuration.agent_name)?;
+    }
     validate_service_outbound(&configuration)?;
     let _outbound = configuration.outbound_transport()?;
     let state = BridgeState::initialize(state_root, configuration)?;
@@ -1000,16 +1003,32 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     settings: RunSettings,
 ) -> Result<Value, ChatServiceError> {
     let offer_reply_command = settings.offer_reply_command;
-    let state = BridgeState::open(state_root)?
+    let state = BridgeState::open(state_root)?;
+    // A headless coordinator has no screen to read or composer to type into: its requests go to
+    // its queue, which its wrapper drains, and it replies only through `chat reply` (#594
+    // headless-slack-trial).
+    let headless = manager.is_headless(&state.config().agent_name)?;
+    let state = state
         .with_ignored_text_prefixes(settings.ignored_text_prefixes)?
-        .with_reply_command_offered(offer_reply_command);
+        .with_reply_command_offered(offer_reply_command)
+        .with_command_only_replies(headless);
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
+    if headless {
+        service_log(format!(
+            "agentctl: {} is headless: requests go to its queue, replies only through \
+             `agentctl chat reply`; reply reminders and the stale composer guard are off",
+            state.config().agent_name
+        ));
+    }
     let stale_composer = match settings.stale_composer_clear_after {
-        Some(window) => Some(stale_composer_guard(state_root, state.config(), window)?),
-        None => None,
+        Some(window) if !headless => {
+            Some(stale_composer_guard(state_root, state.config(), window)?)
+        }
+        _ => None,
     };
     let reminders = match &settings.reply_reminders {
+        Some(_) if headless => None,
         Some(reminders) if state.config().outbound_enabled => {
             service_log(ReplyReminders::describe(reminders));
             Some(ReplyReminders::new(reminders))
@@ -1066,7 +1085,9 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     // Preflight owns no generation: release its descriptors and captured environment values
     // before the provider worker independently pins and launches the real generation.
     drop(pinned);
-    let _target = manager.pane_info(&state.config().agent_name)?;
+    if !headless {
+        let _target = manager.pane_info(&state.config().agent_name)?;
+    }
     let _lease = state.acquire_runner_lease()?;
 
     if let Some(queue) = ack_queue.as_ref() {
@@ -4305,9 +4326,24 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let result = loop {
         let started = Instant::now();
         health.pass_started(started);
-        let result = owner_loop_end(
-            stop,
-            owner_loop_pass(
+        // A headless coordinator has no pane for the pane loop to read. The prompts' reply
+        // instructions are chosen at startup, so a coordinator restarted in the other mode needs
+        // `chat run` restarted too.
+        let pass = match manager.is_headless(&state.config().agent_name) {
+            Err(error) => Err(error.into()),
+            Ok(true) => headless_owner_loop_pass(
+                state,
+                manager,
+                options,
+                stop,
+                cancellation,
+                overflowed,
+                notices,
+                reply_wakes,
+                transport,
+                &mut health,
+            ),
+            Ok(false) => owner_loop_pass(
                 state,
                 client,
                 manager,
@@ -4323,7 +4359,8 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                 &mut reminders,
                 &mut health,
             ),
-        );
+        };
+        let result = owner_loop_end(stop, pass);
         let error = match result {
             Ok(()) => break Ok(()),
             Err(error) if stop.is_stopped() || !error.restarts_owner_loop() => break Err(error),
@@ -5205,6 +5242,141 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
 struct StaleComposerRun {
     guard: StaleComposer,
     last_held: Option<String>,
+}
+
+/// How long the headless owner loop waits for a provider notice before it looks for reply wakes
+/// and due scans again: a `chat reply` wake reaches no pane event stream, so this bounds how long
+/// a stored reply waits to be sent.
+const HEADLESS_WAIT: Duration = Duration::from_millis(250);
+
+/// One run of the owner loop for a headless coordinator (#594 headless-slack-trial, the minimal
+/// form of the design note's `HeadlessDelivery`). Its wrapper is the only drainer of its queue,
+/// so a pass enqueues each admitted request (urgent and delivered mid-turn with
+/// `--deliver-while-working`) and wakes the wrapper; there is no pane to read, no turn to watch
+/// and no reply block to capture, because a headless coordinator replies only through
+/// `agentctl chat reply`, whose wake brings the send forward. Delivery state comes from the
+/// queue alone. Rescans retry the requests still pending, and each reconciliation runs a
+/// recovery pass, as the pane loop does.
+#[allow(clippy::too_many_arguments)]
+fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    options: ServiceOptions,
+    stop: &StopState,
+    cancellation: &SharedCancellation,
+    overflowed: &AtomicBool,
+    notices: &mpsc::Receiver<ProviderNotice>,
+    reply_wakes: &mpsc::Receiver<String>,
+    transport: &mut Option<CommandOutboundTransport>,
+    health: &mut ServiceHealth,
+) -> Result<(), ChatServiceError> {
+    let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
+    let mut control = PassControl {
+        transport,
+        stop: Some(stop),
+    };
+    let mut direct_keys = DirectKeyQueue::default();
+    let mut notes = NoteLog::default();
+    let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
+    enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
+    notes.log(&recovery);
+    let queue_reader = CancellableDelivery {
+        manager,
+        runtime: StopRuntime::new(stop),
+    };
+    let mut watch = DeliveryWatch::new(options.timing);
+    watch.scan(state, &queue_reader, &mut routes);
+    let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
+    while !stop.is_stopped() {
+        health.tick(state);
+        take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
+        take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
+        let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
+        let retry = watch.due() && {
+            watch.scan(state, &queue_reader, &mut routes);
+            !recover && !watch.retry_keys.is_empty()
+        };
+        if recover {
+            let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
+            enqueue_report_backlog(&mut direct_keys, &report, overflowed);
+            notes.log(&report);
+        }
+        if !direct_keys.is_empty() {
+            let report = drain_immediate_backlog(
+                state,
+                manager,
+                options.delivery,
+                &mut direct_keys,
+                &mut control,
+                overflowed,
+            )?;
+            notes.log(&report);
+            for key in &report.processed_keys {
+                routes.replace(key, state.next_reply_route(key)?);
+            }
+        }
+        if retry {
+            // Oldest admission first, stopping at the first request still waiting: its wake
+            // asked the wrapper to take every queued input, so the later ones wait for it too.
+            let mut report = CycleReport::default();
+            for key in &watch.retry_keys {
+                if control.stopped() {
+                    break;
+                }
+                let pass = process_keys(
+                    state,
+                    manager,
+                    options.delivery,
+                    std::slice::from_ref(key),
+                    &mut control,
+                )?;
+                let waiting = pass.has_errors() || pass.delivery_pending.contains(key);
+                report.merge(pass);
+                if waiting {
+                    break;
+                }
+            }
+            notes.log(&report);
+            for key in &report.processed_keys {
+                routes.replace(key, state.next_reply_route(key)?);
+            }
+            watch.scan(state, &queue_reader, &mut routes);
+        }
+        if Instant::now() >= next_reconciliation {
+            let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
+            enqueue_report_backlog(&mut direct_keys, &report, overflowed);
+            notes.log(&report);
+            next_reconciliation = Instant::now() + options.reconciliation_interval;
+        }
+        let timeout = if direct_keys.is_empty() {
+            watch
+                .next_scan
+                .min(next_reconciliation)
+                .saturating_duration_since(Instant::now())
+                .min(HEADLESS_WAIT)
+        } else {
+            Duration::ZERO
+        };
+        match notices.recv_timeout(timeout) {
+            Ok(ProviderNotice::Batch(keys)) => {
+                enqueue_direct_keys(&mut direct_keys, keys, overflowed);
+            }
+            Ok(ProviderNotice::Fatal(error)) => {
+                return Err(ChatServiceError::Generation(format!(
+                    "chat provider stopped on an unrecoverable stream gap: {error}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) if stop.is_stopped() => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ChatServiceError::Worker(
+                    "chat provider worker stopped unexpectedly".to_owned(),
+                ));
+            }
+        }
+    }
+    cancel_provider(cancellation)?;
+    Ok(())
 }
 
 /// Build the stale-composer clear for `chat run --stale-composer-clear-after`. Its notice is
@@ -13043,6 +13215,104 @@ esac
         );
         assert_eq!(stored_replies(&state, &first), 1);
         assert_eq!(stored_replies(&state, &second), 0);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    /// The first file named `name` below `root`, depth first.
+    fn find_file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+        for entry in fs::read_dir(root).ok()?.flatten() {
+            let path = entry.path();
+            if entry.file_type().ok()?.is_dir() {
+                if let Some(found) = find_file(&path, name) {
+                    return Some(found);
+                }
+            } else if entry.file_name().to_str() == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_owner_loop_queues_a_headless_coordinators_requests_without_herdr() {
+        // A headless coordinator has no pane: its requests go to its queue, which its wrapper
+        // drains, and the loop never asks Herdr anything (#594 headless-slack-trial). No wrapper
+        // runs here, so the wake fails and the request waits in the queue's inbox.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture
+            .manager()
+            .start_headless(
+                "worker",
+                &fixture.root,
+                crate::subagents::HeadlessStart {
+                    harness: "claude".to_owned(),
+                    ..crate::subagents::HeadlessStart::default()
+                },
+            )
+            .expect("register a headless agent");
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let state = state.with_command_only_replies(true);
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let manager = fixture.manager();
+        let mut key = None;
+        let queued = |key: &str| {
+            manager
+                .message_state("worker", &format!("chat-{key}"))
+                .expect("queue state")
+        };
+        run_owner_loop_notified(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            |notify, _| match &key {
+                None => {
+                    let admitted = admitted_worker_message(&state, 1, "one");
+                    notify(ProviderNotice::Batch(vec![admitted.clone()]));
+                    key = Some(admitted);
+                    false
+                }
+                Some(key) => queued(key).is_some(),
+            },
+        );
+        let key = key.expect("a request was admitted");
+        assert_eq!(queued(&key), Some(QueueMessageState::Pending));
+        // Not started by any model, so not delivered: the request waits, saying why.
+        let inspection = state.inspect_request(&key).expect("inspect request");
+        assert_eq!(inspection["phase"], "pending", "{inspection:#}");
+        let error = inspection["delivery"]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("the headless wrapper is not running"),
+            "{error}"
+        );
+        // The queued prompt opens with its delay, as a pane queue's does, and gives only the
+        // reply command. The queue's place in the registry is not this test's concern.
+        let item = find_file(&fixture.root, &format!("chat-{key}.json")).expect("queued item");
+        let item: Value =
+            serde_json::from_slice(&fs::read(&item).expect("read item")).expect("item JSON");
+        let text = item["text"].as_str().expect("item text");
+        assert!(text.starts_with("Sent "), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.contains(" chat reply --bridge-state "), "{text}");
+        assert!(!text.contains("CHAT_REPLY"), "{text}");
+        assert_eq!(item["priority"], "normal", "{item:#}");
+        assert_eq!(herdr.subscriptions.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            fixture.client.pane_info_calls.load(AtomicOrdering::SeqCst),
+            0
+        );
+        assert!(fixture
+            .client
+            .read_sources
+            .lock()
+            .expect("read sources")
+            .is_empty());
+        assert!(fixture.client.runs.lock().expect("runs").is_empty());
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
     }

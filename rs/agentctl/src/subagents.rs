@@ -8784,10 +8784,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         message_id: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> Result<QueueResult> {
-        let _lock = self.lock_with_runtime(agent_name, runtime)?;
+        let lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
         if record.is_headless() {
-            return self.send_headless_record(&record, text, Some(message_id), &options);
+            return self.send_headless_for_chat(lock, &record, text, message_id, &options);
         }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
@@ -9321,6 +9321,9 @@ its drain would type first, so it was not queued",
     ) -> Result<Option<agent::QueueMessageState>> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
+        if record.is_headless() {
+            return self.headless_message_state(agent_name, message_id);
+        }
         record.supported()?;
         agent::message_state(&self.queue(agent_name)?, message_id)
     }
@@ -9333,6 +9336,9 @@ its drain would type first, so it was not queued",
     ) -> Result<Option<agent::QueueMessageState>> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
+        if record.is_headless() {
+            return self.headless_message_state(agent_name, message_id);
+        }
         record.supported()?;
         agent::message_state(&self.queue(agent_name)?, message_id)
     }
@@ -9448,8 +9454,11 @@ its drain would type first, so it was not queued",
 
     /// Drain only prompts known not to have been injected.
     pub fn drain(&self, agent_name: &str, options: DrainOptions) -> Result<QueueResult> {
-        let _lock = self.lock(agent_name)?;
+        let lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
+        if record.is_headless() {
+            return self.wake_headless_record(lock, &record);
+        }
         record.input_allowed()?;
         agent::drain_managed(
             &WorkspaceClient {
@@ -9475,8 +9484,11 @@ its drain would type first, so it was not queued",
         options: DrainOptions,
         runtime: &dyn agent::AgentRuntime,
     ) -> Result<QueueResult> {
-        let _lock = self.lock_with_runtime(agent_name, runtime)?;
+        let lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
+        if record.is_headless() {
+            return self.wake_headless_record(lock, &record);
+        }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
         agent::drain_managed_with_runtime(
@@ -9613,6 +9625,11 @@ its drain would type first, so it was not queued",
     ) -> Result<String> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
+        // A headless agent has no screen: the bridge reads none of its replies, which it sends
+        // only through `agentctl chat reply`, and no screen holds a reply block.
+        if record.is_headless() {
+            return Ok(String::new());
+        }
         let target = self.policy_target(&record)?;
         let info = agent::resolve_target_with_runtime(
             &WorkspaceClient {

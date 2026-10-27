@@ -19,6 +19,10 @@ const STOP_WAIT: Duration = Duration::from_secs(150);
 /// How long a control request may take.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long the chat bridge waits for a wrapper to answer a wake. The input is already queued,
+/// and a wrapper that does not answer takes it at its next queue poll.
+const CHAT_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// What `start --mode headless` registers.
 #[derive(Clone, Debug, Default)]
 pub struct HeadlessStart {
@@ -424,7 +428,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             true,
             &agent_queue::fsio::Blocking,
             |identifier| {
-                json!({
+                // A chat request prompt names its message's create time, as for a pane queue:
+                // open it with the delay as of queuing, so the stored text stays printable.
+                let mut item = json!({
                     "id": identifier,
                     "text": text,
                     "queued_at": agent_queue::queue::unix_seconds(),
@@ -433,7 +439,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     "priority": priority,
                     "deliver": deliver,
                     "not_after": not_after,
-                })
+                });
+                if let Some(queued) =
+                    crate::prompt_time::queue_deferred(text, crate::prompt_time::now_millis())
+                {
+                    item["text"] = json!(queued.text);
+                    item["sent_at"] = json!(queued.sent_at);
+                    item["opening"] = json!(queued.opening);
+                }
+                item
             },
         )?)
     }
@@ -460,8 +474,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 
     fn wake(&self, agent_name: &str) -> Option<String> {
+        self.wake_within(agent_name, CONTROL_TIMEOUT)
+    }
+
+    fn wake_within(&self, agent_name: &str, timeout: Duration) -> Option<String> {
         let socket = hcontrol::socket_path(&self.directory(agent_name).ok()?);
-        match hcontrol::request(&socket, &json!({"op": "wake"}), CONTROL_TIMEOUT) {
+        match hcontrol::request(&socket, &json!({"op": "wake"}), timeout) {
             Ok(answer) if answer["ok"] == true => None,
             Ok(answer) => Some(format!(
                 "the headless wrapper refused wake: {}",
@@ -531,6 +549,101 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             settle(&queue_root, &[id], wait),
             blocked,
         ))
+    }
+
+    /// The chat bridge's form of a headless send (#594 headless-slack-trial): enqueue under the
+    /// agent's lifecycle `lock`, release it, wake the wrapper briefly, and wait as a send does.
+    /// The wake is made outside the lock, which the wrapper takes when it records a new harness.
+    /// It succeeds only once the model has started the input; until then it fails as `Pending`,
+    /// so the bridge keeps the request pending, retries it, and its stall alarm covers a wrapper
+    /// that is down. An input set aside as possibly submitted fails as such.
+    pub(super) fn send_headless_for_chat(
+        &self,
+        lock: File,
+        record: &AgentRecord,
+        text: &str,
+        message_id: &str,
+        options: &DrainOptions,
+    ) -> Result<QueueResult> {
+        let (queue_root, id) = self.enqueue_for(
+            record,
+            text,
+            Some(message_id),
+            options.deliver_while_working,
+            options.not_after,
+        )?;
+        drop(lock);
+        let blocked = self.wake_within(&record.name, CHAT_WAKE_TIMEOUT);
+        let wait = if blocked.is_some() {
+            Duration::ZERO
+        } else {
+            options.ready_timeout.min(Duration::from_secs(10))
+        };
+        let result = queue_result(
+            id.clone(),
+            settle(&queue_root, std::slice::from_ref(&id), wait),
+            blocked,
+        );
+        let undelivered = |state: &str| agent::UndeliveredMessage {
+            message: format!(
+                "queued for headless agent {:?}, which has {state}: {}",
+                record.name,
+                result.blocked.as_deref().unwrap_or("see agentctl tail")
+            ),
+            message_id: id.clone(),
+            artifact: queue_root.clone(),
+        };
+        match result.outcome {
+            agent::QueueOutcome::Delivered => Ok(result),
+            agent::QueueOutcome::PossiblySubmitted => Err(AgentError::PossiblySubmitted(
+                undelivered("set it aside as possibly submitted"),
+            )),
+            _ => Err(AgentError::Pending(undelivered("not started it yet"))),
+        }
+    }
+
+    /// The headless form of a drain by the chat bridge, called with the agent's lifecycle
+    /// `lock`: the wrapper is the only drainer, so release the lock, wake the wrapper briefly, and
+    /// report the inputs still waiting, without waiting for them.
+    pub(super) fn wake_headless_record(
+        &self,
+        lock: File,
+        record: &AgentRecord,
+    ) -> Result<QueueResult> {
+        if record.lifecycle != "running" {
+            return Err(fail(format!(
+                "agent {:?} is not a running headless agent",
+                record.name
+            )));
+        }
+        if record.paused {
+            return Err(fail(format!("agent {:?} is paused", record.name)));
+        }
+        let queue_root = self.queue(&record.name)?;
+        let ids = agent_queue::queue::pending_identifiers(&queue_root)?;
+        drop(lock);
+        let blocked = self.wake_within(&record.name, CHAT_WAKE_TIMEOUT);
+        Ok(queue_result(
+            String::new(),
+            settle(&queue_root, &ids, Duration::ZERO),
+            blocked,
+        ))
+    }
+
+    /// A headless queue entry's state as the chat bridge reads it: an input written to the
+    /// harness that the model has still to start (`inflight`) is on its way, as one in the inbox
+    /// is, not possibly lost as a pane prompt the queue began to type would be.
+    pub(super) fn headless_message_state(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+    ) -> Result<Option<agent::QueueMessageState>> {
+        Ok(
+            match agent::message_state(&self.queue(agent_name)?, message_id)? {
+                Some(agent::QueueMessageState::Inflight) => Some(agent::QueueMessageState::Pending),
+                state => state,
+            },
+        )
     }
 
     fn enqueue_for(

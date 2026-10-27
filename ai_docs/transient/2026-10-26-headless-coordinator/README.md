@@ -95,9 +95,20 @@ one turn each; `system/init` opens every turn; `result` carries a per-result cos
 `model_usage_since_last_result`. Not exercised: cancelling one queued input, and what the
 transcript records for an input queued and then cancelled.
 
+Bridge delivery, minimal M3 slice (`#594 headless-slack-trial`, section 8): `chat init` and
+`chat run` accept a headless target without asking Herdr. The owner loop runs a pane-free pass
+that enqueues each request (`urgent` + `now` with `--deliver-while-working`, opened with its
+delay as a pane queue does), releases the lifecycle lock, and wakes the wrapper with a 2 s bound;
+a drain is a wake. A request is `delivered` once the queue shows it `processed` (the model
+started it); `inflight` reads as pending. It captures no reply: prompts name only `agentctl chat
+reply` (a request whose command cannot be printed is refused), and the reply's wake brings the
+send forward within 250 ms. **Differences from section 8:** no receipt reaction (the pane path's
+comes from verified typing), and reply reminders and the stale-composer guard are off for a
+headless target rather than becoming queue items.
+
 Not built yet: the bridge's request journal and `agentctl ledger` (12.1); the Python extension's
 v1 events; `agentctl say`; per-input cancel of a written input; the provenance header of section
-10; the post-compaction records prompt of 9.5; `HeadlessDelivery` in the bridge (M3); Codex and Muse wrappers (after the
+10; the post-compaction records prompt of 9.5; the rest of M3 (`inbox deliver --via queue`, reminders as queue items, receipts on `started`); Codex and Muse wrappers (after the
 Claude cutover, per the owner's answer to question 5).
 
 ## 0. Summary
