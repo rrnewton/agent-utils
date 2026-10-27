@@ -376,6 +376,20 @@ async fn every_part_of_a_long_thread_message_stays_in_its_thread() {
 #[tokio::test]
 async fn older_thread_messages_remain_addressable_for_summaries_and_speech() {
     let (app, backend) = harness();
+    // `#564 message-summary-toggle`: summaries on, through the settings route as a page does.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/api/v1/client-settings",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"set": [{
+            "key": vibe_talk::client_settings::SUMMARIZE_COLLAPSED_KEY,
+            "value": "1",
+            "updated_ms": 0,
+        }]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let prefix = format!("/api/v1/channels/{WRITE_CHANNEL}");
     for suffix in [
         "/messages/11?thread_id=opaque%2Fthread-A",

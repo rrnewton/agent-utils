@@ -84,6 +84,9 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.in-app-links",
     "vibe-talk.voice.collapsed-lines",
     "vibe-talk.voice.hidden-link-kinds",
+    // Summarize collapsed messages (`#564 message-summary-toggle`). The server reads it too
+    // ([`summarize_collapsed`]): with it off, no message summary is generated.
+    "vibe-talk.voice.summarize-collapsed",
     // Threads view: pack/unpack, each thread's own choice, main rows, order, card fold.
     "vibe-talk.voice.threads-unpacked",
     "vibe-talk.voice.thread-card-states",
@@ -98,6 +101,27 @@ pub const SYNCED_KEYS: &[&str] = &[
     // a person or another bot. `#488 slack-app-agents`.
     "vibe-talk.voice.identities",
 ];
+
+/// Summarize collapsed messages: `"1"` is on; anything else, or nothing held, is off.
+/// `#564 message-summary-toggle`.
+pub const SUMMARIZE_COLLAPSED_KEY: &str = "vibe-talk.voice.summarize-collapsed";
+
+/// Whether the owner has asked for collapsed messages to be summarised, by the synced setting.
+///
+/// OFF unless it says `"1"`, as on the page: the owner, 2026-10-26, "I'm actually really NOT
+/// liking the summaries of collapsed messages". Every summary is a paid model call, so a page that
+/// still asks with the setting off — an older script, another client — is refused rather than
+/// served ([`crate::http::api::message_summary`]). Thread-card summaries are the thread namer's
+/// and do not read it.
+#[must_use]
+pub fn summarize_collapsed(settings: &[SyncedSetting]) -> bool {
+    settings
+        .iter()
+        .rev()
+        .find(|setting| setting.key == SUMMARIZE_COLLAPSED_KEY)
+        .and_then(|setting| setting.value.as_deref())
+        == Some("1")
+}
 
 /// The largest value one synced setting may hold, in bytes.
 ///
@@ -178,6 +202,23 @@ pub fn validate(entries: &[(String, Option<String>)]) -> Result<(), Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsed_messages_are_summarised_only_when_the_setting_says_1() {
+        let held = |value: Option<&str>| {
+            vec![SyncedSetting {
+                key: SUMMARIZE_COLLAPSED_KEY.to_owned(),
+                value: value.map(str::to_owned),
+                updated_ms: 1,
+            }]
+        };
+        assert!(!summarize_collapsed(&[]), "nothing held is off");
+        assert!(!summarize_collapsed(&held(None)));
+        assert!(!summarize_collapsed(&held(Some("0"))));
+        assert!(!summarize_collapsed(&held(Some("true"))));
+        assert!(summarize_collapsed(&held(Some("1"))));
+        assert!(SYNCED_KEYS.contains(&SUMMARIZE_COLLAPSED_KEY));
+    }
 
     #[test]
     fn the_page_and_the_server_name_the_same_synced_keys() {

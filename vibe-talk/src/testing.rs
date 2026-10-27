@@ -201,6 +201,27 @@ pub fn state_with_summarizer(
     (state, discord, store, summarizer)
 }
 
+/// Turn the owner's "Summarize collapsed messages" on in `state`'s store, as a page's settings
+/// write would: the summary route refuses every request while it is off. `#564
+/// message-summary-toggle`.
+///
+/// # Panics
+///
+/// When the store refuses the write.
+pub async fn summaries_on(state: &AppState) {
+    state
+        .store
+        .apply_client_settings(
+            &[(
+                crate::client_settings::SUMMARIZE_COLLAPSED_KEY.to_owned(),
+                Some("1".to_owned()),
+            )],
+            &[],
+        )
+        .await
+        .expect("the store keeps the summaries setting");
+}
+
 /// A server whose summariser is one the caller built, plus its store.
 ///
 /// The counterpart of [`state_with`] for the OTHER pluggable half. [`state_with_summarizer`] hands

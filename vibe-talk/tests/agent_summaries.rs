@@ -143,6 +143,7 @@ async fn the_summary_route_hands_the_round_trip_time_to_whoever_asked() {
     // anybody instrumenting anything.
     let (state, _vendor, _discord) = server(PoolPolicy::default(), 2);
     let id = newest_ids(&state).await.pop().expect("a message");
+    vibe_talk::testing::summaries_on(&state).await;
     let router = vibe_talk::http::router(state);
 
     let request = Request::builder()

@@ -1592,6 +1592,28 @@
                     </div>
                   </section>
 
+                  <section class="settings-group">
+                    <div class="group-head">
+                      <h3 title="A collapsed long message shows a model's one-line summary in place of its opening lines."><button class="fold-toggle" id="fold-summaries" type="button" aria-expanded="false" aria-controls="fold-summaries-body">Summaries</button></h3>
+                      <button class="help-link" id="help-link-summaries" type="button" data-help="summaries" aria-label="About summaries" title="A collapsed long message shows a model's one-line summary in place of its opening lines.">?</button>
+                    </div>
+                    <div class="fold-body" id="fold-summaries-body" hidden="until-found">
+                      <!--
+                        `#564 message-summary-toggle`. OFF by default. The owner, 2026-10-26: "I'm actually
+                        really NOT liking the summaries of collapsed messages ... I also want a toggle to turn
+                        summarization off on messages. But I want to keep summarization on for thread cards."
+                        Off, a collapsed message shows its opening lines, nothing is asked for, and the server
+                        refuses a summary anything asks for anyway (`summaries_off`). The Summaries chip over the
+                        list is this same switch. Thread cards are summarised by the server's thread namer and
+                        do not read it. Synced, as the other switches in Messages are.
+                      -->
+                      <label class="toggle">
+                        <input id="summarize-collapsed" type="checkbox" />
+                        Summarize collapsed messages
+                      </label>
+                    </div>
+                  </section>
+
                   <!--
                     `#193 compose-draft-loss`. A send dismissed from the outbox unsent is not gone at one
                     tap: it is kept here, on this device only, for a week (the newest ten), and Put back
@@ -2938,6 +2960,23 @@
                 opens the chat service, as it always did. A reload keeps the message you are on, but
                 not the way back from links followed before it. Turn this off to have every message
                 link open the chat service.
+              </p>
+            </details>
+
+            <details id="help-summaries" class="help-entry">
+              <summary><h2>Summaries</h2></summary>
+              <p class="hint">
+                With <strong>Summarize collapsed messages</strong> on, a long message that is collapsed
+                shows a one-line summary written by a model in place of its opening lines, marked
+                <em>summary</em> and tinted in its thread's colour. <strong>More</strong> opens the
+                message itself. Each summary is a call to a model, asked only for the messages you
+                scroll to, and kept once made. The <strong>Summaries</strong> chip over the list is the
+                same switch.
+              </p>
+              <p class="hint">
+                It is <strong>off</strong> unless you turn it on, and off nothing is summarised: collapsed
+                messages show their opening lines. Thread cards are not affected: a thread's name and the
+                sentence saying what it is about are made by the server either way.
               </p>
             </details>
 

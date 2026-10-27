@@ -391,6 +391,8 @@ async fn record() -> Value {
     let main = seed(&discord);
     let plain = Arc::new(Plain::new(Arc::clone(&discord)));
     let (state, router) = server(Arc::clone(&plain) as Arc<dyn ChatClient>);
+    // `#564 message-summary-toggle`: the summary cases are asked with summaries on.
+    vibe_talk::testing::summaries_on(&state).await;
     let mut cases = Vec::new();
     for ask in asks(&main) {
         // Each case from upstream: nothing one case read is answered from memory in the next.
@@ -712,6 +714,20 @@ async fn every_caller_reads_through_one_lookup() {
         );
     }
     let (native, router) = counted(Arc::new(Native::new(discord, &[])));
+    // `#564 message-summary-toggle`: summaries on, through the settings route as a page does.
+    let (status, _) = call(
+        &router,
+        WRITE_TOKEN,
+        "PUT",
+        "/api/v1/client-settings",
+        Some(json!({"set": [{
+            "key": vibe_talk::client_settings::SUMMARIZE_COLLAPSED_KEY,
+            "value": "1",
+            "updated_ms": 0,
+        }]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let base = format!("/api/v1/channels/{READ_CHANNEL}");
     let thread = THREAD.replace('/', "%2F");
     let lookups = || native.count("fetch_messages");

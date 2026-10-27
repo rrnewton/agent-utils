@@ -125,6 +125,7 @@ async fn a_configured_llm_section_is_the_summariser_the_summary_route_uses() {
             &"The cache key used to be the source path plus the compiler version. ".repeat(10),
         )
         .0;
+    vibe_talk::testing::summaries_on(&state).await;
     let app = vibe_talk::http::router(state);
 
     let (status, body) = call(

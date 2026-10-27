@@ -5150,6 +5150,23 @@ pub async fn message_summary(
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessageSummaryResponse>, ApiError> {
+    // `#564 message-summary-toggle`. Before anything is fetched or asked: the owner's synced
+    // "Summarize collapsed messages" is off unless he turned it on, and a summary he has switched
+    // off is a model call nobody wants. A page that still asks — an older script, a client that
+    // does not read the setting — is told why. With no store, settings live on each device and the
+    // page alone decides, as it always did.
+    match state.store.client_settings().await {
+        Ok(settings) if !crate::client_settings::summarize_collapsed(&settings) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "summaries_off",
+                "Summarize collapsed messages is off in the owner's settings, so no summary is \
+                 generated",
+            ));
+        }
+        Ok(_) | Err(StoreError::Unavailable(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
     // The granted scope, not the required one: a read token may be served FROM the cache but
     // never writes to it. See `ops::summarize_message`.
     // Empty segments dropped rather than rejected: `with=` and a trailing comma both mean "no

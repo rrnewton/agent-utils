@@ -5045,6 +5045,10 @@ const TUNING_BANDS = {
     "phone connection has not answered yet, and an edit out of the replay tail costs a second " +
     "read of the newest page; past ten seconds a proxy that holds the stream back leaves the " +
     "reader looking at saved rows long after the server could have said what changed"],
+  SUMMARY_IN_FLIGHT: [1, 3,
+    "how many summary requests may be on the wire at once (`#564 message-summary-toggle`). Zero asks " +
+    "nothing; past three a screenful outruns the server's burst of model calls and its rate limit " +
+    "turns the rest away, every one drawn as 'summary failed' with no model call made"],
   SUMMARY_LOOKAHEAD_PX: [100, 2000,
     "how far past the viewport a row is still summarised. Below about a hundred pixels the line " +
     "only starts being fetched once the row is fully on screen, so the reader watches it appear " +
@@ -13014,7 +13018,7 @@ test("...AND IT IS A RECTANGLE: FOUR SIDES AND SQUARE CORNERS, ON A PHONE AND ON
   assert.equal(takesASide("background: var(--theirs); border-left: none; border-right: none;"), "border-left: none");
   assert.equal(takesASide("border-width: 1px 0;"), "border-width: 1px 0");
   assert.equal(takesASide("border-inline-style: hidden;"), "border-inline-style: hidden");
-  assert.equal(takesASide("border: 1px solid var(--edge); border-left: 3px solid var(--summary-edge);"), null);
+  assert.equal(takesASide("border: 1px solid var(--edge); border-left: 3px solid var(--summary-tint);"), null);
 });
 
 test("MY OWN MESSAGES ARE READ ALREADY, BY DEFAULT, WITHOUT VISITING SETTINGS", async () => {
@@ -16665,8 +16669,17 @@ test("...and a row showing a summary is DRAWN differently from one showing the m
   // a fact nobody can see — the failure this suite has hit before with an invisible highlight.
   const drawn = cssBlock('#discord-log li.discord-message[data-summarised="true"]');
   assert.ok(drawn, "nothing in the stylesheet draws a summarised row differently");
-  assert.match(drawn, /background:/, "a summarised row does not take a surface of its own");
-  assert.match(drawn, /border-left:\s*3px solid/, "a summarised row has no mark down its edge");
+  assert.match(drawn, /background:\s*color-mix\(in srgb, var\(--summary-tint\)/, "a summarised row does not take a surface of its own");
+  assert.match(drawn, /border-left:\s*3px solid var\(--summary-tint\)/, "a summarised row has no mark down its edge");
+  // `#564 message-summary-toggle`: the tint is its thread's hue where it has one, never a fixed
+  // accent, and the muted grey where it has none.
+  assert.match(drawn, /--summary-tint:\s*var\(--muted\)/, "a row in no thread has a fixed accent");
+  assert.match(
+    cssBlock('#discord-log li.discord-message[data-summarised="true"][data-summary-hue]'),
+    /--summary-tint:\s*hsl\(var\(--summary-hue, 210\) 55% 50%\)/,
+    "a summarised row in a thread is not drawn in its thread's hue"
+  );
+  assert.doesNotMatch(CSS, /--summary-(bg|edge|ink):/, "the fixed summary teal is still declared");
   // Every row's left side is a one-pixel hairline, the coder's tile's too since
   // `#213 row-side-borders`, and a bar no wider than that would read as one more border. It is in
   // place of the hairline and wider than it.
@@ -16679,7 +16692,7 @@ test("...and a row showing a summary is DRAWN differently from one showing the m
   // And the word that says so is not muted grey, which is what the eye is trained to skip.
   const mark = cssBlock(".summary-mark");
   assert.doesNotMatch(mark, /color:\s*var\(--muted\)/, "the summary label is still muted");
-  assert.match(mark, /color:\s*var\(--summary-ink\)/, "the summary label has no colour of its own");
+  assert.match(mark, /color:\s*var\(--summary-tint, var\(--muted\)\)/, "the summary label is not in the row's tint");
 
   // ...and it does not cost a LINE. A two-line summary under a label line is three lines, which is
   // exactly what the clamp already gives the message itself, so a mark on its own line makes the
@@ -17188,6 +17201,145 @@ test("...and a failed row is QUIET: a small muted label, and the row keeps its r
     assert.match(block, /--summary-fail-ink:\s*#[0-9a-f]{6}/i, "--summary-fail-ink is missing a scheme");
     assert.doesNotMatch(block, /--summary-fail-(bg|edge)/, "an unused failure surface is still declared");
   }
+});
+
+// --- `#564 message-summary-toggle`: a setting, off unless turned on -------------------------------
+
+const SUMMARIZE_KEY = "vibe-talk.voice.summarize-collapsed";
+
+test("Summarize collapsed messages is OFF by default, and the switch in Settings turns summaries on", async () => {
+  // The owner, 2026-10-26: "I'm actually really NOT liking the summaries of collapsed messages ...
+  // I also want a toggle to turn summarization off on messages."
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "7000000000000000071", content: longMessage("default") })]);
+  assert.equal(page.el("summarize-collapsed").checked, false, "the setting is not off by default");
+  assert.equal(page.el("summarise").getAttribute("aria-pressed"), "false");
+  assert.deepStrictEqual(page.summaryAsks, [], "a summary was asked for with the setting off");
+
+  await page.el("summarize-collapsed").setChecked(true);
+  await page.settle();
+  assert.deepStrictEqual(page.summaryAsks.map((ask) => ask.message), ["7000000000000000071"],
+    "turning the setting on asked about nothing");
+  assert.equal(page.el("summarise").getAttribute("aria-pressed"), "true", "the chip does not follow the setting");
+  assert.equal(page.storage.get(SUMMARIZE_KEY), "1", "the setting is not kept");
+
+  // Off again: the row shows its opening lines, and scrolling to more asks nothing.
+  await page.el("summarize-collapsed").setChecked(false);
+  await page.settle();
+  const rows = page.el("discord-log").children;
+  assert.equal(rows[0].getAttribute("data-summarised"), "false", "turned off, the row still shows its summary");
+  assert.equal(page.storage.get(SUMMARIZE_KEY), "0");
+  const spent = page.summaryAsks.length;
+  await refreshDiscord(page, [
+    message({ id: "7000000000000000071", content: longMessage("default") }),
+    message({ id: "7000000000000000072", content: longMessage("another") }),
+  ]);
+  await page.settle();
+  assert.equal(page.summaryAsks.length, spent, "turned off, a new long row was still sent for summarising");
+});
+
+test("...and it is the owner's setting: kept across a reload, and the chip is the same switch", async () => {
+  const store = new Map([[SUMMARIZE_KEY, "1"]]);
+  const page = newPage(store);
+  await signIn(page);
+  await showDiscord(page, [message({ id: "7000000000000000073", content: longMessage("kept") })]);
+  await page.settle();
+  assert.equal(page.el("summarize-collapsed").checked, true, "a kept setting was not put back");
+  assert.deepStrictEqual(page.summaryAsks.map((ask) => ask.message), ["7000000000000000073"],
+    "a reload with the setting on did not summarise");
+
+  // The chip turns the SETTING off, not a session mode beside it.
+  await page.el("summarise").click();
+  await page.settle();
+  assert.equal(page.el("summarize-collapsed").checked, false, "the chip and the setting disagree");
+  assert.equal(store.get(SUMMARIZE_KEY), "0", "the chip's choice is not kept");
+  // A fresh page with this one's kept setting alone (the rest of the store would reopen the
+  // channel this page was on, which is not what is being asked about).
+  const reopened = newPage(new Map([[SUMMARIZE_KEY, store.get(SUMMARIZE_KEY)]]));
+  await signIn(reopened);
+  await showDiscord(reopened, [message({ id: "7000000000000000073", content: longMessage("kept") })]);
+  assert.deepStrictEqual(reopened.summaryAsks, [], "the chip's off did not survive a reload");
+});
+
+test("a summary the server refuses because the setting is off there is NOT a failure", async () => {
+  // The page may turn the setting on a moment before its write reaches the server, which answers
+  // 409 `summaries_off` in between. That is not a summary that failed, and the row says nothing.
+  const page = newPage();
+  await signIn(page);
+  page.summaryResponse = async () =>
+    json(409, { error: "summaries_off", detail: "Summarize collapsed messages is off" });
+  const rows = await showDiscord(page, [message({ id: "7000000000000000074", content: longMessage("race") })]);
+  await turnSummariesOn(page);
+  await reportFailures(page);
+  assert.equal(page.summaryAsks.length, 1, "the fixture never asked");
+  assert.equal(rows[0].getAttribute("data-summary-failed"), "false", "a refusal for the setting was drawn as failed");
+  assert.equal(rows[0].getAttribute("data-summarised"), "false");
+  assert.doesNotMatch(page.el("status-line").textContent, /could not be summarised/,
+    "a refusal for the setting was reported as a failure");
+  // ...and the refused row STAYS asked: a read-only token's "on" never reaches the server, and a
+  // row un-asked on refusal would be asked again on every scroll, for ever.
+  const area = page.el("scroll-area");
+  for (let i = 0; i < 10; i += 1) {
+    area.scrollTop = area.scrollHeight - i;
+    await area.dispatch("scroll");
+  }
+  await page.settle();
+  assert.equal(page.summaryAsks.length, 1, `a refused row was asked ${page.summaryAsks.length} times as the list scrolled`);
+});
+
+test("at most two summary requests are on the wire at once, and the rest follow as they answer", async () => {
+  // The live server turned 27 of 95 summary requests away with no model call made: a screenful
+  // asked at once outran its own rate limit. Two at a time never wait long enough to be refused.
+  const page = newPage();
+  await signIn(page);
+  const answer = page.summaryResponse;
+  const waiting = [];
+  page.summaryResponse = (id) => new Promise((resolve) => waiting.push(() => resolve(answer(id))));
+  await showDiscord(page, tallChannel(6));
+  await turnSummariesOn(page);
+  assert.equal(page.summaryAsks.length, 2, `${page.summaryAsks.length} requests went out at once`);
+  waiting.shift()();
+  await page.settle();
+  assert.equal(page.summaryAsks.length, 3, "an answer did not let the next request go");
+  // Turned off with requests still queued: nothing more is sent.
+  await page.el("summarize-collapsed").setChecked(false);
+  for (const release of waiting.splice(0)) release();
+  await page.settle();
+  for (const release of waiting.splice(0)) release();
+  await page.settle();
+  assert.equal(page.summaryAsks.length, 3, "requests queued before the setting went off were still sent");
+});
+
+test("a summarised row is tinted in its thread's hue, and a row in no thread in no fixed accent", async () => {
+  // The owner, 2026-10-26: "their little highlight color doesn't match the thread they're part of.
+  // It should."
+  const page = newPage();
+  await signIn(page);
+  const thread = (name, root) => ({ id: `spaces/A/threads/${name}`, root_message_id: root, is_root: true,
+    reply_count: 1, reply_count_exact: true });
+  const rows = await showDiscord(page, [
+    message({ id: "7000000000000000075", content: longMessage("in one thread"), thread: thread("one", "7000000000000000075") }),
+    message({ id: "7000000000000000076", content: longMessage("in no thread") }),
+    message({ id: "7000000000000000077", content: longMessage("in another thread"), thread: thread("two", "7000000000000000077") }),
+  ]);
+  await turnSummariesOn(page);
+  const row = (id) => [...rows].find((li) => li.getAttribute("data-id") === id);
+  const [one, plain, two] = ["7000000000000000075", "7000000000000000076", "7000000000000000077"].map(row);
+  for (const li of [one, plain, two]) {
+    assert.equal(li.getAttribute("data-summarised"), "true", "the fixture never summarised");
+  }
+  const hue = (li) => li.style.getPropertyValue("--summary-hue");
+  for (const li of [one, two]) {
+    assert.equal(li.hasAttribute("data-summary-hue"), true, "a summarised row in a thread has no thread hue");
+    assert.match(hue(li), /^\d+(\.\d+)?$/, `the row's hue is not a hue: ${hue(li)}`);
+  }
+  // Each in ITS thread's colour: two threads, two colours — a fixed accent would be one.
+  assert.notEqual(hue(one), hue(two), "two threads' summaries share one colour");
+  assert.equal(plain.hasAttribute("data-summary-hue"), false, "a row in no thread was given a hue");
+  // Opened, the row is the message again and gives the hue back.
+  await one.foldEntry.fold.click();
+  assert.equal(one.hasAttribute("data-summary-hue"), false, "an opened row kept the summary's hue");
 });
 
 test("the thread list's track is never wider than the list, so an opened code block cannot push rows off a phone", () => {
@@ -64410,7 +64562,7 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // and Screen and keys is the one per-device section. `#543 in-app-message-links` put Message links
   // after Rich headers: whether a link to a message opens it here is a choice about drawing messages.
   assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Empty messages", "Combining messages",
-    "Rich headers", "Message links", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
+    "Rich headers", "Message links", "Summaries", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -65735,7 +65887,7 @@ function foldProblems(html, css, script) {
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, SCRIPT_CODE), []);
   // 31 since `#481 slack-app-deep-link` added Opening links, counted and checked above.
-  assert.equal(scriptFolds(SCRIPT_CODE).length, 33, "a fold went missing from the list, or one was added unchecked");
+  assert.equal(scriptFolds(SCRIPT_CODE).length, 34, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {

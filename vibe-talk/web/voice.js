@@ -74,6 +74,7 @@ const COMBINE_KEY = "vibe-talk.voice.combine";
 const HIDE_EMPTY_KEY = "vibe-talk.voice.hide-empty";
 const RICH_HEADERS_KEY = "vibe-talk.voice.rich-headers";
 const IN_APP_LINKS_KEY = "vibe-talk.voice.in-app-links";
+const SUMMARIZE_COLLAPSED_KEY = "vibe-talk.voice.summarize-collapsed";
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
 // --- two columns on a desk: which column the code is working on -------------------------------
@@ -164,6 +165,7 @@ const ALL_CHANNELS = "*";
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
  *   | "reply-branch" | "reply-grow" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"
+ *   | "summarize-collapsed"
  *   | "voice-ask-before-send" | "voice-post-prefix"} id
  * @returns {HTMLInputElement}
  */
@@ -187,7 +189,7 @@ const ALL_CHANNELS = "*";
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help"
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-card-max-lines" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-opening-links" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-message-links" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-card-max-lines" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-opening-links" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-message-links" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-summaries" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
@@ -198,7 +200,7 @@ const ALL_CHANNELS = "*";
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar" | "help-link-empty-messages"
  *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-message-links" | "help-link-microphone"
- *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
+ *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers" | "help-link-summaries"
  *   | "help-link-speech-prep"
  *   | "help-link-message-cache" | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-file" | "link-kind-issue" | "link-kind-other"
@@ -2488,6 +2490,7 @@ const SETTINGS_FOLDS = [
   "combining",
   "rich-headers",
   "message-links",
+  "summaries",
   "dismissed",
   "settings-channels",
   "hidden-channels",
@@ -2605,6 +2608,7 @@ const HELP_TOPICS = [
   "combining",
   "rich-headers",
   "message-links",
+  "summaries",
   "reading-width",
   "collapsed-lines",
   "card-max-lines",
@@ -4495,6 +4499,16 @@ function setFolded(entry, folded) {
   // plain text where the message was markdown, and the row has to say so on its own — without it,
   // the only difference a reader can see is that the formatting stopped working.
   entry.li.setAttribute("data-summarised", summarised ? "true" : "false");
+  // `#564 message-summary-toggle`. In its thread's colour, as the card's edge and the bridge are,
+  // never a fixed accent; a message in no thread has none to match (web/voice.css).
+  const hueThread = summarised ? summaryThread(entry) : null;
+  if (hueThread !== null) {
+    entry.li.style.setProperty("--summary-hue", String(threadHue(hueThread)));
+    entry.li.setAttribute("data-summary-hue", "");
+  } else if (entry.li.hasAttribute("data-summary-hue")) {
+    entry.li.removeAttribute("data-summary-hue");
+    entry.li.style.removeProperty("--summary-hue");
+  }
   entry.body.className = folded ? "body clamped" : "body";
   // A row whose summary FAILED shows its note AS WELL AS the message — the one case where the two
   // are on the row together. The note is appended after the body, so those words read UNDER the
@@ -4523,6 +4537,16 @@ function setFolded(entry, folded) {
 }
 
 const isFolded = (entry) => entry.li.getAttribute("data-collapsed") === "true";
+
+/**
+ * The thread a summarised row's colour is taken from: the one it is unpacked under, or its own
+ * message's, or null for a message in no thread — and for the conversation a single-conversation
+ * channel is, which is the channel itself rather than a thread with a colour.
+ */
+function summaryThread(entry) {
+  const thread = entry.li.getAttribute("data-unpack-thread") || threadOf(rowMessages(entry.li)[0]);
+  return thread && thread !== channelCanon.scope ? thread : null;
+}
 
 /**
  * Fold this message if it is long enough to be worth folding.
@@ -4623,8 +4647,14 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
 //   * ONE REQUEST PER MESSAGE, EVER. `summariesAsked` is the record, and it is consulted before
 //     the fetch rather than after it, so a hundred scroll events over one row are one request.
 //   * ONLY WHAT YOU ARE LOOKING AT. Nothing is spent on rows the reader never reaches.
-//   * THE MODE IS NOT PERSISTED across a reload, for the same reason the fold state is not: it is
-//     an act, not a preference, and one that spends money should not come back on by itself.
+//   * THE MODE IS THE OWNER'S SETTING, OFF UNLESS HE TURNS IT ON (`#564 message-summary-toggle`).
+//     It was once session-only, an act rather than a preference. The owner, 2026-10-26: "I'm
+//     actually really NOT liking the summaries of collapsed messages ... I also want a toggle to
+//     turn summarization off on messages. But I want to keep summarization on for thread cards."
+//     So it is "Summarize collapsed messages" in Settings > Messages, synced like its neighbours,
+//     and the Summaries chip is the same switch. Off, nothing is asked and the server refuses
+//     anything that asks anyway (`summaries_off`); thread cards are the thread namer's and are
+//     untouched.
 //   * A FAILURE IS SHOWN, ON THE ROW IT HAPPENED TO. Every summary is now a paid round trip to a
 //     vendor, so "no summary arrived" is a thing that happens and a thing that costs. The row
 //     says `summary failed` in small muted words and KEEPS ITS MESSAGE, its read state and its
@@ -4647,15 +4677,62 @@ const SUMMARY_WAITING = "summarising…";
 /**
  * ...and what a row says when the summary did not come.
  *
- * IN WORDS, and that is the load-bearing part. The row also takes a red surface and a red bar
- * (web/voice.css), but a colour is not readable by a screen reader, is not readable by anyone who
- * cannot separate red from the surface behind it, and does not survive a screenshot in greyscale.
- * The tint is the glance; this is the statement.
+ * IN WORDS, and since `#564 message-summary-toggle` ONLY in words: small and muted, the row's own
+ * surface, read state and controls untouched (web/voice.css).
  */
 const SUMMARY_FAILED_MARK = "summary failed";
 
-/** Is the reader in summary mode? Session-only, on purpose — see above. */
+/** Is the reader in summary mode? The owner's synced setting, unless the server cannot summarise. */
 let summaryMode = false;
+
+/**
+ * Turn "Summarize collapsed messages" on or off, keep it, and put the mode in step. The chip over
+ * the list and the switch in Settings are the one setting (`#564 message-summary-toggle`).
+ */
+function applySummarizeCollapsed(on) {
+  const wanted = Boolean(on);
+  el("summarize-collapsed").checked = wanted;
+  try {
+    localStorage.setItem(SUMMARIZE_COLLAPSED_KEY, wanted ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  if (wanted !== summaryMode) setSummaryMode(wanted);
+}
+
+/** What was stored. ABSENT MEANS OFF: every summary is a paid model call, and the owner asked. */
+function storedSummarizeCollapsed() {
+  try {
+    return localStorage.getItem(SUMMARIZE_COLLAPSED_KEY) === "1";
+  } catch (_error) {
+    return false;
+  }
+}
+
+/**
+ * Rows the server refused because the owner's setting, as IT holds it, is off: this page turned it
+ * on and the write has not landed yet, or the two have not converged, or this token may only read
+ * and cannot write it. Not a failure and not shown: the rows keep their opening lines. They STAY
+ * asked — a refusal un-asked would be asked again on every scroll and every redraw, forever, on a
+ * page whose "on" can never reach the server — and are asked again only once the server is seen to
+ * hold the setting on (`summariesSettingLanded`). `#564 message-summary-toggle`.
+ */
+const summariesRefusedOff = new Set();
+
+/**
+ * The server's settings were read or written: if it now holds summaries on, the rows it refused
+ * while it held them off are asked again. Called from `takeServerSettings`, after every read,
+ * write and stream frame.
+ */
+function summariesSettingLanded() {
+  if (summariesRefusedOff.size === 0) return;
+  const held = syncedArchive.get(SUMMARIZE_COLLAPSED_KEY);
+  if (!held || held.value !== "1" || !summaryMode) return;
+  for (const key of summariesRefusedOff) summariesAsked.delete(key);
+  summariesRefusedOff.clear();
+  requestVisibleSummaries();
+  inOtherColumn(requestVisibleSummaries);
+}
 
 /**
  * What the server has said about each message, by id.
@@ -4900,7 +4977,50 @@ function requestVisibleSummaries(limit = Infinity) {
     // scroll event — the exact thing the issue names.
     summariesAsked.add(key);
     issued += 1;
-    fetchSummary(entry.id, entry.also, key);
+    queueSummary(entry.id, entry.also, key);
+  }
+}
+
+/**
+ * How many summary requests may be on the wire at once. `#564 message-summary-toggle`.
+ *
+ * Every row on screen used to be asked about at once, a dozen or more, and the server paces its
+ * model calls (15 a minute after a burst of 3 by default, `summaries.llm`) and turns away AT ONCE
+ * a caller whose turn would come after its patience runs out. On the live instance that was 27 of
+ * 95 summary requests answered 503 with no model call made, every one drawn as "summary failed".
+ * Two at a time never queue long enough there to be turned away, and the rows still fill in order.
+ */
+const SUMMARY_IN_FLIGHT = 2;
+
+/** Summary requests on the wire now. */
+let summariesInFlight = 0;
+
+/** Rows asked about and not yet sent, oldest first: `{id, also, key, channel, thread}`. */
+const summaryQueue = [];
+
+/**
+ * Queue one row. Its channel and thread are read NOW, in the column that asked: a queued request is
+ * sent later, from whichever column is current then, and on a two-column desk the other column's
+ * thread would be the wrong one (`threadForMessageId` reads the current column).
+ */
+function queueSummary(id, also, key) {
+  summaryQueue.push({ id, also, key, channel: el("discord-channel").value, thread: threadForMessageId(id) });
+  pumpSummaries();
+}
+
+/** Send queued requests while there is room. One the mode or the channel has left behind is forgotten. */
+function pumpSummaries() {
+  while (summariesInFlight < SUMMARY_IN_FLIGHT && summaryQueue.length > 0) {
+    const next = summaryQueue.shift();
+    if (!summaryMode || next.channel !== el("discord-channel").value) {
+      summariesAsked.delete(next.key);
+      continue;
+    }
+    summariesInFlight += 1;
+    fetchSummary(next.id, next.also, next.key, next.channel, next.thread).finally(() => {
+      summariesInFlight -= 1;
+      pumpSummaries();
+    });
   }
 }
 
@@ -4923,9 +5043,10 @@ function summaryRecheckAnswered() {
   requestVisibleSummaries();
 }
 
-async function fetchSummary(id, alsoIds = [], key = summaryKey({ id, also: alsoIds })) {
-  const channel = el("discord-channel").value;
+async function fetchSummary(id, alsoIds, key, channel, thread) {
   if (!channel) {
+    // Never asked, so not left asked: the row is asked about when a channel is there.
+    summariesAsked.delete(key);
     return;
   }
   // The rest of the glommed row, so the server summarises what the reader is actually looking at.
@@ -4936,9 +5057,15 @@ async function fetchSummary(id, alsoIds = [], key = summaryKey({ id, also: alsoI
   let payload = null;
   try {
     payload = await api(
-      withThreadQuery(`/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`, threadForMessageId(id))
+      withThreadQuery(`/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`, thread)
     );
   } catch (error) {
+    // `#564 message-summary-toggle`. The server holds the owner's setting off: not a failure, and
+    // asked again once this page's write of it lands.
+    if (error.code === "summaries_off") {
+      summariesRefusedOff.add(key);
+      return;
+    }
     // The CODE, not the sentence. `summarizer_not_configured` is a fact about the deployment and
     // `summarizer_error` is a fact about this attempt; the two are told apart on the machine
     // string the server sends for exactly that purpose, never on the prose beside it.
@@ -5057,6 +5184,13 @@ function reportSummaryFailures() {
 function setSummaryMode(on) {
   if (on && summariesDisabledByServer) return;
   summaryMode = on;
+  if (!on) {
+    // Nothing still waiting to be sent is sent: off costs nothing from the moment it is off. Rows
+    // the server refused are forgotten too, so turning it on again asks about them.
+    for (const queued of summaryQueue.splice(0)) summariesAsked.delete(queued.key);
+    for (const key of summariesRefusedOff) summariesAsked.delete(key);
+    summariesRefusedOff.clear();
+  }
   el("summarise").setAttribute("aria-pressed", on ? "true" : "false");
   el("summarise-label").textContent = on ? SUMMARY_MODE_ON : SUMMARY_MODE_OFF;
   // A DEPLOYMENT-LEVEL refusal is re-checked with ONE request, never with one per visible row.
@@ -55322,6 +55456,8 @@ function applyClientConfig(config) {
   summariesDisabledByServer =
     typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "";
   if (summariesDisabledByServer && summaryMode) setSummaryMode(false);
+  // ...and back on when the server can summarise again and the owner's setting still says so.
+  else if (!summariesDisabledByServer && !summaryMode && storedSummarizeCollapsed()) setSummaryMode(true);
   renderScrollTools();
   deploymentCapabilities.liveDelivery = liveDelivery;
   deploymentCapabilities.livePollSeconds = livePollSeconds;
@@ -55688,6 +55824,9 @@ const SYNCED_SETTING_KEYS = [
   "vibe-talk.voice.in-app-links",
   "vibe-talk.voice.collapsed-lines",
   "vibe-talk.voice.hidden-link-kinds",
+  // `#564 message-summary-toggle`. Summarize collapsed messages; the server reads it too, and
+  // generates no message summary while it is off.
+  "vibe-talk.voice.summarize-collapsed",
   "vibe-talk.voice.threads-unpacked",
   "vibe-talk.voice.thread-card-states",
   "vibe-talk.voice.threads-main",
@@ -55793,6 +55932,7 @@ function applySyncedSetting(key) {
       case HIDE_EMPTY_KEY: applyHideEmptyMessages(storedHideEmptyMessages()); break;
       case COMBINE_KEY: applyCombineMessages(storedCombineMessages()); break;
       case RICH_HEADERS_KEY: applyRichHeaders(storedRichHeaders()); break;
+      case SUMMARIZE_COLLAPSED_KEY: applySummarizeCollapsed(storedSummarizeCollapsed()); break;
       case IN_APP_LINKS_KEY:
         applyInAppLinks(storedInAppLinks());
         redrawMessageLinks();
@@ -55961,6 +56101,7 @@ function takeServerSettings(entries, whole) {
       adoptAppliedSetting(key, null, agreed.updatedMs);
     }
   }
+  summariesSettingLanded();
 }
 
 /**
@@ -56236,6 +56377,7 @@ applyCombineMessages(storedCombineMessages());
 applyHideEmptyMessages(storedHideEmptyMessages());
 applyRichHeaders(storedRichHeaders());
 applyInAppLinks(storedInAppLinks());
+applySummarizeCollapsed(storedSummarizeCollapsed());
 applyEnterSends(storedEnterSends());
 // `#340 composer-grow-box`. Drawn as stored, and stored only once the reader ticks one: absent means off.
 renderComposerGrow(storedComposerGrow());
@@ -56412,6 +56554,16 @@ el("in-app-links").addEventListener("change", () => {
   setStatus(el("in-app-links").checked
     ? "links to messages open here."
     : "links to messages open the chat service.");
+});
+
+// `#564 message-summary-toggle`. The chip over the list follows it (`setSummaryMode`).
+el("summarize-collapsed").addEventListener("change", () => {
+  applySummarizeCollapsed(el("summarize-collapsed").checked);
+  setStatus(
+    el("summarize-collapsed").checked
+      ? "collapsed messages show a summary when one arrives."
+      : "collapsed messages show their opening lines; nothing is summarised."
+  );
 });
 
 // `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the
@@ -57100,7 +57252,8 @@ el("expand-all").addEventListener("click", () => setAllFolded(false));
 el("todo-filter").addEventListener("click", cycleReadMode);
 el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
 el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));
-el("summarise").addEventListener("click", () => setSummaryMode(!summaryMode));
+// `#564 message-summary-toggle`. The chip is Settings' switch, kept and synced like it.
+el("summarise").addEventListener("click", () => applySummarizeCollapsed(!storedSummarizeCollapsed()));
 el("jump-newest").addEventListener("click", jumpToNewest);
 // `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
 // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
