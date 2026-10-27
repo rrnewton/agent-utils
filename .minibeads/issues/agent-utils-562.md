@@ -267,3 +267,24 @@ and `--wait-lock` is not offered. Gate 39 failures were load
 timeouts only (repository-infrastructure 149, wrkslots shards
 508 + 508 passed alone). Upstream commits shared no files;
 rebased and pushed without a second gate.
+
+[muse watermelon] Slice 29 landed (c821e7bd): `wrkslotsd heartbeat`,
+the fourth writer slice, reproduces the owner heartbeat mutation
+(caller-process capture and ancestry proof, owner authorization,
+seal/journal disjointness, owner-release refusal with the
+publication and sidecar void rules, the `active-state-recorded`
+event, and the ACTIVE shard rewrite at the next revision) behind
+the fixture-only writer guard. The shared `active_document` now
+folds derived event logs (import plus `active-state-recorded`
+replacements) the way the Python loader does. Adversarial review
+found the incomplete release void rules, the seal-collapse of the
+journal guard, name-only seal overlap, and the stale-snapshot
+revision regression; all fixed. Known divergences: cleanup-create
+journal classification beside a seal is approximated by journal
+names, storage refusal text names the first finding, and
+`--wait-lock` is not offered. Differential: 6 passed in this
+slice's file (35 across the writer files). Gate 40 failures were
+load flakes only (repository-infrastructure 149, herdr-agent
+differential 103, wrkslots shards 511 + 511 passed alone).
+Upstream commits shared no files; rebased and pushed without a
+second gate.
