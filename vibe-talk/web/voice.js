@@ -34026,7 +34026,8 @@ function renderJumpBookmark() {
   /** @type {"up" | "down" | null} */
   let direction = null;
   const anchor = bookmarkAnchor();
-  if (currentScreen === "main" && currentView === "discord" && anchor && bookmarkListRefusal(anchor) === "") {
+  if (currentScreen === "main" && currentView === "discord" && anchor && bookmarkListRefusal(anchor) === "" &&
+      !bookmarksOffScreen()) {
     const target = bookmarkDrawn.main;
     if (!target) {
       direction = [...el("discord-log").children].some((row) => row.hasAttribute("data-id")) ? "up" : null;
@@ -34064,8 +34065,35 @@ function landOnBookmark() {
   return true;
 }
 
+// `#584 thread-view-bookmark-chip`. The owner, 2026-10-27: in the Threads view b and Shift+B said "Back at
+// your bookmark", where no bookmark is drawn. The thread list on its own is the right column across the
+// window, and b worked in the left column behind it, landing on Main's line out of sight. The bookmark
+// is a line between messages of Main and All, and cards are threads: so over the thread list, and on a
+// card or a message unpacked under one, every way in — b, the Bookmark chip, Shift+B, the ⋯ item and the
+// details sheet — says so instead, and sets, moves or jumps to nothing.
+
+/** What every bookmark key says where the cards are: there is no line among them. */
+const NO_BOOKMARK_IN_THREADS = "No bookmarks in thread view.";
+
+/** Whether `row` is among the cards: a card, or a message unpacked under one (`#407 unpack-row-parity`). */
+function rowAmongCards(row) {
+  const list = row ? row.parentNode : null;
+  return Boolean(row) && (row.hasAttribute("data-card") || list === leftEl("side-cards") || list === el("thread-list"));
+}
+
+/**
+ * Whether the view on screen is the thread list, where no bookmark is drawn: on its own across the
+ * window, or the Threads view of one column.
+ */
+const bookmarksOffScreen = () => threadListOnScreen() ||
+  (currentView === "discord" && !sideActive && threadingSupported && channelView === "threads");
+
 /** b, m and the chip: back to the bookmark, walking back through older pages when it is further back. */
 async function jumpToBookmark() {
+  if (bookmarksOffScreen()) {
+    setStatus(NO_BOOKMARK_IN_THREADS);
+    return;
+  }
   if (sideActive) return inColumn(columns.main, jumpToBookmark);
   // A jump the reader asks for lets go of a filter change's held message (#243 filter-keeps-selection),
   // as Newest and the reply arrow do, whether it came from b, m or the Bookmark chip.
@@ -34086,6 +34114,10 @@ async function jumpToBookmark() {
 
 /** b and m: `jumpToBookmark`, for the left column, whichever column the keys are in. */
 function bookmarkJumpFromKeyboard() {
+  if (bookmarksOffScreen()) {
+    setStatus(NO_BOOKMARK_IN_THREADS);
+    return true;
+  }
   if (sideActive) return inColumn(columns.main, bookmarkJumpFromKeyboard);
   if (!channelOnScreen()) return false;
   guardQuietly(jumpToBookmark)();
@@ -34106,6 +34138,10 @@ function bookmarkAbove(row) {
 function toggleBookmarkAt(row) {
   const channel = currentChannelId();
   if (!channel || !row) return;
+  if (rowAmongCards(row) || bookmarksOffScreen()) {
+    setStatus(NO_BOOKMARK_IN_THREADS);
+    return;
+  }
   if (row.parentNode === el("discord-log") && bookmarkAbove(row)) {
     removeBookmark(channel);
     return;
@@ -34192,6 +34228,12 @@ function undoBookmarkRemoval() {
 
 /** Shift+B on the selected message. */
 function bookmarkFromKeyboard(target) {
+  // On a card, which `rowForAct` hands no row for, and over the thread list: said, never a silent key.
+  const { row: under } = keyContext(target);
+  if (bookmarksOffScreen() || rowAmongCards(under)) {
+    setStatus(NO_BOOKMARK_IN_THREADS);
+    return true;
+  }
   const { pane, row, took } = rowForAct(target);
   if (!pane || !row) return took;
   toggleBookmarkAt(row);

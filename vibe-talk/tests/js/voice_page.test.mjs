@@ -59406,24 +59406,24 @@ test("`#240 reading-bookmark`: under Hide read, a bookmark on a read message old
   assert.equal(statusText(page), "Not in this list — Hide read is on.");
 });
 
-test("`#240 reading-bookmark`: Shift+B on a thread's card, in the Threads list or on the right, is left alone and writes nothing", async () => {
-  // A card is a thread, not a message, and holds none: there is nothing to put the line above, so the
-  // key is not taken, as Pin's is not.
+test("`#240 reading-bookmark`: Shift+B on a thread's card, in the Threads list or on the right, says there are no bookmarks and writes nothing", async () => {
+  // A card is a thread, not a message, and holds none: there is nothing to put the line above. Since
+  // `#584 thread-view-bookmark-chip` the key says so, where it used to be left to the browser in silence.
   const page = await threadPage();
   await page.el("channel-view-threads").click();
   await page.settle();
   const card = page.el("thread-list").children[0];
   await card.descendants().find((node) => node.className === "thread-open").focus();
-  const status = statusText(page);
   let event = await press(page, focused(page), "B", { shiftKey: true });
-  assert.equal(event.defaulted, true, "Shift+B on a card in the Threads list was taken");
-  assert.equal(statusText(page), status, "Shift+B on a card said something");
+  assert.equal(event.defaulted, false, "Shift+B on a card in the Threads list was left to the browser");
+  assert.equal(statusText(page), "No bookmarks in thread view.", "Shift+B on a card said something else");
   const two = await threadPage();
   await twoColumns(two);
   const side = two.el("side-cards").children[0];
   side.focus();
   event = await press(two, side, "B", { shiftKey: true });
-  assert.equal(event.defaulted, true, "Shift+B on a card on the right was taken");
+  assert.equal(event.defaulted, false, "Shift+B on a card on the right was left to the browser");
+  assert.equal(statusText(two), "No bookmarks in thread view.");
   assert.deepStrictEqual([...page.bookmarkCalls, ...two.bookmarkCalls], [], "Shift+B on a card wrote a bookmark");
 });
 
@@ -65991,6 +65991,52 @@ test("`#578 search-status-clarity`: only the notice that All left replies out is
   await showDiscord(page, page.messages);
   assert.equal(page.el("timeline-notice").textContent, forum);
   assert.equal(page.el("timeline-notice").hidden, false);
+});
+
+// --- `#584 thread-view-bookmark-chip` ----------------------------------------------------------------
+//
+// The owner, 2026-10-27: in the Threads view b and Shift+B said "Back at your bookmark", where no bookmark
+// is drawn: b worked in Main, out of sight behind the thread list. Every way to the bookmark says so there.
+
+test("`#584 thread-view-bookmark-chip`: over the thread list b, Shift+B and the chip say there are no bookmarks, and touch none", async () => {
+  const { page } = await repliesPage({}, false);
+  // A bookmark set in All, where it is drawn.
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await pressHere(page, "B", { shiftKey: true });
+  assert.equal(statusText(page), "Bookmarked. b comes back here.");
+  const calls = page.bookmarkCalls.length;
+  await pickThread(page, "threads");
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list");
+  const cards = page.el("side-scroll");
+  for (const [key, fields] of [["b", {}], ["B", { shiftKey: true }]]) {
+    page.el("status").textContent = "";
+    const event = await press(page, cards, key, fields);
+    assert.equal(event.defaulted, false, `${key} over the thread list was left to the browser`);
+    assert.equal(statusText(page), "No bookmarks in thread view.", `${key} over the thread list said something else`);
+  }
+  // On a card the keys have ringed, too: never silent, never "Bookmarked".
+  await press(page, cards, "j");
+  page.el("status").textContent = "";
+  await press(page, cards, "B", { shiftKey: true });
+  assert.equal(statusText(page), "No bookmarks in thread view.", "Shift+B on a card said something else");
+  assert.equal(page.el("jump-bookmark").hidden, true, "the Bookmark chip was offered over the thread list");
+  assert.equal(page.bookmarkCalls.length, calls, "a bookmark key over the thread list moved the bookmark");
+  // Back in All, b goes back to it as ever.
+  await pickThread(page, "flat");
+  await press(page, page.el("scroll-area"), "b");
+  assert.equal(statusText(page), "Back at your bookmark.");
+
+  // In two columns the cards are on the right and Main, with its line, on the left: Shift+B with the keys
+  // in the cards says so; b goes to Main's line, which is on screen.
+  const two = await repliesPage({});
+  await press(two.page, two.page.el("scroll-area"), "ArrowDown");
+  await pressHere(two.page, "B", { shiftKey: true });
+  await press(two.page, two.page.el("scroll-area"), "]");
+  await press(two.page, two.page.el("side-scroll"), "j");
+  await press(two.page, two.page.el("side-scroll"), "B", { shiftKey: true });
+  assert.equal(statusText(two.page), "No bookmarks in thread view.", "Shift+B on a card in two columns said something else");
+  await press(two.page, two.page.el("side-scroll"), "b");
+  assert.equal(statusText(two.page), "Back at your bookmark.", "b in two columns did not go to Main's line");
 });
 
 // --- `#271 settings-groups` -----------------------------------------------------------------------

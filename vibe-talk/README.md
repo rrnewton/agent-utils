@@ -8394,6 +8394,10 @@ with the word *Bookmark* in it, drawn just above one message.
   the list and the message under it selected. The **Bookmark** chip, directly right of *Newest*,
   does the same, and is shown only while the line is off the screen, its arrow pointing toward it.
   A bookmark older than what is loaded is reached by reading older pages, as a reply's arrow is.
+- **Not among the thread cards** (`#584 thread-view-bookmark-chip`). Over the thread list, and on a
+  card or a message unpacked under one, `b`, Shift+B and the ⋯ item say *No bookmarks in thread view.*
+  and move nothing: the line is drawn between messages of Main and All, and a card is a thread. `b`
+  used to work in Main, out of sight behind the list, and said *Back at your bookmark*.
 - **Reply, then `b`.** Sending a reply goes to the newest message as it always has; the chip and `b`
   bring you back to where you were reading. The message you answered is Done once the reply is sent,
   so a line right above it slides on past it, as below.
