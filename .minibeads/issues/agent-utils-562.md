@@ -27,3 +27,11 @@ until the delivery-latency lane lands; migrate/repair fold in here via the
 herdr-subagents runtime when this port reaches turn-runner workers.
 
 [muse watermelon] Slice 1 landed: Rust document loader (wrkslotsd parse-config) at differential parity with the Python loader (17-case corpus). Next slice: config validation (the load_config semantics: schema, inheritance, normalization) in wrkslotsd behind a read-only command, same differential pattern.
+
+[muse watermelon] Slice 2 scoping: `_load_config` (py/wrkslots/cli.py)
+discovers the root, exact-keys the document, then validates schema,
+machine, worktrees/control directories, remote, landed ref, liveness
+commands, caps, globs, hooks, disk thresholds, and representation/image/
+sandbox settings. Rust slice 2 = `wrkslotsd validate-config --root DIR`
+reproducing the resulting Config as canonical JSON for fixture roots built
+by the Python tests, error-for-error on the refusal cases. No mutation.
