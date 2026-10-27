@@ -1,13 +1,14 @@
 ---
 title: 'bridge-git-timeout-fatal: a slow git check-ignore must never stop chat run'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 - chat
 created_at: 2026-10-27T15:53:00.281682659+00:00
-updated_at: 2026-10-27T15:53:00.281682659+00:00
+updated_at: 2026-10-27T16:17:13.900487670+00:00
+closed_at: 2026-10-27T16:17:13.900487530+00:00
 ---
 
 # Description
