@@ -1,10 +1,11 @@
 ---
 title: 'gh-paced-permission-403: a permission 403 must not start a host-wide cooldown'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-27T19:50:22.733284292+00:00
-updated_at: 2026-10-27T19:50:22.733284292+00:00
+updated_at: 2026-10-27T20:14:35.401421978+00:00
+closed_at: 2026-10-27T20:14:35.401421868+00:00
 ---
 
 # Description
