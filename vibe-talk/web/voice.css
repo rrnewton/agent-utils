@@ -6807,6 +6807,12 @@ a.search-hit-link {
   background: transparent;
 }
 
+/* `read-chunk-balance`. The pieces of one drawn block stand closer together than two blocks do, so the
+   line reads as the message's blocks and the steps inside each. */
+.read-timeline-block[data-continues] {
+  margin-inline-start: -0.1rem;
+}
+
 .read-timeline-block[data-heard] {
   background: color-mix(in srgb, var(--warn) 35%, var(--panel));
 }
