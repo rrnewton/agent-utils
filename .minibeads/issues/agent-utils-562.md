@@ -25,3 +25,5 @@ wrkslotsd reader that reproduces `status --format json` for that corpus
 byte-for-byte before any mutating command moves. `chat launch` stays held
 until the delivery-latency lane lands; migrate/repair fold in here via the
 herdr-subagents runtime when this port reaches turn-runner workers.
+
+[muse watermelon] Slice 1 landed: Rust document loader (wrkslotsd parse-config) at differential parity with the Python loader (17-case corpus). Next slice: config validation (the load_config semantics: schema, inheritance, normalization) in wrkslotsd behind a read-only command, same differential pattern.
