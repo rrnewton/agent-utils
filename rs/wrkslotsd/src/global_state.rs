@@ -212,8 +212,15 @@ pub(crate) enum EventLogStatus {
 }
 
 pub(crate) fn event_log_status(directory: &Path) -> EventLogStatus {
-    if !directory.exists() {
-        return EventLogStatus::Snapshot;
+    match directory.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return EventLogStatus::Invalid(format!(
+                "append-only event log is not a real directory: {}",
+                directory.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(_) => return EventLogStatus::Snapshot,
     }
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -251,6 +258,27 @@ pub(crate) fn event_log_status(directory: &Path) -> EventLogStatus {
     } else {
         EventLogStatus::Snapshot
     }
+}
+
+/// The state bootstrap's refusal when an in-progress write of the
+/// first event file is present, if any: it would append that file, and
+/// its atomic-write leftover check names the first such leftover.
+pub(crate) fn partial_write_refusal(directory: &Path) -> Option<String> {
+    let first = "00000000000000000001.json";
+    let prefix = format!("{first}.tmp.");
+    let entries = std::fs::read_dir(directory).ok()?;
+    let mut leftovers: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix) && is_event_name(name, true))
+        .collect();
+    leftovers.sort();
+    leftovers.first().map(|name| {
+        format!(
+            "partial state update exists for {first}: {}; inspect it and use 'wrkslots recover'",
+            directory.join(name).display()
+        )
+    })
 }
 
 fn event_log_derived(directory: &Path) -> Result<bool> {

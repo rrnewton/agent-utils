@@ -5,8 +5,13 @@
 //! partial machine state, a lone empty shard pairs with an empty
 //! counterpart, and two present shards are both validated. Snapshot mode
 //! only: when the append-only event log derives the state, derivation
-//! stays with `rebuild`. Read-only; the missing counterpart is reported
-//! as the empty document the bootstrap would write, never created.
+//! stays with `rebuild`. The log is classified by its entries (a
+//! complete event file derives, any other entry refuses with the
+//! event loader's message, and an in-progress write of the first
+//! event file refuses with the bootstrap's partial-update message,
+//! since the bootstrap would append that file). Read-only;
+//! the missing counterpart is reported as the empty document the
+//! bootstrap would write, never created.
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +19,9 @@ use serde_json::{json, Value};
 
 use crate::active_state::{load_cfg, parse_state};
 use crate::archive_state::parse_archive;
+use crate::global_state::{
+    event_log_status, partial_write_refusal, validate_event_chain, EventLogStatus,
+};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -26,14 +34,15 @@ fn present(path: &Path) -> bool {
 pub(crate) fn parse_states(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
     let (cfg, selected) = load_cfg(root, machine_override)?;
     let events: PathBuf = cfg.control.join(format!("EVENTS.{selected}"));
-    if events.is_dir()
-        && std::fs::read_dir(&events)
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false)
-    {
-        return Err(format!(
-            "machine state for {selected} is derived from the append-only event log; use rebuild instead of snapshot pairing"
-        ));
+    match event_log_status(&events) {
+        EventLogStatus::Derived => {
+            validate_event_chain(&events, &selected)?;
+            return Err(format!(
+                "machine state for {selected} is derived from the append-only event log; use rebuild instead of snapshot pairing"
+            ));
+        }
+        EventLogStatus::Invalid(message) => return Err(message),
+        EventLogStatus::Snapshot => {}
     }
     let active_path = cfg.control.join(format!("ACTIVE.{selected}.json"));
     let archive_path = cfg.control.join(format!("ARCHIVED.{selected}.json"));
@@ -74,6 +83,9 @@ pub(crate) fn parse_states(root: Option<&Path>, machine_override: Option<&str>) 
             parse_archive(root, machine_override)?,
         ),
     };
+    if let Some(message) = partial_write_refusal(&events) {
+        return Err(message);
+    }
     Ok(json!({
         "machine": selected,
         "active": active,

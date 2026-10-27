@@ -145,3 +145,9 @@ precedence, and partial-name edges; all fixed with differential cases
 known low divergence). Gate 30 failures were load flakes only
 (cross-skip 71 passed alone; wrkslots shard 0 481 passed alone).
 Next: slice 20 gives `parse-states` the same event-log classification.
+
+[muse watermelon] Slice 20 in progress: `wrkslotsd parse-states`
+adopts the shared event-log classification (complete event file
+derives toward `rebuild`, unexpected entry refuses with the event
+loader's message, an in-progress write of the first event file
+refuses with the bootstrap's partial-update message).
