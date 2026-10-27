@@ -520,6 +520,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#567 pace-stepper` in the browser engine: the Pace popover's [-] [100%] [+] stepper, no slider, at
+  # 393x852 by touch (targets at least 44 px) and 1280x800: + to 130%, arrows, typed and clamped values,
+  # and a change mid-read reading the block again.
+  - group: check
+    job: pace-stepper-browser
+    desc: the Pace popover's stepper in current Chromium at 393x852 by touch and 1280x800, stepping, typing, clamping and a mid-read change
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/pace_stepper_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#49 post-confirmation-card-hold` in the browser engine: a real touch on Send the moment a first
   # card appears in a typed call commits nothing, and Send enables itself after the hold.
   - group: check

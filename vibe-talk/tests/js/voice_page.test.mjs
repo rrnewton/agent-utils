@@ -4789,6 +4789,12 @@ const TUNING_BANDS = {
     "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
   BROWSER_SPEECH_FINISH_MS: [30000, 120000,
     "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
+  READ_SPEED_STEP: [5, 25,
+    "what one press of the pace stepper's − or + moves the pace by (#567 pace-stepper): the owner " +
+    "wants a few presses of + to be a clear change, and the range is 50 to 200"],
+  READ_SPEED_SETTLE_MS: [200, 1500,
+    "how long the pace rests before a read in progress is taken up at it (#567 pace-stepper): shorter " +
+    "restarts the sentence for every press, longer makes a change heard late"],
   READ_NO_SPEECH_MS: [2500, 10000,
     "how long a part of a cloud read may go with no speech before it is stopped (#548 " +
     "cloud-read-failures): speech follows the first frame by under a second, so less stops a slow but " +
@@ -10944,13 +10950,13 @@ test("device speech picks the device language and applies pace to every subseque
   await signIn(page);
   const rows = await inReadingMode(page, [message({ content: "A sentence long enough to make multiple parts. ".repeat(12) })]);
   assert.match(page.el("speed-value").textContent, /device default/);
-  page.el("read-speed-range").value = "145";
-  await page.el("read-speed-range").dispatch("input");
+  page.el("read-speed-box").value = "145";
+  await page.el("read-speed-box").dispatch("change");
   await rows[0].dispatch("click", {});
   assert.equal(page.deviceSpeech.utterances[0].voice, english);
   assert.equal(page.deviceSpeech.utterances[0].rate, 1.45);
-  page.el("read-speed-range").value = "180";
-  await page.el("read-speed-range").dispatch("input");
+  page.el("read-speed-box").value = "180%";
+  await page.el("read-speed-box").dispatch("change");
   page.deviceSpeech.utterances[0].end();
   assert.equal(page.deviceSpeech.utterances[1].rate, 1.8);
   assert.deepEqual(page.prepareCalls, []);
@@ -11456,8 +11462,8 @@ test("the reading pace is the AGENT'S until the reader chooses one", async () =>
     "an unset pace sent 100%, overriding an agent configured to speak faster"
   );
 
-  page.el("read-speed-range").value = "150";
-  await page.el("read-speed-range").dispatch("input", {});
+  page.el("read-speed-box").value = "150";
+  await page.el("read-speed-box").dispatch("change", {});
   await page.settle();
   // ...and a ticket minted at the OLD pace is thrown away rather than played. A reader who moves
   // the slider and hears no difference has been given the most confusing possible answer.
@@ -13647,6 +13653,143 @@ test("the pace popover is anchored to something, so pressing Pace actually shows
   await page.settle();
   assert.equal(page.el("speed-popover").hidden, false, "pressing Pace did not open it");
   assert.equal(page.el("read-speed").getAttribute("aria-expanded"), "true");
+});
+
+// --- `#567 pace-stepper`: [-] [100%] [+] in place of the slider ------------------------------------
+
+const paceKey = (node, key) => node.dispatch("keydown", { key, preventDefault() {} });
+
+test("`#567 pace-stepper`: the pace is a box between − and +, ten a step, within 50 to 200, typed or arrowed", async () => {
+  const popover = HTML_CODE.slice(HTML_CODE.indexOf('id="speed-popover"'), HTML_CODE.indexOf('id="read-aloud-stop"'));
+  assert.ok(popover.includes('id="read-speed-box"'), "the pace popover has no box");
+  assert.doesNotMatch(popover, /type="range"/, "the pace slider is still in the popover");
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await page.el("read-speed").click();
+  await page.settle();
+  const box = page.el("read-speed-box");
+  assert.equal(box.value, "100%", "the box does not start at 100%");
+  assert.equal(page.storage.has("vibe-talk.voice.read-speed"), false, "opening it chose a pace");
+  // Tapped into and out of, or Enter on what it shows: nothing is chosen, the voice keeps its own pace.
+  await box.dispatch("blur");
+  await paceKey(box, "Enter");
+  assert.equal(page.storage.has("vibe-talk.voice.read-speed"), false, "leaving the box untouched chose 100%");
+  assert.equal(page.el("read-speed-label").text(), "Pace");
+  for (let press = 0; press < 3; press += 1) await page.el("read-speed-up").click();
+  assert.equal(box.value, "130%");
+  assert.equal(page.el("read-speed-label").text(), "130%");
+  assert.equal(page.storage.get("vibe-talk.voice.read-speed"), "130", "the pace was not kept where it is synced");
+  await page.el("read-speed-down").click();
+  assert.equal(box.value, "120%");
+  // Typed, with or without the sign, taken on Enter or when the box is left.
+  box.value = "95";
+  await paceKey(box, "Enter");
+  assert.equal(box.value, "95%");
+  await page.el("read-speed-up").click();
+  assert.equal(box.value, "100%", "+ from 95 did not go to the next step of ten");
+  box.value = " 72 % ";
+  await box.dispatch("blur");
+  assert.equal(box.value, "72%");
+  await page.el("read-speed-down").click();
+  assert.equal(box.value, "70%", "− from 72 did not go to the step of ten below");
+  box.value = "fast";
+  await box.dispatch("change");
+  assert.equal(box.value, "70%", "a word in the box was taken for a pace");
+  // Clamped to what the voices take, and the end's button says so.
+  box.value = "1000";
+  await box.dispatch("change");
+  assert.equal(box.value, "200%", "a four-figure pace was not clamped");
+  box.value = "190";
+  await box.dispatch("change");
+  box.value = "250%";
+  await box.dispatch("change");
+  assert.equal(box.value, "200%");
+  assert.equal(page.el("read-speed-up").disabled, true, "+ is offered past the fastest pace");
+  await page.el("read-speed-up").click();
+  assert.equal(box.value, "200%");
+  // The arrows step it from the box.
+  await paceKey(box, "ArrowDown");
+  assert.equal(box.value, "190%");
+  assert.equal(page.el("read-speed-up").disabled, false);
+  box.value = "40";
+  await paceKey(box, "Enter");
+  assert.equal(box.value, "50%");
+  assert.equal(page.el("read-speed-down").disabled, true, "− is offered past the slowest pace");
+  await paceKey(box, "ArrowUp");
+  assert.equal(box.value, "60%");
+  assert.equal(page.storage.get("vibe-talk.voice.read-speed"), "60");
+});
+
+test("`#567 pace-stepper`: the keyboard the pace box raises leaves its popover and the bar open, and a disabled end gives the focus to the box", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await page.el("read-speed").click();
+  await page.settle();
+  await focusOn(page, page.el("read-speed-box"));
+  await page.resizeViewport({ visual: 480 });
+  assert.equal(page.el("speed-popover").hidden, false, "the keyboard for the pace box closed its popover");
+  assert.notEqual(page.documentElement.getAttribute("data-keyboard"), "open",
+    "the bars went for a keyboard raised by the pace box");
+  // The message box, with the keyboard still up: the page lays out for it as ever.
+  await focusOn(page, page.el("channel-compose-text"));
+  await page.resizeViewport({ visual: 470 });
+  assert.equal(page.documentElement.getAttribute("data-keyboard"), "open");
+  assert.equal(page.el("speed-popover").hidden, true);
+  // + pressed to the fastest pace, the focus on it: it goes to the box, not the page.
+  await page.resizeViewport({ visual: 900 });
+  await page.el("read-speed").click();
+  await page.settle();
+  page.el("read-speed-box").value = "190";
+  await page.el("read-speed-box").dispatch("change");
+  await focusOn(page, page.el("read-speed-up"));
+  await page.el("read-speed-up").click();
+  assert.equal(page.el("read-speed-up").disabled, true);
+  assert.equal(page.document.activeElement, page.el("read-speed-box"), "the focus fell off the disabled +");
+});
+
+test("`#567 pace-stepper`: a pace changed mid-read is taken up at once by the device voice, from the sentence being read", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const sentences = ["The first sentence of the message is here.", "The second sentence of it comes after."];
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001", content: sentences.join(" ") })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances[0].rate, 1);
+  await page.el("read-speed-up").click();
+  await page.el("read-speed-up").click();
+  // The pace rests, and only then is the sentence said again: once, at the pace it came to.
+  assert.equal(page.deviceSpeech.utterances.length, 1, "each press restarted the sentence");
+  page.expireTimers(sourceConstant("READ_SPEED_SETTLE_MS"));
+  await page.settle();
+  assert.equal(page.deviceSpeech.cancellations, 1, "the sentence was not stopped for the new pace");
+  // A beat after the cancel, the sentence again.
+  page.expireTimers(50);
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 2);
+  assert.equal(page.deviceSpeech.utterances[1].text, sentences[0], "the read did not go on from the sentence being read");
+  assert.equal(page.deviceSpeech.utterances[1].rate, 1.2);
+  page.deviceSpeech.utterances[0].end();
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 2, "the sentence cut off for the new pace ended the read");
+});
+
+test("`#567 pace-stepper`: a pace changed mid-read is taken up at once by the cloud voice, the block being read again at the new pace", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001", content: "Read this at a new pace." })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const streams = page.audioStreams.length;
+  const prepares = page.prepareCalls.length;
+  await page.el("read-speed-up").click();
+  page.expireTimers(sourceConstant("READ_SPEED_SETTLE_MS"));
+  await page.settle();
+  assert.ok(page.prepareCalls.slice(prepares).some((asked) => asked.speed === 1.1),
+    `nothing was prepared at the new pace: ${JSON.stringify(page.prepareCalls.slice(prepares))}`);
+  assert.equal(page.audioStreams.length, streams + 1, "the block was not read again");
 });
 
 test("A TAP SHOWS IMMEDIATELY, before anything has been fetched", async () => {
@@ -24553,7 +24696,8 @@ test("THERE IS EXACTLY ONE COMPOSER FOR THE AGENT, AND IT IS IN THE CALL'S TRANS
   // Nothing typeable is left in the dock at all: the bar does not convert into a field any more.
   const dock = HTML.slice(HTML.indexOf('id="dock"'));
   const typeable = [...(dock.match(/<input[^>]*>/g) || []), ...(dock.match(/<textarea[^>]*>/g) || [])].filter(
-    (tag) => !/type="(range|checkbox|radio|button)"/.test(tag)
+    // The pace box (`#567 pace-stepper`) takes a percent, not a message to anyone.
+    (tag) => !/type="(range|checkbox|radio|button)"/.test(tag) && !/id="read-speed-box"/.test(tag)
   );
   assert.deepStrictEqual(typeable, [], "the dock still holds a text field, so there are two composers");
   // The one that is left is in the call's pane, inside the scrolling element, after the turns.
@@ -27757,9 +27901,9 @@ test("`#239 single-selection`: A CONTROL A CLICK FOCUSED gives the focus up to t
   assert.equal(focused(page), summarise, "the mouse took the focus from a control the keys had reached");
   await mouseTo(page, channelRow(page, "3"), 104, 302);
   assert.equal(focused(page), summarise, "a second move in the lit message took the focus from the control the keys reached");
-  // Nor ever from a picker or a slider, however it was focused: a picker's keys are its own.
+  // Nor ever from a picker or the pace box, however it was focused: a picker's keys are its own.
   let y = 310;
-  for (const id of ["discord-channel", "read-speed-range"]) {
+  for (const id of ["discord-channel", "read-speed-box"]) {
     page.el(id).focusFrom("pointer");
     y += 4;
     await mouseTo(page, channelRow(page, "4"), 100, y);
@@ -29328,9 +29472,9 @@ test("`#344 search-shortcut`: Ctrl+/ AND Cmd+/ OPEN THE SEARCH FROM ANYWHERE, wh
     await page.el("read-speed").click();
     await page.settle();
     assert.equal(page.el("speed-popover").hidden, false, "fixture: the pace button did not open its popover");
-    await press(page, page.el("read-speed-range"), "/");
-    assert.equal(page.el("search-field").hidden, true, "a bare \"/\" on the pace slider opened the search");
-    await opens(page, page.el("read-speed-range"), "on the pace popover's slider");
+    await press(page, page.el("read-speed-box"), "/");
+    assert.equal(page.el("search-field").hidden, true, "a bare \"/\" in the pace box opened the search");
+    await opens(page, page.el("read-speed-box"), "on the pace popover's box");
     assert.equal(page.el("speed-popover").hidden, true, `${said} left the pace popover open`);
     // The prompts tray: closed first.
     page = await keyboardPage(platform);
@@ -37257,8 +37401,8 @@ test("a batch cancelled while it was being answered keeps nothing it was answere
   const { page, releases } = await heldThreadPreparations();
   const first = page.prepareSignals[0];
   page.prepareHold = null;
-  page.el("read-speed-range").value = "150";
-  await page.el("read-speed-range").dispatch("input");
+  page.el("read-speed-box").value = "150";
+  await page.el("read-speed-box").dispatch("change");
   await page.settle();
   assert.equal(first.aborted, true, "the batch at the old pace was left running");
   releases[0]();

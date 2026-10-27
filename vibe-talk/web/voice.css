@@ -7717,13 +7717,41 @@ textarea {
   box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
 }
 
-.popover input[type="range"] {
-  display: block;
+/* `#567 pace-stepper`. [-] [100%] [+]: the buttons a thumb's width at least (44px), the box between
+ * them as tall, its percent large and centred. */
+#speed-popover {
+  /* The help under the stepper wraps rather than stretching the popover across a desk. */
+  width: min(20rem, calc(100vw - 1.2rem));
+}
+
+.pace-stepper {
+  display: grid;
+  grid-template-columns: 3rem minmax(5rem, 1fr) 3rem;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.pace-step {
+  min-width: 2.75rem;
+  min-height: 3rem;
+  font-size: 1.6rem;
+  line-height: 1;
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  background: var(--theirs);
+  color: inherit;
+}
+
+.pace-step:disabled {
+  opacity: 0.4;
+}
+
+#read-speed-box {
+  min-height: 3rem;
   width: 100%;
-  padding: 0.35rem 0;
-  background: none;
-  border: none;
-  accent-color: var(--accent);
+  font-size: 1.3rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
 }
 
 #speed-value {

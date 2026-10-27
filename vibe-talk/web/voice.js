@@ -163,7 +163,7 @@ const ALL_CHANNELS = "*";
  *   | "mic-echo-cancellation" | "side-compose-grow"
  *   | "message-cache-enabled"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
- *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
+ *   | "new-channel-writable" | "noise-rule-new" | "read-speed-box" | "reading-width"
  *   | "reply-branch" | "reply-grow" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"
  *   | "summarize-collapsed"
  *   | "voice-ask-before-send" | "voice-post-prefix"} id
@@ -209,7 +209,7 @@ const ALL_CHANNELS = "*";
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "own-read-apply" | "own-read-undo" | "page-update"
  *   | "pair-confirm" | "pair-dismiss"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-on-device" | "read-prev" | "read-speed" | "read-steer-grip" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-on-device" | "read-prev" | "read-speed" | "read-speed-down" | "read-speed-up" | "read-steer-grip" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send"
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
@@ -35651,6 +35651,13 @@ function toggleMessageDetails(li, messages) {
  */
 const MIN_READ_SPEED = 50;
 const MAX_READ_SPEED = 200;
+/** `#567 pace-stepper`. What one press of − or +, or one arrow key in the box, moves the pace by. */
+const READ_SPEED_STEP = 10;
+/**
+ * How long the pace must rest before a read in progress takes it up again at the new pace: three
+ * presses of + restart the sentence or block once, not three times.
+ */
+const READ_SPEED_SETTLE_MS = 600;
 let readSpeed = null;
 
 const clampReadSpeed = (value) => {
@@ -35663,15 +35670,25 @@ function applyReadSpeed(value) {
   const previous = readSpeed;
   readSpeed = value === null ? null : clampReadSpeed(value);
   const shown = readSpeed === null ? 100 : readSpeed;
-  el("read-speed-range").value = String(shown);
+  el("read-speed-box").value = `${shown}%`;
+  el("read-speed-down").disabled = shown <= MIN_READ_SPEED;
+  el("read-speed-up").disabled = shown >= MAX_READ_SPEED;
+  // A button disabled under the focus would drop it to the page: it goes to the box instead.
+  const focused = document.activeElement;
+  if ((focused === el("read-speed-down") && el("read-speed-down").disabled) ||
+      (focused === el("read-speed-up") && el("read-speed-up").disabled)) {
+    el("read-speed-box").focus();
+  }
   el("speed-value").textContent =
     readSpeed === null
       ? readAloudPlayback === "browser" ? "Pace: device default" : "Pace: as the agent speaks"
       : `Pace: ${readSpeed}%`;
   el("read-pace-help").textContent = readAloudPlayback === "browser"
-    ? "Unset, a message uses the device voice's normal pace. Changes apply to the next spoken part."
-    : "Unset, a message is read at whatever pace the voice agent is configured with.";
-  el("read-speed-range").setAttribute("aria-label", readAloudPlayback === "browser"
+    ? "Unset, a message uses the device voice's normal pace. A change applies at once, from the " +
+      "sentence being read."
+    : "Unset, a message is read at whatever pace the voice agent is configured with. A change " +
+      "applies at once, from the block being read (a message read whole starts again).";
+  el("read-speed-box").setAttribute("aria-label", readAloudPlayback === "browser"
     ? "reading pace, percent of the device voice's normal pace" : "reading pace, percent of the agent's own");
   el("read-speed-label").textContent = readSpeed === null ? "Pace" : `${readSpeed}%`;
   try {
@@ -35690,7 +35707,61 @@ function applyReadSpeed(value) {
   if (readSpeed !== previous) {
     forgetPreparedSpeech();
     guardQuietly(prepareSpeech)();
+    retakeReadAtPace();
   }
+}
+
+/** The settle timer of `retakeReadAtPace`; null while none is waiting. */
+let readSpeedSettleTimer = null;
+
+/**
+ * `#567 pace-stepper`. The pace changed while a message is being read: once it rests, the read takes
+ * the new pace up where it is. The device voice says the sentence being read again at the new rate
+ * (its pause and resume, `#554`); the cloud voice reads the block being read again on tickets at the
+ * new pace (a jump to where it is). A held read waits: its resume uses the pace then.
+ */
+function retakeReadAtPace() {
+  if (readSpeedSettleTimer !== null) clearTimeout(readSpeedSettleTimer);
+  readSpeedSettleTimer = setTimeout(() => {
+    readSpeedSettleTimer = null;
+    const playing = nowPlaying;
+    if (playing === null || playing.paused) return;
+    if (playing.playback === "browser") {
+      if (typeof playing.pauseTransport === "function" && typeof playing.resumeTransport === "function") {
+        playing.pauseTransport();
+        // A beat between the cancel and the next speak: some engines drop a speak issued in the
+        // same moment as a cancel.
+        const ticket = readingTicket;
+        setTimeout(() => {
+          if (ticket === readingTicket && nowPlaying === playing && !playing.paused) playing.resumeTransport();
+        }, 50);
+      }
+      return;
+    }
+    if (playing.streamed === true && Array.isArray(playing.segments)) jumpReading(playing.segment || 0);
+  }, READ_SPEED_SETTLE_MS);
+}
+
+/** `#567 pace-stepper`. One press of − (`-1`) or + (`+1`): to the next step of ten, within the range. */
+function stepReadSpeed(direction) {
+  const from = readSpeed === null ? 100 : readSpeed;
+  const next = direction > 0
+    ? Math.floor(from / READ_SPEED_STEP) * READ_SPEED_STEP + READ_SPEED_STEP
+    : Math.ceil(from / READ_SPEED_STEP) * READ_SPEED_STEP - READ_SPEED_STEP;
+  applyReadSpeed(Math.min(MAX_READ_SPEED, Math.max(MIN_READ_SPEED, next)));
+}
+
+/**
+ * `#567 pace-stepper`. What is typed in the box, taken on Enter or when the box is left: a number,
+ * with or without "%", clamped to the range. Anything else puts the pace it had back in the box.
+ */
+function commitReadSpeedBox() {
+  const value = el("read-speed-box").value.trim();
+  // Left as it was shown — tapped into and out of — chooses nothing: an unset pace stays the voice's
+  // own, which the box shows as 100%, and a read in progress is not restarted.
+  if (value === `${readSpeed === null ? 100 : readSpeed}%`) return;
+  const typed = /^(\d{1,4}(?:\.\d+)?)\s*%?$/u.exec(value);
+  applyReadSpeed(typed ? Number(typed[1]) : readSpeed);
 }
 
 /** What was stored, clamped. Absent means "as the agent speaks", which is not the same as 100%. */
@@ -56905,8 +56976,18 @@ el("enter-sends").addEventListener("change", () => applyEnterSends(el("enter-sen
 el("jump-bookmark").addEventListener("click", () => guardQuietly(jumpToBookmark)());
 el("back-to-reply").addEventListener("click", backToReply);
 
-el("read-speed-range").addEventListener("input", () => {
-  applyReadSpeed(el("read-speed-range").value);
+el("read-speed-down").addEventListener("click", () => stepReadSpeed(-1));
+el("read-speed-up").addEventListener("click", () => stepReadSpeed(1));
+el("read-speed-box").addEventListener("change", commitReadSpeedBox);
+el("read-speed-box").addEventListener("blur", commitReadSpeedBox);
+el("read-speed-box").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    commitReadSpeedBox();
+  } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+    event.preventDefault();
+    stepReadSpeed(event.key === "ArrowUp" ? 1 : -1);
+  }
 });
 
 // `#376 read-aloud-blocks`. Through the blocks of the read in progress.
@@ -57282,9 +57363,11 @@ const KEYBOARD_MIN_SHARE = 0.2;
  * which is that width's screen with no keyboard; the width last measured; and, across a turn of the
  * phone with the keyboard up, the height the new width was first measured at (`turnedAt`), null otherwise.
  *
- * @type {{up: boolean, tallest: Map<number, number>, width: number, turnedAt: number | null}}
+ * `shown`: whether the page lays itself out for it (`data-keyboard`), which it does not for the pace box.
+ *
+ * @type {{up: boolean, shown: boolean, tallest: Map<number, number>, width: number, turnedAt: number | null}}
  */
-const onScreenKeyboard = { up: false, tallest: new Map(), width: -1, turnedAt: null };
+const onScreenKeyboard = { up: false, shown: false, tallest: new Map(), width: -1, turnedAt: null };
 
 /**
  * Decide again whether the on-screen keyboard is up, as above, and tell the stylesheet when that
@@ -57317,10 +57400,14 @@ function noteKeyboard() {
   const reported = Boolean(virtual && virtual.boundingRect && virtual.boundingRect.height > 0);
   const shrunk = visible > 0 && tallest - visible >= least(tallest);
   const up = typing && (reported || shrunk || onScreenKeyboard.turnedAt !== null);
-  if (up === onScreenKeyboard.up) return;
+  // `#567 pace-stepper`. The pace box raises the keyboard too, but what is being used then is its
+  // popover and the bar it stands on: neither goes, as they do for a message being written.
+  const shown = up && field !== el("read-speed-box");
+  if (up === onScreenKeyboard.up && shown === onScreenKeyboard.shown) return;
   onScreenKeyboard.up = up;
-  document.documentElement.setAttribute("data-keyboard", up ? "open" : "closed");
-  if (up && !el("speed-popover").hidden) closeSpeedPopover();
+  onScreenKeyboard.shown = shown;
+  document.documentElement.setAttribute("data-keyboard", shown ? "open" : "closed");
+  if (shown && !el("speed-popover").hidden) closeSpeedPopover();
 }
 
 if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {

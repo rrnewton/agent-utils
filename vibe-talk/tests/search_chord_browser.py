@@ -182,12 +182,12 @@ def from_the_box(walk: Walk) -> None:
 
 
 def from_the_pace_popover(walk: Walk) -> None:
-    """The pace popover open, the focus on its slider: the dialog of this page."""
+    """The pace popover open, the focus on its box: the dialog of this page."""
     page = walk.page
     page.click("#read-speed")
     page.wait_for_selector("#speed-popover", state="visible", timeout=5000)
-    page.focus("#read-speed-range")
-    bare_slash_opens_nothing(walk, "on the pace popover's slider")
+    page.focus("#read-speed-box")
+    bare_slash_opens_nothing(walk, "on the pace popover's box")
     kb.press(walk.cdp, "Control+/")
     searched(walk, "with the pace popover open")
     check(page.evaluate("() => document.getElementById('speed-popover').hidden") is True,

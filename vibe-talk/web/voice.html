@@ -3823,15 +3823,15 @@
           any one message. `hidden` until asked for.
         -->
         <div id="speed-popover" class="popover" role="dialog" aria-label="Reading pace" hidden>
-          <label id="speed-value" for="read-speed-range">Pace</label>
-          <input
-            id="read-speed-range"
-            type="range"
-            min="50"
-            max="200"
-            step="5"
-            aria-label="reading pace, percent of the agent's own"
-          />
+          <!-- `#567 pace-stepper`. The owner: the slider was "SUPER annoying"; a box for the percent
+               between a minus and a plus, "popping it open and clicking plus a few times". -->
+          <label id="speed-value" for="read-speed-box">Pace</label>
+          <div class="pace-stepper">
+            <button id="read-speed-down" class="pace-step" type="button" aria-label="Slower: 10 percent less">&minus;</button>
+            <input id="read-speed-box" type="text" inputmode="numeric" autocomplete="off" spellcheck="false"
+                   value="100%" aria-label="reading pace, percent of the agent's own" />
+            <button id="read-speed-up" class="pace-step" type="button" aria-label="Faster: 10 percent more">+</button>
+          </div>
           <p id="read-pace-help" class="hint">
             Unset, a message is read at whatever pace the voice agent is configured with.
           </p>
