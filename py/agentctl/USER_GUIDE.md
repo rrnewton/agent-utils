@@ -24,7 +24,9 @@ MCP. The Rust distribution provides the interactive core plus a durable
 event-driven Chat host, a provider-neutral inbound-subscription protocol, and
 safe plugin discovery.** It does not ship a provider executable: an operator
 installs an inbound plugin and separately selects any outbound helper. Headless
-workers and MCP remain bundled capabilities of the Python distribution.
+Codex, AGY and Muse workers and MCP remain bundled capabilities of the Python
+distribution; the Rust distribution runs headless Claude agents (see
+[Headless Claude agents](#headless-claude-agents-rust-edition)).
 
 `list` and `status NAME` retain the launch profile name, requested model and
 reasoning effort, starting directory, and any slot, project and isolation
@@ -40,6 +42,7 @@ Environment metadata contains names only; values remain in private profiles.
 | --- | --- | --- |
 | Interactive | A native Codex, Claude, or Muse TUI that remains directly accessible | Herdr, or tmux in the Rust edition |
 | Headless worker extension | Resumable Codex, AGY, or Muse structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
+| Headless Claude agent (Rust edition) | One persistent Claude Code stream-json process per agent, fed only from its durable queue; `agentctl tail` shows its typed event log | Claude Code; systemd to supervise it |
 | Chat service | Provider messages connected to an interactive coordinator | Herdr and either the Python Google Chat transport or a Rust subscription plugin |
 | MCP extension | The same session operations over local MCP stdio | An MCP client |
 
@@ -1933,6 +1936,172 @@ prose. Successful operations exit 0. Pending interactive work exits 75 and
 uncertain submission exits 76; failures include a diagnostic. Read the reported
 outcome and saved artifact instead of treating every nonzero exit as a request
 to submit again.
+
+## Headless Claude agents (Rust edition)
+
+An interactive coordinator is a TUI that every other program types into and
+reads back from the screen. Typing is exclusive and slow, and screen reads break
+when the harness redraws. A **headless** agent instead runs one persistent
+`claude -p --input-format stream-json --output-format stream-json` process.
+Inputs go in as structured lines that Claude Code acknowledges by their own ID,
+so "the model started this input" is a fact the harness reports, not a guess
+from the screen. Owner chat can be delivered between tool calls of a running
+turn. What the agent does is written to a typed event log that any number of
+`agentctl tail` views can follow.
+
+```sh
+agentctl start coordinator --mode headless --harness claude --cwd ~/work/project \
+  --model claude-opus-5-5 --harness-arg=--settings=$HOME/.local/etc/coordinator-settings.json \
+  --no-launch
+agentctl install-units --headless coordinator --dest ~/.config/systemd/user
+systemctl --user daemon-reload && systemctl --user enable --now agentctl-headless-coordinator.service
+agentctl tail coordinator --follow          # in a Herdr tab: the view of the agent
+agentctl send coordinator 'Status of the open lanes?'
+agentctl send coordinator --urgent 'Stop what you are doing and answer this'
+agentctl interrupt coordinator              # end the running turn
+agentctl compact coordinator                # queue /compact for the turn boundary
+agentctl status coordinator                 # agent_status from the wrapper, queue counts
+agentctl stop coordinator                   # clean stop, archive record, queue and log
+```
+
+`start --mode headless --harness claude` registers an `adapter: harness-wrapper`,
+`mode: headless` record with a new session UUID (`--resume UUID` keeps an existing
+session begun in the same working directory). Without `--no-launch` it also starts
+the wrapper as a detached process logging to `REGISTRY/NAME/headless.log`. With
+`--no-launch` a supervisor runs `agentctl run-headless NAME`; `install-units
+--headless NAME` writes that user unit (`Restart=on-failure`, `KillMode=mixed`,
+`TimeoutStopSec=120`, the installing shell's PATH and CLAUDE_CONFIG_DIR, and the
+`claude` found on that PATH) and nothing else. `--model` becomes `--model`, and every
+`--harness-arg` is passed to Claude Code after the protocol arguments; the
+wrapper owns `-p`, the formats, `--session-id`, `--resume`, `--continue` and
+`--bare` and refuses them. It adds `--permission-prompts none` unless given, so a
+tool call that would ask a human is denied and logged as `permission.denied`
+instead of waiting.
+
+**The wrapper** (`agentctl run-headless NAME`) holds `REGISTRY/NAME/headless.lock`,
+so one agent never has two harness processes. It starts Claude Code with
+`--resume SESSION` when Claude Code has a transcript for the session and with
+`--session-id SESSION` otherwise, and is the **only drainer** of the agent's
+queue: `send`, `drain`, agent-teams delivery, watcher and restore notices, and
+every other sender only enqueue into `inbox.v2/` and wake it through
+`REGISTRY/NAME/control.sock` (mode 0600, no network listener). Each item moves to
+`inflight/` with the usual at-most-once stamps and `harness_input_id` (a fresh
+UUID per attempt), then `paste_started_at`, then is handed to a writer thread
+that feeds the harness. It moves to `processed/` with `started_at` only when
+Claude Code reports the input `started`. `queued` is required within 30 s (counted
+after a 120 s startup grace for a harness that just started), and an input queued
+but left unstarted for 30 s by an idle harness is not waited on forever: both go
+to `failed/` as `possibly_submitted`. An input cancelled before it started goes
+back to its lane.
+The next item is written only after the previous one started. Items with
+`priority: urgent` (`send --urgent`) or `deliver: now` are written mid-turn and
+start between tool calls; the default, `turn-boundary`, waits for the running
+turn to end. On start, an `inflight/` item that was written before a crash is
+looked up in Claude Code's transcript: one the model received moves to
+`processed/` with `recovered: transcript`; the rest are quarantined, never
+replayed. An unexpected harness exit is restarted with `--resume` (backoff, at
+most 5 in 10 minutes, then exit 1 for the supervisor). When the harness died
+inside a turn, or the previous wrapper stopped uncleanly, the agent gets one
+notice telling it to re-read its records. The running harness's kernel identity
+is kept in `REGISTRY/NAME/harness.json` and in the record's `harness_identity`
+(so caller-ancestry checks and agent-teams sender proof find the agent); a new
+wrapper refuses to start while a harness an earlier wrapper started still lives.
+SIGTERM or `agentctl stop` closes the harness's input, waits up to 60 s for it to
+finish, and exits 0; a wrapper that exits on an error ends its harness too.
+
+`send` on a headless agent returns once the model started the input or the
+delivery timeout (`--ready-timeout`) passed; `outcome` is `delivered`, `pending`
+(still queued; the wrapper delivers it later) or `possibly_submitted`. `drain`
+wakes the wrapper and waits for the inputs pending at the call, with the usual
+exit status 0, 75 or 76. When no wrapper runs, inputs stay queued and both report
+`blocked`.
+
+**The event log** is `REGISTRY/NAME/events/<generation>.jsonl` (mode 0600, one
+JSON object per line, appended with one write each) plus `index.json`. Every
+event has `v` (1), `seq` (one more than the previous event of this agent, across
+wrapper generations: `events#SEQ` is a stable address), `id`, `ts` (Unix ms),
+`agent`, `generation`, `session`, `turn`, `causation` (the queue item that caused
+it) and `type`, with type-specific `data`. Events describe; they never act:
+replies still go through `agentctl chat reply` and messages through `agentctl
+send`, so re-reading a log repeats nothing.
+
+| Type | Data |
+| --- | --- |
+| `lifecycle.started`, `lifecycle.stopped` | wrapper build, cwd, settings digest; stop cause |
+| `lifecycle.harness_spawned`, `lifecycle.harness`, `lifecycle.harness_exited` | pid and resume; harness version, model, permission mode; exit code and what happens next |
+| `status` | `idle`, `busy`, `unreachable` (harness restarting), `stopped` |
+| `input.queued` | `queue_id`, `harness_input_id`, `from`, `priority`, `deliver`, `excerpt` (600 bytes) |
+| `input.started`, `input.completed`, `input.cancelled` | `queue_id`, `mid_turn`, `before_start`, `recovered` |
+| `turn.started`, `turn.completed` | `cause` (`input`, or `self` for a turn the harness began); `outcome` (`completed`, `interrupted`, `error`), usage, `cost_usd`, `duration_ms` |
+| `assistant.text` | the agent's prose, verbatim |
+| `tool.started`, `tool.completed` | tool, a 200-byte summary with credential-looking values masked, `ok`, output size; never the output |
+| `permission.denied` | tool and summary |
+| `compact.started`, `compact.completed` | trigger, tokens before and after |
+| `interrupt.requested`, `error` | request ID; error class and message |
+
+A starting wrapper continues `seq` from the larger of `index.json` and the last
+complete line of the newest file, truncating a partial final line. Generations
+older than 90 days, then the oldest beyond 2 GiB, are pruned at start.
+
+**`agentctl tail NAME`** reads the log without a lock: one line per event, prose
+wrapped to `--width`, inputs marked with their sender, turns ruled with usage and
+cost; control characters in sender or model text are shown as U+FFFD, never sent
+to the terminal. `--follow` keeps printing across wrapper restarts, `--last N` and `--since
+SEQ` select, `--types tool.,turn.completed` filters, `--json` prints events
+verbatim, and `--at SEQ` prints one event's whole turn (exit 1 when it is gone).
+A hole in `seq` prints a gap line. It is unrelated to `read --output tail`.
+
+**Permissions.** A headless agent cannot ask anyone, so its settings file decides
+everything: allow rules for the coordinator's tools and, because host settings or
+a launcher sandbox may approve more than the file names, explicit deny rules for
+what must never run. This example is a starting point; review it against your
+Claude Code version (file rules use `Edit(...)`, which covers every editing
+tool), keep host-specific rules in a private copy, have the owner sign it off,
+and pass it with `--harness-arg=--settings=FILE`. The settings file's digest is
+recorded in `lifecycle.started`.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(agentctl *)",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(git fetch*)",
+      "Bash(git rev-parse*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(date*)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Bash(sudo *)",
+      "Bash(systemctl --user stop *)",
+      "Bash(systemctl --user disable *)",
+      "Bash(pkill *)",
+      "Bash(killall *)",
+      "Edit(~/.config/systemd/**)"
+    ]
+  }
+}
+```
+
+**Taking over.** To use the TUI on the same conversation, `agentctl stop NAME`
+(the receipt names the session), then run `claude --resume SESSION` in the
+agent's working directory; start a headless agent with `--resume SESSION` to go
+back. `watch-agents` does not watch headless agents yet; their event log and
+`status` are their status.
 
 ## Headless worker extension
 

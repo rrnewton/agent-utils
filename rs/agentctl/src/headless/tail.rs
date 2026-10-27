@@ -124,9 +124,32 @@ fn text_of<'a>(data: &'a Value, key: &str) -> &'a str {
     data.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-/// The human rendering of one event: zero or more lines.
+/// `line` safe for a terminal: tabs become spaces, and control and bidirectional-override
+/// characters (escape sequences in a sender's text or the model's output) become U+FFFD.
+fn sanitize(line: String) -> String {
+    if !line
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+    {
+        return line;
+    }
+    line.chars()
+        .map(|c| match c {
+            '\t' => ' ',
+            c if c.is_control() => '\u{fffd}',
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+/// The human rendering of one event: zero or more lines, safe to print to a terminal.
 #[must_use]
 pub fn render(event: &Event, width: usize) -> Vec<String> {
+    render_raw(event, width).into_iter().map(sanitize).collect()
+}
+
+fn render_raw(event: &Event, width: usize) -> Vec<String> {
     let data = &event.data;
     let time = clock(event.ts);
     let head = format!("{time} ");
@@ -588,6 +611,32 @@ mod tests {
         );
         assert!(!found);
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn escape_sequences_in_text_are_neutralised() {
+        let event = Event {
+            v: 1,
+            seq: 1,
+            id: "evt-1-1".to_owned(),
+            ts: 0,
+            agent: "a".to_owned(),
+            generation: 1,
+            session: None,
+            turn: 1,
+            causation: None,
+            kind: "assistant.text".to_owned(),
+            data: json!({"text": "hi \u{1b}]52;c;cGF5bG9hZA==\u{7}there\u{202e}x\tend"}),
+        };
+        let lines = render(&event, 100);
+        assert!(
+            lines.iter().all(|line| !line.chars().any(char::is_control)),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("hi \u{fffd}]52;c;cGF5bG9hZA==\u{fffd}there\u{fffd}x end"),
+            "{lines:?}"
+        );
     }
 
     #[test]

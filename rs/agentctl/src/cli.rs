@@ -197,6 +197,17 @@ enum Commands {
         after_help = "Examples:\n  agentctl tail coordinator --follow\n  agentctl tail coordinator --last 50 --types assistant.text,turn.\n  agentctl tail coordinator --json --since 4180\n  agentctl tail coordinator --at 4182\n\nThe log is REGISTRY/NAME/events/<generation>.jsonl (schema v1, one JSON object per line; see\n`agentctl userguide`). Any number of tails may run beside the agent; closing one never touches it.\nA hole in the sequence (pruned or unreadable lines) prints as a gap line. Not to be confused with\n`agentctl read --output tail`, which reads an interactive agent's pane."
     )]
     Tail(Tail),
+    /// Run a headless agent's wrapper in the foreground: one persistent harness process (Claude Code stream-json) that is the only drainer of the agent's queue; normally run by a systemd user unit
+    #[command(
+        after_help = "Examples:\n  agentctl run-headless coordinator\n  agentctl install-units --headless coordinator --dest ~/.config/systemd/user\n\nThe wrapper resumes the agent's recorded session when Claude Code has a transcript for it,\nrecovers inputs a previous wrapper left in flight from that transcript, writes the event log,\nand serves REGISTRY/NAME/control.sock. SIGTERM closes the harness's input, waits up to 60 s for\nit to finish, and exits 0. An unexpected harness exit restarts it with --resume (backoff, at\nmost 5 in 10 minutes), then exits 1. Exit 75 when another wrapper already serves NAME."
+    )]
+    RunHeadless(RunHeadless),
+    /// Interrupt a headless agent's running turn; queued inputs stay queued and run next
+    #[command(after_help = "Example: agentctl interrupt coordinator")]
+    Interrupt(Named),
+    /// Queue /compact for a headless agent; it runs when the current turn ends and the log records compact.started and compact.completed with token counts
+    #[command(after_help = "Example: agentctl compact coordinator")]
+    Compact(Named),
     /// Ask every drain not to type a queued prompt: write its tombstone without waiting for any lock, and report where the prompt is
     #[command(
         after_help = "Examples:\n  agentctl cancel reviewer review-1\n  agentctl cancel reviewer hold-3 --reason superseded\n\nThe tombstone is QUEUE/cancel/MESSAGE_ID.json. A drain checks it after taking the prompt and before\ntyping, so a prompt reported pending is never typed: the drain moves it to cancelled/. outcome is\npending, unknown (no such prompt yet; one that arrives later is set aside too), inflight (a drain\nhas taken it and may be typing it), too_late (typed or quarantined), or already_cancelled. Once a\nqueue has a tombstone, the other edition refuses to drain it."
@@ -355,6 +366,11 @@ struct InstallUnits {
     /// Replace existing files whose contents differ
     #[arg(long)]
     force: bool,
+    /// Write only agentctl-headless-NAME.service, which runs `agentctl run-headless NAME` for
+    /// the headless agent NAME, instead of the restore units; the unit gets this shell's PATH,
+    /// CLAUDE_CONFIG_DIR when set, and the claude found on PATH
+    #[arg(long, value_name = "NAME", conflicts_with = "bridge_unit")]
+    headless: Option<String>,
 }
 
 #[derive(Args)]
@@ -382,6 +398,15 @@ struct Tail {
     /// Print the event with this sequence number and the rest of its turn, then exit; exit 1 when it does not exist
     #[arg(long, value_name = "SEQ", conflicts_with_all = ["follow", "since", "last"])]
     at: Option<u64>,
+}
+
+#[derive(Args)]
+struct RunHeadless {
+    #[command(flatten)]
+    agent: Named,
+    /// Claude Code executable (default: claude on PATH)
+    #[arg(long, value_name = "PATH")]
+    claude_bin: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -749,6 +774,10 @@ struct Start {
     /// Seconds to wait for harness startup, greater than zero and at most 300
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
+    /// With --mode headless: register the agent without starting its wrapper, for a supervisor
+    /// that runs `agentctl run-headless NAME` (see install-units --headless)
+    #[arg(long)]
+    no_launch: bool,
     #[command(flatten)]
     delivery: Delivery,
 }
@@ -2078,6 +2107,45 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     std::env::current_exe().map_err(|error| Failure::Usage(error.to_string()))?
                 }
             };
+            if let Some(name) = value.headless {
+                // The unit runs with the installer's PATH and Claude Code, so the harness and
+                // the agent's tools resolve as they do here.
+                let path = std::env::var("PATH").ok().filter(|path| !path.is_empty());
+                let claude = path.as_deref().and_then(|path| {
+                    std::env::split_paths(path)
+                        .map(|directory| directory.join("claude"))
+                        .find(|candidate| candidate.is_file())
+                });
+                let mut environment = Vec::new();
+                if let Some(path) = path {
+                    environment.push(("PATH".to_owned(), path));
+                }
+                if let Some(config) = std::env::var("CLAUDE_CONFIG_DIR")
+                    .ok()
+                    .filter(|config| !config.is_empty())
+                {
+                    environment.push(("CLAUDE_CONFIG_DIR".to_owned(), config));
+                }
+                let unit = crate::units::HeadlessUnit {
+                    claude,
+                    environment,
+                };
+                write_json(&crate::units::install_headless(
+                    &crate::units::InstallOptions {
+                        dest: value.dest,
+                        agentctl,
+                        herdr,
+                        registry: absolute(&args.registry)?,
+                        bridge_unit: None,
+                        dry_run: value.dry_run,
+                        force: value.force,
+                    },
+                    &name,
+                    &unit,
+                )?)
+                .map_err(Failure::Output)?;
+                return Ok(0);
+            }
             write_json(&crate::units::install(&crate::units::InstallOptions {
                 dest: value.dest,
                 agentctl,
@@ -2304,71 +2372,104 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         cloud,
                     )
                 };
-            if mode != "interactive" {
-                return Err(Failure::Usage("Rust agentctl supports interactive sessions; use agentctl with the worker extension for headless workers (the Python edition; for example DAGRUN_ENGINE=python)".to_owned()));
-            }
-            if value
-                .backend
-                .as_deref()
-                .is_some_and(|backend| backend != selected_backend.as_str())
-            {
-                return Err(Failure::Usage(format!(
-                    "start --backend {} does not match the selected terminal backend {}; \
-                     pass a matching --term-backend or drop --backend",
-                    value.backend.as_deref().unwrap_or_default(),
-                    selected_backend.as_str()
-                )));
-            }
-            let brief = match value.file {
-                Some(path) => Some(
-                    fs::read_to_string(path).map_err(|error| Failure::Usage(error.to_string()))?,
-                ),
-                None => value.brief,
-            };
-            let slot = if value.project_box {
-                Some(SlotLaunch {
-                    slot: value
-                        .box_name
-                        .clone()
-                        .unwrap_or_else(|| value.agent.name.clone()),
-                    isolation: value.box_isolation.clone(),
-                    project: value.box_project.clone(),
-                    project_box: true,
-                    box_writable: value.box_writable.clone(),
-                    ..SlotLaunch::default()
-                })
-            } else {
-                value.slot.clone().map(|slot| SlotLaunch {
-                    slot,
-                    isolation: value.slot_isolation.clone(),
-                    project: value.slot_project.clone(),
-                    ..SlotLaunch::default()
-                })
-            };
-            let options = StartOptions {
-                workspace_id: value.workspace_id,
-                profile: value.profile,
-                harness,
-                model,
-                resume: value.resume,
-                harness_args,
-                environment,
-                brief,
-                startup_timeout: Duration::from_secs_f64(value.startup_timeout),
-                delivery: value.delivery.options(),
-                cloud,
-                slot,
-                record_edges,
-            };
-            if let Some(effort) = reasoning_effort.as_deref() {
-                manager.start_with_reasoning_effort(
+            if mode == "headless" && harness == "claude" && value.profile.is_none() {
+                let brief = match value.file {
+                    Some(path) => Some(
+                        fs::read_to_string(path)
+                            .map_err(|error| Failure::Usage(error.to_string()))?,
+                    ),
+                    None => value.brief,
+                };
+                if reasoning_effort.is_some() || !environment.is_empty() || value.slot.is_some() {
+                    return Err(Failure::Usage(
+                        "--reasoning-effort, --env and --slot do not apply to a headless Claude agent; pass harness options with --harness-arg".to_owned(),
+                    ));
+                }
+                manager.start_headless(
                     &value.agent.name,
                     &value.cwd,
-                    effort,
-                    options,
+                    crate::subagents::HeadlessStart {
+                        harness,
+                        model,
+                        arguments: harness_args,
+                        session: value.resume,
+                        launch: !value.no_launch,
+                        brief,
+                        record_edges,
+                    },
                 )?
+            } else if mode != "interactive" {
+                return Err(Failure::Usage("Rust agentctl runs headless Claude agents (start --mode headless --harness claude) and interactive sessions; use agentctl with the worker extension for other headless workers (the Python edition; for example DAGRUN_ENGINE=python)".to_owned()));
             } else {
-                manager.start(&value.agent.name, &value.cwd, options)?
+                if value.no_launch {
+                    return Err(Failure::Usage(
+                        "--no-launch applies only with --mode headless".to_owned(),
+                    ));
+                }
+                if value
+                    .backend
+                    .as_deref()
+                    .is_some_and(|backend| backend != selected_backend.as_str())
+                {
+                    return Err(Failure::Usage(format!(
+                        "start --backend {} does not match the selected terminal backend {}; \
+                     pass a matching --term-backend or drop --backend",
+                        value.backend.as_deref().unwrap_or_default(),
+                        selected_backend.as_str()
+                    )));
+                }
+                let brief = match value.file {
+                    Some(path) => Some(
+                        fs::read_to_string(path)
+                            .map_err(|error| Failure::Usage(error.to_string()))?,
+                    ),
+                    None => value.brief,
+                };
+                let slot = if value.project_box {
+                    Some(SlotLaunch {
+                        slot: value
+                            .box_name
+                            .clone()
+                            .unwrap_or_else(|| value.agent.name.clone()),
+                        isolation: value.box_isolation.clone(),
+                        project: value.box_project.clone(),
+                        project_box: true,
+                        box_writable: value.box_writable.clone(),
+                        ..SlotLaunch::default()
+                    })
+                } else {
+                    value.slot.clone().map(|slot| SlotLaunch {
+                        slot,
+                        isolation: value.slot_isolation.clone(),
+                        project: value.slot_project.clone(),
+                        ..SlotLaunch::default()
+                    })
+                };
+                let options = StartOptions {
+                    workspace_id: value.workspace_id,
+                    profile: value.profile,
+                    harness,
+                    model,
+                    resume: value.resume,
+                    harness_args,
+                    environment,
+                    brief,
+                    startup_timeout: Duration::from_secs_f64(value.startup_timeout),
+                    delivery: value.delivery.options(),
+                    cloud,
+                    slot,
+                    record_edges,
+                };
+                if let Some(effort) = reasoning_effort.as_deref() {
+                    manager.start_with_reasoning_effort(
+                        &value.agent.name,
+                        &value.cwd,
+                        effort,
+                        options,
+                    )?
+                } else {
+                    manager.start(&value.agent.name, &value.cwd, options)?
+                }
             }
         }
         Commands::Adopt(value) => {
@@ -2502,7 +2603,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .read()
                 .map_err(Failure::Usage)?
                 .ok_or_else(|| Failure::Usage("send requires prompt text or --file".to_owned()))?;
-            if manager.is_cloud(&value.agent.name)? {
+            if manager.is_headless(&value.agent.name)? {
+                let not_after = value.ttl.map(|ttl| {
+                    crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
+                });
+                json!(manager.send_headless(
+                    &value.agent.name,
+                    &text,
+                    value.message_id.as_deref(),
+                    value.urgent,
+                    not_after,
+                    value.delivery.options().ready_timeout,
+                )?)
+            } else if manager.is_cloud(&value.agent.name)? {
                 if value.ttl.is_some() {
                     return Err(Failure::Usage(
                         "--ttl applies to interactive agents; agentcloud journals the prompt at once"
@@ -2553,6 +2666,20 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 document
             }
         }
+        Commands::Interrupt(value) => manager.headless_control(&value.name, "interrupt")?,
+        Commands::Compact(value) => manager.compact_headless(&value.name)?,
+        Commands::RunHeadless(value) => {
+            let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+                signal_hook::flag::register(signal, terminate.clone())
+                    .map_err(|error| Failure::Usage(format!("cannot handle signals: {error}")))?;
+            }
+            return Ok(manager.run_headless(
+                &value.agent.name,
+                value.claude_bin.as_deref(),
+                terminate,
+            )?);
+        }
         Commands::Cancel(value) => {
             manager.cancel_message(&value.agent.name, &value.message_id, &value.reason)?
         }
@@ -2565,7 +2692,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
                 ..value.delivery.options()
             };
-            let result = manager.drain(&value.agent.name, options)?;
+            let result = if manager.is_headless(&value.agent.name)? {
+                manager.drain_headless(&value.agent.name, &options)?
+            } else {
+                manager.drain(&value.agent.name, options)?
+            };
             write_json(&result).map_err(Failure::Output)?;
             return Ok(if result.blocked.is_some() {
                 75
@@ -3005,7 +3136,7 @@ fn capabilities_document(
             "requires": ["herdr", "agentcloudctl", "agentterm"],
             "capabilities": CLOUD_CAPABILITIES
         },
-        "headless": null,
+        "headless": crate::headless::capabilities(),
         "queue": {
             "lanes": [
                 agent_queue::queue::INBOX_V2,
@@ -3069,6 +3200,18 @@ const CLOUD_CAPABILITIES: [&str; 9] = [
     "final-output",
 ];
 
+/// What a headless (`harness-wrapper`) agent supports.
+const HEADLESS_CAPABILITIES: [&str; 8] = [
+    "send",
+    "drain",
+    "status",
+    "tail",
+    "interrupt",
+    "compact",
+    "cancel",
+    "stop",
+];
+
 fn add_capabilities(value: &mut serde_json::Value) {
     if let Some(values) = value.as_array_mut() {
         for value in values {
@@ -3089,6 +3232,8 @@ fn add_capabilities(value: &mut serde_json::Value) {
         let adapter = adapter.as_deref();
         value["capabilities"] = if adapter == Some("agentcloud") {
             json!(CLOUD_CAPABILITIES)
+        } else if adapter == Some(crate::headless::ADAPTER) {
+            json!(HEADLESS_CAPABILITIES)
         } else if matches!(
             adapter,
             Some(
