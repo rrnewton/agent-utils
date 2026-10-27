@@ -1,10 +1,11 @@
 ---
 title: 'headings-real-headings: Markdown headings show as real headings in vibe-talk on both Slack posting paths'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-26T20:16:41.097314550+00:00
-updated_at: 2026-10-26T20:16:41.097314550+00:00
+updated_at: 2026-10-27T00:14:17.626210254+00:00
+closed_at: 2026-10-27T00:14:17.626210114+00:00
 ---
 
 # Description
