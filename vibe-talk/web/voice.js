@@ -10352,7 +10352,7 @@ function sendUserMessage(text, options) {
   // A send that cut the answer short keeps saying so (`interruptForTyped`), rather than "Sent.".
   if (!session.cutForTyped) setStatus("Sent.");
   session.cutForTyped = false;
-  if (answerToCard) reportSpokenOutcome(answerToCard);
+  if (answerToCard) reportAnswerOutcome(classifySpokenAnswer(said), answerToCard);
   return true;
 }
 
@@ -16062,7 +16062,10 @@ function noteNotSent(why, proposal, conversationId) {
     where = shown !== undefined && shown !== null ? shown : session.conversationId;
   }
   const li = placeInConversation(notSentSeam(why, []), where || null);
-  if (why === "lapsed") setStatus(`The draft to ${proposal.channel_name} lapsed; nothing was posted.`);
+  if (why === "lapsed") {
+    setStatus(`The draft to ${proposal.channel_name} lapsed; nothing was posted.`);
+    tellAgentOfLapse(proposal);
+  }
   if (transcriptRecordsSupported && where) {
     const marker = { kind: "not_sent", why, serial: proposal.serial };
     recordInScreenOrder(() => void recordRecord(where, { speaker: "marker", text: "", marker }));
@@ -16213,6 +16216,14 @@ function settleCardAtCallEnd(cause) {
 const SPOKEN_YES_SETTLE_MS = 1200;
 /** How soon after the read-back's audio ends an answer made of its last words is taken for its echo. */
 const SPOKEN_YES_ECHO_GUARD_MS = 1500;
+/**
+ * How long the page's word on an answer that was not a plain yes waits for a new draft, which it
+ * then never says. `#579 voice-send-confirm-timing`: the owner's own "send X on channel Y" says send,
+ * so it was judged as an answer to the card, and the agent, drafting X at that moment, was told the
+ * last draft had lapsed or was NOT sent — and told him so as the new card came up. A request makes a
+ * draft within a few seconds: the agent's reply, its tool call, and this page's watch waking.
+ */
+const REDRAFT_WAIT_MS = 6500;
 
 /** Answers that mean yes, as word lists; matched whole, longest first. */
 const SPOKEN_YES_PHRASES = [
@@ -16241,6 +16252,8 @@ const SPOKEN_YES_HINTS = new Set([
 ]);
 /** Words that make sending the subject: of a question the assistant asked, or of the answer itself. */
 const SENDING_WORDS = new Set(["send", "sent", "sending", "post", "posted", "posting"]);
+/** What stands between a word that sends and where it sends to (`namesWhereToSend`). */
+const SEND_DESTINATION_WORDS = new Set(["to", "in", "on", "into"]);
 /** How many closing words stand for the question in a transcript with no punctuation at all. */
 const SENDING_QUESTION_WORDS = 6;
 /**
@@ -16359,6 +16372,10 @@ const spokenYes = {
   // read-back that arrives once it has lapsed or been settled is still answered.
   /** @type {VibeTalk.PendingPost | null} */
   lastShown: null,
+  // The page's word on an answer that may have been a new request, held for REDRAFT_WAIT_MS and
+  // dropped if the card changes first (`reportUnlessRedrafted`). `#579 voice-send-confirm-timing`.
+  /** @type {{outcome: any, from: string | null, timer: any} | null} */
+  redraft: null,
   // Whether this call's agent was told to ask before it sends, as the server said when the call
   // began: an agent that posts at once asks nothing, so there is no yes to judge.
   askFirst: true,
@@ -16578,6 +16595,85 @@ function mayBeYes(kind, text) {
 }
 
 /**
+ * Does `text` ask to send something somewhere: a word that sends, and after it "to", "in", "on" or
+ * "into" with a word after that? "Send hello on lead team", "post that in the lead channel", "send it
+ * to Bob" do; "ok send it", "yep that's right, send it" and "go on, send it" do not. Pure.
+ * `#579 voice-send-confirm-timing`: with no card up, such a turn is the owner's new request, never
+ * an answer to a draft that has gone.
+ */
+function namesWhereToSend(text) {
+  const words = answerWords(text);
+  const verb = words.findIndex((word) => SENDING_WORDS.has(word));
+  if (verb < 0) return false;
+  const to = words.findIndex((word, at) => at > verb && SEND_DESTINATION_WORDS.has(word));
+  return to > verb && to < words.length - 1;
+}
+
+/**
+ * Say what came of an answer of kind `kind`: at once for a plain yes, whose agent said "One moment."
+ * and is waiting; for anything else, only if the card is unchanged REDRAFT_WAIT_MS later. `#579
+ * voice-send-confirm-timing`.
+ *
+ * @param {"affirmative" | "negative" | "hint" | "other"} kind
+ * @param {{kind: string, proposal?: VibeTalk.PendingPost | null, reason?: string}} outcome
+ */
+function reportAnswerOutcome(kind, outcome) {
+  if (kind === "affirmative") reportSpokenOutcome(outcome);
+  else reportUnlessRedrafted(outcome);
+}
+
+/**
+ * Report `outcome` REDRAFT_WAIT_MS from now, unless the card changes first.
+ *
+ * An answer that is not a plain yes may be the owner asking for something new ("send hello on lead
+ * team" says send), and the agent drafts it while the page judges it. A new draft on the card says
+ * so, and the word about the old card is dropped: it would tell the agent, and the owner by status
+ * line, seam and tone, that a draft was not sent or had lapsed just as the new one came up. The card
+ * changing any other way — Send, Don't send, a lapse — has its own word, so this one is dropped too.
+ * A plain yes is never held: its agent says only "One moment." and waits for the page.
+ *
+ * @param {{kind: string, proposal?: VibeTalk.PendingPost | null, reason?: string}} outcome
+ */
+function reportUnlessRedrafted(outcome) {
+  dropRedraftWait();
+  const epoch = spokenYes.epoch;
+  const wait = { outcome, from: postWatch.shown ? postWatch.shown.handle : null, timer: /** @type {any} */ (null) };
+  wait.timer = setTimeout(() => {
+    if (spokenYes.redraft !== wait) return;
+    spokenYes.redraft = null;
+    if (spokenYes.epoch !== epoch || !session.connected) return;
+    reportSpokenOutcome(outcome);
+  }, REDRAFT_WAIT_MS);
+  spokenYes.redraft = wait;
+}
+
+/** Say the word held by `reportUnlessRedrafted` at once, if one is held. */
+function sayRedraftWait() {
+  const wait = spokenYes.redraft;
+  if (!wait) return;
+  dropRedraftWait();
+  reportSpokenOutcome(wait.outcome);
+}
+
+/**
+ * The agent is calling `post_reply` while a word is held: a draft is on its way, so the hold starts
+ * again from now rather than running out before the draft reaches the card. Hosted protocol only,
+ * where the voice service reports its tool calls (`mcp_tool_call`).
+ */
+function extendRedraftWait() {
+  const wait = spokenYes.redraft;
+  if (wait) reportUnlessRedrafted(wait.outcome);
+}
+
+/** Forget the word held by `reportUnlessRedrafted`, unsaid. */
+function dropRedraftWait() {
+  const wait = spokenYes.redraft;
+  if (!wait) return;
+  clearTimeout(wait.timer);
+  spokenYes.redraft = null;
+}
+
+/**
  * Forget the conversation so far: a new call, a hang-up, or a replacement voice session.
  *
  * @param {"earlier_draft" | "replaced_session"} [why] why a draft on the card now may not be sent by voice
@@ -16601,6 +16697,7 @@ function resetSpokenYes(why = "earlier_draft") {
   spokenYes.answered = null;
   spokenYes.eligible = null;
   spokenYes.lastShown = null;
+  dropRedraftWait();
   // Whatever is on the card now was proposed to a conversation that is over, or to a session that
   // did not see it: a tap may still send it, a yes may not.
   spokenYes.ineligible = postWatch.shown ? postWatch.shown.handle : null;
@@ -16657,6 +16754,8 @@ function noteProposalsAtCallOpen(proposal) {
 function noteCardForSpokenYes(proposal, previous) {
   const handle = proposal ? proposal.handle : null;
   if (handle === (previous ? previous.handle : null)) return;
+  // A held word about the card that was there is about a card that is not there now.
+  if (spokenYes.redraft && spokenYes.redraft.from !== handle) dropRedraftWait();
   if (spokenYes.settling && spokenYes.settling.handle !== handle) abortSpokenYes("changed");
   spokenYes.eligible = handle !== null && handle !== spokenYes.ineligible ? handle : null;
   if (proposal) spokenYes.lastShown = proposal;
@@ -17000,14 +17099,19 @@ function heardBefore(answer) {
  */
 function judgeSpokenAnswer(text, heard, refused = null) {
   if (!session.connected || !spokenYes.askFirst) return;
+  // The owner spoke again with no new draft on the card: the word held for the last answer is said
+  // now, as it would have been before the hold, so a "did it go?" never meets an agent the page has
+  // told nothing. This answer is then judged on its own.
+  sayRedraftWait();
   const shown = postWatch.shown;
   const kind = classifySpokenAnswer(text);
   const asked = askedAboutSending(heard.sinceUser, text);
   if (!shown) {
     // This call's draft has gone — it lapsed and the watch took it down, or it was settled — and an
-    // agent that asked about it, told to say only "One moment." on a yes, would wait for nothing.
-    if (spokenYes.lastShown && asked && mayBeYes(kind, text)) {
-      reportSpokenOutcome({ kind: "gone", proposal: spokenYes.lastShown });
+    // agent that asked about it, told to say only "One moment." on a yes, would wait for nothing. A
+    // send that names where it goes is a new request, not an answer to a draft that is not there.
+    if (spokenYes.lastShown && asked && mayBeYes(kind, text) && !namesWhereToSend(text)) {
+      reportAnswerOutcome(kind, { kind: "gone", proposal: spokenYes.lastShown });
     }
     return;
   }
@@ -17029,13 +17133,13 @@ function judgeSpokenAnswer(text, heard, refused = null) {
   // owner not knowing. A longer answer with nothing like a yes in it is a request of its own.
   if (!mayBeYes(kind, text)) return;
   if (!eligible) {
-    reportSpokenOutcome({
+    reportAnswerOutcome(kind, {
       kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS[spokenYes.ineligibleWhy],
     });
     return;
   }
   if (kind !== "affirmative") {
-    reportSpokenOutcome({ kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS.hint });
+    reportAnswerOutcome(kind, { kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS.hint });
     return;
   }
   const refusal = refused || spokenYesRefusal(shown, text, heard);
@@ -17083,7 +17187,9 @@ function typedAnswerToCard(text) {
   if (kind !== "affirmative" && kind !== "hint") return null;
   if (!askedAboutSending([...spokenYes.sinceUser.values()], text)) return null;
   const shown = postWatch.shown;
-  if (!shown) return spokenYes.lastShown ? { kind: "gone", proposal: spokenYes.lastShown } : null;
+  if (!shown) {
+    return spokenYes.lastShown && !namesWhereToSend(text) ? { kind: "gone", proposal: spokenYes.lastShown } : null;
+  }
   const why = shown.handle !== spokenYes.eligible
     ? spokenYes.ineligibleWhy
     : session.chat ? "typed_call" : "typed_yes";
@@ -17488,6 +17594,10 @@ function outcomeNotice(outcome, how) {
     case "withdrawn":
       return "Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent. " +
         "Say so in a few words. Then stop.";
+    case "lapsed":
+      return `Voice page: the draft to ${channel} lapsed: nobody tapped Send or said yes in time, ` +
+        "so it was NOT sent and the card is gone. Tell the user in one short sentence, and offer to " +
+        "draft it again. Then stop.";
     case "declined":
       // The agent heard the no itself, and will offer new words or drop it; telling it again would
       // only make it speak twice.
@@ -17520,6 +17630,23 @@ function tellAgent(notice) {
  */
 function tellAgentAboutTap(outcome) {
   tellAgent(outcomeNotice(outcome, "tap"));
+}
+
+/**
+ * This call's draft lapsed on the server with nobody's answer: told to the agent, so it neither waits
+ * on a card that has gone nor, asked later, says it is still there. `#579 voice-send-confirm-timing`.
+ * Only a draft this call's agent made and the card showed; one already waiting when the call began,
+ * or left from an agent told to post at once, is not its to report.
+ *
+ * @param {VibeTalk.PendingPost} proposal
+ */
+function tellAgentOfLapse(proposal) {
+  if (!spokenYes.askFirst || proposal.handle === spokenYes.ineligible) return;
+  // A yes settling on it is stopped by the card going, and says so itself; a notice of the page's own
+  // would cut that yes short first, as a typed turn does, and be a second word on one draft.
+  if (spokenYes.settling) return;
+  if (!spokenYes.lastShown || spokenYes.lastShown.handle !== proposal.handle) return;
+  tellAgent(outcomeNotice({ kind: "lapsed", proposal }, "tap"));
 }
 
 /**
@@ -20632,9 +20759,65 @@ function handle(socket, message) {
         JSON.stringify({ type: "pong", event_id: (message.ping_event || {}).event_id })
       );
       break;
+    case "mcp_tool_call":
+      answerVendorApproval(socket, message.mcp_tool_call || {});
+      break;
     default:
       break;
   }
+}
+
+/**
+ * The voice service asks this page to approve a tool call. `#579 voice-send-confirm-timing`.
+ *
+ * A tool the agent's settings mark "requires approval" reaches the client as `mcp_tool_call` in state
+ * `awaiting_approval`, answered by `mcp_tool_approval_result`; the call fails when nobody answers
+ * within its `approval_timeout_secs`. The README had owners put `post_reply` there, and this page
+ * never answered, so the agent was told its send had timed out. While the server asks first,
+ * `post_reply` only proposes — the server holds the draft for the card, and the owner's Send or yes
+ * is the approval — so the page approves it. "Asks first" is read from the server as the request
+ * arrives, as the server reads it for every `post_reply`, and not from what this page last heard:
+ * the owner may have turned it off on another device, and then the vendor's gate is the one left.
+ * A read that fails, or a server that posts at once, approves nothing. Nor is any other tool
+ * approved: those keep whatever gate the owner set at the vendor, and the connection details say
+ * one is waiting. A call from a second MCP server that also names a `post_reply` is not told apart;
+ * this page knows no service id of its own to tell it by.
+ *
+ * Other states of a `post_reply` call say the agent is calling it, so a word held over an answer
+ * that may have asked for this draft waits for it (`extendRedraftWait`).
+ *
+ * @param {WebSocket} socket
+ * @param {{state?: string, tool_call_id?: string, tool_name?: string}} call
+ */
+function answerVendorApproval(socket, call) {
+  if (call.tool_name === "post_reply" && (call.state === "loading" || call.state === "awaiting_approval")) {
+    extendRedraftWait();
+  }
+  if (call.state !== "awaiting_approval" || typeof call.tool_call_id !== "string") return;
+  if (call.tool_name !== "post_reply" || !spokenYes.askFirst) {
+    addDetail(
+      `the voice service is waiting for someone to approve ${call.tool_name || "a tool"}; this page ` +
+        "does not, so the call will time out — set that tool to run without approval in the agent's settings"
+    );
+    return;
+  }
+  const id = call.tool_call_id;
+  void (async () => {
+    let asks = false;
+    try {
+      const setting = await apiDecoded("VoiceSettings", "/api/v1/voice-settings");
+      asks = setting.ask_before_send === true;
+    } catch (_error) {
+      asks = false;
+    }
+    if (session.socket !== socket) return;
+    if (!asks) {
+      addDetail("the voice service asked to approve post_reply; not approved, since this server now posts at once");
+      return;
+    }
+    socket.send(JSON.stringify({ type: "mcp_tool_approval_result", tool_call_id: id, is_approved: true }));
+    addDetail("the voice service asked to approve post_reply; approved, since it only drafts — the card asks you");
+  })();
 }
 
 // --- live transcript reconciliation ------------------------------------------------------------

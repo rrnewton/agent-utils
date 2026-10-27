@@ -496,7 +496,7 @@ async fn with_confirmation_on_post_reply_still_only_proposes() {
     )
     .await;
     let said = tool_text(&response);
-    assert!(said.starts_with("NOT SENT."), "{said}");
+    assert!(said.starts_with("NOT SENT YET."), "{said}");
     assert!(said.contains("Send it?"), "{said}");
     // The agent is handed the finished read-back and told to hold on a yes, not to claim a send.
     assert!(said.contains("say only \"One moment.\""), "{said}");
@@ -706,7 +706,10 @@ async fn a_server_with_no_store_refuses_the_change_and_keeps_asking() {
         json!({ "channel_id": WRITE_CHANNEL, "text": "on it" }),
     )
     .await;
-    assert!(tool_text(&response).starts_with("NOT SENT."), "{response}");
+    assert!(
+        tool_text(&response).starts_with("NOT SENT YET."),
+        "{response}"
+    );
     assert!(harness.discord.posted().is_empty());
 }
 

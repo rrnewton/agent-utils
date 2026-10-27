@@ -254,7 +254,9 @@ fn initialize_result(params: Option<&Value>) -> Value {
             "post_reply's own description says whether it posts at once or proposes a draft ",
             "the speaker confirms outside your tools; the owner chooses which. Never say a ",
             "message was sent unless the post_reply result begins with SENT or the voice page ",
-            "reports that it was sent, and never say it was not sent when the result begins ",
+            "reports that it was sent. A result that begins NOT SENT YET is a draft waiting on ",
+            "the speaker's confirmation card: it has not failed or timed out, so never say it ",
+            "has. Never say it was not sent when the result begins ",
             "NOT CONFIRMED or there was no result at all: it may have posted, so do not call ",
             "post_reply again for the same words. Every message you read carries its author's mention token beside the ",
             "name, as <@author id>; to notify that person, put that exact token in the reply. ",
@@ -1475,7 +1477,7 @@ async fn run_read(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
 ///
 /// While he has the agent ask first — the shipped default — it PROPOSES, as `#34
 /// voice-chat-write-confirm` made it: nothing reaches the channel from here, and the answer is
-/// [`ops::proposal_notice`] — NOT SENT, the exact text to read back, and that the confirmation is
+/// [`ops::proposal_notice`] — NOT SENT YET, the exact text to read back, and that the confirmation is
 /// not the model's to give. The handle that would commit the proposal is deliberately NOT in it.
 ///
 /// With that turned off it posts through the shared send path and answers
@@ -1829,7 +1831,7 @@ mod tests {
         assert!(!is_error(&outcome), "{text}");
         // `#34 voice-chat-write-confirm`. The model is told, first, that nothing went out, and is
         // given the exact text to read back — but never the handle that would send it.
-        assert!(text.starts_with("NOT SENT."), "{text}");
+        assert!(text.starts_with("NOT SENT YET."), "{text}");
         // `#303 voice-post-prefix`: with the owner's tag, which is what will be posted.
         let tagged = format!("{}landed it", crate::post_prefix::DEFAULT_PREFIX);
         assert!(text.contains(&format!("Exact text: {tagged}")), "{text}");

@@ -486,10 +486,12 @@ fn post_reply_description(approval: crate::send_approval::Approval, writable: &s
         format!(
             "Propose a message to post to a channel AS THE OWNER'S BOT. This does NOT send it: \
              the answer is a proposal that the speaker confirms outside your tools, by saying yes \
-             after your read-back or by tapping Send on the voice page. Say the read-back the \
-             answer gives you word for word, adding nothing; it ends with: Send it? Then wait. If \
-             the speaker says yes, say only \"One moment.\": the voice page reports the result in \
-             a message that starts with \"Voice page:\". Calling this again replaces the proposal; \
+             after your read-back or by tapping Send on the voice page. The answer begins NOT \
+             SENT YET: the draft is on the confirmation card, waiting, and nothing has failed or \
+             timed out. Say the read-back the answer gives you word for word, adding nothing; it \
+             ends with: Send it? Then wait. If the speaker says yes, say only \"One moment.\": the \
+             voice page reports the result in a message that starts with \"Voice page:\", and \
+             does the same for a tap on the card or a lapse. Calling this again replaces the proposal; \
              never call it again as the confirmation. {explicit} {tag} {mentions} Writable \
              channels: {writable}."
         )

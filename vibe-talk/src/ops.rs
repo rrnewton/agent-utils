@@ -3004,9 +3004,15 @@ pub async fn propose_reply(
 /// `POST /api/v1/post-proposals`, so a consumer that maps the tool onto the REST route hands its
 /// model the same words.
 ///
-/// It says NOT SENT first, gives the exact text to read back, and says the confirmation is not the
-/// caller's to give. The handle is deliberately absent: a model has no route that could spend it,
-/// and there is no reason to put a capability where it can be repeated.
+/// It says NOT SENT YET first, gives the exact text to read back, and says the confirmation is not
+/// the caller's to give. The handle is deliberately absent: a model has no route that could spend
+/// it, and there is no reason to put a capability where it can be repeated.
+///
+/// `#579 voice-send-confirm-timing`: it says plainly that the draft is WAITING on the card, that
+/// nothing failed or timed out, and that the voice page reports a lapse. The owner heard "it wasn't
+/// sent, the confirmation timed out" while the card he could still tap was on his screen; the
+/// voice page's own word on his request was the cause, and this leaves the bare "NOT SENT" and
+/// "lapses in 120 seconds" no reading of their own that says the same.
 #[must_use]
 pub fn proposal_notice(info: &ChannelInfo, proposal: &crate::post_gate::Proposal) -> String {
     let seconds = proposal.expires_in_ms(tokio::time::Instant::now()) / 1000;
@@ -3015,18 +3021,21 @@ pub fn proposal_notice(info: &ChannelInfo, proposal: &crate::post_gate::Proposal
         None => String::new(),
     };
     format!(
-        "NOT SENT. Proposal {serial} is waiting for the speaker's confirmation.\n\
+        "NOT SENT YET. Proposal {serial} is on the confirmation card on the voice page, waiting for \
+         the speaker; nothing has failed or timed out.\n\
          Channel: {channel} (id {id}){target}\n\
          Exact text: {text}\n\
          Read-back: {read_back}\n\
          Say that read-back to the speaker word for word, adding nothing before or after it, then \
-         wait for the speaker. If they say yes, say only \"One moment.\" The voice page judges \
-         their answer, sends it on a yes or a tap on Send, and then reports the result in a \
-         message that starts with \"Voice page:\"; do not say it was sent before that. You cannot \
-         send it yourself, and nothing you say or call confirms it. Do not call post_reply again \
-         to confirm; calling it again replaces this proposal with a new one. If the speaker wants \
-         different words, call post_reply with the new text. The proposal lapses in {seconds} \
-         seconds.",
+         wait for the speaker: they confirm it by saying yes or by tapping Send on the card. If \
+         they say yes, say only \"One moment.\" The voice page sends it on a yes or a tap on Send, \
+         withdraws it on a no or a tap on Don't send, and reports what happened in a message that \
+         starts with \"Voice page:\"; do not say it was sent, or that it was not, before that, and \
+         never say it failed or timed out. You cannot send it yourself, and nothing you say or call \
+         confirms it. Do not call post_reply again to confirm; calling it again replaces this \
+         proposal with a new one. If the speaker wants different words, call post_reply with the \
+         new text. The card waits {seconds} seconds; if nobody confirms it by then, it lapses, and \
+         the voice page tells you so while the call is open.",
         serial = proposal.serial,
         channel = info.display_name(),
         id = info.id,

@@ -2475,6 +2475,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
      * it. `undefined` sends nothing, as an older server does.
      */
     voiceSettings: { ask_before_send: true, changeable: true },
+    voiceSettingsReads: 0,
+    voiceSettingsReadStatus: 0,
     /** Every body the page PUT to the voice settings route, in order. */
     voiceSettingsCalls: [],
     /**
@@ -3552,6 +3554,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       }
       // `#264 voice-send-approval`. A real little store: what the page PUT is what the answer says.
       if (String(path) === "/api/v1/voice-settings") {
+        // Read as well as written: the vendor's approval is decided on a fresh read. `#579`.
+        if (((options && options.method) || "GET") === "GET") {
+          page.voiceSettingsReads += 1;
+          return page.voiceSettingsReadStatus
+            ? json(page.voiceSettingsReadStatus, { error: "unavailable" })
+            : json(200, page.voiceSettings);
+        }
         const body = JSON.parse((options && options.body) || "null");
         page.voiceSettingsCalls.push(body);
         if (page.voiceSettingsStatus) {
@@ -5414,6 +5423,12 @@ const TUNING_BANDS = {
     "how soon after the read-back's audio ends a bare 'send it' is taken for the agent's own voice. " +
     "Under about a second an echo that the canceller let through arrives after it; past three the " +
     "owner's real 'send it', said promptly, is refused and he has to ask for the read-back again"],
+  // `#579 voice-send-confirm-timing`.
+  REDRAFT_WAIT_MS: [4000, 10000,
+    "how long the page's word on an answer that was not a plain yes waits for the new draft a " +
+    "request would make. Under four seconds a request's draft — the agent's reply, its tool call " +
+    "and the watch waking — can come after the word, and the agent is told 'not sent' as the new " +
+    "card comes up; past ten an agent that took the answer for a yes waits too long to hear the truth"],
   SENDING_QUESTION_WORDS: [4, 6,
     "how many closing words of an unpunctuated transcript stand for its question about sending. " +
     "Under four, 'shall I send that to them' loses its 'send'; past six, 'tap Send or ask me to " +
@@ -42557,6 +42572,8 @@ test("a draft left pending by the last call is not offered in the next one", asy
 // something the owner did not agree to, and that every yes the page acts on is reported truthfully.
 
 const SPOKEN_SETTLE_MS = sourceConstant("SPOKEN_YES_SETTLE_MS");
+/** How long the page holds its word on an answer that was not a plain yes. `#579`. */
+const REDRAFT_WAIT_MS = sourceConstant("REDRAFT_WAIT_MS");
 const VOICE_SEND_ON = "The agent reads the message back and asks 'Send it?'; say yes or tap Send.";
 const VOICE_SEND_OFF =
   "The agent sends as soon as you ask. A message it reads could also talk it into sending.";
@@ -42703,6 +42720,15 @@ async function settleSpokenYes(page) {
   await page.settle();
 }
 
+/**
+ * Let the page's held word on an answer that was not a plain yes go, the card unchanged.
+ * `#579 voice-send-confirm-timing`.
+ */
+async function settleRedraftWait(page) {
+  page.expireTimers(REDRAFT_WAIT_MS);
+  await page.settle();
+}
+
 test("`#264 voice-send-approval`: a plain yes after an uninterrupted read-back sends exactly the card, once, as the speaker's turn, and says so", async () => {
   const page = newPage();
   const pending = spokenDraft();
@@ -42804,6 +42830,9 @@ test("`#264 voice-send-approval`: a yes inside a sentence that adds anything sen
     const before = page.audio.played;
     hostedHears(socket, said);
     await settleSpokenYes(page);
+    // Held a moment in case it was a new request, whose draft would replace the card. `#579`.
+    assert.deepEqual(pageNotices(socket), [], `${said}: told before the card had a chance to change`);
+    await settleRedraftWait(page);
     assert.deepEqual(page.proposalCommits, [], said);
     assert.equal(page.el("post-confirm").hidden, false, said);
     assert.match(page.el("status").textContent, /^Not sent — only a plain answer such as yes or send it counts/, said);
@@ -43628,6 +43657,7 @@ test("`#264 voice-send-approval`: every answer an agent would take for a yes is 
     const sources = page.audio.sources.length;
     hostedHears(socket, said);
     await settleSpokenYes(page);
+    await settleRedraftWait(page);
     assert.deepEqual(page.proposalCommits, [], `${said}: committed`);
     assert.equal(page.el("post-confirm").hidden, false, `${said}: the card went`);
     const notices = pageNotices(socket);
@@ -43755,6 +43785,289 @@ test("`#264 voice-send-approval`: a tap on the card during a call is told to the
   await withdrawn.el("post-confirm-cancel").click();
   await withdrawn.settle();
   assert.match(pageNotices(other)[0] || "", /^Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent\./);
+});
+
+// --- #579 voice-send-confirm-timing ---------------------------------------------------------------
+//
+// The owner: "I will say send X on channel Y. The card will pop up but the agent will just
+// immediately say that it wasn't sent because the confirmation timed out ... it was false because I
+// could still press send on the card and it actually went through." His request says send, so the
+// page judged it as an answer to the card and told the agent, while it drafted X, that the last
+// draft had lapsed or was NOT sent.
+
+/** A second draft, as the agent proposes it for the owner's next request. */
+const secondDraft = () =>
+  spokenDraft({ serial: 8, handle: "hAnDlE-second-draft-0001", text: "hello world" });
+
+test("`#579 voice-send-confirm-timing`: a new send request after an earlier send is not told that no draft is waiting", async () => {
+  for (const said of ["send hello world on the lead team channel", "Send hello world to lead team.", "post hello world in lead team"]) {
+    const page = newPage();
+    const socket = await readBackDuringACall(page);
+    page.expireTimers(2000);
+    await page.el("post-confirm-send").click();
+    await page.settle();
+    const before = pageNotices(socket).length;
+    const sources = page.audio.sources.length;
+    hostedSays(socket, "Sent.");
+    hostedHears(socket, said);
+    await settleSpokenYes(page);
+    await settleRedraftWait(page);
+    page.propose(secondDraft());
+    await page.settle();
+    assert.equal(page.el("post-confirm").hidden, false, `${said}: the new draft never reached the card`);
+    assert.deepEqual(pageNotices(socket).slice(before), [], `${said}: the agent was told a draft lapsed as it made one`);
+    assert.deepEqual(tonesSince(page, sources), [], `${said}: a not-sent tone played over the new card`);
+    assert.doesNotMatch(page.el("status").textContent, /no draft is waiting/, said);
+  }
+
+  // Typed, the same.
+  const typed = newPage();
+  const socket = await readBackDuringACall(typed);
+  typed.expireTimers(2000);
+  await typed.el("post-confirm-send").click();
+  await typed.settle();
+  const before = pageNotices(socket).length;
+  await compose(typed, "send hello world on the lead team channel");
+  await typed.el("send-text").click();
+  await settleSpokenYes(typed);
+  await settleRedraftWait(typed);
+  assert.deepEqual(pageNotices(socket).slice(before), []);
+});
+
+test("`#579 voice-send-confirm-timing`: a request that names no place is held, and dropped when its draft reaches the card", async () => {
+  // "send hello" could be a yes to a draft that lapsed, or the owner's next request: the page waits
+  // to see which, and a new draft on the card says it was a request.
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  page.expireTimers(2000);
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  const before = pageNotices(socket).length;
+  hostedHears(socket, "send hello");
+  await settleSpokenYes(page);
+  page.propose(secondDraft());
+  await page.settle();
+  await settleRedraftWait(page);
+  assert.deepEqual(pageNotices(socket).slice(before), []);
+
+  // With no new draft, the word the page held is said: no draft is waiting.
+  const quiet = newPage();
+  const other = await readBackDuringACall(quiet);
+  quiet.expireTimers(2000);
+  await quiet.el("post-confirm-send").click();
+  await quiet.settle();
+  const earlier = pageNotices(other).length;
+  hostedHears(other, "send hello");
+  await settleSpokenYes(quiet);
+  assert.deepEqual(pageNotices(other).slice(earlier), [], "said before the agent could draft");
+  await settleRedraftWait(quiet);
+  assert.match(pageNotices(other).slice(earlier)[0] || "", /^Voice page: no draft is waiting to be sent/);
+});
+
+test("`#579 voice-send-confirm-timing`: a new request while a card is up is not told NOT sent when its draft replaces the card", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  const sources = page.audio.sources.length;
+  hostedHears(socket, "actually send hello world to the lead team channel");
+  await settleSpokenYes(page);
+  page.propose(secondDraft());
+  await page.settle();
+  await settleRedraftWait(page);
+  assert.deepEqual(pageNotices(socket), []);
+  assert.deepEqual(tonesSince(page, sources), []);
+  assert.deepEqual(page.proposalCommits, []);
+  const seams = page.el("transcript").children.filter((li) => li.className === "seam");
+  assert.equal(seams.length, 0, "a Not sent seam was drawn for a draft a newer one replaced");
+
+  // A tap on Send while the word is held is told as the tap, and the held word is never said.
+  const tapped = newPage();
+  const other = await readBackDuringACall(tapped);
+  hostedHears(other, "sounds good to me");
+  await settleSpokenYes(tapped);
+  tapped.expireTimers(2000);
+  await tapped.el("post-confirm-send").click();
+  await tapped.settle();
+  await settleRedraftWait(tapped);
+  const told = pageNotices(other);
+  assert.equal(told.length, 1, told.join("\n"));
+  assert.match(told[0], /^Voice page: the user tapped Send, and the message was SENT to lead team\./);
+});
+
+test("`#579 voice-send-confirm-timing`: on the bridge, a new request after an earlier send is not told that no draft is waiting", async () => {
+  const page = newPage();
+  const pending = spokenDraft();
+  const socket = await neutralReadBack(page, { pending });
+  page.expireTimers(2000);
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  speech(socket, "user", 2, "send hello world on the lead team channel", false);
+  speech(socket, "user", 2, "Send hello world on the lead team channel.", true);
+  await settleSpokenYes(page);
+  await settleRedraftWait(page);
+  page.propose(secondDraft());
+  await page.settle();
+  turnDone(socket, 2);
+  page.expireTimers(CAPTURE_RESUME_MS);
+  turnDone(socket, 3);
+  // Sent, or still queued for the next boundary: either is the agent being told.
+  const prompts = [...promptsSent(socket), ...page.pure("session.pendingPrompts").map((queued) => queued.text)];
+  assert.equal(prompts.filter((text) => /no draft is waiting|NOT sent/.test(text)).length, 0, prompts.join("\n"));
+});
+
+test("`#579 voice-send-confirm-timing`: the page tells the agent when this call's draft lapses, and not about one from before the call", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  page.lapseProposal();
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, true, "the lapsed card stayed up");
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /^Voice page: the draft to lead team lapsed: nobody tapped Send or said yes in time, so it was NOT sent/);
+  assert.match(page.el("status").textContent, /lapsed; nothing was posted/);
+
+  // A draft already waiting when the call began is not this call's agent's to report.
+  const earlier = newPage();
+  earlier.propose(spokenDraft());
+  const other = await startTalking(earlier);
+  await earlier.settle();
+  assert.equal(earlier.el("post-confirm").hidden, false);
+  earlier.lapseProposal();
+  await earlier.settle();
+  assert.deepEqual(pageNotices(other), []);
+
+  // Superseded is not lapsed: the newer draft is the agent's own news.
+  const replaced = newPage();
+  const third = await readBackDuringACall(replaced);
+  replaced.propose(secondDraft());
+  await replaced.settle();
+  assert.deepEqual(pageNotices(third), []);
+});
+
+test("`#579 voice-send-confirm-timing`: on the bridge, a tap on Send or Don't send and a lapse are told to the agent as prompts", async () => {
+  for (const [act, expected] of [
+    ["send", /^Voice page: the user tapped Send, and the message was SENT to lead team\./],
+    ["cancel", /^Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent\./],
+    ["lapse", /^Voice page: the draft to lead team lapsed/],
+  ]) {
+    const page = newPage();
+    const socket = await neutralReadBack(page);
+    page.expireTimers(2000);
+    if (act === "lapse") page.lapseProposal();
+    else await page.el(act === "send" ? "post-confirm-send" : "post-confirm-cancel").click();
+    await page.settle();
+    page.expireTimers(CAPTURE_RESUME_MS);
+    turnDone(socket, 2);
+    await page.settle();
+    const prompts = promptsSent(socket).filter((text) => text.startsWith("Voice page:"));
+    assert.equal(prompts.length, 1, `${act}: ${prompts.join("\n")}`);
+    assert.match(prompts[0], expected, act);
+  }
+});
+
+/** The approvals the page sent on `socket`. */
+const vendorApprovals = (socket) =>
+  socket.sent.filter((frame) => typeof frame === "string").map((frame) => JSON.parse(frame))
+    .filter((event) => event.type === "mcp_tool_approval_result");
+
+/** The voice service reports a tool call in `state`, as it does for one marked "requires approval". */
+const vendorToolCall = (socket, tool, id, state = "awaiting_approval") => hosted(socket, {
+  type: "mcp_tool_call",
+  mcp_tool_call: {
+    service_id: "svc", tool_call_id: id, tool_name: tool, parameters: {}, state,
+    timestamp: "2026-10-27T13:00:00Z", approval_timeout_secs: 10,
+  },
+});
+
+test("`#579 voice-send-confirm-timing`: the voice service's request to approve post_reply is approved while the server asks first, read fresh, and nothing else is", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  await page.settle();
+  const reads = page.voiceSettingsReads;
+  vendorToolCall(socket, "post_reply", "call-1");
+  vendorToolCall(socket, "post_reply", "call-2", "loading");
+  vendorToolCall(socket, "recent_activity", "call-3");
+  await page.settle();
+  assert.deepEqual(vendorApprovals(socket), [{ type: "mcp_tool_approval_result", tool_call_id: "call-1", is_approved: true }]);
+  assert.equal(page.voiceSettingsReads, reads + 1, "approved without asking the server");
+  assert.match(page.el("connection-detail").textContent, /waiting for someone to approve recent_activity/);
+
+  // Turned off on another device during the call: the server now posts at once, so the vendor's
+  // gate is the one left, and the page leaves it shut.
+  page.voiceSettings = { ask_before_send: false, changeable: true };
+  vendorToolCall(socket, "post_reply", "call-4");
+  await page.settle();
+  assert.equal(vendorApprovals(socket).length, 1, "approved a send that posts at once");
+  assert.match(page.el("connection-detail").textContent, /not approved, since this server now posts at once/);
+
+  // A read that fails approves nothing.
+  page.voiceSettings = { ask_before_send: true, changeable: true };
+  page.voiceSettingsReadStatus = 503;
+  vendorToolCall(socket, "post_reply", "call-5");
+  await page.settle();
+  assert.equal(vendorApprovals(socket).length, 1, "approved on a failed read");
+
+  // An agent told to post at once when the call began keeps whatever gate the owner set at the vendor.
+  const direct = newPage();
+  direct.voiceSettings = { ask_before_send: false, changeable: true };
+  const other = await startTalking(direct);
+  await direct.settle();
+  vendorToolCall(other, "post_reply", "call-6");
+  await direct.settle();
+  assert.deepEqual(vendorApprovals(other), []);
+});
+
+test("`#579 voice-send-confirm-timing`: a held word is said at once when the owner speaks again, and waits longer while the agent is calling post_reply", async () => {
+  // "yeah go ahead and send it" is not a plain yes; the agent said "One moment." and waits. A "did
+  // it go?" before the hold ran out must not meet an agent the page told nothing.
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  hostedHears(socket, "yeah go ahead and send it");
+  await settleSpokenYes(page);
+  assert.deepEqual(pageNotices(socket), []);
+  hostedSays(socket, "One moment.");
+  hostedHears(socket, "did it go?");
+  await settleSpokenYes(page);
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /^Voice page: the message was NOT sent: only a plain answer/);
+  await settleRedraftWait(page);
+  assert.equal(pageNotices(socket).length, 1, "said twice");
+
+  // The voice service reports the agent calling post_reply: the hold starts again, so a slow draft
+  // still lands before the word, and the word is dropped.
+  const slow = newPage();
+  const other = await readBackDuringACall(slow);
+  slow.expireTimers(2000);
+  await slow.el("post-confirm-send").click();
+  await slow.settle();
+  const before = pageNotices(other).length;
+  hostedHears(other, "yes send Bob a note saying I'm late");
+  await settleSpokenYes(slow);
+  const holds = () => [...slow.timers].filter(([, timer]) => timer.ms === REDRAFT_WAIT_MS).map(([id]) => id);
+  const first = holds();
+  assert.equal(first.length, 1, "no word was held");
+  vendorToolCall(other, "post_reply", "call-7", "loading");
+  const again = holds();
+  assert.equal(again.length, 1);
+  assert.notEqual(again[0], first[0], "the hold was not started again");
+  slow.propose(secondDraft());
+  await slow.settle();
+  await settleRedraftWait(slow);
+  assert.deepEqual(pageNotices(other).slice(before), []);
+});
+
+test("`#579 voice-send-confirm-timing`: a draft that lapses while a yes settles on it gets one word, not a lapse notice that cuts the yes short", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  hostedHears(socket, "yes");
+  assert.match(page.el("status").textContent, /Heard yes/);
+  page.lapseProposal();
+  await page.settle();
+  await settleSpokenYes(page);
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.doesNotMatch(notices[0], /typed message/);
+  assert.match(notices[0], /NOT sent/);
 });
 
 test("`#264 voice-send-approval`: a commit the page cannot confirm tells the agent to check the channel, not that the card is up", async () => {
@@ -67679,6 +67992,7 @@ test("`#268 voice-call-drops`: on the bridge's order each safety rule of a spoke
   const hint = newPage();
   answer(hint, await neutralReadBack(hint), "yes and tell him I'm late");
   await settleSpokenYes(hint);
+  await settleRedraftWait(hint);
   assert.deepEqual(hint.proposalCommits, []);
   assert.match(hint.el("status").textContent, /^Not sent — only a plain answer/);
 });

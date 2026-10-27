@@ -658,7 +658,7 @@ async fn a_proposed_voice_reply_marks_nothing_until_it_is_confirmed_and_posted()
         json!({ "channel_id": WRITE_CHANNEL, "text": "looks good", "reply_to": ids[2] }),
     )
     .await;
-    assert!(said.starts_with("NOT SENT."), "{said}");
+    assert!(said.starts_with("NOT SENT YET."), "{said}");
     settle().await;
     // THE CONTROL: proposing is not sending.
     assert_eq!(

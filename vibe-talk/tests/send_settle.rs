@@ -177,7 +177,10 @@ fn tool_text(response: &Value) -> String {
 async fn proposed(harness: &Harness, text: &str) -> Value {
     let (status, response) = post_reply(harness, text).await.expect("the caller stayed");
     assert_eq!(status, StatusCode::OK, "{response}");
-    assert!(tool_text(&response).starts_with("NOT SENT."), "{response}");
+    assert!(
+        tool_text(&response).starts_with("NOT SENT YET."),
+        "{response}"
+    );
     let pending =
         answered(harness, "GET", "/api/v1/post-proposals", None).await["proposal"].clone();
     json!({
