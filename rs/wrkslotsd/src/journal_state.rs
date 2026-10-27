@@ -634,6 +634,50 @@ pub(crate) fn parse_journal(
             &slot,
             expected.len() > 1 && name == expected[1],
         )?,
+        "legacy-validate-remove" => {
+            exact_keys(
+                raw,
+                &[
+                    "schema",
+                    "kind",
+                    "machine",
+                    "slot",
+                    "phase",
+                    "checkout",
+                    "repository",
+                    "completed_record",
+                    "completed_record_sha256",
+                    "head",
+                    "actor",
+                    "coordinator_authorized",
+                ],
+                &[],
+                "legacy validate removal journal",
+            )?;
+            for field in [
+                "phase",
+                "checkout",
+                "repository",
+                "completed_record",
+                "completed_record_sha256",
+                "head",
+            ] {
+                as_str(
+                    &raw[field],
+                    &format!("legacy validate removal journal.{field}"),
+                )?;
+            }
+            if identity_from_obj(&raw["actor"], "legacy validate removal journal.actor")?.is_none()
+            {
+                return Err("legacy validate removal journal has no actor".to_owned());
+            }
+            if !raw["coordinator_authorized"].is_boolean() {
+                return Err(
+                    "legacy validate removal journal.coordinator_authorized must be boolean"
+                        .to_owned(),
+                );
+            }
+        }
         _ => return Err(format!("unsupported recovery journal kind {kind:?}")),
     }
     Ok(Value::Object(raw.clone()))

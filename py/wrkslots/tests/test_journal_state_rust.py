@@ -138,6 +138,23 @@ def _import_journal() -> dict[str, object]:
     }
 
 
+def _legacy_journal() -> dict[str, object]:
+    return {
+        "schema": 2,
+        "kind": "legacy-validate-remove",
+        "machine": "node-a",
+        "slot": "slot-a",
+        "phase": "prepared",
+        "checkout": "worktrees/validate/slot-a/repo",
+        "repository": "../upstream-repo",
+        "completed_record": "record",
+        "completed_record_sha256": DIGEST,
+        "head": SHA,
+        "actor": _identity(789),
+        "coordinator_authorized": True,
+    }
+
+
 def _write(root: Path, name: str, payload: dict[str, object]) -> Path:
     path = root / "worktrees" / name
     path.write_text(json.dumps(payload))
@@ -165,6 +182,7 @@ def _rust(root: Path, name: str) -> subprocess.CompletedProcess[str]:
         ("CREATE.6.node-a.6.slot-a.journal", _create_journal()),
         ("ACTIVE.node-a.journal", _import_journal()),
         ("ACTIVE.node-a.journal", _finish_journal()),
+        ("ACTIVE.node-a.journal", _legacy_journal()),
     ],
 )
 def test_parse_journal_matches_python(
@@ -199,6 +217,16 @@ def test_parse_journal_matches_python(
             "ACTIVE.node-a.journal",
             {**_import_journal(), "slot": "slot-b"},
             "does not match its shard or slot",
+        ),
+        (
+            "ACTIVE.node-a.journal",
+            {**_legacy_journal(), "coordinator_authorized": "yes"},
+            "coordinator_authorized must be boolean",
+        ),
+        (
+            "ACTIVE.node-a.journal",
+            {**_legacy_journal(), "actor": None},
+            "has no actor",
         ),
         (
             "ACTIVE.node-a.journal",

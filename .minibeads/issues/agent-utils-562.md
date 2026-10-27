@@ -67,4 +67,6 @@ content digest binding) and `_handoff_artifact_to_obj` output.
 (filename agreement, planned/created shapes, embedded records, finish
 phase/archive-id and optional evidence bundles). Other kinds still refuse.
 
-[muse watermelon] Next slice: extend `parse-journal` to the legacy-validate-remove journal kind.
+[muse watermelon] Slice 8 in progress: `parse-journal` also covers the
+legacy-validate-remove journal kind (exact fields, actor identity,
+coordinator authorization flag).
