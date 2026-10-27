@@ -2044,8 +2044,10 @@ EMPTY_SIZES = (("font-150", 412, 800, 150, "kinds"), ("font-150", 412, 800, 150,
 EMPTY_SENTENCES = {
     "kinds": "No links left once PRs, Commits and Actions are hidden — turn them back on under the Links button.",
     "typed": "None of the loaded messages with a link match that search.",
-    # `#262 search-load-older`: how far back the search looked — here, the whole of All.
-    "search": "Nothing in All matches that search — all of it is loaded.",
+    # `#262 search-load-older`: how far back the search looked — here, the whole of All; `#578
+    # search-status-clarity`: how many, where, and back to the first message's time (a pattern, as the
+    # time is the browser's own zone's).
+    "search": r"^Searched all 4 messages of All in this browser, back to the first one \(.+\)\. None match\.$",
     "linkless": "No links in the messages loaded so far.",
 }
 
@@ -4659,8 +4661,11 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             elif mode in ("typed", "search"):
                 page.fill("#search-field", "nothing to open" if mode == "typed" else "no such words anywhere")
             sentence = EMPTY_SENTENCES[mode]
-            until(f"() => document.getElementById('search-empty').textContent.trim() === {json.dumps(sentence)}"
-                  " && !document.getElementById('search-empty').hidden", f"the emptied list does not say {sentence!r}")
+            said = (f"new RegExp({json.dumps(sentence)}).test(document.getElementById('search-empty').textContent.trim())"
+                    if sentence.startswith("^") else
+                    f"document.getElementById('search-empty').textContent.trim() === {json.dumps(sentence)}")
+            until(f"() => {said} && !document.getElementById('search-empty').hidden",
+                  f"the emptied list does not say {sentence!r}")
             settled()
             empty = page.evaluate(EMPTY_SENTENCE_JS)
             if args.screenshots:
