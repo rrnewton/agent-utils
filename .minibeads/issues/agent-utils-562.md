@@ -41,9 +41,11 @@ reproduces `_load_config` validation as canonical JSON, error-for-error on
 refusals, over a Python-built fixture corpus (test_config_validate_rust.py).
 Next slice: a pure state reader (status/list JSON over fixture slot state).
 
-[muse watermelon] Slice 3 in progress: `wrkslotsd parse-state` reproduces
+[muse watermelon] Slice 3 landed (3ec1769f): `wrkslotsd parse-state` reproduces
 the ACTIVE.<machine>.json shard loader in reference mode
 (`_load_active_snapshot(..., require_repository=False)` + `_active_to_obj`):
 record identity/handoff/checkout/task-scope/import sub-formats, duplicate
 and machine-shard checks, and stored-path authority against the validated
 configuration. No live-process, Git, or checkout-existence inspection.
+
+[muse watermelon] Next slice: the ARCHIVED.<machine>.json shard reader (`parse-archive`), same differential pattern.
