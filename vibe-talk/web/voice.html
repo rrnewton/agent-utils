@@ -1606,6 +1606,17 @@
                         <input id="in-app-links" type="checkbox" checked />
                         Open links to messages here, in this app
                       </label>
+                      <!--
+                        `#580 open-in-chat-jump`. Where a sent card's Open in channel lands: All, every
+                        message in the order sent, by default (the owner, 2026-10-27: "I suggest that the
+                        all view with all chronological messages be the default"), or Main, the threads,
+                        with a reply opened in its thread. Synced, as the switch above is.
+                      -->
+                      <label for="open-in-view">Open in channel lands in</label>
+                      <select id="open-in-view">
+                        <option value="flat">All — every message, in order</option>
+                        <option value="main">Main — by thread</option>
+                      </select>
                     </div>
                   </section>
 
@@ -2977,6 +2988,14 @@
                 opens the chat service, as it always did. A reload keeps the message you are on, but
                 not the way back from links followed before it. Turn this off to have every message
                 link open the chat service.
+              </p>
+              <p class="hint">
+                <strong>Open in channel</strong>, on a message the voice agent sent, jumps the same way,
+                from the call's view too: to the channel it went to, in <strong>All</strong>, every
+                message in the order sent, with the message in the middle of the screen and lit. Choose
+                <strong>Main</strong> under "Open in channel lands in" to land in the threads instead,
+                a reply opened in its thread. Back returns to where you pressed it, the call's view
+                included. This works whether or not links open here.
               </p>
             </details>
 

@@ -41805,6 +41805,127 @@ test("`#270 voice-transcript-markers`: Open in channel takes the owner to the me
   assert.ok(row && row.getAttribute("data-landed") === "true", "the message was not brought into view");
 });
 
+// --- #580 open-in-chat-jump --------------------------------------------------------------------
+//
+// The owner, of a voice card's Open in channel: "when I click it I want to jump directly to that
+// message. But instead I see a little chip pop up that says the messages in the zero 14 channel and I
+// have to manually switch over ... pressing the button should jump to the right view and to the
+// message ... the all view with all chronological messages be the default ... centered and
+// highlighted on the message that was linked."
+
+/**
+ * A page on the call's view whose stored call holds a frozen card for a message the voice agent sent
+ * to OTHER_CHANNEL — `message`, in `thread` when given — while the channel picker shows CHANNEL.
+ * OTHER_CHANNEL holds `threadData`'s two threads and a dozen long fillers after them.
+ */
+async function sentElsewherePage({ message: id = "204", thread = "spaces/A/threads/another", view = null } = {}) {
+  const stored = new Map(view ? [["vibe-talk.voice.open-in-view", view]] : []);
+  const page = newPage(stored, SCRIPT, (p) => p.enableHistory());
+  const other = { ...CHANNEL, id: OTHER_CHANNEL.id, label: OTHER_CHANNEL.label };
+  page.channels = [{ ...CHANNEL }, other];
+  page.threadingSupported = true;
+  const data = threadData();
+  const fillers = Array.from({ length: 12 }, (_unused, i) => message({ id: `${310 + i}`, content: longMessage(`filler ${i}`) }));
+  const byChannel = {
+    [CHANNEL.id]: { messages: [message({ id: "100", content: "here on lead team" })], threads: [] },
+    [other.id]: { messages: [...data.messages, ...fillers], threads: data.threads },
+  };
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    const channel = page.channels.find((c) => String(path).includes(`/channels/${encodeURIComponent(c.id)}/`));
+    assert.ok(channel, `the page read a channel this fixture has no cast for: ${path}`);
+    page.messages = byChannel[channel.id].messages;
+    page.threads = byChannel[channel.id].threads;
+    const answer = await serve(path, options);
+    return json(answer.status, { ...JSON.parse(await answer.text()), channel });
+  };
+  page.transcriptRecordsSupported = true;
+  page.storedTurns.set("conv_sent", [{
+    speaker: "sent", text: "rebase onto main", at_ms: 1_700_000_000_000,
+    detail: {
+      kind: "sent", serial: 1, send_seq: 1, channel_id: other.id, channel_name: other.label,
+      message_id: id, ...(thread ? { thread_id: thread } : {}),
+      parts_posted: 1, parts_total: 1, unsent_chars: 0, outcome: "sent", how: "tap",
+      origin: "commit", text_truncated: false, text_chars: 16, begun_at_ms: 1, sent_at_ms: 1,
+    },
+  }]);
+  await signIn(page);
+  await page.settle();
+  assert.equal(page.tab(), "voice", "fixture: the page did not open on the call's view");
+  assert.equal(page.el("discord-channel").value, CHANNEL.id, "fixture: the picker is not on the other channel");
+  return page;
+}
+
+/** The card's Open in channel button. */
+const sentOpenButton = (page) => {
+  const card = sentCards(page)[0];
+  assert.ok(card, "fixture: no frozen card was drawn");
+  const open = card.children.find((kid) => kid.hasClass("sent-open"));
+  assert.ok(open, "the card has no Open in channel");
+  return open;
+};
+
+test("`#580 open-in-chat-jump`: Open in channel on the call's view switches channel, lands in All lit on the message, and one Back returns to the call's view", async () => {
+  const page = await sentElsewherePage();
+  const length = page.history.length;
+  await sentOpenButton(page).click();
+  await untilDeepLink(page, () => rowWithId(page, "204")?.getAttribute("data-landed") === "true");
+  assert.equal(page.tab(), "discord", "Open in channel did not open the channel's view");
+  assert.equal(page.el("discord-channel").value, OTHER_CHANNEL.id, "the channel was not switched");
+  assert.equal(page.el("thread-select").value, "flat", "the jump did not land in All");
+  assert.equal(page.el("thread-heading").hidden, true, "All was asked for, and a thread was opened");
+  assert.equal(rowWithId(page, "204").getAttribute("data-landed"), "true", "the message was not lit");
+  assert.doesNotMatch(statusText(page), /choose it in the channel picker/);
+  assert.equal(page.history.length - length, 1, "the jump did not push exactly one entry");
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "jump" });
+
+  await page.browserBack();
+  await untilDeepLink(page, () => page.tab() === "voice");
+  assert.equal(page.left, false, "Back after the jump left the app");
+  assert.equal(page.tab(), "voice", "Back did not return to the call's view");
+  assert.equal(statusText(page), "Back on the call's view.");
+  assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
+  assert.equal(sentCards(page).length, 1, "the card is gone from the call's view");
+});
+
+test("`#580 open-in-chat-jump`: the message landed on is centred in the list, where the list can put it there", async () => {
+  const page = await sentElsewherePage({ message: "316", thread: null });
+  await sentOpenButton(page).click();
+  await untilDeepLink(page, () => rowWithId(page, "316")?.getAttribute("data-landed") === "true");
+  const area = page.el("scroll-area");
+  const room = { top: page.pure("floatingClearance(el('scroll-area'))"), bottom: area.getBoundingClientRect().bottom };
+  const box = rowWithId(page, "316").getBoundingClientRect();
+  const offCentre = Math.abs((box.top + box.bottom) / 2 - (room.top + room.bottom) / 2);
+  assert.ok(offCentre <= 12, `the message is ${offCentre}px off the middle of the list`);
+});
+
+test("`#580 open-in-chat-jump`: with Main chosen in Settings, a reply opens in its thread and a root message in Main", async () => {
+  const reply = await sentElsewherePage({ view: "main" });
+  assert.equal(reply.el("open-in-view").value, "main");
+  await sentOpenButton(reply).click();
+  await untilDeepLink(reply, () => rowWithId(reply, "204")?.getAttribute("data-landed") === "true");
+  assert.equal(reply.el("thread-select").value, "thread:spaces/A/threads/another", "the reply's thread did not open");
+
+  const root = await sentElsewherePage({ message: "200", thread: null, view: "main" });
+  await sentOpenButton(root).click();
+  await untilDeepLink(root, () => rowWithId(root, "200")?.getAttribute("data-landed") === "true");
+  assert.equal(root.el("thread-select").value, "main", "a root message did not land in Main");
+  assert.equal(rowWithId(root, "200").getAttribute("data-landed"), "true");
+
+  // The default is All, and the choice is one of the synced settings.
+  const fresh = newPage();
+  await signIn(fresh);
+  assert.equal(fresh.el("open-in-view").value, "flat", "Open in channel does not land in All by default");
+  // Absent means All, and stays absent until the reader chooses: a default written here would sync
+  // over another device's choice.
+  assert.equal(fresh.storage.has("vibe-talk.voice.open-in-view"), false, "the default was written as a choice");
+  assert.ok(fresh.pure("SYNCED_SETTING_KEYS.includes(OPEN_IN_VIEW_KEY)"), "the choice is not synced");
+  fresh.el("open-in-view").value = "main";
+  await fresh.el("open-in-view").dispatch("change");
+  await fresh.settle();
+  assert.equal(fresh.storage.get("vibe-talk.voice.open-in-view"), "main");
+});
+
 // --- `#269 approval-card-inline` and `#270 voice-transcript-markers`: what becomes of a draft ---------
 
 /** The "Not sent" lines in the transcript, in order. */

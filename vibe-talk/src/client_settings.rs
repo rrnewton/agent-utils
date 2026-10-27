@@ -82,6 +82,8 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.combine",
     "vibe-talk.voice.rich-headers",
     "vibe-talk.voice.in-app-links",
+    // The view a sent card's Open in channel lands in (`#580 open-in-chat-jump`).
+    "vibe-talk.voice.open-in-view",
     "vibe-talk.voice.collapsed-lines",
     "vibe-talk.voice.hidden-link-kinds",
     // Summarize collapsed messages (`#564 message-summary-toggle`). The server reads it too

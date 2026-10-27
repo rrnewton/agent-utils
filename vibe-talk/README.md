@@ -9820,7 +9820,10 @@ nothing.
 In the transcript, a message that went — tapped, said yes to, or sent without asking — is a
 **frozen card** (`#270 voice-transcript-markers`): the card it was sent from, at the same place,
 saying "Sent to lead team", "Partly sent to …" or "Not confirmed: …", when, how it was approved,
-what it answered, and Open in channel. It is drawn from the commit's answer, or from the server's
+what it answered, and Open in channel (`#580 open-in-chat-jump`: a jump to the message, from the
+call's view too — the channel's view, the card's channel, All unless Settings > Message links says
+Main, the message centred and lit — one Back level, as a message link's jump is, whose Back is the
+view it was pressed on). It is drawn from the commit's answer, or from the server's
 send memory when that answer was lost, when the send settled after hang-up, or when it was a direct
 send; a server that takes records files it in the stored transcript from its own copy, so a reload
 draws the same card. A yes that sent nothing is a seam, as before. The server files what a send did

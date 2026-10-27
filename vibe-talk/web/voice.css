@@ -3786,6 +3786,14 @@ a.search-hit-link {
   accent-color: var(--accent);
 }
 
+/* `#580 open-in-chat-jump`. A select is as wide as its longest option, which the generic rule leaves
+   free to push the settings screen wider than a phone: it takes the fold's width instead. */
+#open-in-view {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+}
+
 /* `#230 text-size-buttons`. The text size slider between its − and +, on ONE line at every width:
    no `flex-wrap`, so the + can never fall under the slider on its own. Each button keeps a 44px
    square (2.75rem at the page's 16px root, which the reader's text size does not touch: that

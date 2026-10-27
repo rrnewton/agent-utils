@@ -1,13 +1,14 @@
 ---
 title: 'voice-send-confirm-timing: the agent says a send failed or timed out the moment the card appears'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - voice
 created_at: 2026-10-27T13:10:15.878426049+00:00
-updated_at: 2026-10-27T13:10:15.878426049+00:00
+updated_at: 2026-10-27T14:03:50.906848409+00:00
+closed_at: 2026-10-27T14:03:50.906848309+00:00
 ---
 
 # Description

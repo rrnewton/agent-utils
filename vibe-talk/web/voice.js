@@ -74,6 +74,8 @@ const COMBINE_KEY = "vibe-talk.voice.combine";
 const HIDE_EMPTY_KEY = "vibe-talk.voice.hide-empty";
 const RICH_HEADERS_KEY = "vibe-talk.voice.rich-headers";
 const IN_APP_LINKS_KEY = "vibe-talk.voice.in-app-links";
+/** `#580 open-in-chat-jump`. The view a sent card's Open in channel lands in: "flat" (All) or "main". */
+const OPEN_IN_VIEW_KEY = "vibe-talk.voice.open-in-view";
 const SUMMARIZE_COLLAPSED_KEY = "vibe-talk.voice.summarize-collapsed";
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
@@ -178,7 +180,7 @@ const ALL_CHANNELS = "*";
 /**
  * @overload
  * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
- *   | "settings-channel" | "settings-service" | "settings-wit-voice" | "slack-open-in" | "thread-select" | "upstream-clear-mode"} id
+ *   | "open-in-view" | "settings-channel" | "settings-service" | "settings-wit-voice" | "slack-open-in" | "thread-select" | "upstream-clear-mode"} id
  * @returns {HTMLSelectElement}
  */
 /**
@@ -1815,7 +1817,7 @@ function syncDeepLinkAddress() {
  * head of the list (`#522 thread-card-max-lines`), never on the hidden column under the cards nor on
  * the root's row unpacked beneath it — a summarised card's root child, or a split card's continuation.
  */
-function landOnDeepLink(id) {
+function landOnDeepLink(id, center = false) {
   const cardOf = () => (cardsCycle() ? /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
     .find((one) => one.hasAttribute("data-card") && /** @type {any} */ (one).cardRoot &&
       String(/** @type {any} */ (one).cardRoot.id) === String(id)) || null : null);
@@ -1840,7 +1842,7 @@ function landOnDeepLink(id) {
   if (!row) return false;
   if (String(row.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
   openReadRun(row);
-  revealRow(row);
+  revealRow(row, center);
   renderScrollTools();
   setStatus("Here is the linked message.");
   return true;
@@ -2040,9 +2042,35 @@ function storedInAppLinks() {
 }
 
 /**
+ * The view a sent card's Open in channel lands in (`#580 open-in-chat-jump`): "flat", All, every
+ * message in the order sent, unless the reader chose "main", the threads. ABSENT MEANS ALL, the
+ * owner's choice: "I suggest that the all view with all chronological messages be the default".
+ *
+ * @returns {"flat" | "main"}
+ */
+function storedOpenInView() {
+  return localStorage.getItem(OPEN_IN_VIEW_KEY) === "main" ? "main" : "flat";
+}
+
+/** Draw the choice as stored. Never writes it: an absent choice stays absent, so it syncs nothing. */
+function renderOpenInView() {
+  el("open-in-view").value = storedOpenInView();
+}
+
+/** Keep the reader's choice, `view`, and draw it. */
+function chooseOpenInView(view) {
+  try {
+    localStorage.setItem(OPEN_IN_VIEW_KEY, view === "main" ? "main" : "flat");
+  } catch (_error) {
+    // A browser that refuses storage keeps the shipped default.
+  }
+  renderOpenInView();
+}
+
+/**
  * @typedef {{service: string, channel: string, message: string | null, thread: string | null}} MessageLinkRef
  * @typedef {{place: ChannelPlace | null, column: "main" | "side", pinned: boolean, anchor: string | null,
- *   offset: number, focus: DeepLinkRef | null}} LinkSpot
+ *   offset: number, focus: DeepLinkRef | null, call?: boolean}} LinkSpot
  * @typedef {{spot: LinkSpot, below: string[], landed: string[] | null}} LinkJump
  */
 
@@ -2136,6 +2164,7 @@ function linkJumpSpot() {
     anchor: anchor ? anchor.getAttribute("data-context-id") || idsOf(anchor)[0] || null : null,
     offset: anchor ? mark.top - listPlaceTop(el("scroll-area")) : 0,
     focus: deepLinkFocus,
+    call: false,
   };
 }
 
@@ -2214,12 +2243,42 @@ async function jumpToMessageLink(ref) {
 }
 
 /**
+ * Jump to the message a sent card names (`#580 open-in-chat-jump`), from the call's view or the
+ * channel's: a link's jump (`jumpFromSpot`), landing in the view Settings names (All unless the
+ * reader chose Main) with the message centred and lit. From the call's view the channel's view comes
+ * up as part of the jump, and its Back is the call's view again.
+ *
+ * @param {MessageLinkRef} ref
+ */
+async function jumpToSentMessage(ref) {
+  if (currentScreen !== "main") return undefined;
+  const fromCall = currentView !== "discord";
+  /** @type {LinkSpot} */
+  const spot = fromCall
+    ? { place: null, column: "main", pinned: false, anchor: null, offset: 0, focus: deepLinkFocus, call: true }
+    : linkJumpSpot();
+  const enter = fromCall ? async () => {
+    uiStateSettled = true;
+    showView("discord");
+    // A channel the jump changes to is read as it is chosen; the one already chosen is read here.
+    if (String(el("discord-channel").value) === ref.channel) await readEnteredChannel(viewRestored);
+  } : null;
+  return inColumn(columns.main, () => jumpFromSpot(ref, spot, { view: storedOpenInView(), center: true, enter }));
+}
+
+/**
  * `jumpToMessageLink` from `spot`, in the left column.
+ *
+ * `options.view` (`#580 open-in-chat-jump`) is the view to land a message in, "flat" for All or
+ * "main", where the channel's layout leaves the choice to the jump: never over two columns, which
+ * keep their own. `options.center` centres the message rather than putting it under the top.
+ * `options.enter` runs once the jump is a level, before anything else it does.
  *
  * @param {MessageLinkRef} ref
  * @param {LinkSpot} spot
+ * @param {{view?: "flat" | "main", center?: boolean, enter?: (() => Promise<void>) | null}} [options]
  */
-async function jumpFromSpot(ref, spot) {
+async function jumpFromSpot(ref, spot, options = {}) {
   const here = String(el("discord-channel").value || "");
   if (ref.channel === here && !ref.message && !ref.thread) {
     setStatus("That link is to this channel.");
@@ -2228,12 +2287,15 @@ async function jumpFromSpot(ref, spot) {
   const under = linkJumps[linkJumps.length - 1];
   // A jump still under way when another is taken: what it had opened by now is its own.
   if (under && under.landed === null) under.landed = screenLevelsNow();
+  // From the call's view nothing is open under the jump: what the channel's view shows is the jump's.
   /** @type {LinkJump} */
-  const jump = { spot, below: backLevels(), landed: null };
+  const jump = { spot, below: spot.call ? [] : backLevels(), landed: null };
   linkJumps.push(jump);
   const ticket = ++linkJumpTicket;
   scheduleBackSync();
   try {
+    if (options.enter) await options.enter();
+    if (ticket !== linkJumpTicket) return;
     if (ref.channel !== here) {
       arriveOnChannel(ref.channel);
       if (!await linkJumpRead(ref.channel, ticket)) return;
@@ -2242,11 +2304,18 @@ async function jumpFromSpot(ref, spot) {
     const now = channelPlace();
     /** @type {ChannelPlace | null} */
     let place = null;
-    if (ref.thread && threadingSupported) {
-      const origin = now && now.layout === "one" && (now.view === "main" || now.view === "flat") ? now.view
-        : now && now.view === "thread" && (now.origin === "main" || now.origin === "flat") ? now.origin
-          : defaultChannelView();
+    const want = threadingSupported && ref.message && !(now && now.layout === "two") ? options.view || null : null;
+    if (want === "flat") {
+      // All: every message in the order sent, a reply among them, so no thread is opened.
+      place = { screen: "main", channel, layout: "one", view: "flat", thread: null, origin: null, side: null };
+    } else if (ref.thread && threadingSupported) {
+      const origin = want === "main" ? "main"
+        : now && now.layout === "one" && (now.view === "main" || now.view === "flat") ? now.view
+          : now && now.view === "thread" && (now.origin === "main" || now.origin === "flat") ? now.origin
+            : defaultChannelView();
       place = { screen: "main", channel, layout: "one", view: "thread", thread: ref.thread, origin, side: null };
+    } else if (want === "main") {
+      place = { screen: "main", channel, layout: "one", view: "main", thread: null, origin: null, side: null };
     } else if (ref.message && now && (now.layout === "list" || (now.layout === "one" && now.view === "thread"))) {
       // A root message is on the channel's own timeline: the view a thread was opened from, or the
       // channel's own, where the thread list or a thread cannot show it.
@@ -2266,7 +2335,7 @@ async function jumpFromSpot(ref, spot) {
     deepLinkFocus = { provider: String(name || ref.service).toLowerCase(), channel, message: ref.message, thread: ref.thread };
     const target = ref.message;
     // A Back while the walk looks further back ends it: nothing lands over the place put back.
-    await seekMessage(target, () => ticket === linkJumpTicket && landOnDeepLink(target),
+    await seekMessage(target, () => ticket === linkJumpTicket && landOnDeepLink(target, Boolean(options.center)),
       () => ticket === linkJumpTicket && threadingSupported && channelView !== "flat" && answeredElsewhere(target));
     if (ticket === linkJumpTicket && !rowHolding(target)) deepLinkFocus = null;
   } finally {
@@ -2299,6 +2368,15 @@ function returnFromLinkJump() {
  */
 async function returnToLinkSpot(spot) {
   const ticket = ++linkJumpTicket;
+  // `#580 open-in-chat-jump`. A jump from the call's view goes back to it, where the reader was.
+  if (spot.call) {
+    if (currentScreen !== "main" || currentView === "voice") return;
+    uiStateSettled = true;
+    showView("voice");
+    stopDiscordPolling();
+    setStatus("Back on the call's view.");
+    return;
+  }
   const place = spot.place;
   if (!place || currentScreen !== "main" || currentView !== "discord") return;
   if (!knownChannels.some((channel) => String(channel.id) === place.channel)) return;
@@ -15874,23 +15952,26 @@ function correctSentCard(key, turn) {
 }
 
 /**
- * Open the message a frozen card sent, in the channel view: the channel, the thread it went to,
- * and the row itself when it is loaded. When it is not, the status line says where to look.
+ * Open the message a frozen card sent (`#580 open-in-chat-jump`). The owner: "Of course pressing the
+ * button should jump to the right view and to the message." It used to work only when the channel
+ * picker already showed the card's channel, and otherwise said to choose it there. Now it is a
+ * link's jump (`jumpToSentMessage`): the channel's view, the card's channel, All unless Settings says
+ * Main, and the message centred and lit; one Back returns to where it was pressed.
  */
 async function openSentMessage(detail) {
-  if (String(el("discord-channel").value) !== String(detail.channel_id)) {
-    setStatus(`That message is in ${detail.channel_name}; choose it in the channel picker to see it.`);
+  const channel = String(detail.channel_id);
+  if (!knownChannels.some((known) => String(known.id) === channel)) {
+    setStatus(`That message is in ${detail.channel_name}, which this app no longer reads.`);
     return;
   }
-  if (currentView !== "discord") {
-    uiStateSettled = true;
-    showView("discord");
-    await readEnteredChannel(false);
-  }
-  if (detail.thread_id) await openThread(String(detail.thread_id));
-  const row = [...leftEl("discord-log").children].find((each) => idsOf(each).includes(String(detail.message_id)));
-  if (row) revealRow(row);
-  else setStatus(`That message is not among the ones loaded here — scroll back in ${detail.channel_name} to find it.`);
+  /** @type {MessageLinkRef} */
+  const ref = {
+    service: String(chatProviderName || ""),
+    channel,
+    message: String(detail.message_id),
+    thread: detail.thread_id ? String(detail.thread_id) : null,
+  };
+  await guardQuietly(jumpToSentMessage)(ref);
 }
 
 /**
@@ -34411,12 +34492,17 @@ function rowOnScreen(row) {
  * room below the row is the best chance the reply is still on screen, and then there is nothing to
  * come back from. A row nearer the end of the list than a screenful stops where the list does.
  */
-function revealRow(row) {
+function revealRow(row, center = false) {
   const area = el("scroll-area");
   // The reader asked for this message: a filter change's hold, and its walk back, give way. `#243`.
   filterHold = null;
   endFilterWalk();
-  area.scrollTop += drawnTop(row) - floatingClearance(area) - REPLY_LANDING_GAP_PX;
+  const clear = floatingClearance(area) + REPLY_LANDING_GAP_PX;
+  // `#580 open-in-chat-jump`: centred in the room under what floats over the list, or under the top
+  // as anywhere else when it is too tall to be.
+  const height = row.getBoundingClientRect().bottom - drawnTop(row);
+  const lead = center ? Math.max(clear, (clear + area.getBoundingClientRect().bottom - height) / 2) : clear;
+  area.scrollTop += drawnTop(row) - lead;
   if (replyLanded) {
     clearTimeout(replyLanded.timer);
     replyLanded.row.removeAttribute("data-landed");
@@ -56643,6 +56729,8 @@ const SYNCED_SETTING_KEYS = [
   "vibe-talk.voice.rich-headers",
   // `#543 in-app-message-links`. Whether a link to a message opens it here.
   "vibe-talk.voice.in-app-links",
+  // `#580 open-in-chat-jump`. The view a sent card's Open in channel lands in.
+  "vibe-talk.voice.open-in-view",
   "vibe-talk.voice.collapsed-lines",
   "vibe-talk.voice.hidden-link-kinds",
   // `#564 message-summary-toggle`. Summarize collapsed messages; the server reads it too, and
@@ -56758,6 +56846,7 @@ function applySyncedSetting(key) {
         applyInAppLinks(storedInAppLinks());
         redrawMessageLinks();
         break;
+      case OPEN_IN_VIEW_KEY: renderOpenInView(); break;
       case COLLAPSED_LINES_KEY:
         applyCollapsedLines(storedCollapsedLines());
         refreshElisionLines();
@@ -57198,6 +57287,7 @@ applyCombineMessages(storedCombineMessages());
 applyHideEmptyMessages(storedHideEmptyMessages());
 applyRichHeaders(storedRichHeaders());
 applyInAppLinks(storedInAppLinks());
+renderOpenInView();
 applySummarizeCollapsed(storedSummarizeCollapsed());
 applyEnterSends(storedEnterSends());
 // `#340 composer-grow-box`. Drawn as stored, and stored only once the reader ticks one: absent means off.
@@ -57375,6 +57465,14 @@ el("in-app-links").addEventListener("change", () => {
   setStatus(el("in-app-links").checked
     ? "links to messages open here."
     : "links to messages open the chat service.");
+});
+
+// `#580 open-in-chat-jump`.
+el("open-in-view").addEventListener("change", () => {
+  chooseOpenInView(el("open-in-view").value);
+  setStatus(storedOpenInView() === "main"
+    ? "Open in channel lands in Main."
+    : "Open in channel lands in All, every message in order.");
 });
 
 // `#564 message-summary-toggle`. The chip over the list follows it (`setSummaryMode`).
