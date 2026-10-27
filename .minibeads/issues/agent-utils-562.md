@@ -107,7 +107,9 @@ witnesses, remote containment, submodule salvage receipts, planned
 rescue receipts, and the exact derived ARCHIVED entry under both rescue
 roots). That completes every recovery-journal kind.
 
-[muse watermelon] Slice 16 in progress: validation/editions.json updated for
+[muse watermelon] Slice 16 landed (b2ab2951): validation/editions.json updated for
 complete journal coverage. After this, the remaining work toward a Rust
 wrkslots is composed read commands (list/status-style summaries over the
 validated formats), then writers.
+
+[muse watermelon] Next slice: `parse-states`, composing the ACTIVE/ARCHIVED shard readers with the partial-shard pairing rule from `_ensure_state_shard` (read-only; snapshot mode, no EVENTS derivation).
