@@ -44,6 +44,7 @@
 mod canonical;
 pub mod cli;
 mod config;
+mod config_validate;
 mod evidence;
 mod index;
 mod plan;
