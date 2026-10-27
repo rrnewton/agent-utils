@@ -10,14 +10,14 @@
 //! a read of several threads of its own still gets those names byte for byte, at the same cost, in
 //! the same order, now that the trait has one. Rewrite it only for a change that is MEANT to alter
 //! what such a provider is asked or answers:
-//! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test thread_reads`.
+//! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test integration thread_reads::`.
 //!
 //! Naming reads each channel at most once per `summaries.thread_naming_interval_seconds`, takes a
 //! channel's due threads in its own order, and pauses a channel whose read failed at the provider
 //! (`#286 naming-budget`). So the test runs on tokio's paused clock at the default interval, and
 //! the fixture records that order and that pause, as the code before `fetch_threads` made them.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;

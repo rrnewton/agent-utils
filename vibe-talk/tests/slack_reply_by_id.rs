@@ -9,7 +9,7 @@
 //! at the loopback Slack fake: one pinned read of history, then one of the thread, and nothing at all
 //! read on a guess.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

@@ -2,7 +2,7 @@
 //! default. They take a few minutes and their numbers mean something only in a release build:
 //!
 //! ```text
-//! cargo test --release --test cache_bench -- --ignored --nocapture --test-threads 1
+//! cargo test --release --test integration -- cache_bench:: --ignored --nocapture --test-threads 1
 //! ```
 //!
 //! What they measure, against the plan's targets:

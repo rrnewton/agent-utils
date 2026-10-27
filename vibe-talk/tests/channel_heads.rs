@@ -8,7 +8,7 @@
 //! `ChatClient::channel_heads` existed, so it is the proof that a provider without a head read of
 //! its own still gets those answers byte for byte, at the same cost, once the callers know about
 //! heads. Rewrite it only for a change that is MEANT to alter what such a provider is asked or
-//! answers: `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test channel_heads`.
+//! answers: `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test integration channel_heads::`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

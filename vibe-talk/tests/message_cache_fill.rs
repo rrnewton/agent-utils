@@ -395,7 +395,7 @@ async fn nothing_is_swept_or_filled_when_the_store_did_not_give_back_the_added_c
 
 // ---- write-through at the read sites -----------------------------------------------------------
 
-mod slack_fake;
+use crate::slack_fake;
 
 use vibe_talk::cache::coverage::{Interval, Source, SETTLE_MS};
 use vibe_talk::cache::Read;

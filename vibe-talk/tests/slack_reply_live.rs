@@ -8,7 +8,7 @@
 //! at most four threads a poll, the rest carried to the next. Counted here at a loopback fake that
 //! answers 20 rows a call, as the bridge in front of Slack does.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::collections::HashMap;
 use std::sync::Arc;

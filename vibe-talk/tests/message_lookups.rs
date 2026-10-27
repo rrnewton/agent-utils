@@ -7,9 +7,9 @@
 //! several ids of its own still gets those answers byte for byte, at the same cost, once the
 //! callers read through the trait. Rewrite it only for a change that is MEANT to alter what such a
 //! provider is asked or answers:
-//! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test message_lookups`.
+//! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test integration message_lookups::`.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

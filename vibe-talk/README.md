@@ -4981,7 +4981,7 @@ make contract                   # regenerate the schema, samples, validators and
 make contract-check typecheck   # what validation runs: stale generated files, then tsc
 ```
 
-`cargo test --test contract` fails when the schema or samples no longer match the Rust types, and
+`cargo test --test integration contract::` fails when the schema or samples no longer match the Rust types, and
 `make contract-check` fails when the browser files no longer match the schema. Serving the page
 needs none of this tooling: `web/contract.js` is plain JavaScript with no dependencies.
 

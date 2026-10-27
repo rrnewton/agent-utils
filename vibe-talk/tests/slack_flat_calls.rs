@@ -9,7 +9,7 @@
 //! says what it said last time has nothing new to read, and one that moved needs only what came
 //! after the newest reply already held.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::collections::HashMap;
 use std::time::Duration;

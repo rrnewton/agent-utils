@@ -9,7 +9,7 @@
 //! and silently skips whatever the provider overrides. So a method added to the trait fails here
 //! until all three forward it.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};

@@ -448,10 +448,20 @@ async fn a_stream_leaves_one_line_at_attach_and_it_reads_as_instant() {
         lines[0]
     );
     assert!(lines[0].contains("status=200"), "{}", lines[0]);
+    // The line exists before the never-ending body is read, which is what proves it is written
+    // at attach. Its millis is the attach's own cost: zero on an idle machine, a few on a loaded
+    // one with the whole suite running in one process (`vibe-talk-test-debuginfo`), and never the
+    // reader's connected time, which here would be forever.
+    let millis: u64 = lines[0]
+        .split("millis=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no millis in {}", lines[0]));
     assert!(
-        lines[0].contains("millis=0"),
-        "the attach line is written before the first event, so it must read as zero — if this \
-         ever becomes non-zero the log has started waiting for the stream to END, which would \
+        millis < 1_000,
+        "the attach line is written before the first event, so it must read as the attach's own \
+         cost — if this ever grows, the log has started waiting for the stream to END, which would \
          delay every line by however long the reader stayed connected: {}",
         lines[0]
     );

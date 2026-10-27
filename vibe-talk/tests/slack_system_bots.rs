@@ -9,7 +9,7 @@
 //! one, while a Discord-protocol provider with nothing configured keeps the guess. The page's half
 //! is in the page suite and in `tests/system_bots_browser.py`.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

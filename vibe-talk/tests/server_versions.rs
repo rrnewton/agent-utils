@@ -5,7 +5,7 @@
 //!
 //! Against the loopback Slack fake.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

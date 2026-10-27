@@ -8,7 +8,7 @@
 //! A served read must answer while that read is still held; a read that may not be served
 //! must still be waiting when the hold is released.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 use std::time::Duration;

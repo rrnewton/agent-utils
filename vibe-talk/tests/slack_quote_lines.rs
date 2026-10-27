@@ -10,7 +10,7 @@
 //! an answer, a quote that ends the message, a `>>>` that quotes the rest of it, and a quote and
 //! its answer in a thread reply.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

@@ -8,7 +8,7 @@
 //! thread, the newest messages, the live poller, a forward read, and the HTTP API; and an absent
 //! field stays "not reported", so a bridge that cannot supply reactions reads exactly as before.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

@@ -10,7 +10,7 @@
 //! fake of the provider: a Google Chat bridge speaking Discord's HTTP API, and the Slack Web API.
 //! Discord itself is the in-memory fake every other API test uses.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::{Arc, Mutex};
 

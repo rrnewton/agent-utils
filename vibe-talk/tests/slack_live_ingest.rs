@@ -5,7 +5,7 @@
 //! Driven through the server's own `/api/v1/live/tail` route against the loopback Slack fake,
 //! whose call counters show which provider reads each step made.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -971,7 +971,7 @@ fn the_records_unit_lets_the_adapter_choose_the_channels_and_the_position() {
 ///
 /// The functional tests run in the ordinary suite. The two measurements print their figures and
 /// are `#[ignore]`d, because they take seconds of wall-clock time and their numbers, not a pass,
-/// are the point: `cargo test --test slack_live_ingest measure -- --ignored --nocapture`.
+/// are the point: `cargo test --test integration slack_live_ingest::measure -- --ignored --nocapture`.
 mod measure {
     use std::sync::Arc;
     use std::time::{Duration, Instant};

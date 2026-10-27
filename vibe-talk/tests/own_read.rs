@@ -10,7 +10,7 @@
 //! owner named only by `[owner] user_ids`, the coding agents by `coding_agent_user_ids`), through the
 //! HTTP routes a page reads, and through the live hub a pushed message arrives by.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

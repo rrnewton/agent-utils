@@ -7,7 +7,7 @@
 //! the write token, its upstream read held until the evaluation beside it has read the cache, when
 //! what the request's own write does next matters too.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 use std::time::Duration;

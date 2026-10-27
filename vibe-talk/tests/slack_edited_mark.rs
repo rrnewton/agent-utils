@@ -6,7 +6,7 @@
 //! Slack lists without it, or with an `edited` whose `ts` is not one, has none, so a bridge that
 //! cannot supply edits reads exactly as before.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

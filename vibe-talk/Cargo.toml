@@ -15,6 +15,9 @@ publish = false
 # server. Without this, adding the mock turned all of them into "could not determine which binary
 # to run" — a second target must not change what the first command in the quickstart does.
 default-run = "vibe-talk"
+# The integration tests are one binary, `tests/integration.rs`, plus the two that must have a
+# process of their own (`vibe-talk-test-debuginfo`): see that file.
+autotests = false
 
 [lib]
 name = "vibe_talk"
@@ -32,6 +35,18 @@ path = "src/main.rs"
 [[bin]]
 name = "vibe-talk-mock-elevenlabs"
 path = "src/bin/mock_elevenlabs.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "egress_proxy"
+path = "tests/egress_proxy.rs"
+
+[[test]]
+name = "voice_page"
+path = "tests/voice_page.rs"
 
 [dependencies]
 anyhow = "1"
@@ -151,3 +166,17 @@ tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]
 missing_docs = "deny"
+
+# Debug and test builds keep line tables only (`vibe-talk-test-debuginfo`, 2026-10-26). With
+# full debuginfo every integration-test binary was about 330 MB, and one dev-profile build of the
+# suite about 30 GB, which the shared validation host's disk could not keep up with. Line tables
+# still give file and line in backtraces and panics; dependencies keep none, because nobody steps
+# through them here. `cargo test --release`, which validation runs, is unaffected.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"

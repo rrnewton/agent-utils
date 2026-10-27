@@ -5,7 +5,7 @@
 //! Against the loopback Slack fake, with standard shortcodes, skin tones, a workspace's custom
 //! emoji, a shortcode inside code, and a time and an address whose colons only look like one.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

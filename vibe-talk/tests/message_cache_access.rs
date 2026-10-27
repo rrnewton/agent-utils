@@ -5,7 +5,7 @@
 //! hand-set clock placed near its fixture's times. The providers are scripted: each says it is the
 //! account the test names, and fails the operations the test names, the way the test names.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

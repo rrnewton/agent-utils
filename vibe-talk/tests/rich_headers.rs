@@ -355,7 +355,7 @@ async fn the_browser_check_draws_what_this_server_sends() {
     assert!(
         held == text,
         "{} is not what the server sends for its messages; rewrite it with \
-         VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test rich_headers",
+         VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test integration rich_headers::",
         path.display()
     );
     // Every message the browser draws with a heading has one, and the ones without do not.

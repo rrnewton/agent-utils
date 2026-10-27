@@ -9,7 +9,7 @@
 // with no module loader and no Ajv package present. That is what proves the generated file is
 // standalone, which is what lets it be served with no build step.
 //
-// Run with `node tests/js/contract.test.mjs`; `cargo test --test contract` runs it too.
+// Run with `node tests/js/contract.test.mjs`; `cargo test --test integration contract::` runs it too.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

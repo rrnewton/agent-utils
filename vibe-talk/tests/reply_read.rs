@@ -524,7 +524,7 @@ async fn a_thread_channel_refusal_is_remembered_whoever_asked_the_mark() {
 
     // A reply's own mark, refused although the scope read said the marker is the channel's: the
     // provider's refusal wins, and the next reply asks nothing.
-    let (harness, ids) = crate::harness(4);
+    let (harness, ids) = crate::reply_read::harness(4);
     harness
         .discord
         .fail_upstream_read_mark_next(thread_channel_refusal());
@@ -536,7 +536,7 @@ async fn a_thread_channel_refusal_is_remembered_whoever_asked_the_mark() {
     assert_eq!(asked(&harness), vec![here(&ids[1])]);
 
     // THE CONTROL: any other failure is not remembered, and the next reply asks.
-    let (harness, ids) = crate::harness(4);
+    let (harness, ids) = crate::reply_read::harness(4);
     harness
         .discord
         .fail_upstream_read_mark_next(ChatError::Status {
@@ -746,7 +746,7 @@ async fn a_voice_reply_in_a_channel_narrowed_to_one_thread_is_done_and_asks_the_
     );
 
     // THE CONTROL: the same reply in a whole channel moves it.
-    let (harness, ids) = crate::harness(3);
+    let (harness, ids) = crate::reply_read::harness(3);
     ask_before_send(&harness, false).await;
     let said = post_reply(
         &harness,

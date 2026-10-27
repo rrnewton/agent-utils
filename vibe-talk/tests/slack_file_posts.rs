@@ -7,7 +7,7 @@
 //! points its `url_private` and thumbnail at the fake itself, so a fetch of one would be a request
 //! the fake records.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

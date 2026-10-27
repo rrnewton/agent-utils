@@ -3,7 +3,7 @@
 //! The fake caps every page at a handful of entries, far below what the client asks for, because
 //! a server is allowed to do that and the bridge this client is meant to work through does it.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::time::{Duration, Instant};
 

@@ -6,7 +6,7 @@
 //! through the HTTP routes the page uses: browse, search by a person's name, add, and see the name
 //! in the channel list the picker, the headers and speech take their names from.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

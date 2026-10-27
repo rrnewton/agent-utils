@@ -6,9 +6,9 @@
 //! proof that a provider without a range read of its own still gets those answers byte for byte,
 //! at the same cost, once the routes read through the trait's default. Rewrite it only for a
 //! change that is MEANT to alter what such a provider is asked or answers:
-//! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test range_reads`.
+//! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test integration range_reads::`.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

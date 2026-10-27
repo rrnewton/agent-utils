@@ -8,7 +8,7 @@
 //! names the public Discord API, and the test harness keeps that client on loopback
 //! (`#359 provider-diagnostics-ids`, see `vibe_talk::egress`).
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

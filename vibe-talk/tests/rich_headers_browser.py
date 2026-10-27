@@ -11,7 +11,7 @@ short, and that no word of a message is lost, at a phone's width and at a desk.
 
 It serves the checked-out assets and a small fake API from one loopback origin. The messages are
 tests/fixtures/rich_headers_messages.json — what the real server sends for their text, held equal to
-it by `cargo test --test rich_headers` — with ids, times and a thread added here: bracket and paren
+it by `cargo test --test integration rich_headers::` — with ids, times and a thread added here: bracket and paren
 tags, times in each place, a title with no time and a time with no title, a tag alone, a body the
 server rendered and plain ones, two messages sent two seconds apart and drawn as one row, a title
 that is one long unbroken token (a commit hash, which has to break inside its row), a person with no

@@ -6,7 +6,7 @@
 //! transport in front of Slack that drops metadata posts without it, and reads find none. The
 //! in-memory provider carries it, deduplicates by it, or lacks it, as each test says.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use slack_fake::{profiled, ts, Fake, FakeState};
 use vibe_talk::chat::{ChatClient, OpKeyCarrier, OpKeyDedupe};

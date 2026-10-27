@@ -5,7 +5,7 @@
 //! workspace — configured, or learned from `auth.test` — a Discord-protocol client's guild and
 //! its Google Chat shapes, and one served timeline read carrying the links the page copies.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

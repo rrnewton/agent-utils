@@ -9,7 +9,7 @@
 //! Every test drives the real HTTP route through the real Slack client against a loopback fake of
 //! the Slack Web API, so "posted once" is counted where Slack would count it.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 use std::time::Duration;

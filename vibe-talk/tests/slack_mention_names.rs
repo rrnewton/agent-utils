@@ -7,7 +7,7 @@
 //! speech says it, and the body and what is posted keep `<@U…>`. A channel mention Slack sends
 //! without its name is named from `conversations.info`, and a user group keeps its handle.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

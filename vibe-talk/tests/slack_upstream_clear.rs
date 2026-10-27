@@ -2,7 +2,7 @@
 //! of the Slack Web API whose `conversations.mark` behaves as Slack's does, moving the cursor
 //! wherever it is told, backwards too. Whatever keeps the cursor from going back is the client's.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

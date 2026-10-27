@@ -11,7 +11,7 @@
 //! through would) and the in-memory provider. Matching by words is the pure
 //! `ops::match_uncertain_part`, tested at the end.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 

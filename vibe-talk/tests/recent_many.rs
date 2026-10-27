@@ -9,7 +9,7 @@
 //! a provider without a read of several channels of its own still gets those answers byte for
 //! byte, at the same cost, in the same order, once the callers know about it. Rewrite it only for
 //! a change that is MEANT to alter what such a provider is asked or answers:
-//! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test recent_many`.
+//! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test integration recent_many::`.
 
 use std::collections::HashSet;
 use std::path::PathBuf;

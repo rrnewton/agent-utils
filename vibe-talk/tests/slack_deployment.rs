@@ -2,7 +2,7 @@
 //! `[[providers]]` entry of kind `slack`, the provider router built from it, and the HTTP routes
 //! answering through the real Slack client against the loopback Slack fake.
 
-mod slack_fake;
+use crate::slack_fake;
 
 use std::sync::Arc;
 
