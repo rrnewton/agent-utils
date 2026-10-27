@@ -8881,6 +8881,43 @@ its drain would type first, so it was not queued",
     /// the agent's lifecycle lock, so no sender types in between. Nothing is pressed when the
     /// screen shows neither a running turn nor queued input.
     pub fn interrupt_and_submit(&self, agent_name: &str) -> Result<Value> {
+        self.interrupt_with(agent_name, true)
+    }
+
+    /// Interrupt a stuck turn and deliver everything queued for the agent (the watcher's
+    /// auto-interrupt policy, #574 harness-adapters): input its harness holds is submitted as
+    /// [`Self::interrupt_and_submit`] does, and input still in agentctl's queue (a Claude Code
+    /// agent is typed into only when idle) is drained once the interrupt has stopped the turn.
+    pub fn interrupt_and_deliver(&self, agent_name: &str) -> Result<Value> {
+        let queue = self.queue(agent_name)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+        let waiting = crate::turn_state::backlog(&queue, now, None).waiting;
+        let mut report = self.interrupt_with(agent_name, waiting == 0)?;
+        if waiting > 0 && report["interrupted"] == true {
+            let detail = report["detail"].as_str().unwrap_or_default().to_owned();
+            match self.drain(agent_name, DrainOptions::default()) {
+                Ok(result) => {
+                    report["detail"] = json!(format!(
+                        "{detail}; drained agentctl's queue ({} waiting): {:?}",
+                        waiting, result.outcome
+                    ));
+                    report["drained"] = json!(result);
+                }
+                Err(error) => {
+                    report["detail"] = json!(format!(
+                        "{detail}; draining agentctl's queue ({waiting} waiting) failed: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// [`Self::interrupt_and_submit`]; with `require_held` false the turn is interrupted even
+    /// when its harness holds no input, because the input waits in agentctl's queue.
+    fn interrupt_with(&self, agent_name: &str, require_held: bool) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
         record.input_allowed()?;
@@ -8900,7 +8937,7 @@ its drain would type first, so it was not queued",
             .ok_or_else(|| fail(format!("agent {agent_name:?} has no confirmed pane")))?;
         let first = self.turn_screen(&record)?;
         let before = crate::turn_state::read_screen(&first);
-        if before.queued == 0 {
+        if before.queued == 0 && require_held {
             return Ok(json!({
                 "interrupted": false,
                 "submitted": false,

@@ -362,11 +362,79 @@ pub struct Backlog {
     pub sent_during_turn: usize,
     /// Seconds since the oldest of those was queued.
     pub oldest_sent_during_turn_seconds: Option<f64>,
+    /// How many waiting prompts are marked urgent ([`urgent`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub urgent: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// Whether a prompt is marked urgent: the word `urgent` (any case) in its first line, as in
+/// `owner (urgent): ...` or `URGENT: ...` (#574 harness-adapters). The watcher interrupts a stuck
+/// turn sooner for urgent input.
+#[must_use]
+pub fn urgent(text: &str) -> bool {
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case("urgent"))
+}
+
+/// `screen` without the rows of any queued-input block (Codex's held messages and their edit
+/// hint, Muse's `◆ Queued input` items, Claude Code's queued-message hint), so input sent to a
+/// stuck agent does not read as the agent making progress.
+#[must_use]
+pub fn without_queue(screen: &str) -> String {
+    let lines: Vec<&str> = screen.lines().collect();
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim_end();
+        let heading = line
+            .strip_prefix("• ")
+            .unwrap_or(line)
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(
+            heading.as_str(),
+            "queued follow-up inputs"
+                | "messages to be submitted at end of turn"
+                | "messages to be submitted after next tool call"
+        ) {
+            index += 1;
+            while index < lines.len() {
+                let row = lines[index];
+                if row.trim().is_empty() || !row.starts_with(' ') {
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        if line.starts_with("◆ Queued input") {
+            index += 1;
+            while index < lines.len() && lines[index].trim().starts_with('└') {
+                index += 1;
+            }
+            continue;
+        }
+        if !line.contains("Press up to edit queued messages") {
+            kept.push(lines[index]);
+        }
+        index += 1;
+    }
+    kept.join("\n")
+}
+
+fn queue_item(path: &Path) -> Option<Value> {
+    serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()
 }
 
 fn queued_at(path: &Path) -> Option<f64> {
-    let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<Value>(&text).ok()?["queued_at"].as_f64()
+    queue_item(path)?["queued_at"].as_f64()
 }
 
 fn json_files(directory: &Path) -> Vec<(std::path::PathBuf, Option<f64>)> {
@@ -397,7 +465,18 @@ pub fn backlog(queue: &Path, now: f64, turn_start: Option<f64>) -> Backlog {
     for lane in ["inbox", "inbox.v2", "inflight"] {
         for (path, modified) in json_files(&queue.join(lane)) {
             result.waiting += 1;
-            if let Some(at) = queued_at(&path).or(modified) {
+            let item = queue_item(&path);
+            if item
+                .as_ref()
+                .and_then(|item| item["text"].as_str())
+                .is_some_and(urgent)
+            {
+                result.urgent += 1;
+            }
+            if let Some(at) = item
+                .and_then(|item| item["queued_at"].as_f64())
+                .or(modified)
+            {
                 let age = (now - at).max(0.0);
                 result.oldest_waiting_seconds = Some(
                     result
@@ -775,6 +854,39 @@ pub(crate) mod tests {
 
     fn backlog_missing_is_empty() -> bool {
         backlog(Path::new("/nonexistent/agentctl-queue"), 0.0, Some(0.0)) == Backlog::default()
+    }
+
+    #[test]
+    fn urgent_input_is_marked_in_its_first_line_and_queued_blocks_can_be_masked() {
+        assert!(urgent("owner (urgent): stop the gate"));
+        assert!(urgent("URGENT: disk full"));
+        assert!(
+            !urgent("an urgently worded note"),
+            "the word, not a prefix of another"
+        );
+        assert!(!urgent("status?\nnot urgent at all"), "first line only");
+        let masked = without_queue(CODEX_LONG);
+        assert!(!masked.contains("coordinator:"), "{masked}");
+        assert!(masked.contains("Working (46h 54m 14s"), "{masked}");
+        assert!(masked.contains("Ask Codex to do anything"), "{masked}");
+        assert!(!without_queue(MUSE_QUEUED).contains("Queued input"));
+        assert!(!without_queue(CLAUDE_QUEUED).contains("Press up to edit queued messages"));
+        let directory = scratch();
+        let inbox = directory.join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(
+            inbox.join("a.json"),
+            r#"{"queued_at": 1.0, "text": "owner (urgent): look"}"#,
+        )
+        .unwrap();
+        fs::write(
+            inbox.join("b.json"),
+            r#"{"queued_at": 2.0, "text": "status?"}"#,
+        )
+        .unwrap();
+        let backlog = backlog(&directory, 10.0, None);
+        assert_eq!((backlog.waiting, backlog.urgent), (2, 1));
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]

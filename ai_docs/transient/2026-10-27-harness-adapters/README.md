@@ -131,6 +131,41 @@ verified against harness source: Codex's 10 s default yield, and that a Claude `
 written before the request rather than after its reply (the rows on this host are consistent
 with that).
 
+## What watch-agents does with it (slice 2)
+
+Each pass reads every watched agent's transcript tail (found by the record's session id, or by
+the files its pinned harness process holds open) and reports it under `activity` in the pass
+report. It feeds the #570 states:
+
+* **stream-silent** is timed from the newest of the screen, the tools' counters and the
+  transcript's last progress, and names an open model request (`a model request has been open 32
+  min with nothing back`).
+* **tool-blocked** names the transcript's call and its limit; a call no process runs for (an MCP
+  tool, a web fetch, a sub-agent inside the harness) is tool-blocked once nothing moves for
+  `--stall-minutes`, where the screen alone said "stream silent, no tool running".
+* **untimed-tool** (new): a call that set no timeout, and that its harness does not bound, running
+  past `--untimed-tool-minutes` (default 60), working or not.
+
+The **auto-interrupt policy** replaces the per-agent `--auto-deliver` opt-in (still accepted,
+ignored). On by default, it interrupts a turn (Escape) and delivers the input queued for the agent
+only when every condition holds: input is queued (the harness's queue or agentctl's); no progress
+on `--auto-deliver-checks` (2) consecutive passes spanning `--auto-deliver-after` (60 min; 0 turns
+it off), where progress is a change in the screen with its turn timer and queued-input block
+masked, CPU or I/O under its tools, or a new transcript entry other than bookkeeping; its tools
+could be sampled from /proc; no approval prompt, no draft in its input box, no scrolled-up view;
+not named with `--no-auto-deliver`; not auto-interrupted within the window. Input whose first line
+holds the word "urgent" uses `--auto-deliver-urgent-after` (15 min). Each interrupt is an
+`auto-interrupt` notice of its own to the coordinator saying why, for example `- lane-a:
+auto-interrupted: no progress for 1 h 1 m over 2 checks (screen unchanged, no tool running;
+transcript: a model request open 58 min with nothing back); 4 input(s) queued; interrupted the turn
+after 46 h 54 m and submitted ...`. Input that waits only in agentctl's queue (a Claude Code agent
+is typed into only when idle) is drained once the interrupt has stopped the turn.
+
+Live check, 2026-10-27, one `--once --check-only` pass over this harness's registry with a
+scratch state directory: all four running agents' transcripts were found (three Claude Code
+sessions by session id, the Muse session through its held lock, its record having no session id),
+with the in-flight Bash call and its 400 s timeout shown for the agent running the check.
+
 ## Upstream drafts
 
 Each is written to be filed as is. None has been filed.

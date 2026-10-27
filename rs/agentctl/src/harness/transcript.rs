@@ -170,6 +170,9 @@ pub struct Activity {
     pub last_output_at: Option<f64>,
     /// Its kind.
     pub last_output: Option<String>,
+    /// The newest entry that shows the agent moving: output, a request, a prompt, a tool call
+    /// starting or finishing. Harness bookkeeping does not count.
+    pub last_progress_at: Option<f64>,
     /// When the newest model request was sent, when no output has come back since.
     pub request_since: Option<f64>,
     /// The newest prompt that started a turn.
@@ -184,17 +187,20 @@ pub struct Activity {
 }
 
 impl Activity {
-    /// Note an entry of `kind` at `at`.
+    /// Note an entry of `kind` at `at` that shows the agent moving.
     pub fn event(&mut self, at: f64, kind: &str) {
-        if self.last_event_at.is_none_or(|last| at >= last) {
-            self.last_event_at = Some(at);
-            self.last_event = Some(kind.to_owned());
+        self.bookkeeping(at, kind);
+        if self.last_progress_at.is_none_or(|last| at >= last) {
+            self.last_progress_at = Some(at);
         }
     }
 
     /// Note harness bookkeeping: it moves only the last-event clock.
     pub fn bookkeeping(&mut self, at: f64, kind: &str) {
-        self.event(at, kind);
+        if self.last_event_at.is_none_or(|last| at >= last) {
+            self.last_event_at = Some(at);
+            self.last_event = Some(kind.to_owned());
+        }
     }
 
     /// Note model output of `kind` at `at`; it answers any request sent before it.
@@ -425,5 +431,12 @@ mod tests {
         assert_eq!(activity.request_since, None);
         assert_eq!(activity.last_event.as_deref(), Some("prompt"));
         assert_eq!(activity.last_output_at, Some(25.0));
+        activity.bookkeeping(50.0, "attachment");
+        assert_eq!(activity.last_event_at, Some(50.0));
+        assert_eq!(
+            activity.last_progress_at,
+            Some(40.0),
+            "bookkeeping is not progress"
+        );
     }
 }
