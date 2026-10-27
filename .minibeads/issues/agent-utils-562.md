@@ -76,8 +76,10 @@ slice 1-8 format readers (the wrkslotsd tool note and the wrkslots format
 inventory entry name the Rust modules, the differential corpus, and the
 remaining ownerless/absent journal kinds).
 
-[muse watermelon] Slice 10 in progress: `parse-journal` also covers
+[muse watermelon] Slice 10 landed (df82d2a0): `parse-journal` also covers
 ownerless-validate-remove, including the validation-recovery authorization
 and, when present, the exclusion path validation (recovery target, fenced
 path, guard identity). The ownerless-agent/clone/cache and absent-row
 journal kinds remain unsupported.
+
+[muse watermelon] Remaining journal kinds are the ownerless-agent/clone/cache and absent-row families. Next: scope the ownerless-agent journal inputs.
