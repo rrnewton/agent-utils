@@ -192,6 +192,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl drain reviewer --ready-timeout 60\n  agentctl drain reviewer --deadline 40 --lock-timeout 10 --max-items 1\n\nThe drain types inbox/ and inbox.v2/ together, oldest first. Just before typing each prompt it\nchecks for a tombstone (agentctl cancel) and for an expired --ttl, and sets such a prompt aside in\ncancelled/ instead. Exit 0 when every examined prompt was confirmed, 75 when prompts remain pending\n(not ready, a bound reached, or a lock timeout), 76 when one was quarantined as possibly submitted."
     )]
     Drain(Drain),
+    /// Follow a headless agent's event log: one line per event (turns, prose, tools, inputs with their sender), read-only and lock-free
+    #[command(
+        after_help = "Examples:\n  agentctl tail coordinator --follow\n  agentctl tail coordinator --last 50 --types assistant.text,turn.\n  agentctl tail coordinator --json --since 4180\n  agentctl tail coordinator --at 4182\n\nThe log is REGISTRY/NAME/events/<generation>.jsonl (schema v1, one JSON object per line; see\n`agentctl userguide`). Any number of tails may run beside the agent; closing one never touches it.\nA hole in the sequence (pruned or unreadable lines) prints as a gap line. Not to be confused with\n`agentctl read --output tail`, which reads an interactive agent's pane."
+    )]
+    Tail(Tail),
     /// Ask every drain not to type a queued prompt: write its tombstone without waiting for any lock, and report where the prompt is
     #[command(
         after_help = "Examples:\n  agentctl cancel reviewer review-1\n  agentctl cancel reviewer hold-3 --reason superseded\n\nThe tombstone is QUEUE/cancel/MESSAGE_ID.json. A drain checks it after taking the prompt and before\ntyping, so a prompt reported pending is never typed: the drain moves it to cancelled/. outcome is\npending, unknown (no such prompt yet; one that arrives later is set aside too), inflight (a drain\nhas taken it and may be typing it), too_late (typed or quarantined), or already_cancelled. Once a\nqueue has a tombstone, the other edition refuses to drain it."
@@ -350,6 +355,33 @@ struct InstallUnits {
     /// Replace existing files whose contents differ
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Args)]
+struct Tail {
+    #[command(flatten)]
+    agent: Named,
+    /// Keep printing new events until interrupted (polls every 250 ms, across wrapper restarts)
+    #[arg(long, short = 'f')]
+    follow: bool,
+    /// Print only events after this sequence number
+    #[arg(long, value_name = "SEQ", conflicts_with = "last")]
+    since: Option<u64>,
+    /// Print only the last N matching events (then follow, with --follow)
+    #[arg(long, value_name = "N")]
+    last: Option<usize>,
+    /// Print events verbatim as JSON lines; holes in the sequence print as {"gap": ...}
+    #[arg(long)]
+    json: bool,
+    /// Comma-separated event types to print; a trailing dot matches a prefix (example: tool.,turn.completed)
+    #[arg(long, value_name = "TYPES", value_delimiter = ',')]
+    types: Vec<String>,
+    /// Columns to wrap prose at (default: 100)
+    #[arg(long, default_value = "100", value_name = "COLS")]
+    width: usize,
+    /// Print the event with this sequence number and the rest of its turn, then exit; exit 1 when it does not exist
+    #[arg(long, value_name = "SEQ", conflicts_with_all = ["follow", "since", "last"])]
+    at: Option<u64>,
 }
 
 #[derive(Args)]
@@ -1737,6 +1769,56 @@ fn write_text(text: &str) -> io::Result<()> {
     output.flush()
 }
 
+/// `agentctl tail NAME`: read the agent's event log without touching the agent.
+fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
+    let name = &value.agent.name;
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(Failure::Usage(format!(
+            "invalid agent name {name:?}: use 1-32 lowercase letters, digits, and hyphens"
+        )));
+    }
+    let directory = registry.join(name);
+    if !directory.is_dir() {
+        return Err(Failure::Usage(format!(
+            "unknown agent {name:?} in {}; use list to inspect the registry",
+            registry.display()
+        )));
+    }
+    let events = crate::headless::events::directory(&directory);
+    if !events.is_dir() && !value.follow {
+        return Err(Failure::Usage(format!(
+            "agent {name:?} has no event log ({}); only headless agents write one",
+            events.display()
+        )));
+    }
+    let options = crate::headless::tail::TailOptions {
+        follow: value.follow,
+        since: value.since,
+        last: value.last,
+        json: value.json,
+        types: value.types,
+        width: value.width.max(20),
+        at: value.at,
+        ..crate::headless::tail::TailOptions::default()
+    };
+    let mut output = io::stdout().lock();
+    let found = crate::headless::tail::run(&events, &options, &mut output, &|| false)
+        .map_err(Failure::Output)?;
+    if !found {
+        eprintln!(
+            "agentctl tail: no event {} in {name}'s log (pruned, or not yet written)",
+            value.at.unwrap_or_default()
+        );
+        return Ok(1);
+    }
+    Ok(0)
+}
+
 fn plugin_discovery_required(command: &Commands) -> bool {
     matches!(command, Commands::Capabilities)
 }
@@ -2007,6 +2089,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             })?)
             .map_err(Failure::Output)?;
             return Ok(0);
+        }
+        Commands::Tail(value) => {
+            return run_tail(&args.registry, value);
         }
         Commands::Profiles(value) => {
             let root = crate::profiles::configuration_root(&value.cwd, &args.registry, true)?;
@@ -2571,7 +2656,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::InstallUnits(_)
         | Commands::Watch(_)
         | Commands::WatchAgents(_)
-        | Commands::Hold(_) => {
+        | Commands::Hold(_)
+        | Commands::Tail(_) => {
             unreachable!()
         }
     };
