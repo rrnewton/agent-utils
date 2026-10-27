@@ -1,7 +1,10 @@
 # server-side-search: pilot study, design and implementation plan
 
-2026-10-25, `#521 server-side-search`. **A plan for the owner to decide on. Nothing in it is
-implemented.** Evidence is in `evidence/`, with the scripts that produced it in `evidence/scripts/`.
+2026-10-25, `#521 server-side-search`. **A plan for the owner to decide on.** Updated
+2026-10-27 (`#596 server-search-prep`): the owner settled questions 3, 4 and 10. §9 compares the
+query syntax of five products, §10 evaluates existing crates, and §11 lists the
+question-independent groundwork that landed (none of it reachable from the page) and what still
+waits on a question. Evidence is in `evidence/`, with the scripts that produced it in `evidence/scripts/`.
 Channel ids, host names, the private shim's location and message text are redacted throughout:
 "channel A" is the owner's channel whose summary read "112 messages", "channel B" the one before
 it, "channel C" the busiest bridged channel. Revised once after an adversarial review against the
@@ -47,6 +50,14 @@ is loaded"* under *"112 messages from <channel A>"*. The owner asked:
   against a Rust and a JavaScript matcher in CI, with a cross-language differential fuzz. Not WASM.
   The matcher is the small half (~300 lines a side). The large half is *what text is searched*,
   and WASM does not solve that. ([§5](#5-one-matcher-two-languages).)
+- **2026-10-27 (`#596 server-search-prep`):**
+  - Classic `search.messages` cannot be called on our Slack path: no command for it, no
+    `search:read` scope, and the path refuses it.
+  - Real-Time Search found 72% of our substring matches over 20 terms on one channel-day, with
+    whole words found and everything inside or at the start of a longer word missed
+    (`ai_docs/transient/2026-10-27-slack-search-probe/`).
+  - The settled syntax, its precedents (§9), a crate evaluation (§10) and the groundwork that
+    landed (§11) are below.
 - **Plan:** five phases, about **10–15 agent-days**. Phase 0 (honest counts and completeness) is
   under a day and independent of the rest. ([§7](#7-phased-plan).) Ten questions for the owner are
   in [§8](#8-questions-for-the-owner).
@@ -218,6 +229,13 @@ and, offline: *"Searched what is loaded, back to Oct 24. The server can't be rea
 
 ### The language
 
+**Settled (owner, 2026-10-27):** Gmail's syntax as the base plus `from:`, `in:`, `before:`,
+`after:` and `has:`, over substring matching that ignores case and accents. Two details differ from
+the draft below, and §9 says why: OR binds its two neighbours rather than being the loosest
+operator; and `NOT` is a word, because the base's negation is `-`. The
+specification is now the module documentation of `vibe-talk/src/search_query.rs`, pinned by
+`vibe-talk/tests/fixtures/search_query.json`. The draft follows as it was written.
+
 ```
 query    := or
 or       := and ( "OR" and )*                    OR in capitals; lower-case "or" is a word
@@ -361,8 +379,8 @@ plus 2–3 for 0b.
    rather than the row's combined text? *Recommended: yes; the server has no rows.*
 3. **Substring, not words:** keep today's substring matching (`coord` finds "coordinator", an
    infix finds the word that holds it)? The cost is that upstream search can never be an exact
-   prefilter, only hints. *Recommended: keep substring.*
-4. **Accents:** should `cafe` find "café" (diacritic folding on both sides)? *Recommended: yes.*
+   prefilter, only hints. *Recommended: keep substring.* **Answered 2026-10-27: yes, keep substring**, even where it clashes with upstream word search; upstream is a candidate source only.
+4. **Accents:** should `cafe` find "café" (diacritic folding on both sides)? *Recommended: yes.* **Answered 2026-10-27: yes**, case- and accent-insensitive by default.
 5. **Consent and cost upstream:** start an exhaustive upstream scan only on a tap that shows its
    estimate ("Search Slack further back: about 80 s for this channel"), bounded like today's walk,
    or in the background on every search? *Recommended: on a tap.*
@@ -380,6 +398,228 @@ plus 2–3 for 0b.
    neighbours? *Recommended: alone, plus "Show in channel".*
 10. **Syntax:** OR in capitals only (lower-case `or` stays a word), `-term` and `NOT term`,
     parentheses, and `from:` `before:` `after:` `on:` `in:` `has:`. Anything to add or drop?
+    **Answered 2026-10-27:** Gmail syntax as the base plus the shared fields; see §9.
+
+## 9. Precedents: how five products spell a search
+
+`#596 server-search-prep`, 2026-10-27. The owner asked for the query syntax of Google web search,
+Gmail, Slack, Discord and Google Chat, checked against each product's public help pages, and for
+ours to be a compatible superset with Gmail's as the base. The pages were fetched read-only on
+2026-10-27:
+
+- Google web search: [Refine Google searches](https://support.google.com/websearch/answer/2466433),
+  the [Advanced Search form](https://www.google.com/advanced_search), and
+  [search tips](https://support.google.com/websearch/answer/134479).
+- Gmail: [Refine searches in Gmail](https://support.google.com/mail/answer/7190).
+- Slack: [Search in Slack](https://slack.com/help/articles/202528808-Search-in-Slack), plus what
+  evidence 2 measured.
+- Discord: [How to Use Search on Discord](https://support.discord.com/hc/en-us/articles/115000468588).
+  The article was read through the help centre's JSON API, because the page itself answers with a
+  browser challenge.
+- Google Chat:
+  [Use search operators in Google Chat](https://support.google.com/chat/answer/14179758).
+
+"Not documented" means the cited page does not say. It does not mean the product lacks the feature.
+
+| | Google web | Gmail | Slack | Discord | Google Chat | **Ours (settled)** |
+|---|---|---|---|---|---|---|
+| Several words | all of them, but "might include results that only contain some of the terms" | all | all; measured through the API: not strict (`gate report` returned messages lacking one word) | not documented | all (API: implicit AND) | **all** |
+| `AND` keyword | not documented | `from:amy AND to:david` | measured: works | not documented | not documented | **`AND`, capitals only** |
+| OR | `miniature OR standard` (Advanced Search) | `OR` or `{ }` | measured: none (`OR` read as AND) | not documented | not documented (API: none between keywords) | **`OR`, capitals only; binds its two neighbours** |
+| `\|` | not documented | not documented | measured: matches nothing | not documented | not documented | a word |
+| Exclude | `-car`, `-"Jack Russell"` | `dinner -movie` | `marketing -report`, `-in:`, `-from:` | "author type" filter only | `-birthday`, `-from:jenny`, `-has:file` | **`-term`, `-"phrase"`, `-field:`, `-(group)`** |
+| `NOT` | not documented | not documented | measured: works | not documented | not documented | a word |
+| Exact phrase | `"tallest building"` | `"dinner and movie tonight"` | `"marketing report"` | not documented | `"happy birthday"` | **`"…"`; an unclosed quote runs to the end** |
+| Grouping | not documented | `subject:(dinner movie)` | not documented | not documented | `in:(mobile phones)` | **`( … )`** |
+| Author | not documented | `from:amy@example.com`, `from:me` | `from:@Sara`; via the API only `from:<@U…>` (evidence 2) | `from:` | `from:john@xyz.com`, `from:me` | **`from:` an id exactly, or part of the display name** |
+| Where | `site:` | `in:anywhere`, `in:archive`, `label:` | `in:#channel`, `in:@person`, `is:thread`, `with:` | `in:` a channel | `in:<space>`, `is:dm`, `is:room` | **`in:thread`, `in:main`** (within the channel being searched) |
+| Dates | `before:2025/11/01`, `after:2026/03/10`, `after:2019-03-01` | `after:2004/04/16`, `before:04/18/2004`, `older_than:1y`, `newer_than:2d` | `before:`, `after:` (measured: excludes its day), `on:`, `during:august` | on, before or after a date (filter) | `after:2023/04/16`, `before:04/18/2023`, `older_than:`, `newer_than:`, `tz:` | **`before:` and `after:`; `YYYY-MM-DD`, `YYYY/MM/DD` or `MM/DD/YYYY`, in the reader's zone** |
+| Contains | `filetype:` | `has:attachment`, `has:drive`, `filename:` | `has::emoji:`, `has:pin`, `is:saved` | `has:` links, embeds, files… | `has:url`, `has:file`, `has:image`… | **`has:link`** |
+| Mentions | not applicable | `to:`, `cc:` | not documented (`with:` for threads and DMs) | `mentions:` | `at:` | not yet |
+| Status | not applicable | `is:unread`, `is:starred` | `is:saved` | `pinned` (API) | `is:unread` | not yet |
+| Wildcard | not documented on these pages | not documented | `rep*`: words beginning with at least three letters; measured through the API: no effect (`gat*` 0 hits, `coord*` = `coord`) | not documented | not documented | none needed: every term already matches inside words |
+| Case | "A search for New York Times is the same as a search for new york times" | not documented | measured: insensitive | not documented | not documented | **insensitive (full case folding)** |
+| Accents | not documented | not documented | not documented | not documented | not documented | **insensitive (combining diacritics dropped, `ø`→`o`, `ł`→`l`…)** |
+| Unit matched | words and related words ("running" for "jogging") | words; "a space or a dash (-) will separate a number" | measured: whole words and their inflections (`landed` finds "land"); not a longer word's start (`coord` missed 119 "coordinator…"), never inside a word | API: tokens with `slop` | API: keywords | **substrings of the message's folded text** |
+
+**Ours is Gmail's syntax plus the fields the chat services share.** The base is Gmail's: implicit
+AND, an optional `AND`, upper-case `OR`, `-` before a term, phrase, field or group, `"phrase"` and
+`( … )`. The fields are the ones at least three of the chat services have and that make sense
+inside one channel: `from:`, `in:`, `before:`, `after:` and `has:`. A field with a value we do not
+know (`has:file`, `in:#general`, `on:2026-10-24`, `during:october`) is read as an ordinary word,
+just as Gmail reads an operator it does not know. So a query written for Slack, Gmail or Google
+Chat searches something sensible here and never fails to parse. Where the products agree, we agree:
+`-from:`, quoted phrases, the `YYYY/MM/DD` and `MM/DD/YYYY` dates that Gmail and Google Chat accept,
+and Google's ISO dates.
+
+**Where we deliberately differ:**
+
+- **Substring, not words** (owner, 2026-10-27). `coord` finds "coordinator", `andoff` finds
+  "handoff", and `f(x)` finds "call f(x)". Every product above matches words or word prefixes.
+  This is why upstream search can only ever offer candidates (§5, and the probe in
+  `ai_docs/transient/2026-10-27-slack-search-probe/`).
+- **Case- and accent-insensitive by one written fold** (owner, 2026-10-27). The fold is:
+  - NFD, with the combining diacritic blocks dropped, then NFC;
+  - lower-casing;
+  - a table that completes Unicode's full case folding (`ς`→`σ`, `ß`→`ss`, `µ`→`μ`, ligatures)
+    and joins letters whose mark is built in (`ø`→`o`, `ł`→`l`).
+
+  Only the diacritic blocks are dropped. Indic and Thai vowel signs, Hebrew and Arabic points and
+  Japanese voiced marks are combining marks too, and dropping them would make `कि` find every
+  `क`. The corpus pins both.
+- **OR binds its two neighbours**: `a b OR c` is `a AND (b OR c)`. None of the help pages cited
+  above states a precedence. A draft of §5 had OR as the loosest operator instead. Parentheses
+  settle either reading.
+- **`OR`, `AND` and `NOT`.** Only the capitalised `OR` and `AND` are operators, so `or` stays a
+  word. `NOT` is a word as well, because the approved base is Gmail's `-`. A product that reads
+  `NOT` (Slack does, by measurement) loses nothing, since `-` does the same job.
+- **`after:` includes its day and `before:` excludes its own**: `after:D before:E` is the days
+  D up to but not including E. Gmail's page does not say which way it reads `after:`. Slack's
+  `after:` was measured to exclude its day (the probe).
+- **`in:` names a part of the channel, not another channel.** Searching several channels is open
+  question 8.
+- **No `{ }`, `|`, `AROUND`, `*`, `on:`, `during:`, `older_than:` or `newer_than:` yet.** Each is
+  simple to add once the owner wants it. Until then each is a word, so adding one later changes
+  only queries that already contain it.
+
+## 10. Existing crates: index, query parser, matcher
+
+The owner asked (2026-10-27) to check existing crates before building the query DSL, the matcher
+or the index. These options were evaluated in a scratch benchmark, built outside the repository; its source is
+`ai_docs/transient/2026-10-27-slack-search-probe/scripts/index_bench.rs`:
+
+- (a) SQLite FTS5 in the store vibe-talk already uses;
+- (b) tantivy;
+- (c) query-parser-only crates.
+
+The corpus was this harness's busiest Slack channel: 216 real messages, median 656 characters,
+lower-cased. They were replicated to 20,000 and 110,000 rows; the second is the size the store's own
+benchmark uses. Each row had four random words from the corpus vocabulary and a unique token
+appended. "Incremental" means 1,000 more rows in commits of 50. The live volume, as `#595
+cache-full-history` measured it with `vibe-talk cache-stats` on a copy of the live store: 2,300
+messages in 19.3 MB, 8,378 bytes a message, with the trigram index 52% of the file. That is a
+fraction of either benchmark size.
+
+| | FTS5 trigram, `detail=full` (today's schema) | FTS5 trigram, `detail=none` | tantivy 0.27, 3-gram + lower-case + ASCII folding | plain table, no index |
+|---|---|---|---|---|
+| File at 110k rows (93 MB of text) | 390 MB (index ≈ 276 MB, 3× the text) | not run at 110k | text in SQLite 113 MB + index 64 MB | 113 MB |
+| File at 20k rows (17 MB of text) | 72 MB | **32 MB** (index ≈ 12 MB) | 20.5 MB + 13 MB | 20.5 MB |
+| Bulk build, 110k | 46–51 s | (20k: 5.0 s against full's 6.4 s) | 1.8 s | 0.6 s |
+| Incremental, 1,000 rows in commits of 50 | 0.3–0.9 s | 0.25 s (20k) | 1.5–2.4 s | ~0 |
+| `gate` at 110k (7,333 true matches) | 1.7 ms, exact | (20k: 3.4 ms, exact, via `LIKE`) | 1.0 ms, **9,433: not exact** | 147 ms scan |
+| A unique token at 110k | 0.3 ms | (20k: 0.3 ms) | 0.1 ms | 167 ms scan |
+| Substring | exact for 3+ characters; shorter terms scan | the same, through `LIKE '%…%'` (phrase `MATCH` refuses `detail=none`) | approximate: a phrase of 3-grams gave 29% false positives for `gate` | exact, by scan |
+| Case and accents (probed) | case folded (`ΟΔΟΣ`=`οδος`); `remove_diacritics 1` or `2` folds `café`, `naïve`, `İstanbul` but **not** `Łódź`→`lodz`, `Straße`→`strasse`, `ﬁnal`→`final` | the same | ASCII folding (Latin only) | none |
+| Consistency with the store | same transaction, triggers, `secure-delete` erasure | the same | a second store: its own commits, crash recovery, and deletes that are tombstones until a merge | — |
+| Licence | public domain (bundled 3.53.2) | the same | MIT | — |
+| Dependencies | none new | none new | **107 crates, 76 not already in vibe-talk's tree; +9.5 MB to a release binary** (2.6 → 12.1 MB in the bench) | — |
+
+**Query parsers.**
+
+- `search-query-parser` 0.1.4 (MIT; eyre, regex, serde) parses `and`/`or` in any case, binds AND
+  tighter than OR, and has no fields. Each of those three contradicts the settled syntax.
+- tantivy's `QueryParser` is field-and-term syntax for its own index. It has no substring
+  semantics and no JavaScript twin.
+- A pest or nom grammar would cover Rust only, and the page needs an identical parser in
+  JavaScript.
+
+Whichever parser the server uses, the parity risk sits in a second hand-written parser on the page.
+The corpus and the differential fuzz exist to control exactly that.
+
+**Recommendation: keep FTS5's trigram index, hand-roll the parser and matcher, and fold before
+indexing.**
+
+1. **Matcher and parser: hand-rolled, done.** They are `src/search_query.rs` (about 600 lines
+   of code and specification besides its tests) and its twin in `web/voice.js` (about 290 lines
+   of code). Both are held to `tests/fixtures/search_query.json` (31 fold, 76 parse, 55 match
+   and 22 upstream cases). A seeded differential runs the page's code under node against the
+   Rust code on 4,000 random queries, texts, authors and links. The Rust suite also reads the
+   page's fold table, white-space set and diacritic blocks back from `voice.js` and compares
+   them both ways. No crate fits the settled syntax, and none helps the page.
+2. **Index: FTS5 trigram, as today, over a folded column.** No engine's own folding equals the
+   page's, so the stored `search_text` should hold `fold(…)` of the haystack, under a new
+   `SearchTextSource` version that the writer rebuilds in the background. Query terms get the same
+   fold. Trigram matching is then exact substring matching for terms of 3 or more characters.
+   Shorter terms, or terms containing `%` or `_`, take the scan. The Rust re-match stays as the
+   final word. Not done in this pass: it rewrites every row of the live cache on deploy, which the
+   coordinator should schedule.
+3. **Size: move the index to `detail=none` and query it with `LIKE`.** At 20k rows that cut the
+   index from 51 MB to 12 MB, about tantivy's size, and the counts stayed exact. Today's index is
+   about 3× the text. At the live store's 8.4 KB a message, the default `max_megabytes = 256`
+   holds about 30k messages. `#595 cache-full-history`'s `backfill = "full"`, which keeps whole
+   histories up to 16 GB, makes the index's size matter more. It is a schema migration (drop and
+   rebuild the virtual table), so it was not done here.
+4. **Revisit tantivy** only if the folded `detail=none` index proves too large or too slow on the
+   live volume. It would add a second store to keep consistent with erasure and eviction, a 4.6×
+   larger binary, and 76 new crates.
+
+## 11. Groundwork landed, and what waits on a question
+
+`#596 server-search-prep`, 2026-10-27. Every item is either unreachable from the page or off by
+default. Nothing below changes what the page shows today.
+
+**Settled by the owner on 2026-10-27, and now written into the code and the corpus:**
+
+- question 3, substring matching;
+- question 4, accents;
+- question 10, the syntax, as summarised in §9.
+
+**Done (question-independent):**
+
+- **One language, two copies.** `src/search_query.rs` (the specification, in its module
+  documentation) and its twin in `web/voice.js` (not yet called by the page) share the conformance
+  corpus `tests/fixtures/search_query.json` and a seeded cross-language differential, run by
+  `cargo test`. The page suite runs the corpus too, with negative controls.
+- **The upstream candidate plan** (`upstream_plan`, `searchUpstreamPlan`) follows the owner's
+  2026-10-27 answer on substring matching:
+  - negations and fields are dropped, since dropping a condition only widens the candidate set;
+  - the rest goes into disjunctive normal form, at most 4 upstream queries;
+  - each alternative sends only its word-aligned terms (3+ letters or digits);
+  - an alternative with none reports why the cache must be scanned for it: `not-word-aligned`,
+    `no-term` or `too-many-alternatives`, so that the status can say so.
+- **Horizon bookkeeping.** `coverage::horizon` follows the claim chain down from the head's settled
+  top to the first gap, clamped at the age limit. A property test checks it against `covers`.
+  Not yet used: `#595 cache-full-history`'s record of a channel walked to its beginning, which is
+  what lets a horizon say "the whole channel".
+- **A cache search** (`MessageCache::search`):
+  - it scans newest first, below the page's floor, within a row budget;
+  - it matches every row with the shared language;
+  - it returns the hits, where to resume, how many rows had a capped or partial text, and the
+    view's horizon, read in the same snapshot;
+  - on Slack's All the horizon covers top-level messages only.
+
+  No route reaches it.
+
+**Not done, and why:**
+
+- **The `/search` route.** Serving cache rows to a caller has rules (`Sink::try_serve`): the
+  account the rows were read with, a suspended provider, a channel in doubt. A route that bypassed
+  them could serve one account's rows to another. Building that path is Phase 2 proper. It is
+  question-independent but not small.
+- **The folded `search_text` and the `detail=none` index.** These are the §10 recommendations
+  2 and 3. Both rewrite the live cache file on deploy.
+- **The page moving to the new matcher.** That waits on question 2 (match a combined row only
+  when one of its messages matches).
+- **An upstream candidate provider for Slack.** Classic `search.messages` cannot be reached on our
+  path. Real-Time Search could stand in, but it finds whole words only: 72% recall of our
+  substring matches over 20 terms. The shim has no method for it yet (the shim is private,
+  outside this repository), and whether to show upstream hints at all is question 7.
+- **The server's haystack and `has:link`.** `MessageCache::search` matches on the stored
+  `search_text`, which also holds the raw content (the §3 parity gap), and it approximates
+  `has:link` as `://` anywhere in it. Both close when the column is rebuilt from the page's
+  haystack.
+
+**Skipped because they depend on an open question:**
+
+| Step | Waits on |
+|---|---|
+| Page's search box on the new matcher; row vs message unit | 2 |
+| Upstream scan job (consent, budget, cost estimate shown first) | 5 |
+| Retention or a longer-lived search index | 6 |
+| Upstream hints shown apart from the horizon | 7 |
+| Several channels at once (`in:` naming channels) | 8 |
+| Context around far-back hits | 9 |
+| Phase 0's page wording | 1 |
 
 ## Evidence
 
