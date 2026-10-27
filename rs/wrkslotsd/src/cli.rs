@@ -149,6 +149,18 @@ pub(crate) enum Command {
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
     },
+    /// Diagnose the registry (tolerant status records plus operational findings)
+    ParseDoctor {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Diagnose every machine instead of only the selected machine
+        #[arg(long)]
+        all_machines: bool,
+    },
     /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
     ParseConfig {
         /// Configuration document to parse; it is never modified
@@ -381,6 +393,27 @@ pub fn run() -> u8 {
             }
         }
         Command::ParseStatus { root } => match crate::status_state::parse_status(root.as_deref()) {
+            Ok(value) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::ParseDoctor {
+            root,
+            machine,
+            all_machines,
+        } => match crate::doctor_state::parse_doctor(
+            root.as_deref(),
+            machine.as_deref(),
+            all_machines,
+        ) {
             Ok(value) => {
                 println!(
                     "{}",

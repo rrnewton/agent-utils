@@ -214,9 +214,13 @@ fn identity_from_value(value: &Value) -> Option<Identity> {
     })
 }
 
-/// Diagnose every active record across all machines, printing one
-/// status object per record in machine then shard order.
-pub(crate) fn parse_status(root: Option<&Path>) -> Result<Value> {
+/// Build one status object per active record in machine then shard
+/// order. A hold load error refuses unless `tolerate_hold_error`, in
+/// which case it is reported in the record like the existing doctor.
+pub(crate) fn status_records(
+    root: Option<&Path>,
+    tolerate_hold_error: bool,
+) -> Result<(Vec<String>, Vec<Value>)> {
     let (cfg, _selected) = load_cfg(root, None)?;
     let machines = discover_machines(&cfg.control)?;
     let (_hold_machines, hold_entries) = load_record_holds(root)?;
@@ -277,9 +281,11 @@ pub(crate) fn parse_status(root: Option<&Path>) -> Result<Value> {
             let hold_entry = hold_entries
                 .iter()
                 .find(|entry| entry.machine == *machine && entry.slot == record_order.slot);
-            if let Some(entry) = hold_entry {
-                if let Some(message) = &entry.error {
-                    return Err(message.clone());
+            if !tolerate_hold_error {
+                if let Some(entry) = hold_entry {
+                    if let Some(message) = &entry.error {
+                        return Err(message.clone());
+                    }
                 }
             }
             let (held, hold_reason, hold_error) = match hold_entry {
@@ -310,6 +316,13 @@ pub(crate) fn parse_status(root: Option<&Path>) -> Result<Value> {
             records.push(value);
         }
     }
+    Ok((machines, records))
+}
+
+/// Diagnose every active record across all machines, printing one
+/// status object per record in machine then shard order.
+pub(crate) fn parse_status(root: Option<&Path>) -> Result<Value> {
+    let (machines, records) = status_records(root, false)?;
     Ok(json!({
         "machines": machines,
         "records": records,

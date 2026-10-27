@@ -177,3 +177,9 @@ suite 3 passed, 13 with holds). Gate 33 failures were load flakes only
 (cross-skip 71 passed alone; wrkslots shard 0 490 passed alone).
 Upstream vibe-talk commits shared no files; rebased and pushed
 without a second gate.
+
+[muse watermelon] Slice 23 in progress: `wrkslotsd parse-doctor`
+composes tolerant status records with the snapshot-scope doctor
+findings (invalid hold, dead owner, unfinished journal, partial
+atomic update, cap breach). Registry storage, slot-image, and
+owner-release findings stay with the Python `doctor`.

@@ -47,6 +47,7 @@ mod canonical;
 pub mod cli;
 mod config;
 mod config_validate;
+mod doctor_state;
 mod evidence;
 mod global_state;
 mod handoff_state;
