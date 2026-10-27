@@ -55,7 +55,7 @@ fn name_valid(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn validate_name(value: &str, label: &str) -> Result<String> {
+pub(crate) fn validate_name(value: &str, label: &str) -> Result<String> {
     if name_valid(value) {
         Ok(value.to_owned())
     } else {
@@ -65,7 +65,7 @@ fn validate_name(value: &str, label: &str) -> Result<String> {
     }
 }
 
-fn validate_remote(value: &str) -> Result<String> {
+pub(crate) fn validate_remote(value: &str) -> Result<String> {
     let shaped = !value.is_empty()
         && value.len() <= 128
         && value
@@ -94,7 +94,7 @@ fn validate_ref(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_full_ref(value: &str, label: &str) -> Result<String> {
+pub(crate) fn validate_full_ref(value: &str, label: &str) -> Result<String> {
     validate_ref(value, label)?;
     let forbidden = [' ', '~', '^', ':', '?', '*', '[', '\\'];
     let parts: Vec<&str> = value.split('/').collect();
@@ -153,14 +153,14 @@ fn exact_keys(raw: &Map<String, Value>, label: &str) -> Result<()> {
     ))
 }
 
-fn refuse_symlink(path: &Path, label: &str) -> Result<()> {
+pub(crate) fn refuse_symlink(path: &Path, label: &str) -> Result<()> {
     if path.is_symlink() {
         return Err(format!("{label} must not be a symlink: {}", path.display()));
     }
     Ok(())
 }
 
-fn ensure_no_symlink_components(root: &Path, path: &Path, label: &str) -> Result<()> {
+pub(crate) fn ensure_no_symlink_components(root: &Path, path: &Path, label: &str) -> Result<()> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| format!("{label} escapes the project root: {}", path.display()))?;
@@ -175,7 +175,7 @@ fn ensure_no_symlink_components(root: &Path, path: &Path, label: &str) -> Result
 }
 
 /// Lexical normalization matching `os.path.normpath` for relative paths.
-fn normpath(raw: &str) -> String {
+pub(crate) fn normpath(raw: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for part in raw.split('/') {
         match part {
@@ -214,7 +214,7 @@ fn relative_inside(root: &Path, raw: &str, label: &str) -> Result<(String, PathB
     Ok((lexical, absolute))
 }
 
-fn validate_layout(value: &str) -> Result<String> {
+pub(crate) fn validate_layout(value: &str) -> Result<String> {
     if matches!(value, "nested" | "flat") {
         Ok(value.to_owned())
     } else {

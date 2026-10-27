@@ -41,6 +41,7 @@
 
 #![forbid(unsafe_code)]
 
+mod active_state;
 mod canonical;
 pub mod cli;
 mod config;

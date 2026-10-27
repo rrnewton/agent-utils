@@ -303,6 +303,7 @@
       "reverse_dependencies": [],
       "test_files": [
         "py/tests/test_wrkslotsd_source_contract.py",
+        "py/wrkslots/tests/test_active_state_rust.py",
         "py/wrkslots/tests/test_agentctl_liveness_probe.py",
         "py/wrkslots/tests/test_cache_plan_budget.py",
         "py/wrkslots/tests/test_census_binding_deadline.py",

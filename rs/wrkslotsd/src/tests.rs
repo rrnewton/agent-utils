@@ -5032,6 +5032,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
         BTreeSet::from([
             "explain",
             "parse-config",
+            "parse-state",
             "plan",
             "rebuild",
             "status",
