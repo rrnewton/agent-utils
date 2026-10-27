@@ -60,6 +60,7 @@ mod policy;
 mod record_holds;
 mod replay;
 mod schema;
+mod status_state;
 mod yamlconfig;
 
 use std::error::Error;

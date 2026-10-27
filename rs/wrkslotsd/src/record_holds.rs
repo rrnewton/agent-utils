@@ -21,9 +21,17 @@ use crate::hold_state::parse_hold;
 
 type Result<T> = std::result::Result<T, String>;
 
-/// Load every active record's hold across all machines, printing one
-/// entry per record in machine then shard order.
-pub(crate) fn parse_holds(root: Option<&Path>) -> Result<Value> {
+/// One record's hold outcome: the hold document (or null) and the
+/// captured load error (or none), in machine then shard order.
+pub(crate) struct HoldEntry {
+    pub(crate) machine: String,
+    pub(crate) slot: String,
+    pub(crate) hold: Value,
+    pub(crate) error: Option<String>,
+}
+
+/// Load every active record's hold across all machines.
+pub(crate) fn load_record_holds(root: Option<&Path>) -> Result<(Vec<String>, Vec<HoldEntry>)> {
     let (cfg, _selected) = load_cfg(root, None)?;
     let machines = discover_machines(&cfg.control)?;
     let mut orders: Vec<Vec<RecordOrder>> = Vec::new();
@@ -31,7 +39,7 @@ pub(crate) fn parse_holds(root: Option<&Path>) -> Result<Value> {
         let (_active, order) = parse_state_ordered(root, Some(machine))?;
         orders.push(order);
     }
-    let mut holds: Vec<Value> = Vec::new();
+    let mut holds: Vec<HoldEntry> = Vec::new();
     for (machine, order) in machines.iter().zip(orders.iter()) {
         let events = cfg.control.join(format!("EVENTS.{machine}"));
         let captured = match event_log_status(&events) {
@@ -49,30 +57,48 @@ pub(crate) fn parse_holds(root: Option<&Path>) -> Result<Value> {
         match captured {
             Some(message) => {
                 for record in order {
-                    holds.push(json!({
-                        "machine": machine,
-                        "slot": record.slot,
-                        "hold": Value::Null,
-                        "error": message,
-                    }));
+                    holds.push(HoldEntry {
+                        machine: machine.clone(),
+                        slot: record.slot.clone(),
+                        hold: Value::Null,
+                        error: Some(message.clone()),
+                    });
                 }
             }
             None => {
                 for record in order.iter() {
                     let (hold, error) = match parse_hold(root, Some(machine), &record.slot) {
-                        Ok(value) => (value, Value::Null),
-                        Err(message) => (Value::Null, Value::String(message)),
+                        Ok(value) => (value, None),
+                        Err(message) => (Value::Null, Some(message)),
                     };
-                    holds.push(json!({
-                        "machine": machine,
-                        "slot": record.slot,
-                        "hold": hold,
-                        "error": error,
-                    }));
+                    holds.push(HoldEntry {
+                        machine: machine.clone(),
+                        slot: record.slot.clone(),
+                        hold,
+                        error,
+                    });
                 }
             }
         }
     }
+    Ok((machines, holds))
+}
+
+/// Load every active record's hold across all machines, printing one
+/// entry per record in machine then shard order.
+pub(crate) fn parse_holds(root: Option<&Path>) -> Result<Value> {
+    let (machines, entries) = load_record_holds(root)?;
+    let holds: Vec<Value> = entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "machine": entry.machine,
+                "slot": entry.slot,
+                "hold": entry.hold,
+                "error": entry.error,
+            })
+        })
+        .collect();
     Ok(json!({
         "machines": machines,
         "holds": holds,

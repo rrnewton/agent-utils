@@ -5039,6 +5039,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "parse-journal",
             "parse-journals",
             "parse-states",
+            "parse-status",
             "parse-config",
             "parse-state",
             "plan",

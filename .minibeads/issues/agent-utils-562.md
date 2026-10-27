@@ -165,3 +165,9 @@ bare `ACTIVE.journal` glob edge; both fixed with differential cases
 validation-graph 113 passed together alone; wrkslots shards 488 + 488
 passed alone). Upstream vibe-talk commits shared no files; rebased and
 pushed without a second gate.
+
+[muse watermelon] Slice 22 in progress: `wrkslotsd parse-status`
+reproduces the per-record status object over snapshot states (owner
+process diagnosis from this host's /proc, boot and machine identity,
+heartbeat age/expiry, hold outcome). Registry storage inconsistencies
+and event-derived owner releases stay with the Python `status`.
