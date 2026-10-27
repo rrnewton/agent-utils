@@ -1006,6 +1006,15 @@ class FakeElement {
     await this.dispatch("click");
   }
 
+  /**
+   * `EventTarget.dispatchEvent`, for an event the page makes itself: its own listeners, given the event.
+   * `#575 mobile-keyboard-compose` tells a box of the new line its key wrote, as typing would, by an `input`.
+   */
+  dispatchEvent(event) {
+    this.dispatch(event.type, event);
+    return true;
+  }
+
   /** Flip a checkbox the way a finger does: set the property, then fire `change`. */
   async setChecked(value) {
     this.checked = value;
@@ -2699,9 +2708,26 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     /**
      * `document.execCommand("copy")`, as Chromium runs it with a user's key behind it: the browser's
      * copy command (`page.browserCopy`), and true. False, copying nothing and firing nothing, where a
-     * test says the browser refuses it (`page.execCopyRefuses`). No other command is modelled.
+     * test says the browser refuses it (`page.execCopyRefuses`).
+     *
+     * `#575 mobile-keyboard-compose`: `insertLineBreak`, as Chromium runs it in a focused textarea: a new
+     * line over the selection, the caret after it, an `input` of that type, and true. False, changing
+     * nothing, where a test says the browser will not (`page.execLineBreakRefuses`). No other command is
+     * modelled.
      */
     execCommand: (name) => {
+      if (String(name).toLowerCase() === "insertlinebreak") {
+        page.execLineBreaks = (page.execLineBreaks || 0) + 1;
+        const box = FakeElement.focused;
+        if (page.execLineBreakRefuses || !box) return false;
+        const value = String(box.value || "");
+        const start = typeof box.selectionStart === "number" ? box.selectionStart : value.length;
+        const end = typeof box.selectionEnd === "number" ? Math.max(start, box.selectionEnd) : start;
+        box.value = `${value.slice(0, start)}\n${value.slice(end)}`;
+        box.setSelectionRange(start + 1, start + 1);
+        box.dispatch("input", { type: "input", inputType: "insertLineBreak", target: box });
+        return true;
+      }
       if (String(name).toLowerCase() !== "copy") throw new Error(`execCommand("${name}") is not modelled`);
       page.execCopies += 1;
       if (page.execCopyRefuses) return false;
@@ -3005,11 +3031,23 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
    * one too where the browser resizes the content for it (Chrome on Android, told so by web/voice.html);
    * a desk or a phone with a keyboard plugged in takes nothing from either.
    */
-  page.viewport = { layout: 852, visual: 852, scale: 1, listeners: [] };
-  /** Resize the viewports, and tell the page as a browser does, by `resize` on the visual viewport. */
+  page.viewport = { layout: 852, visual: 852, scale: 1, offsetTop: 0, listeners: [], scrolls: [] };
+  /**
+   * Resize the viewports, and tell the page as a browser does, by `resize` on the visual viewport.
+     */
   page.resizeViewport = async ({ visual, layout = page.viewport.layout, scale = page.viewport.scale }) => {
     Object.assign(page.viewport, { visual, layout, scale });
     for (const fn of page.viewport.listeners) await fn({ type: "resize" });
+    await page.settle();
+  };
+  /**
+   * `#575 mobile-keyboard-compose`. Pan the visual viewport `offsetTop` down the layout one, as Safari does
+   * after its keyboard's resize to show a focused field over it, and tell the page as Safari does, by
+   * `scroll` on the visual viewport (not `resize`: its size has not changed).
+   */
+  page.panViewport = async (offsetTop) => {
+    page.viewport.offsetTop = offsetTop;
+    for (const fn of page.viewport.scrolls) await fn({ type: "scroll" });
     await page.settle();
   };
   /**
@@ -3075,8 +3113,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         get scale() {
           return page.viewport.scale;
         },
+        get offsetTop() {
+          return page.viewport.offsetTop;
+        },
         addEventListener: (type, fn) => {
           if (type === "resize") page.viewport.listeners.push(fn);
+          if (type === "scroll") page.viewport.scrolls.push(fn);
         },
       },
       addEventListener: (type, fn, options) => {
@@ -25161,13 +25203,13 @@ test("THE HINT NAMES THE KEY THAT SENDS, in the words on the reader's keyboard",
     const page = newPage(new Map(), SCRIPT, (p) => p.setPlatform(platform));
     await signIn(page);
     const hint = page.el("enter-sends-hint");
-    assert.equal(hint.textContent, "Shift+Enter starts a new line.", `${platform}: the hint with it on`);
+    assert.equal(hint.textContent, "Shift+Enter starts a new line, and on a phone's keyboard so does ↵ in the box's corner.", `${platform}: the hint with it on`);
     await page.el("enter-sends").setChecked(false);
     assert.equal(hint.textContent, `${chord} sends. Enter starts a new line.`,
       `${platform}: the hint with it off does not name ${chord}`);
     assert.doesNotMatch(hint.textContent, new RegExp(other), `${platform}: the hint names the other key`);
     await page.el("enter-sends").setChecked(true);
-    assert.equal(hint.textContent, "Shift+Enter starts a new line.", `${platform}: the hint stuck`);
+    assert.equal(hint.textContent, "Shift+Enter starts a new line, and on a phone's keyboard so does ↵ in the box's corner.", `${platform}: the hint stuck`);
   }
 });
 
@@ -25197,6 +25239,158 @@ test("a phone's own return key says what Enter will do, in every message box", a
   for (const id of boxes) assert.equal(page.el(id).getAttribute("enterkeyhint"), "enter", `#${id} with it off`);
   await page.el("enter-sends").setChecked(true);
   for (const id of boxes) assert.equal(page.el(id).getAttribute("enterkeyhint"), "send", `#${id} turned back on`);
+});
+
+// --- `#575 mobile-keyboard-compose` ------------------------------------------------------------------
+//
+// The owner, 2026-10-27, on Android and iOS: a tap in the box left Send and "some useless white space"
+// between it and the keyboard, whose own send key makes Send needless; and "I thought previously there
+// was a way to put in new lines by pressing shift ... It just stays a send button and I have no way to
+// place a new line." A phone keyboard's Shift never reaches the page (neither Gboard nor iOS reports it
+// on the return key), so the new line is a key of the page's, in the box's corner while the keyboard is
+// up and Enter sends.
+
+/** Each box with a new-line key: how to open it (`ENTER_COMPOSERS`), and its key. */
+const NEWLINE_BOXES = [["channel", "channel-newline"], ["thread", "channel-newline"], ["reply", "reply-newline"]];
+
+for (const [name, keyId] of NEWLINE_BOXES) for (const refused of [false, true]) {
+  test(`MOBILE KEYBOARD COMPOSE in the ${name} box${refused ? ", the editor refusing" : ""}: the new-line key writes a new line at the caret, keeps the focus, sends nothing, and Enter then sends both lines`, async () => {
+    const box = await ENTER_COMPOSERS[name](true);
+    box.page.execLineBreakRefuses = refused;
+    const field = box.page.el(box.field);
+    const key = box.page.el(keyId);
+    await box.ready("first linesecond line");
+    field.focus();
+    field.setSelectionRange(10, 10);
+    const inputs = [];
+    field.addEventListener("input", (event) => inputs.push(event));
+    const before = box.sent();
+    // The press keeps the focus in the box: a tap's `mousedown` would move it to the key and take the
+    // keyboard down with it.
+    let kept = false;
+    await key.dispatch("mousedown", { type: "mousedown", preventDefault: () => { kept = true; } });
+    assert.equal(kept, true, `the new-line key's press takes the focus from the ${name} box`);
+    await key.click();
+    await box.page.settle();
+    assert.equal(field.value, "first line\nsecond line", `no new line at the caret in the ${name} box`);
+    assert.equal(field.selectionStart, 11, "the caret is not on the new line");
+    assert.equal(field.selectionEnd, 11);
+    assert.equal(box.page.document.activeElement, field, `the ${name} box lost the focus`);
+    assert.deepEqual(inputs.map((event) => event.inputType), ["insertLineBreak"],
+      `the ${name} box was not told of its new line, so its draft would not follow`);
+    assert.equal(box.sent(), before, `the new-line key sent from the ${name} box`);
+    // Through the browser's editor, which keeps it in the box's undo, where the browser will.
+    assert.equal(box.page.execLineBreaks, 1, "the new line was not asked of the browser's editor");
+    // Over a selection, as typing over one does.
+    field.setSelectionRange(0, 5);
+    await key.click();
+    assert.equal(field.value, "\n line\nsecond line", "the new line did not replace the selection");
+    await box.ready("first line\nsecond line");
+    // Not a paste (`paste-never-sends`): the reader's Enter straight after still sends, both lines once.
+    await field.dispatch("keydown", enterKey({}));
+    await box.page.settle();
+    assert.equal(box.sent(), before + 1, `Enter after the new-line key did not send from the ${name} box`);
+    box.went("first line\nsecond line");
+  });
+}
+
+test("MOBILE KEYBOARD COMPOSE: the new line is never noted as a paste, so the next Enter is the reader's", async () => {
+  const box = await ENTER_COMPOSERS.channel(true);
+  const field = box.page.el(box.field);
+  await box.ready("one");
+  field.focus();
+  field.setSelectionRange(3, 3);
+  await box.page.el("channel-newline").click();
+  // Typed on, with no input reported: the key's own input is the last the box was told of.
+  field.value = "one\ntwo";
+  const enter = enterKey({});
+  await field.dispatch("keydown", enter);
+  await box.page.settle();
+  assert.equal(box.sent(), 1, "an Enter just after the new-line key was taken for a paste's");
+  box.went("one\ntwo");
+  assert.equal(enter.defaulted, false, "the Enter that sent also typed a new line");
+});
+
+test("MOBILE KEYBOARD COMPOSE: what the keyboard covers of the layout viewport is the composer's room, on Safari and on Chrome", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  const box = page.el("channel-compose-text");
+  const inset = () => page.documentElement.style.getPropertyValue("--keyboard-inset");
+
+  // Safari: the visual viewport shrinks and the layout does not, so the keyboard covers the list's foot.
+  await focusOn(page, box);
+  await page.resizeViewport({ visual: 480 });
+  assert.equal(keyboardSaid(page), "open");
+  assert.equal(inset(), "372px", "the keyboard over the list's foot was not given to the composer as room");
+  // Safari panning the page up over its keyboard, after the resize, covers that much less.
+  await page.panViewport(200);
+  assert.equal(inset(), "172px", "the pan was not taken off what the keyboard covers");
+  await page.panViewport(0);
+  await page.resizeViewport({ visual: 852 });
+  assert.equal(inset(), "0px", "the room outlived the keyboard");
+
+  // Chrome on Android resizes the content: the list ends at the keyboard already.
+  await page.resizeViewport({ visual: 520, layout: 520 });
+  assert.equal(keyboardSaid(page), "open");
+  assert.equal(inset(), "0px", "a keyboard that resized the layout was given room again");
+  await page.resizeViewport({ visual: 852, layout: 852 });
+
+  // A focused field with the keyboard up, then the focus gone: no room kept.
+  await page.resizeViewport({ visual: 480 });
+  assert.equal(inset(), "372px");
+  await page.moveFocus(null);
+  page.expireTimers(0);
+  assert.equal(keyboardSaid(page), "closed");
+  assert.equal(inset(), "0px", "the room stayed after the box lost the focus");
+});
+
+test("MOBILE KEYBOARD COMPOSE: with the keyboard up, the box's foot is on it, Send goes only while the keyboard's key sends, and the new-line key comes only then", () => {
+  const { body } = keyboardMedia();
+  const P = ':root[data-keyboard="open"]:has(#pane-discord:not([hidden]))';
+  const rule = (selector) => {
+    const at = body.indexOf(`${P} ${selector} {`);
+    assert.ok(at >= 0, `no keyboard rule for ${selector}`);
+    return body.slice(body.indexOf("{", at) + 1, body.indexOf("}", at));
+  };
+  // The composer of the box being written in keeps no room under itself but what the keyboard covers,
+  // and says so to the script that brings its foot to the keyboard's top.
+  const composer = rule(":is(#channel-composer, #side-composer):has(> textarea:focus)");
+  assert.match(composer, /padding-bottom:\s*var\(--keyboard-inset, 0px\);/);
+  assert.match(composer, /--keyboard-fit:\s*on;/);
+  assert.match(rule("#side-scroll:has(:is(#channel-compose-text, #side-compose-text):focus)"),
+    /padding-bottom:\s*0;/, "the list keeps its own room under the composer at its foot");
+  // Send goes while the keyboard's key sends (`enterkeyhint="send"`), and only for the box with the focus.
+  assert.match(rule(':is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus ~ :is(#channel-send, #side-send)'),
+    /display:\s*none;/);
+  for (const hidden of body.matchAll(/([^{}]*#(?:channel|side)-send[^{}]*)\{([^{}]*)\}/g)) {
+    if (/display:\s*none/.test(hidden[2])) {
+      assert.match(hidden[1], /\[enterkeyhint="send"\]:focus/, `Send goes with the keyboard's key a return: ${hidden[1].trim()}`);
+    }
+  }
+  // An empty state line is no row under the box; one with something to say stays.
+  assert.match(rule(":is(#channel-compose-text, #side-compose-text):focus ~ :is(#channel-compose-state, #side-compose-state):empty"),
+    /display:\s*none;/);
+  // The new-line key: none anywhere but here, and here only while Enter sends.
+  assert.match(CSS_CODE, /(?:^|\})\s*\.newline-key\s*\{\s*display:\s*none;\s*\}/, "the new-line key is drawn without a keyboard");
+  const shown = rule(':is(#channel-compose-text, #side-compose-text, #reply-text)[enterkeyhint="send"]:focus ~ .newline-key');
+  assert.match(shown, /display:\s*inline-flex;/);
+  assert.match(shown, /align-self:\s*end;/);
+  assert.match(shown, /justify-self:\s*end;/);
+  // ...in the box's own grid cell, its corner, with room kept so no word is written under it.
+  assert.match(rule(':is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus'), /padding-right:\s*3\.25rem;/);
+  assert.match(rule('#reply-text[enterkeyhint="send"]:focus'), /padding-right:\s*3\.25rem;/);
+});
+
+test("MOBILE KEYBOARD COMPOSE: each box's new-line key follows it, a button out of the tab order named for what it does", () => {
+  for (const [boxId, keyId] of [["channel-compose-text", "channel-newline"], ["side-compose-text", "side-newline"],
+    ["reply-text", "reply-newline"]]) {
+    const after = HTML.slice(HTML.indexOf(`<textarea id="${boxId}"`));
+    const next = after.slice(after.indexOf("</textarea>")).match(/<(?!!--)[a-z]+[^>]*>/)[0];
+    assert.match(next, new RegExp(`^<button id="${keyId}" class="newline-key" type="button"`), `#${keyId} does not follow #${boxId}`);
+    assert.match(next, /aria-label="New line"/);
+    assert.match(next, /tabindex="-1"/, "a keyboard's Tab would stop on a key a keyboard has its own Shift+Enter for");
+  }
 });
 
 test("the field states its own layout rule: the size iOS will not zoom", () => {
@@ -25263,7 +25457,10 @@ test("`#340 composer-grow-box`: EACH COMPOSER HOLDS A Grow CHECKBOX AFTER Send, 
     assert.ok(order.every((at, i) => at >= 0 && (i === 0 || at > order[i - 1])), `#${composer}'s parts are out of order: ${order}`);
     // Every other part of the composer spans both columns of the desk's row, so `dense` cannot put Send
     // beside it, above the box: whatever is added to a composer must say where it goes.
-    const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]).filter((id) => id !== composer);
+    // `#575 mobile-keyboard-compose`: the new-line key is drawn under a coarse pointer alone, with a phone's
+    // keyboard up, so never in a desk's row (`(pointer: fine)`), and takes the box's own cell where it is.
+    const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1])
+      .filter((id) => id !== composer && !/-newline$/.test(id));
     for (const id of ids.filter((one) => one !== send && one !== grow)) {
       assert.match(cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${id}`)), /grid-column:\s*1 \/ -1/,
         `#${id} does not span both columns of #${composer} on a desk`);

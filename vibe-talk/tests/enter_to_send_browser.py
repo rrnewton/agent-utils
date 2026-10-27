@@ -259,7 +259,7 @@ def main() -> int:
             page.click("#fold-typing")
             page.locator("#enter-sends").wait_for(state="visible", timeout=5000)
             check(page.is_checked("#enter-sends"), "Enter to send is not on by default")
-            check(page.inner_text("#enter-sends-hint") == "Shift+Enter starts a new line.",
+            check(page.inner_text("#enter-sends-hint") == "Shift+Enter starts a new line, and on a phone's keyboard so does ↵ in the box's corner.",
                   f"the hint with Enter to send on: {page.inner_text('#enter-sends-hint')!r}")
             page.click("#enter-sends")
             check(not page.is_checked("#enter-sends"), "the switch did not turn off")

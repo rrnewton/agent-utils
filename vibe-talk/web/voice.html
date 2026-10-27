@@ -586,6 +586,9 @@
                 <!-- No heading line: it read like one more message. The box says where the message
                      goes in its placeholder, and names itself to a screen reader the same way. -->
                 <textarea id="channel-compose-text" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
+                <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
+                     so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
+                <button id="channel-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
                 <button id="channel-send" type="button">Send</button>
                 <!-- `#340 composer-grow-box`: see #compose-grow. -->
                 <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
@@ -618,6 +621,9 @@
                     <p id="reply-target-meta" class="hint"></p>
                   </div>
                   <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
+                  <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
+                       so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
+                  <button id="reply-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
                   <!-- `#185 reply-new-thread`. Where Send will post, said before it does: a reply goes
                        where the message it answers is, and starting a new thread from a main-channel
                        message is a choice offered only where the chat service can do it. -->
@@ -781,6 +787,9 @@
                 <ol id="side-outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
                 <div id="side-composer">
                   <textarea id="side-compose-text" rows="3" placeholder="Reply in this thread…" aria-label="Reply in this thread" aria-describedby="side-compose-state"></textarea>
+                  <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
+                       so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
+                  <button id="side-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
                   <button id="side-send" type="button">Send</button>
                   <!-- `#340 composer-grow-box`: see #compose-grow. -->
                   <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
