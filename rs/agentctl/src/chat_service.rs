@@ -9278,7 +9278,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
 
     #[test]
     fn restart_drains_full_256_request_batch_without_waiting_for_reconciliation_timer() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_scratch_root().join(format!(
             "agentctl-chat-service-backlog-{}-{}",
             std::process::id(),
             NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)

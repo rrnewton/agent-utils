@@ -34,6 +34,9 @@ const TRUST_ACCEPT: &str = "Yes, I trust this folder";
 pub const TRUST_REFUSE: &str = "No, exit";
 
 impl HarnessAdapter for ClaudeCode {
+    fn transient_recovery(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "claude"
     }

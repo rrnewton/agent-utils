@@ -1,0 +1,2 @@
+API Error: 429 {"type":"insufficient_quota","message":"Your credit balance is too low"}
+❯

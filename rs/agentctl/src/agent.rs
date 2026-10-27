@@ -2257,17 +2257,33 @@ pub(crate) fn rebind_queue_after<T, F>(
 where
     F: FnOnce() -> AgentResult<(Target, T)>,
 {
+    rebind_queue_after_with_runtime(
+        root,
+        previous,
+        already_replacement,
+        allow_legacy_workspace_binding,
+        operation,
+        &SystemRuntime::default(),
+    )
+}
+
+pub(crate) fn rebind_queue_after_with_runtime<T, F>(
+    root: &Path,
+    previous: &Target,
+    already_replacement: Option<&Target>,
+    allow_legacy_workspace_binding: bool,
+    operation: F,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<T>
+where
+    F: FnOnce() -> AgentResult<(Target, T)>,
+{
     validate_target_authority(previous)?;
     prepare(root)?;
     let directory_identity = queue_directory_identity(root)?;
     let delivery_path = root.join(".delivery.lock");
     let delivery = open_private_lock(&delivery_path, "queue delivery lock")?;
-    lock_exclusive_with_runtime(
-        &delivery,
-        &delivery_path,
-        "queue delivery",
-        &SystemRuntime::default(),
-    )?;
+    lock_exclusive_with_runtime(&delivery, &delivery_path, "queue delivery", runtime)?;
     verify_queue_lock(
         root,
         directory_identity,
@@ -2277,12 +2293,7 @@ where
     )?;
     let binding_lock_path = root.join(".binding.lock");
     let binding_lock = open_private_lock(&binding_lock_path, "queue binding lock")?;
-    lock_exclusive_with_runtime(
-        &binding_lock,
-        &binding_lock_path,
-        "queue binding",
-        &SystemRuntime::default(),
-    )?;
+    lock_exclusive_with_runtime(&binding_lock, &binding_lock_path, "queue binding", runtime)?;
     verify_queue_lock(
         root,
         directory_identity,

@@ -1,0 +1,2 @@
+Goal stalled (/goal resume)
+›

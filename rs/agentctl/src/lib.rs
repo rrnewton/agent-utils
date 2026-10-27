@@ -31,6 +31,7 @@ pub(crate) mod prompt_time;
 pub mod restore;
 pub(crate) mod skill_install;
 pub mod stale_composer;
+pub mod stuck;
 pub mod subagents;
 pub mod submission;
 pub mod term;

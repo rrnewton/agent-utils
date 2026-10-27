@@ -2514,15 +2514,8 @@ impl HerdrClient {
         agent_queue::identity::liveness(expected)
     }
 
-    /// Pin the pane's foreground process-group leader, the harness Herdr detected.
-    ///
-    /// Returns `None` when the leader is the pane's shell, is not listed among the foreground
-    /// Pin the pane's harness process when it is the only foreground process.
-    ///
-    /// A foreground group with several processes (a launcher and the program it started, or
-    /// the harness running a foreground child) is ambiguous: the pinned process could be a
-    /// launcher that outlives the harness. `None` then, and when the kernel identity cannot be
-    /// read coherently. `kind` is the expected harness.
+    /// Pin the sole foreground process, or a native harness group leader whose
+    /// adapter permits foreground helpers. Never select a child or shell wrapper.
     pub fn harness_identity(
         &self,
         pane_id: &str,
@@ -2537,22 +2530,44 @@ impl HerdrClient {
         kind: &str,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<CustomProcessIdentity>> {
-        let _ = kind;
         let state = self.pane_process_state(pane_id, cancelled)?;
-        if state.foreground_process_group_id == state.shell_pid || state.processes.len() != 1 {
+        if state.foreground_process_group_id == state.shell_pid {
             return Ok(None);
         }
-        let Some(pid) = state.processes[0].get("pid").and_then(Value::as_u64) else {
+        let leader = state.processes.iter().find(|process| {
+            process.get("pid").and_then(Value::as_u64) == Some(state.foreground_process_group_id)
+        });
+        let Some(pid) = leader.and_then(|process| process.get("pid").and_then(Value::as_u64))
+        else {
             return Ok(None);
         };
         let Ok(observed) = live_custom_process(pid) else {
             return Ok(None);
         };
+        if state.processes.len() != 1 && !self.native_group_leader(&observed.identity, kind) {
+            return Ok(None);
+        }
         Ok(
             (observed.process_group_id == state.foreground_process_group_id)
                 .then_some(observed.identity),
         )
     }
+    fn native_group_leader(&self, expected: &CustomProcessIdentity, kind: &str) -> bool {
+        let same = || {
+            live_custom_process(expected.pid)
+                .ok()
+                .is_some_and(|observed| observed.identity == *expected)
+        };
+        same()
+            && fs::read_link(format!("/proc/{}/exe", expected.pid))
+                .ok()
+                .is_some_and(|path| {
+                    crate::harness::adapter(kind)
+                        .is_some_and(|adapter| adapter.native_group_leader(&path))
+                })
+            && same()
+    }
+
     /// Read the argument vector of one pinned process generation, or `None`.
     ///
     /// The identity is proved before and after `/proc/PID/cmdline` is read, so the vector
@@ -2588,8 +2603,8 @@ impl HerdrClient {
         (!argv.is_empty() && argv.iter().all(|item| !item.is_empty())).then_some(argv)
     }
 
-    /// Is the pinned harness process, the same kernel lifetime, still the pane's only
-    /// foreground process? (An anchor pinned to a launcher therefore fails.)
+    /// Is the same pinned process still the foreground group leader? Helpers are
+    /// accepted only for the adapter's native executable, never a wrapper.
     pub fn verify_harness_identity(
         &self,
         pane_id: &str,
@@ -2605,15 +2620,26 @@ impl HerdrClient {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<bool> {
         let state = self.pane_process_state(pane_id, cancelled)?;
-        if !expected.valid() || state.processes.len() != 1 {
+        if !expected.valid() || expected.pid != state.foreground_process_group_id {
             return Ok(false);
         }
-        if state.processes[0].get("pid").and_then(Value::as_u64) != Some(expected.pid) {
+        if !state
+            .processes
+            .iter()
+            .any(|process| process.get("pid").and_then(Value::as_u64) == Some(expected.pid))
+        {
             return Ok(false);
         }
         let Ok(observed) = live_custom_process(expected.pid) else {
             return Ok(false);
         };
+        if state.processes.len() != 1
+            && !crate::harness::all()
+                .iter()
+                .any(|adapter| self.native_group_leader(expected, adapter.name()))
+        {
+            return Ok(false);
+        }
         Ok(
             observed.process_group_id == state.foreground_process_group_id
                 && observed.identity == *expected,

@@ -2814,3 +2814,17 @@ def test_input_source_reconnects_with_last_durable_cursor(
         {"action": "subscribe", "space": _SPACE, "cursor": "durable-cursor"},
     ]
     assert len(list((rig.state / "requests").glob("*.json"))) == 1
+
+
+def test_service_shutdown_interrupts_reconciliation_instead_of_becoming_retry(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def terminated(*args: object, **kwargs: object) -> object:
+        raise chat_module._ServiceTerminated()
+
+    monkeypatch.setattr(rig.bridge, "_ingest_result", terminated)
+    with pytest.raises(chat_module._ServiceTerminated):
+        rig.runtime._complete(_Completion(
+            "poll", "page", {"messages": [], "cursor": None}, None,
+            "2026-01-02T00:05:00Z"))
+    assert ("poll", "page") not in rig.runtime.retry

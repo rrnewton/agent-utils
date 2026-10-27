@@ -557,3 +557,42 @@ fn herdr_093_muse_uses_only_the_active_mode_and_complete_literal_editor() {
         prompt
     ));
 }
+
+#[test]
+fn native_codex_group_leader_remains_pinned_with_foreground_helpers() {
+    let herdr = FakeExecutable::new("{}");
+    for name in ["codex", "launcher"] {
+        let executable = herdr.root.join(name);
+        install_test_elf("/bin/sleep", &executable);
+        let process = spawn_test_process(&executable);
+        let mut document = process_document(process.0.id(), &executable);
+        document["result"]["process_info"]["shell_pid"] = Value::from(1);
+        let processes = document["result"]["process_info"]["foreground_processes"]
+            .as_array_mut()
+            .unwrap();
+        let mut helper = processes[0].clone();
+        helper["pid"] = Value::from(2);
+        processes.insert(0, helper);
+        herdr.set_response(&document.to_string());
+        let identity = live_custom_process(u64::from(process.0.id()))
+            .unwrap()
+            .identity;
+        assert_eq!(
+            herdr.client().harness_identity("pane", "codex").unwrap(),
+            (name == "codex").then_some(identity.clone())
+        );
+        assert_eq!(
+            herdr
+                .client()
+                .verify_harness_identity("pane", &identity)
+                .unwrap(),
+            name == "codex"
+        );
+        let mut changed = identity;
+        changed.starttime_ticks += 1;
+        assert!(!herdr
+            .client()
+            .verify_harness_identity("pane", &changed)
+            .unwrap());
+    }
+}

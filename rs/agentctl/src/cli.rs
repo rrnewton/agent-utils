@@ -148,7 +148,7 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch --once\n  agentctl --registry ~/project/.agentctl watch --interval 60\n\nConfiguration is REGISTRY/restore.json (herdr_unit, units, timers [{unit, max_age_seconds}],\ncoordinator). health.json goes to --state-dir (default $XDG_STATE_HOME/agentctl/watch). With --once,\nexit 0 when every check passed and 1 otherwise. Without it the watch runs until stopped."
     )]
     Watch(Watch),
-    /// Watch every registered agent and tell its manager, else the coordinator, when one finished its turn with a verdict or needs a human: at a harness approval or permission prompt, idle without a verdict, stalled, blocked or silent while working, inside a long turn with input queued behind it, without progress on a declared metric, looping, or dead. One notice per episode, queued durably for its recipient; never answers a prompt and types into another agent only to interrupt a stuck turn with input queued behind it (the auto-interrupt policy, --auto-deliver-after)
+    /// Watch every registered agent and tell its manager, else the coordinator, when one finished its turn with a verdict or needs a human: at a harness approval or permission prompt, idle without a verdict, stalled, blocked or silent while working, inside a long turn with input queued behind it, without progress on a declared metric, looping, or dead. One notice per episode, queued durably for its recipient; never answers a prompt and types into another agent only to interrupt a stuck turn with input queued behind it (the auto-interrupt policy, --auto-deliver-after); opt-in --auto-recover retries verified transient capacity/rate-limit stops
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 5 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued through the same durable path as `agentctl send`, so a busy recipient\nloses nothing. The recipient is the nearest reachable agent up the agent's managed_by chain, else the coordinator\n(`agentctl tree` shows the chain). A verdict is a prose line (not tool output) of the agent's last reply (from its first block after the last user turn\non screen) that starts with one of --done-marker once any reply bullet is stripped (--done-marker replaces the DONE:/BLOCKED:\ndefaults). An idle agent with a verdict is reported as child-done after --child-done-seconds (default 0: the pass that sees it),\nin a message of its own that names the verdict line, once per turn, never held by --min-notice-interval; when the registry's\nlanding queue (`agentctl hold`) has agents waiting on it, the same message says who is next. An agent that was never sent\nwork, or still has prompts queued, is never reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓`\nabove the input box) is never judged stalled, idle, or finished until it is back at the bottom. Episode memory lives in\n--state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a message's queue ID is derived from its notices, so a restart\nrecognises a message that is already queued instead of sending it twice, and one watcher runs per state directory. With\n--once, exit 0 only when the team could be probed, no episode other than child-done is reported or due, and no view is\nscrolled up, 1 otherwise.\n\n\"Working\" is classified too (#570). The harness's turn timer is masked before screens are compared, and the tool\ncommands and gate steps under the agent's pinned harness process are read from /proc each pass: one that used CPU or moved\nbytes is progressing; one that did not for --stall-minutes is tool-blocked, named with what it waits on (a file lock and\nits holder, terminal input, a network socket, a pipe, an idle child); no tool and no output or token movement is\nstream-silent. The harness's own transcript (#574: Claude Code's session JSONL, Codex's rollout, Muse's journal, found\nby the record's session id or the files the harness holds open) adds the last event, the last model output, an open model\nrequest, and the tool call in flight with its command and timeout: a call no process runs for (an MCP tool, a sub-agent)\nis tool-blocked once nothing moves; untimed-tool: a call with no timeout running past --untimed-tool-minutes. The report's\n`activity` lists what each transcript says. turn-queued: inside one turn past --turn-minutes with input queued behind it.\nauto-interrupt: a stuck turn with input queued is interrupted and the input delivered (--auto-deliver-after). no-progress: a metric declared with `agentctl progress` unchanged for its hours while working.\nover-expected: a gate step past the p95 of --step-history. looping: the same command or error --loop-repeats times, or a\nretry banner, for --loop-minutes. background-wait: idle on background shells that are gone or idle.\nWithout it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
     )]
@@ -166,6 +166,11 @@ enum Commands {
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
+    /// Archive an exact stale registration and its queued work without stopping any runtime; then use adopt to register the verified live pane
+    #[command(
+        after_help = "First inspect agent.json and compute sha256sum. Use --dry-run before applying. A matching live registration is refused. An incomplete revive additionally requires its journal SHA-256; a live candidate must be pinned by pane and observed session. Archives preserve the original record, queue and revive artifacts. Rerun the same pins after an interruption; never replay the archived prompts automatically."
+    )]
+    RetireStaleRegistration(RetireStaleRegistration),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(
         after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n  agentctl stop reviewer --retire-dead-adoption --expected-token TOKEN --expected-record-sha256 SHA256\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`).\n\nA headless turn-runner worker is retired only when every process its runtime recorded has\nprovably exited: stop --expected-token then archives the record with its runtime home and leaves\nthe tmux window or Herdr tab in place. A live or unprovable runner exits 69 and changes nothing."
@@ -487,6 +492,9 @@ struct WatchAgents {
     /// Minutes a tool call that set no timeout, and that its harness does not bound, may run before it is reported as untimed-tool, read from the harness's own transcript (Claude Code's session JSONL, Codex's rollout, Muse's journal), from 1 to 10080 (default: 60)
     #[arg(long, default_value = "60", value_parser = turn_minutes, value_name = "MINUTES")]
     untimed_tool_minutes: u64,
+    /// Agent whose model-capacity/API-rate-limit failures may be retried after 60, 120 and 240 seconds (maximum three attempts per episode); repeatable, default none. Never answers approval prompts or retries quota/safety refusals. An uncertain submission stops automatic retries
+    #[arg(long = "auto-recover", value_name = "NAME")]
+    auto_recover: Vec<String>,
     /// How many times in a row the same tool command, or in how many separate attempts the same error line, must show on screen to count as a loop, from 2 to 100 (default: 3)
     #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(2..=100), value_name = "N")]
     loop_repeats: u64,
@@ -607,6 +615,30 @@ struct Doctor {
     /// Restore the tab label and Herdr agent name of owned agents whose every other anchor still matches
     #[arg(long)]
     repair_labels: bool,
+}
+
+#[derive(Args)]
+struct RetireStaleRegistration {
+    #[command(flatten)]
+    agent: Named,
+    /// Exact current registration generation token
+    #[arg(long)]
+    expected_token: String,
+    /// SHA-256 of the raw agent.json bytes
+    #[arg(long)]
+    expected_record_sha256: String,
+    /// SHA-256 of the inspected incomplete revive journal (default: refuse a pending revive)
+    #[arg(long)]
+    expected_revive_sha256: Option<String>,
+    /// Live candidate pane to preserve when retiring an incomplete revive
+    #[arg(long, requires = "replacement_session")]
+    replacement_pane: Option<String>,
+    /// Independently observed native session in --replacement-pane
+    #[arg(long, requires = "replacement_pane")]
+    replacement_session: Option<String>,
+    /// Show a checked plan without archiving metadata
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -2035,6 +2067,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     urgent_after: Duration::from_secs(value.auto_deliver_urgent_after * 60),
                     opt_out: value.no_auto_deliver,
                 },
+                auto_recover: value.auto_recover,
                 loop_repeats: usize::try_from(value.loop_repeats).unwrap_or(3),
                 loop_hold: Duration::from_secs(value.loop_minutes * 60),
                 step_history: crate::work_state::StepHistory::load(&value.step_history),
@@ -2528,6 +2561,17 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             write_json(&report).map_err(Failure::Output)?;
             return Ok(if report["clean"] == true { 0 } else { 1 });
         }
+        Commands::RetireStaleRegistration(value) => manager.retire_stale_registration(
+            &value.agent.name,
+            &crate::subagents::RetireStaleOptions {
+                expected_token: value.expected_token,
+                expected_record_sha256: value.expected_record_sha256,
+                expected_revive_sha256: value.expected_revive_sha256,
+                replacement_pane: value.replacement_pane,
+                replacement_session: value.replacement_session,
+                dry_run: value.dry_run,
+            },
+        )?,
         Commands::Stop(value) => {
             let recovery_selector = if value.retire_dead_adoption {
                 Some("--retire-dead-adoption")

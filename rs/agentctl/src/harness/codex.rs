@@ -41,6 +41,18 @@ const TRUST_QUESTION: &str = "Trust this folder?";
 const TRUST_ACCEPT: &str = "Trust and continue";
 
 impl HarnessAdapter for Codex {
+    fn native_group_leader(&self, executable: &Path) -> bool {
+        executable.file_name().is_some_and(|name| name == "codex")
+    }
+    fn transient_recovery(&self) -> bool {
+        true
+    }
+    fn stalled_goal_resume(&self, screen: &str) -> Option<&'static str> {
+        screen
+            .lines()
+            .any(|line| line.trim().starts_with("Goal stalled"))
+            .then_some("/goal resume")
+    }
     fn name(&self) -> &'static str {
         "codex"
     }

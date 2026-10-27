@@ -124,6 +124,12 @@ pub trait HarnessAdapter: Sync {
         None
     }
 
+    /// Native executable allowed to remain the pinned foreground group leader while
+    /// helper children share its terminal. Wrappers are deliberately excluded.
+    fn native_group_leader(&self, _executable: &std::path::Path) -> bool {
+        false
+    }
+
     // Screen.
 
     /// Whether [`crate::submission::submit_verified`] can read this harness's composer.
@@ -158,6 +164,15 @@ pub trait HarnessAdapter: Sync {
     /// The classifier a queue drain uses to type a follow-up into a working pane.
     fn followup_tui(&self) -> Option<&'static dyn crate::harness_tui::HarnessTui> {
         self.tui()
+    }
+
+    /// Whether verified availability failures may receive an opt-in continue prompt.
+    fn transient_recovery(&self) -> bool {
+        false
+    }
+    /// Native command to resume the stalled goal visible on this screen, if supported.
+    fn stalled_goal_resume(&self, _screen: &str) -> Option<&'static str> {
+        None
     }
 
     // Transcript.

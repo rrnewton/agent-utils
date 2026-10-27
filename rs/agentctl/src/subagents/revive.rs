@@ -227,7 +227,7 @@ struct Journal {
     proof: Proof,
 }
 
-fn token(value: &str) -> bool {
+pub(super) fn token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 80
         && value
@@ -239,7 +239,7 @@ fn digest(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
 }
 
-fn valid_digest(value: &str) -> bool {
+pub(super) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -334,7 +334,10 @@ fn artifact_bytes(pinned: &PinnedAgentDirectory, file_name: &str) -> Result<Vec<
     Ok(content)
 }
 
-fn read_record_at(path: &Path, name: &str) -> Result<(PinnedAgentDirectory, AgentRecord, Vec<u8>)> {
+pub(super) fn read_record_at(
+    path: &Path,
+    name: &str,
+) -> Result<(PinnedAgentDirectory, AgentRecord, Vec<u8>)> {
     let pinned = pin_directory(path, name)?;
     let bytes = artifact_bytes(&pinned, "agent.json")?;
     let record = match nested::decode_bytes(&bytes, &path.join("agent.json")) {
@@ -2299,4 +2302,141 @@ fn publish_candidate(
         .sync_all()
         .map_err(|error| fail(error.to_string()))?;
     Ok(())
+}
+
+impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
+    pub(super) fn retire_revive_preflight(
+        &self,
+        record: &AgentRecord,
+        destination: &Path,
+        options: &RetireStaleOptions,
+    ) -> Result<Option<(PathBuf, PathBuf)>> {
+        let root = self.registry.join(".revives");
+        let journal_path = root.join(format!("{}.json", record.token));
+        let saved = destination.join(format!("{}.json", record.token));
+        let present = journal_path.try_exists().map_err(|e| fail(e.to_string()))?;
+        if !present && !saved.try_exists().map_err(|e| fail(e.to_string()))? {
+            if options.expected_revive_sha256.is_some() || root.join(&record.token).exists() {
+                return Err(fail("expected revive journal is missing; inspect retained artifacts before retirement"));
+            }
+            return Ok(None);
+        }
+        let expected = options.expected_revive_sha256.as_deref().ok_or_else(|| {
+            fail("incomplete revive requires --expected-revive-sha256 after inspection")
+        })?;
+        let path = if present { &journal_path } else { &saved };
+        let journal = parse_journal(path)?;
+        if format!("{:x}", Sha256::digest(&journal.expected_bytes)) != expected {
+            return Err(fail("revive journal SHA-256 changed"));
+        }
+        if journal.name != record.name
+            || journal.old_token != record.token
+            || !matches!(journal.phase.as_str(), "launching" | "ready")
+        {
+            return Err(fail(
+                "revive journal is not this registration's incomplete transaction",
+            ));
+        }
+        let operation = root.join(&record.token);
+        let candidate = operation.join("new");
+        if candidate.exists() {
+            let (pin, candidate, _) = read_record_at(&candidate, &record.name)?;
+            if candidate.token != journal.new_token
+                || pin.device != journal.new_directory_device
+                || pin.inode != journal.new_directory_inode
+            {
+                return Err(fail("revive candidate generation or directory changed"));
+            }
+            if let Some(pane) = candidate.pane_id.as_deref() {
+                let live = self.client.panes()?.iter().any(|row| row.pane_id == pane);
+                if live {
+                    if options.replacement_pane.as_deref() != Some(pane) {
+                        return Err(fail("revive candidate pane is live; explicitly pin --replacement-pane and --replacement-session to preserve it"));
+                    }
+                    let session = options
+                        .replacement_session
+                        .as_ref()
+                        .ok_or_else(|| fail("live candidate requires --replacement-session"))?;
+                    agent::resolve_target(
+                        self.client,
+                        &Target {
+                            pane_id: Some(pane.to_owned()),
+                            session_agent: Some(candidate.harness.clone()),
+                            session_value: Some(session.clone()),
+                            expected_agent: Some(candidate.harness.clone()),
+                            expected_workspace: self.project_workspace()?,
+                            expected_cwd: Some(candidate.cwd.clone().into()),
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(Some((journal_path, operation)))
+    }
+
+    pub(super) fn retire_revive_archive(
+        &self,
+        record: &AgentRecord,
+        destination: &Path,
+        journal: &Path,
+        operation: &Path,
+        options: &RetireStaleOptions,
+    ) -> Result<()> {
+        self.retire_revive_preflight(record, destination, options)?;
+        if journal.exists() {
+            let saved = destination.join(format!("{}.json", record.token));
+            if saved.exists() {
+                return Err(fail(
+                    "both current and archived revive journals exist; refusing overwrite",
+                ));
+            }
+            let parent = pin_directory(
+                journal.parent().expect("revive journal parent"),
+                &record.name,
+            )?;
+            let archive = pin_directory(destination, &record.name)?;
+            rename_directory_noreplace_at(
+                &parent.file,
+                journal
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| fail("invalid journal filename"))?,
+                &archive.file,
+                saved
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| fail("invalid archive filename"))?,
+            )?;
+            agent::sync_directory(journal.parent().expect("revive journal parent"))?;
+            agent::sync_directory(destination)?;
+        }
+        if operation.exists() {
+            let saved = destination.join("retired-revive");
+            if saved.exists() {
+                return Err(fail("both current and archived revive operation directories exist; refusing overwrite"));
+            }
+            // Pin and recheck the private directory; preserve every original artifact.
+            let pinned = pin_directory(operation, &record.name)?;
+            ManagedAgents::<A>::verify_pinned_agent_directory(&pinned)?;
+            let parent = pin_directory(
+                operation.parent().expect("revive operation parent"),
+                &record.name,
+            )?;
+            let archive = pin_directory(destination, &record.name)?;
+            rename_directory_noreplace_at(
+                &parent.file,
+                &record.token,
+                &archive.file,
+                "retired-revive",
+            )?;
+            let moved = fs::symlink_metadata(&saved).map_err(|e| fail(e.to_string()))?;
+            if (moved.dev(), moved.ino()) != (pinned.device, pinned.inode) {
+                return Err(fail(
+                    "revive operation changed during archival; artifacts retained for inspection",
+                ));
+            }
+            agent::sync_directory(operation.parent().expect("revive operation parent"))?;
+        }
+        agent::sync_directory(destination)
+    }
 }

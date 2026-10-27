@@ -1034,8 +1034,43 @@ sub-agent) counts once nothing moves; `untimed-tool` reports a call that set no
 timeout running past `--untimed-tool-minutes` (default 60). The pass report's
 `activity` lists what each transcript says.
 
+Typed harness failures are reported immediately as `model-capacity`, `api-rate-limit`,
+`unsafe-command`, `safety-refusal`, `out-of-quota`, or `goal-stalled`. Detection uses
+anchored error rows in the current response; a newer turn clears the old error.
+Unrecognised error wording still falls back to ordinary idle/stall monitoring.
+
+`--auto-recover NAME` (repeatable, default none) opts that agent into recovery
+for model capacity and API rate limits only. It waits 60 seconds, then retries
+at most three times, with 120 and 240 seconds between attempts. A fresh recipient
+and screen check refuses paused agents, running turns, drafts, pending input,
+and approval dialogs. For Codex, it first submits `/goal resume` when the screen
+shows `Goal stalled`; if that starts work, it stops there, otherwise it submits
+`Continue the current task.` after confirming the stalled footer disappeared.
+Other transient failures receive the same continue prompt. It never switches
+models, answers a permission prompt, retries exhausted quota, or counteracts a
+safety refusal. Those conditions require coordinator attention.
+
+For an opted-in Codex recipient, the watcher can also follow an observed native
+session change within the same pinned Codex process lifetime. Run `agentctl
+anchor NAME` after verifying the pane. A changed or unpinned process, terminal,
+workspace, directory, duplicate conversation, or explicitly asserted session
+refuses automatic rebinding. Foreground helper children are accepted only when
+the pinned group leader is the native Codex executable; launchers are refused.
+The queue binding is updated before the record, preserving pending messages and
+making an interrupted update safe to finish on the next pass. No input is sent
+by the session update. `--check-only` never updates sessions. The pass report
+lists these checks under `session_follow` and logs failures.
+
+Recovery receipts (`recovery-NAME.json` in `--state-dir`) are saved before input.
+A crash or uncertain result disarms further automatic recovery, including after
+restart, until an operator inspects the recipient and archives that receipt.
+The pass report's `recovery` rows and service journal show backoff, attempts,
+exhaustion, and uncertainty. Each attempt also sends a coordinator notice; failed
+notice delivery is logged explicitly. Use `--once --check-only` before enabling;
+that mode sends and recovers nothing. Use a separate state directory per registry.
+
 The watcher never answers a prompt and never types into any agent except
-those recipients and, under the auto-interrupt policy, a stuck agent's pane. A condition past its threshold becomes **one notice per episode**,
+those recipients and, under the auto-interrupt policy, a stuck agent’s pane, or an agent named with `--auto-recover`. A condition past its threshold becomes **one notice per episode**,
 and every message goes through the same durable queue as `agentctl send`,
 delivered even while the coordinator works, so a coordinator that is busy
 simply keeps it queued. A `child-done` notice is a message of its own, sent in
@@ -1123,6 +1158,35 @@ Save it as `~/.config/systemd/user/agent-watch-agents.service`, adjust the
 paths, the registry, and the coordinator's name, then
 `systemctl --user daemon-reload` and
 `systemctl --user enable --now agent-watch-agents.service`.
+
+### Retire a stale registration without stopping its runtime (Rust edition)
+
+When a server restore leaves an old row claiming a missing pane or a different
+terminal/session, `stop`, `bind-session`, and `adopt` deliberately refuse to
+operate through that row. Inspect its raw `agent.json`, compute `sha256sum`,
+and preview metadata retirement:
+
+```sh
+agentctl retire-stale-registration worker --expected-token TOKEN --expected-record-sha256 SHA256 --dry-run
+agentctl retire-stale-registration worker --expected-token TOKEN --expected-record-sha256 SHA256
+agentctl adopt worker --pane LIVE_PANE --workspace project --cwd /work/project --harness codex --session OBSERVED_SESSION
+```
+
+Retirement refuses a row that still matches its live presentation, wrong byte
+or generation pins, an unavailable terminal-server census, and pending renames.
+It archives the original registration and queue without sending input, stopping
+processes, closing panes, or replaying prompts. Normal `adopt` then asserts the
+new live identity. If this was the coordinator, designate it again with
+`agentctl coordinator set NAME`; its generation token has changed.
+
+An incomplete revive requires `--expected-revive-sha256` with the SHA-256 of
+`REGISTRY/.revives/TOKEN.json`. If its candidate pane is live, additionally pin
+`--replacement-pane ID --replacement-session OBSERVED_SESSION`: the runtime is
+preserved and the original revive journal and operation directory are archived.
+A published revive must be finished through `revive` instead. If interrupted,
+rerun retirement with the same pins to finish archiving; it never retires a
+new generation that has since occupied the name. Inspect archived queued work
+and decide deliberately what to send to the new registration.
 
 ### Adopt an existing Herdr agent
 

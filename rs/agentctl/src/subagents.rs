@@ -38,7 +38,10 @@ mod control;
 mod headless;
 mod launch_spec;
 mod nested;
+mod retire_registration;
 mod revive;
+mod session_follow;
+pub use retire_registration::RetireStaleOptions;
 mod stop_advice;
 mod turn_runner;
 
@@ -523,7 +526,7 @@ fn message_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn name(value: &str) -> Result<&str> {
+pub(crate) fn name(value: &str) -> Result<&str> {
     if value.is_empty()
         || value.len() > 32
         || value == "archive"
@@ -8884,6 +8887,114 @@ its drain would type first, so it was not queued",
             .as_deref()
             .ok_or_else(|| fail(format!("agent {:?} has no confirmed pane", record.name)))?;
         Ok(self.client.read(pane, "visible", Some(TURN_SCREEN_LINES))?)
+    }
+
+    /// Recover only a freshly verified service availability error. This never interrupts a
+    /// turn, answers a dialog, changes a goal, or replays an uncertain submission.
+    pub fn recover_transient(
+        &self,
+        agent_name: &str,
+        cause: crate::stuck::StuckCause,
+    ) -> Result<String> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.input_allowed()?;
+        let adapter = crate::harness::adapter(&record.harness)
+            .ok_or_else(|| fail("unknown harness cannot recover transient failures"))?;
+        if !cause.recoverable()
+            || !adapter.transient_recovery()
+            || !matches!(
+                record.adapter.as_str(),
+                "herdr" | "herdr-pane" | "herdr-foreign"
+            )
+        {
+            return Err(fail(
+                "transient recovery requires a local Codex or Claude pane",
+            ));
+        }
+        self.checked(&record)?;
+        let screen = self.turn_screen(&record)?;
+        let input_blocked = |screen: &str| {
+            crate::agent_watch::approval_prompt_line(screen).is_some()
+                || crate::turn_state::composer_draft(screen).is_some()
+                || crate::turn_state::read_screen(screen).running
+                || crate::harness_tui::followup_tui(Some(&record.harness)).is_some_and(|tui| {
+                    matches!(
+                        tui.classify(screen).state,
+                        crate::harness_tui::State::MenuOrPicker
+                            | crate::harness_tui::State::BlockingQuestion
+                    )
+                })
+        };
+        if crate::stuck::classify(&screen) != Some(cause) || input_blocked(&screen) {
+            return Err(fail(
+                "recovery refused: fault changed, turn running, prompt or draft present",
+            ));
+        }
+        let queue = self.queue(&record.name)?;
+        if !agent::queued_prompts(&queue)?.is_empty() {
+            return Err(fail("recovery refused: input is already pending"));
+        }
+        let mut client = self.workspace_client(&record);
+        client.expected_workspace = self.project_workspace()?;
+        let runtime = agent::SystemRuntime::default();
+        let pane = record
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| fail("no confirmed pane"))?;
+        let guarded = client.guarded(&runtime)?;
+        if let Some(command) = adapter.stalled_goal_resume(&screen) {
+            guarded.native_prompt(pane, command)?;
+            // Resume may start work immediately; never append input to a dialog or live turn.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                self.checked(&record)?;
+                let after = self.turn_screen(&record)?;
+                if crate::turn_state::read_screen(&after).running {
+                    return Ok("resumed the stalled goal; it is working".to_owned());
+                }
+                if adapter.stalled_goal_resume(&after).is_none() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(fail(
+                        "goal resume outcome unconfirmed; no continue prompt sent",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        self.checked(&record)?;
+        let after = self.turn_screen(&record)?;
+        if input_blocked(&after) || crate::stuck::classify(&after).is_some_and(|next| next != cause)
+        {
+            return Err(fail(
+                "continue refused: a turn, dialog, draft or new failure appeared",
+            ));
+        }
+        let result = self.send_record(
+            &record,
+            "Continue the current task.",
+            DrainOptions {
+                ready_timeout: Duration::from_secs(2),
+                working_timeout: Duration::from_secs(5),
+                max_attempts: 1,
+                max_items: Some(1),
+                deadline: Some(Duration::from_secs(10)),
+                lock_timeout: Some(Duration::from_secs(2)),
+                not_after: Some(agent::now_millis().saturating_add(10_000)),
+                ..DrainOptions::default()
+            },
+            None,
+            None,
+        )?;
+        if result.outcome.as_str() != "delivered" {
+            return Err(fail(format!(
+                "continue outcome: {}",
+                result.outcome.as_str()
+            )));
+        }
+        Ok("submitted a continue prompt".to_owned())
     }
 
     /// Interrupt the agent's running turn and submit the input its harness held for later
@@ -17815,6 +17926,80 @@ fi
     }
 
     #[test]
+    fn transient_recovery_rechecks_fault_and_protects_drafts_prompts_and_pauses() {
+        use crate::stuck::StuckCause;
+        for screen in [
+            "No failure here\n›",
+            "■ You've hit your usage limit.\n›",
+            "■ Selected model is at capacity. Please try a different model.\nDo you want to proceed?\n› 1. Yes",
+            "■ Selected model is at capacity. Please try a different model.\n› my unfinished draft",
+        ] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            *fixture.client.screen.lock().unwrap() = Some(screen.into());
+            assert!(fixture.manager().recover_transient("worker", StuckCause::ModelCapacity).is_err());
+            assert!(fixture.client.runs.lock().unwrap().is_empty());
+            assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+        }
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture.manager().pause("worker", true).unwrap();
+        *fixture.client.screen.lock().unwrap() = Some("■ Selected model is at capacity.\n›".into());
+        assert!(fixture
+            .manager()
+            .recover_transient("worker", StuckCause::ModelCapacity)
+            .is_err());
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn transient_recovery_never_continues_after_resume_reveals_quota_or_a_picker() {
+        use crate::stuck::StuckCause;
+        for after in [
+            "■ You've hit your usage limit.\n›",
+            include_str!("../tests/fixtures/tui/codex-rate-limit.txt"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            *fixture.client.screen.lock().unwrap() =
+                Some(include_str!("../testdata/stuck/codex-capacity.txt").into());
+            *fixture.client.screen_after_run.lock().unwrap() = Some(after.into());
+            assert!(fixture
+                .manager()
+                .recover_transient("worker", StuckCause::ModelCapacity)
+                .is_err());
+            assert_eq!(*fixture.client.runs.lock().unwrap(), ["/goal resume"]);
+        }
+    }
+
+    #[test]
+    fn transient_recovery_resumes_a_stalled_goal_and_never_retries_quota() {
+        use crate::stuck::StuckCause;
+        let fixture = Fixture::new();
+        fixture.start(None);
+        *fixture.client.screen.lock().unwrap() =
+            Some(include_str!("../testdata/stuck/codex-capacity.txt").into());
+        // Slash commands may leave the original error in the transcript after the stalled
+        // footer disappears. That old, identical availability error must not prevent continue.
+        *fixture.client.screen_after_run.lock().unwrap() =
+            Some("■ Selected model is at capacity. Please try a different model.\n›\n".into());
+        fixture
+            .manager()
+            .recover_transient("worker", StuckCause::ModelCapacity)
+            .unwrap();
+        assert_eq!(
+            *fixture.client.runs.lock().unwrap(),
+            ["/goal resume", "Continue the current task."]
+        );
+        let before = fixture.client.runs.lock().unwrap().len();
+        assert!(fixture
+            .manager()
+            .recover_transient("worker", StuckCause::OutOfQuota)
+            .is_err());
+        assert_eq!(fixture.client.runs.lock().unwrap().len(), before);
+    }
+
+    #[test]
     fn capture_reads_take_only_the_screen_of_a_pane_that_keeps_no_scrollback() {
         let fixture = Fixture::new();
         fixture.start(None);
@@ -17949,8 +18134,10 @@ fi
     mod recovery_metadata;
     /// `agentctl restore` and `agentctl watch` against the fake Herdr and a scripted host.
     mod restore;
+    mod retire_registration;
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.
     mod revive;
+    mod session_follow;
     /// Trusted stop refusals and generation-bound recovery advice.
     mod stop_advice;
     /// Retirement of headless turn-runner records whose runner is provably dead.

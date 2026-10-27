@@ -22,7 +22,8 @@
 //! that activity continues.
 //!
 //! The watcher never answers a prompt and never types into any agent except the coordinator,
-//! with one opt-in exception: an agent named with `--auto-deliver` whose long turn holds queued
+//! with opt-in exceptions: `--auto-recover` retries only verified transient availability errors,
+//! and an agent named with `--auto-deliver` whose long turn holds queued
 //! input has that turn interrupted and the input submitted. Its episode memory (when each condition was first seen, whether it was
 //! already reported, notices still waiting to be sent) is persisted after every pass, so
 //! restarting the watcher does not report the same episode twice.
@@ -38,7 +39,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::agent::{AgentError, DrainOptions, QueueMessageState};
+
+#[path = "agent_watch_recovery.rs"]
+mod recovery;
 use crate::subagents::{controller_of, ManagedAgents, ManagedApi};
+use recovery::recover_due;
 
 /// Schema of the persisted watcher state and of the per-pass report.
 pub const STATE_SCHEMA: &str = "agentctl-agent-watch/v1";
@@ -106,6 +111,8 @@ pub struct WatchAgentsOptions {
     pub untimed_tool: Duration,
     /// When a stuck agent's turn is interrupted so input queued for it is delivered.
     pub auto_deliver: AutoDeliver,
+    /// Agents opted into bounded transient-failure recovery.
+    pub auto_recover: Vec<String>,
     /// How many times in a row the same command or error must show to count as a loop.
     pub loop_repeats: usize,
     /// How long a loop or a retry banner may hold before it is reported.
@@ -154,6 +161,7 @@ impl AutoDeliver {
 impl WatchAgentsOptions {
     fn threshold(&self, kind: EpisodeKind) -> Duration {
         match kind {
+            EpisodeKind::Stuck(_) => Duration::ZERO,
             EpisodeKind::ApprovalPrompt => self.approval,
             EpisodeKind::IdleNoVerdict => self.idle,
             EpisodeKind::ChildDone => self.child_done,
@@ -178,6 +186,8 @@ impl WatchAgentsOptions {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EpisodeKind {
+    /// Typed harness failure; only transient availability failures permit opt-in recovery.
+    Stuck(crate::stuck::StuckCause),
     /// The agent sits at a harness approval, permission, or trust prompt.
     ApprovalPrompt,
     /// The agent went idle or done without a verdict marker in its last reply.
@@ -215,6 +225,7 @@ impl EpisodeKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Stuck(cause) => cause.as_str(),
             Self::ApprovalPrompt => "approval-prompt",
             Self::IdleNoVerdict => "idle-no-verdict",
             Self::Stalled => "stalled",
@@ -252,6 +263,7 @@ impl EpisodeKind {
     fn describe(self, options: &WatchAgentsOptions) -> String {
         let minutes = |duration: Duration| duration.as_secs() / 60;
         match self {
+            Self::Stuck(cause) => format!("harness stopped: {} (operator attention required unless transient recovery is enabled)", cause.as_str()),
             Self::ApprovalPrompt => format!(
                 "at a harness approval or permission prompt for over {} minutes",
                 minutes(options.approval)
@@ -673,6 +685,18 @@ pub trait Notifier {
     fn notify_urgent(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
         self.notify(coordinator, text, message_id)
     }
+    /// Refresh an observed session within a positively pinned native process lifetime.
+    fn follow_observed_session(&mut self, _agent: &str) -> Result<bool> {
+        Ok(false)
+    }
+    /// Retry a verified transient failure, under the recipient's lifecycle/input guards.
+    fn recover_transient(
+        &mut self,
+        _agent: &str,
+        _cause: crate::stuck::StuckCause,
+    ) -> Result<String> {
+        Err(fail("this watcher cannot recover transient failures"))
+    }
     /// Interrupt `agent`'s running turn and deliver the input queued for it, in its harness or
     /// in agentctl's queue (the auto-interrupt policy), but only while its screen still shows a
     /// running turn whose [`crate::turn_state::quiet_rows`] hash to `expected`: a turn that moved
@@ -937,6 +961,9 @@ fn classify(
         return Some(Finding::new(EpisodeKind::Dead, observation.detail.clone()));
     }
     let screen = observation.screen.as_deref()?;
+    if let Some(cause) = crate::stuck::classify(screen) {
+        return Some(Finding::new(EpisodeKind::Stuck(cause), cause.as_str()));
+    }
     if let Some(line) = approval_prompt_line(screen) {
         return Some(Finding::new(EpisodeKind::ApprovalPrompt, line));
     }
@@ -2198,7 +2225,8 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
         .and_then(|()| file.sync_all())
         .map_err(|error| fail(format!("cannot write {}: {error}", temporary.display())))?;
     fs::rename(&temporary, path)
-        .map_err(|error| fail(format!("cannot publish {}: {error}", path.display())))
+        .map_err(|error| fail(format!("cannot publish {}: {error}", path.display())))?;
+    crate::agent::sync_directory(directory)
 }
 
 /// Run the agent watch: one pass with `once`, otherwise forever, one pass per interval.
@@ -2244,7 +2272,23 @@ pub fn watch_agents(
         .unwrap_or_default();
     loop {
         let now = clock.now();
-        let report = watch_agents_once(probe, notifier, &mut state, now, options);
+        let mut session_follows = Vec::new();
+        if !options.check_only {
+            for name in &options.auto_recover {
+                match notifier.follow_observed_session(name) {
+                    Ok(changed) => session_follows.push(json!({"agent":name,"changed":changed})),
+                    Err(error) => {
+                        eprintln!("agentctl watch-agents: {name} session follow: {error}");
+                        session_follows.push(json!({"agent":name,"error":error.to_string()}));
+                    }
+                }
+            }
+        }
+        let mut report = watch_agents_once(probe, notifier, &mut state, now, options);
+        report["session_follow"] = json!(session_follows);
+        if !options.check_only {
+            report["recovery"] = recover_due(&report, notifier, now, options)?;
+        }
         if let Some(error) = report["probe_error"].as_str() {
             eprintln!("agentctl watch-agents: {error}");
         }
@@ -2871,6 +2915,17 @@ fn attempt_message_id(message_id: &str, attempt: u32) -> String {
 }
 
 impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
+    fn follow_observed_session(&mut self, agent: &str) -> Result<bool> {
+        ManagedAgents::new(self.client, &self.registry)?.follow_observed_session(agent)
+    }
+    fn recover_transient(
+        &mut self,
+        agent: &str,
+        cause: crate::stuck::StuckCause,
+    ) -> Result<String> {
+        ManagedAgents::new(self.client, &self.registry)?.recover_transient(agent, cause)
+    }
+
     fn notify(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
         self.queue_notice(
             ManagedAgents::new(self.client, &self.registry)?,
@@ -2985,6 +3040,7 @@ mod tests {
             turn: Duration::from_secs(7200),
             untimed_tool: Duration::from_secs(3600),
             auto_deliver: AutoDeliver::off(),
+            auto_recover: Vec::new(),
             loop_repeats: 3,
             loop_hold: Duration::from_secs(600),
             step_history: crate::work_state::StepHistory::default(),

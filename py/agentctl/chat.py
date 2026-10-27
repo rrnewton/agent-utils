@@ -180,8 +180,8 @@ class _AuxPopulationSnapshot:
     queue_fixed_reservation: int
 
 
-class _ServiceTerminated(Exception):
-    """SIGTERM requested normal service shutdown after owned cleanup."""
+class _ServiceTerminated(BaseException):
+    """Exit through owned cleanup, bypassing ordinary adapter-error retries."""
 
 
 class Transport(Protocol):
@@ -3838,11 +3838,11 @@ class Bridge:
     def _deliver(self) -> None:
         queue = self.state / "queue"
         paths = sorted((self.state / "requests").glob("*.json"),
-                       key=lambda path: get_str(_read(path), "received_at", "request"))
+                       key=lambda path: get_str(_read(path), "queue_id", "request"))
         # `drain` types prompts in the order they were queued, and a queue ID begins
         # with its message's creation time: queue in queue-ID order, so that this
         # pass's requests reach the agent in the order their messages were created.
-        for path in sorted(paths, key=lambda path: get_str(_read(path), "queue_id", "request")):
+        for path in paths:
             record = _read(path)
             queue_id = get_str(record, "queue_id", "request")
             if record["phase"] == "received":

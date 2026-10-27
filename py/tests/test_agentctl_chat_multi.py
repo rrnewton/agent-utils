@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -627,3 +628,38 @@ def test_new_response_to_a_closed_legacy_id_gets_feedback_but_history_does_not(t
     assert str(record["reply_nonce"]) in harness.prompts[-1]
     assert "not available" in harness.prompts[-1]
     assert not chat.sent
+
+
+@pytest.mark.parametrize("first_received,second_received", [
+    ("2026-01-02T00:00:00Z", "2026-01-02T00:00:00.000001Z"),
+    ("2026-01-02T01:00:00+01:00", "2026-01-02T00:00:01Z"),
+    ("2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"),
+    ("2026-01-02T00:00:02Z", "2026-01-02T00:00:01Z"),
+])
+def test_reply_delivery_follows_prompt_queue_despite_receipt_clock_formats_and_reversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    first_received: str, second_received: str,
+) -> None:
+    bridge, harness, chat = _setup(tmp_path)
+    monkeypatch.setattr(chat_module, "_utc", lambda: first_received)
+    chat.message("one")
+    bridge.tick()
+    first = _record(tmp_path)
+    monkeypatch.setattr(chat_module, "_utc", lambda: second_received)
+    chat.message("two", timestamp="2026-01-02T00:01:00Z")
+    bridge.tick()
+    second = _record(tmp_path, "two")
+    original_glob = Path.glob
+
+    def reverse_requests(path: Path, pattern: str) -> Iterator[Path]:
+        values = list(original_glob(path, pattern))
+        if path == tmp_path / "requests":
+            values.sort(key=lambda value: str(_read(value)["queue_id"]), reverse=True)
+        return iter(values)
+
+    monkeypatch.setattr(Path, "glob", reverse_requests)
+    snapshot = _snapshot(harness.prompts[0] + "\n" + _block(first, "First answer")
+                         + "\n" + harness.prompts[1] + "\n" + _block(second, "Second answer"))
+    bridge.capture_output(snapshot)
+    assert _sent_texts(chat) == ["[test-agent] First answer", "[test-agent] Second answer"]
+    assert len(harness.prompts) == 2
