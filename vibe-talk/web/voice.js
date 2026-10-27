@@ -159,7 +159,7 @@ const ALL_CHANNELS = "*";
 // controls.
 /**
  * @overload
- * @param {"api-token" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
+ * @param {"api-token" | "pair-input" | "pair-transfer" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
  *   | "card-max-lines" | "collapsed-lines"
  *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "in-app-links" | "mark-own-read" | "mic-auto-gain"
  *   | "mic-echo-cancellation" | "side-compose-grow"
@@ -210,7 +210,7 @@ const ALL_CHANNELS = "*";
  *   | "message-cache-confirm-no" | "message-cache-confirm-yes" | "message-cache-erase"
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "own-read-apply" | "own-read-undo" | "page-update"
- *   | "pair-confirm" | "pair-dismiss"
+ *   | "pair-confirm" | "pair-dismiss" | "pair-submit"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-on-device" | "read-prev" | "read-speed" | "read-speed-down" | "read-speed-up" | "read-steer-grip" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-newline" | "reply-send"
  *   | "reset-voice-post-prefix"
@@ -56963,6 +56963,7 @@ async function pairFromLink() {
   const newer = pairingCode !== code ? pairingCode : null;
   pairingCode = null;
   el("pair-offer").hidden = true;
+  el("pair-transfer").value = "";
   let payload = null;
   try {
     payload = JSON.parse(await response.text());
@@ -56986,10 +56987,36 @@ async function pairFromLink() {
   return failed;
 }
 
+/** Redeem inside the installed app's own storage, without navigating back to Safari. */
+async function pairFromInput() {
+  if (pairingInFlight) return;
+  const value = el("pair-input").value.trim();
+  let code = value;
+  if (value.includes("://")) {
+    try {
+      const link = new URL(value);
+      if (link.origin !== window.location.origin) throw new Error("different server");
+      code = deepLinkParams(link.hash.slice(1)).get("pair") || "";
+    } catch (_error) {
+      showError("Paste a pairing link for this server, or its pairing code.");
+      return;
+    }
+  }
+  if (!/^[A-Za-z0-9_-]{43}$/.test(code)) {
+    showError("Paste the complete pairing link or code. Ask for a fresh link if it was already used.");
+    return;
+  }
+  el("pair-input").value = "";
+  pairingCode = code;
+  offerPairing();
+  await pairFromLink();
+}
+
 /** The sign-in screen, offering to redeem the pairing link this page was opened from. */
 function offerPairing() {
   showScreen("signin");
   el("pair-offer").hidden = false;
+  el("pair-transfer").value = `${window.location.origin}/#pair=${encodeURIComponent(pairingCode || "")}`;
   el("pair-confirm").disabled = false;
   el("pair-dismiss").disabled = false;
   el("pair-confirm").focus();
@@ -56998,6 +57025,7 @@ function offerPairing() {
 /** Not now: the link is left unspent, and the page carries on as it would have without it. */
 function declinePairing() {
   pairingCode = null;
+  el("pair-transfer").value = "";
   el("pair-offer").hidden = true;
   if (token()) {
     if (hydrateFromCache()) {
@@ -57572,6 +57600,7 @@ function startSettingsSync() {
 el("api-token").value = token();
 el("save-token").addEventListener("click", guardQuietly(saveToken));
 el("forget-token").addEventListener("click", forgetToken);
+el("pair-submit").addEventListener("click", guardQuietly(pairFromInput));
 el("pair-confirm").addEventListener("click", guardQuietly(pairFromLink));
 el("pair-dismiss").addEventListener("click", declinePairing);
 // A second link opened in a tab already showing the app is a navigation within the page: the

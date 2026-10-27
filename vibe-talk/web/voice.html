@@ -144,11 +144,18 @@
                redeemed only on the tap, so a link scanner that runs this page cannot spend it. -->
           <div id="pair-offer" class="panel" hidden>
             <p id="pair-offer-text">This pairing link signs this browser in. It works once.</p>
+            <label for="pair-transfer">Unused link — copy to the Home Screen app</label>
+            <input id="pair-transfer" type="text" readonly autocomplete="off" />
             <div class="row">
               <button id="pair-confirm" type="button">Sign this device in</button>
               <button id="pair-dismiss" class="secondary" type="button">Not now</button>
             </div>
           </div>
+
+          <label for="pair-input">Pairing link or code (also for the Home Screen app)</label>
+          <input id="pair-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+            placeholder="paste a fresh pairing link" />
+          <button id="pair-submit" type="button">Pair this app</button>
 
           <label for="api-token">Write token</label>
           <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />

@@ -52,12 +52,9 @@ pub const TTS_MODEL: &str = "eleven_turbo_v2_5";
 /// The audio this server asks for, and therefore what it tells the browser it is sending.
 pub const TTS_CONTENT_TYPE: &str = "audio/mpeg";
 
-/// What [`SPEECH_FORMAT`] actually is, told to the browser rather than guessed by it.
-///
-/// The vendor labels the streaming response `audio/mpeg` regardless of the format requested, and a
-/// browser handed Opus-in-Ogg under an mp3 label refuses to play it. This server asked for the
-/// format, so this server is the thing that knows what it is.
-pub const SPEECH_CONTENT_TYPE: &str = "audio/ogg";
+/// The streaming PCM is wrapped in the same WAV envelope as conversational read-aloud.
+/// The browser's incremental player consumes 16-bit PCM rather than compressed audio.
+pub const SPEECH_CONTENT_TYPE: &str = "audio/wav";
 
 /// Build the request that reads text aloud.
 ///
@@ -76,16 +73,9 @@ pub fn speech_request(api_base: &str, voice_id: &str) -> PreparedRequest {
     }
 }
 
-/// The audio format asked of the vendor, and the reason it is not the default.
-///
-/// Sending nothing takes the vendor's default, which is mp3 at 44.1kHz and 128kbit/s — around
-/// sixteen kilobytes for every second of speech. A long message is then more than a megabyte
-/// crossing a phone connection before the reader hears anything. This is one voice reading prose,
-/// not music: 32kbit/s Opus is a quarter of the size and, at that bitrate, audibly BETTER than the
-/// mp3 it replaces, because mp3 is poor down there and Opus was designed for it.
-///
-/// `opus_48000_32` is in the vendor's published format list, and Safari has decoded Opus for years.
-pub const SPEECH_FORMAT: &str = "opus_48000_32";
+/// Mono 16-bit little-endian PCM at 24 kHz, consumed incrementally by the browser.
+/// A WAV preamble is supplied locally because the vendor returns raw samples.
+pub const SPEECH_FORMAT: &str = "pcm_24000";
 
 /// How hard the vendor is asked to trade quality for a faster first byte.
 ///
@@ -560,9 +550,8 @@ impl SpeechProvider for HttpElevenLabsClient {
             let body = response.text().await.unwrap_or_default();
             return Err(SpeechError::from_response(status.as_u16(), &body, api_key));
         }
-        // NOT read from the response. The vendor labels this `audio/mpeg` whatever was actually
-        // asked for, and a browser handed Opus-in-Ogg under an mp3 label will refuse to play it.
-        // What went out in `output_format` is what is coming back, so that is what is declared.
+        // The response contains raw PCM, regardless of the vendor's MIME label. Our preamble
+        // makes it the WAV stream the incremental browser player expects.
         let content_type = SPEECH_CONTENT_TYPE.to_owned();
         let redaction = api_key.clone();
         let chunks = response
@@ -573,7 +562,10 @@ impl SpeechProvider for HttpElevenLabsClient {
             .boxed();
         Ok(super::SpeechStream {
             content_type,
-            preamble: None,
+            preamble: Some(bytes::Bytes::from(crate::speech::wav_header(
+                u32::MAX,
+                24_000,
+            ))),
             voice: None,
             session: None,
             chunks,
@@ -775,6 +767,33 @@ mod tests {
             "the key leaked out of a vendor error body: {rendered}"
         );
         assert!(rendered.contains(super::super::REDACTED), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn streamed_speech_is_pcm_wrapped_for_the_browser_wav_decoder() {
+        use futures_util::StreamExt as _;
+
+        let (base, server) = one_shot_server("200 OK", "\x01\x00\x02\x00").await;
+        let client = HttpElevenLabsClient::new().expect("client");
+        let mut config = live_config(base);
+        config.agent_id = None; // An explicit voice needs no profile request in this fixture.
+        let mut stream = client
+            .speak_stream(&config, "hello", None)
+            .await
+            .expect("speech");
+        assert_eq!(stream.content_type, "audio/wav");
+        assert_eq!(
+            stream.preamble.as_deref(),
+            Some(crate::speech::wav_header(u32::MAX, 24_000).as_slice())
+        );
+        let mut pcm = Vec::new();
+        while let Some(chunk) = stream.chunks.next().await {
+            pcm.extend_from_slice(&chunk.expect("audio"));
+        }
+        assert_eq!(pcm, [1, 0, 2, 0]);
+        let request = server.await.expect("request");
+        assert!(request.contains("output_format=pcm_24000"));
+        assert!(!request.contains("opus_"));
     }
 
     #[test]

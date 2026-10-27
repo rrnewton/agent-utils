@@ -97,6 +97,7 @@ pub mod retrieval;
 pub mod send_approval;
 pub mod send_intent;
 pub mod send_refusal;
+pub mod service_health;
 pub mod slack;
 pub mod speakable;
 pub mod speech;

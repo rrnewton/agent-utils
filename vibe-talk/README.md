@@ -4758,6 +4758,22 @@ not exist — a client pointed at the wrong URL is exactly the case this log exi
 
 All `/api/` routes require `Authorization: Bearer <token>`. The two live-adapter routes use their
 own adapter-only token; every other route uses the read/write tokens described above.
+The server checks configured ElevenLabs dependencies immediately after startup and every ten
+minutes, independently of browser activity. It mints a signed conversation URL without opening a
+call, and generates a tiny “OK.” via the streaming read-aloud provider (about 432 synthesized
+characters per day). The audio check requires the PCM WAV framing consumed by the browser and
+nonempty, nonsilent, complete 16-bit samples. Each check has a 30-second deadline. Search logs for
+`voice dependency check`: success is INFO; failure is WARN with the component and a safe error
+code. These checks do not test a phone's audio permission, speaker, microphone or direct WebSocket
+connection, nor do they extend a vendor's maximum call duration. Non-ElevenLabs read-aloud is
+skipped. `/healthz` remains liveness and does not claim dependency health.
+
+For an iPhone Home Screen app, open the installed app and paste an **unused** pairing link into
+**Pairing link or code** on its sign-in screen, then tap **Pair this app**. Safari's pairing offer
+shows a copyable link before redemption. Copy it before signing in there: each link works only
+once. This saves the token in the installed app's own storage, separately from Safari. The entire
+link or existing strong pairing code is accepted; links for a different server are refused.
+
 `/healthz` and the static web app require neither, and neither reveals configuration.
 
 | Method | Path | Scope | Purpose |
@@ -6287,6 +6303,11 @@ on a session that has started keeps the call:
   started, nor the hosted vendor's protocol. A server's close whose reason ends "; reconnect" (code
   1011, "interrupt boundary timed out; reconnect") is the same family and is left for a follow-up.
   It does happen with the page in the background: the call and its microphone are already live.
+
+The hosted voice provider can impose its own maximum conversation duration. A close with
+`Max call duration exceeded` is that account/agent setting, even with WebSocket code 1000;
+it is not a client keep-alive timeout. Adjust Max conversation duration in the ElevenLabs agent's
+Advanced settings if longer calls are needed. The app records the provider's close reason.
 
 A healthy call does not end itself. Nothing the page times — the 9-second open deadline (which only
 applies to a socket that has not opened), the spoken yes's settle window, the hold below and its

@@ -938,6 +938,7 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    tokio::spawn(vibe_talk::service_health::run(state.clone()));
     let app = vibe_talk::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

@@ -481,7 +481,7 @@ fn wav_from_pcm(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     wav
 }
 
-fn wav_header(data_len: u32, sample_rate: u32) -> Vec<u8> {
+pub(crate) fn wav_header(data_len: u32, sample_rate: u32) -> Vec<u8> {
     let mut wav = Vec::with_capacity(44);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36_u32.saturating_add(data_len)).to_le_bytes());

@@ -206,7 +206,7 @@ def main() -> int:
     try:
         with sync_playwright() as playwright:
             browser_version = "Chromium"
-            for attempt in ("first", "second"):
+            for attempt in ("first", "second", "installed-app"):
                 with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                     context = playwright.chromium.launch_persistent_context(
                         profile,
@@ -220,6 +220,25 @@ def main() -> int:
                     page = context.pages[0]
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
+                    if attempt == "installed-app":
+                        # A separate profile models the Home Screen app's separate storage.
+                        with api.lock:
+                            api.live.add(CODE)
+                        page.goto(base, wait_until="load")
+                        for invalid in ("truncated-code", f"https://other.example/#pair={CODE}"):
+                            page.fill("#pair-input", invalid)
+                            page.tap("#pair-submit")
+                            page.wait_for_function("() => document.getElementById('error').textContent.length > 0")
+                            check(len(api.redemptions) == 2, "invalid input reached redemption")
+                        page.fill("#pair-input", link)
+                        page.tap("#pair-submit")
+                        page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+                        check(page.evaluate(f"() => localStorage.getItem({json.dumps(TOKEN_KEY)})") == TOKEN,
+                              "pasting a pairing link did not sign the installed app's storage in")
+                        check(page.input_value("#pair-input") == "", "the pasted credential was retained")
+                        check(not errors, f"the installed app threw: {errors}")
+                        context.close()
+                        continue
                     page.goto(link, wait_until="load")
                     # Opening the link alone spends nothing: a link scanner that runs the page
                     # must not be able to use it up. The person taps.
@@ -230,6 +249,8 @@ def main() -> int:
                     if args.shots:
                         args.shots.mkdir(parents=True, exist_ok=True)
                         page.screenshot(path=str(args.shots / f"{attempt}-offer.png"))
+                    check(page.input_value("#pair-transfer") == link,
+                          "Safari did not offer the unspent pairing link for transfer")
                     page.tap("#pair-confirm")
                     if attempt == "first":
                         page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
@@ -268,14 +289,15 @@ def main() -> int:
         server.server_close()
         thread.join()
 
-    check(len(api.redemptions) == 2, f"expected one redemption per browser: {api.redemptions}")
+    check(len(api.redemptions) == 3, f"expected one redemption per browser: {api.redemptions}")
     for body, authorization in api.redemptions:
         check(body == {"code": CODE}, f"the redemption did not carry the code in its body: {body!r}")
         check(authorization is None, f"a redemption carried a bearer token: {authorization!r}")
     named = [path for path in api.paths if CODE in path or SECOND_CODE in path]
     check(not named, f"a request put the code in its URL: {named}")
     print(f"{browser_version} at 390x844: the pairing link signed a fresh browser in with one redemption, "
-          f"the code in its body and out of the address; the same link in a second browser said {message!r}")
+          f"the code in its body and out of the address; the same link in a second browser said {message!r}; "
+          "a separate installed-app profile signed in by pasting an unused link, and refused malformed/foreign links")
     return 0
 
 
