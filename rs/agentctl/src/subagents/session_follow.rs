@@ -69,6 +69,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         record.session_agent = Some("codex".into());
         record.session_value = Some(session.to_owned());
         record.native_session = Some(NativeSession::new("codex", session, "observed"));
+        // Refresh the existing process anchor's spec using supported provenance, and
+        // validate it before changing the durable queue binding.
+        record.launch_spec =
+            self.captured_launch_spec(&record, Some(&anchor), "anchor", None, Some(session))?;
         // Verify unique native routing plus terminal, shell and process pins on the candidate.
         self.checked_policy(&record, false)?;
         if self.client.pane_info(pane)? != info
@@ -88,13 +92,6 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             true,
             || Ok((new.clone(), ())),
             &agent::GraceRuntime::new(Duration::from_secs(2)),
-        )?;
-        record.launch_spec = self.captured_launch_spec(
-            &record,
-            Some(&anchor),
-            "session-follow",
-            None,
-            Some(session),
         )?;
         self.save(&record)?;
         Ok(true)
