@@ -249,3 +249,21 @@ findings do not print warnings, and `--wait-lock` is not offered
 load flakes only (validation-graph 149, agentctl revive test,
 wrkslots shards 504 + 504 all passed alone). Upstream commits shared
 no files; rebased and pushed without a second gate.
+
+[muse watermelon] Slice 28 landed (e7727a4d): `wrkslotsd unhold`,
+the third writer slice, reproduces the hold-release mutation
+(locks, partial/seal/journal refusals, global cross-machine
+validation, the storage-absent release path with its NOTE, the
+`slot-hold-released` event, and HOLD record removal) behind the
+fixture-only writer guard. Adversarial review found the
+order-dependent overlap check, imported-hold invisibility, the
+over-broad storage-absent test, and unhold's missing
+configuration-changed recheck; all fixed with new differential
+cases (8 passed in this slice's file, 10 in slice 27's). Known
+divergences: derived-state reads still prefer the materialized
+snapshot over a full event fold (crash windows only; writers
+materialize both), storage refusal text names the first finding,
+and `--wait-lock` is not offered. Gate 39 failures were load
+timeouts only (repository-infrastructure 149, wrkslots shards
+508 + 508 passed alone). Upstream commits shared no files;
+rebased and pushed without a second gate.
