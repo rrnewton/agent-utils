@@ -146,8 +146,12 @@ known low divergence). Gate 30 failures were load flakes only
 (cross-skip 71 passed alone; wrkslots shard 0 481 passed alone).
 Next: slice 20 gives `parse-states` the same event-log classification.
 
-[muse watermelon] Slice 20 in progress: `wrkslotsd parse-states`
+[muse watermelon] Slice 20 landed (09958917): `wrkslotsd parse-states`
 adopts the shared event-log classification (complete event file
-derives toward `rebuild`, unexpected entry refuses with the event
-loader's message, an in-progress write of the first event file
-refuses with the bootstrap's partial-update message).
+derives toward `rebuild` after chain validation, unexpected entry
+refuses with the event loader's message, an in-progress write of the
+first event file refuses with the bootstrap's partial-update message
+after shard validation). Adversarial review found the precedence,
+symlinked-log, and corrupt-chain divergences; all fixed with
+differential cases. Gate 31 failed only on validation-graph (timeout
+under load), passed alone (42 passed).
