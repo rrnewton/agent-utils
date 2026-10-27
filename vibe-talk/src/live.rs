@@ -469,7 +469,8 @@ pub struct LiveHub {
     reaction_memory: Mutex<BTreeMap<ChannelId, ReactionSets>>,
     /// The channels whose reaction changes a connected Discord Gateway session is pushing
     /// (`#578 discord-live-reactions`): the poller spends no reaction refresh on them while it
-    /// is. Set when a session is ready, cleared the moment it drops.
+    /// is. Set by the session's connection when it is ready, cleared by it the moment it ends,
+    /// and per channel when its re-reads keep failing.
     reactions_pushed: Mutex<BTreeSet<ChannelId>>,
     /// Synced client settings changed by some page, for every other open page.
     /// `#457 settings-server-side`. Carried on the same streams as messages — a second

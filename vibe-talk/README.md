@@ -5620,14 +5620,18 @@ What it does:
   cache. So the page gets Discord's authoritative counts, and a missed event cannot leave a count
   drifting. `MESSAGE_REACTION_ADD`, `_REMOVE`, `_REMOVE_ALL` and `_REMOVE_EMOJI` are all handled.
   Events for one message are gathered for 150 ms first, so a burst of reactions costs one read.
+  A read that fails is tried again after 1, 2, 4 and 8 seconds; if it still fails, the poller's
+  own reaction refresh looks after that channel until the next fresh session.
 * **Emoji map as they do on every read**: a standard emoji is itself, skin tone included; a custom
   emoji is drawn as `:name:` and kept apart from another of the same name by its id.
 * **Your own reactions are marked as yours** when `owner_user_id` is set. Discord's REST copy says
   only whether the *bot* reacted, so the mark comes from the events, which name the user. A
   reaction you made before the server started is not known to be yours and is drawn as
-  anybody's until you react again.
-* **Threads**: an event names the thread a reply lives in; the thread's parent is read once
+  anybody's until you react again, and so is every mark after a gap Discord could not replay.
+* **Threads**: an event names the thread a reply lives in; the thread's parent is read
   (`GET /channels/{thread}`) and remembered, and the update goes to the parent channel's stream.
+  The re-read of a thread reply checks the thread again, as every thread read does, so it is two
+  requests rather than one.
   An event in a channel that is neither configured nor a thread of one is ignored.
 * **Staying connected**: heartbeats as Discord asks; a dropped connection, a Reconnect, or any
   close code Discord marks reconnectable **resumes** the session and Discord replays what was
@@ -5650,11 +5654,13 @@ thread's reactions reach the bot only when it is a member of that thread. Discor
 documentation of these intents and events: Gateway → *Gateway Intents*, and Gateway Events →
 *Message Reaction Add*.
 
-What it costs: one WebSocket connection; one REST read per reacted message per 150 ms window
-(the client obeys Discord's 429s like every other read); one `GET /gateway/bot` per fresh
-session; one channel read per thread, once.
+What it costs: one WebSocket connection; one REST read per reacted message per 150 ms window,
+two for a thread reply (the client obeys Discord's 429s like every other read); one
+`GET /gateway/bot` per fresh session; one read of each channel a reaction names that is not
+configured, once.
 
-Limits, stated plainly: the WebSocket is opened directly, never through an HTTP proxy; it speaks
+Limits, stated plainly: the WebSocket is opened directly, never through an HTTP proxy (three
+fresh sessions in a row that cannot open it log one ERROR saying so); it speaks
 JSON without compression; and it is one shard, which is right for a bot in fewer than 2500 servers.
 **It has been tested against a fake Gateway and REST server only** (adds, removals, custom emoji,
 threads, a burst, resume, a session that cannot resume, an unacknowledged heartbeat, a 429, a

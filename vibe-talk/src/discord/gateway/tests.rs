@@ -45,6 +45,12 @@ struct FakeState {
     /// How many of the next single-message reads answer 429.
     rate_limit_next: u32,
     rate_limited: u32,
+    /// How many of the next single-message reads answer 500.
+    fail_next: u32,
+    /// Whether the next `GET /gateway/bot` says no session starts are left.
+    exhausted_once: bool,
+    /// The close codes the client closed its connections with.
+    client_closes: Vec<u16>,
     requests: Vec<String>,
     heartbeat_ms: u64,
     mute_acks: bool,
@@ -197,13 +203,20 @@ fn answer(
     }
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
-        ["gateway", "bot"] => Json(json!({
-            "url": format!("ws://{gateway}"),
-            "shards": 1,
-            "session_start_limit": {"total": 1000, "remaining": 999, "reset_after": 1000,
-                                    "max_concurrency": 1},
-        }))
-        .into_response(),
+        ["gateway", "bot"] => {
+            let remaining = if std::mem::take(&mut state.exhausted_once) {
+                0
+            } else {
+                999
+            };
+            Json(json!({
+                "url": format!("ws://{gateway}"),
+                "shards": 1,
+                "session_start_limit": {"total": 1000, "remaining": remaining,
+                                        "reset_after": 1000, "max_concurrency": 1},
+            }))
+            .into_response()
+        }
         ["channels", channel] => match state.channels.get(*channel) {
             Some(value) => Json(value.clone()).into_response(),
             None => (
@@ -213,6 +226,14 @@ fn answer(
                 .into_response(),
         },
         ["channels", channel, "messages", id] => {
+            if state.fail_next > 0 {
+                state.fail_next -= 1;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": "500: Internal Server Error", "code": 0})),
+                )
+                    .into_response();
+            }
             if state.rate_limit_next > 0 {
                 state.rate_limit_next -= 1;
                 state.rate_limited += 1;
@@ -383,7 +404,13 @@ async fn hold(stream: tokio::net::TcpStream, state: Arc<Mutex<FakeState>>, gatew
                         }
                     }
                 }
-                Some(Ok(Frame::Close(_)) | Err(_)) | None => break,
+                Some(Ok(Frame::Close(frame))) => {
+                    if let Some(frame) = frame {
+                        locked(&state).client_closes.push(frame.code.into());
+                    }
+                    break;
+                }
+                Some(Err(_)) | None => break,
                 Some(Ok(_)) => {}
             },
             control = controls.recv() => match control {
@@ -421,6 +448,7 @@ fn timing() -> Timing {
         max_wait: Duration::from_millis(200),
         stable: Duration::from_millis(50),
         connect_timeout: Duration::from_secs(2),
+        retry: Duration::from_millis(20),
     }
 }
 
@@ -438,6 +466,10 @@ impl Drop for Running {
 }
 
 fn start(fake: &Fake) -> Running {
+    start_with(fake, timing())
+}
+
+fn start_with(fake: &Fake, timing: Timing) -> Running {
     let hub = Arc::new(LiveHub::new());
     let updates = hub.subscribe(&ChannelId(CHANNEL.into()), None).receiver;
     let config = fake.config();
@@ -451,7 +483,7 @@ fn start(fake: &Fake) -> Running {
             running_hub,
             chat,
             channels,
-            timing(),
+            timing,
         )
         .await;
     });
@@ -610,6 +642,7 @@ fn the_owners_own_reactions_mark_every_read_of_the_message_until_taken_back() {
             emoji: "👍".into(),
         }),
         Some(OWNER),
+        UNIT_SOURCE,
     );
     note_owner_reaction(
         &event(ReactionChange::Added {
@@ -617,6 +650,7 @@ fn the_owners_own_reactions_mark_every_read_of_the_message_until_taken_back() {
             emoji: "👍".into(),
         }),
         None,
+        UNIT_SOURCE,
     );
     assert_eq!(read(), [false, false]);
     note_owner_reaction(
@@ -625,6 +659,7 @@ fn the_owners_own_reactions_mark_every_read_of_the_message_until_taken_back() {
             emoji: "👍".into(),
         }),
         Some(OWNER),
+        UNIT_SOURCE,
     );
     note_owner_reaction(
         &event(ReactionChange::Added {
@@ -632,6 +667,7 @@ fn the_owners_own_reactions_mark_every_read_of_the_message_until_taken_back() {
             emoji: "777".into(),
         }),
         Some(OWNER),
+        UNIT_SOURCE,
     );
     assert_eq!(read(), [true, true], "a custom emoji is known by its id");
     note_owner_reaction(
@@ -640,6 +676,7 @@ fn the_owners_own_reactions_mark_every_read_of_the_message_until_taken_back() {
             emoji: "👍".into(),
         }),
         Some(OWNER),
+        UNIT_SOURCE,
     );
     assert_eq!(read(), [false, true]);
     note_owner_reaction(
@@ -647,6 +684,7 @@ fn the_owners_own_reactions_mark_every_read_of_the_message_until_taken_back() {
             emoji: "777".into(),
         }),
         Some(OWNER),
+        UNIT_SOURCE,
     );
     assert_eq!(read(), [false, false]);
     note_owner_reaction(
@@ -655,10 +693,28 @@ fn the_owners_own_reactions_mark_every_read_of_the_message_until_taken_back() {
             emoji: "👍".into(),
         }),
         Some(OWNER),
+        UNIT_SOURCE,
     );
-    note_owner_reaction(&event(ReactionChange::RemovedAll), Some(OWNER));
+    note_owner_reaction(&event(ReactionChange::RemovedAll), Some(OWNER), UNIT_SOURCE);
+    assert_eq!(read(), [false, false]);
+
+    // A session task that loses track forgets its own marks, and nobody else's.
+    note_owner_reaction(
+        &event(ReactionChange::Added {
+            user: OWNER.into(),
+            emoji: "👍".into(),
+        }),
+        Some(OWNER),
+        UNIT_SOURCE,
+    );
+    forget_owner_reactions(UNIT_SOURCE + 1);
+    assert_eq!(read(), [true, false]);
+    forget_owner_reactions(UNIT_SOURCE);
     assert_eq!(read(), [false, false]);
 }
+
+/// A source no running session task is given: they count up from one.
+const UNIT_SOURCE: Source = u64::MAX - 1;
 
 #[test]
 fn addresses_close_codes_and_waits_follow_discords_rules() {
@@ -837,7 +893,14 @@ async fn a_burst_of_events_on_one_message_costs_one_read_and_one_update() {
     let fake = Fake::start().await;
     let message = "1578000000000000401";
     fake.put_message(CHANNEL, message, None);
-    let mut running = start(&fake);
+    // A window wide enough that a loaded host still lands all five events inside it.
+    let mut running = start_with(
+        &fake,
+        Timing {
+            coalesce: Duration::from_millis(400),
+            ..timing()
+        },
+    );
     ready(&fake, &running, 1).await;
     fake.put_message(CHANNEL, message, Some(json!([unicode("🎉", 5)])));
     for user in ["51", "52", "53", "54", "55"] {
@@ -899,6 +962,10 @@ async fn a_reaction_in_a_thread_is_published_on_its_parent_channel() {
             json!({"id": null, "name": "✅"}),
         ),
     );
+    eventually("the unknown channel read", || {
+        fake.requests("/channels/999") >= 1
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(fake.requests("/channels/999"), 1);
     assert_eq!(
@@ -1069,7 +1136,128 @@ async fn an_unacknowledged_heartbeat_is_a_dead_connection_and_is_resumed() {
         !locked(&fake.state).resumes.is_empty()
     })
     .await;
+    eventually("the client's close frame", || {
+        !locked(&fake.state).client_closes.is_empty()
+    })
+    .await;
     let state = locked(&fake.state);
     assert!(state.heartbeats >= 1);
     assert_eq!(state.identifies, 1);
+    // 1000 or 1001 would end the session it means to resume.
+    assert!(
+        state
+            .client_closes
+            .iter()
+            .all(|code| *code != 1000 && *code != 1001),
+        "{:?}",
+        state.client_closes
+    );
+}
+
+#[tokio::test]
+async fn a_failed_read_is_tried_again_and_still_publishes() {
+    let fake = Fake::start().await;
+    let message = "1578000000000000901";
+    fake.put_message(CHANNEL, message, None);
+    let mut running = start(&fake);
+    ready(&fake, &running, 1).await;
+    locked(&fake.state).fail_next = 2;
+    fake.put_message(CHANNEL, message, Some(json!([unicode("👍", 1)])));
+    fake.dispatch(
+        "MESSAGE_REACTION_ADD",
+        added(
+            CHANNEL,
+            message,
+            SOMEBODY,
+            json!({"id": null, "name": "👍"}),
+        ),
+    );
+    let live = next_update(&mut running.updates).await;
+    assert_eq!(shown(&live), [("👍".into(), false, None, 1, false)]);
+    assert!(running.hub.reactions_pushed(&ChannelId(CHANNEL.into())));
+}
+
+#[tokio::test]
+async fn a_read_that_keeps_failing_hands_the_channel_back_to_the_poller() {
+    let fake = Fake::start().await;
+    let message = "1578000000000000951";
+    fake.put_message(CHANNEL, message, None);
+    let running = start(&fake);
+    ready(&fake, &running, 1).await;
+    locked(&fake.state).fail_next = 100;
+    fake.dispatch(
+        "MESSAGE_REACTION_ADD",
+        added(
+            CHANNEL,
+            message,
+            SOMEBODY,
+            json!({"id": null, "name": "👍"}),
+        ),
+    );
+    eventually("the channel handed back", || {
+        !running.hub.reactions_pushed(&ChannelId(CHANNEL.into()))
+    })
+    .await;
+    assert_eq!(
+        fake.requests(&format!("/channels/{CHANNEL}/messages/{message}")),
+        READ_ATTEMPTS as usize
+    );
+}
+
+#[tokio::test]
+async fn no_session_starts_left_waits_for_them_to_reset() {
+    let fake = Fake::start().await;
+    locked(&fake.state).exhausted_once = true;
+    let started = std::time::Instant::now();
+    let running = start(&fake);
+    ready(&fake, &running, 1).await;
+    // `reset_after` 1000 ms: no identify before it, one after.
+    assert!(started.elapsed() >= Duration::from_millis(1000));
+    assert_eq!(locked(&fake.state).identifies, 1);
+    assert_eq!(fake.requests("/gateway/bot"), 2);
+}
+
+#[tokio::test]
+async fn a_resumable_invalid_session_is_resumed() {
+    let fake = Fake::start().await;
+    let running = start(&fake);
+    ready(&fake, &running, 1).await;
+    let connection = locked(&fake.state).connection.clone().expect("connected");
+    let _ = connection.send(Control::Send(json!({"op": 9, "d": true}).to_string()));
+    eventually("a resume after op 9 true", || {
+        locked(&fake.state).resumes.len() == 1
+    })
+    .await;
+    ready(&fake, &running, 1).await;
+    assert_eq!(locked(&fake.state).identifies, 1);
+}
+
+#[tokio::test]
+async fn a_fresh_session_forgets_the_owner_marks_it_may_have_missed_the_end_of() {
+    let fake = Fake::start().await;
+    let message = "1578000000000001001";
+    fake.put_message(CHANNEL, message, None);
+    let mut running = start(&fake);
+    ready(&fake, &running, 1).await;
+    fake.put_message(CHANNEL, message, Some(json!([unicode("👍", 2)])));
+    fake.dispatch(
+        "MESSAGE_REACTION_ADD",
+        added(CHANNEL, message, OWNER, json!({"id": null, "name": "👍"})),
+    );
+    assert_eq!(
+        shown(&next_update(&mut running.updates).await),
+        [("👍".into(), false, None, 2, true)]
+    );
+
+    // The owner takes his back while no session is up, and the gap is not replayed.
+    locked(&fake.state).resumable = false;
+    fake.control(Control::Drop);
+    fake.put_message(CHANNEL, message, Some(json!([unicode("👍", 1)])));
+    let live = next_update(&mut running.updates).await;
+    assert_eq!(
+        shown(&live),
+        [("👍".into(), false, None, 1, false)],
+        "the reconcile's copy no longer claims the reaction is his"
+    );
+    assert_eq!(locked(&fake.state).identifies, 2);
 }
