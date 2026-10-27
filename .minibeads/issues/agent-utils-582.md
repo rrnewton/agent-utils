@@ -1,6 +1,6 @@
 ---
 title: 'headless-m1-event-log: typed JSONL event log and agentctl tail NAME'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-565: parent-child
 created_at: 2026-10-27T16:25:26.055083547+00:00
-updated_at: 2026-10-27T16:25:26.055083547+00:00
+updated_at: 2026-10-27T17:15:11.391559613+00:00
+closed_at: 2026-10-27T17:15:11.391559493+00:00
 ---
 
 # Description

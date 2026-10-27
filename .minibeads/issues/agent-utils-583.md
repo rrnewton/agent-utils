@@ -1,6 +1,6 @@
 ---
 title: 'headless-m2-claude-wrapper: persistent Claude Code stream-json wrapper as the queue''s only drainer'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-565: parent-child
 created_at: 2026-10-27T16:25:34.653895799+00:00
-updated_at: 2026-10-27T16:25:34.653895799+00:00
+updated_at: 2026-10-27T17:15:11.393863531+00:00
+closed_at: 2026-10-27T17:15:11.393863431+00:00
 ---
 
 # Description
