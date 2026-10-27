@@ -84175,6 +84175,20 @@ async function replyFromCards(page, server, data, id, text, postedId) {
 const receiptsSaying = (page, text) => [...outgoingRows(page), ...inPlaceRows(page, "side-list")]
   .filter((li) => li.text().includes(text)).map((li) => li.getAttribute("data-send-state"));
 
+test("a sent-receipt timer firing before its deadline rechecks the same deadline", async () => {
+  const { page, data, server } = await ownersCards();
+  const posted = await replyFromCards(page, server, data, "703", "receipt with an early timer", "7989");
+  const confirmed = page.clock();
+  page.setClock(confirmed + SENT_RECEIPT_MS - 1);
+  page.expireTimers(SENT_RECEIPT_MS);
+  await page.settle();
+  assert.deepEqual(receiptsSaying(page, posted.content), ["sent"], "the receipt retired before its deadline");
+  page.setClock(confirmed + SENT_RECEIPT_MS);
+  assert.ok(page.expireTimers(1) > 0, "the early timer postponed its next check to the ten-minute grace");
+  await page.settle();
+  assert.deepEqual(receiptsSaying(page, posted.content), [], "the receipt survived its showing deadline");
+});
+
 test("`#500 sent-receipts-pile-up`: thread replies sent from the cards say Sent for a while, then go; none is saved, and a reload draws none while the replies stay", async () => {
   const { page, data, server } = await ownersCards();
   // The first reply: its thread is read now, and packs, so the reply is drawn nowhere in the view.

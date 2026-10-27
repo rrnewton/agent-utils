@@ -29934,9 +29934,15 @@ function sentReceiptRetires(entry, drawn) {
 function armSentReceipt(entry, due = SENT_RECEIPT_MS) {
   setTimeout(() => {
     if (outgoingMessages.get(entry.id) !== entry || entry.state !== "sent") return;
+    // Timers can fire before the wall-clock deadline. Retry that deadline instead of
+    // postponing a still-visible receipt straight to the ten-minute fallback.
+    if (Date.now() - entry.sentAt < due) {
+      armSentReceipt(entry, due);
+      return;
+    }
     renderOutgoingEverywhere();
     if (outgoingMessages.get(entry.id) === entry && due < OWN_POST_GRACE_MS) armSentReceipt(entry, OWN_POST_GRACE_MS);
-  }, Math.max(0, due - (Date.now() - entry.sentAt)));
+  }, Math.max(1, due - (Date.now() - entry.sentAt)));
 }
 
 /** Only provider history/stream observations retire receipts; appending an ACK is not a read. */
