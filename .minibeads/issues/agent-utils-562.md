@@ -87,4 +87,7 @@ recover-absent-validate-rows (journal identity, per-row record digest,
 and the exact derived ARCHIVED entry per row). The ownerless-agent,
 ownerless-clone, cache-relocate, and absent-agent-row kinds remain.
 
-[muse watermelon] Next: scope the ownerless-agent journal inputs (they mix directory-identity filesystem checks with shape).
+[muse watermelon] Slice 12 in progress: `parse-journal` also covers
+ownerless-agent-remove, including its directory-identity check (device,
+inode, mount id) on a present target and repository resolution. The
+ownerless-clone, cache-relocate, and absent-agent-row kinds remain.

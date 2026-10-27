@@ -858,6 +858,270 @@ fn exclusion_from_obj(cfg: &Cfg, fenced: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+struct AgentAuthorization {
+    path: String,
+    identity: (i64, i64, i64),
+    repository: String,
+}
+
+fn ownerless_agent_authorization(value: &Value) -> Result<AgentAuthorization> {
+    let label = "ownerless agent authorization";
+    let raw = as_mapping(value, label)?;
+    const REQUIRED: [&str; 10] = [
+        "path",
+        "identity",
+        "actor",
+        "repository",
+        "head",
+        "branch",
+        "remote",
+        "remote_url_sha256",
+        "handoff_sha256",
+        "recorded_at",
+    ];
+    let mut keys: Vec<&str> = raw.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut pre_handoff: Vec<&str> = REQUIRED
+        .iter()
+        .filter(|key| **key != "handoff_sha256")
+        .copied()
+        .collect();
+    pre_handoff.sort_unstable();
+    let mut owned: Map<String, Value>;
+    let raw = if keys == pre_handoff {
+        owned = raw.clone();
+        owned.insert("handoff_sha256".to_owned(), Value::Null);
+        &owned
+    } else {
+        raw
+    };
+    exact_keys(raw, &REQUIRED, &[], label)?;
+    let mut identity = Vec::new();
+    for item in as_list(&raw["identity"], "ownerless agent directory identity")? {
+        identity.push(as_int(item, "ownerless agent directory identity", 0)?);
+    }
+    if identity.len() != 3 {
+        return Err("ownerless agent directory identity must have three fields".to_owned());
+    }
+    if identity_from_obj(&raw["actor"], "ownerless agent recovery actor")?.is_none() {
+        return Err("ownerless agent recovery has no actor".to_owned());
+    }
+    let head = as_str(&raw["head"], "ownerless agent HEAD")?;
+    let digest = as_str(&raw["remote_url_sha256"], "ownerless agent remote digest")?;
+    if !is_sha(head) || !is_digest(digest) {
+        return Err("ownerless agent Git identity is invalid".to_owned());
+    }
+    if !raw["handoff_sha256"].is_null() {
+        let handoff = as_str(&raw["handoff_sha256"], "ownerless agent HANDOFF.md digest")?;
+        if !is_digest(handoff) {
+            return Err("ownerless agent HANDOFF.md digest is invalid".to_owned());
+        }
+    }
+    let recorded_at = as_str(&raw["recorded_at"], "ownerless agent recorded_at")?;
+    parse_timestamp(recorded_at, "ownerless agent recorded_at")?;
+    let path = as_str(&raw["path"], "ownerless agent path")?.to_owned();
+    let repository = as_str(&raw["repository"], "ownerless agent repository")?.to_owned();
+    if !raw["branch"].is_null() {
+        validate_ref(as_str(&raw["branch"], "ownerless agent branch")?, "branch")?;
+    }
+    validate_remote(as_str(&raw["remote"], "ownerless agent remote")?)?;
+    Ok(AgentAuthorization {
+        path,
+        identity: (identity[0], identity[1], identity[2]),
+        repository,
+    })
+}
+
+fn open_directory_identity(path: &Path, label: &str) -> Result<(i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot safely open {label} {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot safely open {label} {}: {error}", path.display()))?;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .map_err(|error| format!("cannot determine mount identity for {label}: {error}"))?;
+    for line in fdinfo.lines() {
+        let Some((key, raw)) = line.split_once(':') else {
+            continue;
+        };
+        if key == "mnt_id" {
+            let value: i64 = raw
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid mount identity for {label}: {raw:?}"))?;
+            if value > 0 {
+                return Ok((metadata.dev() as i64, metadata.ino() as i64, value));
+            }
+        }
+    }
+    Err(format!(
+        "cannot determine mount identity for {label}: mnt_id is absent"
+    ))
+}
+
+fn repository_resolved(cfg: &Cfg, raw: &str) -> Result<PathBuf> {
+    if raw.starts_with('/') {
+        return Err(format!(
+            "repository path must be relative to {}: {raw:?}; use a path inside the project root or ../NAME[/PATH] components inside one direct sibling",
+            cfg.root.display()
+        ));
+    }
+    let parts: Vec<&str> = raw
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let sibling = parts.len() >= 2
+        && parts[0] == ".."
+        && parts[1..].iter().all(|part| !matches!(*part, "." | ".."));
+    if parts.contains(&"..") && !sibling {
+        return Err(format!(
+            "repository path must stay inside {} or one direct sibling, with path components '../NAME' or '../NAME/PATH'; other parent traversal is refused: {raw:?}",
+            cfg.root.display()
+        ));
+    }
+    let root_parent = cfg.root.parent().map(Path::to_path_buf).unwrap_or_default();
+    let (stored, unresolved, allowed_root) = if sibling {
+        if root_parent.join(parts[1]) == cfg.root {
+            return Err(format!(
+                "repository path {raw:?} aliases the project root; use a path inside it instead"
+            ));
+        }
+        (
+            crate::config_validate::normpath(raw),
+            root_parent.join(parts[1..].join("/")),
+            root_parent.clone(),
+        )
+    } else {
+        let lexical = crate::config_validate::normpath(raw);
+        let unresolved = if lexical == "." {
+            cfg.root.clone()
+        } else {
+            cfg.root.join(&lexical)
+        };
+        (lexical, unresolved, cfg.root.clone())
+    };
+    crate::config_validate::ensure_no_symlink_components(&allowed_root, &unresolved, "repository")?;
+    let absolute = unresolved.canonicalize().map_err(|_| {
+        format!(
+            "source repository {stored:?} does not exist or cannot be resolved: {}",
+            unresolved.display()
+        )
+    })?;
+    if !absolute.is_dir() {
+        return Err(format!(
+            "repository does not exist or is unsafe: {}",
+            absolute.display()
+        ));
+    }
+    Ok(absolute)
+}
+
+fn ownerless_agent_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    exact_keys(
+        raw,
+        &[
+            "schema",
+            "kind",
+            "machine",
+            "slot",
+            "phase",
+            "fenced",
+            "authorization",
+            "salvage",
+        ],
+        &[],
+        "ownerless agent journal",
+    )?;
+    if as_int(&raw["schema"], "ownerless agent journal.schema", 0)? != SCHEMA
+        || raw["kind"] != Value::String("ownerless-agent-remove".to_owned())
+        || raw["machine"].as_str() != Some(journal_machine)
+    {
+        return Err("ownerless agent journal identity is invalid".to_owned());
+    }
+    let authorization = ownerless_agent_authorization(&raw["authorization"])?;
+    let (_relative, target) = crate::config_validate::relative_inside(
+        &cfg.root,
+        &authorization.path,
+        "ownerless agent worktree",
+    )?;
+    let target_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if target.parent() != Some(cfg.worktrees.as_path()) || target_name == "ignored" {
+        return Err(format!(
+            "ownerless agent worktree must be one direct child of {}, excluding ignored",
+            cfg.worktrees.display()
+        ));
+    }
+    validate_name(&target_name, "ownerless agent worktree name")?;
+    if raw["slot"].as_str() != Some(target_name.as_str()) {
+        return Err("ownerless agent journal slot differs from its path".to_owned());
+    }
+    let (_relative, fenced) = crate::config_validate::relative_inside(
+        &cfg.root,
+        as_str(&raw["fenced"], "ownerless agent fenced path")?,
+        "fenced path",
+    )?;
+    let fenced_name = fenced
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let prefix = format!(".{target_name}.ownerless-agent.");
+    let tail = fenced_name.strip_prefix(&prefix).unwrap_or_default();
+    if fenced.parent() != target.parent()
+        || !fenced_name.starts_with(&prefix)
+        || !(tail.len() == 32
+            && tail
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    {
+        return Err("ownerless agent fenced path does not match its target".to_owned());
+    }
+    let phase = as_str(&raw["phase"], "ownerless agent journal.phase")?;
+    if !matches!(phase, "prepared" | "preserved" | "fenced" | "removed") {
+        return Err(format!("unknown ownerless agent phase {phase:?}"));
+    }
+    let present = |path: &Path| path.symlink_metadata().is_ok();
+    let target_present = present(&target);
+    let fenced_present = present(&fenced);
+    if target_present && fenced_present {
+        return Err("canonical and fenced ownerless agent paths both exist".to_owned());
+    }
+    let active = if target_present {
+        Some(target.clone())
+    } else if fenced_present {
+        Some(fenced.clone())
+    } else {
+        None
+    };
+    if phase == "removed" && active.is_some() {
+        return Err("ownerless agent worktree reappeared after removal was recorded".to_owned());
+    }
+    if let Some(active) = &active {
+        if active.is_symlink()
+            || !active.is_dir()
+            || open_directory_identity(active, "ownerless agent worktree")?
+                != authorization.identity
+        {
+            return Err("ownerless agent worktree identity changed; preserve it".to_owned());
+        }
+    }
+    let repository = repository_resolved(cfg, &authorization.repository)?;
+    if repository == target || repository.starts_with(&target) {
+        return Err("ownerless agent source repository is inside the removal target".to_owned());
+    }
+    for (index, item) in as_list(&raw["salvage"], "ownerless agent journal.salvage")?
+        .iter()
+        .enumerate()
+    {
+        as_mapping(item, &format!("ownerless agent journal.salvage[{index}]"))?;
+    }
+    Ok(())
+}
+
 fn absent_validate_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
     const LABEL: &str = "absent-validation-row journal";
     exact_keys(
@@ -1228,6 +1492,9 @@ pub(crate) fn parse_journal(
         }
         "recover-absent-validate-rows" => {
             absent_validate_shape(raw, &machine)?;
+        }
+        "ownerless-agent-remove" => {
+            ownerless_agent_shape(&cfg, raw, &machine)?;
         }
         _ => return Err(format!("unsupported recovery journal kind {kind:?}")),
     }
