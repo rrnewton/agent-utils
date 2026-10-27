@@ -120,3 +120,10 @@ partial-shard pairing rule (snapshot mode; EVENTS derivation stays with
 wrkslots shard 1 (468 passed alone) each passed in a solo rerun, so every
 selected step passed in some run. Next: further composed readers or the
 first writer slice.
+
+[muse watermelon] Slice 18 in progress: `wrkslotsd parse-global`
+composes the per-machine shard readers as one registry (machine-shard
+and event-directory discovery, shard-set disagreement without history,
+cross-machine slot/agent uniqueness, active-versus-archived overlap) in
+snapshot/reference mode; EVENTS-derived machines refuse toward `rebuild`
+and the Python lock-based overlap re-read is not reproduced.

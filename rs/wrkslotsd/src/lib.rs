@@ -48,6 +48,7 @@ pub mod cli;
 mod config;
 mod config_validate;
 mod evidence;
+mod global_state;
 mod handoff_state;
 mod hold_state;
 mod index;

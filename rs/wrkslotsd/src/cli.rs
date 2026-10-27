@@ -125,6 +125,12 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Validate every machine's ACTIVE and ARCHIVED shards as one registry and print each pair
+    ParseGlobal {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+    },
     /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
     ParseConfig {
         /// Configuration document to parse; it is never modified
@@ -315,6 +321,19 @@ pub fn run() -> u8 {
                 }
             }
         }
+        Command::ParseGlobal { root } => match crate::global_state::parse_global(root.as_deref()) {
+            Ok(value) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
         Command::ParseConfig { config } => {
             let parsed = std::fs::read_to_string(&config)
                 .map_err(|error| {

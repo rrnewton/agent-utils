@@ -925,7 +925,20 @@ fn assert_record_paths(cfg: &Cfg, record: &RecordRec) -> Result<()> {
     Ok(())
 }
 
-fn active_from_obj(cfg: &Cfg, value: &Value, selected: &str, label: &str) -> Result<Value> {
+/// One active record's identity for cross-machine checks, in shard order.
+pub(crate) struct RecordOrder {
+    pub(crate) slot: String,
+    pub(crate) agent: String,
+    pub(crate) slot_type: String,
+    pub(crate) imported: bool,
+}
+
+fn active_from_obj(
+    cfg: &Cfg,
+    value: &Value,
+    selected: &str,
+    label: &str,
+) -> Result<(Value, Vec<RecordOrder>)> {
     let raw = as_mapping(value, label)?;
     exact_keys(
         raw,
@@ -982,18 +995,30 @@ fn active_from_obj(cfg: &Cfg, value: &Value, selected: &str, label: &str) -> Res
         assert_record_paths(cfg, record)?;
     }
     let revision = as_int(&raw["revision"], "active state.revision", 0)?;
+    let order: Vec<RecordOrder> = records
+        .iter()
+        .map(|item| RecordOrder {
+            slot: item.slot.clone(),
+            agent: item.agent.clone(),
+            slot_type: item.slot_type.clone(),
+            imported: item.import_source.is_some(),
+        })
+        .collect();
     let mut slots: Vec<Value> = records.into_iter().map(|item| item.normalized).collect();
     slots.sort_by(|left, right| {
         left.get("slot")
             .and_then(Value::as_str)
             .cmp(&right.get("slot").and_then(Value::as_str))
     });
-    Ok(json!({
-        "schema": SCHEMA,
-        "machine": actual_machine,
-        "revision": revision,
-        "slots": slots,
-    }))
+    Ok((
+        json!({
+            "schema": SCHEMA,
+            "machine": actual_machine,
+            "revision": revision,
+            "slots": slots,
+        }),
+        order,
+    ))
 }
 
 pub(crate) fn load_cfg(
@@ -1023,6 +1048,15 @@ pub(crate) fn load_cfg(
 /// Read and validate `ACTIVE.<machine>.json` under a project's control
 /// directory, printing the normalized state document.
 pub(crate) fn parse_state(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
+    Ok(parse_state_ordered(root, machine_override)?.0)
+}
+
+/// Like `parse_state`, but also return each record's identity in the
+/// order the records appear in the shard.
+pub(crate) fn parse_state_ordered(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+) -> Result<(Value, Vec<RecordOrder>)> {
     let (cfg, selected) = load_cfg(root, machine_override)?;
     validate_name(&selected, "machine")?;
     let path = cfg.control.join(format!("ACTIVE.{selected}.json"));
