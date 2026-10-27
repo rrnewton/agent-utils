@@ -166,8 +166,14 @@ validation-graph 113 passed together alone; wrkslots shards 488 + 488
 passed alone). Upstream vibe-talk commits shared no files; rebased and
 pushed without a second gate.
 
-[muse watermelon] Slice 22 in progress: `wrkslotsd parse-status`
+[muse watermelon] Slice 22 landed (5a4fc874): `wrkslotsd parse-status`
 reproduces the per-record status object over snapshot states (owner
 process diagnosis from this host's /proc, boot and machine identity,
 heartbeat age/expiry, hold outcome). Registry storage inconsistencies
 and event-derived owner releases stay with the Python `status`.
+Adversarial review found the fractional-second heartbeat expiry and
+the hold-error refusal; both fixed with differential cases (status
+suite 3 passed, 13 with holds). Gate 33 failures were load flakes only
+(cross-skip 71 passed alone; wrkslots shard 0 490 passed alone).
+Upstream vibe-talk commits shared no files; rebased and pushed
+without a second gate.
