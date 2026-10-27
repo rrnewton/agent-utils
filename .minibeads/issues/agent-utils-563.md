@@ -1,6 +1,6 @@
 ---
 title: 'read-aloud-fallback-chain: ordered voice providers with per-block fallback'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - read-aloud
 - voice
 created_at: 2026-10-26T22:32:35.703545036+00:00
-updated_at: 2026-10-26T22:32:35.703545036+00:00
+updated_at: 2026-10-27T01:36:04.726038947+00:00
+closed_at: 2026-10-27T01:36:04.726038567+00:00
 ---
 
 # Description
