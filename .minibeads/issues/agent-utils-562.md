@@ -230,3 +230,22 @@ failures were one rustfmt fix plus load flakes (validation-graph 149,
 wrkslots shards 499 + 499, cross agentctl 777, five vibe-talk browser
 checks all passed alone). Upstream agentctl commit shared no files;
 rebased and pushed without a second gate.
+
+[muse watermelon] Slice 27 landed (aab4d857): `wrkslotsd hold`, the
+second writer slice, reproduces the slot-hold mutation behind the
+registry locks (config-directory lock with a configuration-changed
+recheck, partial/seal/journal refusals, global active/archived
+overlap validation, filesystem+Git storage findings for the target
+slot, the `slot-held` event, and the atomic HOLD record). The
+already-held decision replays the event log when it derives the
+machine, matching the Python loader. Adversarial review found the
+snapshot-only hold decision, the dropped overlap check, the missing
+seal-journal refusal, the narrower lock set, and the silent
+slot-image storage skip; all fixed with new differential cases
+(10 passed). Known divergences: storage refusal names the first
+finding instead of Python's aggregated text, non-target storage
+findings do not print warnings, and `--wait-lock` is not offered
+(Python's default is also fail-immediately). Gate 38 failures were
+load flakes only (validation-graph 149, agentctl revive test,
+wrkslots shards 504 + 504 all passed alone). Upstream commits shared
+no files; rebased and pushed without a second gate.
