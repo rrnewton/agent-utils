@@ -1656,9 +1656,10 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
 
 /// What a REST call needs admin rights for, when `method` on `endpoint` (normalised by
 /// [`normalize_endpoint`]) is one of the requests GitHub serves only to repository or
-/// organization administrators. `{owner}`-style placeholders count as names. Reads that need
-/// only read or push access (listing rulesets or collaborators, reading a branch) are left
-/// alone; so is GraphQL.
+/// organization administrators. `{owner}`-style placeholders count as names, and a GitHub
+/// Enterprise Server `api/v3/` prefix is ignored. Reads that need only read or push access
+/// (listing rulesets or collaborators, reading a branch), removing a collaborator (anyone may
+/// remove themselves) and GraphQL are left alone.
 pub fn admin_only(method: &str, endpoint: &str) -> Option<&'static str> {
     let write = !matches!(method, "GET" | "HEAD" | "OPTIONS");
     let segs: Vec<String> = endpoint
@@ -1666,7 +1667,10 @@ pub fn admin_only(method: &str, endpoint: &str) -> Option<&'static str> {
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase)
         .collect();
-    let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+    let mut segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+    if segs.starts_with(&["api", "v3"]) {
+        segs.drain(..2);
+    }
     match segs.as_slice() {
         ["repos", _, _] if matches!(method, "PATCH" | "DELETE") => {
             Some("the repository's settings (editing or deleting the repository)")
@@ -1676,12 +1680,16 @@ pub fn admin_only(method: &str, endpoint: &str) -> Option<&'static str> {
         }
         ["repos", _, _, "hooks", ..] => Some("the repository's webhooks"),
         ["repos", _, _, "rulesets", ..] if write => Some("a change to the repository's rulesets"),
+        // Branch names may hold slashes; `.../rename` renames a branch, whatever its name.
         ["repos", _, _, "branches", rest @ ..]
-            if write && rest.len() >= 2 && rest[1..].contains(&"protection") =>
+            if write
+                && rest.len() >= 2
+                && rest[1..].contains(&"protection")
+                && rest.last() != Some(&"rename") =>
         {
             Some("a change to branch protection")
         }
-        ["repos", _, _, "collaborators", ..] if write => {
+        ["repos", _, _, "collaborators", ..] if write && method != "DELETE" => {
             Some("a change to the repository's collaborators")
         }
         ["orgs", _] if write => Some("the organization's settings"),
@@ -2440,7 +2448,7 @@ mod tests {
             "api -X PUT repos/o/r/branches/main/protection --input p.json",
             "api -X DELETE repos/o/r/branches/feat/x/protection/required_signatures",
             "api -X PUT repos/o/r/collaborators/u",
-            "api -X DELETE repos/o/r/collaborators/u",
+            "api https://ghe.example/api/v3/repos/o/r/hooks",
             "api -X PATCH orgs/acme -f name=x",
             "api orgs/acme/hooks",
             "api orgs/acme/actions/permissions",
@@ -2474,6 +2482,8 @@ mod tests {
             "api repos/o/r/branches/main",
             "api repos/o/r/branches/main/protection",
             "api -X POST repos/o/r/branches/protection/rename -f new_name=x",
+            "api -X POST repos/o/r/branches/rel/protection/x/rename -f new_name=y",
+            "api -X DELETE repos/o/r/collaborators/me",
             "api -X POST repos/o/r/issues -f title=t",
             "api orgs/acme",
             "api repos/o/hooks",

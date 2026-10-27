@@ -27,12 +27,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Whether a call that got an unknown HTTP 403 may wait before it returns: gh ran, the call is
-/// not a GIT_CREDENTIAL call (git may hold its caller's locks), and its caller has not asked it
-/// to stop.
+/// Whether a call that got an unknown HTTP 403 may wait before it returns: gh ran and failed
+/// (exited with a non-zero status, not by a signal), the call is not a GIT_CREDENTIAL call (git
+/// may hold its caller's locks), and its caller has not asked it to stop.
 fn may_back_off(c: &Classification, ran: Option<Ran>) -> bool {
     c.class != Class::GitCredential
-        && ran.is_some_and(|r| r.late_signal.is_none() && !r.deadline_hit)
+        && ran.is_some_and(|r| {
+            matches!(r.exit, Exit::Code(n) if n != 0) && r.late_signal.is_none() && !r.deadline_hit
+        })
 }
 
 /// Exit status when a budget, cooldown or recursion limit refuses the call.
@@ -601,7 +603,9 @@ impl Wrapper<'_> {
         if self.unknown_403_backoff(&c, ran, &scanner) {
             // Only this call waits, outside the lock, after saying why (#592).
             self.flush();
-            self.clock.sleep(self.cfg.unknown_403_backoff_secs);
+            if let Some(sig) = self.back_off(self.backoff_secs(&c)) {
+                return Outcome::Signal(sig);
+            }
         }
         if ran.is_some_and(|r| r.deadline_hit) {
             return Outcome::Exit(EXIT_REFUSED);
@@ -1015,6 +1019,31 @@ impl Wrapper<'_> {
     /// and got an HTTP 403 that was neither a rate limit nor a permission denial. A
     /// GIT_CREDENTIAL call never waits (git may hold its caller's locks), and neither does a
     /// call its caller has already asked to stop.
+    /// How long an unknown 403 holds `c`: `unknown_403_backoff_secs`, but never longer than the
+    /// caller agreed to wait (`GH_PACED_MAX_WAIT`).
+    fn backoff_secs(&self, c: &Classification) -> f64 {
+        self.cfg
+            .unknown_403_backoff_secs
+            .min(self.cfg.max_wait(c.class).0)
+            .max(0.0)
+    }
+
+    /// Sleep `secs` in short steps, stopping early when the caller sends a signal (INT, TERM,
+    /// HUP, QUIT): gh has exited, so there is nobody to forward it to, and gh-paced dies by it.
+    fn back_off(&mut self, secs: f64) -> Option<i32> {
+        let end = self.clock.monotonic() + secs;
+        loop {
+            if let Some(sig) = self.runner.signal_after_run() {
+                return Some(sig);
+            }
+            let left = end - self.clock.monotonic();
+            if left <= 0.0 {
+                return None;
+            }
+            self.clock.sleep(left.min(0.1));
+        }
+    }
+
     fn unknown_403_backoff(&self, c: &Classification, ran: Option<Ran>, scanner: &Scanner) -> bool {
         may_back_off(c, ran) && scanner.forbidden(&self.cfg) == Some(Forbidden::Unknown)
     }
@@ -1050,7 +1079,7 @@ impl Wrapper<'_> {
                     format!(
                         "this call alone waits {} s before returning, so a retry loop cannot \
                          hammer GitHub",
-                        self.cfg.unknown_403_backoff_secs
+                        self.backoff_secs(c)
                     )
                 } else {
                     "this call returns at once".to_string()

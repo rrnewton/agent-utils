@@ -218,6 +218,11 @@ pub trait Runner: Send + Sync {
     /// Run with stdout and stderr captured, killing the child after `timeout_secs`. Each stream
     /// keeps its first [`MAX_CAPTURE_BYTES`], and reports whether more followed.
     fn capture(&self, inv: Invocation<'_>, timeout_secs: f64) -> Result<Captured, String>;
+    /// A forwarded signal (INT, TERM, HUP, QUIT) that arrived after the last [`Runner::run`]
+    /// returned, when there was no gh left to forward it to: gh-paced should die by it.
+    fn signal_after_run(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// Spawns the real gh.
@@ -946,6 +951,13 @@ fn feed_stdin(child: &mut std::process::Child, data: Option<Vec<u8>>) {
 }
 
 impl Runner for RealRunner {
+    fn signal_after_run(&self) -> Option<i32> {
+        match LATE_SIGNAL.load(Ordering::SeqCst) {
+            0 => None,
+            sig => Some(sig),
+        }
+    }
+
     fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, RunError> {
         let shared = Arc::new(Mutex::new(std::mem::take(scanner)));
         let err_cap = capture_for(2);

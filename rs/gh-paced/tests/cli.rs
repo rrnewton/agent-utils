@@ -3609,19 +3609,19 @@ fn has_cooldown(sb: &Sandbox) -> bool {
 /// no rate-limit signal in them) it is the same.
 #[test]
 fn a_permission_403_starts_no_cooldown() {
-    let body = r#"{"message":"Must have admin rights to Repository.","documentation_url":"https://docs.github.com/rest/actions/secrets","status":"403"}"#;
+    let body = r#"{"message":"Must have push access to repository.","documentation_url":"https://docs.github.com/rest/metrics/traffic","status":"403"}"#;
     let headed = format!(
         "HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 4987\r\n\r\n{body}"
     );
     for (name, args, out) in [
         (
             "perm",
-            &["api", "repos/o/r/actions/secrets"][..],
+            &["api", "repos/o/r/traffic/views"][..],
             body.to_string(),
         ),
         (
             "perm-i",
-            &["api", "-i", "repos/o/r/actions/secrets"][..],
+            &["api", "-i", "repos/o/r/traffic/views"][..],
             headed,
         ),
     ] {
@@ -3633,14 +3633,14 @@ fn a_permission_403_starts_no_cooldown() {
                 ("FAKE_GH_STDOUT", out.as_str()),
                 (
                     "FAKE_GH_STDERR",
-                    "gh: Must have admin rights to Repository. (HTTP 403)",
+                    "gh: Must have push access to repository. (HTTP 403)",
                 ),
                 ("FAKE_GH_EXIT", "1"),
             ],
         );
         let err = stderr(&o);
         assert_eq!(o.status.code(), Some(1), "{name}: {err}");
-        assert!(stdout(&o).contains("Must have admin rights"), "{name}");
+        assert!(stdout(&o).contains("Must have push access"), "{name}");
         assert!(err.contains("GH-PACED FORBIDDEN [test]"), "{name}: {err}");
         assert!(
             err.contains("a permission denial, not a rate limit"),
@@ -3750,5 +3750,67 @@ fn an_admin_only_endpoint_is_refused_before_github() {
     );
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert_eq!(sb.starts().len(), 1, "{:?}", sb.log());
+    assert!(!has_cooldown(&sb));
+}
+
+/// #592: the unknown-403 wait holds only a call that failed, is capped by GH_PACED_MAX_WAIT,
+/// and ends when the caller sends a signal, which gh-paced then dies by.
+#[test]
+fn the_unknown_403_wait_is_bounded_and_interruptible() {
+    let config = r#"{"read": {"per_minute": 60, "burst": 10, "per_hour": 500},
+                     "unknown_403_backoff_secs": 30}"#;
+    let sb = Sandbox::new("unknown-403-bounds", config);
+    let unknown = ("FAKE_GH_STDERR", "gh: HTTP 403");
+    // gh succeeded despite the 403 text: no wait.
+    let started = Instant::now();
+    let o = sb.run(&["api", "repos/o/r"], &[unknown]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("this call returns at once"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(started.elapsed().as_secs_f64() < 10.0);
+    // GH_PACED_MAX_WAIT caps it.
+    let started = Instant::now();
+    let o = sb.run(
+        &["api", "repos/o/r"],
+        &[unknown, ("FAKE_GH_EXIT", "1"), ("GH_PACED_MAX_WAIT", "1")],
+    );
+    let took = started.elapsed().as_secs_f64();
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("this call alone waits 1 s"),
+        "{}",
+        stderr(&o)
+    );
+    assert!((1.0..10.0).contains(&took), "{took}");
+    // A TERM during the 30 s wait ends it, and gh-paced dies by TERM.
+    let mut c = sb.cmd(&["api", "repos/o/r"]);
+    c.env(unknown.0, unknown.1)
+        .env("FAKE_GH_EXIT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = c.spawn().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    // The banner is flushed before the wait begins.
+    let mut seen = String::new();
+    let mut buf = [0u8; 4096];
+    while !seen.contains("this call alone waits 30 s") {
+        let n = std::io::Read::read(&mut err, &mut buf).unwrap();
+        assert!(n > 0, "stderr ended early: {seen}");
+        seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    // SAFETY: signalling the child this test spawned.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    assert!(
+        started.elapsed().as_secs_f64() < 20.0,
+        "the wait was not cut short"
+    );
     assert!(!has_cooldown(&sb));
 }

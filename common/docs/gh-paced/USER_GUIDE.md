@@ -497,10 +497,19 @@ stderr decides:
 | --- | --- | --- |
 | Rate limit | any limit signal above: `secondary rate limit`, `rate limit`, `abuse`, `submitted too quickly`, a `Retry-After` value, or `X-RateLimit-Remaining: 0` in an `--include` header block | the host-wide cooldown, honouring `Retry-After` (`GH-PACED PUSHBACK` banner) |
 | Permission denial | none of those, and one of: `Resource not accessible by integration`, `Resource not accessible by personal access token`, `Must have admin rights`, `Must have admin access`, `Must have push access`, `must be an admin`, `must be an organization owner`, `Write access to repository not granted`, `protected by organization SAML enforcement`, `OAuth App access restrictions`, `forbids access via a personal access token` (or a fine-grained one), `Not Found` | no cooldown; gh's output and status pass through at once, with a `GH-PACED FORBIDDEN` banner saying it was a permission denial |
-| Unknown | none of the above | no cooldown; only this call waits `unknown_403_backoff_secs` (default 30 s) before it returns, so a caller retrying it in a loop cannot hammer GitHub. A GIT_CREDENTIAL call never waits |
+| Unknown | none of the above | no cooldown; only this call waits `unknown_403_backoff_secs` (default 30 s, never more than `GH_PACED_MAX_WAIT`) before it returns, so a caller retrying it in a loop cannot hammer GitHub. It waits only when gh exited with a non-zero status; a GIT_CREDENTIAL call never waits, nor does a call whose caller signalled it to stop (INT, TERM, HUP or QUIT ends the wait, and gh-paced dies by that signal). The wait is not counted in the audit record's `waited_secs` |
 
 A rate-limit signal always wins: a 403 whose output holds both permission
-wording and a limit signal starts the cooldown. Matching ignores case. Neither
+wording and a limit signal starts the cooldown. Matching ignores case, and the
+word `abuse` inside a path or URL (a repository named `abuse-reports`) is not
+a signal. A specific permission phrase is reported in preference to the broad
+`Not Found`.
+
+One trade-off remains. With `--include`, if the program reading stdout stops
+early (`gh api -i ... | head -n1`), gh can be killed by the broken pipe before
+it prints GitHub's message on stderr. A 403 cut off there, before any
+`Retry-After` or `X-RateLimit-Remaining: 0` header, is then unknown rather
+than a cooldown with no end time, as it was when every 403 counted. Neither
 the permission denial nor the unknown 403 touches the state shared with other
 calls, so the git credential helper is refused only during a cooldown that a
 rate-limit signal (or state recovery) started. Both are written to the audit
@@ -510,7 +519,7 @@ The permission-denial banner looks like this:
 
 ```text
 GH-PACED ********************************************************************
-GH-PACED FORBIDDEN [octocat] GitHub refused `api GET repos/o/r/actions/secrets` because this account may not make that request (HTTP 403, "must have admin rights"): a permission denial, not a rate limit
+GH-PACED FORBIDDEN [octocat] GitHub refused `api GET repos/o/r/traffic/views` because this account may not make that request (HTTP 403, "must have push access"): a permission denial, not a rate limit
 GH-PACED FORBIDDEN [octocat] no cooldown was started; other gh calls on this host are not affected
 GH-PACED FORBIDDEN [octocat] Do not retry it: it fails until the account gets the access it needs (admin rights, a token scope, or an app permission). Tell your coordinator if the task needs it.
 GH-PACED ********************************************************************
@@ -533,7 +542,7 @@ missing permission cannot even cost a request:
 | `repos/OWNER/REPO/hooks...` | all |
 | `repos/OWNER/REPO/rulesets...` | writes |
 | `repos/OWNER/REPO/branches/BRANCH/protection...` | writes |
-| `repos/OWNER/REPO/collaborators...` | writes |
+| `repos/OWNER/REPO/collaborators...` | writes but `DELETE` (anyone may remove themselves) |
 | `orgs/ORG` (organization settings) | writes |
 | `orgs/ORG/actions/permissions...` | all |
 | `orgs/ORG/hooks...` | all |
@@ -541,9 +550,12 @@ missing permission cannot even cost a request:
 
 "Writes" are every method but `GET`, `HEAD` and `OPTIONS`. Reads that GitHub
 serves with read or push access (listing rulesets or collaborators, reading a
-branch) are not refused, and neither is GraphQL. The endpoint is matched after
-gh-paced drops its scheme, host, leading slash and query string, and gh's
-`{owner}` and `{repo}` placeholders count as names. An account that does have
+branch) are not refused, and neither is renaming a branch or GraphQL. The
+endpoint is matched after gh-paced drops its scheme, host, leading slash, query
+string and any GitHub Enterprise Server `api/v3/` prefix, and gh's `{owner}`
+and `{repo}` placeholders count as names. The list is a convenience, not a
+complete catalogue: a request missing from it that GitHub refuses for lack of
+permission is still classified as a permission denial and starts no cooldown. An account that does have
 admin rights there sets `GH_PACED_ALLOW_ADMIN_API=1` for that one call:
 
 ```sh

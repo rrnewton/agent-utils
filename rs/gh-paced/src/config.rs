@@ -705,7 +705,7 @@ mod tests {
 
     /// #592 gh-paced-permission-403: a plain 403 starts no cooldown, so its old setting is
     /// accepted (and still range-checked) but unused; the unknown-403 backoff holds one call
-    /// for 10 to 300 s, 30 by default; admin-only endpoints are refused unless
+    /// for 1 to 300 s, 30 by default; admin-only endpoints are refused unless
     /// `GH_PACED_ALLOW_ADMIN_API=1`.
     #[test]
     fn plain_403_settings() {

@@ -27,8 +27,9 @@ gh-paced sits between an account shim and the real gh. Every call is classified
 per-account budgets shared by every process on the host through a locked state
 file, and delayed with a loud stderr warning when a budget is exhausted. It
 also watches GitHub's own account-wide numbers (GET /rate_limit), backs off
-for at least 15 minutes after any rate-limit, abuse or HTTP 403 response, and
-refuses oversized or base64-laden write bodies. It expands gh's ordinary
+for at least 15 minutes after a rate-limit or abuse response (an HTTP 403
+counts only when it is a rate limit; see GITHUB PUSHBACK), and refuses
+oversized or base64-laden write bodies. It expands gh's ordinary
 aliases itself and runs gh with the expansion, so gh never sees an ordinary
 alias's name; a shell alias (`!...`) is passed to gh by name and charged one
 WRITE, and what its shell command sends is paced only if the gh it runs is
@@ -100,8 +101,9 @@ GITHUB PUSHBACK
   the account on this host for max(Retry-After, 900 s). An HTTP 403 without one
   starts no cooldown: a permission denial (`Must have admin rights`, `Resource
   not accessible by integration`, ...) is reported and returns at once; any
-  other 403 holds only its own call for 30 s (unknown_403_backoff_secs; never a
-  GIT_CREDENTIAL call). `gh api` calls to endpoints that need admin rights
+  other failed call that got a 403 waits 30 s before returning
+  (unknown_403_backoff_secs, at most GH_PACED_MAX_WAIT; never a GIT_CREDENTIAL
+  call; INT, TERM, HUP or QUIT ends the wait). `gh api` calls to endpoints that need admin rights
   (webhooks, Actions permissions, rulesets, branch protection and collaborator
   changes, repository or organization settings) are refused before they reach
   GitHub (exit 64) unless GH_PACED_ALLOW_ADMIN_API=1.

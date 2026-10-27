@@ -274,6 +274,20 @@ fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
     out
 }
 
+/// Whether `text[at..end]` lies in a whitespace-delimited token that holds a `/`: a path or a
+/// URL, not prose.
+fn in_path(text: &[u8], at: usize, end: usize) -> bool {
+    let start = text[..at]
+        .iter()
+        .rposition(u8::is_ascii_whitespace)
+        .map_or(0, |i| i + 1);
+    let stop = text[end..]
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .map_or(text.len(), |i| end + i);
+    text[start..stop].contains(&b'/')
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -342,17 +356,23 @@ impl Scanner {
         self.http_429 |= !find_all(&text, b"http 429").is_empty();
         self.http_403 |= !find_all(&text, b"http 403").is_empty();
         self.too_quickly |= !find_all(&text, b"submitted too quickly").is_empty();
-        if self.permission.is_none() {
-            self.permission = PERMISSION_PHRASES
+        // The broad `not found` (last in the list) gives way to a specific phrase seen later.
+        if self.permission.is_none_or(|p| p == "not found") {
+            if let Some(p) = PERMISSION_PHRASES
                 .iter()
                 .copied()
-                .find(|p| !find_all(&text, p.as_bytes()).is_empty());
+                .find(|p| !find_all(&text, p.as_bytes()).is_empty())
+            {
+                self.permission = Some(p);
+            }
         }
         for at in find_all(&text, b"abuse") {
             let before = at == 0 || !is_word_byte(text[at - 1]);
             let end = at + 5;
             let after = end >= text.len() || !is_word_byte(text[end]);
-            if before && after {
+            // A path or URL (`HTTP 403: ... (https://api.github.com/repos/o/abuse-reports)`) is
+            // not GitHub's wording: a permission denial on such a repository is not a limit.
+            if before && after && !in_path(&text, at, end) {
                 self.abuse = true;
             }
         }
@@ -934,6 +954,24 @@ mod tests {
             assert_eq!(s.verdict(&cfg), None, "{unknown:?}: a cooldown");
             assert_eq!(s.forbidden(&cfg), Some(Forbidden::Unknown), "{unknown:?}");
         }
+        // `abuse` in a repository's URL is not GitHub's wording; a later specific phrase beats
+        // an earlier broad `not found`.
+        let s = scan(&["HTTP 403: Must have admin rights to Repository. \
+             (https://api.github.com/repos/acme/abuse-reports/hooks)\n"]);
+        assert!(!s.abuse, "{s:?}");
+        assert_eq!(
+            s.forbidden(&cfg),
+            Some(Forbidden::Permission("must have admin rights"))
+        );
+        assert!(scan(&["triggered an abuse detection mechanism (HTTP 403)"]).abuse);
+        let s = scan(&[
+            "warning: config file not found\n",
+            "gh: Must have admin rights to Repository. (HTTP 403)\n",
+        ]);
+        assert_eq!(
+            s.forbidden(&cfg),
+            Some(Forbidden::Permission("must have admin rights"))
+        );
         // Permission wording without a 403 is nothing at all.
         let s = scan(&["gh: Not Found (HTTP 404)\n"]);
         assert_eq!((s.verdict(&cfg), s.forbidden(&cfg)), (None, None));
@@ -955,6 +993,13 @@ mod tests {
             s
         };
         let plain = "HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 4999\r\n\r\n{}";
+        // A paginated call's later page is read the same way.
+        let page = format!("HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 5000\r\n\r\n[]\n{plain}");
+        let mut s = headers(&[&page]);
+        assert!(s.http_403, "{s:?}");
+        s.feed(denied);
+        assert_eq!(s.verdict(&cfg), None);
+        assert!(matches!(s.forbidden(&cfg), Some(Forbidden::Permission(_))));
         let s = block(plain, denied);
         assert_eq!(s.verdict(&cfg), None);
         assert_eq!(
