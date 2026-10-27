@@ -2965,10 +2965,7 @@ mod tests {
                 &["agentctl", "--registry", "/tmp/r", "migrate"],
                 Some("migrate"),
             ),
-            (
-                &["agentctl", "--herdr-bin=/bin/herdr", "reset"],
-                None,
-            ),
+            (&["agentctl", "--herdr-bin=/bin/herdr", "reset"], None),
             (
                 &["agentctl", "chat", "launch", "--config", "c.json"],
                 Some("chat launch"),
