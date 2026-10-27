@@ -1213,6 +1213,14 @@ level was requested in the same run, otherwise phases, plus up to ten prior dail
 Outputs use the common phrase/paragraph/work-bullet schema and are projected under
 `summary_data/rollups/<kind>/<key>.json`.
 
+The prior same-level summaries are continuity context, not what a rollup summarizes. A rollup's
+**own inputs** are everything in its cache identity except `prior_context`
+(`summarize.py:rollup_inputs_hash`). Each generated or exact-hit rollup is indexed under that
+hash in `summary_data/rollup_inputs/`; when a job misses only because its prior context changed,
+summarize reuses the indexed artifact (`carried_forward_summary`) and the build's input
+validation accepts it (`carried_forward_matches`). Without this, a change to day N changed the
+prior context, and so the identity, of the next ten days, and through them every later day.
+
 ### Plain-language calendar rollup
 
 This is a separate paid rewrite, not deterministic formatting. It receives the same-period
@@ -1226,6 +1234,12 @@ projection with the technical result but has an independent input hash and usage
 technical artifact recorded as a provenance dependency.
 
 ## Common cache identity and receipts
+
+Before any model call, `pipeline.py:_plan_tree` walks the same tree against the caches and
+counts, per stage, cached, carried-forward and to-generate jobs; `budget.py` prices them from the
+team's own receipts. With a budget, an over-budget plan refuses the run, and `budget.SpendGuard`
+reserves each batch's estimate before its call so a run stops admitting batches at the budget.
+`summary_data/summarize_state.json` records each run as running, partial or complete.
 
 Both runners content-address a job over the exact structured model payload plus registered
 summarizer ID/version, output schema version, backend, model, prompt version, reasoning effort, and

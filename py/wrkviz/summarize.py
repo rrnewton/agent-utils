@@ -25,6 +25,7 @@ from wrkviz.archive import (
     read_json,
     write_json_if_changed,
 )
+from wrkviz.budget import BudgetStop, SpendGuard
 from wrkviz.backend_process import (
     BackendProcesses,
     defer_sigint_during_cleanup,
@@ -117,9 +118,11 @@ _ENCRYPTED_COLLABORATION_RE: Final = re.compile(
 )
 
 
-#: How a batch answer that left out some of its jobs is reported; summarize_jobs retries those
-#: batches one job at a time instead of abandoning the run.
+#: How a batch answer that left out some of its jobs, or answered under a key it was never given,
+#: is reported; summarize_jobs retries those batches one job at a time instead of abandoning the run.
 _OMISSION_PREFIX = "codex output: missing summaries for "
+_INVENTED_PREFIX = "codex output: summaries under invented keys "
+_RETRYABLE_ANSWER = (_OMISSION_PREFIX, _INVENTED_PREFIX)
 
 
 class SummaryError(RuntimeError):
@@ -465,6 +468,178 @@ def input_hash_for_provenance(
     return content_hash(canonical_json(payload))
 
 
+_ROLLUP_STYLES: Final = frozenset({TECHNICAL_ROLLUP_STYLE, PLAIN_LANGUAGE_ROLLUP_STYLE})
+_ROLLUP_INPUTS_IDENTITY: Final = "rollup-own-inputs/v1"
+
+
+def _rollup_inputs_payload_hash(
+    job: SummaryJob,
+    *,
+    summarizer_id: str,
+    summarizer_version: int,
+    output_schema_version: int,
+    backend: str,
+    model: str,
+    prompt_version: str,
+    reasoning_effort: str | None,
+    service_tier: str | None,
+) -> str:
+    own = _job_json(job)
+    del own["prior_context"]
+    payload: dict[str, JsonValue] = {
+        "identity": _ROLLUP_INPUTS_IDENTITY,
+        "summarizer_id": summarizer_id,
+        "summarizer_version": summarizer_version,
+        "output_schema_version": output_schema_version,
+        "backend": backend,
+        "model": model,
+        "prompt_version": prompt_version,
+        "job": own,
+    }
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+    if service_tier not in (None, DEFAULT_SERVICE_TIER):
+        payload["service_tier"] = service_tier
+    return content_hash(canonical_json(payload))
+
+
+def rollup_inputs_hash(
+    job: SummaryJob,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None = None,
+    service_tier: str | None = None,
+) -> str:
+    """Hash a rollup's own inputs: everything in its cache identity except prior same-level context.
+
+    Prior same-level summaries (yesterday's rollup, last week's) give a rollup continuity and
+    terminology; they are not what it summarizes. Two jobs with the same own inputs summarize the
+    same work, so a rollup whose lower levels are unchanged keeps its paid text when only an
+    earlier period changed (see :func:`carried_forward_summary`).
+    """
+
+    if job.summary_style not in _ROLLUP_STYLES:
+        raise SummaryError(f"summary job {job.key!r} is not a rollup")
+    spec = summarizer_for_style(job.summary_style)
+    return _rollup_inputs_payload_hash(
+        job,
+        summarizer_id=spec.summarizer_id,
+        summarizer_version=spec.current_version,
+        output_schema_version=spec.output_schema_version,
+        backend=backend,
+        model=model,
+        prompt_version=spec.prompt_version,
+        reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
+    )
+
+
+def rollup_inputs_hash_for_provenance(
+    job: SummaryJob, provenance: SummaryArtifactProvenance
+) -> str | None:
+    """Recompute *job*'s own-inputs hash under an existing artifact's contract (``None`` if legacy)."""
+
+    if job.summary_style not in _ROLLUP_STYLES or provenance.legacy_storage:
+        return None
+    return _rollup_inputs_payload_hash(
+        job,
+        summarizer_id=provenance.summarizer_id,
+        summarizer_version=provenance.summarizer_version,
+        output_schema_version=provenance.output_schema_version,
+        backend=provenance.backend,
+        model=provenance.model,
+        prompt_version=provenance.prompt_version,
+        reasoning_effort=provenance.reasoning_effort,
+        service_tier=provenance.service_tier,
+    )
+
+
+def _rollup_inputs_entry(index_dir: Path, own_hash: str) -> tuple[str, str] | None:
+    try:
+        entry = _object(read_json(index_dir / f"{own_hash}.json"), "rollup inputs index")
+        _require_keys(
+            entry, {"schema_version", "logical_key", "input_hash"}, "rollup inputs index"
+        )
+        if _integer(entry["schema_version"], "rollup inputs index.schema_version") != 1:
+            return None
+        logical_key = _string(entry["logical_key"], "rollup inputs index.logical_key")
+        input_hash = _string(entry["input_hash"], "rollup inputs index.input_hash")
+    except (OSError, ValueError, SummaryError):
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", input_hash) is None:
+        return None
+    return logical_key, input_hash
+
+
+def record_rollup_inputs(index_dir: Path, job: SummaryJob, result: SummaryResult) -> bool:
+    """Index *result* under *job*'s own inputs; *result* must be derived from exactly *job*.
+
+    Returns whether the index changed.
+    """
+
+    provenance = result.artifact_provenance
+    if provenance is None or not result.summary_available:
+        return False
+    own_hash = rollup_inputs_hash_for_provenance(job, provenance)
+    if own_hash is None:
+        return False
+    return write_json_if_changed(
+        index_dir / f"{own_hash}.json",
+        {"schema_version": 1, "logical_key": job.key, "input_hash": result.input_hash},
+    )
+
+
+def carried_forward_summary(
+    job: SummaryJob,
+    index_dir: Path,
+    cache_dir: Path,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None = None,
+    service_tier: str | None = None,
+) -> SummaryResult | None:
+    """Return a paid rollup for the same own inputs as *job*, generated with older prior context."""
+
+    effective_service_tier = resolve_service_tier(backend, service_tier)
+    own_hash = rollup_inputs_hash(
+        job, backend, model, reasoning_effort, effective_service_tier
+    )
+    entry = _rollup_inputs_entry(index_dir, own_hash)
+    if entry is None or entry[0] != job.key:
+        return None
+    item = _PendingJob(
+        job=job, input_hash=entry[1], cache_path=cache_dir / f"{entry[1]}.json"
+    )
+    cached = _load_cache(item, backend, model, reasoning_effort, effective_service_tier)
+    if cached is None or cached.result.artifact_provenance is None:
+        return None
+    if rollup_inputs_hash_for_provenance(job, cached.result.artifact_provenance) != own_hash:
+        return None
+    return cached.result
+
+
+def carried_forward_matches(
+    job: SummaryJob, result: SummaryResult, index_dir: Path
+) -> bool:
+    """Return whether *result* is the indexed rollup for *job*'s own inputs (see above)."""
+
+    provenance = result.artifact_provenance
+    if (
+        provenance is None
+        or provenance.input_hash != result.input_hash
+        or provenance.logical_key != job.key
+        or provenance.team_slug != job.team_slug
+        or provenance.start_ms != job.start_ms
+        or provenance.end_ms != job.end_ms
+    ):
+        return False
+    own_hash = rollup_inputs_hash_for_provenance(job, provenance)
+    if own_hash is None:
+        return False
+    entry = _rollup_inputs_entry(index_dir, own_hash)
+    return entry == (job.key, result.input_hash)
+
+
 def build_summary_prompt(jobs: Sequence[SummaryJob]) -> str:
     """Build the complete, untruncated prompt for one backend batch.
 
@@ -714,13 +889,18 @@ def _parse_backend_output_with_repairs(
     expected = {item.job.key: item for item in pending}
     results: dict[str, SummaryResult] = {}
     repairs: list[_SummaryRepair] = []
+    invented: list[str] = []
     for index, raw_summary in enumerate(_array(root["summaries"], "codex output.summaries")):
         where = f"codex output.summaries[{index}]"
         summary = _object(raw_summary, where)
         _require_keys(summary, {"key", "phrase", "paragraph", "work_summary"}, where)
         key = _string(summary["key"], where + ".key")
         if key not in expected:
-            raise SummaryError(f"{where}.key: unexpected key {key!r}")
+            # A model that renames or duplicates a job has answered under a key nobody asked
+            # for. Nothing under that key can be trusted or cached, but the batch is worth
+            # asking again, exactly like one that left a job out.
+            invented.append(key)
+            continue
         if key in results:
             raise SummaryError(f"{where}.key: duplicate key {key!r}")
         phrase = clean_summary_prose(_string(summary["phrase"], where + ".phrase"))
@@ -817,8 +997,15 @@ def _parse_backend_output_with_repairs(
             generated_at=generated_at,
         )
     missing = sorted(set(expected) - set(results))
+    named = ", ".join(repr(key) for key in invented)
     if missing:
-        raise SummaryError(_OMISSION_PREFIX + ", ".join(missing))
+        raise SummaryError(
+            _OMISSION_PREFIX
+            + ", ".join(missing)
+            + (f" (answered instead under invented keys {named})" if invented else "")
+        )
+    if invented:
+        raise SummaryError(_INVENTED_PREFIX + named)
     return _ParsedBackendOutput(results=results, repairs=tuple(repairs))
 
 
@@ -1518,6 +1705,61 @@ def _run_backend_batch(
     return _GeneratedBatch(results=results, receipt=receipt)
 
 
+def _lookup_cache(
+    job: SummaryJob,
+    cache_dir: Path,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None,
+    service_tier: str | None,
+) -> tuple[_PendingJob, _ResolvedSummary | None]:
+    """Return the job's cache slot and its validated hit (current or legacy identity), if any."""
+
+    input_hash = _input_hash(job, backend, model, reasoning_effort, service_tier)
+    item = _PendingJob(
+        job=job,
+        input_hash=input_hash,
+        cache_path=cache_dir / f"{input_hash}.json",
+    )
+    cached = _load_cache(item, backend, model, reasoning_effort, service_tier)
+    if cached is None:
+        legacy_hash = _legacy_input_hash(
+            job, backend, model, reasoning_effort, service_tier
+        )
+        if legacy_hash != input_hash:
+            legacy_item = _PendingJob(
+                job=job,
+                input_hash=legacy_hash,
+                cache_path=cache_dir / f"{legacy_hash}.json",
+            )
+            cached = _load_cache(
+                legacy_item, backend, model, reasoning_effort, service_tier
+            )
+    return item, cached
+
+
+def cached_summary(
+    job: SummaryJob,
+    cache_dir: Path,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None = None,
+    service_tier: str | None = None,
+) -> SummaryResult | None:
+    """Return the cached summary :func:`summarize_jobs` would reuse for *job*, without spending."""
+
+    _validate_job(job)
+    effective_service_tier = resolve_service_tier(backend, service_tier)
+    _, cached = _lookup_cache(
+        job, cache_dir, backend, model, reasoning_effort, effective_service_tier
+    )
+    return cached.result if cached is not None else None
+
+
+class _BudgetRefusal(Exception):
+    """A batch the spend guard did not admit; it made no model call."""
+
+
 def summarize_jobs(
     jobs: Sequence[SummaryJob],
     cache_dir: Path,
@@ -1529,8 +1771,14 @@ def summarize_jobs(
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
     claude_command: Sequence[str] = ("claude",),
+    guard: SpendGuard | None = None,
 ) -> tuple[dict[str, SummaryResult], SummaryRunStats]:
-    """Return summaries, consulting immutable content-addressed cache entries first."""
+    """Return summaries, consulting immutable content-addressed cache entries first.
+
+    With *guard*, each batch reserves its estimated cost before its model call; once the budget
+    would be crossed no further batch starts, batches already running finish and are cached, and
+    :class:`~wrkviz.budget.BudgetStop` is raised.
+    """
 
     run_started_at = _utc_now()
 
@@ -1559,38 +1807,9 @@ def summarize_jobs(
         if job.key in seen_keys:
             raise SummaryError(f"duplicate summary job key {job.key!r}")
         seen_keys.add(job.key)
-        input_hash = _input_hash(
-            job, backend, model, reasoning_effort, effective_service_tier
+        item, cached = _lookup_cache(
+            job, cache_dir, backend, model, reasoning_effort, effective_service_tier
         )
-        item = _PendingJob(
-            job=job,
-            input_hash=input_hash,
-            cache_path=cache_dir / f"{input_hash}.json",
-        )
-        cached = _load_cache(
-            item,
-            backend,
-            model,
-            reasoning_effort,
-            effective_service_tier,
-        )
-        if cached is None:
-            legacy_hash = _legacy_input_hash(
-                job, backend, model, reasoning_effort, effective_service_tier
-            )
-            if legacy_hash != input_hash:
-                legacy_item = _PendingJob(
-                    job=job,
-                    input_hash=legacy_hash,
-                    cache_path=cache_dir / f"{legacy_hash}.json",
-                )
-                cached = _load_cache(
-                    legacy_item,
-                    backend,
-                    model,
-                    reasoning_effort,
-                    effective_service_tier,
-                )
         if cached is None:
             pending.append(item)
         else:
@@ -1641,6 +1860,37 @@ def summarize_jobs(
         new_receipts.append(batch_result.receipt)
         return published
 
+    def run_batch(batch: tuple[_PendingJob, ...]) -> _GeneratedBatch:
+        reservation = None
+        if guard is not None:
+            reservation = guard.reserve(batch[0].job.summary_style, len(batch))
+            if reservation is None:
+                raise _BudgetRefusal()
+        usage: TokenUsage | None = None
+        try:
+            outcome = _run_backend_batch(
+                batch,
+                cache_dir=cache_dir,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=effective_service_tier,
+                codex_command=tuple(codex_command),
+                claude_command=tuple(claude_command),
+                processes=processes,
+            )
+            usage = outcome.receipt.usage
+            return outcome
+        except SummaryError as error:
+            cause = error.__cause__
+            if isinstance(cause, (_CodexBatchError, _ClaudeBatchError)):
+                usage = cause.usage
+            raise
+        finally:
+            if guard is not None and reservation is not None:
+                guard.settle(reservation, usage)
+
+    refused_jobs = 0
     if backend == "heuristic":
         for batch in batches:
             batch_result = _run_backend_batch(
@@ -1656,27 +1906,16 @@ def summarize_jobs(
             )
             generated.update(publish_batch(batch, batch_result))
     elif batches:
-        codex = tuple(codex_command)
-        claude = tuple(claude_command)
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
         futures: dict[
             concurrent.futures.Future[_GeneratedBatch], tuple[_PendingJob, ...]
         ] = {}
+        retried_alone: set[str] = set()
+
         def submit(
             batch: tuple[_PendingJob, ...],
         ) -> concurrent.futures.Future[_GeneratedBatch]:
-            future = executor.submit(
-                _run_backend_batch,
-                batch,
-                cache_dir=cache_dir,
-                backend=backend,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                service_tier=effective_service_tier,
-                codex_command=codex,
-                claude_command=claude,
-                processes=processes,
-            )
+            future = executor.submit(run_batch, batch)
             futures[future] = batch
             return future
 
@@ -1695,19 +1934,27 @@ def summarize_jobs(
                         generated.update(publish_batch(futures[future], batch_result))
                     except concurrent.futures.CancelledError:
                         continue
+                    except _BudgetRefusal:
+                        # Batches already running keep going and are cached; the rest are
+                        # refused one by one as they reach the guard, without a model call.
+                        refused_jobs += len(futures[future])
+                        continue
                     except SummaryError as error:
                         batch = futures[future]
-                        # A model that drops one job from a multi-job answer has still done
-                        # the others, but the answer is rejected whole. Asking again one job
-                        # at a time keeps a long run alive at the cost of re-asking that one
-                        # batch, instead of discarding every batch still in flight.
-                        if (
-                            first_error is None
-                            and len(batch) > 1
-                            and str(error).startswith(_OMISSION_PREFIX)
-                        ):
-                            outstanding.update(submit((item,)) for item in batch)
-                            continue
+                        # A model that drops one job from a multi-job answer, or answers one
+                        # under a key it invented, has still done the others, but the answer is
+                        # rejected whole. Asking again one job at a time keeps a long run alive
+                        # at the cost of re-asking that one batch, instead of discarding every
+                        # batch still in flight. A one-job batch gets one more attempt.
+                        if first_error is None and str(error).startswith(_RETRYABLE_ANSWER):
+                            if len(batch) > 1:
+                                retried_alone.update(item.job.key for item in batch)
+                                outstanding.update(submit((item,)) for item in batch)
+                                continue
+                            if batch[0].job.key not in retried_alone:
+                                retried_alone.add(batch[0].job.key)
+                                outstanding.add(submit(batch))
+                                continue
                         if first_error is None:
                             first_error = error
                             for other in futures:
@@ -1731,6 +1978,12 @@ def summarize_jobs(
                 executor.shutdown(wait=True, cancel_futures=True)
             raise
 
+    if refused_jobs:
+        raise BudgetStop(
+            f"budget reached: {len(generated)} of {len(pending)} {pending[0].job.summary_style} "
+            f"job(s) needing a model call were generated and cached; {refused_jobs} were not "
+            "started"
+        )
     for item in pending:
         result = generated.get(item.job.key)
         if result is None:
@@ -1804,8 +2057,14 @@ __all__ = [
     "TECHNICAL_ROLLUP_STYLE",
     "WorkBullet",
     "build_summary_prompt",
+    "cached_summary",
+    "carried_forward_matches",
+    "carried_forward_summary",
     "knowledge_text_has_link",
     "overview_text_has_link",
+    "record_rollup_inputs",
+    "rollup_inputs_hash",
+    "rollup_inputs_hash_for_provenance",
     "strip_overview_links",
     "summarize_jobs",
 ]

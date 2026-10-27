@@ -1689,7 +1689,9 @@ def _daily_plain_hashes(archive: Path) -> list[str]:
     ]
 
 
-def test_later_daily_rollup_hash_includes_prior_daily_summary(tmp_path: Path) -> None:
+def test_changed_day_regenerates_and_later_unchanged_day_is_carried_forward(
+    tmp_path: Path,
+) -> None:
     first_team = _two_day_team(
         "Implemented alpha receipt binding; 101 focused tests passed and released the benchmark."
     )
@@ -1700,17 +1702,57 @@ def test_later_daily_rollup_hash_includes_prior_daily_summary(tmp_path: Path) ->
     assert len(first) >= 2
     assert len(first_plain) == len(first)
 
+    # Only day one's work changes. Day two reads day one as prior context, but what it
+    # summarizes is unchanged, so its paid summary is kept rather than generated again.
     changed_team = _two_day_team(
         "Implemented beta scheduler isolation; 909 focused tests passed and released the benchmark."
     )
     _write_team(tmp_path, changed_team)
-    summarize_archive(tmp_path, changed_team.team_slug, "heuristic", "test-model")
+    report = summarize_archive(tmp_path, changed_team.team_slug, "heuristic", "test-model")
     second = _daily_hashes(tmp_path)
     second_plain = _daily_plain_hashes(tmp_path)
     assert first[0] != second[0]
-    assert first[1] != second[1]
     assert first_plain[0] != second_plain[0]
-    assert first_plain[1] != second_plain[1]
+    assert first[1] == second[1]
+    assert first_plain[1] == second_plain[1]
+    assert report.carried_forward_rollups >= 2
+
+    # The build agrees: a carried-forward rollup is current, not stale.
+    output = tmp_path / "carried-forward-site"
+    build_archive(tmp_path, changed_team.team_slug, output=output)
+    rollups = json.loads(schema_1_timeline_text(output))["rollups"]
+    assert rollups
+    assert all(item["summary_available"] for item in rollups)
+
+    # A second identical run makes no model call; the unchanged later day is still served by
+    # carry-forward, because its exact identity (with the new prior context) never existed.
+    again = summarize_archive(tmp_path, changed_team.team_slug, "heuristic", "test-model")
+    assert again.cache_misses == 0
+    assert again.carried_forward_rollups == report.carried_forward_rollups
+    assert _daily_hashes(tmp_path) == second
+
+
+def test_day_whose_own_work_changes_is_regenerated(tmp_path: Path) -> None:
+    team = _two_day_team("Implemented exact receipt binding and verified the focused tests.")
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    first = _daily_hashes(tmp_path)
+
+    # New work lands on day two only (a leaf added to the tree).
+    day = 26 * 60 * 60 * 1000
+    added = _event(
+        "day-two-followup",
+        ROOT,
+        day + 2_500,
+        "assistant_message",
+        "The archived report failed verification on the second host.",
+    )
+    _write_team(tmp_path, replace(team, events=team.events + (added,)))
+    report = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    second = _daily_hashes(tmp_path)
+    assert first[0] == second[0]
+    assert first[1] != second[1]
+    assert report.carried_forward_rollups == 0
 
 
 def test_isolated_day_backfill_loads_prior_day_from_artifact_catalog(

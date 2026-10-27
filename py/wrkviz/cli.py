@@ -48,9 +48,17 @@ from wrkviz.pipeline import (
     ingest_muse,
     ingest_orc,
     load_archived_team,
+    plan_summaries,
     record_run,
     summarize_archive,
     utc_now,
+)
+from wrkviz.budget import (
+    BudgetError,
+    Prices,
+    SummaryPlan,
+    load_state,
+    partial_warning,
 )
 from wrkviz.project_config import (
     ProjectIngestConfig,
@@ -120,6 +128,16 @@ Build a version-controllable, multi-resolution website from an agent team's appe
 
 3. Rerun the same refresh later. New log records are normalized; content-addressed summaries are
    reused; only changed time windows and calendar rollups spend model tokens.
+
+4. See what a summarize run would spend before it spends anything, and cap it:
+
+   {PROG} summarize --team example-team --output ./timelines/example-team \
+     --price input=2,output=10 --plan
+   {PROG} summarize --team example-team --output ./timelines/example-team \
+     --price input=2,output=10 --budget-usd 20
+
+   A run estimated over the budget refuses to start; one that reaches it anyway stops, marks
+   summary_data/summarize_state.json partial, and the next run resumes from the cache.
 
 The stages are separate on purpose: `ingest`, `summarize`, and `build`. The `build` command never
 calls a model, so formatting and UI changes can be regenerated for free.
@@ -468,6 +486,33 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
             "(default: daily, weekly, monthly, quarterly)"
         ),
     )
+    parser.add_argument(
+        "--budget-usd",
+        type=float,
+        default=None,
+        metavar="USD",
+        help=(
+            "spending cap for this run in US dollars; requires --price. Before any model call "
+            "the whole remaining tree (phase summaries, agent names, overview, every rollup) is "
+            "estimated, and the run refuses to start, spending nothing, when the estimate is "
+            "over the cap. If actual spend still reaches the cap, no new model call starts, "
+            "calls already running finish and are cached, the run exits 3, and the team's "
+            "summary_data/summarize_state.json marks it partial; rerun to resume "
+            "(default: no cap)"
+        ),
+    )
+    parser.add_argument(
+        "--price",
+        default=None,
+        metavar="RATES",
+        help=(
+            "model prices in US dollars per million tokens, as "
+            "input=N,output=N[,cached_input=N][,cache_write_input=N]; a cache rate defaults to "
+            "the input rate. Used to price the plan and to enforce --budget-usd, e.g. "
+            "--price input=2,output=10,cached_input=0.2,cache_write_input=2.5 "
+            "(default: none; the plan then shows tokens only)"
+        ),
+    )
 
 
 def _add_github_options(parser: argparse.ArgumentParser) -> None:
@@ -637,6 +682,14 @@ def _parser() -> argparse.ArgumentParser:
     summarize = sub.add_parser("summarize", help="fill structured summary cache misses", description="fill structured summary cache misses")
     _add_archive(summarize)
     _add_summary(summarize)
+    summarize.add_argument(
+        "--plan",
+        action="store_true",
+        help=(
+            "print what the run would generate and its estimated tokens and cost (with "
+            "--price), then exit without any model call; exits 3 when over --budget-usd"
+        ),
+    )
     summarize.set_defaults(handler="summarize")
 
     build = sub.add_parser("build", help="regenerate Markdown/site from cached data; zero tokens", description="regenerate Markdown/site from cached data; zero tokens")
@@ -1231,7 +1284,16 @@ def _instant(raw: object, label: str) -> float | None:
     return parsed.timestamp()
 
 
-def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
+class _PlanOverBudget(Exception):
+    """``summarize --plan`` found the remaining tree over the budget."""
+
+
+def _print_plan(plan: SummaryPlan) -> None:
+    for line in plan.lines():
+        print(line, flush=True)
+
+
+def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
     backend = str(ns.backend)
     raw_model: object = ns.model
     if raw_model is None:
@@ -1288,11 +1350,41 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
         if raw_rollup_kinds
         else ("daily", "weekly", "monthly", "quarterly")
     )
+    raw_budget: object = ns.budget_usd
+    budget_usd = None if raw_budget is None else float(str(raw_budget))
+    if budget_usd is not None and not budget_usd >= 0:
+        raise ValueError("--budget-usd must be a non-negative number")
+    prices = None if ns.price is None else Prices.parse(str(ns.price))
+    if budget_usd is not None and prices is None and backend != "heuristic":
+        raise ValueError("--budget-usd needs --price to turn token estimates into dollars")
+    if bool(getattr(ns, "plan", False)):
+        plan = plan_summaries(
+            archive,
+            str(ns.team),
+            backend,
+            model,
+            phase_minutes=int(ns.phase_minutes),
+            context_chars=int(ns.context_chars),
+            transcript_chars=int(ns.transcript_chars),
+            reasoning_effort=str(ns.reasoning_effort),
+            service_tier=service_tier,
+            summary_window=summary_window,
+            rollup_kinds=rollup_kinds,
+            budget_usd=budget_usd,
+            prices=prices,
+        )
+        _print_plan(plan)
+        if plan.over_budget:
+            raise _PlanOverBudget()
+        return None
     return summarize_archive(
         archive,
         str(ns.team),
         backend,
         model,
+        budget_usd=budget_usd,
+        prices=prices,
+        on_plan=_print_plan,
         max_workers=int(ns.summary_workers),
         batch_size=int(ns.summary_batch_size),
         name_batch_size=int(ns.name_batch_size),
@@ -1562,6 +1654,11 @@ def _print_summaries(report: SummarizeReport) -> None:
         f"{report.glossary_definitions} glossary definitions; "
         f"catalog {report.catalog_artifacts} immutable artifacts"
     )
+    if report.carried_forward_rollups:
+        print(
+            f"rollups carried forward: {report.carried_forward_rollups} (what they summarize is "
+            "unchanged; only earlier periods they read as context changed)"
+        )
     print(
         _usage_line(
             "tokens newly spent",
@@ -2441,7 +2538,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_prefix_overrides(ingest_report)
         refresh_handlers = ("refresh", "refresh_claude", "refresh_orc")
         if handler == "summarize" or handler in refresh_handlers:
-            summary_report = _summary_call(ns)
+            try:
+                summary_report = _summary_call(ns)
+            except _PlanOverBudget:
+                return 3
+            if summary_report is None:
+                return 0
             _print_summaries(summary_report)
         if handler == "build" or handler in refresh_handlers:
             build_report = build_archive(
@@ -2452,6 +2554,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{build_report['edges']} edges, {build_report['summary_files']} Markdown files; "
                 f"{build_report['files_changed']} presentation files changed"
             )
+            warning = partial_warning(
+                load_state(archive / "teams" / team_slug / "summary_data")
+            )
+            if warning is not None:
+                print(f"{PROG}: warning: {warning}", file=sys.stderr)
         wants_github = handler == "github-metadata" or (
             handler in refresh_handlers and bool(ns.github_metadata)
         )
@@ -2507,6 +2614,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass
         print(f"{PROG}: {interruption}", file=sys.stderr)
         return 130
+    except BudgetError as error:
+        try:
+            run_path = record_run(
+                archive,
+                command,
+                started,
+                "failed",
+                team_slug,
+                ingest_report,
+                summary_report,
+                build_report,
+                error=str(error),
+            )
+            print(f"run metadata: {run_path}", file=sys.stderr)
+        except (OSError, ValueError):
+            pass
+        print(f"{PROG}: {error}", file=sys.stderr)
+        return 3
     except (
         AgentNameError,
         ClaudeParseError,

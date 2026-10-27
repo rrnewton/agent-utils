@@ -709,6 +709,49 @@ versioned discovery contract must classify and evidence those concepts before th
 prompts or become site-wide links. If an older generated site still shows retired glossary links,
 run the zero-token `build` or `export` again; `summary_data/glossary.json` itself remains unchanged.
 
+#### Plan first, then spend within a budget
+
+A summarize run is a map-reduce tree: phase summaries are the leaves, then hindsight agent names
+and the project overview, then each calendar level of rollups built from the level below. Before
+any model call, `summarize` walks that whole tree against the cache and prints a plan: per stage,
+how many jobs are cached, carried forward (below), or need a model call, with estimated tokens
+and, given `--price`, dollars. Estimates are the mean recorded usage per job of each kind from
+this team's own receipts for the same backend, model and effort; a team with no history uses
+built-in figures that err high. `--plan` prints the plan and exits without spending:
+
+```bash
+wrkviz summarize --team example-team --output ./timelines/example-team \
+  --backend claude --model sonnet --rollup-kind daily --rollup-kind weekly \
+  --price input=2,output=10,cached_input=0.2,cache_write_input=2.5 --plan
+```
+
+`--budget-usd N` (with `--price`) turns the plan into a gate. If the whole remaining tree is
+estimated over the budget, the run refuses to start, spends nothing, and exits 3 with the
+estimate: raise the budget, narrow the window, or drop rollup levels, rather than paying for leaves
+whose rollups would never be written. While a run is under way, each model batch reserves its
+estimated cost before it starts; once the next batch would cross the budget no new batch starts,
+batches already running finish and are cached, and the run exits 3.
+
+Every run records itself in `summary_data/summarize_state.json`: `running` before the first model
+call, then `complete`, or `partial` with the stage it stopped in and why (`budget`, `error` or
+`interrupted`). A run killed outright stays `running`. The next run's plan says it is resuming,
+and because every finished leaf and rollup is content-addressed, it asks the model only for what
+is still missing. `build` warns while the last summarize run is not complete.
+
+Rollups are incremental. A rollup's own inputs are what it summarizes: the lower-level summaries
+and boundary phases inside its period, its aggregate statistics, and, for the plain-language
+audience, the same-period technical summary and the project overview. Adding or changing leaves
+regenerates exactly the rollups whose own inputs changed, all the way up. Up to ten earlier
+same-level summaries are also part of each rollup's prompt, as continuity context; when only
+those changed, the rollup's paid summary is carried forward instead of regenerated, through the
+`summary_data/rollup_inputs/` index, and `build` treats it as current. So new work on one day
+regenerates that day and its week, not every later day. The same rule lets a rollup summarized inside a
+`--summary-start-date`/`--summary-end-date` window show in a build of the team's whole range,
+where the days before the window are unsummarized and so read as different prior context.
+
+A batch answer that leaves a job out, or answers one under a key it was never given, is asked
+again one job at a time; a one-job batch gets one more attempt.
+
 Unchanged keys are never sent to the model again. A changed live window creates a new cache record while the previous valuable record
 remains on disk. Each batch is committed only after every response in that batch validates against
 the strict JSON schema; a failed batch cannot corrupt existing cache data, while other validated
@@ -940,6 +983,8 @@ example-team/
     │   ├── phases/<phase-id>.json
     │   ├── project_overview.json     # immutable evidence epoch + generated overview
     │   ├── rollups/{hourly,daily,weekly,monthly,quarterly}/... # both audiences
+    │   ├── rollup_inputs/<own-inputs-hash>.json # rollup carry-forward index
+    │   ├── summarize_state.json      # last summarize run: running, partial or complete
     │   ├── github/pulls.json         # ETag-backed bounded PR title/hover metadata
     │   └── glossary.json             # optional retired definition projection; audit-only
     └── summaries/
