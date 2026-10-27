@@ -1,13 +1,14 @@
 ---
 title: 'watch-agents-scale: a large registry makes watch-agents --once take minutes and print nothing'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 - performance
 created_at: 2026-10-27T05:30:32.634927403+00:00
-updated_at: 2026-10-27T05:30:32.634927403+00:00
+updated_at: 2026-10-27T06:22:11.704626307+00:00
+closed_at: 2026-10-27T06:22:11.704626107+00:00
 ---
 
 # Description
