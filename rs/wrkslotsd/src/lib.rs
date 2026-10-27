@@ -56,6 +56,7 @@ mod journal_state;
 mod pair_state;
 mod plan;
 mod policy;
+mod record_holds;
 mod replay;
 mod schema;
 mod yamlconfig;

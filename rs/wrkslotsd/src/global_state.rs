@@ -57,7 +57,7 @@ fn is_event_stem(stem: &str) -> bool {
 fn is_event_name(name: &str, partial: bool) -> bool {
     if partial {
         match name.split_once(".json.tmp.") {
-            Some((stem, rest)) => is_event_stem(stem) && !rest.is_empty(),
+            Some((stem, rest)) => is_event_stem(stem) && !rest.is_empty() && !rest.contains('\n'),
             None => false,
         }
     } else {
@@ -68,45 +68,210 @@ fn is_event_name(name: &str, partial: bool) -> bool {
     }
 }
 
-/// Whether the machine's state is derived from its event log, applying
-/// the log directory's entry classification: complete event files derive,
-/// in-progress `.tmp.` files do not, and any other entry refuses.
-fn event_log_derived(directory: &Path) -> Result<bool> {
-    if !directory.exists() {
-        return Ok(false);
+/// Validate one machine's complete event chain the way the existing
+/// event loader does (filename sequence, exact keys, schema, machine,
+/// sequence, hash chain, and content digest), returning the loader's
+/// first refusal message.
+pub(crate) fn validate_event_chain(directory: &Path, machine: &str) -> Result<()> {
+    use crate::active_state::{as_int, as_mapping, as_str, parse_timestamp};
+
+    let mut names: Vec<String> = Vec::new();
+    if directory.exists() {
+        let entries = std::fs::read_dir(directory)
+            .map_err(|error| format!("cannot list event log {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!("cannot list event log {}: {error}", directory.display())
+            })?;
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
     }
-    let entries = std::fs::read_dir(directory)
-        .map_err(|error| format!("cannot list event log {}: {error}", directory.display()))?;
+    let mut complete: Vec<String> = names
+        .into_iter()
+        .filter(|name| is_event_name(name, false))
+        .collect();
+    complete.sort();
+    let mut previous = "0".repeat(64);
+    for (index, name) in complete.iter().enumerate() {
+        let expected = index + 1;
+        let path = directory.join(name);
+        if *name != format!("{expected:020}.json") {
+            return Err(format!(
+                "append-only event log has a sequence gap at {}; preserve the log and run 'wrkslots doctor'",
+                path.display()
+            ));
+        }
+        if path
+            .symlink_metadata()
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "append-only event must not be a symlink: {}",
+                path.display()
+            ));
+        }
+        let text = std::fs::read_to_string(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!("missing append-only event: {}", path.display())
+            } else {
+                format!("cannot read append-only event {}: {error}", path.display())
+            }
+        })?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("append-only event is malformed JSON: {error}"))?;
+        let raw = as_mapping(&value, "append-only event")?;
+        let required = [
+            "schema",
+            "machine",
+            "sequence",
+            "previous_sha256",
+            "recorded_at",
+            "kind",
+            "payload",
+            "sha256",
+        ];
+        let mut missing: Vec<&str> = required
+            .iter()
+            .filter(|key| !raw.contains_key(**key))
+            .copied()
+            .collect();
+        missing.sort_unstable();
+        let mut unknown: Vec<&str> = raw
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !required.contains(key))
+            .collect();
+        unknown.sort_unstable();
+        if !missing.is_empty() || !unknown.is_empty() {
+            let mut details = Vec::new();
+            if !missing.is_empty() {
+                details.push(format!("missing {}", missing.join(", ")));
+            }
+            if !unknown.is_empty() {
+                details.push(format!("unknown {}", unknown.join(", ")));
+            }
+            return Err(format!(
+                "append-only event has invalid fields: {}",
+                details.join("; ")
+            ));
+        }
+        if as_int(&raw["schema"], "append-only event.schema", 0)? != 1 {
+            return Err(format!(
+                "unsupported append-only event schema in {}",
+                path.display()
+            ));
+        }
+        if as_str(&raw["machine"], "append-only event.machine")? != machine {
+            return Err(format!(
+                "append-only event belongs to another machine: {}",
+                path.display()
+            ));
+        }
+        if as_int(&raw["sequence"], "append-only event.sequence", 0)? != expected as i64 {
+            return Err(format!(
+                "append-only event sequence does not match its filename: {}",
+                path.display()
+            ));
+        }
+        if as_str(&raw["previous_sha256"], "append-only event.previous_sha256")? != previous {
+            return Err(format!(
+                "append-only event hash chain is broken at {}",
+                path.display()
+            ));
+        }
+        parse_timestamp(
+            as_str(&raw["recorded_at"], "append-only event.recorded_at")?,
+            "append-only event.recorded_at",
+        )?;
+        as_str(&raw["kind"], "append-only event.kind")?;
+        as_mapping(&raw["payload"], "append-only event.payload")?;
+        let recorded = as_str(&raw["sha256"], "append-only event.sha256")?;
+        let mut core = raw.clone();
+        core.remove("sha256");
+        let digest = crate::canonical::canonical_sha256(&Value::Object(core))
+            .map_err(|error| error.to_string())?;
+        if recorded != digest {
+            return Err(format!(
+                "append-only event digest does not match its content: {}",
+                path.display()
+            ));
+        }
+        previous = recorded.to_owned();
+    }
+    Ok(())
+}
+
+/// How a machine's event log classifies under the log directory's entry
+/// rules: complete event files derive state, in-progress `.tmp.` files
+/// do not, and any other entry is invalid with the loader's message.
+pub(crate) enum EventLogStatus {
+    Snapshot,
+    Derived,
+    Invalid(String),
+}
+
+pub(crate) fn event_log_status(directory: &Path) -> EventLogStatus {
+    if !directory.exists() {
+        return EventLogStatus::Snapshot;
+    }
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return EventLogStatus::Invalid(format!(
+                "cannot list event log {}: {error}",
+                directory.display()
+            ));
+        }
+    };
     let mut names: Vec<String> = Vec::new();
     for entry in entries {
-        let entry = entry
-            .map_err(|error| format!("cannot list event log {}: {error}", directory.display()))?;
-        names.push(entry.file_name().to_string_lossy().into_owned());
+        match entry {
+            Ok(entry) => names.push(entry.file_name().to_string_lossy().into_owned()),
+            Err(error) => {
+                return EventLogStatus::Invalid(format!(
+                    "cannot list event log {}: {error}",
+                    directory.display()
+                ));
+            }
+        }
     }
     let unexpected: Vec<&String> = names
         .iter()
         .filter(|name| !is_event_name(name, false) && !is_event_name(name, true))
         .collect();
     if let Some(first) = unexpected.iter().min() {
-        return Err(format!(
+        return EventLogStatus::Invalid(format!(
             "append-only event log contains an unexpected entry: {}; preserve it and run 'wrkslots doctor' before changing slot state",
             directory.join(first).display()
         ));
     }
-    Ok(names.iter().any(|name| is_event_name(name, false)))
+    if names.iter().any(|name| is_event_name(name, false)) {
+        EventLogStatus::Derived
+    } else {
+        EventLogStatus::Snapshot
+    }
 }
 
-/// Validate every machine's ACTIVE and ARCHIVED shards as one registry,
-/// printing each machine's normalized pair.
-pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {
-    let (cfg, _selected) = load_cfg(root, None)?;
+fn event_log_derived(directory: &Path) -> Result<bool> {
+    match event_log_status(directory) {
+        EventLogStatus::Snapshot => Ok(false),
+        EventLogStatus::Derived => Ok(true),
+        EventLogStatus::Invalid(message) => Err(message),
+    }
+}
+
+/// Discover the registry's machines from its shard and event-log
+/// names, refusing unexpected names and a shard set that differs
+/// without append-only history. Sorted like the existing discovery.
+pub(crate) fn discover_machines(control: &Path) -> Result<Vec<String>> {
     let mut active_machines: BTreeSet<String> = BTreeSet::new();
     let mut archive_machines: BTreeSet<String> = BTreeSet::new();
     let mut event_machines: BTreeSet<String> = BTreeSet::new();
-    let entries = std::fs::read_dir(&cfg.control).map_err(|error| {
+    let entries = std::fs::read_dir(control).map_err(|error| {
         format!(
             "cannot list control directory {}: {error}",
-            cfg.control.display()
+            control.display()
         )
     })?;
     let mut names: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
@@ -114,7 +279,7 @@ pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {
         let entry = entry.map_err(|error| {
             format!(
                 "cannot list control directory {}: {error}",
-                cfg.control.display()
+                control.display()
             )
         })?;
         let path = entry.path();
@@ -190,6 +355,14 @@ pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {
         .chain(event_machines.iter())
         .cloned()
         .collect();
+    Ok(machines.into_iter().collect())
+}
+
+/// Validate every machine's ACTIVE and ARCHIVED shards as one registry,
+/// printing each machine's normalized pair.
+pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {
+    let (cfg, _selected) = load_cfg(root, None)?;
+    let machines = discover_machines(&cfg.control)?;
     let mut actives: Vec<Value> = Vec::new();
     let mut orders: Vec<Vec<crate::active_state::RecordOrder>> = Vec::new();
     for machine in &machines {

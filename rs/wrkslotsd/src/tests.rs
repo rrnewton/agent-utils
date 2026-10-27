@@ -5034,6 +5034,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "parse-archive",
             "parse-handoff",
             "parse-hold",
+            "parse-holds",
             "parse-global",
             "parse-journal",
             "parse-states",

@@ -131,6 +131,12 @@ pub(crate) enum Command {
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
     },
+    /// Load every active record's hold across all machines and print one entry per record
+    ParseHolds {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+    },
     /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
     ParseConfig {
         /// Configuration document to parse; it is never modified
@@ -322,6 +328,19 @@ pub fn run() -> u8 {
             }
         }
         Command::ParseGlobal { root } => match crate::global_state::parse_global(root.as_deref()) {
+            Ok(value) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::ParseHolds { root } => match crate::record_holds::parse_holds(root.as_deref()) {
             Ok(value) => {
                 println!(
                     "{}",
