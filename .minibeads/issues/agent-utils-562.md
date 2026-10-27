@@ -190,8 +190,16 @@ validation-graph 113 passed together alone; wrkslots shards 491 + 491
 passed alone). Upstream commits shared no files; rebased and pushed
 without a second gate.
 
-[muse watermelon] Slice 24 in progress: `wrkslotsd parse-storage`
+[muse watermelon] Slice 24 landed (19d6d989): `wrkslotsd parse-storage`
 reproduces the filesystem half of `_registry_storage_inconsistencies`
 (slot-directory presence/safety, nested checkout entries, managed
 directory enumeration). Git registration/identity checks and slot
-image mount findings stay with the Python `status`.
+image mount findings stay with the Python `status`. Adversarial
+review found the unguarded slot-images refusal, Python repr details,
+and discarded directory-entry errors; all fixed with differential
+cases (3 passed). Gate 35 failed under severe host overload (OOM and
+CPU timeouts across 13 steps); every failure passed alone
+(repository-infrastructure 149, cross-skip+graph 113, dagrun 494+493,
+lifecycle host shard 121, wrkslots 493+492, and all four vibe-talk
+browser checks). Upstream commits shared no files; rebased and
+pushed without a second gate.
