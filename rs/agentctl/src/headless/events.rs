@@ -253,6 +253,51 @@ pub fn read_segments(segments: &[Segment]) -> io::Result<Vec<Event>> {
     Ok(events)
 }
 
+/// The readable events in the last `budget` bytes of the log, across segment boundaries, oldest
+/// first. A line cut by the window's start is skipped, and so is a partial final line.
+pub fn read_recent(dir: &Path, budget: u64) -> io::Result<Vec<Event>> {
+    let mut chunks: Vec<Vec<Event>> = Vec::new();
+    let mut left = budget;
+    for segment in segments(dir)?.iter().rev() {
+        if left == 0 {
+            break;
+        }
+        let mut file = match File::open(&segment.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let length = file.metadata()?.len();
+        let start = length.saturating_sub(left);
+        left -= length - start;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let first = if start > 0 {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |index| index + 1)
+        } else {
+            0
+        };
+        let end = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1)
+            .max(first);
+        chunks.push(
+            bytes[first..end]
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_slice::<Event>(line).ok())
+                .collect(),
+        );
+    }
+    chunks.reverse();
+    Ok(chunks.into_iter().flatten().collect())
+}
+
 /// The index into `segments` of the one holding `seq`: the newest whose first event is at or
 /// before it (0 when none is). Searches from the newest segment back, reading one line of each,
 /// so a recent `seq` never opens old segments.

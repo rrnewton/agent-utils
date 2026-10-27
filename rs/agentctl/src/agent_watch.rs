@@ -351,6 +351,9 @@ pub struct Observation {
     pub harness: Option<String>,
     /// What the harness's own transcript says the agent is doing, when it could be found.
     pub transcript: Option<Activity>,
+    /// For a headless agent (`#589 headless-watch`), what its event log shows; it has no
+    /// screen, so this replaces `screen` in every judgement.
+    pub headless: Option<crate::headless::watch::View>,
 }
 
 use crate::harness::transcript::Activity;
@@ -960,6 +963,9 @@ fn classify(
     if observation.status == "gone" {
         return Some(Finding::new(EpisodeKind::Dead, observation.detail.clone()));
     }
+    if let Some(view) = &observation.headless {
+        return classify_headless(observation, view, options, memory, now);
+    }
     let screen = observation.screen.as_deref()?;
     if let Some(cause) = crate::stuck::classify(screen) {
         return Some(Finding::new(EpisodeKind::Stuck(cause), cause.as_str()));
@@ -1053,6 +1059,101 @@ fn classify(
         return working_finding(observation, options, memory, now, screen, &turn);
     }
     None
+}
+
+/// What is wrong with a headless agent, judged from its event log and queue instead of a screen
+/// (`#589 headless-watch`, design 7.2). Inside a turn: input queued behind a turn past
+/// `--turn-minutes` is `turn-queued`, and a log that has not moved is `stalled`, timed from its
+/// last event. Idle: input left queued is `stalled` (the wrapper delivers at once, so this is
+/// due after the dead threshold), a verdict in the last turn's prose is `child-done`, and none
+/// is `idle-no-verdict`, timed from the turn's end. Under `--permission-prompts none` nothing
+/// waits at a prompt, so there is no approval episode.
+fn classify_headless(
+    observation: &Observation,
+    view: &crate::headless::watch::View,
+    options: &WatchAgentsOptions,
+    memory: &AgentMemory,
+    now: f64,
+) -> Option<Finding> {
+    let age = |since: f64| crate::turn_state::format_age((now - since).max(0.0));
+    match observation.status.as_str() {
+        "working" => {
+            let since = view.busy_since.or(memory.working_since).unwrap_or(now);
+            let backlog = &observation.backlog;
+            if backlog.waiting > 0 && now - since >= options.turn.as_secs_f64() {
+                return Some(Finding::timed(
+                    EpisodeKind::TurnQueued,
+                    format!(
+                        "turn {} running for {} with {} input(s) queued behind it, the oldest for {}",
+                        view.turn,
+                        age(since),
+                        backlog.waiting,
+                        crate::turn_state::format_age(backlog.oldest_waiting_seconds.unwrap_or(0.0)),
+                    ),
+                    since,
+                    Some(options.turn.as_secs_f64()),
+                ));
+            }
+            let quiet = view.last_event_at.unwrap_or(now);
+            let tool = view
+                .open_tool
+                .as_ref()
+                .map_or_else(String::new, |(tool, summary, at)| {
+                    format!("; {tool} running for {}: {summary}", age(*at))
+                });
+            Some(Finding::timed(
+                EpisodeKind::Stalled,
+                format!(
+                    "event log silent for {} in turn {} (running for {}){tool}",
+                    age(quiet),
+                    view.turn,
+                    age(since)
+                ),
+                quiet,
+                None,
+            ))
+        }
+        "idle" => {
+            let backlog = &observation.backlog;
+            if backlog.deliverable > 0 {
+                let since = now - backlog.oldest_waiting_seconds.unwrap_or(0.0);
+                return Some(Finding::timed(
+                    EpisodeKind::Stalled,
+                    format!(
+                        "idle with {} input(s) queued for {}; the wrapper has not delivered them",
+                        backlog.deliverable,
+                        age(since)
+                    ),
+                    since,
+                    Some(options.dead.as_secs_f64()),
+                ));
+            }
+            if !observation.has_delivered {
+                return None;
+            }
+            if let Some(verdict) = crate::headless::watch::verdict(view, &options.markers) {
+                return Some(Finding::new(
+                    EpisodeKind::ChildDone,
+                    format!("turn {}: {verdict}", view.turn),
+                ));
+            }
+            let ended = view.turn_completed_at.unwrap_or(now);
+            Some(Finding::timed(
+                EpisodeKind::IdleNoVerdict,
+                format!(
+                    "idle for {} since turn {} ended {}",
+                    age(ended),
+                    view.turn,
+                    view.last_outcome
+                        .as_deref()
+                        .unwrap_or("(not in the recent log)")
+                ),
+                ended,
+                None,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// What is wrong with an agent that is inside a turn, if anything: a loop, a gate step past its
@@ -1516,7 +1617,11 @@ fn update_episode(
     now: f64,
     options: &WatchAgentsOptions,
 ) -> Option<Value> {
-    let hash = screen_hash(observation.screen.as_deref());
+    // A headless agent's log stands in for its screen: new events are new output.
+    let hash = match &observation.headless {
+        Some(view) => stable_hash(&format!("h{}", view.last_seq)),
+        None => screen_hash(observation.screen.as_deref()),
+    };
     let mut memory = state
         .agents
         .get(&observation.name)
@@ -1525,7 +1630,10 @@ fn update_episode(
     // An unreadable screen is no evidence either way: a transient read failure must
     // neither clear a live episode nor restart its clock. The episode freezes until
     // the screen can be read again; only `gone` classifies without one.
-    if observation.screen.is_none() && observation.status != "gone" {
+    if observation.screen.is_none()
+        && observation.status != "gone"
+        && observation.headless.is_none()
+    {
         return memory.episode.as_ref().map(|episode| {
             held_row(
                 observation,
@@ -2445,8 +2553,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             && (row["record_error"] == true
                 || (matches!(row["lifecycle"].as_str(), Some("running" | "starting"))
                     && row["adapter"].as_str() != Some("agentcloud")
-                    // A headless agent has no screen; its event log is its status (#565).
-                    && row["adapter"].as_str() != Some(crate::headless::ADAPTER)));
+                    // A headless agent taken over by an interactive terminal has its owner at
+                    // the keyboard; nothing to watch until it is handed back.
+                    && row["agent_status"] != "taken-over"));
         if !watched {
             return (!expired()).then_some(Checked {
                 row,
@@ -2455,9 +2564,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
                 reused: false,
             });
         }
-        let gone = row["agent_status"] == "unknown" && !row["probe_error"].is_null();
+        let headless = row["adapter"].as_str() == Some(crate::headless::ADAPTER);
+        // A headless agent's wrapper answers for it: a dead or unreachable wrapper is gone.
+        let gone = (row["agent_status"] == "unknown"
+            || (headless && matches!(row["agent_status"].as_str(), Some("dead" | "unreachable"))))
+            && !row["probe_error"].is_null();
         let status = row["agent_status"].as_str().unwrap_or("unknown").to_owned();
-        let (screen, kept, reused) = if gone {
+        // A headless agent has no screen; its event log stands in for one (#589).
+        let (screen, kept, reused) = if gone || headless {
             (None, None, false)
         } else {
             self.screen(manager, &name, &status)
@@ -2515,10 +2629,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             .as_str()
             .map_or_else(|| self.registry.join(&name).join("queue"), PathBuf::from);
         let now = SystemClock.now();
-        let started = screen.as_deref().and_then(|screen| {
-            crate::turn_state::turn_age(&crate::turn_state::read_screen(screen), None)
-                .map(|age| now - age)
-        });
+        let headless =
+            (row["adapter"].as_str() == Some(crate::headless::ADAPTER) && !gone).then(|| {
+                let events = row["event_log"].as_str().map_or_else(
+                    || crate::headless::events::directory(&self.registry.join(&name)),
+                    PathBuf::from,
+                );
+                crate::headless::watch::read(&events).unwrap_or_default()
+            });
+        let started = match &headless {
+            Some(view) => view.busy_since,
+            None => screen.as_deref().and_then(|screen| {
+                crate::turn_state::turn_age(&crate::turn_state::read_screen(screen), None)
+                    .map(|age| now - age)
+            }),
+        };
         let backlog = crate::turn_state::backlog(&queue, now, started);
         // The pinned harness process (a custom-pane harness such as Muse is pinned as its
         // custom process), checked against its start time so a reused PID is never read as
@@ -2535,7 +2660,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             _ => None,
         };
         let harness = row["harness"].as_str().map(str::to_owned);
-        let transcript = if gone {
+        let transcript = if gone || headless.is_some() {
             None
         } else {
             harness
@@ -2627,6 +2752,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             progress,
             harness,
             transcript,
+            headless,
             name,
         }
     }
@@ -2876,6 +3002,7 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
                 progress: None,
                 harness: None,
                 transcript: None,
+                headless: None,
             });
         }
         Ok(observations)
@@ -3061,6 +3188,7 @@ mod tests {
             progress: None,
             harness: None,
             transcript: None,
+            headless: None,
         }
     }
 
@@ -5247,5 +5375,195 @@ mod tests {
         pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
         let healthy = pass(&mut probe, &mut notifier, &mut state, 1_860.0, &options);
         assert_eq!(healthy["episodes"], json!([]), "{healthy}");
+    }
+
+    /// A headless agent's observation: no screen, its log reduced to `view`.
+    fn headless(status: &str, view: crate::headless::watch::View) -> Observation {
+        Observation {
+            harness: Some("claude".to_owned()),
+            headless: Some(view),
+            ..observation("lead", status, None)
+        }
+    }
+
+    fn view_at(last_seq: u64, last_event_at: f64) -> crate::headless::watch::View {
+        crate::headless::watch::View {
+            last_seq,
+            last_event_at: Some(last_event_at),
+            turn: 7,
+            ..crate::headless::watch::View::default()
+        }
+    }
+
+    fn due_kinds(state: &WatchState) -> Vec<&'static str> {
+        state
+            .pending
+            .iter()
+            .map(|notice| notice.kind.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_headless_turn_whose_log_stops_moving_is_stalled_from_its_last_event() {
+        let options = options();
+        let mut state = WatchState::default();
+        let busy = |seq, at| crate::headless::watch::View {
+            busy_since: Some(0.0),
+            open_tool: Some(("Bash".to_owned(), "make validate".to_owned(), 100.0)),
+            ..view_at(seq, at)
+        };
+        // Events keep arriving: never due, however long the turn.
+        for minute in 0..40 {
+            let now = f64::from(minute) * 60.0;
+            update_episode(
+                &mut state,
+                &headless("working", busy(minute as u64 + 1, now)),
+                now,
+                &options,
+            );
+        }
+        assert!(state.pending.is_empty(), "{:?}", due_kinds(&state));
+        // Then silence: due once the log has not moved for the stall threshold (30 min here).
+        let quiet_from = 39.0 * 60.0;
+        let row = update_episode(
+            &mut state,
+            &headless("working", busy(40, quiet_from)),
+            quiet_from + 1_700.0,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(row["kind"], "stalled");
+        assert_eq!(row["due"], false);
+        let row = update_episode(
+            &mut state,
+            &headless("working", busy(40, quiet_from)),
+            quiet_from + 1_810.0,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(row["due"], true, "{row}");
+        assert_eq!(due_kinds(&state), vec!["stalled"]);
+        let detail = row["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("event log silent for 30 min") && detail.contains("Bash running for"),
+            "{detail}"
+        );
+        // A new event ends the episode.
+        let row = update_episode(
+            &mut state,
+            &headless("working", busy(41, quiet_from + 1_900.0)),
+            quiet_from + 1_900.0,
+            &options,
+        );
+        assert!(row.is_none_or(|row| row["due"] == false));
+    }
+
+    #[test]
+    fn a_headless_agent_that_finishes_with_a_verdict_is_child_done_and_without_one_idle() {
+        let options = options();
+        let mut state = WatchState::default();
+        let done = crate::headless::watch::View {
+            turn_completed_at: Some(100.0),
+            last_outcome: Some("completed".to_owned()),
+            last_text: vec![
+                "Working on it.".to_owned(),
+                "Summary:\n**DONE:** landed abc123".to_owned(),
+            ],
+            ..view_at(9, 100.0)
+        };
+        let row = update_episode(&mut state, &headless("idle", done), 110.0, &options).unwrap();
+        assert_eq!(row["kind"], "child-done");
+        assert_eq!(row["detail"], "turn 7: DONE:** landed abc123");
+        assert_eq!(due_kinds(&state), vec!["child-done"]);
+        let mut state = WatchState::default();
+        let silent = crate::headless::watch::View {
+            turn_completed_at: Some(100.0),
+            last_outcome: Some("completed".to_owned()),
+            last_text: vec!["I looked at it.".to_owned()],
+            ..view_at(9, 100.0)
+        };
+        let row = update_episode(
+            &mut state,
+            &headless("idle", silent.clone()),
+            500.0,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(
+            (row["kind"].as_str(), row["due"].as_bool()),
+            (Some("idle-no-verdict"), Some(false))
+        );
+        let row = update_episode(&mut state, &headless("idle", silent), 1_001.0, &options).unwrap();
+        assert_eq!(
+            row["due"], true,
+            "timed from the turn's end, not from the first pass: {row}"
+        );
+        // An agent that was never sent anything is idle legitimately.
+        let mut state = WatchState::default();
+        let fresh = Observation {
+            has_delivered: false,
+            ..headless("idle", view_at(2, 0.0))
+        };
+        assert!(update_episode(&mut state, &fresh, 5_000.0, &options).is_none());
+    }
+
+    #[test]
+    fn headless_queues_dead_wrappers_and_long_turns_are_reported() {
+        let options = options();
+        // Input queued while the wrapper sits idle: due after the dead threshold.
+        let mut state = WatchState::default();
+        let mut waiting = headless("idle", view_at(3, 0.0));
+        waiting.backlog.waiting = 2;
+        waiting.backlog.deliverable = 2;
+        waiting.backlog.oldest_waiting_seconds = Some(400.0);
+        let row = update_episode(&mut state, &waiting, 1_000.0, &options).unwrap();
+        assert_eq!(
+            (row["kind"].as_str(), row["due"].as_bool()),
+            (Some("stalled"), Some(true)),
+            "{row}"
+        );
+        assert!(row["detail"]
+            .as_str()
+            .unwrap()
+            .contains("2 input(s) queued"));
+        // A turn past --turn-minutes with input queued behind it.
+        let mut state = WatchState::default();
+        let mut long = headless(
+            "working",
+            crate::headless::watch::View {
+                busy_since: Some(0.0),
+                ..view_at(5, 7_100.0)
+            },
+        );
+        long.backlog.waiting = 1;
+        long.backlog.oldest_waiting_seconds = Some(60.0);
+        let row = update_episode(&mut state, &long, 7_300.0, &options).unwrap();
+        assert_eq!(
+            (row["kind"].as_str(), row["due"].as_bool()),
+            (Some("turn-queued"), Some(true)),
+            "{row}"
+        );
+        // A dead wrapper is gone, and starting or stopped agents are left alone.
+        let mut state = WatchState::default();
+        let dead = Observation {
+            status: "gone".to_owned(),
+            headless: None,
+            detail: "the headless wrapper is not running".to_owned(),
+            ..headless("gone", view_at(1, 0.0))
+        };
+        update_episode(&mut state, &dead, 0.0, &options);
+        let row = update_episode(&mut state, &dead, 301.0, &options).unwrap();
+        assert_eq!(
+            (row["kind"].as_str(), row["due"].as_bool()),
+            (Some("dead"), Some(true))
+        );
+        let mut state = WatchState::default();
+        assert!(update_episode(
+            &mut state,
+            &headless("starting", view_at(1, 0.0)),
+            9_999.0,
+            &options
+        )
+        .is_none());
     }
 }

@@ -2182,8 +2182,18 @@ recorded in `lifecycle.started`.
 **Taking over.** To use the TUI on the same conversation, `agentctl stop NAME`
 (the receipt names the session), then run `claude --resume SESSION` in the
 agent's working directory; start a headless agent with `--resume SESSION` to go
-back. `watch-agents` does not watch headless agents yet; their event log and
-`status` are their status.
+back.
+
+**Watching.** `watch-agents` judges a headless agent from its wrapper's status
+and the newest 512 KiB of its event log instead of a screen: a turn whose log
+has not moved for the stall threshold is `stalled` (the notice names the tool
+running and for how long), input queued behind a turn past `--turn-minutes` is
+`turn-queued`, input left queued while the wrapper is idle is `stalled` after the
+dead threshold, a dead or unreachable wrapper is `dead`, and an idle agent whose
+last turn's prose has a `DONE:` or `BLOCKED:` line is `child-done`, otherwise
+`idle-no-verdict`, timed from the turn's end. Nothing can wait at a prompt, so
+there is no approval episode, and the auto-interrupt policy, which reads a
+screen, does not apply (`send --urgent` already delivers mid-turn).
 
 ## Headless worker extension
 

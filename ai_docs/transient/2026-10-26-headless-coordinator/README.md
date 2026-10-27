@@ -65,6 +65,13 @@ starts with the last 200 events instead of the whole log. A writer that restarts
 right after a rotation takes `seq` from the newest segment that holds an event, not from a
 stale index.
 
+Status for watchers (`#589 headless-watch`, 7.2): `watch-agents` reads the wrapper's status and
+the newest 512 KiB of the event log: turn age, the tool running, queued inputs, and the last
+turn's prose for the verdict rule. A silent log inside a turn is `stalled` from its last event;
+input left queued while idle is `stalled` after the dead threshold; a dead or unreachable
+wrapper is `dead`; there is no `blocked`. The harness process sample (`/proc`) is taken as for
+interactive agents but not yet used for headless tool-blocked findings.
+
 Verified on Claude Code 2.1.310 (the 3.1 "to verify in M2" list): `--input-format stream-json`
 with `--resume` keeps the session; two inputs written together while idle run strictly in order,
 one turn each; `system/init` opens every turn; `result` carries a per-result cost in
@@ -74,8 +81,7 @@ transcript records for an input queued and then cancelled.
 Not built yet: the bridge's request journal and `agentctl ledger` (12.1); the Python extension's
 v1 events; `agentctl say`, `takeover` and `release-headless` (takeover is manual: stop, then
 `claude --resume SESSION`); per-input cancel of a written input; the provenance header of section
-10; the post-compaction records prompt of 9.5; status from events in `watch-agents`, which skips
-headless agents for now; `HeadlessDelivery` in the bridge (M3); Codex and Muse wrappers (after the
+10; the post-compaction records prompt of 9.5; `HeadlessDelivery` in the bridge (M3); Codex and Muse wrappers (after the
 Claude cutover, per the owner's answer to question 5).
 
 ## 0. Summary

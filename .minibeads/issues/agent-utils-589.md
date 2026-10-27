@@ -1,6 +1,6 @@
 ---
 title: 'headless-watch: watch-agents status for headless agents from the event log'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-565: parent-child
 created_at: 2026-10-27T17:37:08.213184635+00:00
-updated_at: 2026-10-27T17:37:08.213184635+00:00
+updated_at: 2026-10-27T18:30:42.471627952+00:00
+closed_at: 2026-10-27T18:30:42.471627782+00:00
 ---
 
 # Description
