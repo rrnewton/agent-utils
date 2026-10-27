@@ -29,13 +29,13 @@ const HISTORICAL_STATUSES: [&str; 4] = [
 const TASK_NOT_RECORDED: &str = "no task recorded in worktree-state.json";
 const PURPOSE_NOT_RECORDED: &str = "no purpose recorded in worktree-state.json";
 
-struct Cfg {
-    root: PathBuf,
-    worktrees: PathBuf,
-    control: PathBuf,
-    layout: String,
-    default_remote: String,
-    default_landed_ref: String,
+pub(crate) struct Cfg {
+    pub(crate) root: PathBuf,
+    pub(crate) worktrees: PathBuf,
+    pub(crate) control: PathBuf,
+    pub(crate) layout: String,
+    pub(crate) default_remote: String,
+    pub(crate) default_landed_ref: String,
 }
 
 #[derive(Clone)]
@@ -47,16 +47,16 @@ struct Identity {
     cgroup_path: String,
 }
 
-struct CheckoutRec {
-    name: String,
-    path: String,
-    repository: String,
-    remote: String,
-    landed_ref: String,
+pub(crate) struct CheckoutRec {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) repository: String,
+    pub(crate) remote: String,
+    pub(crate) landed_ref: String,
 }
 
-struct ImportRec {
-    row: Map<String, Value>,
+pub(crate) struct ImportRec {
+    pub(crate) row: Map<String, Value>,
 }
 
 struct ScopeRec {
@@ -81,25 +81,25 @@ struct RecordRec {
     normalized: Value,
 }
 
-fn as_mapping<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>> {
+pub(crate) fn as_mapping<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>> {
     value
         .as_object()
         .ok_or_else(|| format!("{label} must be a JSON object"))
 }
 
-fn as_list<'a>(value: &'a Value, label: &str) -> Result<&'a Vec<Value>> {
+pub(crate) fn as_list<'a>(value: &'a Value, label: &str) -> Result<&'a Vec<Value>> {
     value
         .as_array()
         .ok_or_else(|| format!("{label} must be a JSON array"))
 }
 
-fn as_str<'a>(value: &'a Value, label: &str) -> Result<&'a str> {
+pub(crate) fn as_str<'a>(value: &'a Value, label: &str) -> Result<&'a str> {
     value
         .as_str()
         .ok_or_else(|| format!("{label} must be a string"))
 }
 
-fn as_int(value: &Value, label: &str, minimum: i64) -> Result<i64> {
+pub(crate) fn as_int(value: &Value, label: &str, minimum: i64) -> Result<i64> {
     let number = match value {
         Value::Number(number) => number
             .as_i64()
@@ -112,7 +112,7 @@ fn as_int(value: &Value, label: &str, minimum: i64) -> Result<i64> {
     }
 }
 
-fn exact_keys(
+pub(crate) fn exact_keys(
     raw: &Map<String, Value>,
     required: &[&str],
     optional: &[&str],
@@ -145,7 +145,7 @@ fn exact_keys(
     ))
 }
 
-fn parse_timestamp(value: &str, label: &str) -> Result<()> {
+pub(crate) fn parse_timestamp(value: &str, label: &str) -> Result<()> {
     if crate::schema::parse_timestamp(value, label).is_ok() {
         return Ok(());
     }
@@ -256,7 +256,7 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRec> {
+pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRec> {
     let raw = as_mapping(value, label)?;
     exact_keys(
         raw,
@@ -407,7 +407,7 @@ fn scope_from_obj(value: &Value, label: &str) -> Result<ScopeRec> {
     })
 }
 
-fn import_from_obj(value: Option<&Value>, label: &str) -> Result<Option<ImportRec>> {
+pub(crate) fn import_from_obj(value: Option<&Value>, label: &str) -> Result<Option<ImportRec>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -458,7 +458,7 @@ fn import_from_obj(value: Option<&Value>, label: &str) -> Result<Option<ImportRe
     Ok(Some(ImportRec { row }))
 }
 
-fn historical_task_and_purpose(
+pub(crate) fn historical_task_and_purpose(
     row: &Map<String, Value>,
     label: &str,
     agent: &str,
@@ -757,7 +757,7 @@ fn managed_worktrees_root(cfg: &Cfg) -> PathBuf {
     cfg.worktrees.clone()
 }
 
-fn slot_directory(cfg: &Cfg, slot: &str, slot_type: &str) -> Result<PathBuf> {
+pub(crate) fn slot_directory(cfg: &Cfg, slot: &str, slot_type: &str) -> Result<PathBuf> {
     validate_name(slot, "slot")?;
     if !matches!(slot_type, "agent" | "validate") {
         return Err("slot type must be one of agent, validate".to_owned());
@@ -770,7 +770,7 @@ fn slot_directory(cfg: &Cfg, slot: &str, slot_type: &str) -> Result<PathBuf> {
     Ok(base.join(slot))
 }
 
-fn landed_ref_for_remote(cfg: &Cfg, remote: &str) -> Result<String> {
+pub(crate) fn landed_ref_for_remote(cfg: &Cfg, remote: &str) -> Result<String> {
     let prefix = format!("refs/remotes/{}/", cfg.default_remote);
     let Some(rest) = cfg.default_landed_ref.strip_prefix(&prefix) else {
         return Err(format!("configured landed ref must be under {prefix}"));
@@ -778,7 +778,7 @@ fn landed_ref_for_remote(cfg: &Cfg, remote: &str) -> Result<String> {
     Ok(format!("refs/remotes/{remote}/{rest}"))
 }
 
-fn posix_relative(root: &Path, path: &Path) -> Result<String> {
+pub(crate) fn posix_relative(root: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| format!("slot path escapes the project root: {}", path.display()))?;
@@ -994,9 +994,10 @@ fn active_from_obj(cfg: &Cfg, value: &Value, selected: &str, label: &str) -> Res
     }))
 }
 
-/// Read and validate `ACTIVE.<machine>.json` under a project's control
-/// directory, printing the normalized state document.
-pub(crate) fn parse_state(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
+pub(crate) fn load_cfg(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+) -> Result<(Cfg, String)> {
     let config = load_config(root, machine_override)?;
     let text = |key: &str| -> Result<String> {
         config
@@ -1014,6 +1015,13 @@ pub(crate) fn parse_state(root: Option<&Path>, machine_override: Option<&str>) -
         default_landed_ref: text("default_landed_ref")?,
     };
     let selected = text("machine")?;
+    Ok((cfg, selected))
+}
+
+/// Read and validate `ACTIVE.<machine>.json` under a project's control
+/// directory, printing the normalized state document.
+pub(crate) fn parse_state(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
+    let (cfg, selected) = load_cfg(root, machine_override)?;
     validate_name(&selected, "machine")?;
     let path = cfg.control.join(format!("ACTIVE.{selected}.json"));
     refuse_symlink(&path, "active state")?;

@@ -48,4 +48,7 @@ record identity/handoff/checkout/task-scope/import sub-formats, duplicate
 and machine-shard checks, and stored-path authority against the validated
 configuration. No live-process, Git, or checkout-existence inspection.
 
-[muse watermelon] Next slice: the ARCHIVED.<machine>.json shard reader (`parse-archive`), same differential pattern.
+[muse watermelon] Slice 4 in progress: `wrkslotsd parse-archive` reproduces
+`_archive_from_obj` / `_load_archive_snapshot`: retirement evidence,
+archive-id derivation, historical-import consistency, and archived
+checkout path/authority, emitting records as stored.

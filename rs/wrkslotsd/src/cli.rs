@@ -71,6 +71,15 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Validate one ARCHIVED.<machine>.json shard and print it with records as stored
+    ParseArchive {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
     ParseConfig {
         /// Configuration document to parse; it is never modified
@@ -163,6 +172,21 @@ pub fn run() -> u8 {
         }
         Command::ParseState { root, machine } => {
             match crate::active_state::parse_state(root.as_deref(), machine.as_deref()) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::ParseArchive { root, machine } => {
+            match crate::archive_state::parse_archive(root.as_deref(), machine.as_deref()) {
                 Ok(value) => {
                     println!(
                         "{}",
