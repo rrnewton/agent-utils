@@ -134,8 +134,14 @@ passed alone; wrkslots shard 0 476 passed alone). Note: the landed
 `parse-states` (slice 17) keeps the simpler any-entry event check and
 should adopt the same classification. Next: slice 19 parse-holds.
 
-[muse watermelon] Slice 19 in progress: `wrkslotsd parse-holds`
+[muse watermelon] Slice 19 landed (44764349): `wrkslotsd parse-holds`
 composes the active-shard and hold readers per `_load_record_holds`
 (one entry per active record across all machines, per-slot errors
 captured) in snapshot mode; EVENTS-derived machines refuse toward
 `rebuild`, an invalid event log becomes each record's captured error.
+Adversarial review found the corrupt-chain classification, error
+precedence, and partial-name edges; all fixed with differential cases
+(11 passed in the new suite; library-generated error suffixes remain a
+known low divergence). Gate 30 failures were load flakes only
+(cross-skip 71 passed alone; wrkslots shard 0 481 passed alone).
+Next: slice 20 gives `parse-states` the same event-log classification.
