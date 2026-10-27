@@ -137,6 +137,12 @@ pub(crate) enum Command {
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
     },
+    /// List the outstanding recovery-journal file names for the registry
+    ParseJournals {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+    },
     /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
     ParseConfig {
         /// Configuration document to parse; it is never modified
@@ -353,6 +359,21 @@ pub fn run() -> u8 {
                 return 1;
             }
         },
+        Command::ParseJournals { root } => {
+            match crate::journals_state::parse_journals(root.as_deref()) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
         Command::ParseConfig { config } => {
             let parsed = std::fs::read_to_string(&config)
                 .map_err(|error| {

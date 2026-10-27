@@ -73,6 +73,11 @@ fn is_event_name(name: &str, partial: bool) -> bool {
 /// sequence, hash chain, and content digest), returning the loader's
 /// first refusal message.
 pub(crate) fn validate_event_chain(directory: &Path, machine: &str) -> Result<()> {
+    load_event_chain(directory, machine).map(|_| ())
+}
+
+/// Like `validate_event_chain`, but also return the event documents.
+pub(crate) fn load_event_chain(directory: &Path, machine: &str) -> Result<Vec<Value>> {
     use crate::active_state::{as_int, as_mapping, as_str, parse_timestamp};
 
     let mut names: Vec<String> = Vec::new();
@@ -91,6 +96,7 @@ pub(crate) fn validate_event_chain(directory: &Path, machine: &str) -> Result<()
         .filter(|name| is_event_name(name, false))
         .collect();
     complete.sort();
+    let mut events: Vec<Value> = Vec::new();
     let mut previous = "0".repeat(64);
     for (index, name) in complete.iter().enumerate() {
         let expected = index + 1;
@@ -198,8 +204,9 @@ pub(crate) fn validate_event_chain(directory: &Path, machine: &str) -> Result<()
             ));
         }
         previous = recorded.to_owned();
+        events.push(value);
     }
-    Ok(())
+    Ok(events)
 }
 
 /// How a machine's event log classifies under the log directory's entry

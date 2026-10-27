@@ -53,6 +53,7 @@ mod handoff_state;
 mod hold_state;
 mod index;
 mod journal_state;
+mod journals_state;
 mod pair_state;
 mod plan;
 mod policy;
