@@ -4,7 +4,7 @@ status: open
 priority: 2
 issue_type: bug
 created_at: 2026-10-27T16:01:30.599636281+00:00
-updated_at: 2026-10-27T17:17:54.320791416+00:00
+updated_at: 2026-10-27T18:24:50.018664828+00:00
 ---
 
 # Description
@@ -39,8 +39,8 @@ Other outcomes must not be called pre-existing failures: `python.dagrun.shard-0`
 
 `vibe-talk.check.read-aloud-blocks-browser` PASS on first baseline, FAIL on a second at the media-resume assertion; on the candidate it FAIL at the sentence-highlight population assertion, then PASS on a focused canonical rerun (54.2 seconds). These are distinct assertions, recorded as a flaky supplemental check, not a fabricated identical reproduction.
 
-The original relevant Python shutdown failure is fixed separately: SIGTERM inherited Exception and could be swallowed by a reconciliation retry handler. The deterministic regression fails before the BaseException correction; process, descendant and lock assertions are unchanged. The selected candidate gate on `36717a97` PASS: 40 DAG nodes, 1530 Rust cases across 12 binaries, 2565 passing Python shard cases, 777 agentctl paired comparisons and 103 herdr-agent paired comparisons, with package and housekeeping checks. Duration 564.2 seconds. Its dedicated chat scratch setting preserves all real fsync and fault-injection calls. The earlier disk-backed run naturally completed its 1517 Rust cases in 3573 seconds, but its broad overall result remains red.
+Current delivery receipts: source 59543339 passed all 40 selected contract nodes in 457.4 seconds. The three extra candidate checks passed, with the herdr-run failure/full focused passing pair retained. Session-follow hotfix a76450de passed all 33 selected nodes, including 1,585 Rust cases and Python shards with 1,285 and 1,284 passes (four expected failures), 777 agentctl and 103 Herdr-agent comparisons. No broad green result is claimed.
 
-This issue remains open for the reproduced host/tool failures and transient checks. Detailed receipt matrix is in `ai_docs/transient/2026-10-27-agent-watch-recovery/VALIDATION.md`; final candidate additional checks are recorded there before publication.
+A first hotfix run on b24f79a1 had one timing-sensitive reminder fixture fail: a_reply_the_transcript_holds_is_not_reported_missing_though_the_pane_does_not_show_it expected one typed reminder and saw none. Five isolated runs of the unchanged failed test and a Cargo rerun passed; the full unchanged-head rerun passed all 33 nodes in 490.7 seconds. The rebased exact-head a76450de run also passed the fixture and its full selected gate. Both failed and passing receipts are preserved. Root cause is not established; the lead explicitly accepted recording it as flaky rather than blocking publication.
 
-Final extra candidate checks: dagrun Python shard PASS (492 passes, two skips), voice-call-drop browser PASS. Herdr-run first failed only in adjacent read-only process-info call order, then passed its permitted focused rerun (1868 paired checks, 208 seconds). Both results are recorded as a flake. The supplemental long-message audio failure and 54.2-second passing rerun are recorded distinctly. The 36717a97 source gate passed; final immutable-head validation follows record consolidation because policy-only AGENTS restoration happened during that source run.
+This issue remains open for the reproduced host/tool failures and flaky checks. The earlier relevant shutdown and polling reply-order bugs were fixed separately. See ai_docs/transient/2026-10-27-agent-watch-recovery/VALIDATION.md for the receipt matrix. The source change has no validation-timeout or generic policy change.
