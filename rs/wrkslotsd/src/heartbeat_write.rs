@@ -35,7 +35,7 @@ fn parent_pid(pid: i64) -> Option<i64> {
     fields.get(1).and_then(|value| value.parse().ok())
 }
 
-fn assert_caller(identity: &Identity, label: &str) -> Result<()> {
+pub(crate) fn assert_caller(identity: &Identity, label: &str) -> Result<()> {
     let mut current: Option<i64> = Some(std::process::id() as i64);
     let mut seen: Vec<i64> = Vec::new();
     for _ in 0..256 {
@@ -57,7 +57,7 @@ fn assert_caller(identity: &Identity, label: &str) -> Result<()> {
     ))
 }
 
-fn identity_value(identity: &Identity) -> Value {
+pub(crate) fn identity_value(identity: &Identity) -> Value {
     json!({
         "pid": identity.pid,
         "start_ticks": identity.start_ticks,
@@ -81,7 +81,7 @@ fn record_identity(record: &Value, key: &str) -> Option<Identity> {
     })
 }
 
-fn seal_paths(cfg: &Cfg) -> Vec<std::path::PathBuf> {
+pub(crate) fn seal_paths(cfg: &Cfg) -> Vec<std::path::PathBuf> {
     let mut seals: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&cfg.control) {
         for entry in entries.flatten() {
@@ -95,7 +95,11 @@ fn seal_paths(cfg: &Cfg) -> Vec<std::path::PathBuf> {
     seals
 }
 
-fn refuse_seal_overlap(cfg: &Cfg, record: &Value) -> Result<()> {
+pub(crate) fn refuse_seal_overlap(cfg: &Cfg, record: &Value) -> Result<()> {
+    refuse_seal_overlap_action(cfg, record, "heartbeat")
+}
+
+pub(crate) fn refuse_seal_overlap_action(cfg: &Cfg, record: &Value, action: &str) -> Result<()> {
     let slot = record
         .get("slot")
         .and_then(Value::as_str)
@@ -139,7 +143,10 @@ fn refuse_seal_overlap(cfg: &Cfg, record: &Value) -> Result<()> {
                 .get("slot")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let generation = target.get("generation").cloned().unwrap_or(json!(0));
+            let generation = target
+                .get("generation")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
             let target_path = target
                 .get("path")
                 .and_then(Value::as_str)
@@ -151,7 +158,7 @@ fn refuse_seal_overlap(cfg: &Cfg, record: &Value) -> Result<()> {
                     .unwrap_or(false);
             if overlaps {
                 return Err(format!(
-                    "heartbeat target '{slot}' overlaps validation cleanup seal {} target '{sealed}' generation {generation}",
+                    "{action} target '{slot}' overlaps validation cleanup seal {} target '{sealed}' generation {generation}",
                     path.file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default()
@@ -162,7 +169,11 @@ fn refuse_seal_overlap(cfg: &Cfg, record: &Value) -> Result<()> {
     Ok(())
 }
 
-fn release_in_effect(cfg: &Cfg, record: &Value, events: &[Value]) -> Result<Option<Value>> {
+pub(crate) fn release_in_effect(
+    cfg: &Cfg,
+    record: &Value,
+    events: &[Value],
+) -> Result<Option<Value>> {
     if record.get("slot_type").and_then(Value::as_str) != Some("agent") {
         return Ok(None);
     }
@@ -185,6 +196,36 @@ fn release_in_effect(cfg: &Cfg, record: &Value, events: &[Value]) -> Result<Opti
         {
             continue;
         }
+        let handoff = payload.get("handoff").cloned().unwrap_or(Value::Null);
+        let mut handoff_keys: Vec<&str> = handoff
+            .as_object()
+            .map(|object| object.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        handoff_keys.sort();
+        let sha = handoff
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if handoff_keys != ["intent_sequence", "path", "sha256", "source"]
+            || sha.len() != 64
+            || !sha.chars().all(|ch| ch.is_ascii_hexdigit())
+            || handoff.get("source").and_then(Value::as_str) != Some("write-handoff")
+        {
+            return Err("owner-released event handoff is invalid".to_string());
+        }
+        let canonical = crate::handoff_state::sidecar_path(
+            &cfg.control,
+            record
+                .get("machine")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            slot,
+            generation,
+        );
+        if handoff.get("path").and_then(Value::as_str) != Some(canonical.to_string_lossy().as_ref())
+        {
+            return Ok(None);
+        }
         let mut keys: Vec<&str> = payload
             .as_object()
             .map(|object| object.keys().map(String::as_str).collect())
@@ -194,8 +235,8 @@ fn release_in_effect(cfg: &Cfg, record: &Value, events: &[Value]) -> Result<Opti
             != [
                 "agent",
                 "generation",
-                "heartbeat_at",
                 "handoff",
+                "heartbeat_at",
                 "owner",
                 "slot",
             ]

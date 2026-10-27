@@ -64,6 +64,7 @@ mod pair_state;
 mod plan;
 mod policy;
 mod record_holds;
+mod release_write;
 mod replay;
 mod schema;
 mod status_state;

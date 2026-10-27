@@ -208,7 +208,73 @@ fn validate_intent(payload: &Value, slot: &str, generation: i64) -> Result<()> {
     Ok(())
 }
 
-fn publication(events: &[Value], slot: &str, generation: i64) -> Option<(i64, Value, bool)> {
+/// Validate the latest publication intent the way the existing
+/// publication fold does: artifact identity, writer binding to the
+/// supplied owner, known-intent completions, and completion digests.
+pub(crate) fn validate_publication(
+    events: &[Value],
+    slot: &str,
+    generation: i64,
+    supplied: &Identity,
+) -> Result<()> {
+    let mut intent_sequences: Vec<i64> = Vec::new();
+    for event in events {
+        let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+        if payload.get("slot").and_then(Value::as_str) != Some(slot)
+            || payload.get("generation").and_then(Value::as_i64) != Some(generation)
+        {
+            continue;
+        }
+        match event.get("kind").and_then(Value::as_str) {
+            Some("handoff-write-intended") => {
+                validate_intent(&payload, slot, generation)?;
+                if payload.get("writer") != Some(&identity_value(supplied)) {
+                    return Err(
+                        "handoff write intent writer does not match the recorded slot owner"
+                            .to_string(),
+                    );
+                }
+                if let Some(sequence) = event.get("sequence").and_then(Value::as_i64) {
+                    intent_sequences.push(sequence);
+                }
+            }
+            Some("handoff-write-completed") => {
+                let sequence = payload
+                    .get("intent_sequence")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if !intent_sequences.contains(&sequence) {
+                    return Err("handoff write completion references an unknown intent".to_string());
+                }
+                let intended = events
+                    .iter()
+                    .find(|candidate| {
+                        candidate.get("sequence").and_then(Value::as_i64) == Some(sequence)
+                    })
+                    .and_then(|candidate| candidate.get("payload"))
+                    .and_then(|payload| payload.get("artifact"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let expected = crate::canonical::canonical_sha256(&intended)
+                    .map_err(|error| error.to_string())?;
+                if payload.get("artifact_sha256").and_then(Value::as_str) != Some(expected.as_str())
+                {
+                    return Err(
+                        "handoff write completion digest does not match its intent".to_string()
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn publication(
+    events: &[Value],
+    slot: &str,
+    generation: i64,
+) -> Option<(i64, Value, bool)> {
     let mut latest: Option<(i64, Value)> = None;
     let mut completed: Vec<i64> = Vec::new();
     for event in events {
@@ -318,7 +384,7 @@ fn write_noreplace(path: &Path, payload: &Value) -> Result<()> {
     Ok(())
 }
 
-fn committed_project_file(path: &Path) -> bool {
+pub(crate) fn committed_project_file(path: &Path) -> bool {
     let parent = path.parent().unwrap_or(Path::new("."));
     let Ok(Some(root)) = git_toplevel(parent) else {
         return false;

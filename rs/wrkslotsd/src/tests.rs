@@ -5052,6 +5052,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "parse-state",
             "plan",
             "rebuild",
+            "release",
             "status",
             "validate-config"
         ])
