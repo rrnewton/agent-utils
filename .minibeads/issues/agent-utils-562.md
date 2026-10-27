@@ -71,4 +71,7 @@ phase/archive-id and optional evidence bundles). Other kinds still refuse.
 legacy-validate-remove journal kind (exact fields, actor identity,
 coordinator authorization flag).
 
-[muse watermelon] State-format readers now cover config, ACTIVE, ARCHIVED, handoff sidecar, hold, and create/import/finish/legacy journals. Ownerless/absent journal kinds remain Python-only (filesystem-path input validation). Next: record these formats in validation/editions.json and take stock toward a composed read command.
+[muse watermelon] Slice 9 in progress: validation/editions.json now records the
+slice 1-8 format readers (the wrkslotsd tool note and the wrkslots format
+inventory entry name the Rust modules, the differential corpus, and the
+remaining ownerless/absent journal kinds).
