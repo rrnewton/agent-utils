@@ -921,6 +921,33 @@ means that recipient. Each recipient gets its own batches and its own
 `--min-notice-interval`, and a manager that cannot take a batch has its notices
 redirected to the coordinator.
 
+#### Large registries
+
+A pass checks only the records it judges: a record that is not running or
+starting, or is paused, is read from its file and costs no Herdr call. Up to
+eight agents are checked at once. Within a pass each Herdr question is asked
+once (one `pane list` and one `agent list`, which answer every pane and agent
+they name, at most one `workspace get` per workspace, process information at
+most once per pane), so an agent whose pane is gone costs only the few calls
+that find it missing. Every Herdr call is limited to 30 seconds, and
+`agentcloudctl list` runs at most once per orchestrator, only when a running
+agentcloud record needs it, for at most 30 seconds. Screens are read without
+the agent's lifecycle lock, so the watcher never waits behind a send, and
+watching writes nothing into the registry (in particular it no longer
+refreshes an agent's `output.json`). In a long-running watcher, an idle or
+finished agent whose visible rows, status and pane are unchanged since the
+last pass, and whose view is not scrolled back, keeps its last recent screen
+instead of reading it again; only its visible rows, a cheap read, are read.
+
+A pass starts no new check after `--pass-budget-seconds` (default 120), and a
+check still running then is set aside. Agents it had no time for are listed
+under `unchecked` in its JSON and on standard error, the pass is not `ok`, and
+their clocks neither advance nor end, so a slow pass can neither report a
+false death nor lose an episode. A pass can still run a little past its
+budget while the work it already started (a progress-metric command, the
+agentcloud listing) finishes. `--verbose` prints each agent's status and how
+long its check took, and the pass's totals, on standard error.
+
 #### What "working" means
 
 A working agent is not necessarily making progress, and one that looks still is

@@ -81,6 +81,42 @@ pub trait ProcView {
 /// The production [`ProcView`].
 pub struct LinuxProc;
 
+/// [`LinuxProc`] for one pass over many agents (#571 watch-agents-scale): the process table
+/// and `/proc/locks` are read once, when first asked for, and every agent's sample shares them;
+/// per-process facts are still read when asked for.
+#[derive(Default)]
+pub struct PassProc {
+    processes: std::sync::OnceLock<Vec<ProcInfo>>,
+    locks: std::sync::OnceLock<String>,
+}
+
+impl ProcView for PassProc {
+    fn processes(&self) -> Vec<ProcInfo> {
+        self.processes.get_or_init(|| LinuxProc.processes()).clone()
+    }
+    fn io_bytes(&self, pid: u32) -> Option<u64> {
+        LinuxProc.io_bytes(pid)
+    }
+    fn wchan(&self, pid: u32) -> Option<String> {
+        LinuxProc.wchan(pid)
+    }
+    fn cmdline(&self, pid: u32) -> Option<String> {
+        LinuxProc.cmdline(pid)
+    }
+    fn fds(&self, pid: u32) -> Vec<FdTarget> {
+        LinuxProc.fds(pid)
+    }
+    fn locks(&self) -> String {
+        self.locks.get_or_init(|| LinuxProc.locks()).clone()
+    }
+    fn read_tail(&self, path: &Path, limit: u64) -> Option<String> {
+        LinuxProc.read_tail(path, limit)
+    }
+    fn started_at(&self, start_ticks: u64) -> Option<f64> {
+        LinuxProc.started_at(start_ticks)
+    }
+}
+
 fn parse_stat(pid: u32, text: &str) -> Option<ProcInfo> {
     let close = text.rfind(')')?;
     let fields: Vec<&str> = text[close + 1..].split_whitespace().collect();

@@ -424,6 +424,12 @@ struct WatchAgents {
     /// A step runner's per-step profile CSV (columns step and elapsed_s) recording how long each gate step takes; a step running past the p95 of at least 5 recorded runs is reported as over-expected; repeatable (default: none, no step is judged against history)
     #[arg(long = "step-history", value_name = "CSV")]
     step_history: Vec<PathBuf>,
+    /// Seconds one pass may spend checking agents, from 10 to 3600 (default: 120). Agents still unchecked when it runs out are listed under "unchecked" in the report (and on standard error), the pass is not ok, and their episodes neither advance nor end; each Herdr call is also limited to 30 s
+    #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(10..=3600), value_name = "SECONDS")]
+    pass_budget_seconds: u64,
+    /// Say on standard error what each pass checks: every agent's status and how long its check took, and the pass's totals
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Args)]
@@ -1858,6 +1864,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::WatchAgents(value) => {
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
+            // The probe only looks, so it keeps Herdr's read-only answers for each pass; the
+            // notifier types into the coordinator and always asks Herdr afresh.
+            let observer = client
+                .clone()
+                .snapshotting(crate::agent_watch::PASS_CALL_TIMEOUT);
             let markers = if value.done_markers.is_empty() {
                 vec!["DONE:".to_owned(), "BLOCKED:".to_owned()]
             } else {
@@ -1891,10 +1902,15 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 step_history: crate::work_state::StepHistory::load(&value.step_history),
             };
             let mut probe = crate::agent_watch::ManagedProbe::new(
-                &client,
+                &observer,
                 &args.registry,
                 &options.coordinator,
-            );
+            )
+            .with_budget(
+                Some(Duration::from_secs(value.pass_budget_seconds)),
+                value.verbose,
+            )
+            .keeping_screens(!value.once);
             let mut notifier = crate::agent_watch::ManagedNotifier::new(&client, &args.registry);
             let report = crate::agent_watch::watch_agents(
                 &mut probe,
