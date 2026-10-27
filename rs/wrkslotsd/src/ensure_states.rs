@@ -90,10 +90,10 @@ fn refuse_symlink(path: &Path, label: &str) -> Result<()> {
     }
 }
 
-fn escape_ascii_json(text: &str) -> String {
+pub(crate) fn escape_ascii_json(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if (ch as u32) < 0x80 {
+        if (ch as u32) < 0x7f {
             out.push(ch);
         } else {
             let mut buffer = [0u16; 2];

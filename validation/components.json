@@ -326,6 +326,7 @@
         "py/wrkslots/tests/test_git_storage_state_rust.py",
         "py/wrkslots/tests/test_global_state_rust.py",
         "py/wrkslots/tests/test_handoff_state_rust.py",
+        "py/wrkslots/tests/test_handoff_write_rust.py",
         "py/wrkslots/tests/test_heartbeat_write_rust.py",
         "py/wrkslots/tests/test_hold_state_rust.py",
         "py/wrkslots/tests/test_hold_write_rust.py",

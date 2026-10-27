@@ -26,11 +26,11 @@ const LEGACY_SCHEMA: i64 = 1;
 const HANDOFF_BYTES_LIMIT: usize = 1024 * 1024;
 const SIDECAR_BYTES_LIMIT: usize = HANDOFF_BYTES_LIMIT * 6 + 64 * 1024;
 
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    size: u64,
-    sha256: String,
+pub(crate) struct FileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
 }
 
 fn bound_text(limit: usize) -> String {
@@ -41,7 +41,7 @@ fn bound_text(limit: usize) -> String {
     }
 }
 
-fn read_regular_file_identity(
+pub(crate) fn read_regular_file_identity(
     path: &Path,
     label: &str,
     limit: usize,
@@ -269,7 +269,7 @@ fn identity_from_obj(value: &Value, label: &str) -> Result<Option<FileIdentity>>
     }))
 }
 
-fn identity_to_obj(identity: &FileIdentity) -> Value {
+pub(crate) fn identity_to_obj(identity: &FileIdentity) -> Value {
     json!({
         "identity": [identity.device, identity.inode],
         "size": identity.size,
@@ -287,7 +287,7 @@ fn resolve_loose(path: &Path) -> PathBuf {
     }
 }
 
-fn sidecar_path(control: &Path, machine: &str, slot: &str, generation: i64) -> PathBuf {
+pub(crate) fn sidecar_path(control: &Path, machine: &str, slot: &str, generation: i64) -> PathBuf {
     control.join(format!(
         "HANDOFF.{}.{}.{}.{}.{}.json",
         machine.chars().count(),
