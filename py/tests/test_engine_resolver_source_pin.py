@@ -10,6 +10,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 RESOLVER = AU_ROOT / "common" / "bin" / "engine-resolver"
@@ -524,3 +526,97 @@ def test_build_failure_never_runs_previous_binary_or_python(tmp_path: Path) -> N
     assert "Cargo build failed; no cached Rust artifact was executed" in failed.stderr
     assert "v1" not in failed.stdout
     assert "PYTHON_FALLBACK_RAN" not in failed.stdout
+
+
+CACHEDIR_TAG_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
+
+
+@pytest.mark.parametrize("state", ["absent", "empty-untagged", "tagged", "symlinked-tag"])
+def test_missing_cache_clean_accepts_absent_untagged_or_tagged_target_root(
+    tmp_path: Path, state: str
+) -> None:
+    """Cargo refuses to clean an existing untagged target root; the launcher's own one is tagged."""
+    root = _build_sandbox(tmp_path)
+    target_root = root / "rs" / "target"
+    tag = target_root / "CACHEDIR.TAG"
+    existing_tag = CACHEDIR_TAG_SIGNATURE + "\n# written before the launcher ran\n"
+    if state != "absent":
+        target_root.mkdir()
+    if state == "tagged":
+        tag.write_text(existing_tag)
+    if state == "symlinked-tag":
+        # Cargo refuses a symlinked tag even when its target is valid.
+        elsewhere = tmp_path / "valid-tag"
+        elsewhere.write_text(existing_tag)
+        tag.symlink_to(elsewhere)
+
+    first = _run_launcher(root)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == "v1\n"
+    assert "discarding missing" in first.stderr
+    assert "without cargo clean" not in first.stderr
+    assert tag.read_text().startswith(CACHEDIR_TAG_SIGNATURE)
+    assert not tag.is_symlink()
+    if state == "tagged":
+        assert tag.read_text() == existing_tag
+
+
+def test_untaggable_target_root_removes_package_artifacts_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """A linked, untagged target root is never tagged, yet a stale package still rebuilds."""
+    root = _build_sandbox(tmp_path)
+    shared = tmp_path / "shared-target"
+    shared.mkdir()
+    (root / "rs" / "target").symlink_to(shared)
+
+    first = _run_launcher(root)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == "v1\n"
+    assert "without cargo clean" in first.stderr
+    assert not (shared / "CACHEDIR.TAG").exists()
+
+    library = root / "rs" / "tick-hub" / "src" / "lib.rs"
+    original_stat = library.stat()
+    library.write_text('pub fn message() -> &\'static str { "v2" }\n')
+    os.utime(library, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    changed = _run_launcher(root)
+    assert changed.returncode == 0, changed.stderr
+    assert changed.stdout == "v2\n"
+    assert "without cargo clean" in changed.stderr
+    assert not (shared / "CACHEDIR.TAG").exists()
+
+
+def test_cargo_clean_failure_prints_cargo_reason(tmp_path: Path) -> None:
+    """A clean refusal is shown, not silenced by --quiet, and nothing cached runs."""
+    root = _build_sandbox(tmp_path)
+    real_cargo = shutil.which("cargo")
+    assert real_cargo is not None
+    wrapper_dir = tmp_path / "refusing cargo"
+    wrapper_dir.mkdir()
+    clean_args = tmp_path / "clean-args"
+    wrapper = wrapper_dir / "cargo"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = clean ]; then\n'
+        '  printf "%s\\n" "$*" >"$AGENT_UTILS_TEST_CLEAN_ARGS"\n'
+        '  echo "error: synthetic clean refusal" >&2\n'
+        "  exit 101\n"
+        "fi\n"
+        'exec "$AGENT_UTILS_TEST_REAL_CARGO" "$@"\n'
+    )
+    _chmod_x(wrapper)
+
+    failed = _run_launcher(
+        root,
+        extra_env={
+            "PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"],
+            "AGENT_UTILS_TEST_REAL_CARGO": real_cargo,
+            "AGENT_UTILS_TEST_CLEAN_ARGS": str(clean_args),
+        },
+    )
+    assert failed.returncode != 0
+    assert failed.stdout == ""
+    assert "error: synthetic clean refusal" in failed.stderr
+    assert "Cargo clean failed; no cached Rust artifact was executed" in failed.stderr
+    assert "--quiet" not in clean_args.read_text()

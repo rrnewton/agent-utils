@@ -644,6 +644,41 @@ def _stream_lines(process: subprocess.Popen[str]) -> Iterable[tuple[float, str]]
         yield time.monotonic(), line.rstrip("\n")
 
 
+CACHEDIR_TAG = (
+    "Signature: 8a477f597d28d172789f06886806bc55\n"
+    "# This file is a cache directory tag created by agent-utils scripts/case_timings.py.\n"
+    "# For information about cache directory tags see https://bford.info/cachedir/\n"
+)
+
+
+def _tag_created_target_parent(cargo_args: Sequence[str]) -> None:
+    """Create a nested ``--target-dir``'s missing parent as a tagged cache directory.
+
+    Cargo writes ``CACHEDIR.TAG`` only into the target directory it creates. Given
+    ``--target-dir rs/target/validation-tests`` before ``rs/target`` exists, it creates
+    ``rs/target`` untagged, and the tracked launchers' later ``cargo clean --target-dir rs/target``
+    refuses it. A parent created here holds nothing but the target directory, so it is a cache.
+    """
+
+    target_dir: str | None = None
+    for index, arg in enumerate(cargo_args):
+        if arg == "--target-dir" and index + 1 < len(cargo_args):
+            target_dir = cargo_args[index + 1]
+        elif arg.startswith("--target-dir="):
+            target_dir = arg.split("=", 1)[1]
+    if not target_dir:
+        return
+    parent = Path(target_dir).parent
+    if os.path.lexists(parent):
+        return
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=parent, prefix=".CACHEDIR.TAG.", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(CACHEDIR_TAG)
+    os.replace(handle.name, parent / "CACHEDIR.TAG")
+
+
 def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
     """Run ``cargo test`` with per-case timings; see the module docstring.
 
@@ -662,6 +697,7 @@ def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
     else:
         cargo_args, test_args = rest, []
     resolved_gate = gate if gate is not None else current_gate()
+    _tag_created_target_parent(cargo_args)
 
     build = subprocess.Popen(
         [argv[0], "test", *cargo_args, "--no-run", "--message-format", "json"],
