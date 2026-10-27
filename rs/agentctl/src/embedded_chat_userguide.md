@@ -2458,7 +2458,8 @@ AGENTCTL_HOME="$ROOT/home" "$AGENTCTL" --registry "$ROOT/registry" \
   chat run --bridge-state "$ROOT/bridge" 2>>"$ROOT/logs/bridge.log"
 ```
 
-Run `chat run` in its own terminal or as its own user unit. Post a message in the
+Run `chat run` in its own terminal or as its own user unit; a unit that should
+keep the bridge up needs `Restart=on-failure` (see "Service management"). Post a message in the
 channel as an allowed sender: the bridge reacts with 👀 once the request is
 admitted, types the prompt into the `slack-test` pane and adds ✅ once that
 delivery is verified, and posts the agent's reply into the message's thread as
@@ -2469,7 +2470,43 @@ logs show each step. To stop the test, stop `chat run`, then the agent; delete
 ## Service management
 
 `chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM.
-A service manager should restart it on failure and use the same state directory.
+Run it under a service manager that restarts it on failure, with the same state
+directory: `Restart=on-failure` in a systemd unit, as in the example below. A
+unit without a restart policy leaves chat down after the first failure the
+service cannot recover from, until someone notices. A transient unit gets the
+same policy from its command line:
+
+```sh
+systemd-run --user --unit=agentctl-chat-project \
+  -p Restart=on-failure -p RestartSec=5 \
+  /absolute/path/agentctl --registry /work/project/.agentctl \
+  chat run --bridge-state /home/USER/.local/state/agentctl/project-chat
+```
+
+A transient unit does not survive a reboot or a restart of the user manager;
+the installed unit below does.
+
+Slow or briefly failing local tools do not stop `chat run`. A Herdr call that
+fails or times out, or finds Herdr unavailable, ends only the loop that types
+prompts and reads replies: `chat run` logs a line starting `agentctl: warning:
+the chat owner loop failed:`, waits, and starts that loop again from the
+durable state, as a new `chat run` would, while the provider worker keeps
+admitting messages. The wait follows the provider reconnect rule below (1
+second, doubling up to 60, back to 1 after a loop that ran for 60 seconds).
+Each operation on the agent registry also checks with `git check-ignore` that
+the project's `.agentctl/profiles.json` is ignored by Git. A check that runs
+past its 5-second timeout, cannot start, or is killed does not count as an
+answer: once Git has said the file is ignored, that answer stands, Git is asked
+again after 30 seconds (doubling to 10 minutes while it keeps failing), and
+the service logs one warning and one line when Git answers again. Git saying
+the file is not ignored still refuses at once. `chat status` reports both
+under `service_health`: `owner_loop` while the loop has failed and not yet run
+for 60 seconds since it started again, and `profile_policy` while Git is not
+answering. Each holds `down_since_millis`, `failures`, `last_failure_at_millis`,
+`last_error_class` and `last_error`, and is `null` while that part works. The
+running service keeps them in `service-health.json` in the state directory.
+A failure the service cannot recover from, such as a damaged state directory,
+still ends `chat run` with an error, which is what the restart policy is for.
 Size task and memory limits for the selected provider implementation; those
 costs are outside the provider-neutral host and can differ substantially between
 plugins. Disable swap for a latency-sensitive bridge only after giving the

@@ -4816,6 +4816,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         })
     }
 
+    /// The agent registry directory this manager works in.
+    pub(crate) fn registry(&self) -> &Path {
+        &self.registry
+    }
+
     /// Select the `agentcloudctl` and `agentterm` executables for agentcloud agents.
     #[must_use]
     pub fn with_cloud_tools(mut self, tools: CloudTools) -> Self {
@@ -11425,6 +11430,9 @@ pub(crate) mod tests {
     pub(crate) struct Fixture {
         pub(crate) root: PathBuf,
         pub(crate) client: Fake,
+        /// The registry directory's name below `root`: `registry`, or `.agentctl` for a test
+        /// that needs the project's profile config beside it.
+        pub(crate) registry_name: &'static str,
     }
     impl Fixture {
         pub(crate) fn new() -> Self {
@@ -11536,10 +11544,16 @@ pub(crate) mod tests {
                     on_run: Mutex::new(None),
                 },
                 root,
+                registry_name: "registry",
             }
         }
+        /// This fixture with its registry at `root/<name>`.
+        pub(crate) fn with_registry_name(mut self, name: &'static str) -> Self {
+            self.registry_name = name;
+            self
+        }
         pub(crate) fn manager(&self) -> ManagedAgents<'_, Fake> {
-            ManagedAgents::new(&self.client, &self.root.join("registry"))
+            ManagedAgents::new(&self.client, &self.root.join(self.registry_name))
                 .unwrap()
                 .with_inherited_workspace(None)
         }

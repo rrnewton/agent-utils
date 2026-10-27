@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentError;
+use crate::error::AdapterError;
 use crate::subagents::CloudLaunch;
 
 pub(crate) const SCHEMA: &str = "agentctl-profiles/v1";
@@ -358,10 +359,281 @@ pub(crate) fn validate_structured_harness_argument_conflicts(
     Ok(())
 }
 
+/// How long one `git check-ignore` may run before it counts as no answer.
+const IGNORE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+/// The waits between attempts when git does not answer and no earlier answer can stand in.
+const IGNORE_CHECK_RETRIES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
+/// After git fails to answer, how long the last answer it gave stands before git is asked again.
+/// It doubles with each further failure, up to `IGNORE_CHECK_BACKOFF_MAX`.
+const IGNORE_CHECK_BACKOFF_MIN: Duration = Duration::from_secs(30);
+const IGNORE_CHECK_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+/// How `require_ignored` asks git: the production values above, or a test's.
+#[derive(Clone, Debug)]
+struct IgnoreCheckPolicy {
+    /// `None` runs the verified system Git; a test names its own stand-in.
+    git: Option<PathBuf>,
+    timeout: Duration,
+    retries: Vec<Duration>,
+    backoff_min: Duration,
+    backoff_max: Duration,
+}
+
+impl Default for IgnoreCheckPolicy {
+    fn default() -> Self {
+        Self {
+            git: None,
+            timeout: IGNORE_CHECK_TIMEOUT,
+            retries: IGNORE_CHECK_RETRIES.to_vec(),
+            backoff_min: IGNORE_CHECK_BACKOFF_MIN,
+            backoff_max: IGNORE_CHECK_BACKOFF_MAX,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_IGNORE_CHECK: std::cell::RefCell<Option<IgnoreCheckPolicy>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A stand-in for Git in tests, and the policy that runs it on this thread.
+#[cfg(test)]
+pub(crate) mod test_git {
+    use super::{IgnoreCheckPolicy, TEST_IGNORE_CHECK};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    /// A Git that runs the system Git, except that while its `hang` file exists it sleeps for
+    /// 30 s instead, past any timeout a test sets.
+    pub(crate) struct HangingGit {
+        pub(crate) executable: PathBuf,
+        pub(crate) hang: PathBuf,
+    }
+
+    impl HangingGit {
+        /// Write the stand-in into `directory`.
+        pub(crate) fn new(directory: &Path) -> Self {
+            let executable = directory.join("hanging-git");
+            let hang = directory.join("git-hangs");
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nif [ -e '{}' ]; then exec sleep 30; fi\nexec {} \"$@\"\n",
+                    hang.display(),
+                    super::SYSTEM_GIT
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            Self { executable, hang }
+        }
+
+        pub(crate) fn hang(&self, hang: bool) {
+            if hang {
+                fs::write(&self.hang, b"").unwrap();
+            } else {
+                let _ = fs::remove_file(&self.hang);
+            }
+        }
+
+        /// Ask this Git on this thread until the guard drops, timing a check out after
+        /// `timeout`, retrying once after 50 ms with no earlier answer, and backing off from
+        /// `backoff` up to twice that.
+        pub(crate) fn install(&self, timeout: Duration, backoff: Duration) -> Installed {
+            TEST_IGNORE_CHECK.with(|policy| {
+                *policy.borrow_mut() = Some(IgnoreCheckPolicy {
+                    git: Some(self.executable.clone()),
+                    timeout,
+                    retries: vec![Duration::from_millis(50)],
+                    backoff_min: backoff,
+                    backoff_max: backoff * 2,
+                });
+            });
+            Installed
+        }
+    }
+
+    /// Restores the production policy on drop.
+    pub(crate) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            TEST_IGNORE_CHECK.with(|policy| *policy.borrow_mut() = None);
+        }
+    }
+}
+
+fn ignore_check_policy() -> IgnoreCheckPolicy {
+    #[cfg(test)]
+    if let Some(policy) = TEST_IGNORE_CHECK.with(|policy| policy.borrow().clone()) {
+        return policy;
+    }
+    IgnoreCheckPolicy::default()
+}
+
+/// The checks of one profile config that git did not answer since it last did, as `chat status`
+/// reports them (#581 bridge-git-timeout-fatal).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IgnoreCheckFailure {
+    /// When the first of these checks failed, in Unix milliseconds.
+    pub(crate) since_millis: u64,
+    pub(crate) failures: u64,
+    pub(crate) last_at_millis: u64,
+    pub(crate) last_error: String,
+}
+
+/// What this process last learned from git about one profile config.
+#[derive(Debug, Default)]
+struct IgnoreCheckState {
+    /// Git last said the config is ignored.
+    ignored: bool,
+    /// Set from git's first failure to answer until it answers again.
+    failure: Option<IgnoreCheckFailure>,
+    /// While git is failing, it is not asked again before this; the last answer stands.
+    retry_at: Option<Instant>,
+    backoff: Duration,
+}
+
+type IgnoreCheckKey = (PathBuf, PathBuf);
+
+static IGNORE_CHECKS: std::sync::Mutex<BTreeMap<IgnoreCheckKey, IgnoreCheckState>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn ignore_checks() -> std::sync::MutexGuard<'static, BTreeMap<IgnoreCheckKey, IgnoreCheckState>> {
+    IGNORE_CHECKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The checks git has not answered for the profile config beside `registry`, while it is not
+/// answering and its last answer stands in. `None` when it answered the last check, or when this
+/// process has not checked that config.
+pub(crate) fn ignore_check_failure(registry: &Path) -> Option<IgnoreCheckFailure> {
+    let root = registry.parent()?;
+    ignore_checks()
+        .get(&(root.to_path_buf(), PathBuf::from(PROFILE_PATH)))
+        .and_then(|state| state.failure.clone())
+}
+
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Log one line as `chat run` logs, so a long-lived service shows when git stops and starts
+/// answering; a short command shows it on stderr.
+fn ignore_check_log(line: impl fmt::Display) {
+    crate::chat_service::service_log(line);
+}
+
+/// Refuse unless Git ignores the profile config at `path` below `cwd`.
+///
+/// A check git does not answer, because it timed out, could not be started, or was killed, is
+/// not an answer that the config stopped being ignored. When git said it was ignored earlier in
+/// this process, that answer stands, git is asked again only after a backoff (30 s, doubling to
+/// 10 min), and the failure is logged once and reported by [`ignore_check_failure`], so a slow
+/// git on a loaded host never stops a long-lived `chat run` (#581 bridge-git-timeout-fatal).
+/// With no earlier answer the check is tried three times before it fails. Git saying the config
+/// is not ignored always refuses at once.
 fn require_ignored(cwd: &Path, path: &Path) -> Result<(), AgentError> {
     let relative = path
         .strip_prefix(cwd)
         .map_err(|_| fail("profile config must remain below the selected working directory"))?;
+    let policy = ignore_check_policy();
+    let key = (cwd.to_path_buf(), relative.to_path_buf());
+    if ignore_checks()
+        .get(&key)
+        .is_some_and(|state| state.ignored && state.retry_at.is_some_and(|at| Instant::now() < at))
+    {
+        return Ok(());
+    }
+    let git = match &policy.git {
+        Some(git) => git.clone(),
+        None => verified_system_git()?,
+    };
+    let mut retries = policy.retries.iter();
+    let answer = loop {
+        match ask_check_ignore(&git, cwd, relative, policy.timeout) {
+            Ok(ignored) => break Ok(ignored),
+            Err(error) => {
+                let stands_in = ignore_checks().get(&key).is_some_and(|state| state.ignored);
+                match retries.next() {
+                    Some(wait) if !stands_in => thread::sleep(*wait),
+                    _ => break Err(error),
+                }
+            }
+        }
+    };
+    let mut checks = ignore_checks();
+    match answer {
+        Ok(true) => {
+            let state = checks.entry(key).or_default();
+            state.ignored = true;
+            state.retry_at = None;
+            state.backoff = Duration::ZERO;
+            if let Some(failure) = state.failure.take() {
+                ignore_check_log(format_args!(
+                    "agentctl: git check-ignore answers again for {} after {} failed checks",
+                    path.display(),
+                    failure.failures
+                ));
+            }
+            Ok(())
+        }
+        Ok(false) => {
+            checks.remove(&key);
+            Err(fail(format!(
+                "profile config is not ignored by Git: {}; add .agentctl/ to .gitignore",
+                relative.display()
+            )))
+        }
+        Err(error) => {
+            let Some(state) = checks.get_mut(&key).filter(|state| state.ignored) else {
+                let attempts = policy.retries.len() + 1;
+                return Err(AgentError::Client(AdapterError::unavailable(format!(
+                    "cannot verify that profile config is ignored: {error} ({attempts} attempts)"
+                ))));
+            };
+            state.backoff = if state.backoff.is_zero() {
+                policy.backoff_min
+            } else {
+                (state.backoff * 2).min(policy.backoff_max)
+            };
+            state.retry_at = Some(Instant::now() + state.backoff);
+            let now = unix_millis_now();
+            match state.failure.as_mut() {
+                Some(failure) => {
+                    failure.failures = failure.failures.saturating_add(1);
+                    failure.last_at_millis = now.max(failure.since_millis);
+                    failure.last_error = error;
+                }
+                None => {
+                    ignore_check_log(format_args!(
+                        "agentctl: warning: {error}; keeping the earlier answer that {} is \
+                         ignored and asking git again in {}",
+                        path.display(),
+                        seconds_or_millis(state.backoff)
+                    ));
+                    state.failure = Some(IgnoreCheckFailure {
+                        since_millis: now,
+                        failures: 1,
+                        last_at_millis: now,
+                        last_error: error,
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn verified_system_git() -> Result<PathBuf, AgentError> {
     let git = fs::canonicalize(SYSTEM_GIT).map_err(|error| {
         fail(format!(
             "cannot verify the system Git executable {SYSTEM_GIT}: {error}"
@@ -383,6 +655,18 @@ fn require_ignored(cwd: &Path, path: &Path) -> Result<(), AgentError> {
             git.display()
         )));
     }
+    Ok(git)
+}
+
+/// Ask `git check-ignore` whether `relative` below `cwd` is ignored: `Ok(true)` when it exits 0,
+/// `Ok(false)` for any other exit status, and `Err` when it gives no answer: it cannot be
+/// started or waited for, runs past `timeout`, or is killed by a signal.
+fn ask_check_ignore(
+    git: &Path,
+    cwd: &Path,
+    relative: &Path,
+    timeout: Duration,
+) -> Result<bool, String> {
     let mut child = Command::new(git)
         .args(["-C"])
         .arg(cwd)
@@ -392,33 +676,41 @@ fn require_ignored(cwd: &Path, path: &Path) -> Result<(), AgentError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| {
-            fail(format!(
-                "cannot verify that profile config is ignored: {error}"
-            ))
-        })?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+        .map_err(|error| format!("cannot start git check-ignore: {error}"))?;
+    let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| fail(format!("cannot wait for git check-ignore: {error}")))?
-        {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("cannot wait for git check-ignore: {error}"));
+            }
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(fail("git check-ignore timed out after 5 seconds"));
+            return Err(format!(
+                "git check-ignore timed out after {}",
+                seconds_or_millis(timeout)
+            ));
         }
         thread::sleep(Duration::from_millis(10));
     };
-    if !status.success() {
-        return Err(fail(format!(
-            "profile config is not ignored by Git: {}; add .agentctl/ to .gitignore",
-            relative.display()
-        )));
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(_) => Ok(false),
+        None => Err(format!("git check-ignore was killed: {status}")),
     }
-    Ok(())
+}
+
+fn seconds_or_millis(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{} seconds", duration.as_secs())
+    } else {
+        format!("{} ms", duration.as_millis())
+    }
 }
 
 fn validate_muse_headless_arguments(name: &str, argv: &[String]) -> Result<(), AgentError> {
@@ -1068,6 +1360,105 @@ mod tests {
         .unwrap();
         let error = workspace_for_registry(&directory).unwrap_err();
         assert!(error.to_string().contains("duplicate key \"workspace\""));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_git_that_stops_answering_keeps_the_last_answer_and_backs_off() {
+        // #581 bridge-git-timeout-fatal: a long-lived chat run exited when one check of its
+        // registry's profile config timed out on a loaded host.
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-profiles-hang-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        assert!(Command::new(SYSTEM_GIT)
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join(".gitignore"), ".agentctl/\n").unwrap();
+        let registry = root.join(".agentctl");
+        fs::create_dir(&registry).unwrap();
+        fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = registry.join("profiles.json");
+        fs::write(
+            &path,
+            r#"{"schema":"agentctl-profiles/v1","workspace":"project-agents","profiles":{}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let git = test_git::HangingGit::new(&root);
+        let timeout = Duration::from_millis(300);
+        let backoff = Duration::from_millis(400);
+        let _installed = git.install(timeout, backoff);
+        let workspace = || workspace_for_registry(&registry);
+
+        assert_eq!(workspace().unwrap().as_deref(), Some("project-agents"));
+        assert_eq!(ignore_check_failure(&registry), None);
+
+        // Git stops answering: the earlier answer stands, and the failure is reported.
+        git.hang(true);
+        let asked = Instant::now();
+        assert_eq!(workspace().unwrap().as_deref(), Some("project-agents"));
+        assert!(asked.elapsed() >= timeout, "{:?}", asked.elapsed());
+        let failure = ignore_check_failure(&registry).expect("the failure is reported");
+        assert_eq!(failure.failures, 1);
+        assert!(
+            failure.last_error.contains("timed out after 300 ms"),
+            "{}",
+            failure.last_error
+        );
+        // Within the backoff git is not asked: the answer comes at once.
+        let asked = Instant::now();
+        assert_eq!(workspace().unwrap().as_deref(), Some("project-agents"));
+        assert!(asked.elapsed() < timeout, "{:?}", asked.elapsed());
+        assert_eq!(ignore_check_failure(&registry).unwrap().failures, 1);
+        // After it, git is asked again, fails again, and the backoff doubles.
+        thread::sleep(backoff);
+        assert_eq!(workspace().unwrap().as_deref(), Some("project-agents"));
+        let failure = ignore_check_failure(&registry).unwrap();
+        assert_eq!(failure.failures, 2);
+        thread::sleep(backoff);
+        let asked = Instant::now();
+        workspace().unwrap();
+        assert!(
+            asked.elapsed() < timeout,
+            "the doubled backoff had not run out"
+        );
+
+        // Git answers again once the backoff runs out, and the failure clears.
+        git.hang(false);
+        thread::sleep(backoff * 2);
+        assert_eq!(workspace().unwrap().as_deref(), Some("project-agents"));
+        assert_eq!(ignore_check_failure(&registry), None);
+
+        // Git saying the config is not ignored refuses at once and forgets the earlier answer...
+        fs::remove_file(root.join(".gitignore")).unwrap();
+        let error = workspace().unwrap_err();
+        assert!(
+            error.to_string().contains("is not ignored by Git"),
+            "{error}"
+        );
+        assert!(matches!(error, AgentError::Delivery(_)), "{error:?}");
+        // ...so a check git does not answer then has nothing to stand in, and fails after its
+        // retry as an unavailable runtime, which chat run's owner loop starts again after.
+        git.hang(true);
+        let error = workspace().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("timed out after 300 ms (2 attempts)"),
+            "{error}"
+        );
+        assert!(
+            matches!(&error, AgentError::Client(client) if client.kind() == crate::error::AdapterErrorKind::Unavailable),
+            "{error:?}"
+        );
+        assert_eq!(ignore_check_failure(&registry), None);
+        git.hang(false);
         fs::remove_dir_all(root).unwrap();
     }
 

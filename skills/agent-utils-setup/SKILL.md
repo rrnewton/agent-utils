@@ -416,6 +416,14 @@ guide's Setup section). `DAGRUN_ENGINE=python agentctl chat launch --config chat
 pane is not an agentctl session, so `agentctl send coordinator` (and so tick-hub delivery) cannot
 reach it; if the owner prefers it anyway, say so and record it in the harness `AGENTS.md`.
 
+Run a long-lived bridge (`agentctl chat run`) as a user service that restarts on failure, and
+record its unit name in the harness `AGENTS.md`: an installed unit with `Restart=on-failure`
+(the agentctl chat userguide's "Service management" has one), or a transient one started with
+`systemd-run --user --unit=<repo>-chat -p Restart=on-failure -p RestartSec=5 <agentctl> chat run
+...`. Never leave the restart policy out: a bridge whose unit has none stops at its first
+unrecoverable failure, and the owner's messages stop reaching the coordinator until someone
+notices. A transient unit is gone after a reboot; note how to start it again.
+
 If the owner instead asks you to "attach yourself to Herdr", follow the agentctl skill's section
 of that name: a session that can be viewed remotely registers itself with `agentctl attach-self`
 from `$H`; a local terminal session cannot be moved and hands off to the started coordinator.
