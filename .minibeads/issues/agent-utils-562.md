@@ -58,4 +58,6 @@ checkout path/authority, emitting records as stored.
 file read, strict duplicate-refusing JSON, schema 1/2 provenance rules,
 content digest binding) and `_handoff_artifact_to_obj` output.
 
-[muse watermelon] Next slice: `parse-hold` for the slot-hold file format.
+[muse watermelon] Slice 6 in progress: `wrkslotsd parse-hold` reproduces
+`_load_hold_snapshot` for the HOLD.<machine>.<slot>.json record
+(absent = null; exact keys, schema, filename identity, timestamp, reason).

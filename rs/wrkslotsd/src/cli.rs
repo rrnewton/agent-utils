@@ -92,6 +92,18 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         slot: String,
     },
+    /// Validate one slot's hold record and print it as stored (or null)
+    ParseHold {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Slot whose hold record should be read
+        #[arg(long, value_name = "NAME")]
+        slot: String,
+    },
     /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
     ParseConfig {
         /// Configuration document to parse; it is never modified
@@ -231,6 +243,23 @@ pub fn run() -> u8 {
                 }
             }
         }
+        Command::ParseHold {
+            root,
+            machine,
+            slot,
+        } => match crate::hold_state::parse_hold(root.as_deref(), machine.as_deref(), &slot) {
+            Ok(value) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
         Command::ParseConfig { config } => {
             let parsed = std::fs::read_to_string(&config)
                 .map_err(|error| {
