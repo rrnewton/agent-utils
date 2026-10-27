@@ -5991,6 +5991,29 @@ test("with no token the page IS the sign-in screen, not the interface behind a n
   );
 });
 
+test("a pending audio suspension honors the next read and a later stop", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  const audio = page.pure("readAloudAudioContext")();
+  const pending = [];
+  audio.suspend = () => new Promise((resolve) => pending.push(() => {
+    audio.state = "suspended";
+    resolve();
+  }));
+  page.pure("quietReadAloudContext")();
+  page.pure("readAloudAudioContext")();
+  pending.shift()();
+  await page.settle();
+  assert.equal(audio.state, "running", "the preceding read's suspension silenced the next read");
+
+  page.pure("quietReadAloudContext")();
+  page.pure("readAloudAudioContext")();
+  page.pure("quietReadAloudContext")();
+  for (const finish of pending.splice(0)) finish();
+  await page.settle();
+  assert.equal(audio.state, "suspended", "an old suspension resumed audio after Stop");
+});
+
 test("the sign-in screen is compact and names the server receiving the token", () => {
   const signin = HTML.slice(
     HTML.indexOf('id="screen-signin"'),

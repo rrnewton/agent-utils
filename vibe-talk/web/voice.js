@@ -37613,6 +37613,7 @@ const CLOUD_CAUSES = [
 ];
 
 let readAloudContext = null;
+let readAloudWantsOutput = false;
 
 /**
  * The context read-aloud plays through, resumed. Null where a fetch cannot be streamed into Web
@@ -37635,6 +37636,7 @@ function readAloudAudioContext() {
   }
   // Not while the reader has paused: the clock stays stopped until they play. `#376`.
   const paused = nowPlaying !== null && nowPlaying.paused === true;
+  readAloudWantsOutput = !paused;
   if (readAloudContext.state === "suspended" && !paused && typeof readAloudContext.resume === "function") {
     readAloudContext.resume().catch(() => {});
   }
@@ -37643,9 +37645,17 @@ function readAloudAudioContext() {
 
 /** Nothing is being read: let the device's audio output go rather than hold it open in silence. */
 function quietReadAloudContext() {
+  readAloudWantsOutput = false;
   if (readAloudContext !== null && readAloudContext.state === "running"
     && typeof readAloudContext.suspend === "function") {
-    readAloudContext.suspend().catch(() => {});
+    const context = readAloudContext;
+    context.suspend().then(() => {
+      // A new read may have asked to resume before this asynchronous suspension completed.
+      // Honor the latest intent, including a subsequent Stop or Pause, when it settles.
+      if (readAloudWantsOutput && readAloudContext === context && typeof context.resume === "function") {
+        context.resume().catch(() => {});
+      }
+    }).catch(() => {});
   }
 }
 
@@ -38957,7 +38967,7 @@ function pauseReading() {
     playing.pauseTransport();
   } else if (audio && audio.hearsSpeech === true) {
     if (readAloudContext === null || typeof readAloudContext.suspend !== "function") return;
-    readAloudContext.suspend().catch(() => {});
+    quietReadAloudContext();
   } else if (audio && typeof audio.pause === "function") {
     audio.pause();
   } else {
@@ -39106,6 +39116,7 @@ function resumeReading() {
     held.resumeTransport();
   } else if (audio && audio.hearsSpeech === true) {
     if (readAloudContext !== null && typeof readAloudContext.resume === "function") {
+      readAloudAudioContext();
       const begun = readAloudContext.resume();
       if (begun && typeof begun.catch === "function") begun.catch(again);
     }
