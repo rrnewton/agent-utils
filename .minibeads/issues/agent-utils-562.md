@@ -92,4 +92,7 @@ ownerless-agent-remove, including its directory-identity check (device,
 inode, mount id) on a present target and repository resolution. The
 ownerless-clone, cache-relocate, and absent-agent-row kinds remain.
 
-[muse watermelon] Next slice: the ownerless-clone-remove journal kind (same target/fenced/identity pattern, clone authorization).
+[muse watermelon] Slice 13 in progress: `parse-journal` also covers
+ownerless-clone-remove (clone authorization, target/fenced agreement,
+directory identity). Remaining: ownerless-agent-cache-relocate and
+recover-absent-agent-row.

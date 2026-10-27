@@ -1122,6 +1122,158 @@ fn ownerless_agent_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
     Ok(())
 }
 
+fn ownerless_clone_authorization(value: &Value) -> Result<(String, (i64, i64, i64))> {
+    let label = "ownerless clone authorization";
+    let raw = as_mapping(value, label)?;
+    exact_keys(
+        raw,
+        &[
+            "path",
+            "identity",
+            "actor",
+            "remote_urls",
+            "inventory_sha256",
+            "handoff_sha256s",
+            "discard_ignored",
+            "recorded_at",
+        ],
+        &[],
+        label,
+    )?;
+    let mut identity = Vec::new();
+    for item in as_list(&raw["identity"], "ownerless clone directory identity")? {
+        identity.push(as_int(item, "ownerless clone directory identity", 0)?);
+    }
+    if identity.len() != 3 {
+        return Err("ownerless clone directory identity must have three fields".to_owned());
+    }
+    if identity_from_obj(&raw["actor"], "ownerless clone recovery actor")?.is_none() {
+        return Err("ownerless clone recovery has no actor".to_owned());
+    }
+    for url in as_mapping(&raw["remote_urls"], "ownerless clone remote URLs")?.values() {
+        as_str(url, "ownerless clone remote URL")?;
+    }
+    let digest = as_str(&raw["inventory_sha256"], "ownerless clone inventory digest")?;
+    let mut handoffs_valid = true;
+    for item in as_list(&raw["handoff_sha256s"], "ownerless clone handoff digests")? {
+        let handoff = as_str(item, "ownerless clone handoff digest")?;
+        handoffs_valid &= is_digest(handoff);
+    }
+    if !is_digest(digest) || !handoffs_valid {
+        return Err("ownerless clone digests are invalid".to_owned());
+    }
+    let recorded_at = as_str(&raw["recorded_at"], "ownerless clone recorded_at")?;
+    parse_timestamp(recorded_at, "ownerless clone recorded_at")?;
+    if !raw["discard_ignored"].is_boolean() {
+        return Err("ownerless clone discard_ignored must be boolean".to_owned());
+    }
+    let path = as_str(&raw["path"], "ownerless clone path")?.to_owned();
+    Ok((path, (identity[0], identity[1], identity[2])))
+}
+
+fn ownerless_clone_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    exact_keys(
+        raw,
+        &[
+            "schema",
+            "kind",
+            "machine",
+            "slot",
+            "phase",
+            "fenced",
+            "authorization",
+            "rescue",
+            "record",
+        ],
+        &[],
+        "ownerless clone journal",
+    )?;
+    if as_int(&raw["schema"], "ownerless clone journal.schema", 0)? != SCHEMA
+        || raw["kind"] != Value::String("ownerless-clone-remove".to_owned())
+        || raw["machine"].as_str() != Some(journal_machine)
+    {
+        return Err("ownerless clone journal identity is invalid".to_owned());
+    }
+    let (auth_path, identity) = ownerless_clone_authorization(&raw["authorization"])?;
+    let (_relative, target) =
+        crate::config_validate::relative_inside(&cfg.root, &auth_path, "ownerless agent worktree")?;
+    let target_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if target.parent() != Some(cfg.worktrees.as_path()) || target_name == "ignored" {
+        return Err(format!(
+            "ownerless agent worktree must be one direct child of {}, excluding ignored",
+            cfg.worktrees.display()
+        ));
+    }
+    validate_name(&target_name, "ownerless agent worktree name")?;
+    if raw["slot"].as_str() != Some(target_name.as_str()) {
+        return Err("ownerless clone journal slot differs from its path".to_owned());
+    }
+    let (_relative, fenced) = crate::config_validate::relative_inside(
+        &cfg.root,
+        as_str(&raw["fenced"], "ownerless clone fenced path")?,
+        "fenced path",
+    )?;
+    let fenced_name = fenced
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let prefix = format!(".{target_name}.ownerless-clone.");
+    let tail = fenced_name.strip_prefix(&prefix).unwrap_or_default();
+    if fenced.parent() != target.parent()
+        || !fenced_name.starts_with(&prefix)
+        || !(tail.len() == 32
+            && tail
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    {
+        return Err("ownerless clone fenced path does not match its target".to_owned());
+    }
+    let phase = as_str(&raw["phase"], "ownerless clone journal.phase")?;
+    if !matches!(
+        phase,
+        "prepared" | "rescued" | "fenced" | "removing" | "removed"
+    ) {
+        return Err(format!("unknown ownerless clone phase {phase:?}"));
+    }
+    for (index, item) in as_list(&raw["rescue"], "ownerless clone journal.rescue")?
+        .iter()
+        .enumerate()
+    {
+        as_mapping(item, &format!("ownerless clone journal.rescue[{index}]"))?;
+    }
+    if !raw["record"].is_null() {
+        as_mapping(&raw["record"], "ownerless clone journal.record")?;
+    }
+    let present = |path: &Path| path.symlink_metadata().is_ok();
+    let target_present = present(&target);
+    let fenced_present = present(&fenced);
+    if target_present && fenced_present {
+        return Err("canonical and fenced ownerless clone paths both exist".to_owned());
+    }
+    let active = if target_present {
+        Some(target)
+    } else if fenced_present {
+        Some(fenced)
+    } else {
+        None
+    };
+    if phase == "removed" && active.is_some() {
+        return Err("ownerless clone reappeared after removal was recorded".to_owned());
+    }
+    if let Some(active) = &active {
+        if active.is_symlink()
+            || !active.is_dir()
+            || open_directory_identity(active, "ownerless clone")? != identity
+        {
+            return Err("ownerless clone identity changed; preserve it".to_owned());
+        }
+    }
+    Ok(())
+}
+
 fn absent_validate_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
     const LABEL: &str = "absent-validation-row journal";
     exact_keys(
@@ -1495,6 +1647,9 @@ pub(crate) fn parse_journal(
         }
         "ownerless-agent-remove" => {
             ownerless_agent_shape(&cfg, raw, &machine)?;
+        }
+        "ownerless-clone-remove" => {
+            ownerless_clone_shape(&cfg, raw, &machine)?;
         }
         _ => return Err(format!("unsupported recovery journal kind {kind:?}")),
     }

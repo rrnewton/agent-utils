@@ -382,6 +382,66 @@ def test_parse_journal_ownerless_agent_refusals(tmp_path: Path, mutate: str) -> 
     assert fragment in result.stderr
 
 
+def _ownerless_clone_journal(root: Path, present: bool) -> dict[str, object]:
+    identity: list[int] = [1, 2, 3]
+    if present:
+        target = root / "worktrees" / "slot-a"
+        target.mkdir(exist_ok=True)
+        identity = list(wrkslots_cli._open_directory_identity(target, "ownerless clone"))
+    return {
+        "schema": 2,
+        "kind": "ownerless-clone-remove",
+        "machine": "node-a",
+        "slot": "slot-a",
+        "phase": "prepared",
+        "fenced": f"worktrees/.slot-a.ownerless-clone.{'c' * 32}",
+        "authorization": {
+            "path": "worktrees/slot-a",
+            "identity": identity,
+            "actor": _identity(789),
+            "remote_urls": {"origin": "https://example.invalid/repo.git"},
+            "inventory_sha256": DIGEST,
+            "handoff_sha256s": [],
+            "discard_ignored": False,
+            "recorded_at": "2026-10-26T02:00:00Z",
+        },
+        "rescue": [],
+        "record": None,
+    }
+
+
+@pytest.mark.parametrize("present", [False, True])
+def test_parse_journal_ownerless_clone_matches_python(tmp_path: Path, present: bool) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    path = _write(root, name, _ownerless_clone_journal(root, present))
+    result = _rust(root, name)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root, path)
+
+
+@pytest.mark.parametrize("mutate", ["both", "digest"])
+def test_parse_journal_ownerless_clone_refusals(tmp_path: Path, mutate: str) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    journal = _ownerless_clone_journal(root, present=True)
+    if mutate == "both":
+        (root / "worktrees" / f".slot-a.ownerless-clone.{'c' * 32}").mkdir()
+        fragment = "canonical and fenced ownerless clone paths both exist"
+    else:
+        authorization = journal["authorization"]
+        assert isinstance(authorization, dict)
+        authorization["inventory_sha256"] = "zz"
+        fragment = "ownerless clone digests are invalid"
+    path = _write(root, name, journal)
+    with pytest.raises(Exception) as caught:
+        _expected(root, path)
+    assert fragment in str(caught.value)
+    result = _rust(root, name)
+    assert result.returncode == 1
+    assert fragment in result.stderr
+
+
 @pytest.mark.parametrize("with_exclusion", [False, True])
 def test_parse_journal_ownerless_matches_python(tmp_path: Path, with_exclusion: bool) -> None:
     root = _root(tmp_path)
