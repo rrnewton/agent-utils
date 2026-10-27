@@ -4,6 +4,8 @@
 //!
 //! - [`events`]: the typed JSONL event log a headless agent writes (M1).
 //! - [`tail`]: `agentctl tail NAME`, a read-only follower of that log (M1).
+//! - [`render`]: how `tail` draws events: colors, turn headers, Markdown, folded tool output.
+//! - [`reply`]: reply and send commands recognised in tool calls, logged as `reply.sent`.
 //! - [`control`]: the wrapper's control socket (wake, status, interrupt, stop).
 //! - [`claude`]: Claude Code's stream-json protocol, translated.
 //! - [`wrapper`]: the Claude Code wrapper, the queue's only drainer (M2).
@@ -22,6 +24,8 @@
 pub mod claude;
 pub mod control;
 pub mod events;
+pub mod render;
+pub mod reply;
 pub mod tail;
 pub mod wrapper;
 

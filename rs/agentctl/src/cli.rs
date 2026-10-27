@@ -1,7 +1,7 @@
 //! Discoverable command-line interface for persistent named agents.
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read as _, Write};
+use std::io::{self, IsTerminal as _, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -397,9 +397,18 @@ struct Tail {
     /// Comma-separated event types to print; a trailing dot matches a prefix (example: tool.,turn.completed)
     #[arg(long, value_name = "TYPES", value_delimiter = ',')]
     types: Vec<String>,
-    /// Columns to wrap prose at (default: 100)
-    #[arg(long, default_value = "100", value_name = "COLS")]
-    width: usize,
+    /// Columns to wrap at, at least 20 (default: the terminal's width, read again before each event so a resized pane rewraps; 100 when standard output is not a terminal)
+    #[arg(long, value_name = "COLS")]
+    width: Option<usize>,
+    /// Plain text: no colors, Markdown markers kept as written (default when standard output is not a terminal, NO_COLOR is set and not empty, or TERM is dumb)
+    #[arg(long, conflicts_with_all = ["pretty", "json"])]
+    plain: bool,
+    /// Colors and styled Markdown even when standard output is not a terminal, as for `less -R`
+    #[arg(long, conflicts_with = "json")]
+    pretty: bool,
+    /// Lines of a tool result shown under the call before the rest is folded into "… N more lines"; 0 shows none (default: 4)
+    #[arg(long, default_value = "4", value_name = "N")]
+    tool_lines: usize,
     /// Print the event with this sequence number and the rest of its turn, then exit; exit 1 when it does not exist
     #[arg(long, value_name = "SEQ", conflicts_with_all = ["follow", "since", "last"])]
     at: Option<u64>,
@@ -412,6 +421,9 @@ struct RunHeadless {
     /// Claude Code executable (default: claude on PATH)
     #[arg(long, value_name = "PATH")]
     claude_bin: Option<PathBuf>,
+    /// Lines of each tool result kept, credential-shaped words masked, as the `preview` of its tool.completed event, at most 8; 0 keeps no output in the log (default: 8)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(0..=8))]
+    tool_preview_lines: Option<u64>,
 }
 
 #[derive(Args)]
@@ -1857,13 +1869,19 @@ fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
             events.display()
         )));
     }
+    let terminal = io::stdout().is_terminal();
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+        || std::env::var_os("TERM").is_some_and(|value| value == "dumb");
     let options = crate::headless::tail::TailOptions {
         follow: value.follow,
         since: value.since,
         last: value.last,
         json: value.json,
         types: value.types,
-        width: value.width.max(20),
+        width: value.width.unwrap_or(100).max(20),
+        auto_width: value.width.is_none() && terminal,
+        pretty: value.pretty || (terminal && !no_color && !value.plain),
+        tool_lines: value.tool_lines,
         at: value.at,
         ..crate::headless::tail::TailOptions::default()
     };
@@ -2721,6 +2739,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return Ok(manager.run_headless(
                 &value.agent.name,
                 value.claude_bin.as_deref(),
+                value.tool_preview_lines.map(|lines| lines as usize),
                 terminate,
             )?);
         }

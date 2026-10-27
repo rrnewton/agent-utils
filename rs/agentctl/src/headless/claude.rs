@@ -20,6 +20,12 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use super::events::{excerpt, SUMMARY_BYTES};
+use super::reply::{self, ReplyCall};
+
+/// Most lines of a tool result kept as its preview.
+pub const PREVIEW_LINES: usize = 8;
+/// Longest line of a tool result preview, in bytes.
+pub const PREVIEW_LINE_BYTES: usize = 200;
 
 /// Lowest Claude Code version the wrapper was tested with.
 pub const TESTED_VERSION: &str = "2.1.310";
@@ -70,6 +76,8 @@ pub enum Signal {
         tool: String,
         /// Bounded, masked summary of the call.
         summary: String,
+        /// The message the call sends, when it is a recognised reply or send command.
+        reply: Option<ReplyCall>,
     },
     /// A tool call returned.
     ToolCompleted {
@@ -79,6 +87,10 @@ pub enum Signal {
         ok: bool,
         /// Size of the result text, in bytes.
         bytes: usize,
+        /// The first lines of the result text, bounded and masked ([`output_preview`]).
+        preview: Vec<String>,
+        /// Number of lines in the result text.
+        lines: usize,
     },
     /// The turn ended.
     Result {
@@ -306,6 +318,90 @@ pub fn tool_summary(tool: &str, input: &Value) -> String {
     excerpt(&mask_secrets(flat.trim()), SUMMARY_BYTES)
 }
 
+/// `word` looks like a credential: a known token prefix, a private-key armour line, or a long
+/// run of base64 or URL-safe characters that mixes upper case, lower case and digits (so Git
+/// object names and other lower-case hex stay readable).
+fn credential_shaped(word: &str) -> bool {
+    const PREFIXES: [&str; 10] = [
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "github_pat_",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "AKIA",
+        "eyJ",
+    ];
+    let trimmed = word.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')'));
+    if PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix) && trimmed.len() >= prefix.len() + 12)
+    {
+        return true;
+    }
+    trimmed.len() >= 32
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-'))
+        && trimmed.chars().any(|c| c.is_ascii_uppercase())
+        && trimmed.chars().any(|c| c.is_ascii_lowercase())
+        && trimmed.chars().any(|c| c.is_ascii_digit())
+}
+
+/// One line of tool output made safe to keep: [`mask_secrets`], then every credential-shaped
+/// word replaced by `***`.
+#[must_use]
+pub fn mask_output_line(line: &str) -> String {
+    mask_secrets(line)
+        .split(' ')
+        .map(|word| if credential_shaped(word) { "***" } else { word })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The first `max_lines` lines of a tool result, each cut to [`PREVIEW_LINE_BYTES`] and masked
+/// ([`mask_output_line`]), and the result's total line count. Trailing blank lines are not
+/// counted; once a private key's armour appears, the rest of the preview is withheld.
+#[must_use]
+pub fn output_preview(text: &str, max_lines: usize) -> (Vec<String>, usize) {
+    let text = text.trim_end();
+    if text.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let total = text.lines().count();
+    let mut preview = Vec::new();
+    for line in text.lines().take(max_lines) {
+        if line.contains("PRIVATE KEY-----") {
+            preview.push("*** (private key withheld)".to_owned());
+            break;
+        }
+        let flat: String = line
+            .chars()
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        preview.push(excerpt(
+            &mask_output_line(flat.trim_end()),
+            PREVIEW_LINE_BYTES,
+        ));
+    }
+    (preview, total)
+}
+
 fn content_bytes(content: &Value) -> usize {
     match content {
         Value::String(text) => text.len(),
@@ -400,17 +496,29 @@ pub fn parse(line: &Value) -> Vec<Signal> {
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_owned();
+                            let input = block.get("input").unwrap_or(&Value::Null);
+                            let reply = (tool == "Bash")
+                                .then(|| input.get("command").and_then(Value::as_str))
+                                .flatten()
+                                .and_then(reply::detect)
+                                .map(|mut call| {
+                                    call.text = call.text.map(|text| {
+                                        text.lines()
+                                            .map(mask_secrets)
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    });
+                                    call
+                                });
                             Some(Signal::ToolStarted {
                                 id: block
                                     .get("id")
                                     .and_then(Value::as_str)
                                     .unwrap_or("")
                                     .to_owned(),
-                                summary: tool_summary(
-                                    &tool,
-                                    block.get("input").unwrap_or(&Value::Null),
-                                ),
+                                summary: tool_summary(&tool, input),
                                 tool,
+                                reply,
                             })
                         }
                         _ => None,
@@ -427,14 +535,21 @@ pub fn parse(line: &Value) -> Vec<Signal> {
                     .filter(|block| {
                         block.get("type").and_then(Value::as_str) == Some("tool_result")
                     })
-                    .map(|block| Signal::ToolCompleted {
-                        id: block
-                            .get("tool_use_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned(),
-                        ok: block.get("is_error").and_then(Value::as_bool) != Some(true),
-                        bytes: content_bytes(block.get("content").unwrap_or(&Value::Null)),
+                    .map(|block| {
+                        let content = block.get("content").unwrap_or(&Value::Null);
+                        let (preview, lines) =
+                            output_preview(&content_text(content), PREVIEW_LINES);
+                        Signal::ToolCompleted {
+                            id: block
+                                .get("tool_use_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_owned(),
+                            ok: block.get("is_error").and_then(Value::as_bool) != Some(true),
+                            bytes: content_bytes(content),
+                            preview,
+                            lines,
+                        }
                     })
                     .collect()
             })
@@ -599,7 +714,8 @@ mod tests {
                 Signal::ToolStarted {
                     id: "t1".to_owned(),
                     tool: "Bash".to_owned(),
-                    summary: "git push --token=*** origin".to_owned()
+                    summary: "git push --token=*** origin".to_owned(),
+                    reply: None,
                 }
             ]
         );
@@ -612,7 +728,9 @@ mod tests {
             vec![Signal::ToolCompleted {
                 id: "t1".to_owned(),
                 ok: false,
-                bytes: 3
+                bytes: 3,
+                preview: vec!["abc".to_owned()],
+                lines: 1,
             }]
         );
         let result = json!({"type": "result", "subtype": "success", "duration_ms": 1795,
@@ -715,5 +833,42 @@ mod tests {
             PathBuf::from("/c/projects/-tmp-a-b/s.jsonl")
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn output_previews_are_bounded_and_masked() {
+        let text = format!(
+            "line 1\tx\ntoken=hunter2\nkey ghp_{} end\ncommit 0123456789abcdef0123456789abcdef01234567\n{}\n6\n7\n8\n9\n\n",
+            "a".repeat(30),
+            "y".repeat(400)
+        );
+        let (preview, lines) = output_preview(&text, 8);
+        assert_eq!(lines, 9);
+        assert_eq!(preview.len(), 8);
+        assert_eq!(preview[0], "line 1 x");
+        assert_eq!(preview[1], "token=***");
+        assert_eq!(preview[2], "key *** end");
+        assert!(preview[3].contains("0123456789abcdef"), "{preview:?}");
+        assert!(preview[4].len() <= PREVIEW_LINE_BYTES + 3);
+        let (preview, _) = output_preview("ok\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n", 8);
+        assert_eq!(preview, vec!["ok", "*** (private key withheld)"]);
+        assert_eq!(
+            mask_output_line("AbCdEfGh1234567890AbCdEfGh12345678"),
+            "***"
+        );
+        assert_eq!(output_preview("  \n", 8), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn bash_sends_carry_their_reply() {
+        let assistant = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t2", "name": "Bash",
+             "input": {"command": "agent-teams reply tm-9 --text 'done, password: x1'"}}]}});
+        let Signal::ToolStarted { reply, .. } = &parse(&assistant)[0] else {
+            panic!()
+        };
+        let reply = reply.as_ref().unwrap();
+        assert_eq!(reply.channel, "team");
+        assert_eq!(reply.text.as_deref(), Some("done, password: ***"));
     }
 }

@@ -1,0 +1,65 @@
+HH:MM:SS ══ wrapper started · generation 1 · claude 2.1.310 · session
+         s-1 ══
+HH:MM:SS    harness started (pid 4242), resuming the session
+HH:MM:SS ← owner  turn-boundary · normal  [q-7]
+         ┃ Please check the gate.
+         ┃ Then **report** back.
+
+HH:MM:SS ━━ turn 1 · from owner ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HH:MM:SS   ↳ started [q-7]
+HH:MM:SS $ Bash  git -C agent-utils log --oneline -5 && python3
+                 scripts/validate.py --base origin/main > /tmp/gate.log
+                 2>&1; echo rc=$?
+HH:MM:SS   ✓ 1.2 s · 2048 B · 40 lines
+           │ 59543339 agentctl: watch and recover
+           │ 435de837 minibeads: reserve
+           │ 433116ec minibeads: close
+           │ 7f29d9c4 minibeads: note
+           … 36 more lines
+HH:MM:SS $ Read  /w/README.md
+HH:MM:SS   ✗ 15 s · 31 B
+           │ error: �[31mno such file
+HH:MM:SS ● I checked the queue and the gate. This sentence is long
+           enough that it must wrap at the terminal width instead of
+           running off as one line.
+
+           ### Results
+
+           1. first item with *emphasis*
+           2. second item with a [link](https://example.com/x)
+
+           step  │ result
+           ──────┼─────────
+           build │ ok
+           tests │ 2 failed
+
+           ▎ quoted owner text
+
+           ─────────────────────────────────────────────────────────────
+
+           ╭─ rust
+           │ fn main() {
+           │     println!("hi");
+           │ }
+           ╰─
+HH:MM:SS ⇢ chat reply r-12 #001
+         ┃ ## Status
+         ┃
+         ┃ The gate is **green** and `main` moved to 59543339.
+         ┃
+         ┃ • landed #588 headless-tail-pretty
+         ┃ • next: rotation
+         ┃   ◦ then watch
+         ┃
+         ┃ ╭─ sh
+         ┃ │ agentctl tail coordinator --follow
+         ┃ ╰─
+HH:MM:SS ⇢ team message tm-1
+         ┃ (text in /tmp/gone.md, not readable)
+HH:MM:SS ⛔ denied Bash  git push origin main
+HH:MM:SS !! interrupt requested
+HH:MM:SS   ↳ cancelled [q-8] after the model saw it
+HH:MM:SS ── turn 1 interrupted · 61 s · in 10 out 900 cache r 50k w… ───
+HH:MM:SS    · idle
+… event 18 is missing (pruned or unreadable)
+HH:MM:SS !! protocol: unexpected line

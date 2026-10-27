@@ -2098,7 +2098,8 @@ send`, so re-reading a log repeats nothing.
 | `input.started`, `input.completed`, `input.cancelled` | `queue_id`, `mid_turn`, `before_start`, `recovered` |
 | `turn.started`, `turn.completed` | `cause` (`input`, or `self` for a turn the harness began); `outcome` (`completed`, `interrupted`, `error`), usage, `cost_usd`, `duration_ms` |
 | `assistant.text` | the agent's prose, verbatim |
-| `tool.started`, `tool.completed` | tool, a 200-byte summary with credential-looking values masked, `ok`, output size; never the output |
+| `tool.started`, `tool.completed` | tool, a 200-byte summary with credential-looking values masked, `ok`, output size and line count, and `preview`: the result's first 8 lines (200 bytes each, credential-shaped words masked; none for `Read`, and nothing after a private-key header; `run-headless --tool-preview-lines N` keeps fewer, 0 none) |
+| `reply.sent` | after a successful `agentctl chat reply`, `agentctl send`, or `agent-teams reply`/`send` run by the shell tool: `channel` (`chat`, `agent`, `team`), `to`, and the `text` sent (inline, from a here-document, or read back from the named file, up to 32 KiB), or `file` when it could not be read |
 | `permission.denied` | tool and summary |
 | `compact.started`, `compact.completed` | trigger, tokens before and after |
 | `interrupt.requested`, `error` | request ID; error class and message |
@@ -2107,12 +2108,24 @@ A starting wrapper continues `seq` from the larger of `index.json` and the last
 complete line of the newest file, truncating a partial final line. Generations
 older than 90 days, then the oldest beyond 2 GiB, are pruned at start.
 
-**`agentctl tail NAME`** reads the log without a lock: one line per event, prose
-wrapped to `--width`, inputs marked with their sender, turns ruled with usage and
-cost; control characters in sender or model text are shown as U+FFFD, never sent
-to the terminal. `--follow` keeps printing across wrapper restarts, `--last N` and `--since
-SEQ` select, `--types tool.,turn.completed` filters, `--json` prints events
-verbatim, and `--at SEQ` prints one event's whole turn (exit 1 when it is gone).
+**`agentctl tail NAME`** reads the log without a lock. Each event is a line
+with a dimmed time; inputs show their sender and delivery above the text, each
+turn opens with a rule naming its number and sender and closes with one carrying
+outcome, duration, tokens and cost, and tool calls show the command, then the
+result with its first `--tool-lines` lines of output (default 4) and "… N more
+lines". The agent's prose, inputs and replies are drawn as Markdown: line breaks
+kept, each line soft-wrapped with a hanging indent, lists, headings, quotes,
+aligned tables, and fenced code in a box that is never reflowed. On a terminal
+the view is colored (inputs cyan, delivery blue, the agent's text green, tools
+yellow, replies magenta, interrupts yellow, errors red) and follows the
+terminal's width, read again before every event; `--width COLS` fixes it.
+`--plain`, a non-terminal output, `NO_COLOR` or `TERM=dumb` give the same layout
+without colors and with the Markdown markers kept; `--pretty` forces colors, as
+for `less -R`. Control characters in sender or model text are shown as U+FFFD,
+never sent to the terminal. `--follow` keeps printing across wrapper restarts,
+`--last N` and `--since SEQ` select, `--types tool.,turn.completed` filters,
+`--json` prints events verbatim, and `--at SEQ` prints one event's whole turn
+(exit 1 when it is gone).
 A hole in `seq` prints a gap line. It is unrelated to `read --output tail`.
 
 **Permissions.** A headless agent cannot ask anyone, so its settings file decides

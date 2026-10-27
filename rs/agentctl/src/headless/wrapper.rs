@@ -52,6 +52,7 @@ use sha2::{Digest, Sha256};
 use super::claude::{self, InputState, Signal};
 use super::control;
 use super::events::{self, EventWriter};
+use super::reply::{self, ReplyCall};
 
 /// File name of the lock a running wrapper holds in the agent directory.
 pub const LOCK_FILE: &str = "headless.lock";
@@ -90,6 +91,8 @@ pub struct WrapperConfig {
     pub stop_timeout: Duration,
     /// Claude Code configuration directory, for transcript lookups; `None` disables them.
     pub config_directory: Option<PathBuf>,
+    /// Lines of each tool result kept, masked, in its `tool.completed` event (0 keeps none).
+    pub tool_preview_lines: usize,
 }
 
 impl WrapperConfig {
@@ -109,6 +112,7 @@ impl WrapperConfig {
             restart_window: Duration::from_secs(600),
             stop_timeout: Duration::from_secs(60),
             config_directory: claude::config_directory(),
+            tool_preview_lines: claude::PREVIEW_LINES,
         }
     }
 
@@ -239,7 +243,7 @@ struct Wrapper {
     turn_started: Option<Instant>,
     current: Option<Written>,
     started_inputs: HashMap<String, String>,
-    tools: HashMap<String, (String, Instant)>,
+    tools: HashMap<String, (String, Instant, Option<ReplyCall>)>,
     pending_controls: HashMap<String, SyncSender<Value>>,
     next_request: u64,
     interrupt_requested: bool,
@@ -721,27 +725,65 @@ impl Wrapper {
                 Signal::Text(text) => {
                     self.emit("assistant.text", causation, json!({"text": text}))?;
                 }
-                Signal::ToolStarted { id, tool, summary } => {
+                Signal::ToolStarted {
+                    id,
+                    tool,
+                    summary,
+                    reply,
+                } => {
                     self.tools
-                        .insert(id.clone(), (tool.clone(), Instant::now()));
+                        .insert(id.clone(), (tool.clone(), Instant::now(), reply));
                     self.emit(
                         "tool.started",
                         causation,
                         json!({"tool": tool, "summary": summary, "tool_use_id": id}),
                     )?;
                 }
-                Signal::ToolCompleted { id, ok, bytes } => {
-                    let (tool, began) = self
+                Signal::ToolCompleted {
+                    id,
+                    ok,
+                    bytes,
+                    mut preview,
+                    lines,
+                } => {
+                    let (tool, began, reply) = self
                         .tools
                         .remove(&id)
-                        .map_or((String::new(), None), |(tool, began)| (tool, Some(began)));
+                        .map_or((String::new(), None, None), |(tool, began, reply)| {
+                            (tool, Some(began), reply)
+                        });
                     let duration_ms = began.map(|began| began.elapsed().as_millis() as u64);
-                    self.emit(
-                        "tool.completed",
-                        causation,
-                        json!({"tool": tool, "tool_use_id": id, "ok": ok, "output_bytes": bytes,
-                               "duration_ms": duration_ms}),
-                    )?;
+                    // A file's contents are not output worth previewing, and may be anything.
+                    if tool == "Read" {
+                        preview.clear();
+                    }
+                    preview.truncate(self.config.tool_preview_lines);
+                    let mut data = json!({"tool": tool, "tool_use_id": id, "ok": ok,
+                                          "output_bytes": bytes, "output_lines": lines,
+                                          "duration_ms": duration_ms});
+                    if !preview.is_empty() {
+                        data["preview"] = json!(preview);
+                    }
+                    self.emit("tool.completed", causation, data)?;
+                    if let Some(call) = reply.filter(|_| ok) {
+                        let text = call.text.clone().or_else(|| {
+                            call.file
+                                .as_deref()
+                                .and_then(|file| reply::read_file(file, &self.config.cwd))
+                                .map(|text| {
+                                    text.lines()
+                                        .map(claude::mask_secrets)
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                        });
+                        self.emit(
+                            "reply.sent",
+                            causation,
+                            json!({"channel": call.channel, "to": call.to, "text": text,
+                                   "file": call.file, "tool_use_id": id}),
+                        )?;
+                    }
                 }
                 Signal::Result {
                     subtype,

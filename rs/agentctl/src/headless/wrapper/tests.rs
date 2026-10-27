@@ -7,7 +7,8 @@ use std::os::unix::fs::DirBuilderExt;
 
 /// A stand-in for `claude -p` stream-json that follows the observed protocol: `queued`,
 /// `started`, `init`, text, `result`, `completed`; `SLOW` runs a tool until an interrupt or a
-/// mid-turn input arrives; `FAKE_MODE=silent` never acknowledges; `FAKE_MODE=crash` exits on
+/// mid-turn input arrives; `REPLY` runs an `agent-teams reply --file` command;
+/// `FAKE_MODE=silent` never acknowledges; `FAKE_MODE=crash` exits on
 /// the first input; `FAKE_MODE=queueonly` acknowledges but never starts; `FAKE_MODE=crashmid`
 /// exits inside a `SLOW` turn. It appends its argv to `FAKE_ARGS_LOG` and records received inputs in
 /// `FAKE_TRANSCRIPT` the way Claude Code's transcript does.
@@ -45,6 +46,13 @@ def turn(first):
     record(first["uuid"])
     out({"type": "system", "subtype": "init", "claude_code_version": "9.9.9", "model": "fake",
          "permissionMode": "dontAsk", "session_id": session, "tools": ["Bash"]})
+    if "REPLY" in first["message"]["content"]:
+        out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_use", "id": "t2", "name": "Bash",
+             "input": {"command": "agent-teams reply tm-1 --file reply.md"}}]}})
+        out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t2",
+             "content": "sent\nkey AbCdEfGh1234567890AbCdEfGh12345678\n3\n4\n5\n6\n7\n8\n9\n10\n"}]}})
     if "SLOW" in first["message"]["content"]:
         out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "sleep 30"}}]}})
@@ -308,6 +316,30 @@ fn an_item_settles_processed_only_after_started_and_the_turn_is_logged() {
     assert!(fixture.has_event("lifecycle.harness", |data| data["version"] == "9.9.9"));
     let status = fixture.request("status");
     assert_eq!(status["status"], "idle", "{status}");
+    fixture.stop(handle);
+}
+
+#[test]
+fn a_reply_command_is_logged_with_its_file_text_and_tool_output_is_previewed() {
+    let fixture = Fixture::new("reply", "normal");
+    fs::write(fixture.config.cwd.join("reply.md"), "## Done\n\n- landed\n").unwrap();
+    let handle = fixture.start();
+    fixture.enqueue("m1", "REPLY please", json!({"from": "owner"}));
+    fixture.wait("reply.sent", || fixture.has_event("reply.sent", |_| true));
+    assert!(fixture.has_event("tool.completed", |data| {
+        data["output_lines"] == 10
+            && data["preview"]
+                .as_array()
+                .is_some_and(|lines| lines.len() == claude::PREVIEW_LINES && lines[1] == "key ***")
+    }));
+    assert!(
+        fixture.has_event("reply.sent", |data| data["channel"] == "team"
+            && data["to"] == "tm-1"
+            && data["text"] == "## Done\n\n- landed"
+            && data["file"] == "reply.md")
+    );
+    let kinds = fixture.kinds();
+    assert!(position(&kinds, "tool.completed") < position(&kinds, "reply.sent"));
     fixture.stop(handle);
 }
 

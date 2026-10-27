@@ -39,6 +39,24 @@ Built (operator reference: `agentctl userguide`, "Headless Claude agents"):
   `stop` (clean stop, archive), `install-units --headless NAME`, `--permission-prompts none` by
   default, and an example settings file with deny rules in the user guide.
 
+Revised the same day after the owner's first look at the trial's tail tab (`#588
+headless-tail-pretty`):
+
+- `tail` is colored per event kind on a terminal, follows the terminal's width, opens each turn
+  with a header naming its sender, and renders the agent's prose, inputs and replies as Markdown
+  (line breaks kept, soft-wrapped with hanging indents, boxed code, aligned tables). `--plain`
+  or `NO_COLOR` keeps the layout without colors.
+- **Difference from 5.2:** `tool.completed` now carries a `preview` of the result (first 8 lines,
+  200 bytes each, credential-shaped words masked, none for `Read`, withheld after a private-key
+  header) so `tail` can fold long output to its first lines. The design kept output out of the
+  log entirely; masking is best-effort, so a secret printed in an unrecognised shape can reach
+  the log (0600, retained by age). `run-headless --tool-preview-lines 0` turns it off.
+- A new `reply.sent` event describes a successful `agentctl chat reply`, `agentctl send` or
+  `agent-teams reply`/`send` run through the shell tool, with the text it sent (inline, a
+  here-document, or the named file read back). It is the derived `chat_reply` view of 5.2 built
+  by the wrapper instead of `tail`, because the 200-byte tool summary cannot hold the text. It
+  still only describes; nothing consumes it to act.
+
 Verified on Claude Code 2.1.310 (the 3.1 "to verify in M2" list): `--input-format stream-json`
 with `--resume` keeps the session; two inputs written together while idle run strictly in order,
 one turn each; `system/init` opens every turn; `result` carries a per-result cost in

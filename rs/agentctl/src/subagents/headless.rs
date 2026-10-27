@@ -357,6 +357,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         &self,
         agent_name: &str,
         claude_bin: Option<&Path>,
+        tool_preview_lines: Option<usize>,
         terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<i32> {
         let record = self.load(agent_name)?;
@@ -380,6 +381,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             config.command = vec![bin.display().to_string()];
         }
         config.arguments = record.arguments.clone();
+        if let Some(lines) = tool_preview_lines {
+            config.tool_preview_lines = lines;
+        }
         let hooks = RecordIdentity {
             manager: self,
             name: agent_name.to_owned(),
