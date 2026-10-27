@@ -6,6 +6,9 @@
 > independent of the data model; its questions are group I of the consolidated list. Nothing here is
 > superseded.
 
+> **Update 2026-10-27 (`#573 scrubber-full-width`).** A playback policy that whichever option is
+> picked must keep: see [Playback policy](#playback-policy-2026-10-27-573-scrubber-full-width) below.
+
 [opus 5.5] A proposal for the owner. Nothing here is implemented. Written on 2026-10-22, after
 `#429 keyboard-hides-bar`, and with the `mu-readstrip` lane in mind (it moves the floating read-aloud
 strip down onto the bottom controls row, with no gap, and gives it Play/Pause).
@@ -249,6 +252,50 @@ the panel state, the stepper writing the existing pace key). Then the page suite
 "READ OWNS THE THUMB" assertions get rewritten, and a phone and desk browser walk is added. The read
 strip's positioning comes from mu-readstrip, which should land first so the panel can sit under it
 rather than fight it.
+
+## Playback policy (2026-10-27, `#573 scrubber-full-width`)
+
+[opus 5.5] Added after this proposal was written, at the owner's request (2026-10-27): whatever layout
+the redesign picks keeps this policy. `#573 scrubber-full-width` implements it for today's two rows.
+
+**The policy.** On a phone, while a read of several blocks is up:
+
+- **The read strip (the scrubber) is a full-width row**, edge to edge within the safe-area insets,
+  standing flush on the dock's **transport row**: the row that holds the read's Pause/Resume and Stop.
+  It does not float, and the list ends at its top edge, so no message scrolls under it.
+- **While the read plays, everything secondary hides**: the bar's other rows (the gear, the pickers,
+  the Voice/Channel switch, the read toggle) and the floating chips. The list takes their room.
+- **Paused, the chips come back** (they float and move nothing) and the secondary rows stay hidden, so
+  a pause or a resume never resizes the list or moves the strip under the thumb. This matches
+  [car-mode-design](2026-10-26-car-mode/README.md): pause keeps the reading layout, stop closes it.
+- **Stop, or the end of the read, brings everything back.**
+- The keyboard-up slim row (`#429`) still applies, and the strip stands on it. A desk is unaffected.
+
+The page states it on the root as `data-read-strip="playing"` or `"paused"` (absent with no strip;
+`renderReadLayout` in `web/voice.js`). The redesign should key its own hiding off that attribute
+rather than add a second state. The multi-track scrubber (the hierarchical navigator in
+[documents-view](2026-10-26-documents-view/README.md)) grows the strip upward from the same place.
+
+**How it maps onto each option.**
+
+- **Option B (two slim rows and the read panel).** The transport row is the read panel's row, with Read
+  as Pause and Stop beside it. While a read plays, the pickers row and the gear/toggle row hide, and the
+  panel's row stays, with the strip on it. If the reader had folded the panel away, it shows again for
+  the read, because the policy needs Pause and Stop on screen. The other rows come back at stop.
+- **Option A (one row).** There is no second row to hide, so the biggest saving goes away. The owner
+  suspected the policy might then not matter. Two parts of it still do:
+  - **The chips still hide while playing.** They are what floats over the foot of the list, so this
+    is still room for the list.
+  - **The single row has to become the transport row while a read plays.** At rest it holds the gear,
+    the pickers, the read toggle and the switch, but no Pause or Stop. So for the length of the read it
+    swaps its members for the transport (Pace, Stop, Pause), and the strip stands on it. That is a swap
+    of the row's contents, not a new row, so it costs no height. At stop the row goes back to the gear
+    and the pickers.
+
+  The alternative, opening the panel as a second row under the strip, would bring back the stacked
+  rows this policy removes.
+- **Option C (the pickers in the title row).** The title row is secondary: hide it while playing, as
+  `#573` does for a bar moved to the top. The bottom rows map as in A or B.
 
 ## Questions for the owner
 
