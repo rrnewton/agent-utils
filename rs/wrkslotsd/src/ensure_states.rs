@@ -29,11 +29,11 @@ use crate::hold_state::parse_hold;
 
 type Result<T> = std::result::Result<T, String>;
 
-struct Flock {
+pub(crate) struct Flock {
     _file: std::fs::File,
 }
 
-fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
+pub(crate) fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
     if let Some(parent) = path.parent() {
         if parent
             .symlink_metadata()
@@ -105,7 +105,7 @@ fn escape_ascii_json(text: &str) -> String {
     out
 }
 
-fn atomic_write_json(path: &Path, payload: &Value) -> Result<()> {
+pub(crate) fn atomic_write_json(path: &Path, payload: &Value) -> Result<()> {
     let pretty = serde_json::to_string_pretty(payload).map_err(|error| error.to_string())?;
     let mut text = escape_ascii_json(&pretty);
     text.push('\n');
@@ -203,7 +203,7 @@ fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     result
 }
 
-fn utc_now() -> String {
+pub(crate) fn utc_now() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
@@ -213,7 +213,7 @@ fn utc_now() -> String {
         .unwrap_or_default()
 }
 
-fn append_event(cfg: &Cfg, machine: &str, kind: &str, payload: Value) -> Result<Value> {
+pub(crate) fn append_event(cfg: &Cfg, machine: &str, kind: &str, payload: Value) -> Result<Value> {
     let directory = cfg.control.join(format!("EVENTS.{machine}"));
     if directory.exists()
         && directory
@@ -279,7 +279,7 @@ fn empty_archive(machine: &str) -> Value {
     json!({"schema": 2, "machine": machine, "revision": 0, "records": []})
 }
 
-fn ensure_event_log(root: Option<&Path>, cfg: &Cfg, machine: &str) -> Result<()> {
+pub(crate) fn ensure_event_log(root: Option<&Path>, cfg: &Cfg, machine: &str) -> Result<()> {
     let directory = cfg.control.join(format!("EVENTS.{machine}"));
     if let EventLogStatus::Invalid(message) = event_log_status(&directory) {
         return Err(message);
@@ -289,16 +289,21 @@ fn ensure_event_log(root: Option<&Path>, cfg: &Cfg, machine: &str) -> Result<()>
     }
     let (active, order) = parse_state_ordered(root, Some(machine))?;
     let archive = parse_archive(root, Some(machine))?;
-    for record in &order {
-        let slot_dir = crate::active_state::slot_directory(cfg, &record.slot, &record.slot_type)?;
-        if !slot_dir.is_dir() {
-            return Err(format!(
-                "slot {} directory does not exist: {}",
-                record.slot,
-                slot_dir.display()
-            ));
+    let slots = active
+        .get("slots")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for record in &slots {
+        if let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) {
+            for checkout in checkouts {
+                if let Some(repository) = checkout.get("repository").and_then(Value::as_str) {
+                    crate::active_state::stored_repository_parts(cfg, repository)?;
+                }
+            }
         }
     }
+    let _ = &order;
     let mut holds: Vec<Value> = Vec::new();
     for record in &order {
         let hold = parse_hold(root, Some(machine), &record.slot)?;
@@ -320,10 +325,106 @@ fn ensure_event_log(root: Option<&Path>, cfg: &Cfg, machine: &str) -> Result<()>
 
 /// Bootstrap the selected machine's shard pair and event log the way
 /// `_ensure_state_shard` does, printing the resulting pair.
-pub(crate) fn ensure_states(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
-    if std::env::var_os("WRKSLOTSD_FIXTURE_WRITER").is_none() {
-        return Err("ensure-states is a fixture-only writer: set WRKSLOTSD_FIXTURE_WRITER=1 only for a temporary registry (the live registry stays on the Python edition until an approved cutover)".to_string());
+pub(crate) fn require_fixture() -> Result<()> {
+    if std::env::var("WRKSLOTSD_FIXTURE_WRITER").ok().as_deref() != Some("1") {
+        return Err("this writer is fixture-only: set WRKSLOTSD_FIXTURE_WRITER=1 only for a temporary registry (the live registry stays on the Python edition until an approved cutover)".to_string());
     }
+    Ok(())
+}
+
+/// Refuse when a partial atomic update is present in the control
+/// directory, matching the existing `_refuse_partial_state` scan.
+pub(crate) fn refuse_partial_state(control: &Path) -> Result<()> {
+    let patterns: [(&str, &str); 7] = [
+        ("ACTIVE.", ".json.tmp."),
+        ("ARCHIVED.", ".json.tmp."),
+        ("ACTIVE.", ".journal.tmp."),
+        ("CREATE.", ".journal.tmp."),
+        ("FINISH.", ".journal.tmp."),
+        ("HANDOFF.", ".json.tmp."),
+        ("VALIDATE-BATCH-SEAL.", ".journal.tmp."),
+    ];
+    let mut leftovers: Vec<PathBuf> = Vec::new();
+    let entries = std::fs::read_dir(control).map_err(|error| {
+        format!(
+            "cannot list control directory {}: {error}",
+            control.display()
+        )
+    })?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "cannot list control directory {}: {error}",
+                control.display()
+            )
+        })?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    for (prefix, marker) in patterns {
+        let mut group: Vec<PathBuf> = names
+            .iter()
+            .filter(|name| {
+                name.strip_prefix(prefix).is_some_and(|rest| {
+                    rest.find(marker)
+                        .is_some_and(|at| at > 0 && at + marker.len() < rest.len())
+                })
+            })
+            .map(|name| control.join(name))
+            .collect();
+        group.sort();
+        leftovers.append(&mut group);
+    }
+    let mut event_names: Vec<String> = names
+        .iter()
+        .filter(|name| name.starts_with("EVENTS."))
+        .cloned()
+        .collect();
+    event_names.sort();
+    for name in event_names {
+        let directory = control.join(&name);
+        let is_real_dir = directory
+            .symlink_metadata()
+            .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_real_dir {
+            continue;
+        }
+        let mut group: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&directory) {
+            for entry in entries.flatten() {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                if file.contains(".json.tmp.") {
+                    group.push(directory.join(file));
+                }
+            }
+        }
+        group.sort();
+        leftovers.append(&mut group);
+    }
+    if let Some(first) = leftovers.first() {
+        return Err(format!(
+            "partial atomic update found: {}; preserve it and use 'wrkslots recover'",
+            first.display()
+        ));
+    }
+    let mut seals: Vec<PathBuf> = names
+        .iter()
+        .filter(|name| name.starts_with("VALIDATE-BATCH-SEAL.") && name.ends_with(".journal"))
+        .map(|name| control.join(name))
+        .collect();
+    seals.sort();
+    if let Some(first) = seals.first() {
+        return Err(format!(
+            "interrupted validation-batch seal recorded in {}; run 'wrkslots recover' first",
+            first.display()
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_states(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
+    require_fixture()?;
     let (cfg, selected) = load_cfg(root, machine_override)?;
     crate::config_validate::validate_name(&selected, "machine")?;
     let _global = acquire_lock(

@@ -54,6 +54,7 @@ mod git_storage_state;
 mod global_state;
 mod handoff_state;
 mod hold_state;
+mod hold_write;
 mod index;
 mod journal_state;
 mod journals_state;

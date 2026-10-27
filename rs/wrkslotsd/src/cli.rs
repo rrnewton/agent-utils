@@ -173,6 +173,20 @@ pub(crate) enum Command {
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
     },
+    /// Protect one active slot from cleanup and removal (writer; fixture registries only until cutover)
+    Hold {
+        /// Active slot name
+        slot: String,
+        /// Why the slot is protected
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Bootstrap the selected machine's shard pair and event log (writer; fixture registries only until cutover)
     EnsureStates {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -464,6 +478,27 @@ pub fn run() -> u8 {
         }
         Command::ParseStorageGit { root } => {
             match crate::git_storage_state::parse_storage_git(root.as_deref()) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::Hold {
+            slot,
+            reason,
+            root,
+            machine,
+        } => {
+            match crate::hold_write::hold_slot(root.as_deref(), machine.as_deref(), &slot, &reason)
+            {
                 Ok(value) => {
                     println!(
                         "{}",
