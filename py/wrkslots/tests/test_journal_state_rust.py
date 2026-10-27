@@ -239,6 +239,86 @@ def test_parse_journal_matches_python(
     assert json.loads(result.stdout) == _expected(root, path)
 
 
+def _absent_journal() -> dict[str, object]:
+    record = _record("slot-a", "agent-a")
+    record["slot_type"] = "validate"
+    record_obj = wrkslots_cli._record_from_obj(record, "fixture record")
+    row = wrkslots_cli.AbsentValidateRow(
+        machine="node-a",
+        slot="slot-a",
+        generation=1,
+        record_sha256=wrkslots_cli._record_sha256(record_obj),
+    )
+    return {
+        "schema": 2,
+        "kind": "recover-absent-validate-rows",
+        "machine": "node-a",
+        "host_id": "host-1",
+        "slot": "absent-validate-rows",
+        "input_sha256": DIGEST,
+        "cursor": 0,
+        "actor": _identity(789),
+        "items": [
+            {
+                "input": {
+                    "machine": "node-a",
+                    "slot": "slot-a",
+                    "generation": 1,
+                    "record_sha256": row.record_sha256,
+                },
+                "record": record,
+                "archive_entry": wrkslots_cli._absent_validate_archive_entry(
+                    record_obj, row, "2026-10-26T02:00:00Z"
+                ),
+            }
+        ],
+    }
+
+
+def test_parse_journal_absent_rows_matches_python(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    path = _write(root, name, _absent_journal())
+    result = _rust(root, name)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root, path)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "fragment"),
+    [
+        ("cursor", "cursor exceeds its item count"),
+        ("archive", "differs from its exact input row"),
+        ("agent", "is not a validation row"),
+    ],
+)
+def test_parse_journal_absent_rows_refusals(tmp_path: Path, mutate: str, fragment: str) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    journal = _absent_journal()
+    if mutate == "cursor":
+        journal["cursor"] = 5
+    elif mutate == "archive":
+        items = journal["items"]
+        assert isinstance(items, list) and isinstance(items[0], dict)
+        entry = items[0]["archive_entry"]
+        assert isinstance(entry, dict)
+        entry["continuation"] = "tampered"
+    else:
+        items = journal["items"]
+        assert isinstance(items, list) and isinstance(items[0], dict)
+        record = items[0]["record"]
+        assert isinstance(record, dict)
+        record["slot_type"] = "agent"
+    path = _write(root, name, journal)
+    with pytest.raises(Exception) as caught:
+        _expected(root, path)
+    assert fragment in str(caught.value)
+    result = _rust(root, name)
+    assert result.returncode == 1
+    assert fragment in result.stderr
+
+
 @pytest.mark.parametrize("with_exclusion", [False, True])
 def test_parse_journal_ownerless_matches_python(tmp_path: Path, with_exclusion: bool) -> None:
     root = _root(tmp_path)

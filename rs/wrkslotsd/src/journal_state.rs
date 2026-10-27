@@ -858,6 +858,156 @@ fn exclusion_from_obj(cfg: &Cfg, fenced: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn absent_validate_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    const LABEL: &str = "absent-validation-row journal";
+    exact_keys(
+        raw,
+        &[
+            "schema",
+            "kind",
+            "machine",
+            "host_id",
+            "slot",
+            "input_sha256",
+            "cursor",
+            "actor",
+            "items",
+        ],
+        &[],
+        LABEL,
+    )?;
+    if as_int(&raw["schema"], &format!("{LABEL}.schema"), 0)? != SCHEMA
+        || raw["kind"] != Value::String("recover-absent-validate-rows".to_owned())
+        || raw["machine"].as_str() != Some(journal_machine)
+        || raw["slot"].as_str() != Some("absent-validate-rows")
+    {
+        return Err(format!("{LABEL} identity is invalid"));
+    }
+    let input_digest = as_str(&raw["input_sha256"], &format!("{LABEL}.input_sha256"))?;
+    if !is_digest(input_digest) {
+        return Err(format!("{LABEL} input digest is invalid"));
+    }
+    if identity_from_obj(&raw["actor"], &format!("{LABEL}.actor"))?.is_none() {
+        return Err(format!("{LABEL} has no actor"));
+    }
+    if as_str(&raw["host_id"], &format!("{LABEL}.host_id"))?.is_empty() {
+        return Err(format!("{LABEL} has no stable host identity"));
+    }
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let items = as_list(&raw["items"], &format!("{LABEL}.items"))?;
+    for (index, entry) in items.iter().enumerate() {
+        let label = format!("{LABEL}.items[{index}]");
+        let entry = as_mapping(entry, &label)?;
+        exact_keys(entry, &["input", "record", "archive_entry"], &[], &label)?;
+        let input = as_mapping(&entry["input"], &format!("{label}.input"))?;
+        exact_keys(
+            input,
+            &["machine", "slot", "generation", "record_sha256"],
+            &[],
+            &format!("{label}.input"),
+        )?;
+        let item_machine = validate_name(
+            as_str(&input["machine"], &format!("{label}.input.machine"))?,
+            "machine",
+        )?;
+        let item_slot = validate_name(
+            as_str(&input["slot"], &format!("{label}.input.slot"))?,
+            "slot",
+        )?;
+        let item_generation = as_int(
+            &input["generation"],
+            &format!("{label}.input.generation"),
+            1,
+        )?;
+        let record_digest = as_str(
+            &input["record_sha256"],
+            &format!("{label}.input.record_sha256"),
+        )?;
+        if item_machine != journal_machine || !is_digest(record_digest) {
+            return Err(format!("{label}.input identity is invalid"));
+        }
+        let record = record_from_obj(&entry["record"], &format!("{label}.record"))?;
+        if record.slot_type != "validate" {
+            return Err(format!("slot {item_slot} is not a validation row"));
+        }
+        if record.machine != item_machine || record.generation != item_generation {
+            return Err(format!(
+                "validation row {item_machine}/{item_slot} generation changed"
+            ));
+        }
+        let digest =
+            crate::canonical_sha256(&record.normalized).map_err(|error| error.to_string())?;
+        if digest != record_digest {
+            return Err(format!(
+                "validation row {item_machine}/{item_slot} changed: expected {record_digest}, found {digest}"
+            ));
+        }
+        let archive_entry = as_mapping(&entry["archive_entry"], &format!("{label}.archive_entry"))?;
+        let finished_at = as_str(
+            archive_entry.get("finished_at").unwrap_or(&Value::Null),
+            &format!("{label}.archive_entry.finished_at"),
+        )?;
+        parse_timestamp(finished_at, &format!("{label}.archive_entry.finished_at"))?;
+        let normalized = record
+            .normalized
+            .as_object()
+            .ok_or_else(|| format!("{label}.record must be a JSON object"))?;
+        let mut expected = serde_json::json!({
+            "archive_id": format!("{}:{}:{}:{}", record.machine, record.slot, record.generation, finished_at),
+            "slot": record.slot,
+            "agent": record.agent,
+            "task": record.task,
+            "purpose": record.purpose,
+            "slot_type": record.slot_type,
+            "machine": record.machine,
+            "generation": normalized["generation"],
+            "created_at": record.created_at,
+            "finished_at": finished_at,
+            "mode": "remove",
+            "actor": "coordinator",
+            "physical_storage": "removed",
+            "validation": [
+                "registry reconciliation confirmed physical storage absent",
+                format!("source ACTIVE record SHA-256: {record_digest}"),
+            ],
+            "limitations": ["validation outcome unknown"],
+            "continuation": "no storage remains; consult retained validation records by run identity",
+            "salvage": [],
+            "checkouts": normalized["checkouts"],
+        });
+        if let Some(layout) = normalized.get("layout") {
+            expected["layout"] = layout.clone();
+        }
+        if let Some(source) = normalized.get("import_source") {
+            expected["import_source"] = source.clone();
+        }
+        let expected_canonical =
+            crate::canonical::canonical_json(&expected).map_err(|error| error.to_string())?;
+        let actual_canonical =
+            crate::canonical::canonical_json(&Value::Object(archive_entry.clone()))
+                .map_err(|error| error.to_string())?;
+        if actual_canonical != expected_canonical {
+            return Err(format!(
+                "{label}.archive_entry differs from its exact input row"
+            ));
+        }
+        seen.push((item_machine, item_slot));
+    }
+    if seen.is_empty() {
+        return Err(format!("{LABEL} has no items"));
+    }
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != seen.len() {
+        return Err(format!("{LABEL} repeats a row"));
+    }
+    if as_int(&raw["cursor"], &format!("{LABEL}.cursor"), 0)? > seen.len() as i64 {
+        return Err(format!("{LABEL} cursor exceeds its item count"));
+    }
+    Ok(())
+}
+
 fn ownerless_validate_shape(
     cfg: &Cfg,
     raw: &Map<String, Value>,
@@ -1075,6 +1225,9 @@ pub(crate) fn parse_journal(
         }
         "ownerless-validate-remove" => {
             ownerless_validate_shape(&cfg, raw, &machine)?;
+        }
+        "recover-absent-validate-rows" => {
+            absent_validate_shape(raw, &machine)?;
         }
         _ => return Err(format!("unsupported recovery journal kind {kind:?}")),
     }

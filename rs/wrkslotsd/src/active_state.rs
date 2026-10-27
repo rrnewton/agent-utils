@@ -68,18 +68,18 @@ pub(crate) struct ScopeRec {
 
 pub(crate) struct RecordRec {
     pub(crate) slot: String,
-    agent: String,
-    task: String,
-    purpose: String,
+    pub(crate) agent: String,
+    pub(crate) task: String,
+    pub(crate) purpose: String,
     pub(crate) slot_type: String,
     pub(crate) machine: String,
     pub(crate) generation: i64,
-    created_at: String,
+    pub(crate) created_at: String,
     layout: Option<String>,
     owner: Option<Identity>,
     pub(crate) checkouts: Vec<CheckoutRec>,
     import_source: Option<ImportRec>,
-    normalized: Value,
+    pub(crate) normalized: Value,
 }
 
 pub(crate) fn as_mapping<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>> {
