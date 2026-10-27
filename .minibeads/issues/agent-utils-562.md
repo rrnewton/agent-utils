@@ -101,8 +101,10 @@ recover-absent-agent-row.
 ownerless-agent-cache-relocate (host identity, canonical cache paths,
 fence, directory identity). Remaining: recover-absent-agent-row.
 
-[muse watermelon] Slice 15 in progress: `parse-journal` also covers
+[muse watermelon] Slice 15 landed (0eaa9f58): `parse-journal` also covers
 recover-absent-agent-row (row identity and record digest, branch
 witnesses, remote containment, submodule salvage receipts, planned
 rescue receipts, and the exact derived ARCHIVED entry under both rescue
 roots). That completes every recovery-journal kind.
+
+[muse watermelon] Recovery-journal coverage is complete. Next: update the editions inventory for the finished journal kinds, then take stock toward the first composed read command.
