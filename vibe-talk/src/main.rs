@@ -874,6 +874,62 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
+    // `#578 discord-live-reactions`. A Discord provider with `gateway_reactions` holds a Gateway
+    // session whose reaction events are published as live updates, poller or no poller.
+    for provider in &state.config.providers {
+        let vibe_talk::config::ProviderKind::Discord(discord) = &provider.kind else {
+            continue;
+        };
+        if !discord.gateway_reactions {
+            continue;
+        }
+        let Some(entry) = providers.entry(&provider.key) else {
+            continue;
+        };
+        tracing::info!(
+            key = provider.key,
+            intents = vibe_talk::discord::gateway::INTENTS,
+            "Discord live reactions are ON for this provider: a Gateway session with the two \
+             reaction intents pushes each reaction change, and the message is read again to \
+             publish it"
+        );
+        let state = state.clone();
+        let key = providers.is_multi().then(|| provider.key.clone());
+        let client = Arc::clone(&entry.client);
+        let provider_key = provider.key.clone();
+        tokio::spawn(async move {
+            state.message_cache.first_checks(FIRST_CHECKS_WAIT).await;
+            let Some(vibe_talk::config::ProviderKind::Discord(discord)) = state
+                .config
+                .providers
+                .iter()
+                .find(|provider| provider.key == provider_key)
+                .map(|provider| &provider.kind)
+            else {
+                return;
+            };
+            let listing = state.clone();
+            let channels: vibe_talk::discord::gateway::Channels = Arc::new(move || {
+                listing
+                    .all_channels()
+                    .into_iter()
+                    .filter(|channel| {
+                        key.as_deref()
+                            .is_none_or(|key| channel.provider.as_deref() == Some(key))
+                    })
+                    .map(|channel| channel.id)
+                    .collect()
+            });
+            vibe_talk::discord::gateway::run(
+                discord,
+                Arc::clone(&state.live),
+                client,
+                channels,
+                vibe_talk::discord::gateway::Timing::default(),
+            )
+            .await;
+        });
+    }
     // `#452 slack-live-ingest`. The relist reads each channel a provider's event stream feeds
     // again on its interval, for the edits and deletions the stream never carries.
     if state.config.ingest.relist_seconds > 0 {

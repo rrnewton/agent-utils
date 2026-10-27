@@ -127,6 +127,14 @@ max_count_scan = 500
 # 30 is a reasonable place to start. Environment: VIBE_TALK_LIVE_POLL_SECONDS
 live_poll_seconds = 0
 
+# LIVE REACTIONS: push each reaction change to open pages over a Discord Gateway session, in well
+# under a second, instead of waiting for the next read. Discord itself only (thread_api =
+# "native", the default). The session asks for the two reaction intents only, neither of them
+# privileged, so nothing needs switching on in the Developer Portal; the bot needs View Channels
+# and Read Message History, as reading already does. Each change costs one read of the message.
+# Off by default. README, "Discord live reactions over the Gateway".
+# gateway_reactions = false
+
 # owner_user_id is YOUR Discord user id, and it cannot be worked out from anything above.
 #
 # The bot token identifies the BOT — the server reads that straight out of it, so messages this
