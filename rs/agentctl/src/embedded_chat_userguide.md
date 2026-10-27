@@ -1484,6 +1484,27 @@ the composer cannot be proved empty, the prompt is left there and the request
 is `delivery_uncertain`, as for any prompt left staged. The retries every 10
 seconds also run while the pane is `working`.
 
+### A headless coordinator
+
+When the bridge's agent is headless (`agentctl start --mode headless`, run by
+`agentctl run-headless`), there is no pane and no composer. `chat init` and
+`chat run` accept it without asking herdr anything. Each request's prompt goes
+into the agent's queue, and the wrapper, the queue's only drainer, gives it
+to the model. With `--deliver-while-working` the prompt is urgent and arrives
+between tool calls in the current turn. Without it, the prompt waits for the
+turn to end. A pass wakes the wrapper but does not drain the queue itself.
+Delivery state comes from the queue alone. A request stays `pending` until the
+model starts its prompt, and the retries every 10 seconds then record it
+`delivered`. While the wrapper is down, its `delivery.error` says so and the
+stall alarm lists it. A headless request gets no receipt reaction. The bridge never reads a screen, so the prompt gives
+no marker lines. It names the `chat reply` command as the only way to reply,
+whether or not `--offer-reply-command` is given, and the same command and
+reply ID send every reply. Reply reminders and `--stale-composer-clear-after`
+are off for a headless agent. Give the agent permission to run the printed
+`chat reply` command and to write its reply files. Restart `chat run` when
+the agent is restarted in the other mode, since the prompts' reply
+instructions are chosen at startup.
+
 ### Clearing a draft left in the composer
 
 A draft left in the coordinator's composer holds every request behind it for

@@ -5055,6 +5055,9 @@ pub struct BridgeState {
     ignored_text_prefixes: Arc<[String]>,
     // Whether request prompts name the `chat reply` command; also process-local.
     offer_reply_command: bool,
+    // Whether the coordinator's screen is never read, as for a headless agent, so request prompts
+    // give only the `chat reply` command and no marker lines; also process-local.
+    command_only_replies: bool,
     // The requests this process retired with their prompts recorded as typed, and when each was
     // typed, oldest retirement first, until `take_typed_retirements` takes them. A retired
     // request's record is gone and its tombstone keeps no delivery time.
@@ -5181,6 +5184,7 @@ impl BridgeState {
             config,
             ignored_text_prefixes: Arc::from([]),
             offer_reply_command: false,
+            command_only_replies: false,
             typed_retirements: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
@@ -5274,6 +5278,7 @@ impl BridgeState {
             config: envelope.config,
             ignored_text_prefixes: Arc::from([]),
             offer_reply_command: false,
+            command_only_replies: false,
             typed_retirements: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
@@ -5318,6 +5323,18 @@ impl BridgeState {
     #[must_use]
     pub fn with_reply_command_offered(mut self, offered: bool) -> Self {
         self.offer_reply_command = offered;
+        self
+    }
+
+    /// Set whether request prompts give the `chat reply` command as the only way to reply, with
+    /// no marker lines, for a coordinator whose screen the service never reads, as a headless
+    /// agent's is not (#594 headless-slack-trial). It implies offering the command. When the
+    /// command cannot be printed, the prompt is refused rather than given marker lines that such
+    /// a coordinator cannot use: the request stays undelivered and each pass logs why.
+    #[must_use]
+    pub fn with_command_only_replies(mut self, command_only: bool) -> Self {
+        self.command_only_replies = command_only;
+        self.offer_reply_command |= command_only;
         self
     }
 
@@ -8190,6 +8207,32 @@ Complete this request using your normal instructions and tools. Outbound chat is
 call between them.",
             ),
         };
+        let command = self
+            .offer_reply_command
+            .then(|| self.reply_command(env::current_exe(), key, &reply_id))
+            .flatten();
+        if self.command_only_replies {
+            let Some(command) = command else {
+                return Err(ChatRuntimeError::invalid(
+                    "the `agentctl chat reply` command cannot be printed for this request (no \
+                     executable at this process's path, or a word of the command is not \
+                     printable), and a coordinator whose screen is never read has no other way \
+                     to reply",
+                ));
+            };
+            return Ok(format!(
+                "{sent}The user's request arrived through the configured chat bridge.\n\
+{context}\n\
+{}\n\n\
+Complete this request using your normal instructions and tools. You may send one or multiple \
+replies, including progress updates; answer separate topics in separate replies. Nothing you \
+print reaches the user: send each reply by writing its text to a file and running this command \
+with the file's path in place of PATH_TO_YOUR_REPLY: {command}\nRun it once for each reply; \
+running it again with the same text does not send that text twice. If it fails, read its error, \
+fix the cause and run it again.",
+                record.message.text,
+            ));
+        }
         let mut prompt = format!(
             "{sent}The user's request arrived through the configured chat bridge.\n\
 {context}\n\
@@ -8200,11 +8243,7 @@ Lines between will be sent to the user as a chat message. {numbering}",
             record.message.text,
         );
         // Offered only with the two lines, so a reply has a way out when the command fails.
-        if let Some(command) = self
-            .offer_reply_command
-            .then(|| self.reply_command(env::current_exe(), key, &reply_id))
-            .flatten()
-        {
+        if let Some(command) = command {
             prompt.push_str(&format!(
                 "\n\nReply between the two lines as usual: that text reaches the user both in \
 this terminal and in the chat. Only to send a reply before your turn ends, or to resend one \
@@ -34035,6 +34074,51 @@ is unknown\n"
             state
                 .submit_reply(&key, "001", "by alias")
                 .expect("store by alias"),
+            stored_reply(2, false)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_command_only_prompt_gives_the_reply_command_and_no_marker_lines() {
+        // A headless coordinator's screen is never read, so its prompt names only the command,
+        // which sends every reply under the same ID (#594 headless-slack-trial).
+        let root = temporary("command-only-prompt");
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_command_only_replies(true);
+        let key = admitted(&state, 1).remove(0);
+        let prompt = prompted(&state, &key);
+        assert!(!prompt.contains("CHAT_REPLY"), "{prompt}");
+        assert!(
+            prompt.contains("Nothing you print reaches the user"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                " chat reply --bridge-state {} --request {key} --reply-id 001 --file \
+PATH_TO_YOUR_REPLY\nRun it once for each reply;",
+                shell_word(
+                    std::path::absolute(&root)
+                        .expect("absolute root")
+                        .to_str()
+                        .expect("UTF-8 root"),
+                )
+                .expect("printable root")
+            )),
+            "{prompt}"
+        );
+        assert_eq!(prompt.matches("chat reply").count(), 1, "{prompt}");
+        assert_eq!(
+            state
+                .submit_reply(&key, "001", "progress")
+                .expect("store a first reply"),
+            stored_reply(1, false)
+        );
+        assert_eq!(
+            state
+                .submit_reply(&key, "001", "done")
+                .expect("store a second reply"),
             stored_reply(2, false)
         );
         fs::remove_dir_all(root).expect("cleanup");
