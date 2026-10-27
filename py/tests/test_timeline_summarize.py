@@ -429,6 +429,16 @@ for job in jobs:
     })
 if os.environ.get("FAKE_CODEX_DROP_FROM_BATCH") and len(summaries) > 1:
     summaries.pop()
+if os.environ.get("FAKE_CODEX_INVENT_IN_BATCH") and len(summaries) > 1:
+    summaries[-1]["key"] += "_dup_placeholder"
+invent_marker = os.environ.get("FAKE_CODEX_INVENT_FIRST_CALL")
+if invent_marker and not Path(invent_marker).exists():
+    Path(invent_marker).write_text("invented", encoding="utf-8")
+    for summary in summaries:
+        summary["key"] += "_dup_placeholder"
+if os.environ.get("FAKE_CODEX_INVENT_ALWAYS"):
+    for summary in summaries:
+        summary["key"] += "_dup_placeholder"
 output_path = Path(args[args.index("--output-last-message") + 1])
 output_path.write_text(json.dumps({"summaries": summaries}), encoding="utf-8")
 with Path(os.environ["FAKE_CODEX_LOG"]).open("a", encoding="utf-8") as handle:
@@ -1353,3 +1363,76 @@ def test_batch_answer_missing_a_job_is_retried_one_job_at_a_time(
     assert sorted(results) == sorted(job.key for job in jobs)
     assert log.read_text(encoding="utf-8").count("CALL\n") == 4
 
+
+
+def test_batch_answer_under_an_invented_key_is_retried_one_job_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_codex.py"
+    log = tmp_path / "calls.log"
+    _write_fake_codex(fake)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    monkeypatch.setenv("FAKE_CODEX_INVENT_IN_BATCH", "1")
+    jobs = [_job("agent-a"), _job("agent-b"), _job("agent-c")]
+
+    results, _ = summarize_jobs(
+        jobs,
+        tmp_path / "cache",
+        backend="codex",
+        model="gpt-test",
+        max_workers=2,
+        batch_size=3,
+        codex_command=(sys.executable, str(fake)),
+    )
+
+    assert sorted(results) == sorted(job.key for job in jobs)
+    assert log.read_text(encoding="utf-8").count("CALL\n") == 4
+    cached_keys = {
+        json.loads(path.read_text(encoding="utf-8"))["result"]["key"]
+        for path in (tmp_path / "cache").glob("*.json")
+    }
+    assert cached_keys == {job.key for job in jobs}
+
+
+def test_one_job_answer_under_an_invented_key_gets_one_more_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_codex.py"
+    log = tmp_path / "calls.log"
+    _write_fake_codex(fake)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    monkeypatch.setenv("FAKE_CODEX_INVENT_FIRST_CALL", str(tmp_path / "invented-once"))
+
+    results, _ = summarize_jobs(
+        [_job("agent-a")],
+        tmp_path / "cache",
+        backend="codex",
+        model="gpt-test",
+        batch_size=1,
+        codex_command=(sys.executable, str(fake)),
+    )
+
+    assert list(results) == ["agent-a"]
+    assert log.read_text(encoding="utf-8").count("CALL\n") == 2
+
+
+def test_one_job_answer_that_keeps_inventing_keys_fails_after_one_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_codex.py"
+    log = tmp_path / "calls.log"
+    _write_fake_codex(fake)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    monkeypatch.setenv("FAKE_CODEX_INVENT_ALWAYS", "1")
+
+    with pytest.raises(SummaryError, match="invented keys 'agent-a_dup_placeholder'"):
+        summarize_jobs(
+            [_job("agent-a")],
+            tmp_path / "cache",
+            backend="codex",
+            model="gpt-test",
+            batch_size=1,
+            codex_command=(sys.executable, str(fake)),
+        )
+    assert log.read_text(encoding="utf-8").count("CALL\n") == 2
+    assert not list((tmp_path / "cache").glob("*.json"))

@@ -40,6 +40,7 @@ from wrkviz.claude_backend import (
     ClaudeBackendError,
     run_claude_json,
 )
+from wrkviz.budget import AGENT_NAME_KIND, BudgetStop, SpendGuard
 from wrkviz.summarize import SummaryRunStats, clean_summary_prose
 from wrkviz.summary_artifacts import (
     ARTIFACT_ENVELOPE_FORMAT,
@@ -69,6 +70,13 @@ _MAX_NAME_LENGTH: Final = 48
 _MIN_NAME_WORDS: Final = 2
 _MAX_NAME_WORDS: Final = 5
 _MAX_LIFETIME_SUMMARY_LENGTH: Final = 800
+
+
+#: How a batch answer that left out a job, or answered under a key it was never given, is
+#: reported; name_agents asks again one job at a time, exactly as summarize_jobs does.
+_OMISSION_PREFIX = "backend output: missing names for "
+_INVENTED_PREFIX = "backend output: names under invented keys "
+_RETRYABLE_ANSWER = (_OMISSION_PREFIX, _INVENTED_PREFIX)
 
 
 class AgentNameError(RuntimeError):
@@ -507,6 +515,7 @@ def _parse_backend_output_with_repairs(
     results: dict[str, AgentNameResult] = {}
     repairs: list[_NameRepair] = []
     seen_threads: set[str] = set()
+    invented: list[str] = []
     for index, raw_name in enumerate(_array(root["names"], "backend output.names")):
         where = f"backend output.names[{index}]"
         item = _object(raw_name, where)
@@ -517,7 +526,9 @@ def _parse_backend_output_with_repairs(
         )
         key = _string(item["key"], where + ".key")
         if key not in expected:
-            raise AgentNameError(f"{where}.key: unexpected key {key!r}")
+            # Answered under a key nobody asked for: never cached, but worth asking again.
+            invented.append(key)
+            continue
         if key in results:
             raise AgentNameError(f"{where}.key: duplicate key {key!r}")
         pending_item = expected[key]
@@ -567,8 +578,15 @@ def _parse_backend_output_with_repairs(
             generated_at=generated_at,
         )
     missing = sorted(set(expected) - set(results))
+    named = ", ".join(repr(key) for key in invented)
     if missing:
-        raise AgentNameError("backend output: missing names for " + ", ".join(missing))
+        raise AgentNameError(
+            _OMISSION_PREFIX
+            + ", ".join(missing)
+            + (f" (answered instead under invented keys {named})" if invented else "")
+        )
+    if invented:
+        raise AgentNameError(_INVENTED_PREFIX + named)
     return _ParsedNameOutput(results=results, repairs=tuple(repairs))
 
 
@@ -1138,6 +1156,61 @@ def _run_backend_batch(
     return _GeneratedNameBatch(results=results, receipt=receipt)
 
 
+def _lookup_cache(
+    job: AgentNameJob,
+    cache_dir: Path,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None,
+    service_tier: str | None,
+) -> tuple[_PendingName, _ResolvedName | None]:
+    """Return the job's cache slot and its validated hit (current or legacy identity), if any."""
+
+    input_hash = _input_hash(job, backend, model, reasoning_effort, service_tier)
+    item = _PendingName(
+        job=job,
+        input_hash=input_hash,
+        cache_path=cache_dir / f"{input_hash}.json",
+    )
+    cached = _load_cache(item, backend, model, reasoning_effort, service_tier)
+    if cached is None:
+        legacy_hash = _legacy_input_hash(
+            job, backend, model, reasoning_effort, service_tier
+        )
+        if legacy_hash != input_hash:
+            legacy_item = _PendingName(
+                job=job,
+                input_hash=legacy_hash,
+                cache_path=cache_dir / f"{legacy_hash}.json",
+            )
+            cached = _load_cache(
+                legacy_item, backend, model, reasoning_effort, service_tier
+            )
+    return item, cached
+
+
+def cached_agent_name(
+    job: AgentNameJob,
+    cache_dir: Path,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None = None,
+    service_tier: str | None = None,
+) -> AgentNameResult | None:
+    """Return the cached name :func:`name_agents` would reuse for *job*, without spending."""
+
+    _validate_job(job)
+    effective_service_tier = resolve_service_tier(backend, service_tier)
+    _, cached = _lookup_cache(
+        job, cache_dir, backend, model, reasoning_effort, effective_service_tier
+    )
+    return cached.result if cached is not None else None
+
+
+class _BudgetRefusal(Exception):
+    """A batch the spend guard did not admit; it made no model call."""
+
+
 def name_agents(
     jobs: Sequence[AgentNameJob],
     cache_dir: Path,
@@ -1149,8 +1222,12 @@ def name_agents(
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
     claude_command: Sequence[str] = ("claude",),
+    guard: SpendGuard | None = None,
 ) -> tuple[dict[str, AgentNameResult], SummaryRunStats]:
-    """Name agents after their summary pass, reusing immutable validated cache entries."""
+    """Name agents after their summary pass, reusing immutable validated cache entries.
+
+    *guard* holds the batches to a budget exactly as in :func:`wrkviz.summarize.summarize_jobs`.
+    """
 
     run_started_at = _utc_now()
 
@@ -1183,34 +1260,9 @@ def name_agents(
             raise AgentNameError(f"duplicate agent name thread id {job.thread_id!r}")
         seen_keys.add(job.key)
         seen_threads.add(job.thread_id)
-        input_hash = _input_hash(
-            job, backend, model, reasoning_effort, effective_service_tier
+        item, cached = _lookup_cache(
+            job, cache_dir, backend, model, reasoning_effort, effective_service_tier
         )
-        item = _PendingName(
-            job=job,
-            input_hash=input_hash,
-            cache_path=cache_dir / f"{input_hash}.json",
-        )
-        cached = _load_cache(
-            item, backend, model, reasoning_effort, effective_service_tier
-        )
-        if cached is None:
-            legacy_hash = _legacy_input_hash(
-                job, backend, model, reasoning_effort, effective_service_tier
-            )
-            if legacy_hash != input_hash:
-                legacy_item = _PendingName(
-                    job=job,
-                    input_hash=legacy_hash,
-                    cache_path=cache_dir / f"{legacy_hash}.json",
-                )
-                cached = _load_cache(
-                    legacy_item,
-                    backend,
-                    model,
-                    reasoning_effort,
-                    effective_service_tier,
-                )
         if cached is None:
             pending.append(item)
         else:
@@ -1258,6 +1310,37 @@ def name_agents(
         new_receipts.append(batch_result.receipt)
         return published
 
+    def run_batch(batch: tuple[_PendingName, ...]) -> _GeneratedNameBatch:
+        reservation = None
+        if guard is not None:
+            reservation = guard.reserve(AGENT_NAME_KIND, len(batch))
+            if reservation is None:
+                raise _BudgetRefusal()
+        usage: TokenUsage | None = None
+        try:
+            outcome = _run_backend_batch(
+                batch,
+                cache_dir=cache_dir,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=effective_service_tier,
+                codex_command=tuple(codex_command),
+                claude_command=tuple(claude_command),
+                processes=processes,
+            )
+            usage = outcome.receipt.usage
+            return outcome
+        except AgentNameError as error:
+            cause = error.__cause__
+            if isinstance(cause, (_CodexNameBatchError, _ClaudeNameBatchError)):
+                usage = cause.usage
+            raise
+        finally:
+            if guard is not None and reservation is not None:
+                guard.settle(reservation, usage)
+
+    refused_jobs = 0
     if backend == "heuristic":
         for batch in batches:
             batch_result = _run_backend_batch(
@@ -1273,48 +1356,63 @@ def name_agents(
             )
             generated.update(publish_batch(batch, batch_result))
     elif batches:
-        codex = tuple(codex_command)
-        claude = tuple(claude_command)
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
         futures: dict[
             concurrent.futures.Future[_GeneratedNameBatch], tuple[_PendingName, ...]
         ] = {}
+        retried_alone: set[str] = set()
+
+        def submit(
+            batch: tuple[_PendingName, ...],
+        ) -> concurrent.futures.Future[_GeneratedNameBatch]:
+            future = executor.submit(run_batch, batch)
+            futures[future] = batch
+            return future
+
         try:
             for batch in batches:
-                future = executor.submit(
-                    _run_backend_batch,
-                    batch,
-                    cache_dir=cache_dir,
-                    backend=backend,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    service_tier=effective_service_tier,
-                    codex_command=codex,
-                    claude_command=claude,
-                    processes=processes,
-                )
-                futures[future] = batch
+                submit(tuple(batch))
             first_error: AgentNameError | None = None
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    batch_result = future.result()
-                    generated.update(publish_batch(futures[future], batch_result))
-                except concurrent.futures.CancelledError:
-                    continue
-                except AgentNameError as error:
-                    if first_error is None:
-                        first_error = error
-                        for other in futures:
-                            if other is not future:
-                                other.cancel()
-                except Exception as error:
-                    if first_error is None:
-                        first_error = AgentNameError(
-                            f"agent naming backend failed: {error}"
-                        )
-                        for other in futures:
-                            if other is not future:
-                                other.cancel()
+            outstanding = set(futures)
+            while outstanding:
+                done, outstanding = concurrent.futures.wait(
+                    outstanding, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    try:
+                        batch_result = future.result()
+                        generated.update(publish_batch(futures[future], batch_result))
+                    except concurrent.futures.CancelledError:
+                        continue
+                    except _BudgetRefusal:
+                        refused_jobs += len(futures[future])
+                        continue
+                    except AgentNameError as error:
+                        batch = futures[future]
+                        # Same recovery as summary batches: a left-out or invented key costs
+                        # one re-ask, one job at a time, not the whole run.
+                        if first_error is None and str(error).startswith(_RETRYABLE_ANSWER):
+                            if len(batch) > 1:
+                                retried_alone.update(item.job.key for item in batch)
+                                outstanding.update(submit((item,)) for item in batch)
+                                continue
+                            if batch[0].job.key not in retried_alone:
+                                retried_alone.add(batch[0].job.key)
+                                outstanding.add(submit(batch))
+                                continue
+                        if first_error is None:
+                            first_error = error
+                            for other in futures:
+                                if other is not future:
+                                    other.cancel()
+                    except Exception as error:
+                        if first_error is None:
+                            first_error = AgentNameError(
+                                f"agent naming backend failed: {error}"
+                            )
+                            for other in futures:
+                                if other is not future:
+                                    other.cancel()
             if first_error is not None:
                 raise first_error
             with defer_sigint_during_cleanup():
@@ -1327,6 +1425,11 @@ def name_agents(
                 executor.shutdown(wait=True, cancel_futures=True)
             raise
 
+    if refused_jobs:
+        raise BudgetStop(
+            f"budget reached: {len(generated)} of {len(pending)} agent name job(s) needing a "
+            f"model call were generated and cached; {refused_jobs} were not started"
+        )
     for item in pending:
         result = generated.get(item.job.key)
         if result is None:
@@ -1393,5 +1496,6 @@ __all__ = [
     "AgentNameResult",
     "build_agent_name_prompt",
     "build_name_prompt",
+    "cached_agent_name",
     "name_agents",
 ]

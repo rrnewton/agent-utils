@@ -7,7 +7,7 @@ import hashlib
 import os
 import re
 import stat
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -88,9 +88,25 @@ from wrkviz.model import (
 )
 from wrkviz.model_io import task_note_from_json_obj, team_from_json_obj
 from wrkviz.payloads import merge_payloads, payload_ref, resolve_payloads
+from wrkviz.budget import (
+    AGENT_NAME_KIND,
+    OVERVIEW_KIND,
+    PHASE_KIND,
+    BudgetExceeded,
+    BudgetStop,
+    Prices,
+    SpendGuard,
+    StageCount,
+    SummaryPlan,
+    calibrate,
+    load_state,
+    running_state,
+    write_state,
+)
 from wrkviz.naming import (
     AgentNameJob,
     AgentNameResult,
+    cached_agent_name,
     input_hash_for_provenance as agent_name_input_hash_for_provenance,
     name_agents,
 )
@@ -147,11 +163,15 @@ from wrkviz.summarize import (
     SummaryRunStats,
     TECHNICAL_ROLLUP_STYLE,
     WorkBullet,
+    cached_summary,
+    carried_forward_matches,
+    carried_forward_summary,
     clean_summary_prose,
     clean_summary_result,
     input_hash_for_provenance as summary_input_hash_for_provenance,
     knowledge_text_has_link,
     overview_text_has_link,
+    record_rollup_inputs,
     summarize_jobs,
 )
 from wrkviz.summary_registry import (
@@ -488,6 +508,7 @@ class SummarizeReport:
     unknown_legacy_artifacts: int
     usage_run_paths: tuple[str, ...]
     files_changed: int
+    carried_forward_rollups: int = 0
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the summarization report as a JSON-serializable object."""
@@ -518,6 +539,7 @@ class SummarizeReport:
             "unknown_legacy_artifacts": self.unknown_legacy_artifacts,
             "usage_run_paths": list(self.usage_run_paths),
             "files_changed": self.files_changed,
+            "carried_forward_rollups": self.carried_forward_rollups,
         }
 
 
@@ -3709,6 +3731,41 @@ def _load_agent_names(
     return results
 
 
+def _rollup_children(
+    period: Period, lower_periods: Sequence[Period], phases: Sequence[PhaseWindow]
+) -> tuple[list[Period], list[PhaseWindow]]:
+    """Return the lower periods and the phases a rollup of *period* summarizes."""
+
+    own_phases = _phases_in(period, phases)
+    lower = [
+        item
+        for item in lower_periods
+        if item.start_ms >= period.start_ms and item.end_ms <= period.end_ms
+    ]
+    # Calendar levels do not nest perfectly: an ISO week can straddle a month. Summarize only
+    # fully-contained lower periods and fill uncovered boundary time from phase summaries, so
+    # January's monthly report never imports work from December or February.
+    uncovered_phases = [
+        phase
+        for phase in own_phases
+        if not any(
+            item.start_ms <= phase.start_ms and phase.end_ms <= item.end_ms
+            for item in lower
+        )
+    ]
+    return lower, uncovered_phases
+
+
+def _prior_same_level(
+    completed: Sequence[tuple[Period, SummaryResult]], period: Period
+) -> list[tuple[Period, SummaryResult]]:
+    """Return the (at most ten) earlier same-level summaries a rollup reads as context."""
+
+    return [
+        (item, result) for item, result in completed if item.end_ms <= period.start_ms
+    ][-10:]
+
+
 def _rollup_jobs_for_level(
     team: TeamData,
     periods: Sequence[Period],
@@ -3725,11 +3782,7 @@ def _rollup_jobs_for_level(
     jobs: list[SummaryJob] = []
     for period in periods:
         own_phases = _phases_in(period, phases)
-        lower = [
-            item
-            for item in lower_periods
-            if item.start_ms >= period.start_ms and item.end_ms <= period.end_ms
-        ]
+        lower, uncovered_phases = _rollup_children(period, lower_periods, phases)
         transcript_parts = [
             (
                 item.start_ms,
@@ -3738,17 +3791,6 @@ def _rollup_jobs_for_level(
             for item in lower
         ]
         dependency_results = [lower_results[_period_key(item)] for item in lower]
-        # Calendar levels do not nest perfectly: an ISO week can straddle a month. Summarize only
-        # fully-contained lower periods and fill uncovered boundary time from phase summaries, so
-        # January's monthly report never imports work from December or February.
-        uncovered_phases = [
-            phase
-            for phase in own_phases
-            if not any(
-                item.start_ms <= phase.start_ms and phase.end_ms <= item.end_ms
-                for item in lower
-            )
-        ]
         transcript_parts.extend(
             (
                 phase.start_ms,
@@ -3764,11 +3806,7 @@ def _rollup_jobs_for_level(
         transcript = "\n\n".join(
             line for _, line in sorted(transcript_parts, key=lambda item: item[0])
         )
-        prior = [
-            (item, result)
-            for item, result in completed_same_level
-            if item.end_ms <= period.start_ms
-        ][-10:]
+        prior = _prior_same_level(completed_same_level, period)
         prior_context = "\n\n".join(
             _result_line(result, item.label, item.start_ms) for item, result in prior
         )
@@ -3927,6 +3965,348 @@ def _period_range(
     return start_ms, end_ms - 1
 
 
+_RollupResolver = Callable[[SummaryJob, bool, bool], SummaryResult | None]
+
+
+def _walk_rollups(
+    team: TeamData,
+    periods: Sequence[Period],
+    rollup_kinds: tuple[str, ...],
+    start_ms: int,
+    phases: Sequence[PhaseWindow],
+    phase_results: Mapping[str, SummaryResult],
+    project_overview: SummaryResult,
+    terms: Sequence[GlossaryTerm],
+    summary_root: Path,
+    catalog: SummaryArtifactCatalog,
+    resolve: _RollupResolver,
+    *,
+    unknown_phase_keys: frozenset[str] = frozenset(),
+    overview_known: bool = True,
+) -> tuple[dict[str, SummaryResult], dict[str, SummaryResult]]:
+    """Build every rollup job bottom-up, in order, and get each result from *resolve*.
+
+    *resolve(job, own_known, prior_known)* returns the job's result, or ``None`` when planning
+    and the job would need a model call. *own_known* says whether everything the rollup
+    summarizes is already known (cached); *prior_known* whether its prior same-level context is.
+    A ``None`` result is replaced by a placeholder whose dependants are then not known either.
+    """
+
+    selected_kinds = tuple(kind for kind in ROLLUP_KINDS if kind in rollup_kinds)
+    by_kind = {
+        kind: [period for period in periods if period.kind == kind]
+        for kind in selected_kinds
+    }
+    all_results: dict[str, SummaryResult] = {}
+    all_plain_results: dict[str, SummaryResult] = {}
+    unknown: set[str] = set()
+    unknown_plain: set[str] = set()
+    previous_periods: list[Period] = []
+    previous_results: dict[str, SummaryResult] = {}
+    previous_plain_results: dict[str, SummaryResult] = {}
+    for kind in selected_kinds:
+        current = by_kind[kind]
+        first_start_ms = current[0].start_ms if current else start_ms
+        completed = _prior_catalog_rollups(
+            summary_root, catalog, kind, TECHNICAL_ROLLUP_STYLE, first_start_ms
+        )
+        completed_plain = _prior_catalog_rollups(
+            summary_root, catalog, kind, PLAIN_LANGUAGE_ROLLUP_STYLE, first_start_ms
+        )
+        # Same-level context is an intentional chronology dependency: day N reads up to ten
+        # earlier daily summaries (and likewise for weeks/months/quarters). Resolve those jobs
+        # one at a time so the actual prior summaries—not empty placeholders—enter the next
+        # content hash and terminology context.
+        for period in current:
+            key = _period_key(period)
+            lower, uncovered = _rollup_children(period, previous_periods, phases)
+            children_known = not any(
+                phase.summary_key in unknown_phase_keys for phase in uncovered
+            )
+            job = _rollup_jobs_for_level(
+                team,
+                (period,),
+                phases,
+                phase_results,
+                previous_periods,
+                previous_results,
+                completed,
+                terms,
+                TECHNICAL_ROLLUP_STYLE,
+            )[0]
+            result = resolve(
+                job,
+                children_known and not any(_period_key(item) in unknown for item in lower),
+                not any(
+                    _period_key(item) in unknown
+                    for item, _ in _prior_same_level(completed, period)
+                ),
+            )
+            if result is None:
+                unknown.add(key)
+                result = _unavailable_summary(job.key, period.end_ms, f"planned {kind} rollup")
+            all_results[key] = result
+            completed.append((period, result))
+            plain_job = _rollup_jobs_for_level(
+                team,
+                (period,),
+                phases,
+                phase_results,
+                previous_periods,
+                previous_plain_results,
+                completed_plain,
+                terms,
+                PLAIN_LANGUAGE_ROLLUP_STYLE,
+                project_overview,
+                {key: result},
+            )[0]
+            plain_result = resolve(
+                plain_job,
+                overview_known
+                and children_known
+                and key not in unknown
+                and not any(_period_key(item) in unknown_plain for item in lower),
+                not any(
+                    _period_key(item) in unknown_plain
+                    for item, _ in _prior_same_level(completed_plain, period)
+                ),
+            )
+            if plain_result is None:
+                unknown_plain.add(key)
+                plain_result = _unavailable_summary(
+                    plain_job.key, period.end_ms, f"planned plain-language {kind} rollup"
+                )
+            all_plain_results[key] = plain_result
+            completed_plain.append((period, plain_result))
+        previous_periods = current
+        previous_results = {
+            _period_key(period): all_results[_period_key(period)] for period in current
+        }
+        previous_plain_results = {
+            _period_key(period): all_plain_results[_period_key(period)]
+            for period in current
+        }
+    return all_results, all_plain_results
+
+
+@dataclass(frozen=True)
+class _SummaryTree:
+    """The mechanical inputs of one team's summary tree, computed before any model call."""
+
+    team: TeamData
+    summary_root: Path
+    catalog: SummaryArtifactCatalog
+    phases: tuple[PhaseWindow, ...]
+    phase_jobs: tuple[SummaryJob, ...]
+    overview_source: _ProjectOverviewInput
+    overview_job: SummaryJob
+    start_ms: int
+    periods: tuple[Period, ...]
+
+
+def _summary_tree(
+    archive: Path,
+    team_slug: str,
+    *,
+    phase_minutes: int,
+    context_chars: int,
+    transcript_chars: int,
+    summary_window: DateWindow | None,
+    rollup_kinds: tuple[str, ...],
+) -> _SummaryTree:
+    team = load_archived_team(archive, team_slug)
+    if summary_window is not None:
+        team = apply_date_window(team, summary_window)
+    summary_root = _summary_root(archive, team_slug)
+    phases = tuple(
+        build_phases(
+            team,
+            phase_minutes=phase_minutes,
+            context_chars=context_chars,
+            transcript_chars=transcript_chars,
+        )
+    )
+    try:
+        overview_source = _frozen_project_overview_input(archive, team)
+    except _ProjectOverviewSourceSetChanged as change:
+        overview_source = _renewed_project_overview_input(team, change.previous_epoch)
+    if overview_source is None:
+        overview_source = _root_overview_input(team)
+    start_ms, end_ms = _period_range(team, phases)
+    return _SummaryTree(
+        team=team,
+        summary_root=summary_root,
+        catalog=load_summary_catalog(summary_root / "artifacts.json", team_slug),
+        phases=phases,
+        # Legacy schema-3 glossary records contain mechanically selected strings, not a
+        # supported semantic project ontology. Until the bounded semantic discovery pipeline is
+        # complete, fail closed: no candidate enters a model prompt and no glossary-specific
+        # model job can run.
+        phase_jobs=tuple(_phase_jobs(team, phases, (), context_chars)),
+        overview_source=overview_source,
+        overview_job=_project_overview_job(team, overview_source),
+        start_ms=start_ms,
+        periods=tuple(
+            periods_for_range(
+                start_ms, end_ms, team.display_timezone, team.team_slug, rollup_kinds
+            )
+        ),
+    )
+
+
+def _request_json(
+    tree: _SummaryTree,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None,
+    service_tier: str | None,
+    rollup_kinds: tuple[str, ...],
+) -> dict[str, JsonValue]:
+    """What a summarize run was asked for, as recorded in its run state."""
+
+    return {
+        "backend": backend,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "service_tier": service_tier,
+        "window_start_ms": tree.team.window_start_ms,
+        "window_end_ms": tree.team.window_end_ms,
+        "rollup_kinds": list(rollup_kinds),
+    }
+
+
+def _rollup_index(summary_root: Path) -> Path:
+    """Directory mapping each rollup's own-inputs hash to the paid artifact for those inputs."""
+
+    return summary_root / "rollup_inputs"
+
+
+def _plan_tree(
+    tree: _SummaryTree,
+    backend: str,
+    model: str,
+    *,
+    context_chars: int,
+    reasoning_effort: str | None,
+    service_tier: str | None,
+    rollup_kinds: tuple[str, ...],
+    prices: Prices | None,
+    budget_usd: float | None,
+) -> SummaryPlan:
+    """Count what is cached, carried forward, or needs a model call, level by level."""
+
+    cache = tree.summary_root / "cache"
+    name_cache = tree.summary_root / "name_cache"
+    index = _rollup_index(tree.summary_root)
+
+    def stage(name: str, kind: str) -> StageCount:
+        item = StageCount(name=name, kind=kind)
+        stages.append(item)
+        return item
+
+    stages: list[StageCount] = []
+    phase_stage = stage("phase summaries", PHASE_KIND)
+    phase_results: dict[str, SummaryResult] = {}
+    unknown_phase_keys: set[str] = set()
+    for job in tree.phase_jobs:
+        phase_stage.total += 1
+        hit = cached_summary(job, cache, backend, model, reasoning_effort, service_tier)
+        if hit is None:
+            phase_stage.to_generate += 1
+            unknown_phase_keys.add(job.key)
+            hit = _unavailable_summary(job.key, job.end_ms, "planned phase")
+        else:
+            phase_stage.cached += 1
+        phase_results[job.key] = hit
+
+    name_stage = stage("agent names", AGENT_NAME_KIND)
+    agents_with_unknown = {
+        phase.agent_id for phase in tree.phases if phase.summary_key in unknown_phase_keys
+    }
+    for name_job in _agent_name_jobs(tree.team, tree.phases, phase_results, context_chars):
+        name_stage.total += 1
+        if name_job.thread_id not in agents_with_unknown and cached_agent_name(
+            name_job, name_cache, backend, model, reasoning_effort, service_tier
+        ) is not None:
+            name_stage.cached += 1
+        else:
+            name_stage.to_generate += 1
+
+    overview_stage = stage("project overview", OVERVIEW_KIND)
+    overview_stage.total = 1
+    overview = cached_summary(
+        tree.overview_job, cache, backend, model, reasoning_effort, service_tier
+    )
+    if overview is None:
+        overview_stage.to_generate = 1
+        overview = _unavailable_summary(
+            tree.overview_job.key, tree.overview_job.end_ms, "planned project overview"
+        )
+    else:
+        overview_stage.cached = 1
+
+    rollup_stages: dict[tuple[str, str], StageCount] = {}
+    for kind in ROLLUP_KINDS:
+        if kind in rollup_kinds:
+            for style, audience in (
+                (TECHNICAL_ROLLUP_STYLE, "technical"),
+                (PLAIN_LANGUAGE_ROLLUP_STYLE, "plain-language"),
+            ):
+                rollup_stages[(kind, style)] = stage(f"{kind} rollups ({audience})", style)
+
+    def resolve(job: SummaryJob, own_known: bool, prior_known: bool) -> SummaryResult | None:
+        item = rollup_stages[(job.key.split(":")[1], job.summary_style)]
+        item.total += 1
+        if own_known and prior_known:
+            hit = cached_summary(job, cache, backend, model, reasoning_effort, service_tier)
+            if hit is not None:
+                item.cached += 1
+                return hit
+        if own_known:
+            carried = carried_forward_summary(
+                job, index, cache, backend, model, reasoning_effort, service_tier
+            )
+            if carried is not None:
+                item.carried_forward += 1
+                return carried
+        item.to_generate += 1
+        return None
+
+    _walk_rollups(
+        tree.team,
+        tree.periods,
+        rollup_kinds,
+        tree.start_ms,
+        tree.phases,
+        phase_results,
+        overview,
+        (),
+        tree.summary_root,
+        tree.catalog,
+        resolve,
+        unknown_phase_keys=frozenset(unknown_phase_keys),
+        overview_known=overview_stage.cached == 1,
+    )
+    return SummaryPlan(
+        team_slug=tree.team.team_slug,
+        stages=stages,
+        costs=calibrate(cache, name_cache, backend, model, reasoning_effort),
+        prices=prices,
+        budget_usd=budget_usd,
+        previous_state=_unfinished_state(tree.summary_root),
+        request=_request_json(
+            tree, backend, model, reasoning_effort, service_tier, rollup_kinds
+        ),
+    )
+
+
+def _unfinished_state(summary_root: Path) -> dict[str, JsonValue] | None:
+    state = load_state(summary_root)
+    if state is None or state.get("status") == "complete":
+        return None
+    return state
+
+
 def _summarize_archive_locked(
     archive: Path,
     team_slug: str,
@@ -3945,44 +4325,143 @@ def _summarize_archive_locked(
     service_tier: str | None = None,
     summary_window: DateWindow | None = None,
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
+    budget_usd: float | None = None,
+    prices: Prices | None = None,
+    on_plan: Callable[[SummaryPlan], None] | None = None,
 ) -> SummarizeReport:
-    """Fill only missing/changed structured summaries; never format the website."""
+    """Fill only missing/changed structured summaries; never format the website.
+
+    The whole remaining tree is planned first (see :class:`~wrkviz.budget.SummaryPlan`); with a
+    budget, a plan over budget raises :class:`~wrkviz.budget.BudgetExceeded` before any model
+    call, and a run whose spend reaches the budget anyway stops with
+    :class:`~wrkviz.budget.BudgetStop`. ``summarize_state.json`` records a run as ``running``
+    before its first model call and as ``complete`` or ``partial`` when it ends.
+    """
 
     service_tier = resolve_service_tier(backend, service_tier)
-    team = load_archived_team(archive, team_slug)
-    if summary_window is not None:
-        team = apply_date_window(team, summary_window)
-    summary_root = _summary_root(archive, team_slug)
-    existing_summary_catalog = load_summary_catalog(
-        summary_root / "artifacts.json", team_slug
+    if budget_usd is not None and prices is None and backend != "heuristic":
+        raise ValueError("a summary budget needs model prices (--price)")
+    tree = _summary_tree(
+        archive,
+        team_slug,
+        phase_minutes=phase_minutes,
+        context_chars=context_chars,
+        transcript_chars=transcript_chars,
+        summary_window=summary_window,
+        rollup_kinds=rollup_kinds,
     )
+    plan = _plan_tree(
+        tree,
+        backend,
+        model,
+        context_chars=context_chars,
+        reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
+        rollup_kinds=rollup_kinds,
+        prices=prices,
+        budget_usd=budget_usd,
+    )
+    if on_plan is not None:
+        on_plan(plan)
+    if plan.over_budget:
+        raise BudgetExceeded(plan)
+    guard = (
+        SpendGuard(budget_usd, prices, plan.costs)
+        if budget_usd is not None and prices is not None
+        else None
+    )
+    summary_root = tree.summary_root
+    state = running_state(
+        request=_request_json(
+            tree, backend, model, reasoning_effort, service_tier, rollup_kinds
+        ),
+        plan=plan,
+        previous=load_state(summary_root),
+    )
+    write_state(summary_root, state)
+    progress = {"stage": "phase summaries"}
+    try:
+        report = _run_summary_tree(
+            archive,
+            tree,
+            backend,
+            model,
+            progress,
+            guard,
+            max_workers=max_workers,
+            batch_size=batch_size,
+            name_batch_size=name_batch_size,
+            context_chars=context_chars,
+            codex_command=codex_command,
+            claude_command=claude_command,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
+            rollup_kinds=rollup_kinds,
+        )
+    except BaseException as error:
+        reason = (
+            "budget"
+            if isinstance(error, BudgetStop)
+            else "interrupted"
+            if isinstance(error, KeyboardInterrupt)
+            else "error"
+        )
+        state.update(
+            status="partial",
+            spent_usd=round(guard.spent_usd, 4) if guard is not None else None,
+            stopped={
+                "reason": reason,
+                "stage": progress["stage"],
+                "detail": _one_line(str(error))[:500],
+            },
+        )
+        try:
+            write_state(summary_root, state)
+        except OSError:
+            pass
+        raise
+    state.update(
+        status="complete",
+        spent_usd=round(guard.spent_usd, 4) if guard is not None else None,
+    )
+    write_state(summary_root, state)
+    return report
+
+
+def _run_summary_tree(
+    archive: Path,
+    tree: _SummaryTree,
+    backend: str,
+    model: str,
+    progress: dict[str, str],
+    guard: SpendGuard | None,
+    *,
+    max_workers: int,
+    batch_size: int,
+    name_batch_size: int,
+    context_chars: int,
+    codex_command: Sequence[str],
+    claude_command: Sequence[str],
+    reasoning_effort: str | None,
+    service_tier: str | None,
+    rollup_kinds: tuple[str, ...],
+) -> SummarizeReport:
+    team = tree.team
+    team_slug = team.team_slug
+    summary_root = tree.summary_root
+    phases = tree.phases
     changed = int(
         write_json_if_changed(
             summary_root / "summarizers.json",
             registry_json_obj(),
         )
     )
-    phases = build_phases(
-        team,
-        phase_minutes=phase_minutes,
-        context_chars=context_chars,
-        transcript_chars=transcript_chars,
-    )
-    # Legacy schema-3 glossary records contain mechanically selected strings, not a supported
-    # semantic project ontology. Until the bounded semantic discovery pipeline is complete, fail
-    # closed: no candidate enters a model prompt and no glossary-specific model job can run.
     supported_terms: tuple[GlossaryTerm, ...] = ()
     cache = summary_root / "cache"
-    try:
-        overview_source = _frozen_project_overview_input(archive, team)
-    except _ProjectOverviewSourceSetChanged as change:
-        overview_source = _renewed_project_overview_input(
-            team, change.previous_epoch
-        )
-    if overview_source is None:
-        overview_source = _root_overview_input(team)
+    index = _rollup_index(summary_root)
+    progress["stage"] = "phase summaries"
     phase_results, phase_stats = summarize_jobs(
-        _phase_jobs(team, phases, supported_terms, context_chars),
+        tree.phase_jobs,
         cache,
         backend,
         model,
@@ -3992,8 +4471,10 @@ def _summarize_archive_locked(
         claude_command=claude_command,
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
+        guard=guard,
     )
     changed += _write_phase_data(archive, team_slug, phases, phase_results)
+    progress["stage"] = "agent names"
     name_jobs = _agent_name_jobs(team, phases, phase_results, context_chars)
     agent_names, name_stats = name_agents(
         name_jobs,
@@ -4006,11 +4487,13 @@ def _summarize_archive_locked(
         claude_command=claude_command,
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
+        guard=guard,
     )
     changed += _write_agent_name_data(
         archive, team_slug, name_jobs, agent_names
     )
-    overview_job = _project_overview_job(team, overview_source)
+    progress["stage"] = "project overview"
+    overview_job = tree.overview_job
     overview_results, overview_stats = summarize_jobs(
         (overview_job,),
         cache,
@@ -4022,126 +4505,68 @@ def _summarize_archive_locked(
         claude_command=claude_command,
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
+        guard=guard,
     )
     project_overview = overview_results[overview_job.key]
     _validate_project_overview(project_overview, "generated project overview")
     changed += _write_project_overview_data(
-        archive, team_slug, overview_source, project_overview
+        archive, team_slug, tree.overview_source, project_overview
     )
     definition_jobs: tuple[SummaryJob, ...] = ()
     definition_results: dict[str, SummaryResult] = {}
-    enriched_terms = supported_terms
 
-    start_ms, end_ms = _period_range(team, phases)
-    periods = periods_for_range(
-        start_ms,
-        end_ms,
-        team.display_timezone,
-        team.team_slug,
-        rollup_kinds,
-    )
-    selected_kinds = tuple(kind for kind in ROLLUP_KINDS if kind in rollup_kinds)
-    by_kind = {
-        kind: [period for period in periods if period.kind == kind]
-        for kind in selected_kinds
-    }
-    all_results: dict[str, SummaryResult] = {}
-    all_plain_results: dict[str, SummaryResult] = {}
     backend_stats: list[SummaryRunStats] = [
         phase_stats,
         name_stats,
         overview_stats,
     ]
-    previous_periods: list[Period] = []
-    previous_results: dict[str, SummaryResult] = {}
-    previous_plain_results: dict[str, SummaryResult] = {}
-    for kind in selected_kinds:
-        current = by_kind[kind]
-        first_start_ms = current[0].start_ms if current else start_ms
-        completed = _prior_catalog_rollups(
-            summary_root,
-            existing_summary_catalog,
-            kind,
-            TECHNICAL_ROLLUP_STYLE,
-            first_start_ms,
-        )
-        completed_plain = _prior_catalog_rollups(
-            summary_root,
-            existing_summary_catalog,
-            kind,
-            PLAIN_LANGUAGE_ROLLUP_STYLE,
-            first_start_ms,
-        )
-        # Same-level context is an intentional chronology dependency: day N reads up to ten
-        # earlier daily summaries (and likewise for weeks/months/quarters). Generate those jobs
-        # one at a time so the actual prior summaries—not empty placeholders—enter the next
-        # content hash and terminology context.
-        for period in current:
-            jobs = _rollup_jobs_for_level(
-                team,
-                (period,),
-                phases,
-                phase_results,
-                previous_periods,
-                previous_results,
-                completed,
-                supported_terms,
-                TECHNICAL_ROLLUP_STYLE,
-            )
-            results, stats = summarize_jobs(
-                jobs,
-                cache,
-                backend,
-                model,
-                max_workers=max_workers,
-                batch_size=batch_size,
-                codex_command=codex_command,
-                claude_command=claude_command,
-                reasoning_effort=reasoning_effort,
-                service_tier=service_tier,
-            )
-            backend_stats.append(stats)
-            result = results[jobs[0].key]
-            all_results[_period_key(period)] = result
-            completed.append((period, result))
-            plain_jobs = _rollup_jobs_for_level(
-                team,
-                (period,),
-                phases,
-                phase_results,
-                previous_periods,
-                previous_plain_results,
-                completed_plain,
-                enriched_terms,
-                PLAIN_LANGUAGE_ROLLUP_STYLE,
-                project_overview,
-                {_period_key(period): result},
-            )
-            plain_results, plain_stats = summarize_jobs(
-                plain_jobs,
-                cache,
-                backend,
-                model,
-                max_workers=max_workers,
-                batch_size=batch_size,
-                codex_command=codex_command,
-                claude_command=claude_command,
-                reasoning_effort=reasoning_effort,
-                service_tier=service_tier,
-            )
-            backend_stats.append(plain_stats)
-            plain_result = plain_results[plain_jobs[0].key]
-            all_plain_results[_period_key(period)] = plain_result
-            completed_plain.append((period, plain_result))
-        previous_periods = current
-        previous_results = {
-            _period_key(period): all_results[_period_key(period)] for period in current
-        }
-        previous_plain_results = {
-            _period_key(period): all_plain_results[_period_key(period)]
-            for period in current
-        }
+    carried_forward = 0
 
+    def resolve(job: SummaryJob, own_known: bool, prior_known: bool) -> SummaryResult:
+        nonlocal carried_forward, changed
+        progress["stage"] = f"{job.key.split(':')[1]} rollups ({job.key})"
+        if cached_summary(job, cache, backend, model, reasoning_effort, service_tier) is None:
+            # Only the prior same-level context changed: the rollup summarizes exactly what
+            # its paid summary already covers, so keep that instead of paying again.
+            carried = carried_forward_summary(
+                job, index, cache, backend, model, reasoning_effort, service_tier
+            )
+            if carried is not None:
+                carried_forward += 1
+                return carried
+        results, stats = summarize_jobs(
+            (job,),
+            cache,
+            backend,
+            model,
+            max_workers=max_workers,
+            batch_size=batch_size,
+            codex_command=codex_command,
+            claude_command=claude_command,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
+            guard=guard,
+        )
+        backend_stats.append(stats)
+        result = results[job.key]
+        changed += int(record_rollup_inputs(index, job, result))
+        return result
+
+    all_results, all_plain_results = _walk_rollups(
+        team,
+        tree.periods,
+        rollup_kinds,
+        tree.start_ms,
+        phases,
+        phase_results,
+        project_overview,
+        supported_terms,
+        summary_root,
+        tree.catalog,
+        resolve,
+    )
+    progress["stage"] = "writing rollups"
+    periods = tree.periods
     for period in periods:
         result = all_results[_period_key(period)]
         plain_result = all_plain_results[_period_key(period)]
@@ -4220,7 +4645,50 @@ def _summarize_archive_locked(
             if item.usage_run_path is not None
         ),
         files_changed=changed,
+        carried_forward_rollups=carried_forward,
     )
+
+
+def plan_summaries(
+    archive: Path,
+    team_slug: str,
+    backend: str,
+    model: str,
+    *,
+    phase_minutes: int = 30,
+    context_chars: int = 16_000,
+    transcript_chars: int = 30_000,
+    reasoning_effort: str | None = None,
+    service_tier: str | None = None,
+    summary_window: DateWindow | None = None,
+    rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
+    budget_usd: float | None = None,
+    prices: Prices | None = None,
+) -> SummaryPlan:
+    """Return what :func:`summarize_archive` would do and cost, without any model call."""
+
+    service_tier = resolve_service_tier(backend, service_tier)
+    with archive_writer_lock(archive):
+        tree = _summary_tree(
+            archive,
+            team_slug,
+            phase_minutes=phase_minutes,
+            context_chars=context_chars,
+            transcript_chars=transcript_chars,
+            summary_window=summary_window,
+            rollup_kinds=rollup_kinds,
+        )
+        return _plan_tree(
+            tree,
+            backend,
+            model,
+            context_chars=context_chars,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
+            rollup_kinds=rollup_kinds,
+            prices=prices,
+            budget_usd=budget_usd,
+        )
 
 
 def summarize_archive(
@@ -4241,8 +4709,16 @@ def summarize_archive(
     service_tier: str | None = None,
     summary_window: DateWindow | None = None,
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
+    budget_usd: float | None = None,
+    prices: Prices | None = None,
+    on_plan: Callable[[SummaryPlan], None] | None = None,
 ) -> SummarizeReport:
-    """Fill structured summaries/names while serializing token-spending cache misses."""
+    """Fill structured summaries/names while serializing token-spending cache misses.
+
+    *on_plan* receives the whole remaining tree's plan before the first model call. With
+    *budget_usd* (which needs *prices*), a plan over budget refuses to start and a run that
+    reaches the budget anyway stops partway; see :func:`_summarize_archive_locked`.
+    """
 
     with archive_writer_lock(archive):
         return _summarize_archive_locked(
@@ -4262,6 +4738,9 @@ def summarize_archive(
             service_tier=service_tier,
             summary_window=summary_window,
             rollup_kinds=rollup_kinds,
+            budget_usd=budget_usd,
+            prices=prices,
+            on_plan=on_plan,
         )
 
 
@@ -4811,7 +5290,11 @@ def _validate_rollup_inputs(
     summary_root: Path,
     catalog: SummaryArtifactCatalog,
 ) -> tuple[dict[str, SummaryResult], dict[str, SummaryResult]]:
-    """Fail closed when current rollup inputs differ from cached model inputs."""
+    """Fail closed when current rollup inputs differ from cached model inputs.
+
+    A rollup carried forward by summarize (same own inputs, older prior same-level context) is
+    current: see :func:`wrkviz.summarize.carried_forward_summary`.
+    """
 
     selected_kinds = tuple(
         kind for kind in ROLLUP_KINDS if any(period.kind == kind for period in periods)
@@ -4856,7 +5339,9 @@ def _validate_rollup_inputs(
                 TECHNICAL_ROLLUP_STYLE,
             )[0]
             technical = technical_candidates[key]
-            if not _summary_matches_job(technical, technical_job):
+            if not _summary_matches_job(technical, technical_job) and not (
+                carried_forward_matches(technical_job, technical, _rollup_index(summary_root))
+            ):
                 technical_fallback = _unavailable_summary(
                     technical_job.key,
                     period.end_ms,
@@ -4890,7 +5375,9 @@ def _validate_rollup_inputs(
                 {key: technical},
             )[0]
             plain = plain_candidates[key]
-            if not _summary_matches_job(plain, plain_job):
+            if not _summary_matches_job(plain, plain_job) and not (
+                carried_forward_matches(plain_job, plain, _rollup_index(summary_root))
+            ):
                 plain_fallback = _unavailable_summary(
                     plain_job.key,
                     period.end_ms,
@@ -5257,6 +5744,7 @@ __all__ = [
     "record_run",
     "rehydrate_tool_payloads",
     "source_digest",
+    "plan_summaries",
     "summarize_archive",
     "utc_now",
 ]
