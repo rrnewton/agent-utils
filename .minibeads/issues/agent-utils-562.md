@@ -107,4 +107,7 @@ witnesses, remote containment, submodule salvage receipts, planned
 rescue receipts, and the exact derived ARCHIVED entry under both rescue
 roots). That completes every recovery-journal kind.
 
-[muse watermelon] Recovery-journal coverage is complete. Next: update the editions inventory for the finished journal kinds, then take stock toward the first composed read command.
+[muse watermelon] Slice 16 in progress: validation/editions.json updated for
+complete journal coverage. After this, the remaining work toward a Rust
+wrkslots is composed read commands (list/status-style summaries over the
+validated formats), then writers.
