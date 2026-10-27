@@ -155,6 +155,13 @@ impl ChatServiceError {
     /// The kind of this failure, as `service-health.json` records it.
     fn class(&self) -> &'static str {
         match self {
+            Self::Agent(AgentError::Client(error))
+                if error
+                    .to_string()
+                    .starts_with(crate::profiles::UNANSWERED_CHECK_PREFIX) =>
+            {
+                "profile_policy_unanswered"
+            }
             Self::Agent(AgentError::Client(_)) => "coordinator_unavailable",
             Self::Agent(_) => "agent",
             Self::Runtime(_) => "runtime",
@@ -4295,7 +4302,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let mut reminders = reminders;
     let mut health = ServiceHealth::new(manager.registry());
     let mut backoff = ProviderBackoff::new();
-    loop {
+    let result = loop {
         let started = Instant::now();
         health.pass_started(started);
         let result = owner_loop_end(
@@ -4318,8 +4325,8 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             ),
         );
         let error = match result {
-            Ok(()) => return Ok(()),
-            Err(error) if stop.is_stopped() || !error.restarts_owner_loop() => return Err(error),
+            Ok(()) => break Ok(()),
+            Err(error) if stop.is_stopped() || !error.restarts_owner_loop() => break Err(error),
             Err(error) => error,
         };
         // A transient failure, such as a Herdr call that failed or timed out on a loaded host,
@@ -4327,6 +4334,15 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         // everything it needs from the durable state, as a new `chat run` would, while the
         // provider and reaction workers keep admitting messages (#581 bridge-git-timeout-fatal).
         let wait = backoff.wait_after(started.elapsed());
+        if !health.owner_loop_synced {
+            // This run has not saved yet: an owner loop failure left by an earlier run is not
+            // this one's.
+            if let Err(error) = state.note_owner_loop_up() {
+                service_log(format_args!(
+                    "agentctl: the service health record could not be saved: {error}"
+                ));
+            }
+        }
         let failures = match state.note_owner_loop_down(error.class(), &error.to_string()) {
             Ok(failure) => failure.failures.to_string(),
             Err(record) => {
@@ -4346,12 +4362,51 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         *output_wake
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        stop.wait(wait);
+        if let Err(error) = backoff_wait(state, stop, notices, overflowed, &mut health, wait) {
+            break Err(error);
+        }
         if stop.is_stopped() {
+            break Ok(());
+        }
+    };
+    // A clean stop leaves no failure behind for `chat status` to report as current.
+    if result.is_ok() {
+        health.clear(state);
+    }
+    result
+}
+
+/// Wait `wait` between owner loop passes, until a stop. The provider's notices are still taken
+/// meanwhile: a fatal notice, or a provider worker that ended, ends `chat run` as it would from
+/// a running pass, and the channel never fills, which would block the provider's fatal notice.
+/// Admitted request keys are dropped and `overflowed` set, so the next pass's recovery finds
+/// them in the durable state. The registry's profile-config check stays reported.
+fn backoff_wait(
+    state: &BridgeState,
+    stop: &StopState,
+    notices: &mpsc::Receiver<ProviderNotice>,
+    overflowed: &AtomicBool,
+    health: &mut ServiceHealth,
+    wait: Duration,
+) -> Result<(), ChatServiceError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let mut keys = DirectKeyQueue::default();
+        take_provider_notices(notices, stop, &mut keys, overflowed)?;
+        if !keys.is_empty() {
+            overflowed.store(true, Ordering::SeqCst);
+        }
+        health.sync_profile_policy(state);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if stop.is_stopped() || remaining.is_zero() {
             return Ok(());
         }
+        stop.wait(remaining.min(BACKOFF_NOTICE_POLL));
     }
 }
+
+/// How often [`backoff_wait`] takes the provider's notices.
+const BACKOFF_NOTICE_POLL: Duration = Duration::from_millis(250);
 
 /// Keeps `service-health.json` current from the owner loop: the registry's profile-config check,
 /// as [`crate::profiles::ignore_check_failure`] reports it, and the end of an owner loop failure
@@ -4388,17 +4443,48 @@ impl ServiceHealth {
         self.owner_loop_synced = true;
     }
 
+    /// Save the profile-config check if it changed since it was last saved.
+    fn sync_profile_policy(&mut self, state: &BridgeState) {
+        let saved = self.save_profile_policy(state);
+        self.logged(saved);
+    }
+
+    fn save_profile_policy(&mut self, state: &BridgeState) -> Result<(), ChatRuntimeError> {
+        let current = crate::profiles::ignore_check_failure(&self.registry);
+        if self.profile_policy.as_ref() == Some(&current) {
+            return Ok(());
+        }
+        state.note_profile_policy(current.as_ref())?;
+        self.profile_policy = Some(current);
+        Ok(())
+    }
+
+    /// Clear both records, as at a clean stop.
+    fn clear(&mut self, state: &BridgeState) {
+        let saved = state
+            .note_profile_policy(None)
+            .and_then(|()| state.note_owner_loop_up());
+        self.logged(saved);
+    }
+
+    fn logged(&mut self, saved: Result<(), ChatRuntimeError>) {
+        match saved {
+            Ok(()) => self.save_failed = false,
+            Err(error) => {
+                if !self.save_failed {
+                    service_log(format_args!(
+                        "agentctl: the service health record could not be saved: {error}"
+                    ));
+                }
+                self.save_failed = true;
+            }
+        }
+    }
+
     /// Save what changed since the last call. A failed save is logged once and tried again at
     /// the next call; it never stops the loop.
     fn tick(&mut self, state: &BridgeState) {
-        let mut saved = Ok(());
-        let current = crate::profiles::ignore_check_failure(&self.registry);
-        if self.profile_policy.as_ref() != Some(&current) {
-            saved = state.note_profile_policy(current.as_ref());
-            if saved.is_ok() {
-                self.profile_policy = Some(current);
-            }
-        }
+        let mut saved = self.save_profile_policy(state);
         let recovered = self.owner_loop_down && self.pass_started.elapsed() >= PROVIDER_RETRY_MAX;
         if saved.is_ok() && (recovered || !self.owner_loop_synced) {
             saved = state.note_owner_loop_up();
@@ -4413,17 +4499,7 @@ impl ServiceHealth {
                 self.owner_loop_synced = true;
             }
         }
-        match saved {
-            Ok(()) => self.save_failed = false,
-            Err(error) => {
-                if !self.save_failed {
-                    service_log(format_args!(
-                        "agentctl: the service health record could not be saved: {error}"
-                    ));
-                }
-                self.save_failed = true;
-            }
-        }
+        self.logged(saved);
     }
 }
 
@@ -13774,6 +13850,7 @@ esac
         let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
         let mut failing = false;
         let mut recorded: Option<(Value, usize)> = None;
+        let mut still_reported = false;
         run_owner_loop_until(
             &fixture,
             &state,
@@ -13797,9 +13874,14 @@ esac
                         recorded = Some((record, reads()));
                     }
                 }
-                recorded
+                let done = recorded
                     .as_ref()
-                    .is_some_and(|(_, before)| reads() > before + 2)
+                    .is_some_and(|(_, before)| reads() > before + 2);
+                if done {
+                    // Until a restarted loop has run for a minute.
+                    still_reported = service_health(&state_root).is_some();
+                }
+                done
             },
         );
         let (record, before) = recorded.expect("no owner loop failure was recorded");
@@ -13813,8 +13895,66 @@ esac
             reads() > before + 2,
             "the restarted loop did not read the pane"
         );
-        // The failure stays reported until a restarted loop has run for a minute.
-        assert!(service_health(&state_root).is_some());
+        assert!(
+            still_reported,
+            "the failure cleared before a minute had passed"
+        );
+        // A clean stop leaves no failure behind.
+        assert!(service_health(&state_root).is_none());
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_fatal_provider_notice_still_ends_chat_run_while_the_owner_loop_waits_to_start_again() {
+        // #581 bridge-git-timeout-fatal: between owner loop passes `chat run` still takes the
+        // provider's notices, so a fatal one ends it as it would from a running pass, and the
+        // notice channel cannot fill and block the provider.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (state_root, state) = worker_bridge_state(&fixture, true);
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        fixture
+            .client
+            .fail_panes
+            .store(true, AtomicOrdering::SeqCst);
+        let mut flooded: Option<Instant> = None;
+        let mut sent: Option<Instant> = None;
+        let result = owner_loop_with(
+            run_owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            None,
+            None,
+            |notify, _| {
+                // More admissions than the channel holds arrive first. The test's sender drops
+                // a notice that finds the channel full, so the fatal one, sent after them, is
+                // seen only if the waiting loop emptied the channel meanwhile.
+                if flooded.is_none() && service_health(&state_root).is_some() {
+                    for _ in 0..(PROVIDER_NOTICE_CAPACITY + 8) {
+                        notify(ProviderNotice::Batch(vec!["k".to_owned()]));
+                    }
+                    flooded = Some(Instant::now());
+                }
+                if sent.is_none()
+                    && flooded.is_some_and(|at| at.elapsed() >= 3 * BACKOFF_NOTICE_POLL)
+                {
+                    notify(ProviderNotice::Fatal("the saved cursor is gone".to_owned()));
+                    sent = Some(Instant::now());
+                }
+                sent.is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+            },
+        );
+        assert!(sent.is_some(), "no owner loop failure was recorded");
+        let error = result.expect_err("the fatal notice ends chat run");
+        assert!(
+            error.to_string().contains("unrecoverable stream gap"),
+            "{error}"
+        );
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
     }

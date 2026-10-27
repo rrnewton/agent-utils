@@ -359,6 +359,8 @@ pub(crate) fn validate_structured_harness_argument_conflicts(
     Ok(())
 }
 
+/// How an unanswered profile-config check with no earlier answer to stand in begins its error.
+pub(crate) const UNANSWERED_CHECK_PREFIX: &str = "cannot verify that profile config is ignored";
 /// How long one `git check-ignore` may run before it counts as no answer.
 const IGNORE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// The waits between attempts when git does not answer and no earlier answer can stand in.
@@ -407,10 +409,12 @@ pub(crate) mod test_git {
     use std::time::Duration;
 
     /// A Git that runs the system Git, except that while its `hang` file exists it sleeps for
-    /// 30 s instead, past any timeout a test sets.
+    /// 30 s instead, past any timeout a test sets, and while its `fail` file exists it exits
+    /// 128, as Git does on a fatal error.
     pub(crate) struct HangingGit {
         pub(crate) executable: PathBuf,
         pub(crate) hang: PathBuf,
+        pub(crate) fail: PathBuf,
     }
 
     impl HangingGit {
@@ -418,17 +422,32 @@ pub(crate) mod test_git {
         pub(crate) fn new(directory: &Path) -> Self {
             let executable = directory.join("hanging-git");
             let hang = directory.join("git-hangs");
+            let fail = directory.join("git-fails");
             fs::write(
                 &executable,
                 format!(
-                    "#!/bin/sh\nif [ -e '{}' ]; then exec sleep 30; fi\nexec {} \"$@\"\n",
+                    "#!/bin/sh\nif [ -e '{}' ]; then exec sleep 30; fi\n\
+                     if [ -e '{}' ]; then exit 128; fi\nexec {} \"$@\"\n",
                     hang.display(),
+                    fail.display(),
                     super::SYSTEM_GIT
                 ),
             )
             .unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-            Self { executable, hang }
+            Self {
+                executable,
+                hang,
+                fail,
+            }
+        }
+
+        pub(crate) fn fail(&self, fail: bool) {
+            if fail {
+                fs::write(&self.fail, b"").unwrap();
+            } else {
+                let _ = fs::remove_file(&self.fail);
+            }
         }
 
         pub(crate) fn hang(&self, hang: bool) {
@@ -534,7 +553,8 @@ fn ignore_check_log(line: impl fmt::Display) {
 
 /// Refuse unless Git ignores the profile config at `path` below `cwd`.
 ///
-/// A check git does not answer, because it timed out, could not be started, or was killed, is
+/// A check git does not answer, because it timed out, could not be started, failed (exit status
+/// other than 0 or 1), or was killed, is
 /// not an answer that the config stopped being ignored. When git said it was ignored earlier in
 /// this process, that answer stands, git is asked again only after a backoff (30 s, doubling to
 /// 10 min), and the failure is logged once and reported by [`ignore_check_failure`], so a slow
@@ -571,14 +591,15 @@ fn require_ignored(cwd: &Path, path: &Path) -> Result<(), AgentError> {
         }
     };
     let mut checks = ignore_checks();
-    match answer {
+    let mut log = None;
+    let outcome = match answer {
         Ok(true) => {
             let state = checks.entry(key).or_default();
             state.ignored = true;
             state.retry_at = None;
             state.backoff = Duration::ZERO;
             if let Some(failure) = state.failure.take() {
-                ignore_check_log(format_args!(
+                log = Some(format!(
                     "agentctl: git check-ignore answers again for {} after {} failed checks",
                     path.display(),
                     failure.failures
@@ -597,15 +618,18 @@ fn require_ignored(cwd: &Path, path: &Path) -> Result<(), AgentError> {
             let Some(state) = checks.get_mut(&key).filter(|state| state.ignored) else {
                 let attempts = policy.retries.len() + 1;
                 return Err(AgentError::Client(AdapterError::unavailable(format!(
-                    "cannot verify that profile config is ignored: {error} ({attempts} attempts)"
+                    "{UNANSWERED_CHECK_PREFIX}: {error} ({attempts} attempts)"
                 ))));
             };
-            state.backoff = if state.backoff.is_zero() {
-                policy.backoff_min
-            } else {
-                (state.backoff * 2).min(policy.backoff_max)
-            };
-            state.retry_at = Some(Instant::now() + state.backoff);
+            // Threads whose checks failed together back off once, not once each.
+            if state.retry_at.is_none_or(|at| at <= Instant::now()) {
+                state.backoff = if state.backoff.is_zero() {
+                    policy.backoff_min
+                } else {
+                    (state.backoff * 2).min(policy.backoff_max)
+                };
+                state.retry_at = Some(Instant::now() + state.backoff);
+            }
             let now = unix_millis_now();
             match state.failure.as_mut() {
                 Some(failure) => {
@@ -614,7 +638,7 @@ fn require_ignored(cwd: &Path, path: &Path) -> Result<(), AgentError> {
                     failure.last_error = error;
                 }
                 None => {
-                    ignore_check_log(format_args!(
+                    log = Some(format!(
                         "agentctl: warning: {error}; keeping the earlier answer that {} is \
                          ignored and asking git again in {}",
                         path.display(),
@@ -630,7 +654,12 @@ fn require_ignored(cwd: &Path, path: &Path) -> Result<(), AgentError> {
             }
             Ok(())
         }
+    };
+    drop(checks);
+    if let Some(line) = log {
+        ignore_check_log(line);
     }
+    outcome
 }
 
 fn verified_system_git() -> Result<PathBuf, AgentError> {
@@ -659,8 +688,8 @@ fn verified_system_git() -> Result<PathBuf, AgentError> {
 }
 
 /// Ask `git check-ignore` whether `relative` below `cwd` is ignored: `Ok(true)` when it exits 0,
-/// `Ok(false)` for any other exit status, and `Err` when it gives no answer: it cannot be
-/// started or waited for, runs past `timeout`, or is killed by a signal.
+/// `Ok(false)` when it exits 1, and `Err` when it gives no answer: it cannot be started or waited
+/// for, runs past `timeout`, exits with another status, or is killed by a signal.
 fn ask_check_ignore(
     git: &Path,
     cwd: &Path,
@@ -698,9 +727,12 @@ fn ask_check_ignore(
         }
         thread::sleep(Duration::from_millis(10));
     };
+    // `git check-ignore` exits 0 for an ignored path and 1 for one that is not; anything else,
+    // such as 128 for a fatal error (out of memory, an unreadable index), answers nothing.
     match status.code() {
         Some(0) => Ok(true),
-        Some(_) => Ok(false),
+        Some(1) => Ok(false),
+        Some(code) => Err(format!("git check-ignore failed with exit status {code}")),
         None => Err(format!("git check-ignore was killed: {status}")),
     }
 }
@@ -1433,6 +1465,20 @@ mod tests {
         git.hang(false);
         thread::sleep(backoff * 2);
         assert_eq!(workspace().unwrap().as_deref(), Some("project-agents"));
+        assert_eq!(ignore_check_failure(&registry), None);
+
+        // A fatal Git error (exit 128) answers nothing either: the earlier answer stands.
+        git.fail(true);
+        assert_eq!(workspace().unwrap().as_deref(), Some("project-agents"));
+        let failure = ignore_check_failure(&registry).expect("the failure is reported");
+        assert!(
+            failure.last_error.contains("exit status 128"),
+            "{}",
+            failure.last_error
+        );
+        git.fail(false);
+        thread::sleep(backoff * 2);
+        workspace().unwrap();
         assert_eq!(ignore_check_failure(&registry), None);
 
         // Git saying the config is not ignored refuses at once and forgets the earlier answer...

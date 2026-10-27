@@ -2495,11 +2495,16 @@ admitting messages. The wait follows the provider reconnect rule below (1
 second, doubling up to 60, back to 1 after a loop that ran for 60 seconds).
 Each operation on the agent registry also checks with `git check-ignore` that
 the project's `.agentctl/profiles.json` is ignored by Git. A check that runs
-past its 5-second timeout, cannot start, or is killed does not count as an
-answer: once Git has said the file is ignored, that answer stands, Git is asked
-again after 30 seconds (doubling to 10 minutes while it keeps failing), and
-the service logs one warning and one line when Git answers again. Git saying
-the file is not ignored still refuses at once. `chat status` reports both
+past its 5-second timeout, cannot start, fails with an exit status other than
+0 (ignored) or 1 (not ignored), or is killed does not count as an answer: once
+Git has said the file is ignored, that answer stands, Git is asked again after
+30 seconds (doubling to 10 minutes while it keeps failing), and the service
+logs one warning and one line when Git answers again. Git saying the file is
+not ignored still refuses at once. The earlier answer lives in the running
+process only: a new `chat run` checks afresh, three times, before it gives up.
+While the loop waits to start again, the provider's notices are still taken,
+so a provider that stops on an unrecoverable gap still ends `chat run`. A clean
+stop clears both records. `chat status` reports both
 under `service_health`: `owner_loop` while the loop has failed and not yet run
 for 60 seconds since it started again, and `profile_policy` while Git is not
 answering. Each holds `down_since_millis`, `failures`, `last_failure_at_millis`,
