@@ -1,12 +1,13 @@
 ---
 title: 'headless-slack-trial: bridge a chat channel to a headless coordinator'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 depends_on:
   agent-utils-565: parent-child
 created_at: 2026-10-27T20:45:01.419898305+00:00
-updated_at: 2026-10-27T20:45:01.419898305+00:00
+updated_at: 2026-10-27T22:21:19.236660546+00:00
+closed_at: 2026-10-27T22:21:19.236660395+00:00
 ---
 
 # Description
