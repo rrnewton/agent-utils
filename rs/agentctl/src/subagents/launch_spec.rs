@@ -217,117 +217,17 @@ pub(super) fn build(fields: SpecFields<'_>) -> Result<Value> {
     Ok(spec)
 }
 
-enum ClaudeSelector {
-    Flag,
-    Value(&'static str, Option<String>),
-}
-
-fn claude_selector(argument: &str) -> Result<Option<ClaudeSelector>> {
-    let (key, inline) = match argument.split_once('=') {
-        Some((key, value)) => (key, Some(value.to_owned())),
-        None => (argument, None),
-    };
-    if argument.starts_with("--") {
-        return Ok(match key {
-            "--resume" => Some(ClaudeSelector::Value("--resume", inline)),
-            "--session-id" => Some(ClaudeSelector::Value("--session-id", inline)),
-            "--continue" | "--fork-session" => Some(ClaudeSelector::Flag),
-            _ => None,
-        });
-    }
-    if argument == "-c" {
-        return Ok(Some(ClaudeSelector::Flag));
-    }
-    if argument == "-r" {
-        return Ok(Some(ClaudeSelector::Value("-r", None)));
-    }
-    if let Some(value) = argument.strip_prefix("-r") {
-        return Ok(Some(ClaudeSelector::Value("-r", Some(value.to_owned()))));
-    }
-    if argument.starts_with("-c") {
-        return Err(fail(format!(
-            "recorded Claude argument {argument:?} combines a conversation flag and cannot be replayed"
-        )));
-    }
-    Ok(None)
-}
-
-/// Separate the conversation selectors from the rest, refusing anything ambiguous.
+/// Separate the conversation selectors from the rest, refusing anything ambiguous; each
+/// harness's selectors live with its adapter (#574 harness-adapters).
 fn split(harness: &str, argv: &[String]) -> Result<(Vec<String>, Vec<String>)> {
-    let mut values = Vec::new();
-    match harness {
-        "claude" => {
-            let mut rest = Vec::new();
-            let mut index = 0;
-            while index < argv.len() {
-                match claude_selector(&argv[index])? {
-                    None => {
-                        rest.push(argv[index].clone());
-                        index += 1;
-                    }
-                    Some(ClaudeSelector::Flag) => index += 1,
-                    Some(ClaudeSelector::Value(option, inline)) => {
-                        let value = match inline {
-                            Some(value) => {
-                                index += 1;
-                                value
-                            }
-                            None => {
-                                if index + 1 >= argv.len() || argv[index + 1].starts_with('-') {
-                                    return Err(fail(format!(
-                                        "recorded Claude {option} has no conversation value; it opens a picker and cannot be replayed"
-                                    )));
-                                }
-                                index += 2;
-                                argv[index - 1].clone()
-                            }
-                        };
-                        if value.is_empty() {
-                            return Err(fail(format!(
-                                "recorded Claude {option} has an empty conversation value"
-                            )));
-                        }
-                        values.push(value);
-                    }
-                }
-            }
-            Ok((values, rest))
-        }
-        "codex" => {
-            let mut rest = argv;
-            if rest.first().map(String::as_str) == Some("resume") {
-                if rest.len() < 2 || rest[1].starts_with('-') {
-                    return Err(fail(
-                        "recorded Codex resume has no conversation id (for example --last) and cannot be replayed",
-                    ));
-                }
-                values.push(rest[1].clone());
-                rest = &rest[2..];
-            }
-            if rest.iter().any(|item| item == "resume") {
-                return Err(fail(
-                    "recorded Codex arguments name resume in an unsupported position",
-                ));
-            }
-            Ok((values, rest.to_vec()))
-        }
-        "muse" => {
-            let mut rest = argv;
-            if rest.len() >= 2 && rest[rest.len() - 2] == "resume" {
-                values.push(rest[rest.len() - 1].clone());
-                rest = &rest[..rest.len() - 2];
-            }
-            if rest.iter().any(|item| item == "resume") {
-                return Err(fail(
-                    "recorded Muse arguments name resume in an unsupported position",
-                ));
-            }
-            Ok((values, rest.to_vec()))
-        }
-        _ => Err(fail(format!(
-            "launch specs replay Claude, Codex and Muse conversations, not {harness:?}"
-        ))),
-    }
+    crate::harness::adapter(harness)
+        .and_then(|adapter| adapter.split_conversation(argv))
+        .unwrap_or_else(|| {
+            Err(format!(
+                "launch specs replay Claude, Codex and Muse conversations, not {harness:?}"
+            ))
+        })
+        .map_err(fail)
 }
 
 /// The one conversation the argument vector selects, or `None`; refuse a conflict.
@@ -349,22 +249,8 @@ pub(super) fn replay_arguments(
         return Err(fail("a replay needs a nonempty native conversation id"));
     }
     let (_, rest) = split(harness, argv)?;
-    let mut arguments = Vec::with_capacity(rest.len() + 2);
-    match harness {
-        "claude" => {
-            arguments.extend(["--resume".to_owned(), conversation.to_owned()]);
-            arguments.extend(rest);
-        }
-        "codex" => {
-            arguments.extend(["resume".to_owned(), conversation.to_owned()]);
-            arguments.extend(rest);
-        }
-        _ => {
-            arguments.extend(rest);
-            arguments.extend(["resume".to_owned(), conversation.to_owned()]);
-        }
-    }
-    Ok(arguments)
+    let adapter = crate::harness::adapter(harness).expect("split accepted the harness");
+    Ok(adapter.replay_arguments(rest, conversation))
 }
 
 /// Is the recorded program the harness itself, so Herdr's kind launch reproduces it?

@@ -21,8 +21,10 @@ use std::time::Duration;
 use crate::agent::AgentRuntime;
 use crate::error::{AdapterError, Result};
 
-/// Harnesses whose composer layout this module can read.
-pub const VERIFIED_HARNESSES: [&str; 2] = ["claude", "codex"];
+/// Whether this module can read `harness`'s composer layout.
+fn verified(harness: &str) -> bool {
+    crate::harness::adapter(harness).is_some_and(|adapter| adapter.verified_submission())
+}
 /// Screen rows requested for every composer read.
 pub const SCREEN_LINES: usize = 200;
 /// Maximum wait for pasted text to appear in the composer before any key is sent.
@@ -59,35 +61,18 @@ pub const PRINT_GRACE: Duration = Duration::from_secs(2);
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
-const QUEUE_MARKERS: [&str; 3] = [
-    "Press up to edit queued messages",
-    "edit last queued message",
-    "Queued follow-up inputs",
-];
-const WORKING_MARKER: &str = "esc to interrupt";
+// Each harness's queued-input hints, in one list (#574 harness-adapters).
+use crate::harness::queue_hints as queue_markers;
+use crate::harness::WORKING_MARKER;
 /// Rows, ending at the last row with text, that `running_turn` searches for a marker.
-const RUNNING_TURN_ROWS: usize = 16;
-/// The hint Claude Code draws in place of the status row under its input box for a while after
-/// a paste, so that row's `esc to interrupt` is missing even while a turn runs.
-const PASTE_HINT: &str = "paste again to expand";
-const CODEX_QUEUE_HINT: &str = "tab to queue message";
-/// Glyphs Codex draws in column 0 of its composer's first row. Earlier releases
-/// draw `›`; v0.159.1 draws `»`, and keeps `›` for selection lists such as its
-/// folder-trust prompt.
-const CODEX_COMPOSER_MARKERS: [char; 2] = ['›', '»'];
-/// Headings, lowercased, under which Codex lists the messages it holds while a turn runs: a
-/// prompt submitted with Enter mid-turn waits for the next tool call, one submitted with Tab for
-/// the end of the turn.
-const CODEX_PENDING_HEADINGS: [&str; 4] = [
-    "messages to be submitted after next tool call",
-    "messages to be submitted at end of turn",
-    "queued follow-up inputs",
-    "queued follow-up messages",
-];
-/// Shortest pending-message preview, without blanks, that counts as the start of a longer
-/// prompt. A shorter preview counts only when it is the whole prompt.
-const CODEX_PREVIEW_MIN_CHARS: usize = 12;
-
+pub(crate) const RUNNING_TURN_ROWS: usize = 16;
+use crate::harness::claude::PASTE_HINT;
+use crate::harness::codex::pending_copies as codex_pending_copies;
+#[cfg(test)]
+use crate::harness::codex::{
+    idle_composer as codex_idle_composer, pending_previews as codex_pending_previews,
+    timer_row as codex_timer_row, QUEUE_HINT as CODEX_QUEUE_HINT,
+};
 /// Positive evidence that a staged prompt left the composer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubmissionReceipt {
@@ -204,7 +189,7 @@ pub struct ComposerView {
 /// Slash commands open harness menus and confirmation dialogs rather than
 /// submitting through the composer, so they keep the native primitive.
 pub fn verifies(harness: &str, text: &str) -> bool {
-    VERIFIED_HARNESSES.contains(&harness) && !text.trim_start().starts_with('/')
+    verified(harness) && !text.trim_start().starts_with('/')
 }
 
 /// Return `(plain, solid)` per row; `solid` blanks faint and reverse-video cells.
@@ -344,7 +329,7 @@ fn apply_sgr(parameters: &str, faint: &mut bool, reverse: &mut bool) {
     }
 }
 
-fn text_of(row: &[char]) -> String {
+pub(crate) fn text_of(row: &[char]) -> String {
     row.iter().collect()
 }
 
@@ -352,7 +337,7 @@ fn is_rule_char(character: char) -> bool {
     matches!(character, '─' | '━' | '═')
 }
 
-fn is_rule(line: &[char]) -> bool {
+pub(crate) fn is_rule(line: &[char]) -> bool {
     let text = text_of(line);
     let stripped = text.trim();
     stripped.chars().count() >= 3 && stripped.chars().all(is_rule_char)
@@ -363,7 +348,7 @@ fn is_rule(line: &[char]) -> bool {
 /// Claude can draw session state into the top border of its composer, as in
 /// `──────── ultracode ─`. Such a row still starts and ends with rule
 /// characters; whatever lies between the two runs is the label.
-fn is_labelled_rule(line: &[char]) -> bool {
+pub(crate) fn is_labelled_rule(line: &[char]) -> bool {
     let text = text_of(line);
     let stripped: Vec<char> = text.trim().chars().collect();
     let leading = stripped.iter().take_while(|c| is_rule_char(**c)).count();
@@ -375,14 +360,17 @@ fn is_labelled_rule(line: &[char]) -> bool {
     stripped.len() >= 3 && leading >= 1 && trailing >= 1 && leading + trailing >= 3
 }
 
-fn join_rows(rows: &[(Vec<char>, Vec<char>)]) -> String {
+pub(crate) fn join_rows(rows: &[(Vec<char>, Vec<char>)]) -> String {
     rows.iter()
         .map(|(plain, _)| text_of(plain))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn composer_from(body: &[(Vec<char>, Vec<char>)], marker_end: usize) -> (String, String) {
+pub(crate) fn composer_from(
+    body: &[(Vec<char>, Vec<char>)],
+    marker_end: usize,
+) -> (String, String) {
     let mut plain_lines: Vec<String> = body.iter().map(|(plain, _)| text_of(plain)).collect();
     let mut solid_lines: Vec<String> = body.iter().map(|(_, solid)| text_of(solid)).collect();
     plain_lines[0] = text_of(&body[0].0[marker_end.min(body[0].0.len())..]);
@@ -390,240 +378,10 @@ fn composer_from(body: &[(Vec<char>, Vec<char>)], marker_end: usize) -> (String,
     (plain_lines.join("\n"), solid_lines.join("\n"))
 }
 
-fn claude_view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
-    // A labelled top border is tried only when two plain rules do not already
-    // frame a composer, so a draft row that happens to look like a labelled
-    // rule cannot change how an unlabelled screen is split.
-    claude_view_framed(rows, is_rule).or_else(|| claude_view_framed(rows, is_labelled_rule))
-}
-
-/// Split `rows` at the last plain rule and the nearest row above it accepted by `is_top`.
-fn claude_view_framed(
-    rows: &[(Vec<char>, Vec<char>)],
-    is_top: fn(&[char]) -> bool,
-) -> Option<ComposerView> {
-    let bottom = rows.iter().rposition(|(plain, _)| is_rule(plain))?;
-    let top = rows[..bottom]
-        .iter()
-        .rposition(|(plain, _)| is_top(plain))?;
-    let body = &rows[top + 1..bottom];
-    let first = body.first()?;
-    let offset = first.0.iter().take_while(|c| c.is_whitespace()).count();
-    if first.0.get(offset) != Some(&'❯') {
-        return None;
-    }
-    let (composer, composer_solid) = composer_from(body, offset + 1);
-    Some(ComposerView {
-        transcript: join_rows(&rows[..top]),
-        composer,
-        composer_solid,
-        footer: join_rows(&rows[bottom + 1..]),
-    })
-}
-
-fn codex_view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
-    let populated: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, (plain, _))| plain.iter().any(|c| !c.is_whitespace()))
-        .map(|(index, _)| index)
-        .collect();
-    if populated.len() < 2 {
-        return None;
-    }
-    let footer = populated[populated.len() - 1];
-    if !text_of(&rows[footer].0).starts_with("  ") {
-        return None;
-    }
-    let mut start = None;
-    for index in (0..footer).rev() {
-        let plain = text_of(&rows[index].0);
-        if plain.starts_with(&CODEX_COMPOSER_MARKERS[..]) {
-            start = Some(index);
-            break;
-        }
-        if !plain.trim().is_empty() && !plain.starts_with("  ") {
-            return None;
-        }
-    }
-    let start = start?;
-    let (composer, composer_solid) = composer_from(&rows[start..footer], 1);
-    Some(ComposerView {
-        transcript: join_rows(&rows[..start]),
-        composer,
-        composer_solid,
-        footer: join_rows(&rows[footer..]),
-    })
-}
-
 /// Locate the composer of a supported harness, or `None` when it is not recognisable.
 pub fn composer_view(harness: &str, screen: &str) -> Option<ComposerView> {
-    let rows = render_screen(screen);
-    match harness {
-        "claude" => claude_view(&rows),
-        "codex" => codex_view(&rows),
-        _ => None,
-    }
-}
-
-/// Whether Codex shows an empty idle composer with a recognized status footer.
-///
-/// This screen observation establishes readiness only after the caller independently
-/// verifies the live recipient. A retained composer during a turn or dialog is not idle.
-pub(crate) fn codex_idle_composer(screen: &str) -> bool {
-    let Some(view) = composer_view("codex", screen) else {
-        return false;
-    };
-    if !view.composer_solid.trim().is_empty()
-        || view.composer.contains("[Pasted text #")
-        || view.composer.contains("[Pasted Content ")
-    {
-        return false;
-    }
-    let footer = view.footer.to_ascii_lowercase();
-    let words: Vec<&str> = footer.split_whitespace().collect();
-    let context = words.windows(3).any(|words| {
-        words[0].strip_suffix('%').is_some_and(|number| {
-            let digits = |value: &str| {
-                !value.is_empty() && value.bytes().all(|value| value.is_ascii_digit())
-            };
-            match number.split_once('.') {
-                Some((whole, fraction)) => digits(whole) && digits(fraction),
-                None => digits(number),
-            }
-        }) && words[1] == "context"
-            && matches!(words[2], "left" | "remaining")
-    });
-    let path_footer = footer.contains('·')
-        && words
-            .iter()
-            .any(|word| word.starts_with('/') || word.starts_with("~/"));
-    if !path_footer && !footer.contains("? for shortcuts") && !context {
-        return false;
-    }
-    let mut active_timer = false;
-    for line in view.transcript.lines() {
-        if codex_timer_row(line) {
-            active_timer = true;
-        } else if line.starts_with(['•', '◦', '■', '✗', '✓'])
-            && ![
-                "queued follow-up inputs",
-                "messages to be submitted after next tool call",
-                "messages to be submitted at end of turn",
-            ]
-            .iter()
-            .any(|marker| line.to_ascii_lowercase().contains(marker))
-        {
-            active_timer = false;
-        }
-    }
-    if active_timer {
-        return false;
-    }
-    let rows = render_screen(screen);
-    let Some(last) = rows
-        .iter()
-        .rposition(|(plain, _)| plain.iter().any(|character| !character.is_whitespace()))
-    else {
-        return false;
-    };
-    const REFUSALS: [&str; 22] = [
-        "esc to interrupt",
-        " to interrupt",
-        "tab to queue message",
-        "press up to edit queued messages",
-        "edit last queued message",
-        "queued follow-up inputs",
-        "messages to be submitted after next tool call",
-        "messages to be submitted at end of turn",
-        "paste again to expand",
-        "trust this folder?",
-        "trust and continue",
-        "do you trust the contents of this directory?",
-        "approval required",
-        "requires approval",
-        "approve this",
-        "would you like to run",
-        "press enter to continue",
-        "enter to confirm",
-        "esc to cancel",
-        "enter to submit answer",
-        "enter to submit all",
-        "allow command?",
-    ];
-    let active = &rows[(last + 1).saturating_sub(RUNNING_TURN_ROWS)..=last];
-    if ["all results", "filesystem only", "plugins"]
-        .iter()
-        .all(|marker| {
-            active
-                .iter()
-                .any(|(plain, _)| text_of(plain).to_ascii_lowercase().contains(marker))
-        })
-    {
-        return false;
-    }
-    !active.iter().any(|(plain, _)| {
-        let line = text_of(plain);
-        if codex_timer_row(&line) {
-            return false;
-        }
-        let line = line.to_ascii_lowercase();
-        REFUSALS.iter().any(|refusal| line.contains(refusal))
-    })
-}
-
-fn codex_timer_row(line: &str) -> bool {
-    let line = line.trim_end();
-    let line = if let Some(rest) = line.strip_prefix('•').or_else(|| line.strip_prefix('◦')) {
-        if !rest.starts_with([' ', '\t']) {
-            return false;
-        }
-        rest.trim_start_matches([' ', '\t'])
-    } else {
-        line
-    };
-    if line.chars().next().is_none_or(|first| {
-        first.is_whitespace() || matches!(first, '›' | '•' | '◦' | '■' | '✗' | '✓' | '─')
-    }) {
-        return false;
-    }
-    line.match_indices(" (")
-        .any(|(index, _)| codex_elapsed_suffix(&line[index + 2..]))
-}
-
-fn codex_elapsed_suffix(mut elapsed: &str) -> bool {
-    loop {
-        let digits = elapsed.bytes().take_while(u8::is_ascii_digit).count();
-        if digits == 0 {
-            return false;
-        }
-        elapsed = &elapsed[digits..];
-        if let Some(rest) = elapsed
-            .strip_prefix("h ")
-            .or_else(|| elapsed.strip_prefix("m "))
-        {
-            elapsed = rest;
-            continue;
-        }
-        let Some(rest) = elapsed.strip_prefix('s') else {
-            return false;
-        };
-        let suffix_valid = |suffix: &str| {
-            suffix.is_empty()
-                || suffix
-                    .strip_prefix(" · ")
-                    .is_some_and(|text| !text.is_empty())
-        };
-        if let Some(suffix) = rest.strip_prefix(')') {
-            return suffix_valid(suffix);
-        }
-        let Some(hint) = rest.strip_prefix(" • ") else {
-            return false;
-        };
-        return hint
-            .match_indices(" to interrupt)")
-            .any(|(end, marker)| end > 0 && suffix_valid(&hint[end + marker.len()..]));
-    }
+    let adapter = crate::harness::adapter(harness)?;
+    adapter.composer_view(&render_screen(screen))
 }
 
 /// Whether the bottom of `screen` shows that the agent is running a turn: `Some(true)` if it
@@ -651,7 +409,8 @@ pub(crate) fn running_turn(screen: &str) -> Option<bool> {
         .iter()
         .any(|(plain, _)| {
             let row = text_of(plain);
-            row.contains(WORKING_MARKER) || QUEUE_MARKERS.iter().any(|marker| row.contains(marker))
+            row.contains(WORKING_MARKER)
+                || queue_markers().iter().any(|marker| row.contains(marker))
         });
     if !marked && text_of(&rows[last].0).contains(PASTE_HINT) {
         return None;
@@ -669,7 +428,7 @@ fn queue_marker(screen: &str) -> Option<&'static str> {
         .iter()
         .find_map(|(plain, _)| {
             let row = text_of(plain);
-            QUEUE_MARKERS
+            queue_markers()
                 .iter()
                 .copied()
                 .find(|marker| row.contains(marker))
@@ -690,7 +449,7 @@ fn markers_within(screen: &str, rows: usize) -> (bool, bool) {
     let mut running = false;
     for (plain, _) in &rendered[(last + 1).saturating_sub(rows)..=last] {
         let row = text_of(plain);
-        let queue = QUEUE_MARKERS.iter().any(|marker| row.contains(marker));
+        let queue = queue_markers().iter().any(|marker| row.contains(marker));
         queued |= queue;
         running |= queue || row.contains(WORKING_MARKER);
     }
@@ -786,73 +545,6 @@ fn placeholder_labels(text: &str) -> Vec<String> {
     labels
 }
 
-/// The messages Codex lists under one of [`CODEX_PENDING_HEADINGS`] in `transcript`, each
-/// without its blanks and without the `↳` that starts it.
-///
-/// Codex draws each held message as `  ↳ ` and its first row, then up to two more wrapped rows
-/// indented by four columns, and a `    …` row when it cut the rest. A preview is therefore the
-/// start of the message, not all of it, so a long prompt held this way never shows its end, which
-/// is what read-back looks for.
-fn codex_pending_previews(transcript: &str) -> Vec<String> {
-    let mut previews = Vec::new();
-    let mut in_block = false;
-    let mut current: Option<String> = None;
-    for line in transcript.lines() {
-        let trimmed = line.trim_start();
-        let lower = trimmed.to_lowercase();
-        if trimmed.starts_with('•')
-            && CODEX_PENDING_HEADINGS
-                .iter()
-                .any(|heading| lower.contains(heading))
-        {
-            previews.extend(current.take());
-            in_block = true;
-            continue;
-        }
-        if !in_block {
-            continue;
-        }
-        if line.starts_with(' ') {
-            if let Some(rest) = trimmed.strip_prefix('↳') {
-                previews.extend(current.take());
-                current = Some(compact(rest));
-                continue;
-            }
-            if line.starts_with("    ") && !trimmed.is_empty() {
-                if let Some(entry) = current.as_mut() {
-                    if trimmed == "…" {
-                        previews.extend(current.take());
-                    } else {
-                        entry.push_str(&compact(trimmed));
-                    }
-                    continue;
-                }
-            }
-        }
-        previews.extend(current.take());
-        in_block = false;
-    }
-    previews.extend(current);
-    previews.retain(|preview| !preview.is_empty());
-    previews
-}
-
-/// How many messages Codex lists as held in `transcript` whose preview is the prompt `prompt`
-/// (given without blanks) or, when at least [`CODEX_PREVIEW_MIN_CHARS`] long, its start.
-fn codex_pending_copies(transcript: &str, prompt: &str) -> usize {
-    if prompt.is_empty() {
-        return 0;
-    }
-    codex_pending_previews(transcript)
-        .iter()
-        .filter(|preview| {
-            preview.as_str() == prompt
-                || (preview.chars().count() >= CODEX_PREVIEW_MIN_CHARS
-                    && prompt.starts_with(preview.as_str()))
-        })
-        .count()
-}
-
 pub(crate) fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
@@ -910,7 +602,7 @@ fn corroborated(before: &ComposerView, after: &ComposerView, text: &str) -> Opti
     let screen = format!("{}\n{}", after.transcript, after.footer);
     // Claude draws its queued-message hint inside the empty composer. Its paste hint can
     // temporarily replace the working status row, so the footer alone misses that evidence.
-    if let Some(marker) = QUEUE_MARKERS
+    if let Some(marker) = queue_markers()
         .iter()
         .find(|marker| screen.contains(*marker) || after.composer.contains(*marker))
     {
@@ -959,13 +651,7 @@ fn submit_key(harness: &str, view: &ComposerView, runtime: &dyn AgentRuntime) ->
     if let Some(key) = runtime.followup_key() {
         return key;
     }
-    // A busy Codex steers the active turn on Enter and queues on Tab. It shows
-    // the Tab hint only while it is busy and holds staged text.
-    if harness == "codex" && view.footer.contains(CODEX_QUEUE_HINT) {
-        "Tab"
-    } else {
-        "Enter"
-    }
+    crate::harness::adapter(harness).map_or("Enter", |adapter| adapter.submit_key(view))
 }
 
 /// Stage `text` in an empty composer, submit it, and prove that it left the composer.
@@ -985,7 +671,7 @@ pub fn submit_verified(
     runtime: &dyn AgentRuntime,
 ) -> Result<Submission> {
     let refuse = |reason: String| Ok(Submission::NotStaged(reason));
-    if !VERIFIED_HARNESSES.contains(&harness) {
+    if !verified(harness) {
         return refuse(format!(
             "no composer model for harness {harness:?}; nothing was typed"
         ));

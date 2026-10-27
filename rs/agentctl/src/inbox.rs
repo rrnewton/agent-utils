@@ -30,7 +30,7 @@ use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-mod watch;
+pub(crate) mod watch;
 
 pub(crate) use watch::{claude_sessions_by_pane, environment_value, transcript_of_session};
 

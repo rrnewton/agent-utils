@@ -280,21 +280,9 @@ pub struct Observation {
     pub progress: Option<crate::progress_metric::Reading>,
 }
 
-/// Prompt phrases, lowercased, matched against the bottom of the screen. Each is a
-/// literal a supported harness is already known to draw: Muse's approval and trust
-/// prompts, Claude Code's permission dialog, and the folder-trust screens.
-const APPROVAL_PATTERNS: [&str; 10] = [
-    "would you like to run",
-    "do you want to proceed",
-    "approval required",
-    "requires approval",
-    "allow command?",
-    "approve this",
-    "yes, i trust this folder",
-    "trust this workspace",
-    "do you trust",
-    "workspace trust",
-];
+/// Prompt phrases, lowercased, matched against the bottom of the screen: every harness's
+/// approval, permission and trust phrases ([`crate::harness::approval_patterns`]).
+use crate::harness::approval_patterns;
 
 /// The prompt line at the bottom of `screen`, trimmed and bounded, when one is showing.
 pub(crate) fn approval_prompt_line(screen: &str) -> Option<String> {
@@ -302,7 +290,7 @@ pub(crate) fn approval_prompt_line(screen: &str) -> Option<String> {
     let start = lines.len().saturating_sub(PROMPT_WINDOW_LINES);
     lines[start..].iter().rev().find_map(|line| {
         let lowered = line.to_ascii_lowercase();
-        APPROVAL_PATTERNS
+        approval_patterns()
             .iter()
             .any(|pattern| lowered.contains(pattern))
             .then(|| line.trim().chars().take(QUOTED_LINE_CHARS).collect())
@@ -310,24 +298,24 @@ pub(crate) fn approval_prompt_line(screen: &str) -> Option<String> {
 }
 
 /// Bullets a harness draws at column 0 to open an assistant block: Claude Code's `●` (`⏺`
-/// in older builds), Muse's `◆`, and Codex's `•`.
-const REPLY_BULLETS: [char; 4] = ['●', '⏺', '◆', '•'];
+/// in older builds), Muse's `◆`, and Codex's `•` ([`crate::harness::reply_bullets`]).
+use crate::harness::reply_bullets;
 
 /// `text` without the reply bullet and spacing that open it, when it has one.
 fn strip_bullet(text: &str) -> &str {
-    text.strip_prefix(REPLY_BULLETS)
+    text.strip_prefix(reply_bullets())
         .map_or(text, |rest| rest.trim_start_matches([' ', '\u{a0}']))
 }
 
 /// Whether `line` opens an assistant block.
 fn is_reply_row(line: &str) -> bool {
-    line.starts_with(REPLY_BULLETS)
+    line.starts_with(reply_bullets())
 }
 
 /// Whether `line` echoes a user turn in the transcript: Claude Code and Muse draw `❯ text`,
 /// Codex `› text`, and older Claude Code builds `> text`. An empty composer is not one.
 fn is_user_turn(line: &str) -> bool {
-    ['❯', '›', '>'].iter().any(|glyph| {
+    crate::harness::user_turn_glyphs().iter().any(|glyph| {
         line.strip_prefix(*glyph).is_some_and(|rest| {
             rest.starts_with([' ', '\u{a0}']) && !rest.trim_matches([' ', '\u{a0}']).is_empty()
         })
@@ -338,7 +326,8 @@ fn is_user_turn(line: &str) -> bool {
 /// draws `⎿` under a tool call and Muse `└`; the rows below are that output until the next
 /// block opens.
 fn is_tool_output(line: &str) -> bool {
-    line.trim_start().starts_with(['⎿', '└'])
+    line.trim_start()
+        .starts_with(crate::harness::tool_output_glyphs())
 }
 
 /// The verdict line of the agent's last reply, trimmed and bounded, when there is one.
@@ -394,57 +383,12 @@ fn verdict_line(screen: &str, markers: &[String]) -> Option<String> {
     block_verdict.or(verdict)
 }
 
-/// Bottom screen lines scanned for background work that is still running.
+/// Bottom screen lines scanned for a running turn.
 const BACKGROUND_WINDOW_LINES: usize = 12;
 
-/// The part of a status row near the bottom of `screen` that says work is still running, when
-/// one shows: a running turn, or background work the agent started. Claude Code counts its background
-/// shells and sub-agents in the footer under its input box, as in
-/// `⏵⏵ auto mode on · 2 shells · ← 1 agent · ↓ to manage`, and in the row that closes a
-/// turn, as in `✻ Sautéed for 5m 51s · done 12:44 AM · 2 shells still running`. The turn's
-/// row is history: it still says `still running` after the work ends. So when the input box
-/// (a `❯` row) is in view, only the footer rows under it are read, and the turn's row only
-/// when no input box is. An agent that went idle waiting on such work, such as a validation
-/// gate it runs in a background shell, has not stopped without a verdict; only one whose
-/// screen then stops changing for the stall threshold is reported, as stalled.
-fn background_work(screen: &str) -> Option<String> {
-    let lines: Vec<&str> = screen.lines().collect();
-    let mut start = lines.len().saturating_sub(BACKGROUND_WINDOW_LINES);
-    if let Some(input) = lines[start..]
-        .iter()
-        .rposition(|line| line.trim_start().starts_with('❯'))
-    {
-        start += input + 1;
-    }
-    lines[start..].iter().rev().find_map(|line| {
-        if !line.contains('·') {
-            return None;
-        }
-        line.split('·').find_map(|segment| {
-            let segment = segment.trim().trim_start_matches('←').trim_start();
-            background_count(segment).then(|| segment.to_owned())
-        })
-    })
-}
-
-/// Whether a footer segment shows work running: Claude Code's `esc to interrupt`, which it
-/// draws while a turn runs, or a count of background shells or agents: `1 shell`, `2 shells`,
-/// `1 agent`, `3 agents`, each optionally followed by `still running`. Herdr's status can say
-/// `idle` while the footer says `esc to interrupt` and output streams (live finding
-/// 2026-10-20), so the screen wins.
-fn background_count(segment: &str) -> bool {
-    if segment == "esc to interrupt" {
-        return true;
-    }
-    let segment = segment.strip_suffix(" still running").unwrap_or(segment);
-    let Some((count, noun)) = segment.split_once(' ') else {
-        return false;
-    };
-    !count.is_empty()
-        && count.bytes().all(|byte| byte.is_ascii_digit())
-        && count.parse::<u64>().is_ok_and(|count| count > 0)
-        && matches!(noun, "shell" | "shells" | "agent" | "agents")
-}
+// Claude Code's footer counts of background work and its scrolled-view pill (#574
+// harness-adapters): read from every screen, since only Claude Code draws them.
+use crate::harness::claude::{background_work, scrolled_below};
 
 /// Whether a row near the bottom of `screen` says a turn is running: `esc to interrupt` as a
 /// `·`-separated or parenthesized segment, as in Claude Code's footer
@@ -458,40 +402,6 @@ fn turn_running(screen: &str) -> bool {
         line.split(['·', '(', ')'])
             .any(|segment| segment.trim() == "esc to interrupt")
     })
-}
-
-/// How many new messages Claude Code says wait below its view, when the view is scrolled up.
-/// Scrolled up, Claude Code freezes the transcript where the reader left it and ends the last
-/// row above its input box with `16 new messages (ctrl+End) ↓`, raising the count as messages
-/// arrive below (live panes, 2026-10-20). Its pane keeps no terminal scrollback, so nothing
-/// below the view can be read: not the running turn's timer, not the newest output, not a
-/// closing verdict. A growing count changes the screen, which is progress like any change; a
-/// count that holds still proves nothing, since one long tool call or sub-agent run is a
-/// single message. The pill is read only at the end of that one row, between the input box's
-/// rule and any blank rows, so a transcript that quotes it is not a scrolled view.
-fn scrolled_below(screen: &str) -> Option<u64> {
-    let lines: Vec<&str> = screen.lines().collect();
-    let start = lines.len().saturating_sub(BACKGROUND_WINDOW_LINES);
-    let input = start
-        + lines[start..]
-            .iter()
-            .rposition(|line| line.trim_start().starts_with('❯'))?;
-    let row = lines[..input].iter().rev().find(|line| {
-        let line = line.trim();
-        !line.is_empty() && !line.chars().all(|character| character == '─')
-    })?;
-    let row = row.trim_end().strip_suffix('↓')?.trim_end();
-    let row = match row.strip_suffix(')') {
-        Some(hinted) => hinted.rsplit_once('(')?.0.trim_end(),
-        None => row,
-    };
-    let row = row
-        .strip_suffix(" new messages")
-        .or_else(|| row.strip_suffix(" new message"))?;
-    // The pill can be drawn flush against the transcript row it covers, so the count is the
-    // row's trailing digits, not its last word.
-    let count = &row[row.len() - row.bytes().rev().take_while(u8::is_ascii_digit).count()..];
-    count.parse::<u64>().ok().filter(|count| *count > 0)
 }
 
 /// FNV-1a over `text`. Persisted hashes must read the same in every process, so the

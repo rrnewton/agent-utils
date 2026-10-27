@@ -1831,15 +1831,20 @@ fn wait_ready<A: AgentApi + ?Sized>(
         let adapter = crate::harness_tui::harness_tui(info.agent.as_deref());
         let followup = crate::harness_tui::followup_tui(info.agent.as_deref());
         // Codex and managed Muse panes take ordinary follow-ups while working by default; Claude
-        // Code only with `deliver_while_working`.
+        // Code only with `deliver_while_working` (each adapter's `followup_policy`).
+        let policy = crate::harness::adapter_for(info.agent.as_deref())
+            .map(|harness| harness.followup_policy());
+        let takes_followups = match policy {
+            Some(crate::harness::FollowupPolicy::Always) => true,
+            Some(crate::harness::FollowupPolicy::WhenVerified) => client.verifies_muse_followups(),
+            _ => false,
+        };
         if allow_followups
-            && (allow_working_claude
-                || info.agent.as_deref() == Some("codex")
-                || (info.agent.as_deref() == Some("muse") && client.verifies_muse_followups()))
+            && (allow_working_claude || takes_followups)
             && info.status == "working"
             && followup.is_some_and(|a| a.working_followups())
         {
-            if info.agent.as_deref() == Some("claude") {
+            if policy == Some(crate::harness::FollowupPolicy::OptIn) {
                 return Ok(info);
             }
             let view = followup

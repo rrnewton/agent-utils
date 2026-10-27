@@ -249,7 +249,7 @@ impl HarnessTui for CodexTui {
         {
             return View::state(State::Working);
         }
-        if crate::submission::codex_idle_composer(screen) {
+        if crate::harness::codex::idle_composer(screen) {
             return View::state(State::IdleComposer);
         }
         View::state(State::Unknown)

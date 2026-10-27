@@ -76,6 +76,10 @@ pub trait ProcView {
     fn started_at(&self, _start_ticks: u64) -> Option<f64> {
         None
     }
+    /// The process's environment as `KEY=VALUE` entries, when readable.
+    fn environ(&self, _pid: u32) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// The production [`ProcView`].
@@ -115,6 +119,9 @@ impl ProcView for PassProc {
     fn started_at(&self, start_ticks: u64) -> Option<f64> {
         LinuxProc.started_at(start_ticks)
     }
+    fn environ(&self, pid: u32) -> Option<Vec<String>> {
+        LinuxProc.environ(pid)
+    }
 }
 
 fn parse_stat(pid: u32, text: &str) -> Option<ProcInfo> {
@@ -136,6 +143,17 @@ fn lock_id(dev: u64, ino: u64) -> String {
 }
 
 impl ProcView for LinuxProc {
+    fn environ(&self, pid: u32) -> Option<Vec<String>> {
+        let bytes = fs::read(format!("/proc/{pid}/environ")).ok()?;
+        Some(
+            bytes
+                .split(|byte| *byte == 0)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| String::from_utf8_lossy(entry).into_owned())
+                .collect(),
+        )
+    }
+
     fn processes(&self) -> Vec<ProcInfo> {
         let Ok(entries) = fs::read_dir("/proc") else {
             return Vec::new();

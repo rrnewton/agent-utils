@@ -1,0 +1,11 @@
+{"parentUuid":null,"type":"user","timestamp":"2026-10-27T10:00:00.000Z","sessionId":"00000000-0000-4000-8000-00000000c1a0","message":{"role":"user","content":"Run the gate, then have the change reviewed."}}
+{"type":"api-request","timestamp":"2026-10-27T10:00:01.000Z","sessionId":"00000000-0000-4000-8000-00000000c1a0","querySource":"repl_main_thread"}
+{"type":"assistant","timestamp":"2026-10-27T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"redacted"}]}}
+{"type":"assistant","timestamp":"2026-10-27T10:00:06.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"make validate","timeout":600000,"description":"Run the gate"}}]}}
+{"type":"user","timestamp":"2026-10-27T10:05:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"validate: OK"}]}}
+{"type":"api-request","timestamp":"2026-10-27T10:05:01.000Z","sessionId":"00000000-0000-4000-8000-00000000c1a0","querySource":"repl_main_thread"}
+{"type":"assistant","timestamp":"2026-10-27T10:05:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The gate passed. Starting the review."}]}}
+{"type":"assistant","timestamp":"2026-10-27T10:05:05.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"Agent","input":{"description":"Review the change","prompt":"Review the diff on the work branch."}}]}}
+{"type":"assistant","timestamp":"2026-10-27T10:05:06.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_03","name":"Bash","input":{"command":"tail -f build.log","run_in_background":true}}]}}
+{"type":"attachment","timestamp":"2026-10-27T10:06:00.000Z","attachment":{"type":"todo_reminder"}}
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-27T10:20:00.000Z","sessionId":"00000000-0000-4000-8000-00000000c1a0","content":"coordinator: status?"}

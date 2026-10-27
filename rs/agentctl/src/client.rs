@@ -97,9 +97,7 @@ fn foreground_process_entries(values: &[Value]) -> Result<Vec<Map<String, Value>
 
 /// Whether a Claude or Codex workspace trust dialog is on screen.
 pub fn relay_trust_prompt(screen: &str) -> bool {
-    (screen.contains("Quick safety check: Is this a project you created or one you trust?")
-        && screen.contains("Yes, I trust this folder"))
-        || (screen.contains("Trust this folder?") && screen.contains("Trust and continue"))
+    crate::harness::any_trust_prompt(screen)
 }
 
 /// The state of a harness behind a root slot relay, from Herdr's live screen-rule verdict
@@ -112,11 +110,10 @@ pub fn relay_trust_prompt(screen: &str) -> bool {
 /// composer with a recognised footer and no running turn, dialog or queued message is idle. Any
 /// other verdict is returned unchanged.
 pub(crate) fn relay_screen_state(kind: &str, herdr_state: &str, screen: &str) -> String {
-    if kind == "codex" && herdr_state == "unknown" && crate::submission::codex_idle_composer(screen)
-    {
-        return "idle".to_owned();
-    }
-    herdr_state.to_owned()
+    crate::harness::adapter(kind)
+        .and_then(|adapter| adapter.settle_herdr_state(herdr_state, screen))
+        .unwrap_or(herdr_state)
+        .to_owned()
 }
 
 /// Parent -> children for every visible process, from world-readable stat files. A root-owned
@@ -2651,7 +2648,7 @@ impl HerdrClient {
             return Ok(false);
         };
         let screen = self.read_screen_with_cancellation(&info.pane_id, cancelled)?;
-        if !crate::submission::codex_idle_composer(&screen) {
+        if !crate::harness::codex::idle_composer(&screen) {
             return Ok(false);
         }
         let confirmed = self.pane_info_with_cancellation(&info.pane_id, cancelled)?;

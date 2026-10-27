@@ -138,8 +138,8 @@ fn parse_tokens(segment: &str) -> Option<u64> {
 }
 
 /// Glyphs that open a harness's running-turn row at column 0: Codex's `•`/`◦`, Muse's `◆`/`◇`,
-/// and Claude Code's spinner frames.
-const RUNNING_GLYPHS: [char; 10] = ['•', '◦', '◆', '◇', '✻', '✽', '✶', '✳', '✢', '*'];
+/// and Claude Code's spinner frames ([`crate::harness::running_glyphs`]).
+use crate::harness::running_glyphs;
 
 /// The running-turn row's timer and tokens, when `line` is one: a row at column 0 that opens
 /// with a running glyph and ends in a parenthesized group whose first segment is an elapsed time
@@ -149,7 +149,7 @@ const RUNNING_GLYPHS: [char; 10] = ['•', '◦', '◆', '◇', '✻', '✽', '�
 fn running_row(line: &str) -> Option<(Option<u64>, Option<u64>, &'static str)> {
     let line = line.trim_end();
     let glyph = line.chars().next()?;
-    if !RUNNING_GLYPHS.contains(&glyph) {
+    if !running_glyphs().contains(&glyph) {
         return None;
     }
     let rest = line[glyph.len_utf8()..].strip_prefix([' ', '\u{a0}'])?;
@@ -316,20 +316,8 @@ pub fn without_timer(screen: &str) -> String {
     out
 }
 
-/// Composer placeholders and hints that are not a draft.
-const COMPOSER_PLACEHOLDERS: [&str; 11] = [
-    "Ask Codex to do anything",
-    "Explain this codebase",
-    "Summarize recent commits",
-    "Implement {feature}",
-    "Find and fix a bug in @filename",
-    "Write tests for @filename",
-    "Improve documentation in @filename",
-    "Run /review on my current changes",
-    "Use /skills to list available skills",
-    "Press up to edit queued messages",
-    "Type your message",
-];
+/// Composer placeholders and hints that are not a draft ([`crate::harness::composer_placeholders`]).
+use crate::harness::composer_placeholders;
 
 /// The text waiting in the harness's input box, when it holds a draft: the last row that opens
 /// with a composer marker (`»` or `›` for Codex, `❯` for Claude Code and Muse) and its indented
@@ -355,7 +343,7 @@ pub fn composer_draft(screen: &str) -> Option<String> {
     }
     let text = text.join("\n").trim().to_owned();
     (!text.is_empty()
-        && !COMPOSER_PLACEHOLDERS
+        && !composer_placeholders()
             .iter()
             .any(|hint| text.starts_with(hint)))
     .then_some(text)

@@ -967,17 +967,14 @@ pub(crate) fn reasoning_arguments(
     ) {
         return Err(fail(format!("unsupported reasoning effort {effort:?}")));
     }
-    match harness {
-        "codex" => Ok(vec![
-            "--config".to_owned(),
-            format!("model_reasoning_effort={effort}"),
-        ]),
-        "claude" => Ok(vec!["--effort".to_owned(), effort.to_owned()]),
-        "muse" => Ok(vec!["--reasoning-effort".to_owned(), effort.to_owned()]),
-        _ => Err(fail(format!(
-            "reasoning effort is not supported for harness {harness:?}"
-        ))),
-    }
+    crate::harness::adapter(harness)
+        .filter(|adapter| adapter.structured_launch())
+        .and_then(|adapter| adapter.reasoning_arguments(effort))
+        .ok_or_else(|| {
+            fail(format!(
+                "reasoning effort is not supported for harness {harness:?}"
+            ))
+        })
 }
 
 #[cfg(test)]

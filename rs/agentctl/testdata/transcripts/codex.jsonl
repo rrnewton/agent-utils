@@ -1,0 +1,11 @@
+{"timestamp":"2026-10-27T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"session_id":"00000000-0000-7000-8000-0000000c0de0","id":"00000000-0000-7000-8000-0000000c0de0","timestamp":"2026-10-27T10:00:00.000Z","cwd":"/work/project","originator":"codex","cli_version":"0.163.0","source":"cli"}}
+{"timestamp":"2026-10-27T10:00:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"t1","started_at":1793095200}}
+{"timestamp":"2026-10-27T10:00:03.000Z","ordinal":2,"type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"redacted"}}
+{"timestamp":"2026-10-27T10:00:04.000Z","ordinal":3,"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_1","name":"exec","input":"text(await tools.exec_command({cmd:\"cargo test --workspace\", yield_time_ms:30000}))"}}
+{"timestamp":"2026-10-27T10:00:34.000Z","ordinal":4,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_1","output":"test result: ok"}}
+{"timestamp":"2026-10-27T10:00:35.000Z","ordinal":5,"type":"event_msg","payload":{"type":"token_count","info":null}}
+{"timestamp":"2026-10-27T10:00:40.000Z","ordinal":6,"type":"response_item","payload":{"type":"function_call","status":"completed","call_id":"call_2","name":"wait_agent","arguments":"{\"targets\":[\"/root/reviewer\"],\"timeout_ms\":600000}"}}
+{"timestamp":"2026-10-27T10:10:40.000Z","ordinal":7,"type":"response_item","payload":{"type":"function_call_output","call_id":"call_2","output":"done"}}
+{"timestamp":"2026-10-27T10:10:45.000Z","ordinal":8,"type":"response_item","payload":{"type":"agent_message","content":[{"type":"output_text","text":"Reviewer done; fetching the page."}]}}
+{"timestamp":"2026-10-27T10:10:46.000Z","ordinal":9,"type":"response_item","payload":{"type":"function_call","status":"completed","call_id":"call_3","name":"fetch_page","arguments":"{\"url\":\"https://example.invalid/report\"}"}}
+{"timestamp":"2026-10-27T10:11:40.000Z","ordinal":10,"type":"event_msg","payload":{"type":"token_count","info":null}}

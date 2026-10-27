@@ -33,14 +33,12 @@ fn direct_root(harness: &str) -> Result<PathBuf, AgentError> {
         }
         return Ok(root);
     }
-    let directory = match harness {
-        "codex" => ".codex",
-        "claude" => ".claude",
-        _ => {
-            return Err(fail(format!(
-                "unsupported direct skill harness {harness:?}"
-            )))
-        }
+    let Some(directory) =
+        crate::harness::adapter(harness).and_then(|adapter| adapter.skill_directory())
+    else {
+        return Err(fail(format!(
+            "unsupported direct skill harness {harness:?}"
+        )));
     };
     Ok(crate::client::account_home()?
         .join(directory)

@@ -760,13 +760,7 @@ fn environment_names(environment: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn claude_conversation_selector(argument: &str) -> bool {
-    let key = argument.split_once('=').map_or(argument, |(key, _)| key);
-    matches!(
-        key,
-        "--session-id" | "--resume" | "--continue" | "--fork-session" | "-r" | "-c"
-    ) || (!argument.starts_with("--") && (argument.starts_with("-r") || argument.starts_with("-c")))
-}
+use crate::harness::claude::conversation_selector as claude_conversation_selector;
 
 #[cfg(test)]
 thread_local! {
@@ -799,44 +793,22 @@ pub fn harness_arguments(
             "harness arguments must be nonempty and contain no NUL",
         ));
     }
-    let mut arguments = Vec::new();
-    match harness {
-        "codex" => {
-            if let Some(resume) = resume.filter(|value| !value.is_empty()) {
-                arguments.extend(["resume".to_owned(), resume.to_owned()]);
-            }
-            arguments.push("--no-alt-screen".to_owned());
-            if let Some(model) = model.filter(|value| !value.is_empty()) {
-                arguments.extend(["--model".to_owned(), model.to_owned()]);
-            }
+    let Some(adapter) =
+        crate::harness::adapter(harness).filter(|adapter| adapter.structured_launch())
+    else {
+        if model.is_some() || resume.is_some() {
+            return Err(fail(
+                "model and resume presets support codex/claude/muse; use harness arguments for other kinds",
+            ));
         }
-        "claude" => {
-            if let Some(resume) = resume.filter(|value| !value.is_empty()) {
-                arguments.extend(["--resume".to_owned(), resume.to_owned()]);
-            }
-            if let Some(model) = model.filter(|value| !value.is_empty()) {
-                arguments.extend(["--model".to_owned(), model.to_owned()]);
-            }
-        }
-        "muse" => {
-            if let Some(model) = model.filter(|value| !value.is_empty()) {
-                arguments.extend(["--model".to_owned(), model.to_owned()]);
-            }
-        }
-        _ if model.is_some() || resume.is_some() => return Err(fail(
-            "model and resume presets support codex/claude/muse; use harness arguments for other kinds",
-        )),
-        _ => {}
-    }
+        return Ok(extra.to_vec());
+    };
+    let (mut arguments, after) = adapter.launch_arguments(model, resume);
     if arguments.iter().any(|value| value.contains('\0')) {
         return Err(fail("harness arguments must contain no NUL"));
     }
     arguments.extend_from_slice(extra);
-    if harness == "muse" {
-        if let Some(resume) = resume.filter(|value| !value.is_empty()) {
-            arguments.extend(["resume".to_owned(), resume.to_owned()]);
-        }
-    }
+    arguments.extend(after);
     Ok(arguments)
 }
 
@@ -4140,11 +4112,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 && info.agent.as_deref() == Some("claude")
             {
                 let screen = self.client.read(pane_id, "visible", Some(200))?;
-                if screen
-                    .contains("Quick safety check: Is this a project you created or one you trust?")
-                    && screen.contains("No, exit")
-                    && screen.contains("Yes, I trust this folder")
-                {
+                if crate::harness::claude::trust_prompt_with_refusal(&screen) {
                     return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
                 }
             }
@@ -4319,11 +4287,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 let screen =
                     self.client
                         .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-                if screen
-                    .contains("Quick safety check: Is this a project you created or one you trust?")
-                    && screen.contains("No, exit")
-                    && screen.contains("Yes, I trust this folder")
-                {
+                if crate::harness::claude::trust_prompt_with_refusal(&screen) {
                     return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
                 }
             }
@@ -12055,7 +12019,7 @@ pub(crate) mod tests {
                 return Ok(false);
             };
             let screen = self.read(&info.pane_id, "visible", Some(200))?;
-            Ok(crate::submission::codex_idle_composer(&screen)
+            Ok(crate::harness::codex::idle_composer(&screen)
                 && self.pane_info(&info.pane_id)? == *info
                 && self.verify_harness_identity(&info.pane_id, &identity)?)
         }
