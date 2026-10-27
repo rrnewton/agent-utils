@@ -1,13 +1,14 @@
 ---
 title: 'agent-progress-monitoring: tell a working-but-stuck agent from a progressing one, and make queued input visible'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 - observability
 created_at: 2026-10-27T03:01:28.208244030+00:00
-updated_at: 2026-10-27T03:01:28.208244030+00:00
+updated_at: 2026-10-27T04:17:00.166684805+00:00
+closed_at: 2026-10-27T04:17:00.166684664+00:00
 ---
 
 # Description
