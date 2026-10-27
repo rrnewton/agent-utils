@@ -336,8 +336,9 @@ If this mentions channel_not_writable, that channel is configured 'ro' — chang
         # `#34 voice-chat-write-confirm`: the model-facing tool only PROPOSES. A server that posted
         # here would be one whose agent can speak in your name without you.
         case "$proposed" in
-            "NOT SENT."*) ;;
-            *) fail "check 6 (propose): post_reply did not say NOT SENT. This server lets the model post without a separate confirmation. It said: $proposed" ;;
+            # NOT SENT YET since `#579 voice-send-confirm-timing`; NOT SENT from an older server.
+            "NOT SENT YET."*|"NOT SENT."*) ;;
+            *) fail "check 6 (propose): post_reply did not say NOT SENT YET. This server lets the model post without a separate confirmation. It said: $proposed" ;;
         esac
         ok "post_reply proposed and did not send: $(head -n1 <<<"$proposed" | cut -c1-100)"
 

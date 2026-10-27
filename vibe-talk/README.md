@@ -9544,8 +9544,11 @@ The log gets one content-free `post_gate event=sent_direct` line (or `direct_fai
 reason, or `direct_repeat`, with what became of the earlier send): a number, the channel, the
 length. There is no card and no read-back. A read credential is still refused.
 
-**On: `post_reply` proposes.** It leaves one pending proposal on this server and answers `NOT SENT`,
-with the channel, the exact text, and the one sentence to read it back with. The owner confirms
+**On: `post_reply` proposes.** It leaves one pending proposal on this server and answers `NOT SENT
+YET`, with the channel, the exact text, and the one sentence to read it back with, and says that the
+draft is waiting on the card and that nothing has failed or timed out (`#579
+voice-send-confirm-timing`): the agent is told never to say either, and that the page will tell it
+what became of the draft, a lapse included. The owner confirms
 it outside anything a model can call:
 
 * **on the voice page**, where a card shows the server's own copy — channel, what it answers, text
@@ -9783,7 +9786,19 @@ cooperative model: the status line ("Sent to lead team." / "Not sent — the rea
 interrupted."), the transcript, and a short tone queued after the speech already playing — a
 rising pair for sent, one low note for not sent; none when Sound is off or in a typed call. A tap on
 **Send** or **Don't send** during a call is told to the agent too (the screen already says it), so
-an agent waiting on "Send it?" hears the result.
+an agent waiting on "Send it?" hears the result; so is a draft of this call's that lapses with
+nobody's answer (`#579 voice-send-confirm-timing`): "the draft to lead team lapsed … NOT sent and the
+card is gone". A draft that was already waiting when the call began is not the agent's to report.
+
+**The owner's next request is not an answer to the card** (`#579 voice-send-confirm-timing`). "Send
+hello on lead team" says send, so it was judged as an answer, and the page told the agent — at the
+moment it was drafting hello — that the last draft had lapsed ("no draft is waiting"), or, with a
+card up, that the message was NOT sent; the agent told the owner his send had timed out as the new
+card came up, and a tap on it posted. Now, with no card up, an answer that sends somewhere — a word
+that sends followed by *to*, *in*, *on* or *into* and more words — is a request and gets no notice;
+and any notice for an answer that is not a plain yes waits 6.5 seconds, and is dropped if the card
+changes meanwhile: a new draft says the words were a request, and Send, Don't send or a lapse has
+its own notice. A plain yes is answered at once, as its agent is waiting on "One moment.".
 
 In the transcript, a message that went — tapped, said yes to, or sent without asking — is a
 **frozen card** (`#270 voice-transcript-markers`): the card it was sent from, at the same place,
@@ -10001,7 +10016,7 @@ Then set per-tool approval. This table is the whole policy:
 | `count_messages` | **auto** — no approval | How many, honest about a floor. |
 | `find_message` | **auto** — no approval | A description in your own words → that message, in full. |
 | `read_message` | **auto** — no approval | One known message by id. |
-| **`post_reply`** | **REQUIRE APPROVAL** | **Speaks in your name, in your channel.** |
+| **`post_reply`** | **REQUIRE APPROVAL** | **Speaks in your name, in your channel.** While the agent asks first, the voice page approves the vendor's request itself — see below. |
 
 That is what implements "reading is automatic while driving, posting asks first". If the agent
 only shows four tools, you gave it the read token — which is correct, deliberate, and means
@@ -10016,7 +10031,13 @@ proposal posts only when the owner confirms it — see "Posting asks first, unle
 off". The conservative first deployment is the read token.
 
 **The prompt and the approval follow the owner's setting.** With "Ask me before the voice agent
-sends" on, paste the `write-confirm` prompt and keep `post_reply` on **REQUIRE APPROVAL**. With it
+sends" on, paste the `write-confirm` prompt and keep `post_reply` on **REQUIRE APPROVAL**. The vendor
+then asks the client to approve each call (`mcp_tool_call` in state `awaiting_approval`) and fails it
+when nobody answers within its `approval_timeout_secs`; the voice page answers it, approving
+`post_reply` at once while the call and the page's setting both say ask, because the call can only
+draft and the card is where you approve it (`#579 voice-send-confirm-timing`; before that the page
+never answered, and the agent was told its send had timed out). It approves nothing else: any other
+tool waiting for approval is said in the connection details, and times out at the vendor. With it
 off, paste the `write-direct` prompt (from `GET /api/v1/voice-agent` with the write token) and set
 `post_reply` to **auto**: the owner turned confirmation off, and a vendor prompt in front of every
 send would be the friction he removed. **A hand-configured agent does not follow a change by
@@ -10029,7 +10050,9 @@ cannot verify it.** Nothing here can tell whether you configured approval correc
 whether it was later changed. What this server enforces is the scope split, the allowlist, and the
 confirmation step: a read token cannot post, `post_reply` never sends by itself while the owner has
 the agent ask first, and no token can reach a channel outside the configuration. Do not mistake the approval prompt for a guarantee we
-implement; the confirmation step is the one we do.
+implement; the confirmation step is the one we do. While the agent asks first, the voice page
+approves the vendor's `post_reply` prompt itself (above), so that setting adds no gate of its own
+then: the card does.
 
 Verify the public endpoint before pointing an agent at it — same script, public URL:
 

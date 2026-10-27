@@ -146,7 +146,10 @@ async fn propose(harness: &Harness, text: &str) -> Value {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["result"]["isError"], false, "{response}");
-    assert!(tool_text(&response).starts_with("NOT SENT."), "{response}");
+    assert!(
+        tool_text(&response).starts_with("NOT SENT YET."),
+        "{response}"
+    );
     assert!(
         harness.discord.posted().is_empty(),
         "a proposal posted: {:?}",
@@ -172,7 +175,7 @@ async fn a_write_scope_post_reply_without_confirmation_posts_nothing() {
     )
     .await;
     let said = tool_text(&response);
-    assert!(said.starts_with("NOT SENT."), "{said}");
+    assert!(said.starts_with("NOT SENT YET."), "{said}");
     assert!(
         said.contains(&format!("Exact text: {}", tagged("ship it"))),
         "{said}"
@@ -184,7 +187,7 @@ async fn a_write_scope_post_reply_without_confirmation_posts_nothing() {
         json!({ "channel_id": WRITE_CHANNEL, "text": "ship it" }),
     )
     .await;
-    assert!(tool_text(&again).starts_with("NOT SENT."), "{again}");
+    assert!(tool_text(&again).starts_with("NOT SENT YET."), "{again}");
     assert!(
         harness.discord.posted().is_empty(),
         "{:?}",
@@ -198,6 +201,90 @@ async fn a_write_scope_post_reply_without_confirmation_posts_nothing() {
     assert_eq!(proposal["channel_id"], WRITE_CHANNEL);
     assert_eq!(proposal["channel_name"], "lead team");
     assert!(proposal["expires_in_ms"].as_u64().expect("a number") > 0);
+}
+
+/// What became of proposal `serial`, as `GET /api/v1/post-proposals` reports it, or null.
+async fn fate_of(harness: &Harness, serial: &Value) -> Value {
+    let (status, body) = send(harness, "GET", "/api/v1/post-proposals", WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Left out while nothing has settled.
+    body["settled"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| &entry["serial"] == serial)
+        .map_or(Value::Null, |entry| entry["fate"].clone())
+}
+
+/// `#579 voice-send-confirm-timing`. The owner heard "it wasn't sent, the confirmation timed out" the
+/// moment the card came up, and a tap on the card then posted it. The answer the agent gets says the
+/// draft is waiting on the card and nothing failed or timed out; the draft stays pending and
+/// committable after it; and what became of it — sent, withdrawn, or lapsed — is the server's own
+/// word afterwards, for the page to tell the agent.
+#[tokio::test]
+async fn a_proposal_is_told_as_waiting_on_the_card_and_settles_only_by_send_withdrawal_or_lapse() {
+    let harness = harness();
+    let (_status, response) = post_reply(
+        &harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "on my way" }),
+    )
+    .await;
+    let said = tool_text(&response);
+    assert!(said.starts_with("NOT SENT YET. "), "{said}");
+    assert!(
+        said.contains("is on the confirmation card on the voice page, waiting for the speaker"),
+        "{said}"
+    );
+    assert!(said.contains("nothing has failed or timed out"), "{said}");
+    assert!(said.contains("never say it failed or timed out"), "{said}");
+    assert!(
+        said.contains("if nobody confirms it by then, the voice page tells you it lapsed"),
+        "{said}"
+    );
+    // Nothing in it reads as a refusal of its own: the only "NOT SENT" is the leading "NOT SENT YET".
+    assert_eq!(said.matches("NOT SENT").count(), 1, "{said}");
+    assert!(!said.contains("lapses in"), "{said}");
+    // Still waiting, for its whole time, and a tap on Send posts it.
+    let proposal = pending(&harness).await;
+    assert!(
+        proposal["expires_in_ms"].as_u64().expect("a number") > 100_000,
+        "{proposal}"
+    );
+    assert_eq!(fate_of(&harness, &proposal["serial"]).await, Value::Null);
+    let (status, body) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fate_of(&harness, &proposal["serial"]).await, "committed");
+
+    // Withdrawn by Don't send.
+    let other = crate::post_gate::harness();
+    let withdrawn = propose(&other, "running late").await;
+    let (status, body) = send(
+        &other,
+        "POST",
+        "/api/v1/post-proposals/cancel",
+        WRITE_TOKEN,
+        Some(json!({ "handle": withdrawn["handle"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(fate_of(&other, &withdrawn["serial"]).await, "cancelled");
+    assert!(other.discord.posted().is_empty());
+
+    // Lapsed, on a gate with a short life: only then is it expired, and only then refused.
+    let short = harness_with(PostGate::with_ttl_and_numbering(
+        Duration::from_millis(150),
+        0,
+    ));
+    let lapsing = propose(&short, "on my way").await;
+    assert_eq!(fate_of(&short, &lapsing["serial"]).await, Value::Null);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(pending(&short).await, Value::Null);
+    assert_eq!(fate_of(&short, &lapsing["serial"]).await, "expired");
+    let (status, body) = commit(&short, restated(&lapsing)).await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert!(short.discord.posted().is_empty());
+    assert_eq!(harness.discord.posted().len(), 1);
 }
 
 #[tokio::test]
@@ -428,7 +515,7 @@ async fn the_rest_propose_route_proposes_and_posts_nothing() {
     let result = body["result"]
         .as_str()
         .expect("a result sentence for the model");
-    assert!(result.starts_with("NOT SENT."), "{result}");
+    assert!(result.starts_with("NOT SENT YET."), "{result}");
     assert!(
         result.contains(&format!("Exact text: {}", tagged("on my way"))),
         "{result}"
@@ -825,7 +912,10 @@ async fn propose_again(harness: &Harness, text: &str) -> Value {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    assert!(tool_text(&response).starts_with("NOT SENT."), "{response}");
+    assert!(
+        tool_text(&response).starts_with("NOT SENT YET."),
+        "{response}"
+    );
     pending(harness).await
 }
 

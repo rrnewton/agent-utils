@@ -87,7 +87,7 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 
 /// Bump this whenever any of the five prompt files changes, and update every pinned fingerprint
 /// below to match. The test that compares them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 13;
+pub const PROMPT_VERSION: u32 = 14;
 
 /// The [`fingerprint`] of [`OWNER_INSTRUCTIONS_HEADING`] at [`PROMPT_VERSION`]. It reaches the
 /// agent only with the owner's instructions, so it is pinned on its own rather than inside a
@@ -95,13 +95,13 @@ pub const PROMPT_VERSION: u32 = 13;
 pub const PINNED_OWNER_HEADING_FINGERPRINT: &str = "fnv1a64:946b5fc6e4828976";
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
-pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:36797a822e9e3fa0";
+pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:e90ae65969b17b73";
 
 /// The [`fingerprint`] of the sending prompt that asks first, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:be1ccd9f3bbff078";
+pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:6960c86cbe4420f7";
 
 /// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:0a6673bfef76aadb";
+pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:66ce8f42bd9aac80";
 
 /// Which instructions follow the base: what this caller can do, and how the owner wants sends
 /// confirmed.
@@ -663,7 +663,7 @@ mod tests {
 
     /// What only the variant that asks first may say: the read-back, the question, and that the
     /// confirmation and its result are the voice page's.
-    const CONFIRM_RULES: [&str; 8] = [
+    const CONFIRM_RULES: [&str; 10] = [
         "outside your tools",
         "word for word",
         // `#303 voice-post-prefix`: the read-back is the posted text, the owner's tag and all.
@@ -672,7 +672,11 @@ mod tests {
         "Send it?",
         "say only \"One moment.\"",
         "\"Voice page:\"",
-        "Never say a message was sent before that",
+        "Never say a message was sent, or that it was not, before that",
+        // `#579 voice-send-confirm-timing`: a draft on the card is waiting, not failed, and the
+        // page reports a tap or a lapse as it reports a yes.
+        "nothing has failed and nothing has timed out",
+        "tap Send or Don't send on the card or the card lapses",
     ];
 
     /// What only the variant that posts at once may say. The last three are `#264
