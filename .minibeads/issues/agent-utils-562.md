@@ -101,4 +101,8 @@ recover-absent-agent-row.
 ownerless-agent-cache-relocate (host identity, canonical cache paths,
 fence, directory identity). Remaining: recover-absent-agent-row.
 
-[muse watermelon] Next slice: recover-absent-agent-row, the last recovery-journal kind; that completes journal coverage.
+[muse watermelon] Slice 15 in progress: `parse-journal` also covers
+recover-absent-agent-row (row identity and record digest, branch
+witnesses, remote containment, submodule salvage receipts, planned
+rescue receipts, and the exact derived ARCHIVED entry under both rescue
+roots). That completes every recovery-journal kind.

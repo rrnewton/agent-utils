@@ -487,6 +487,91 @@ def test_parse_journal_ownerless_cache_refusals(tmp_path: Path, mutate: str) -> 
     assert fragment in result.stderr
 
 
+def _absent_agent_journal(modern: bool) -> dict[str, object]:
+    record = _record("slot-a", "agent-a")
+    record_obj = wrkslots_cli._record_from_obj(record, "fixture record")
+    item = wrkslots_cli.AbsentAgentRow(
+        machine="node-a",
+        slot="slot-a",
+        generation=1,
+        record_sha256=wrkslots_cli._record_sha256(record_obj),
+    )
+    witnesses = (
+        wrkslots_cli._AbsentAgentBranchWitness("repo", "refs/heads/suite/work", "present", SHA),
+    )
+    planned = wrkslots_cli._absent_agent_planned_receipts(
+        record_obj, witnesses, include_branch_witness=modern, containment=None
+    )
+    journal: dict[str, object] = {
+        "schema": 2,
+        "kind": "recover-absent-agent-row",
+        "machine": "node-a",
+        "host_id": "host-1",
+        "slot": "slot-a",
+        "phase": "prepared",
+        "actor": _identity(789),
+        "input": {
+            "machine": "node-a",
+            "slot": "slot-a",
+            "generation": 1,
+            "record_sha256": item.record_sha256,
+        },
+        "record": record,
+        "preserved": [],
+        "removed": [],
+        "archive_entry": wrkslots_cli._absent_agent_archive_entry(
+            record_obj, item, "2026-10-26T02:00:00Z", planned
+        ),
+    }
+    if modern:
+        journal["branch_witnesses"] = [
+            {
+                "checkout": "repo",
+                "branch_ref": "refs/heads/suite/work",
+                "state": "present",
+                "head": SHA,
+            }
+        ]
+    return journal
+
+
+@pytest.mark.parametrize("modern", [False, True])
+def test_parse_journal_absent_agent_matches_python(tmp_path: Path, modern: bool) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    path = _write(root, name, _absent_agent_journal(modern))
+    result = _rust(root, name)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root, path)
+
+
+@pytest.mark.parametrize("mutate", ["archive", "witness", "phase"])
+def test_parse_journal_absent_agent_refusals(tmp_path: Path, mutate: str) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    journal = _absent_agent_journal(modern=True)
+    if mutate == "archive":
+        entry = journal["archive_entry"]
+        assert isinstance(entry, dict)
+        entry["continuation"] = "tampered"
+        fragment = "archive entry differs from its exact inputs"
+    elif mutate == "witness":
+        witnesses = journal["branch_witnesses"]
+        assert isinstance(witnesses, list) and isinstance(witnesses[0], dict)
+        witnesses[0]["branch_ref"] = "refs/heads/other"
+        fragment = "branch witness differs from checkout repo"
+    else:
+        journal["phase"] = "bogus"
+        fragment = "unknown absent-agent-row phase"
+    path = _write(root, name, journal)
+    with pytest.raises(Exception) as caught:
+        _expected(root, path)
+    assert fragment in str(caught.value)
+    result = _rust(root, name)
+    assert result.returncode == 1
+    assert fragment in result.stderr
+
+
 @pytest.mark.parametrize("with_exclusion", [False, True])
 def test_parse_journal_ownerless_matches_python(tmp_path: Path, with_exclusion: bool) -> None:
     root = _root(tmp_path)

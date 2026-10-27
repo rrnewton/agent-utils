@@ -1409,6 +1409,866 @@ fn ownerless_cache_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
     Ok(())
 }
 
+fn git_ref_name(value: &str, label: &str) -> Result<()> {
+    let parts: Vec<&str> = value.split('/').collect();
+    let invalid = !value.starts_with("refs/")
+        || parts.len() < 2
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+        || value.contains("..")
+        || value.contains("@{")
+        || value.ends_with('.')
+        || value
+            .chars()
+            .any(|c| (c as u32) < 0x20 || (c as u32) == 0x7f)
+        || value.chars().any(|c| " ~^:?*[\\".contains(c));
+    if invalid {
+        return Err(format!("invalid full {label} {value:?}"));
+    }
+    Ok(())
+}
+
+struct RowItem {
+    machine: String,
+    slot: String,
+    generation: i64,
+    record_sha256: String,
+}
+
+fn absent_row_identity(value: &Value, label: &str) -> Result<RowItem> {
+    let raw = as_mapping(value, label)?;
+    exact_keys(
+        raw,
+        &["machine", "slot", "generation", "record_sha256"],
+        &[],
+        label,
+    )?;
+    let digest = as_str(&raw["record_sha256"], &format!("{label}.record_sha256"))?;
+    if !is_digest(digest) {
+        return Err(format!(
+            "{label}.record_sha256 must be one lowercase SHA-256 digest"
+        ));
+    }
+    Ok(RowItem {
+        machine: validate_name(
+            as_str(&raw["machine"], &format!("{label}.machine"))?,
+            "machine",
+        )?,
+        slot: validate_name(as_str(&raw["slot"], &format!("{label}.slot"))?, "slot")?,
+        generation: as_int(&raw["generation"], &format!("{label}.generation"), 1)?,
+        record_sha256: digest.to_owned(),
+    })
+}
+
+type Witness = (String, String, String, Option<String>);
+
+fn witness_from_obj(value: &Value, label: &str) -> Result<Witness> {
+    let raw = as_mapping(value, label)?;
+    exact_keys(
+        raw,
+        &["checkout", "branch_ref", "state", "head"],
+        &[],
+        label,
+    )?;
+    let checkout = as_str(&raw["checkout"], &format!("{label}.checkout"))?;
+    if checkout.is_empty() {
+        return Err(format!("{label}.checkout must not be empty"));
+    }
+    let branch_ref = as_str(&raw["branch_ref"], &format!("{label}.branch_ref"))?;
+    if git_ref_name(branch_ref, &format!("{label}.branch_ref")).is_err() {
+        return Err(format!("{label}.branch_ref is invalid"));
+    }
+    if !branch_ref.starts_with("refs/heads/") {
+        return Err(format!("{label}.branch_ref must name refs/heads"));
+    }
+    let state = as_str(&raw["state"], &format!("{label}.state"))?;
+    let head = match state {
+        "absent" => {
+            if !raw["head"].is_null() {
+                return Err(format!(
+                    "{label}.head must be null when the branch is absent"
+                ));
+            }
+            None
+        }
+        "present" => {
+            let head = as_str(&raw["head"], &format!("{label}.head"))?;
+            if !is_sha(head) {
+                return Err(format!("{label}.head must be one full object SHA"));
+            }
+            Some(head.to_owned())
+        }
+        _ => {
+            return Err(format!("{label}.state must be 'absent' or 'present'"));
+        }
+    };
+    Ok((
+        checkout.to_owned(),
+        branch_ref.to_owned(),
+        state.to_owned(),
+        head,
+    ))
+}
+
+fn record_checkouts(record: &crate::active_state::RecordRec) -> Vec<(String, String, String)> {
+    record
+        .normalized
+        .get("checkouts")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    (
+                        item.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        item.get("branch")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        item.get("head")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn rescue_ref(
+    record: &crate::active_state::RecordRec,
+    checkout: &(String, String, String),
+    root: &str,
+) -> String {
+    format!(
+        "{}/{}/{}/{}-{}-{}",
+        root,
+        record.machine,
+        record.slot,
+        checkout.0.replace('/', "-"),
+        record.generation,
+        &checkout.2[..12.min(checkout.2.len())]
+    )
+}
+
+fn planned_receipts(
+    record: &crate::active_state::RecordRec,
+    checkouts: &[(String, String, String)],
+    witnesses: &[Witness],
+    include_witness: bool,
+    rescue_root: Option<&str>,
+    containment: &[(String, String, String)],
+) -> Result<Vec<Value>> {
+    if witnesses.len() != checkouts.len() {
+        return Err("absent-agent branch witness count differs from checkout count".to_owned());
+    }
+    if !containment.is_empty() && !include_witness {
+        return Err("absent-agent remote containment requires branch witnesses".to_owned());
+    }
+    let mut receipts = Vec::new();
+    for (checkout, witness) in checkouts.iter().zip(witnesses) {
+        let existing = containment.iter().find(|(name, _, _)| name == &checkout.0);
+        let mut receipt = match existing {
+            None => serde_json::json!({
+                "checkout": checkout.0,
+                "source_head": checkout.2,
+                "salvage_commit": checkout.2,
+                "status_sha256": Value::Null,
+                "disposition": "salvaged",
+                "remote_ref": rescue_ref(record, checkout, rescue_root.unwrap_or("refs/rescue/wrkslots")),
+                "containing_remote_refs": [],
+                "working_tree_contents": "unknown-storage-absent-before-recovery",
+            }),
+            Some((_, remote_ref, tip)) => serde_json::json!({
+                "checkout": checkout.0,
+                "source_head": checkout.2,
+                "salvage_commit": checkout.2,
+                "status_sha256": Value::Null,
+                "disposition": "already-on-remote",
+                "remote_ref": remote_ref,
+                "remote_ref_tip": tip,
+                "containing_remote_refs": [remote_ref],
+                "working_tree_contents": "unknown-storage-absent-before-recovery",
+            }),
+        };
+        if include_witness {
+            receipt["local_branch"] = serde_json::json!({
+                "checkout": witness.0,
+                "branch_ref": witness.1,
+                "state": witness.2,
+                "head": witness.3,
+            });
+            receipt["local_branch_rescue"] = Value::String(match &witness.3 {
+                None => "not-applicable-absent".to_owned(),
+                Some(head) if *head == checkout.2 => "same-commit-as-recorded-head".to_owned(),
+                Some(_) => "no-separate-ref-left-untouched".to_owned(),
+            });
+        }
+        receipts.push(receipt);
+    }
+    Ok(receipts)
+}
+
+fn branch_validation(receipt: &Map<String, Value>) -> Result<String> {
+    let checkout = as_str(
+        receipt.get("checkout").unwrap_or(&Value::Null),
+        "absent-agent receipt.checkout",
+    )?;
+    let witness = witness_from_obj(
+        receipt.get("local_branch").unwrap_or(&Value::Null),
+        "absent-agent receipt.local_branch",
+    )?;
+    let observed = witness.3.as_deref().unwrap_or("absent");
+    let disposition = as_str(
+        receipt.get("local_branch_rescue").unwrap_or(&Value::Null),
+        "absent-agent receipt.local_branch_rescue",
+    )?;
+    let already = receipt.get("disposition").and_then(Value::as_str) == Some("already-on-remote");
+    let remote_ref = receipt
+        .get("remote_ref")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let source_head = receipt
+        .get("source_head")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let detail = if disposition == "not-applicable-absent" && witness.3.is_none() {
+        if already {
+            format!(
+                "had no tip; the recorded HEAD was already contained in existing remote ref {remote_ref}"
+            )
+        } else {
+            "had no tip to include in the recorded-HEAD rescue ref".to_owned()
+        }
+    } else if disposition == "same-commit-as-recorded-head"
+        && witness.3.as_deref() == receipt.get("source_head").and_then(Value::as_str)
+    {
+        if already {
+            format!(
+                "named the recorded HEAD, which existing remote ref {remote_ref} already contained"
+            )
+        } else {
+            "named the same commit as the recorded HEAD rescue ref".to_owned()
+        }
+    } else if disposition == "no-separate-ref-left-untouched" && witness.3.is_some() {
+        if already {
+            format!(
+                "received no rescue ref; only the recorded HEAD {source_head} was checked against existing remote ref {remote_ref}"
+            )
+        } else {
+            format!(
+                "received no separate rescue ref; the recorded-HEAD rescue ref targets {source_head}"
+            )
+        }
+    } else {
+        return Err("absent-agent local branch rescue disposition is inconsistent".to_owned());
+    };
+    Ok(format!(
+        "checkout {checkout}: recovery issued no source-repository command targeting local branch {} for mutation; checks immediately before and after registration reconciliation matched witnessed state {observed}, then that witness expired when the removal marker became durable and asserts no later branch state; {detail}",
+        witness.1
+    ))
+}
+
+fn module_validation(receipt: &Map<String, Value>) -> Result<String> {
+    let commits = as_list(
+        receipt.get("unpublished_commits").unwrap_or(&Value::Null),
+        "submodule receipt commits",
+    )?;
+    let prefix = format!(
+        "checkout {} submodule {}: ",
+        receipt
+            .get("checkout")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        receipt
+            .get("submodule")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    );
+    match receipt.get("disposition").and_then(Value::as_str) {
+        Some("already-published") => Ok(format!(
+            "{prefix}every commit the submodule repository Git kept for the checkout stored itself, or HEAD or a ref there named, was reachable from a remote-tracking ref there or in the shared submodule repository; nothing was salvaged"
+        )),
+        Some("salvaged") => Ok(format!(
+            "{prefix}{} commit(s) outside every remote-tracking ref were pushed to rescue refs on the submodule's remote and read back before the registration was removed",
+            commits.len()
+        )),
+        _ => Ok(format!(
+            "{prefix}{} commit(s) outside every remote-tracking ref were bundled with complete history into {} (SHA-256 {}), which was cloned afresh and fsck-checked before the registration was removed",
+            commits.len(),
+            receipt.get("archive_bundle").and_then(Value::as_str).unwrap_or_default(),
+            receipt.get("archive_bundle_sha256").and_then(Value::as_str).unwrap_or_default()
+        )),
+    }
+}
+
+fn absent_archive_entry(
+    record: &crate::active_state::RecordRec,
+    item: &RowItem,
+    finished_at: &str,
+    receipts: &[Value],
+    submodules: &[Value],
+) -> Result<Value> {
+    let branch_flags: Vec<bool> = receipts
+        .iter()
+        .map(|receipt| {
+            receipt
+                .as_object()
+                .is_some_and(|map| map.contains_key("local_branch"))
+        })
+        .collect();
+    if branch_flags.iter().any(|flag| *flag) && !branch_flags.iter().all(|flag| *flag) {
+        return Err("absent-agent receipts mix legacy and branch-witness shapes".to_owned());
+    }
+    let has_witnesses = branch_flags.first().copied().unwrap_or(false);
+    let distinct = receipts.iter().any(|receipt| {
+        receipt.get("local_branch_rescue").and_then(Value::as_str)
+            == Some("no-separate-ref-left-untouched")
+    });
+    let already = receipts.iter().any(|receipt| {
+        receipt.get("disposition").and_then(Value::as_str) == Some("already-on-remote")
+    });
+    if already && !has_witnesses {
+        return Err("absent-agent remote containment requires branch witnesses".to_owned());
+    }
+    let mut validation: Vec<Value> = vec![
+        Value::String(
+            "registry reconciliation confirmed physical storage externally absent".to_owned(),
+        ),
+        Value::String(format!(
+            "source ACTIVE record SHA-256: {}",
+            item.record_sha256
+        )),
+    ];
+    for receipt in receipts {
+        let map = receipt
+            .as_object()
+            .ok_or_else(|| "absent-agent receipt must be a JSON object".to_owned())?;
+        let checkout = map
+            .get("checkout")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let source_head = map
+            .get("source_head")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let remote_ref = map
+            .get("remote_ref")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let salvage = map
+            .get("salvage_commit")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        validation.push(Value::String(
+            if map.get("disposition").and_then(Value::as_str) == Some("already-on-remote") {
+                let tip = map.get("remote_ref_tip").and_then(Value::as_str).unwrap_or_default();
+                format!("checkout {checkout}: recorded slot HEAD {source_head} was already contained in existing remote ref {remote_ref} at tip {tip}; recovery pushed nothing and re-verified the containment with git merge-base --is-ancestor against a freshly fetched copy of that ref")
+            } else if has_witnesses {
+                format!("checkout {checkout}: recorded slot HEAD {source_head} preserved at remote rescue ref {remote_ref} and read back at {salvage}")
+            } else {
+                format!("checkout {checkout}: remote rescue ref {remote_ref} read back at {salvage}")
+            },
+        ));
+    }
+    if has_witnesses {
+        for receipt in receipts {
+            let map = receipt
+                .as_object()
+                .ok_or_else(|| "absent-agent receipt must be a JSON object".to_owned())?;
+            validation.push(Value::String(branch_validation(map)?));
+        }
+    }
+    for receipt in submodules {
+        let map = receipt
+            .as_object()
+            .ok_or_else(|| "absent-agent receipt must be a JSON object".to_owned())?;
+        validation.push(Value::String(module_validation(map)?));
+    }
+    let mut limitations: Vec<Value> = vec![Value::String(
+        "working-tree contents were absent before recovery; tracked and ordinary untracked content and HANDOFF could not be inspected or salvaged; ignored content could not be inspected and would not have been uploaded"
+            .to_owned(),
+    )];
+    if has_witnesses {
+        limitations.push(Value::String(
+            "local branch witnesses cover only registration reconciliation; no branch state after the durable removal marker is asserted".to_owned(),
+        ));
+    }
+    if distinct {
+        limitations.push(Value::String(
+            "local branch tips distinct from the recorded slot HEAD were left untouched in source repositories; no separate rescue refs were created to target those exact tips".to_owned(),
+        ));
+    }
+    if already {
+        limitations.push(Value::String(
+            "a recorded HEAD found in an existing remote ref stays preserved only while that ref, which recovery neither created nor protects, still contains it".to_owned(),
+        ));
+    }
+    if !submodules.is_empty() {
+        limitations.push(Value::String(format!(
+            "submodule repositories Git kept for the checkouts under <common>/worktrees/<id>/modules were moved intact, reflogs included, to <common>/wrkslots-retained-modules/{}+{}+{}+<id>/modules before each registration was removed, and recovery never deletes them; at the final census every commit their HEADs, refs and reflogs named and every commit they stored themselves, whether named or not, was compared with their remote-tracking refs and those of the shared repository, and each reachable from none of those was salvaged; none they read through objects/info/alternates was left both unreachable from those and unsalvaged; a commit written there later, by a process already holding a handle inside them, is kept there but recorded nowhere; a commit found in a remote-tracking ref stays preserved only while that remote still holds it",
+            record.slot,
+            record.generation,
+            &item.record_sha256[..16]
+        )));
+    }
+    let continuation = if already {
+        "physical storage was already absent; inspect each checkout's verified remote ref, either a rescue ref this recovery pushed or an existing ref that already contained the recorded HEAD, and re-read every local branch ref because its historical witness has expired"
+    } else if has_witnesses {
+        "physical storage was already absent; inspect the verified recorded-HEAD rescue refs and re-read every local branch ref because its historical witness has expired"
+    } else {
+        "physical storage was already absent; inspect the verified rescue refs"
+    };
+    let mut salvage: Vec<Value> = receipts.to_vec();
+    salvage.extend(submodules.iter().cloned());
+    let normalized = record
+        .normalized
+        .as_object()
+        .ok_or_else(|| "absent-agent record must be a JSON object".to_owned())?;
+    let mut entry = serde_json::json!({
+        "archive_id": format!("{}:{}:{}:{}", record.machine, record.slot, record.generation, finished_at),
+        "slot": record.slot,
+        "agent": record.agent,
+        "task": record.task,
+        "purpose": record.purpose,
+        "slot_type": "agent",
+        "machine": record.machine,
+        "generation": normalized["generation"],
+        "created_at": record.created_at,
+        "finished_at": finished_at,
+        "mode": "remove",
+        "actor": "coordinator",
+        "physical_storage": "removed",
+        "validation": validation,
+        "limitations": limitations,
+        "continuation": continuation,
+        "salvage": salvage,
+        "checkouts": normalized["checkouts"],
+    });
+    if let Some(layout) = normalized.get("layout") {
+        entry["layout"] = layout.clone();
+    }
+    if let Some(source) = normalized.get("import_source") {
+        entry["import_source"] = source.clone();
+    }
+    Ok(entry)
+}
+
+fn module_commit_refs(map: &Map<String, Value>, key: &str, label: &str) -> Result<Vec<String>> {
+    let mut commits = Vec::new();
+    for (index, value) in as_list(
+        map.get(key).unwrap_or(&Value::Null),
+        &format!("{label}.{key}"),
+    )?
+    .iter()
+    .enumerate()
+    {
+        let row_label = format!("{label}.{key}[{index}]");
+        let entry = as_mapping(value, &row_label)?;
+        exact_keys(entry, &["commit", "ref"], &[], &row_label)?;
+        commits.push(as_str(&entry["commit"], &format!("{row_label}.commit"))?.to_owned());
+        let reference = as_str(&entry["ref"], &format!("{row_label}.ref"))?;
+        crate::config_validate::validate_full_ref(reference, &format!("{row_label}.ref"))?;
+    }
+    Ok(commits)
+}
+
+fn submodule_salvage(raw: &Map<String, Value>, checkout_names: &[String]) -> Result<Vec<Value>> {
+    let Some(value) = raw.get("submodule_salvage") else {
+        return Ok(Vec::new());
+    };
+    let entries = as_list(value, "absent-agent-row journal.submodule_salvage")?;
+    if entries.is_empty() {
+        return Err("absent-agent-row journal.submodule_salvage is empty".to_owned());
+    }
+    let mut receipts: Vec<Value> = Vec::new();
+    let mut last: Option<(usize, String)> = None;
+    for (index, entry_value) in entries.iter().enumerate() {
+        let label = format!("absent-agent-row journal.submodule_salvage[{index}]");
+        let entry = as_mapping(entry_value, &label)?;
+        let disposition = as_str(
+            entry.get("disposition").unwrap_or(&Value::Null),
+            &format!("{label}.disposition"),
+        )?;
+        let extras: &[&str] = match disposition {
+            "already-published" => &[],
+            "salvaged" => &["remote_url_sha256", "remote_refs"],
+            "archived-local" => &[
+                "archive_root",
+                "archive_receipt",
+                "archive_receipt_sha256",
+                "archive_bundle",
+                "archive_bundle_sha256",
+                "archive_bundle_bytes",
+                "archive_refs",
+                "complete_history",
+                "archive_reason",
+                "remote_failure",
+            ],
+            _ => {
+                return Err(format!("{label}.disposition {disposition:?} is unknown"));
+            }
+        };
+        let mut required: Vec<&str> = vec![
+            "checkout",
+            "submodule",
+            "submodule_repository",
+            "shared_repository",
+            "unpublished_commits",
+            "disposition",
+        ];
+        required.extend(extras.iter().copied());
+        exact_keys(entry, &required, &[], &label)?;
+        let checkout = as_str(&entry["checkout"], &format!("{label}.checkout"))?;
+        let submodule = as_str(&entry["submodule"], &format!("{label}.submodule"))?;
+        as_str(
+            &entry["submodule_repository"],
+            &format!("{label}.submodule_repository"),
+        )?;
+        if !entry["shared_repository"].is_null() {
+            as_str(
+                &entry["shared_repository"],
+                &format!("{label}.shared_repository"),
+            )?;
+        }
+        let position = checkout_names.iter().position(|name| name == checkout);
+        if position.is_none() || submodule.is_empty() {
+            return Err(format!("{label} names no recorded checkout and submodule"));
+        }
+        let mut commits = Vec::new();
+        for (commit_index, commit) in as_list(
+            &entry["unpublished_commits"],
+            &format!("{label}.unpublished_commits"),
+        )?
+        .iter()
+        .enumerate()
+        {
+            commits.push(
+                as_str(
+                    commit,
+                    &format!("{label}.unpublished_commits[{commit_index}]"),
+                )?
+                .to_owned(),
+            );
+        }
+        let mut sorted = commits.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if commits.iter().any(|commit| !is_sha(commit))
+            || commits != sorted
+            || (disposition == "already-published") != commits.is_empty()
+        {
+            return Err(format!(
+                "{label}.unpublished_commits is invalid for {disposition}"
+            ));
+        }
+        if disposition == "salvaged" {
+            let digest = as_str(
+                &entry["remote_url_sha256"],
+                &format!("{label}.remote_url_sha256"),
+            )?;
+            if !is_digest(digest) || module_commit_refs(entry, "remote_refs", &label)? != commits {
+                return Err(format!("{label} remote refs differ from its commits"));
+            }
+        } else if disposition == "archived-local" {
+            for key in [
+                "archive_root",
+                "archive_receipt",
+                "archive_bundle",
+                "archive_reason",
+            ] {
+                as_str(&entry[key], &format!("{label}.{key}"))?;
+            }
+            for key in ["archive_receipt_sha256", "archive_bundle_sha256"] {
+                let digest = as_str(&entry[key], &format!("{label}.{key}"))?;
+                if !is_digest(digest) {
+                    return Err(format!("{label}.{key} must be one SHA-256 digest"));
+                }
+            }
+            as_int(
+                &entry["archive_bundle_bytes"],
+                &format!("{label}.archive_bundle_bytes"),
+                1,
+            )?;
+            if !entry["remote_failure"].is_null() {
+                as_str(&entry["remote_failure"], &format!("{label}.remote_failure"))?;
+            }
+            if entry["complete_history"] != Value::Bool(true)
+                || module_commit_refs(entry, "archive_refs", &label)? != commits
+            {
+                return Err(format!("{label} archive refs differ from its commits"));
+            }
+        }
+        let position = (position.expect("checked above"), submodule.to_owned());
+        if last.as_ref().is_some_and(|previous| position <= *previous) {
+            return Err(
+                "absent-agent-row submodule receipts are not distinct and in checkout order"
+                    .to_owned(),
+            );
+        }
+        last = Some(position);
+        receipts.push(entry_value.clone());
+    }
+    Ok(receipts)
+}
+
+fn absent_agent_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    exact_keys(
+        raw,
+        &[
+            "schema",
+            "kind",
+            "machine",
+            "host_id",
+            "slot",
+            "phase",
+            "actor",
+            "input",
+            "record",
+            "preserved",
+            "removed",
+            "archive_entry",
+        ],
+        &[
+            "branch_witnesses",
+            "remote_containment",
+            "submodule_salvage",
+        ],
+        "absent-agent-row journal",
+    )?;
+    if as_int(&raw["schema"], "absent-agent-row journal.schema", 0)? != SCHEMA
+        || raw["kind"] != Value::String("recover-absent-agent-row".to_owned())
+        || raw["machine"].as_str() != Some(journal_machine)
+    {
+        return Err("absent-agent-row journal identity is invalid".to_owned());
+    }
+    let item = absent_row_identity(&raw["input"], "absent-agent-row journal.input")?;
+    if item.machine != journal_machine || raw["slot"].as_str() != Some(item.slot.as_str()) {
+        return Err("absent-agent-row journal row identity is invalid".to_owned());
+    }
+    if as_str(&raw["host_id"], "absent-agent-row journal.host_id")?.is_empty() {
+        return Err("absent-agent-row journal has no stable host identity".to_owned());
+    }
+    if identity_from_obj(&raw["actor"], "absent-agent-row journal.actor")?.is_none() {
+        return Err("absent-agent-row journal has no actor".to_owned());
+    }
+    let phase = as_str(&raw["phase"], "absent-agent-row journal.phase")?;
+    if !matches!(phase, "prepared" | "preserved" | "registrations-removed") {
+        return Err(format!("unknown absent-agent-row phase {phase:?}"));
+    }
+    let record = record_from_obj(&raw["record"], "absent-agent-row journal.record")?;
+    if record.slot_type != "agent" {
+        return Err(format!("slot {} is not an agent row", item.slot));
+    }
+    if record.machine != item.machine || record.generation != item.generation {
+        return Err(format!(
+            "agent row {}/{} generation changed",
+            item.machine, item.slot
+        ));
+    }
+    let observed =
+        crate::canonical_sha256(&record.normalized).map_err(|error| error.to_string())?;
+    if observed != item.record_sha256 {
+        return Err(format!(
+            "agent row {}/{} changed: expected {}, found {observed}",
+            item.machine, item.slot, item.record_sha256
+        ));
+    }
+    let checkouts = record_checkouts(&record);
+    let checkout_names: Vec<String> = checkouts.iter().map(|item| item.0.clone()).collect();
+    let legacy = !raw.contains_key("branch_witnesses");
+    let witnesses: Vec<Witness> = if legacy {
+        checkouts
+            .iter()
+            .map(|checkout| {
+                (
+                    checkout.0.clone(),
+                    format!("refs/heads/{}", checkout.1),
+                    "present".to_owned(),
+                    Some(checkout.2.clone()),
+                )
+            })
+            .collect()
+    } else {
+        let mut parsed = Vec::new();
+        for (index, value) in as_list(
+            &raw["branch_witnesses"],
+            "absent-agent-row journal.branch_witnesses",
+        )?
+        .iter()
+        .enumerate()
+        {
+            parsed.push(witness_from_obj(
+                value,
+                &format!("absent-agent-row journal.branch_witnesses[{index}]"),
+            )?);
+        }
+        parsed
+    };
+    if witnesses.len() != checkouts.len() {
+        return Err("absent-agent-row branch witness count differs from checkout count".to_owned());
+    }
+    for (checkout, witness) in checkouts.iter().zip(&witnesses) {
+        if witness.0 != checkout.0 || witness.1 != format!("refs/heads/{}", checkout.1) {
+            return Err(format!(
+                "absent-agent-row branch witness differs from checkout {}",
+                checkout.0
+            ));
+        }
+    }
+    let containment: Vec<(String, String, String)> = match raw.get("remote_containment") {
+        None => Vec::new(),
+        Some(value) => {
+            if legacy {
+                return Err(
+                    "absent-agent-row remote containment requires branch witnesses".to_owned(),
+                );
+            }
+            let entries = as_list(value, "absent-agent-row journal.remote_containment")?;
+            if entries.is_empty() {
+                return Err("absent-agent-row journal.remote_containment is empty".to_owned());
+            }
+            let mut parsed: Vec<(String, String, String)> = Vec::new();
+            for (index, entry_value) in entries.iter().enumerate() {
+                let label = format!("absent-agent-row journal.remote_containment[{index}]");
+                let entry = as_mapping(entry_value, &label)?;
+                exact_keys(entry, &["checkout", "remote_ref", "tip"], &[], &label)?;
+                let name = as_str(&entry["checkout"], &format!("{label}.checkout"))?.to_owned();
+                let reference = as_str(&entry["remote_ref"], &format!("{label}.remote_ref"))?;
+                let tip = as_str(&entry["tip"], &format!("{label}.tip"))?;
+                if git_ref_name(reference, &format!("{label}.remote_ref")).is_err() {
+                    return Err(format!("{label}.remote_ref is invalid"));
+                }
+                if !is_sha(tip) {
+                    return Err(format!("{label}.tip must be one full object SHA"));
+                }
+                if !checkout_names.contains(&name)
+                    || parsed.iter().any(|(seen, _, _)| *seen == name)
+                {
+                    return Err(format!(
+                        "{label}.checkout must name one distinct recorded checkout"
+                    ));
+                }
+                parsed.push((name, reference.to_owned(), tip.to_owned()));
+            }
+            let ordered: Vec<String> = checkout_names
+                .iter()
+                .filter(|name| parsed.iter().any(|(seen, _, _)| seen == *name))
+                .cloned()
+                .collect();
+            if parsed
+                .iter()
+                .map(|(name, _, _)| name.clone())
+                .collect::<Vec<_>>()
+                != ordered
+            {
+                return Err(
+                    "absent-agent-row remote containment is not in checkout order".to_owned(),
+                );
+            }
+            parsed
+        }
+    };
+    let submodules = submodule_salvage(raw, &checkout_names)?;
+    let mut receipts: Vec<Value> = Vec::new();
+    for (index, value) in as_list(&raw["preserved"], "absent-agent-row journal.preserved")?
+        .iter()
+        .enumerate()
+    {
+        as_mapping(
+            value,
+            &format!("absent-agent-row journal.preserved[{index}]"),
+        )?;
+        receipts.push(value.clone());
+    }
+    let mut removed: Vec<String> = Vec::new();
+    for (index, value) in as_list(&raw["removed"], "absent-agent-row journal.removed")?
+        .iter()
+        .enumerate()
+    {
+        removed
+            .push(as_str(value, &format!("absent-agent-row journal.removed[{index}]"))?.to_owned());
+    }
+    if receipts.len() > checkouts.len() || removed.len() > checkouts.len() {
+        return Err("absent-agent-row journal progress exceeds its checkout count".to_owned());
+    }
+    let receipt_names: Vec<String> = receipts
+        .iter()
+        .map(|receipt| match receipt.get("checkout") {
+            Some(Value::String(name)) => name.clone(),
+            _ => "None".to_owned(),
+        })
+        .collect();
+    if receipt_names
+        .iter()
+        .any(|name| !checkout_names.contains(name))
+        || removed.iter().any(|name| !checkout_names.contains(name))
+    {
+        return Err("absent-agent-row journal names an unrelated checkout".to_owned());
+    }
+    let archive_entry = as_mapping(
+        &raw["archive_entry"],
+        "absent-agent-row journal.archive_entry",
+    )?;
+    let finished_at = as_str(
+        archive_entry.get("finished_at").unwrap_or(&Value::Null),
+        "absent-agent archive.finished_at",
+    )?;
+    parse_timestamp(finished_at, "absent-agent archive.finished_at")?;
+    let canonical =
+        |value: &Value| crate::canonical::canonical_json(value).map_err(|error| error.to_string());
+    let mut expected_receipts: Vec<Value> = Vec::new();
+    let mut matched = false;
+    for root in ["refs/rescue/wrkslots", "refs/heads/rescue/wrkslots"] {
+        let planned = planned_receipts(
+            &record,
+            &checkouts,
+            &witnesses,
+            !legacy,
+            Some(root),
+            &containment,
+        )?;
+        let expected = absent_archive_entry(&record, &item, finished_at, &planned, &submodules)?;
+        if canonical(&Value::Object(archive_entry.clone()))? == canonical(&expected)? {
+            expected_receipts = planned;
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        return Err("absent-agent-row archive entry differs from its exact inputs".to_owned());
+    }
+    for (index, receipt) in receipts.iter().enumerate() {
+        if canonical(receipt)? != canonical(&expected_receipts[index])? {
+            return Err("absent-agent-row preserved receipts are not a durable prefix".to_owned());
+        }
+    }
+    if removed != checkout_names[..removed.len()] {
+        return Err("absent-agent-row removed registrations are not a durable prefix".to_owned());
+    }
+    if !removed.is_empty() && (phase == "prepared" || receipts.len() != checkouts.len()) {
+        return Err(
+            "absent-agent-row removed registrations precede durable remote preservation".to_owned(),
+        );
+    }
+    if matches!(phase, "preserved" | "registrations-removed") && receipts.len() != checkouts.len() {
+        return Err(
+            "absent-agent-row journal phase precedes complete remote preservation".to_owned(),
+        );
+    }
+    if phase == "registrations-removed" && removed.len() != checkouts.len() {
+        return Err(
+            "absent-agent-row journal phase precedes complete registration removal".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn absent_validate_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
     const LABEL: &str = "absent-validation-row journal";
     exact_keys(
@@ -1788,6 +2648,9 @@ pub(crate) fn parse_journal(
         }
         "ownerless-agent-cache-relocate" => {
             ownerless_cache_shape(&cfg, raw, &machine)?;
+        }
+        "recover-absent-agent-row" => {
+            absent_agent_shape(raw, &machine)?;
         }
         _ => return Err(format!("unsupported recovery journal kind {kind:?}")),
     }
