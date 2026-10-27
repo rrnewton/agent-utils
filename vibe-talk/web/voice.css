@@ -71,14 +71,6 @@
      off it — and it has to be judged in DARK, because a tint that reads on white is invisible on
      #1d2026, which is the theme the owner's devices are in. */
   --row-hover: #262c36;
-  /* `#49 cached-summaries`. The surface a row takes on while it is showing a SUMMARY instead of
-     the message. Teal, because the three speaker colours are blue, near-black and warm brown, and
-     a fourth variation on any of those would read as another kind of speaker rather than as a
-     different kind of CONTENT. Judged in dark first: the earlier reading highlight was a 14% tint
-     that turned out to be invisible on #1d2026, and this must not repeat that. */
-  --summary-bg: #14312f;
-  --summary-edge: #2f7d73;
-  --summary-ink: #6fd8c6;
   /* `#49 cached-summaries`. The ink of the one standing sentence that says this SERVER cannot
      summarise at all (`#summary-note[data-unavailable]`). A red that exists nowhere else in this
      interface: `--warn` is orange and already means the row being read aloud and an armed Clear.
@@ -190,9 +182,6 @@
     --idle: #98a1b0;
     --paused: #5b48c4;
     --row-hover: #edf1f7;
-    --summary-bg: #e4f4f1;
-    --summary-edge: #4c9c91;
-    --summary-ink: #1d6b60;
     /* The unavailable sentence's ink, in light: a token with only one scheme renders as nothing
        at all in the other. */
     --summary-fail-ink: #8f1d28;
@@ -4226,21 +4215,41 @@ a.search-hit-link {
  * one-line reading" and "the formatter gave up" is that the text got shorter. Both readings were
  * available and the wrong one is the one a reader reaches for.
  *
- * So the row changes SURFACE, not just content: its own tint, and a bar down the summarised edge.
- * Applied to the row rather than to the note, and with the tint applied over every `data-who`
- * colour, because the three speaker colours are what the reader is otherwise reading the row by.
+ * So the row changes SURFACE, not just content: a tint, and a bar down the summarised edge, applied
+ * to the row rather than to the note and over every `data-who` colour.
+ *
+ * IN ITS THREAD'S COLOUR (`#564 message-summary-toggle`). The tint was a fixed teal, and the owner,
+ * 2026-10-26: "their little highlight color doesn't match the thread they're part of. It should."
+ * So `--summary-tint` is the thread's hue (`--summary-hue`, set by `setFolded` in web/voice.js from
+ * the row's own message), drawn as the card's edge and the bridge are (`#427 server-thread-hues`);
+ * a message in no thread has no colour to match and takes the muted grey, never a fixed accent.
  */
 #side-log li.discord-message[data-summarised="true"],
 #side-cards li.discord-message[data-summarised="true"],
 #discord-log li.discord-message[data-summarised="true"],
 #pinned-log li.discord-message[data-summarised="true"] {
-  background: var(--summary-bg);
-  border-color: var(--summary-edge);
+  --summary-tint: var(--muted);
+  background: color-mix(in srgb, var(--summary-tint) 16%, var(--panel));
+  border-color: var(--summary-tint);
   /* The bar, IN PLACE OF the left side's hairline and three times as wide. Every row has a side
      there, the coder's tile too since `#213 row-side-borders`, so a bar that merely recoloured it
      would be one more one-pixel border, and nobody reads a border as the mark that says the row
      is not showing the message. The width is what does that. */
-  border-left: 3px solid var(--summary-edge);
+  border-left: 3px solid var(--summary-tint);
+}
+
+#side-log li.discord-message[data-summarised="true"][data-summary-hue],
+#side-cards li.discord-message[data-summarised="true"][data-summary-hue],
+#discord-log li.discord-message[data-summarised="true"][data-summary-hue],
+#pinned-log li.discord-message[data-summarised="true"][data-summary-hue] {
+  --summary-tint: hsl(var(--summary-hue, 210) 55% 50%);
+}
+
+/* A coding agent's row stacked under another (`[data-stack-under][data-who="coder"]`) puts its left
+   hairline back with more weight than the rule above, which took the bar off every such row in an
+   unpacked thread. The bar is the summary's mark, so it wins there too. */
+:is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message[data-stack-under][data-who][data-summarised="true"] {
+  border-left: 3px solid var(--summary-tint);
 }
 
 /*
@@ -4270,10 +4279,10 @@ a.search-hit-link {
   font-size: 0.66rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  /* NOT `--muted`. This is the one word telling the reader that what follows was written by a
-     machine about the message rather than by the author of it, and muted grey is what the eye is
-     trained to skip. */
-  color: var(--summary-ink);
+  /* NOT `--muted` where there is a colour to have. This is the one word telling the reader that
+     what follows was written by a machine about the message rather than by the author of it, and
+     muted grey is what the eye is trained to skip: it is in the row's tint, its thread's hue. */
+  color: var(--summary-tint, var(--muted));
   font-weight: 600;
 }
 

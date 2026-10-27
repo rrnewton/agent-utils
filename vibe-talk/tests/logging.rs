@@ -1446,6 +1446,7 @@ async fn the_summary_route_and_taking_a_channel_off_the_list_log_numbers_and_nev
     let id = discord
         .seed(&ChannelId(READ_CHANNEL.to_owned()), "someone", &content)
         .0;
+    vibe_talk::testing::summaries_on(&state).await;
     let harness = Harness {
         router: router(state.clone()),
         discord,

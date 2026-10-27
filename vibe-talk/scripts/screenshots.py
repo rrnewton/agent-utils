@@ -2065,6 +2065,48 @@ def _tell_the_mock(driver: Driver, state: str, scenario: str) -> None:
         )
 
 
+def _keep_summaries_setting(driver: Driver, state: str, on: bool) -> None:
+    """Hold "Summarize collapsed messages" on or off ON THE SERVER, as a page's settings write would.
+
+    `#564 message-summary-toggle` made summaries the owner's synced setting, off unless turned on,
+    and the server refuses a summary while it holds the setting off. Written here directly rather
+    than left to the page's own settings sync, so a scene never races that write: the request a
+    scene photographs is answered under the setting the scene chose, and a scene after it starts
+    from off however the profile's pages last left it.
+    """
+    body = json.dumps({"set": [{"key": "vibe-talk.voice.summarize-collapsed",
+                                "value": "1" if on else None, "updated_ms": 0}]}).encode()
+    request = Request(f"{driver.base_url}/api/v1/client-settings", data=body, method="PUT")
+    request.add_header("Authorization", f"Bearer {driver.token}")
+    request.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(request, timeout=10):  # noqa: S310 - a loopback URL this script built
+            return
+    except HTTPError as error:
+        # No store: settings live on the page alone, and the server refuses nothing for them.
+        if error.code == 503:
+            return
+        raise Unreachable(state, "the summaries setting can be kept on the server",
+                          f"PUT /api/v1/client-settings answered HTTP {error.code}") from error
+    except URLError as error:
+        raise Unreachable(state, "the summaries setting can be kept on the server",
+                          f"could not reach {driver.base_url} ({error})") from error
+
+
+def _press_summaries(driver: Driver, on: bool) -> None:
+    """The Summaries chip pressed to `on`, only if it is not already there: it is a kept setting now,
+    and a blind click would turn it OFF on a page that had already put it back on."""
+    want = "true" if on else "false"
+    driver.js(f"(() => {{ const chip = document.getElementById('summarise'); "
+              f"if (chip.getAttribute('aria-pressed') !== '{want}') chip.click(); }})()")
+
+
+def _summaries_off_after(driver: Driver) -> None:
+    """`after` for a scene that turned summaries on: off on the page and on the server again."""
+    _press_summaries(driver, False)
+    _keep_summaries_setting(driver, "summaries-off-after", False)
+
+
 def _forget_cached_summaries(driver: Driver, state: str) -> None:
     """Empty the server's durable store, so the next summary is really generated.
 
@@ -2115,7 +2157,13 @@ def _act_summary_mode(driver: Driver) -> None:
     # assumed from the mock's start-up flag, because the failure state below wedges the same mock
     # and the walk runs once per profile per theme.
     _tell_the_mock(driver, "32-channel-summarised", "no_tool_call")
+    # From OFF, whatever an earlier profile's walk left on the shared server or this page holds:
+    # the clamped row below has to be measured clamped.
+    _keep_summaries_setting(driver, "32-channel-summarised", False)
     _act_open_channel(driver)
+    _press_summaries(driver, False)
+    driver.page.wait_for_function(
+        "() => !document.querySelector('#discord-log > li[data-summarised=\"true\"]')", timeout=10_000)
     # The row this picture is ABOUT, measured before anything changes. The seeded backlog has
     # exactly one message over the server's summarisation threshold and it is the newest, so it is
     # on screen from the first read; its height here is what the three-line clamp gives it.
@@ -2126,9 +2174,12 @@ def _act_summary_mode(driver: Driver) -> None:
         "window.__foldedHeight = row.getBoundingClientRect().height; "
         "return window.__foldedHeight; })()"
     )
+    # The setting on at the server only now, after the clamped row is measured: held there before
+    # the channel opened, the page would have put summaries on while it loaded.
+    _keep_summaries_setting(driver, "32-channel-summarised", True)
     # Through the DOM rather than by clicking: the chip floats over the bottom corner of the list
     # and a real click would scroll it into view, which moves the thing being photographed.
-    driver.js("(() => { document.getElementById('summarise').click(); })()")
+    _press_summaries(driver, True)
     # For a REAL summary on the probed row itself; see SUMMARY_PROBE_SUMMARISED.
     driver.page.wait_for_function(f"() => {SUMMARY_PROBE_SUMMARISED}", timeout=20_000)
     driver.settle(300)
@@ -2199,7 +2250,10 @@ def _act_summary_failed(driver: Driver) -> None:
     )
     # Through the DOM for the same reason as the state above: a real click scrolls the floating
     # chip into view and moves the list being photographed.
-    driver.js("(() => { document.getElementById('summarise').click(); })()")
+    # On at the server after the purge (which forgets the owner's settings with everything else)
+    # and after the probe is measured, as in the state above.
+    _keep_summaries_setting(driver, SUMMARY_FAILED_STATE, True)
+    _press_summaries(driver, True)
     # THE PROBE ROW, not whichever row loses the race.
     #
     # Turning the mode on asks about every long row on screen, and each ask is a separate round
@@ -5166,6 +5220,7 @@ SCENES: tuple[Scene, ...] = (
         name="32-channel-summarised",
         what="the channel in summary mode: a long message shown as one line about it, not its first three",
         act=_act_summary_mode,
+        after=_summaries_off_after,
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
             (
@@ -6891,6 +6946,7 @@ SCENES: tuple[Scene, ...] = (
         name=SUMMARY_FAILED_STATE,
         what="summary mode when the summariser fails: the row says so quietly and keeps the message",
         act=_act_summary_failed,
+        after=_summaries_off_after,
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
             (

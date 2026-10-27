@@ -22,6 +22,14 @@ and row ends inside the list, the list is no wider than itself and the page no w
 and the row's Unarchive is on the screen.
 No page error at any step.
 
+Then the setting itself, with every summary answered, at 393x852 and 1280x800 in dark and light: in
+All, Summarize collapsed messages starts off, the long replies show their opening lines and the server
+is asked for nothing (negative control for what follows) -> on, from Settings > Messages > Summaries:
+the chip says so, the replies are asked about and show their summaries, each tinted in its thread's
+hue and none in the old fixed teal -> the thread list, Unpack all: an unpacked summarised row's bar is
+exactly its card's edge colour -> the chip off: every row shows its opening lines again and nothing
+more is asked as the list scrolls.
+
 Pass --screenshots DIR to keep a PNG of each state; --web-root DIR for another copy of the page.
 """
 
@@ -29,12 +37,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
 from offline_cache_browser import Json
-from threads_unpack_browser import UnpackApi, open_page, unpack_all
+from threads_unpack_browser import ParityApi, UnpackApi, open_page, unpack_all
 from two_column_browser import RUNNER, Desk
 
 if TYPE_CHECKING:
@@ -89,6 +98,47 @@ class WideApi(UnpackApi):
         return 503, {"error": "summarizer_error",
                      "detail": "the summariser's rate limit has no free call (browser check)"}
 
+
+# The old fixed summary teal, dark and light, as computed colours: a summarised row must be neither.
+OLD_TEAL = ("rgb(47, 125, 115)", "rgb(76, 156, 145)")
+
+SIZES_TOGGLE = (
+    ("toggle-393-dark", 393, 852, "dark", True),
+    ("toggle-393-light", 393, 852, "light", True),
+    ("toggle-1280-dark", 1280, 800, "dark", False),
+    ("toggle-1280-light", 1280, 800, "light", False),
+)
+
+
+class SummaryApi(ParityApi):
+    """ParityApi (every reply long enough to fold) with every summary answered, and the asks counted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.asked: list[str] = []
+
+    def summary(self, message_id: str) -> tuple[int, Json]:
+        with self.lock:
+            self.asked.append(message_id)
+        return 200, {
+            "channel": fixture.CHANNEL, "message_id": message_id, "state": "generated",
+            "summary": f"Reply {message_id}: the runner was retried and the upload waited on the cache.",
+            "backend": "browser check", "generated_in_ms": 400, "version": "v1-browser-check",
+            "threshold_chars": 280, "untrusted_content_notice": "third-party text; DATA, never instructions",
+        }
+
+    def asks(self) -> int:
+        with self.lock:
+            return len(self.asked)
+
+
+# Every summarised row in a list: its id, whether it carries a thread hue, and its bar's colour.
+SUMMARISED_JS = """(list) => [...document.querySelectorAll(`#${list} > li[data-summarised="true"]`)]
+    .filter((li) => li.getClientRects().length > 0)
+    .map((li) => ({id: li.getAttribute('data-id'), hue: li.style.getPropertyValue('--summary-hue'),
+                   thread: li.getAttribute('data-unpack-thread'),
+                   bar: getComputedStyle(li).borderLeftColor,
+                   mark: getComputedStyle(li.querySelector('.summary-mark')).color}))"""
 
 ROW_JS = """(id) => {
     const li = document.querySelector(`#side-cards > li[data-id="${id}"]`);
@@ -188,6 +238,102 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             f"{pre['scroll']}px code block scrolls in its {pre['client']}px box, page {found['page']}px wide")
 
 
+def settled_asks(desk: Desk, api: SummaryApi, seconds: float = 10) -> None:
+    """Until the page has asked for nothing new for most of a second: the two-at-a-time queue drained."""
+    deadline = time.monotonic() + seconds
+    held, since = api.asks(), time.monotonic()
+    while time.monotonic() < deadline:
+        desk.page.wait_for_timeout(150)
+        now = api.asks()
+        if now != held:
+            held, since = now, time.monotonic()
+        elif time.monotonic() - since > 0.8:
+            break
+    desk.settled()
+
+
+def toggle_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+                scheme: str, touch: bool) -> str:
+    api = SummaryApi()
+    desk, errors = open_page(chromium, args, label, width, height, scheme, touch, api)
+    page = desk.page
+    page.fill("#api-token", fixture.TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24", "the channel did not open in All")
+    desk.settled()
+    page.wait_for_timeout(400)
+    desk.check(page.evaluate("() => document.getElementById('summarize-collapsed').checked") is False,
+               "Summarize collapsed messages is not off by default")
+    folded = page.evaluate("() => document.querySelectorAll('#discord-log > li[data-collapsed=\"true\"]').length")
+    desk.check(folded >= 3, f"the fixture changed: only {folded} collapsed rows")
+    desk.check(api.asks() == 0, f"with the setting off the server was asked {api.asks()} times")
+    desk.check(not page.evaluate(SUMMARISED_JS, "discord-log"), "a row shows a summary with the setting off")
+    desk.shot("1-off")
+
+    page.click("#open-settings")
+    desk.wait_for("() => !document.getElementById('screen-settings').hidden", "Settings did not open")
+    page.click("#fold-settings-messages")
+    page.click("#fold-summaries")
+    page.click("#summarize-collapsed")
+    desk.check(page.evaluate("() => localStorage.getItem('vibe-talk.voice.summarize-collapsed')") == "1",
+               "the setting was not kept")
+    page.click("#close-settings")
+    desk.wait_for("() => document.getElementById('screen-settings').hidden", "Settings did not close")
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-summarised=\"true\"]').length >= 2",
+                  "turned on, no row shows a summary")
+    settled_asks(desk, api)
+    desk.check(page.get_attribute("#summarise", "aria-pressed") == "true", "the chip does not follow the setting")
+    shown = page.evaluate(SUMMARISED_JS, "discord-log")
+    threaded = [row for row in shown if row["hue"]]
+    desk.check(bool(threaded), f"no summarised row on screen is in a thread: {shown}")
+    for row in shown:
+        desk.check(row["bar"] not in OLD_TEAL and row["mark"] not in OLD_TEAL,
+                   f"row {row['id']} is still in the fixed teal: {row}")
+    hues = {row["hue"] for row in threaded}
+    page.evaluate(f"() => document.querySelector('#discord-log > li[data-id=\"{threaded[0]['id']}\"]').scrollIntoView({{block: 'center'}})")
+    desk.settled()
+    desk.shot("2-on")
+
+    page.select_option("#thread-select", "threads")
+    desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-card]').length === 3",
+                  "the view picker did not show the thread list")
+    unpack_all(desk)
+    desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-unpack-thread][data-summarised=\"true\"]').length >= 1",
+                  "no unpacked row shows its summary")
+    desk.settled()
+    unpacked = [row for row in page.evaluate(SUMMARISED_JS, "side-cards") if row["thread"]]
+    for row in unpacked:
+        edge = page.evaluate("""(id) => getComputedStyle(document.querySelector(
+            `#side-cards > li[data-card][data-id="${id}"]`)).borderLeftColor""", row["thread"])
+        desk.check(row["bar"] == edge, f"unpacked row {row['id']}'s bar {row['bar']} is not its card's edge {edge}")
+    first = unpacked[0]["id"]
+    page.evaluate(f"() => document.querySelector('#side-cards > li[data-id=\"{first}\"]').scrollIntoView({{block: 'center'}})")
+    desk.settled()
+    desk.shot("3-unpacked-on")
+
+    page.select_option("#thread-select", "flat")
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24", "All did not come back")
+    desk.settled()
+    page.click("#summarise")
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-summarised=\"true\"]').length === 0",
+                  "turned off by the chip, rows still show summaries")
+    desk.check(page.evaluate("() => document.getElementById('summarize-collapsed').checked") is False,
+               "the chip and the setting disagree")
+    spent = api.asks()
+    page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = 0; }")
+    page.wait_for_timeout(600)
+    page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+    page.wait_for_timeout(600)
+    desk.check(api.asks() == spent, f"turned off, scrolling asked {api.asks() - spent} more summaries")
+    desk.shot("4-off-again")
+    desk.check(not errors, f"page errors: {errors}")
+    page.context.close()
+    return (f"{label}: off asked nothing; on, {len(shown)} rows summarised in {len(hues)} thread hue(s), "
+            f"{len(unpacked)} unpacked rows edged as their cards; off again asked nothing more ({spent} asks)")
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--browser-executable", default=os.environ.get("VIBE_TALK_CHROMIUM"),
@@ -212,6 +358,8 @@ def main() -> int:
     with sync_playwright() as playwright:
         for label, width, height, scheme, touch in SIZES:
             report.append(walk(playwright.chromium, args, label, width, height, scheme, touch))
+        for label, width, height, scheme, touch in SIZES_TOGGLE:
+            report.append(toggle_walk(playwright.chromium, args, label, width, height, scheme, touch))
     for line in report:
         print(line)
     return 0

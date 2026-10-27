@@ -3819,9 +3819,17 @@ The consequence is worth stating plainly rather than leaving to be found: **with
 `[summaries.llm]`, the ElevenLabs credentials are load-bearing for summaries.** Without either there
 is no summariser at all. The
 server still starts and says so; `/summary` then answers `503 summarizer_not_configured`, and
-the app states the reason once above the list and turns the rows it asked about red. It does not
-fall back to truncation, because a silent fallback is indistinguishable from the agent answering
-badly. Regeneration also now costs vendor calls where it previously cost nothing.
+the app states the reason once above the list and marks the rows it asked about "summary failed".
+It does not fall back to truncation, because a silent fallback is indistinguishable from the agent
+answering badly. Regeneration also now costs vendor calls where it previously cost nothing.
+
+Message summaries are also the owner's choice, and **off unless he turns them on**: "Summarize
+collapsed messages" in Settings › Messages, a synced setting (`vibe-talk.voice.summarize-collapsed`,
+`"1"` on) that the Summaries chip over the list also turns. With it off the app asks for nothing, and
+`/summary` answers `409 summaries_off` before the message is fetched or the summariser asked, so a
+client that does not read the setting costs no model call either. A server with no store has no
+synced settings, and there the app alone decides. Thread cards are summarised by the thread namer
+and do not read it. `#564 message-summary-toggle`.
 
 What is actually load-bearing here is the **cache key**, because a cached derived value has one
 failure mode and it is silent. What decides what a summary says is the prompt, whatever else the
@@ -4761,7 +4769,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first; an optional `as_of` when the provider served a copy it could not bring up to date (`#208 persistent-cache`) |
 | GET | `/api/v1/channels/{id}/messages/{message_id}?thread_id=` | read | one message in full; `thread_id` names the thread a reply is in, and without it a reply is still found in the thread this server knows it to be in — from the reads it holds, a pin or the bookmark — at the cost of one read of that thread (`#319 slack-reply-by-id`) |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message; a reply in a thread carries `thread_id`, as the entries of `/api/v1/activity` do |
-| GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
+| GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be; `409 summaries_off` while the owner's Summarize collapsed messages is off |
 | GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=&render=&reason=` | read | **one step of a walk**, saying that it is one; `render=html` adds each message's `content_html`, which the page asks for and the voice agent's `read_page` does not; optional `reason=` says what the read is for, for the access log and the upstream profile only (`remote-ops-audit`), as on the next two routes |
 | GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=&reason=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
 | GET | `/api/v1/channels/{id}/count?since=&hours=&cap=` | read | a bounded, honest count |

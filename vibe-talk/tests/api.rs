@@ -1251,6 +1251,24 @@ async fn every_rendered_message_carries_its_authors_snowflake() {
 
 // --- durable state -----------------------------------------------------------------------------
 
+/// Turn the owner's "Summarize collapsed messages" on through the settings route, as a page does:
+/// the summary route refuses while it is off. `#564 message-summary-toggle`.
+async fn summaries_on(harness: &Harness) {
+    let (status, _) = call(
+        harness,
+        "PUT",
+        "/api/v1/client-settings",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"set": [{
+            "key": vibe_talk::client_settings::SUMMARIZE_COLLAPSED_KEY,
+            "value": "1",
+            "updated_ms": 0,
+        }]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the summaries setting was not kept");
+}
+
 fn store_harness() -> (Harness, std::sync::Arc<vibe_talk::store::fake::FakeStore>) {
     let (state, discord, store, elevenlabs) = vibe_talk::testing::state_with_store_and_voice();
     (
@@ -1781,6 +1799,7 @@ async fn the_read_token_cannot_leave_a_row_in_the_store_through_the_summary_rout
     // durable write reachable from it is exactly what the two-token split exists to prevent.
     // Driven through the real router, because the property is about the credential on the wire.
     let (harness, store) = store_harness();
+    summaries_on(&harness).await;
     let channel = ChannelId(READ_CHANNEL.to_owned());
     harness.discord.seed(
         &channel,
@@ -3159,6 +3178,7 @@ async fn a_dismissal_that_names_both_ways_of_choosing_is_refused_rather_than_gue
 #[tokio::test]
 async fn the_other_messages_in_a_row_reach_the_summariser_through_the_route() {
     let harness = harness();
+    summaries_on(&harness).await;
     let channel = ChannelId(WRITE_CHANNEL.to_owned());
     // The configured threshold is 400 characters; this is comfortably under it on its own.
     let head = "the arm64 job never reported anything at all. ".repeat(6);
@@ -3211,6 +3231,7 @@ async fn the_other_messages_in_a_row_reach_the_summariser_through_the_route() {
 #[tokio::test]
 async fn an_empty_with_parameter_is_read_as_no_other_messages() {
     let harness = harness();
+    summaries_on(&harness).await;
     let channel = ChannelId(WRITE_CHANNEL.to_owned());
     let id = harness
         .discord
@@ -3233,6 +3254,139 @@ async fn an_empty_with_parameter_is_read_as_no_other_messages() {
     }
 }
 
+// --- `#564 message-summary-toggle`: no summary while the owner has them off ---------------------
+
+/// With "Summarize collapsed messages" off — never set, or set to anything but "1" — the route
+/// refuses with 409 `summaries_off` before the message is fetched or the summariser asked; turned
+/// on, the same request is summarised; turned off again, refused again.
+#[tokio::test]
+async fn a_summary_the_owner_has_switched_off_is_refused_before_anything_is_asked() {
+    let summarizer = Arc::new(vibe_talk::summarize::fake::FakeSummarizer::new());
+    let (state, discord, _store) = vibe_talk::testing::state_with_backend(
+        &vibe_talk::testing::config_toml(),
+        Arc::clone(&summarizer) as Arc<dyn vibe_talk::summarize::Summarizer>,
+    );
+    let harness = Harness {
+        router: router(state),
+        discord,
+        elevenlabs: None,
+    };
+    let id = harness
+        .discord
+        .seed(
+            &ChannelId(WRITE_CHANNEL.to_owned()),
+            "codex-eng",
+            &"the mac runner went offline mid-deploy and nothing reported. ".repeat(12),
+        )
+        .0;
+    let uri = format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{id}/summary");
+    let set = |value: Option<&str>| {
+        serde_json::json!({"set": [{
+            "key": vibe_talk::client_settings::SUMMARIZE_COLLAPSED_KEY,
+            "value": value,
+            "updated_ms": 0,
+        }]})
+    };
+
+    for token in [WRITE_TOKEN, READ_TOKEN] {
+        let (status, payload) = call(&harness, "GET", &uri, Some(token), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "never set is off: {payload}");
+        assert_eq!(payload["error"], "summaries_off", "{payload}");
+    }
+    let (status, _) = call(
+        &harness,
+        "PUT",
+        "/api/v1/client-settings",
+        Some(WRITE_TOKEN),
+        Some(set(Some("0"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, payload) = call(&harness, "GET", &uri, Some(WRITE_TOKEN), None).await;
+    assert_eq!(
+        (status, payload["error"].clone()),
+        (StatusCode::CONFLICT, "summaries_off".into())
+    );
+    assert_eq!(
+        summarizer.calls(),
+        0,
+        "a refused summary still asked the summariser"
+    );
+
+    let (status, _) = call(
+        &harness,
+        "PUT",
+        "/api/v1/client-settings",
+        Some(WRITE_TOKEN),
+        Some(set(Some("1"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, payload) = call(&harness, "GET", &uri, Some(WRITE_TOKEN), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "turned on, the summary is still refused: {payload}"
+    );
+    assert_eq!(payload["state"], "generated", "{payload}");
+    assert_eq!(summarizer.calls(), 1);
+
+    let (status, _) = call(
+        &harness,
+        "PUT",
+        "/api/v1/client-settings",
+        Some(WRITE_TOKEN),
+        Some(set(None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("{uri}?with="),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "forgotten, the setting is off again: {payload}"
+    );
+    assert_eq!(summarizer.calls(), 1);
+}
+
+/// With no store there are no synced settings: each device keeps its own, and the page alone
+/// decides whether to ask, as before the setting existed.
+#[tokio::test]
+async fn with_no_store_the_page_alone_decides_whether_to_summarise() {
+    let (state, discord) =
+        vibe_talk::testing::state_with(Arc::new(vibe_talk::store::disabled::DisabledStore));
+    let harness = Harness {
+        router: router(state),
+        discord,
+        elevenlabs: None,
+    };
+    let id = harness
+        .discord
+        .seed(
+            &ChannelId(WRITE_CHANNEL.to_owned()),
+            "codex-eng",
+            &"the mac runner went offline mid-deploy and nothing reported. ".repeat(12),
+        )
+        .0;
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{id}/summary"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["state"], "generated", "{payload}");
+}
+
 // --- what a failed summary looks like on the wire ------------------------------------------------
 //
 // The browser paints a row RED off exactly these two answers, so both the status and the machine
@@ -3252,6 +3406,7 @@ async fn a_summariser_that_fails_answers_503_with_a_machine_code_and_a_reason() 
         discord,
         elevenlabs: None,
     };
+    summaries_on(&harness).await;
     let id = harness
         .discord
         .seed(
@@ -3316,6 +3471,7 @@ async fn an_unconfigured_summariser_answers_503_and_names_the_setting_to_add() {
         discord,
         elevenlabs: None,
     };
+    summaries_on(&harness).await;
     let id = harness
         .discord
         .seed(
