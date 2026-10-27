@@ -41031,13 +41031,13 @@ function copyThroughTextarea(value) {
 // How far back the rest runs with no gaps is said by the search's own lines, which change as a walk
 // reads; this line holds still at the head of the list, where a change of height moves every row.
 function channelSummary(count, complete, label) {
-  const reach = complete === true ? historyReach() : null;
-  if (reach && reach.start && reach.topLevel && !reach.whole) {
+  const reach = historyReach();
+  if (complete === true && reach.start && reach.topLevel && !reach.whole) {
     const lacking = reach.threads - reach.full;
     return `${label} — back to the first message; ${lacking} thread${lacking === 1 ? " here has" : "s here have"} ` +
       "replies not loaded";
   }
-  if (!reach || !reach.whole) {
+  if (complete !== true || !reach.whole) {
     return `${label} — the most recent messages; older ones are not loaded`;
   }
   if (count === 0) {
