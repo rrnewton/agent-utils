@@ -1,12 +1,13 @@
 ---
 title: 'wrkviz-summarize-budget-plan: summarize never produces a partial tree silently'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - wrkviz
 created_at: 2026-10-27T01:57:17.193960959+00:00
-updated_at: 2026-10-27T01:57:17.193960959+00:00
+updated_at: 2026-10-27T02:53:03.219494670+00:00
+closed_at: 2026-10-27T02:53:03.219494561+00:00
 ---
 
 # Description
