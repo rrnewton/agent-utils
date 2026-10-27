@@ -147,19 +147,81 @@ elif [[ -e "$TARGET" || -e "$PROVENANCE" ]]; then
   cache_state="unverified"
 fi
 
+CACHEDIR_TAG_SIGNATURE="Signature: 8a477f597d28d172789f06886806bc55"
+
+target_root_is_tagged() {
+  local first_line=""
+  # Cargo also refuses a tag that is a symlink, even to a valid tag.
+  [[ -f "$TARGET_ROOT/CACHEDIR.TAG" && ! -L "$TARGET_ROOT/CACHEDIR.TAG" ]] || return 1
+  IFS= read -r first_line <"$TARGET_ROOT/CACHEDIR.TAG" || true
+  [[ "$first_line" == "$CACHEDIR_TAG_SIGNATURE"* ]]
+}
+
+target_root_cleanable() {
+  # `cargo clean --target-dir` refuses an existing directory without a valid CACHEDIR.TAG. Cargo
+  # tags only a target directory it creates itself, so rs/target lacks one when something else
+  # created it first, such as a nested `--target-dir rs/target/<name>`. A real directory at this
+  # checkout's rs/target is this launcher's own cache: tag it. Report anything else (a symlink to
+  # a directory shared with other checkouts, an unwritable rs/target root) as not cleanable.
+  local tag_tmp
+  [[ -e "$TARGET_ROOT" || -L "$TARGET_ROOT" ]] || return 0
+  target_root_is_tagged && return 0
+  [[ -d "$TARGET_ROOT" && ! -L "$TARGET_ROOT" ]] || return 1
+  tag_tmp="$(mktemp "$TARGET_ROOT/.CACHEDIR.TAG.XXXXXX" 2>/dev/null)" || return 1
+  if printf '%s\n%s\n%s\n' "$CACHEDIR_TAG_SIGNATURE" \
+      "# This file is a cache directory tag created by agent-utils rs/bin/cargo-runner." \
+      "# For information about cache directory tags see https://bford.info/cachedir/" \
+      >"$tag_tmp" && mv -f -T -- "$tag_tmp" "$TARGET_ROOT/CACHEDIR.TAG" 2>/dev/null; then
+    return 0
+  fi
+  rm -f -- "$tag_tmp"
+  return 1
+}
+
+remove_package_release_artifacts() {
+  # What `cargo clean --release --package` would remove, for a target root Cargo will not clean.
+  # Deleting the fingerprints is what forces the rebuild. A name prefix can also match a different
+  # package (agentctl-* matches agentctl-slack-plugin-*), which only costs that package a rebuild.
+  local name dir
+  local -a names=("$PACKAGE" "${PACKAGE//-/_}")
+  for name in "${PACKAGE_TOOLS[@]}"; do
+    names+=("$name" "${name//-/_}")
+  done
+  [[ -d "$TARGET_RELEASE" ]] || return 0
+  # The launcher lock covers only this checkout, and a linked target root can be shared. Like
+  # `cargo clean`, wait on Cargo's build-directory lock, which every running build holds shared.
+  (
+    flock 8
+    for dir in .fingerprint build deps incremental; do
+      for name in "${names[@]}"; do
+        rm -rf -- "$TARGET_RELEASE/$dir/$name"-* "$TARGET_RELEASE/$dir/lib$name"-*
+      done
+    done
+  ) 8>>"$TARGET_RELEASE/.cargo-lock"
+}
+
 force_refresh=0
 refresh_package() {
   # Cargo freshness is timestamp-based. A content-fingerprint change must force a clean rebuild:
   # an editor or archive can change bytes while preserving an older mtime.
+  local clean_output
   for package_tool in "${PACKAGE_TOOLS[@]}"; do
     rm -f -- "$TARGET_RELEASE/$package_tool" \
       "$TARGET_RELEASE/$package_tool.provenance"
   done
-  if ! run_cargo clean --quiet --release \
-      --manifest-path "$MANIFEST" --package "$PACKAGE" \
-      --target-dir "$TARGET_ROOT" --target "$HOST_TARGET"; then
-    echo "[$TOOL] Cargo clean failed; no cached Rust artifact was executed" >&2
-    exit 3
+  if target_root_cleanable; then
+    # Not --quiet: that also silences the reason Cargo refused. Keep the output for a failure.
+    if ! clean_output="$(run_cargo clean --release \
+        --manifest-path "$MANIFEST" --package "$PACKAGE" \
+        --target-dir "$TARGET_ROOT" --target "$HOST_TARGET" 2>&1)"; then
+      printf '%s\n' "$clean_output" >&2
+      echo "[$TOOL] Cargo clean failed; no cached Rust artifact was executed" >&2
+      exit 3
+    fi
+  else
+    echo "[$TOOL] $TARGET_ROOT has no CACHEDIR.TAG and is not a directory this launcher can tag;" \
+      "removing $PACKAGE release artifacts without cargo clean" >&2
+    remove_package_release_artifacts
   fi
   force_refresh=1
   before_binary=""

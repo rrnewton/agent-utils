@@ -569,3 +569,24 @@ def test_examples_harness_emits_a_verifiable_record(
         "01-linear-chain.json",
         "profile-smoke",
     }
+
+
+def test_run_cargo_tags_a_target_dir_parent_it_creates(tmp_path: Path) -> None:
+    """A nested target dir's new parent gets a CACHEDIR.TAG, so `cargo clean` accepts it later."""
+    created = tmp_path / "fresh" / "rs" / "target"
+    case_timings._tag_created_target_parent(
+        ["--release", "--target-dir", str(created / "validation-tests"), "-p", "x"]
+    )
+    assert (created / "CACHEDIR.TAG").read_text().startswith(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+    )
+    assert not (created / "validation-tests").exists()
+
+    joined = tmp_path / "joined" / "target"
+    case_timings._tag_created_target_parent([f"--target-dir={joined / 'validation-tests'}"])
+    assert (joined / "CACHEDIR.TAG").is_file()
+
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    case_timings._tag_created_target_parent(["--target-dir", str(existing / "validation-tests")])
+    assert list(existing.iterdir()) == []
