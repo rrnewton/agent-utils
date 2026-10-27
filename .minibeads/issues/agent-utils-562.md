@@ -155,3 +155,13 @@ after shard validation). Adversarial review found the precedence,
 symlinked-log, and corrupt-chain divergences; all fixed with
 differential cases. Gate 31 failed only on validation-graph (timeout
 under load), passed alone (42 passed).
+
+[muse watermelon] Slice 21 landed (2a033777): `wrkslotsd parse-journals`
+reproduces `_outstanding_journals` (control-dir journal files plus
+operations still pending in each machine's validated event history).
+Adversarial review found unvalidated EVENTS machine names and the
+bare `ACTIVE.journal` glob edge; both fixed with differential cases
+(8 passed). Gate 32 failures were load flakes only (cross-skip and
+validation-graph 113 passed together alone; wrkslots shards 488 + 488
+passed alone). Upstream vibe-talk commits shared no files; rebased and
+pushed without a second gate.
