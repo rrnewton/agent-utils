@@ -82,7 +82,9 @@ and, when present, the exclusion path validation (recovery target, fenced
 path, guard identity). The ownerless-agent/clone/cache and absent-row
 journal kinds remain unsupported.
 
-[muse watermelon] Slice 11 in progress: `parse-journal` also covers
+[muse watermelon] Slice 11 landed (0ae36782): `parse-journal` also covers
 recover-absent-validate-rows (journal identity, per-row record digest,
 and the exact derived ARCHIVED entry per row). The ownerless-agent,
 ownerless-clone, cache-relocate, and absent-agent-row kinds remain.
+
+[muse watermelon] Next: scope the ownerless-agent journal inputs (they mix directory-identity filesystem checks with shape).
