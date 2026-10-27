@@ -1,13 +1,14 @@
 ---
 title: 'cloud-read-failures: a read-aloud the voice service answers with silence or an error stops and says why, never reads on in silence'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - read-aloud
 created_at: 2026-10-26T19:58:57.752072313+00:00
-updated_at: 2026-10-26T19:58:57.752072313+00:00
+updated_at: 2026-10-27T01:06:40.526894054+00:00
+closed_at: 2026-10-27T01:06:40.526893984+00:00
 ---
 
 # Description

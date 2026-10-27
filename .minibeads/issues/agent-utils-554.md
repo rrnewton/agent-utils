@@ -1,13 +1,14 @@
 ---
 title: 'read-pause-reply-resume: Resume after pausing a read, replying and sending says nothing on the device voice'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - read-aloud
 created_at: 2026-10-26T19:48:06.883273655+00:00
-updated_at: 2026-10-26T19:48:06.883273655+00:00
+updated_at: 2026-10-27T01:06:40.526725650+00:00
+closed_at: 2026-10-27T01:06:40.526725520+00:00
 ---
 
 # Description
