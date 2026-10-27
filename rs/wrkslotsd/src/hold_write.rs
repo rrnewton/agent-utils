@@ -28,7 +28,7 @@ type Result<T> = std::result::Result<T, String>;
 /// Validate every machine's snapshot state the way the existing
 /// global-state validation does: duplicate slots and agents across
 /// machines, duplicate archived slots, and active/archived overlap.
-fn validate_global(root: Option<&Path>, cfg: &Cfg) -> Result<()> {
+pub(crate) fn validate_global(root: Option<&Path>, cfg: &Cfg) -> Result<()> {
     let mut slot_machine: Vec<(String, String)> = Vec::new();
     let mut agent_slot: Vec<(String, String)> = Vec::new();
     let mut archived: Vec<(String, String)> = Vec::new();
@@ -98,13 +98,13 @@ fn validate_global(root: Option<&Path>, cfg: &Cfg) -> Result<()> {
 
 /// Take the config-directory, global, and machine locks in the
 /// existing order, refusing a configuration changed while starting.
-struct MutationLocks {
+pub(crate) struct MutationLocks {
     _config: ConfigLock,
     _global: crate::ensure_states::Flock,
     _machine: crate::ensure_states::Flock,
 }
 
-fn acquire_mutation_locks(
+pub(crate) fn acquire_mutation_locks(
     root: Option<&Path>,
     machine_override: Option<&str>,
     cfg: &Cfg,
@@ -139,7 +139,7 @@ fn acquire_mutation_locks(
     })
 }
 
-fn refuse_target_storage(root: Option<&Path>, slot: &str) -> Result<()> {
+pub(crate) fn refuse_target_storage(root: Option<&Path>, slot: &str) -> Result<()> {
     for value in [parse_storage(root)?, parse_storage_git(root)?] {
         if let Some(findings) = value.get("findings").and_then(Value::as_array) {
             for finding in findings {
@@ -156,11 +156,11 @@ fn refuse_target_storage(root: Option<&Path>, slot: &str) -> Result<()> {
     Ok(())
 }
 
-struct ConfigLock {
+pub(crate) struct ConfigLock {
     _file: std::fs::File,
 }
 
-fn acquire_config_lock(cfg: &Cfg) -> Result<ConfigLock> {
+pub(crate) fn acquire_config_lock(cfg: &Cfg) -> Result<ConfigLock> {
     let file = std::fs::File::open(&cfg.root).map_err(|error| {
         format!(
             "cannot open configuration lock {}: {error}",
@@ -178,7 +178,12 @@ fn acquire_config_lock(cfg: &Cfg) -> Result<ConfigLock> {
 
 /// The current hold for one slot: replayed from the event log when the
 /// log derives the machine, else the snapshot HOLD record.
-fn current_hold(root: Option<&Path>, cfg: &Cfg, selected: &str, slot: &str) -> Result<Value> {
+pub(crate) fn current_hold(
+    root: Option<&Path>,
+    cfg: &Cfg,
+    selected: &str,
+    slot: &str,
+) -> Result<Value> {
     let directory = cfg.control.join(format!("EVENTS.{selected}"));
     match event_log_status(&directory) {
         EventLogStatus::Invalid(message) => return Err(message),
@@ -223,13 +228,10 @@ fn current_hold(root: Option<&Path>, cfg: &Cfg, selected: &str, slot: &str) -> R
     parse_hold(root, Some(selected), slot)
 }
 
-/// The active document for the selected machine: the snapshot shard,
-/// or the imported state when only the event log materializes it.
-fn active_document(root: Option<&Path>, cfg: &Cfg, selected: &str) -> Result<Value> {
-    let active_path = cfg.control.join(format!("ACTIVE.{selected}.json"));
-    if active_path.symlink_metadata().is_ok() {
-        return Ok(parse_state_ordered(root, Some(selected))?.0);
-    }
+/// The active document for the selected machine: the event fold
+/// when the log derives the machine (import plus
+/// `active-state-recorded` replacements), else the snapshot shard.
+pub(crate) fn active_document(root: Option<&Path>, cfg: &Cfg, selected: &str) -> Result<Value> {
     let directory = cfg.control.join(format!("EVENTS.{selected}"));
     if let EventLogStatus::Derived = event_log_status(&directory) {
         let events = load_event_chain(&directory, selected)?;
@@ -246,18 +248,69 @@ fn active_document(root: Option<&Path>, cfg: &Cfg, selected: &str) -> Result<Val
                 .and_then(|payload| payload.get("active"))
                 .cloned()
                 .ok_or_else(|| "state-imported event has no active state".to_string())?;
-            return crate::active_state::normalize_active_value(
+            let mut document = crate::active_state::normalize_active_value(
                 cfg,
                 &raw,
                 selected,
                 "state-imported event active",
-            );
+            )?;
+            for event in &events {
+                if event.get("kind").and_then(Value::as_str) != Some("active-state-recorded") {
+                    continue;
+                }
+                let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+                let slot = payload
+                    .get("slot")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mut slots: Vec<Value> = document
+                    .get("slots")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                match payload.get("record") {
+                    Some(Value::Null) | None => {
+                        slots.retain(|item| item.get("slot").and_then(Value::as_str) != Some(slot));
+                    }
+                    Some(record) => {
+                        if let Some(item) = slots
+                            .iter_mut()
+                            .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
+                        {
+                            *item = record.clone();
+                        } else {
+                            slots.push(record.clone());
+                        }
+                    }
+                }
+                if let Some(object) = document.as_object_mut() {
+                    object.insert("slots".to_string(), json!(slots));
+                    if let Some(revision) = payload.get("revision").cloned() {
+                        object.insert("revision".to_string(), revision);
+                    }
+                }
+            }
+            if let Some(object) = document.as_object_mut() {
+                if let Some(slots) = object.get_mut("slots").and_then(Value::as_array_mut) {
+                    slots.sort_by(|left, right| {
+                        left.get("slot")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .cmp(
+                                right
+                                    .get("slot")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            )
+                    });
+                }
+            }
+            return Ok(document);
         }
     }
     Ok(parse_state_ordered(root, Some(selected))?.0)
 }
 
-/// Hold the named slot for the given reason, printing the outcome.
 pub(crate) fn hold_slot(
     root: Option<&Path>,
     machine_override: Option<&str>,

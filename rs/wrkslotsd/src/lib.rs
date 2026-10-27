@@ -53,6 +53,7 @@ mod evidence;
 mod git_storage_state;
 mod global_state;
 mod handoff_state;
+mod heartbeat_write;
 mod hold_state;
 mod hold_write;
 mod index;

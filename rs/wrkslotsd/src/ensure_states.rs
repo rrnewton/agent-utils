@@ -335,6 +335,14 @@ pub(crate) fn require_fixture() -> Result<()> {
 /// Refuse when a partial atomic update is present in the control
 /// directory, matching the existing `_refuse_partial_state` scan.
 pub(crate) fn refuse_partial_state(control: &Path) -> Result<()> {
+    refuse_partial_state_inner(control, false)
+}
+
+pub(crate) fn refuse_partial_state_allow_seals(control: &Path) -> Result<()> {
+    refuse_partial_state_inner(control, true)
+}
+
+fn refuse_partial_state_inner(control: &Path, allow_validate_batch_seals: bool) -> Result<()> {
     let patterns: [(&str, &str); 7] = [
         ("ACTIVE.", ".json.tmp."),
         ("ARCHIVED.", ".json.tmp."),
@@ -407,6 +415,9 @@ pub(crate) fn refuse_partial_state(control: &Path) -> Result<()> {
             "partial atomic update found: {}; preserve it and use 'wrkslots recover'",
             first.display()
         ));
+    }
+    if allow_validate_batch_seals {
+        return Ok(());
     }
     let mut seals: Vec<PathBuf> = names
         .iter()

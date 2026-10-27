@@ -198,6 +198,26 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Refresh one slot's heartbeat for its exact owner (writer; fixture registries only until cutover)
+    Heartbeat {
+        /// Active slot name
+        slot: String,
+        /// Recorded agent name
+        #[arg(long, value_name = "NAME")]
+        agent: String,
+        /// Recorded live owner PID
+        #[arg(long, value_name = "PID")]
+        owner_pid: i64,
+        /// Current slot generation
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Bootstrap the selected machine's shard pair and event log (writer; fixture registries only until cutover)
     EnsureStates {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -540,6 +560,35 @@ pub fn run() -> u8 {
                 return 1;
             }
         },
+        Command::Heartbeat {
+            slot,
+            agent,
+            owner_pid,
+            expected_generation,
+            root,
+            machine,
+        } => {
+            match crate::heartbeat_write::heartbeat(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                &agent,
+                owner_pid,
+                expected_generation,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
         Command::EnsureStates { root, machine } => {
             match crate::ensure_states::ensure_states(root.as_deref(), machine.as_deref()) {
                 Ok(value) => {

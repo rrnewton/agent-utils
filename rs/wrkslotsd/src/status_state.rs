@@ -20,12 +20,12 @@ use crate::record_holds::load_record_holds;
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(PartialEq)]
-struct Identity {
-    pid: i64,
-    start_ticks: i64,
-    boot_id: String,
-    host_id: String,
-    cgroup_path: String,
+pub(crate) struct Identity {
+    pub(crate) pid: i64,
+    pub(crate) start_ticks: i64,
+    pub(crate) boot_id: String,
+    pub(crate) host_id: String,
+    pub(crate) cgroup_path: String,
 }
 
 fn host_id() -> std::result::Result<String, String> {
@@ -95,7 +95,7 @@ fn parse_proc_stat(raw: &[u8], pid: i64) -> Option<i64> {
     Some(start_ticks)
 }
 
-fn read_process_identity(pid: i64) -> std::result::Result<Identity, String> {
+pub(crate) fn read_process_identity(pid: i64) -> std::result::Result<Identity, String> {
     if pid <= 0 {
         return Err("owner PID must be positive".to_string());
     }
@@ -149,7 +149,7 @@ fn read_process_identity(pid: i64) -> std::result::Result<Identity, String> {
     })
 }
 
-fn process_state(identity: Option<&Identity>) -> (String, String) {
+pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
     let Some(identity) = identity else {
         return (
             "indeterminate".to_string(),
