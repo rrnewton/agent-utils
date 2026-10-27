@@ -50,6 +50,13 @@
 //! [`LiveHub`]: a channel-keyed publish/subscribe with a replay tail. The external adapter endpoint
 //! already publishes into it; a native Gateway implementation would do the same.
 //!
+//! **Reactions took that path first** (`#578 discord-live-reactions`). With `gateway_reactions`
+//! on, [`crate::discord::gateway`] holds a Gateway session with the two reaction intents only,
+//! none of them privileged, so it carries no message text and needs no `MESSAGE_CONTENT`. Each
+//! reaction event makes it read the one message again over REST and publish the copy with
+//! [`LiveHub::publish_update`], exactly as a reaction change the poller found is published. New
+//! messages still arrive by polling.
+//!
 //! ## What polling costs, stated plainly
 //!
 //! It multiplies this server's Discord request volume by one request per channel per interval,
@@ -460,6 +467,11 @@ pub struct LiveHub {
     /// [`LiveHub::reactions_changed`]. Taken only under the feed lock or on its own, never the
     /// other way round.
     reaction_memory: Mutex<BTreeMap<ChannelId, ReactionSets>>,
+    /// The channels whose reaction changes a connected Discord Gateway session is pushing
+    /// (`#578 discord-live-reactions`): the poller spends no reaction refresh on them while it
+    /// is. Set by the session's connection when it is ready, cleared by it the moment it ends,
+    /// and per channel when its re-reads keep failing.
+    reactions_pushed: Mutex<BTreeSet<ChannelId>>,
     /// Synced client settings changed by some page, for every other open page.
     /// `#457 settings-server-side`. Carried on the same streams as messages — a second
     /// connection per page is what `#226 page-energy-profile` keeps the page from
@@ -518,6 +530,7 @@ impl LiveHub {
             store: std::sync::OnceLock::new(),
             settings: settings_sender,
             reaction_memory: Mutex::new(BTreeMap::new()),
+            reactions_pushed: Mutex::new(BTreeSet::new()),
             updates: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -753,6 +766,25 @@ impl LiveHub {
             }
         }
         changed
+    }
+
+    /// Say whether a Gateway session is pushing `channels`' reaction changes. `#578
+    /// discord-live-reactions`. While it is, the poller's own reaction refresh skips them.
+    pub fn set_reactions_pushed(&self, channels: &[ChannelId], pushed: bool) {
+        let mut held = lock(&self.reactions_pushed);
+        for channel in channels {
+            if pushed {
+                held.insert(channel.clone());
+            } else {
+                held.remove(channel);
+            }
+        }
+    }
+
+    /// Whether a connected Gateway session is pushing `channel`'s reaction changes.
+    #[must_use]
+    pub fn reactions_pushed(&self, channel: &ChannelId) -> bool {
+        lock(&self.reactions_pushed).contains(channel)
     }
 
     /// Forget `id`'s reaction set: the message is gone, and a reused id must be learned afresh.
@@ -2275,7 +2307,9 @@ pub async fn poll_once(
         hub.publish_update_read(channel, message, read_start.clone());
         changed += 1;
     }
-    if !apart && hub.is_watched(channel) {
+    // `#578 discord-live-reactions`: a channel whose reaction changes a Gateway session is
+    // pushing needs no re-read to find them.
+    if !apart && hub.is_watched(channel) && !hub.reactions_pushed(channel) {
         match chat
             .fetch_recent(channel, limit.max(REACTION_REFRESH_MESSAGES))
             .await
@@ -3125,6 +3159,40 @@ mod tests {
                 .published,
             1,
             "what arrived during the failure must be published once it recovers, not skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_whose_reactions_a_gateway_pushes_pays_no_reaction_refresh() {
+        // `#578 discord-live-reactions`. Watched, so a tick would re-read its newest window for
+        // reaction changes; while a Gateway session pushes them it does not, and the moment the
+        // session drops it does again.
+        let channel = ChannelId("1111".to_owned());
+        let fake = fake_with(&channel);
+        let hub = hub_for(&channel);
+        fake.seed(&channel, "codex", "old");
+        let _receiver = hub.subscribe(&channel, None).receiver;
+        let mut cursor = None;
+        poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
+            .await
+            .expect("the seed reads");
+
+        hub.set_reactions_pushed(std::slice::from_ref(&channel), true);
+        let before = fake.fetch_count();
+        poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
+            .await
+            .expect("a tick reads");
+        assert_eq!(fake.fetch_count() - before, 1, "the walk only");
+
+        hub.set_reactions_pushed(std::slice::from_ref(&channel), false);
+        let before = fake.fetch_count();
+        poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
+            .await
+            .expect("a tick reads");
+        assert_eq!(
+            fake.fetch_count() - before,
+            2,
+            "the walk and the reaction refresh"
         );
     }
 

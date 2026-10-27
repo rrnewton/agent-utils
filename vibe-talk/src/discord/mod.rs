@@ -1,10 +1,13 @@
 //! Discord implementation of the provider-neutral chat interface.
 //!
-//! The Discord implementation reads recent messages and posts replies on demand. It has no
-//! Gateway connection or Discord webhook receiver; provider-neutral push ingestion, when a
-//! deployment enables it, enters through the separate adapter endpoint in [`crate::live`].
+//! The Discord implementation reads recent messages and posts replies on demand. Its one
+//! Gateway connection, off unless `gateway_reactions` is set, carries reaction changes only
+//! ([`gateway`], `#578 discord-live-reactions`); it has no Discord webhook receiver, and
+//! provider-neutral push ingestion, when a deployment enables it, enters through the separate
+//! adapter endpoint in [`crate::live`].
 
 pub mod fake;
+pub mod gateway;
 pub mod http;
 pub mod markup;
 pub mod ratelimit;

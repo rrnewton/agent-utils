@@ -165,6 +165,7 @@ fn discord_config(guild_id: Option<String>) -> DiscordConfig {
         head_reads: false,
         recent_many_reads: false,
         thread_reads: false,
+        gateway_reactions: false,
     }
 }
 

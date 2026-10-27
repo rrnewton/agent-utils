@@ -652,6 +652,33 @@ impl HttpDiscordClient {
         Ok(thread)
     }
 
+    /// The parent channel of the thread `id`, or `None` when `id` is a channel but not a thread.
+    /// `#578 discord-live-reactions`: a reaction event names the thread a reply lives in, never
+    /// the channel this server knows it by.
+    ///
+    /// # Errors
+    ///
+    /// The read's own: an id that is not a snowflake, a channel the bot cannot see, a failed
+    /// request.
+    pub(crate) async fn thread_parent(&self, id: &str) -> Result<Option<ChannelId>, ChatError> {
+        native_id(id)?;
+        let value = self.read_thread_json(&["channels", id], &[]).await?;
+        if !matches!(value.get("type").and_then(Value::as_u64), Some(10..=12)) {
+            return Ok(None);
+        }
+        Ok(Some(ChannelId(NativeThread::parse(&value)?.parent)))
+    }
+
+    /// `GET /gateway/bot`: the Gateway's address and how many sessions this token may still
+    /// start. `#578 discord-live-reactions`.
+    ///
+    /// # Errors
+    ///
+    /// The request's own.
+    pub(crate) async fn gateway_bot(&self) -> Result<Value, ChatError> {
+        self.read_thread_json(&["gateway", "bot"], &[]).await
+    }
+
     /// A missing native thread can be started only from a verified root in this parent.
     async fn thread_for_post(
         &self,

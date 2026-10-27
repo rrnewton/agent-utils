@@ -947,7 +947,14 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
-        reactions: parse_reactions(value.get("reactions")),
+        // `#578 discord-live-reactions`: Discord says whether the BOT reacted; whether the owner
+        // did is known only from the Gateway events this process has seen.
+        reactions: parse_reactions(value.get("reactions")).map(|mut reactions| {
+            if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+                super::gateway::mark_owner_reactions(id, &mut reactions);
+            }
+            reactions
+        }),
         heading: None,
         mentions: Vec::new(),
         upstream_url: None,
@@ -2048,6 +2055,7 @@ mod tests {
             head_reads: false,
             recent_many_reads: false,
             thread_reads: false,
+            gateway_reactions: false,
         }
     }
 

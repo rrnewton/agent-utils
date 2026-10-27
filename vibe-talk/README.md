@@ -2496,6 +2496,7 @@ model provider or a real gateway.
 | Count ceiling | `chat.max_count_scan` | — | how many messages a count may walk, default `500`; also accepted as `discord.max_count_scan` |
 | Provider request timeout | `discord.request_timeout_seconds` | — | seconds for one ordinary provider HTTP request, default `20`, range `1`–`120`; compatible bridges may need longer |
 | Live poll interval | `discord.live_poll_seconds` | `VIBE_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
+| Discord live reactions | `discord.gateway_reactions` | — | **off by default**; Discord itself only (`thread_api = "native"`, the default), refused otherwise. On, a Discord Gateway session with the two non-privileged reaction intents pushes each reaction change to open pages in well under a second — see [Discord live reactions over the Gateway](#discord-live-reactions-over-the-gateway) |
 | Live adapter token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; authenticates normalized event push, content-free change hints, and a provider's own stream records at `/api/v1/live/tail` ([Stream records](#stream-records)). Full events for a polled provider are refused with `409 channel_is_polled`; hints and stream records may safely coexist with polling, because a hint wakes the poller's own cursor and a record's message is published once between the record and the poller |
 | Relist interval | `ingest.relist_seconds` | — | optional; `0` (the default) or 30 to 86400 seconds. Each channel of a provider that takes stream records has its newest page and its recently active threads read again on this interval, and the edits and deletions found go out as live updates ([Stream records](#stream-records)) |
 | Relist threads | `ingest.relist_threads` | — | optional; default `4`, 0 to 16: the recently active threads of one channel each relist reads |
@@ -2610,7 +2611,7 @@ or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`
 `request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
 (default `0`, off; at least `5`), `channel_registration`, and `max_post_chars` / `max_post_bytes`
 (the most one message may hold; see the configuration table). Discord-protocol providers also take
-`thread_api`, `upstream_read_marks` and `markup`, and with `thread_api = "bridge"` also `recent_view`,
+`thread_api`, `upstream_read_marks`, `markup` and, Discord itself only, `gateway_reactions`, and with `thread_api = "bridge"` also `recent_view`,
 `recent_view_shadow`, `range_reads`, `id_reads`, `head_reads`, `recent_many_reads` and `thread_reads`, with the same meaning as in `[discord]`. Slack providers
 also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
@@ -5535,8 +5536,9 @@ message.
 
 ### Built-in Discord ingestion is bounded polling, not a Gateway connection
 
-Discord's real-time mechanism is the Gateway. **This server does not use it.** With
-`discord.live_poll_seconds` set, a background task reads each allowlisted channel on that interval
+Discord's real-time mechanism is the Gateway. **This server does not use it for messages.** (It
+does for reactions, when asked: see [Discord live reactions over the
+Gateway](#discord-live-reactions-over-the-gateway).) With `discord.live_poll_seconds` set, a background task reads each allowlisted channel on that interval
 and publishes whatever is newer than a per-channel snowflake cursor.
 
 That is deliberately the less capable option:
@@ -5559,7 +5561,7 @@ to tell which one is wrong.
 
 **A Gateway remains an upgrade path behind this same seam.** Everything above `src/live.rs` sees a
 `LiveHub` — a channel-keyed publish/subscribe with a bounded replay tail. External adapters already
-publish into it; a native Gateway implementation would do the same.
+publish into it; a native Gateway implementation would do the same, and for reactions one now does.
 
 Three rules in the loop are correctness, not tuning:
 
@@ -5601,6 +5603,81 @@ The loop waits the larger of its own doubling and that number, so the two are on
 scales rather than two rival opinions about when to come back. That is measured too: after a
 single failure the doubling alone says twenty seconds, which is not long enough for a limit that
 asked for forty-five.
+
+### Discord live reactions over the Gateway
+
+`#578 discord-live-reactions`. Without this, a reaction added in Discord reaches an open page only
+when something reads that message again: the page's own re-read, or, with `live_poll_seconds`
+set, the poller's re-read of a watched channel's newest window each tick. Older messages and
+thread replies outside that window wait for the next full read. With it, Discord **pushes** each
+reaction change and the page shows it in well under a second.
+
+```toml
+[discord]                       # or a [[providers]] entry with kind = "discord"
+gateway_reactions = true
+owner_user_id = "123456789012345678"   # optional: marks your own reactions as yours
+```
+
+What it does:
+
+* **One Gateway session per provider, with two intents and no others**:
+  `GUILD_MESSAGE_REACTIONS` (`1 << 10`) and `DIRECT_MESSAGE_REACTIONS` (`1 << 13`), 9216 together.
+  **Neither is privileged**, so there is nothing to switch on in the Developer Portal for this:
+  standard intents are simply asked for when the session identifies. No message text crosses this
+  connection; new messages, edits and deletions still arrive by polling or a push adapter.
+* **Each reaction event makes the server read that one message again** over REST
+  (`GET /channels/{channel}/messages/{message}`) and publish the copy as a live update, exactly as
+  a reaction change the poller found is published: same stream, same held window and message
+  cache. So the page gets Discord's authoritative counts, and a missed event cannot leave a count
+  drifting. `MESSAGE_REACTION_ADD`, `_REMOVE`, `_REMOVE_ALL` and `_REMOVE_EMOJI` are all handled.
+  Events for one message are gathered for 150 ms first, so a burst of reactions costs one read.
+  A read that fails is tried again after 1, 2, 4 and 8 seconds; if it still fails, the poller's
+  own reaction refresh looks after that channel until the next fresh session.
+* **Emoji map as they do on every read**: a standard emoji is itself, skin tone included; a custom
+  emoji is drawn as `:name:` and kept apart from another of the same name by its id.
+* **Your own reactions are marked as yours** when `owner_user_id` is set. Discord's REST copy says
+  only whether the *bot* reacted, so the mark comes from the events, which name the user. A
+  reaction you made before the server started is not known to be yours and is drawn as
+  anybody's until you react again, and so is every mark after a gap Discord could not replay.
+* **Threads**: an event names the thread a reply lives in; the thread's parent is read
+  (`GET /channels/{thread}`) and remembered, and the update goes to the parent channel's stream.
+  The re-read of a thread reply checks the thread again, as every thread read does, so it is two
+  requests rather than one.
+  An event in a channel that is neither configured nor a thread of one is ignored.
+* **Staying connected**: heartbeats as Discord asks; a dropped connection, a Reconnect, or any
+  close code Discord marks reconnectable **resumes** the session and Discord replays what was
+  missed. A session that cannot resume is started afresh, and then each watched channel's newest
+  window is read once and diffed, so a reaction made during the gap still arrives.
+* **The token is protected**: Discord resets the token of an application that starts more than
+  1000 sessions in a day. Every fresh session is preceded by `GET /gateway/bot`, whose
+  `session_start_limit` is obeyed; fresh sessions are at least five seconds apart, and a run of
+  short-lived ones backs off, doubling up to ten minutes.
+* **While the session is up, the poller stops re-reading those channels for reactions**; it starts
+  again the moment the session drops.
+* **It stops, and says so at ERROR, on the close codes Discord marks final**: 4004 (the token was
+  refused), 4010 to 4012 (shard or version), 4013 and 4014 (intents). Reactions then arrive by
+  polling only, as before.
+
+What to set up in Discord: nothing beyond what reading already needs. The bot permissions are
+**View Channels** and **Read Message History** in each configured channel (Discord delivers a
+channel's reaction events to a bot that can view it; the re-read needs history). A private
+thread's reactions reach the bot only when it is a member of that thread. Discord's own
+documentation of these intents and events: Gateway → *Gateway Intents*, and Gateway Events →
+*Message Reaction Add*.
+
+What it costs: one WebSocket connection; one REST read per reacted message per 150 ms window,
+two for a thread reply (the client obeys Discord's 429s like every other read); one
+`GET /gateway/bot` per fresh session; one read of each channel a reaction names that is not
+configured, once.
+
+Limits, stated plainly: the WebSocket is opened directly, never through an HTTP proxy (three
+fresh sessions in a row that cannot open it log one ERROR saying so); it speaks
+JSON without compression; and it is one shard, which is right for a bot in fewer than 2500 servers.
+**It has been tested against a fake Gateway and REST server only** (adds, removals, custom emoji,
+threads, a burst, resume, a session that cannot resume, an unacknowledged heartbeat, a 429, a
+refused token), not yet against live Discord. The startup log says `Discord live reactions are ON
+for this provider` and, once connected, `Discord Gateway session ready: reaction changes are
+pushed`.
 
 ### The page keeps the ElevenLabs conversation socket
 

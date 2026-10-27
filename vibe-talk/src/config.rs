@@ -795,6 +795,10 @@ pub struct DiscordConfig {
     /// yet (thread naming reads each thread at its own turn, `#286 naming-budget`), so on, it
     /// changes only what diagnostics say the bridge answers.
     pub thread_reads: bool,
+    /// Whether reaction changes are pushed over a Discord Gateway session rather than found by
+    /// reading again. `#578 discord-live-reactions`; see [`crate::discord::gateway`]. Discord
+    /// itself only (`thread_api = "native"`); off by default.
+    pub gateway_reactions: bool,
 }
 
 impl DiscordConfig {
@@ -1437,6 +1441,7 @@ struct FileDiscord {
     head_reads: Option<bool>,
     recent_many_reads: Option<bool>,
     thread_reads: Option<bool>,
+    gateway_reactions: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1478,6 +1483,8 @@ struct FileProvider {
     head_reads: Option<bool>,
     recent_many_reads: Option<bool>,
     thread_reads: Option<bool>,
+    // Discord itself only (`thread_api = "native"`).
+    gateway_reactions: Option<bool>,
     // Slack providers only.
     registered_channels_writable: Option<bool>,
     channel_discovery: Option<bool>,
@@ -3323,6 +3330,7 @@ fn legacy_discord_provider<'e>(
             || file.head_reads.is_some()
             || file.recent_many_reads.is_some()
             || file.thread_reads.is_some()
+            || file.gateway_reactions.is_some()
             || get(ENV_DISCORD_OWNER_USER_ID).is_some()
             || get(ENV_LIVE_POLL_SECONDS).is_some();
         if configures_a_provider {
@@ -3392,6 +3400,7 @@ fn legacy_discord_provider<'e>(
             recent_many: file.recent_many_reads,
             threads: file.thread_reads,
         },
+        file.gateway_reactions,
     )?;
     Ok(Some(ProviderConfig {
         key: LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
@@ -3419,6 +3428,7 @@ fn discord_protocol(
     post_size: PostSize,
     (recent_view, recent_view_shadow): (Option<RecentView>, Option<bool>),
     bridge_reads: BridgeReads,
+    gateway_reactions: Option<bool>,
 ) -> Result<DiscordConfig, ConfigError> {
     let BridgeReads {
         range: range_reads,
@@ -3515,6 +3525,17 @@ fn discord_protocol(
                 .to_owned(),
         });
     }
+    // `#578 discord-live-reactions`: the Gateway is Discord's own, and a bridge has none.
+    if gateway_reactions.is_some()
+        && thread_api.unwrap_or_default() != crate::threads::ThreadApi::Native
+    {
+        return Err(ConfigError::Invalid {
+            field: format!("{prefix}.gateway_reactions"),
+            detail: "applies only to Discord itself, with thread_api = \"native\" (the default): \
+                     it holds a Discord Gateway session"
+                .to_owned(),
+        });
+    }
     // `#408 copy-upstream-link`: a guild that is not a snowflake could only form links that open
     // nothing, so it is refused here rather than at every copy.
     let guild_id = guild_id
@@ -3549,6 +3570,7 @@ fn discord_protocol(
         head_reads: head_reads.unwrap_or(false),
         recent_many_reads: recent_many_reads.unwrap_or(false),
         thread_reads: thread_reads.unwrap_or(false),
+        gateway_reactions: gateway_reactions.unwrap_or(false),
     })
 }
 
@@ -3758,6 +3780,7 @@ fn provider_entry<'e>(
                     recent_many: entry.recent_many_reads,
                     threads: entry.thread_reads,
                 },
+                entry.gateway_reactions,
             )?)
         }
         "slack" => {
@@ -3784,6 +3807,9 @@ fn provider_entry<'e>(
             }
             if entry.thread_reads.is_some() {
                 return Err(refuse("thread_reads", "slack"));
+            }
+            if entry.gateway_reactions.is_some() {
+                return Err(refuse("gateway_reactions", "slack"));
             }
             if entry.upstream_read_marks.is_some() {
                 return Err(refuse("upstream_read_marks", "slack"));
@@ -6068,6 +6094,64 @@ provider = "slack"
             .iter()
             .any(|provider| matches!(&provider.kind, ProviderKind::Discord(d) if d.range_reads));
         assert!(on, "the gchat bridge reads by time");
+    }
+
+    /// `#578 discord-live-reactions`: reactions are pushed over the Gateway only when the operator
+    /// says so, and only Discord itself (`thread_api = "native"`) has a Gateway to push them.
+    #[test]
+    fn gateway_reactions_are_off_by_default_and_only_discord_itself_may_turn_them_on() {
+        let gateway = |text: &str| {
+            Config::from_toml_and_env(text, &env(&[]))
+                .expect("valid")
+                .discord()
+                .expect("discord provider")
+                .gateway_reactions
+        };
+        assert!(!gateway(FULL));
+        assert!(!gateway(
+            &FULL.replace("[discord]", "[discord]\ngateway_reactions = false")
+        ));
+        assert!(gateway(
+            &FULL.replace("[discord]", "[discord]\ngateway_reactions = true")
+        ));
+        assert!(gateway(&FULL.replace(
+            "[discord]",
+            "[discord]\nthread_api = \"native\"\ngateway_reactions = true"
+        )));
+
+        let refused = |text: &str, wanted: &str| match Config::from_toml_and_env(text, &env(&[])) {
+            Err(ConfigError::Invalid { field, .. }) => assert_eq!(field, wanted, "{text}"),
+            other => panic!("expected {wanted} to be refused, got {other:?}"),
+        };
+        refused(
+            &FULL.replace(
+                "[discord]",
+                "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9876\"\n\
+                 gateway_reactions = true",
+            ),
+            "discord.gateway_reactions",
+        );
+        refused(
+            &FULL.replace(
+                "[discord]",
+                "[discord]\nthread_api = \"off\"\ngateway_reactions = false",
+            ),
+            "discord.gateway_reactions",
+        );
+        refused(
+            &MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\ngateway_reactions = true",
+            ),
+            "providers.slack.gateway_reactions",
+        );
+        refused(
+            &MULTI.replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\ngateway_reactions = true",
+            ),
+            "providers.gchat.gateway_reactions",
+        );
     }
 
     /// remote-ops-audit W11 `#287 bulk-reads`: a bridge looks several messages up by id itself only
