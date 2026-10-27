@@ -409,6 +409,22 @@ CARD_AT_TAP_JS = """() => ({
 })"""
 
 
+def read_back_played(page: Page) -> None:
+    """Wait for the read-back itself, within the original 2.5-second playback budget.
+
+    A fixed sleep can end before routed audio has reached the page under boxed concurrency.
+    Keep the real completion and playback clocks in the precondition for the simulated yes.
+    """
+    page.wait_for_function(
+        """() => {
+            const end = spokenYes.completed.get(1);
+            return end && !end.interrupted && Date.now() >= end.playEnd
+                && session.audio.currentTime >= session.playAt;
+        }""",
+        timeout=2_500,
+    )
+
+
 def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
     """The call, the yes, the service's close, and a hang-up. Answers a line for the summary."""
     page.fill("#api-token", TOKEN)
@@ -442,7 +458,7 @@ def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
     voice.say(0, "assistant", 1, READ_BACK)
     voice.send(0, {"type": "turn_complete", "turn": 1})
     # Heard to the end: a second of audio, banked a quarter of a second ahead, has played.
-    page.wait_for_timeout(2500)
+    read_back_played(page)
 
     # 3. The bridge's order: a hypothesis of the answer, the reply with its audio, then the final.
     voice.say(0, "user", 2, "Yes", final=False)
@@ -519,7 +535,7 @@ def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
     voice.audio(2, 1.0)
     voice.say(2, "assistant", 1, LATE_READ_BACK)
     voice.send(2, {"type": "turn_complete", "turn": 1})
-    page.wait_for_timeout(2500)
+    read_back_played(page)
     api.propose(LATE_PROPOSAL)
     page.locator("#post-confirm").wait_for(state="visible", timeout=10_000)
     voice.say(2, "user", 2, "Yes.")
