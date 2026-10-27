@@ -1,13 +1,14 @@
 ---
 title: 'cache-full-history: the server gathers each channel''s whole history into its cache, and re-checks the recent part in tiers'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - cache
 created_at: 2026-10-27T20:55:54.699605677+00:00
-updated_at: 2026-10-27T20:55:54.699605677+00:00
+updated_at: 2026-10-27T22:16:39.477314384+00:00
+closed_at: 2026-10-27T22:16:39.477314204+00:00
 ---
 
 # Description
