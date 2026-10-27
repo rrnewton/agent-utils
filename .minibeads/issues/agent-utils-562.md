@@ -203,3 +203,9 @@ CPU timeouts across 13 steps); every failure passed alone
 lifecycle host shard 121, wrkslots 493+492, and all four vibe-talk
 browser checks). Upstream commits shared no files; rebased and
 pushed without a second gate.
+
+[muse watermelon] Slice 25 in progress: `wrkslotsd parse-storage-git`
+reproduces the Git half of `_registry_storage_inconsistencies`
+(repository evidence, worktree registration, checkout identity) with
+the same controlled Git invocation. Filesystem findings remain in
+`parse-storage` (slice 24).

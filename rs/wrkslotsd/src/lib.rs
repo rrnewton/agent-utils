@@ -49,6 +49,7 @@ mod config;
 mod config_validate;
 mod doctor_state;
 mod evidence;
+mod git_storage_state;
 mod global_state;
 mod handoff_state;
 mod hold_state;

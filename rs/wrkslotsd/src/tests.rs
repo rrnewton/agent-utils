@@ -5041,6 +5041,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "parse-states",
             "parse-status",
             "parse-storage",
+            "parse-storage-git",
             "parse-config",
             "parse-doctor",
             "parse-state",

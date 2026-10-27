@@ -41,7 +41,7 @@ fn note(
 }
 
 /// Format a filesystem name the way Python's `!r` formats a string.
-fn py_repr(value: &str) -> String {
+pub(crate) fn py_repr(value: &str) -> String {
     let quote = if value.contains('\'') && !value.contains('"') {
         '"'
     } else {
@@ -69,7 +69,7 @@ fn py_repr(value: &str) -> String {
     output
 }
 
-fn managed_root(cfg: &Cfg) -> PathBuf {
+pub(crate) fn managed_root(cfg: &Cfg) -> PathBuf {
     if cfg
         .worktrees
         .file_name()
@@ -84,7 +84,7 @@ fn managed_root(cfg: &Cfg) -> PathBuf {
     }
 }
 
-fn slot_root(cfg: &Cfg, slot_type: &str) -> PathBuf {
+pub(crate) fn slot_root(cfg: &Cfg, slot_type: &str) -> PathBuf {
     if slot_type == "validate" {
         managed_root(cfg).join("validate")
     } else {
@@ -92,7 +92,7 @@ fn slot_root(cfg: &Cfg, slot_type: &str) -> PathBuf {
     }
 }
 
-fn sort_key(value: &Value) -> (String, String, String, String, String) {
+pub(crate) fn storage_sort_key(value: &Value) -> (String, String, String, String, String) {
     let text = |key: &str| {
         value
             .get(key)
@@ -406,7 +406,7 @@ pub(crate) fn parse_storage(root: Option<&Path>) -> Result<Value> {
             ));
         }
     }
-    findings.sort_by_key(sort_key);
+    findings.sort_by_key(storage_sort_key);
     Ok(json!({
         "machines": machines,
         "findings": findings,

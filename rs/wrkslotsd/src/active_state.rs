@@ -824,9 +824,12 @@ fn path_is_within(candidate: &Path, parent: &Path) -> bool {
     candidate == parent || candidate.starts_with(parent)
 }
 
-fn stored_repository_reference(cfg: &Cfg, raw: &str) -> Result<()> {
+/// The normalized stored spelling, unresolved path, and allowed root
+/// for a stored repository reference, as the existing reference
+/// validation computes them.
+pub(crate) fn stored_repository_parts(cfg: &Cfg, raw: &str) -> Result<(String, PathBuf, PathBuf)> {
     let root_parent = cfg.root.parent().map(Path::to_path_buf).unwrap_or_default();
-    let (unresolved, allowed_root) = if raw.starts_with('/') {
+    let (stored, unresolved, allowed_root) = if raw.starts_with('/') {
         if raw != normpath_absolute(raw) {
             return Err(format!(
                 "stored absolute repository path is not canonical: {raw:?}"
@@ -842,7 +845,14 @@ fn stored_repository_reference(cfg: &Cfg, raw: &str) -> Result<()> {
                 "stored absolute repository path must name one direct sibling of the project root, not the project root or another external path: {raw:?}"
             ));
         }
-        (candidate, root_parent.clone())
+        let stored = format!(
+            "../{}",
+            candidate
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        (stored, candidate, root_parent.clone())
     } else {
         let parts: Vec<&str> = raw
             .split('/')
@@ -864,7 +874,15 @@ fn stored_repository_reference(cfg: &Cfg, raw: &str) -> Result<()> {
                     "stored repository path {raw:?} aliases the project root; use a path inside it instead"
                 ));
             }
-            (unresolved, root_parent.clone())
+            let stored = {
+                let joined = parts.join("/");
+                if raw == joined {
+                    raw.to_string()
+                } else {
+                    joined
+                }
+            };
+            (stored, unresolved, root_parent.clone())
         } else {
             let lexical = normpath(raw);
             let unresolved = if lexical == "." {
@@ -872,7 +890,7 @@ fn stored_repository_reference(cfg: &Cfg, raw: &str) -> Result<()> {
             } else {
                 cfg.root.join(&lexical)
             };
-            (unresolved, cfg.root.clone())
+            (lexical.to_string(), unresolved, cfg.root.clone())
         }
     };
     ensure_no_symlink_components(&allowed_root, &unresolved, "repository")?;
@@ -882,7 +900,11 @@ fn stored_repository_reference(cfg: &Cfg, raw: &str) -> Result<()> {
             unresolved.display()
         ));
     }
-    Ok(())
+    Ok((stored, unresolved, allowed_root))
+}
+
+fn stored_repository_reference(cfg: &Cfg, raw: &str) -> Result<()> {
+    stored_repository_parts(cfg, raw).map(|_| ())
 }
 
 fn assert_record_paths(cfg: &Cfg, record: &RecordRec) -> Result<()> {
