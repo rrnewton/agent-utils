@@ -112,4 +112,6 @@ complete journal coverage. After this, the remaining work toward a Rust
 wrkslots is composed read commands (list/status-style summaries over the
 validated formats), then writers.
 
-[muse watermelon] Next slice: `parse-states`, composing the ACTIVE/ARCHIVED shard readers with the partial-shard pairing rule from `_ensure_state_shard` (read-only; snapshot mode, no EVENTS derivation).
+[muse watermelon] Slice 17 in progress: `wrkslotsd parse-states` composes
+the ACTIVE/ARCHIVED readers with `_ensure_state_shard`'s partial-shard
+pairing rule (snapshot mode; EVENTS derivation stays with `rebuild`).
