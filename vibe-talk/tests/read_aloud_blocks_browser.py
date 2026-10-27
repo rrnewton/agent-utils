@@ -23,6 +23,13 @@ draws no strip — is paused and stopped from the bar, the mode never entered. (
 the window as the chips row grows, and the grip's keys in Help's list, are pinned in the fake-DOM
 suite, which can grow a row and read the list.)
 
+`scrubber-full-width`: on a phone (a coarse pointer) the strip of a read playing is a full-width row
+standing on the bottom row of the dock, the bar's second row and the chips gone and the list ending
+at the strip's top edge; held, the chips come back on the strip and the second row stays away; stopped,
+everything is back. Measured at 393x852 and 412x915, dark and light, with a screenshot of each state
+(`12-<width>-<scheme>-<state>.png`), and at 375x812. Through a jump the layout never drops. A desk's
+strip still stands on its chips row (`#433`).
+
 It serves the checked-out assets and a small fake API from one loopback origin. The fake voice
 behaves like the deployed one in the two ways the boundaries depend on: ONE session, so a block's
 audio cannot begin until the block before it has been generated, and audio at SPEAKING PACE, so
@@ -185,6 +192,47 @@ BAR_LAYOUT = """() => {
     stopWidth: box.width,
   };
 }"""
+
+
+# `scrubber-full-width`. What the phone's playback layout is made of: the strip's box, the bottom row's
+# top, whether the bar's second row and the chips are drawn, and the list's box.
+PHONE_LAYOUT = """() => {
+  const box = (id) => { const e = document.getElementById(id);
+    return e && e.getClientRects().length > 0 ? e.getBoundingClientRect() : null; };
+  const strip = box('read-steer');
+  const tools = document.getElementById('scroll-tools');
+  const bar = box('control-bar');
+  const area = box('scroll-area');
+  return {
+    state: document.documentElement.getAttribute('data-read-strip'),
+    width: document.documentElement.clientWidth,
+    strip: strip && { left: strip.left, right: strip.right, top: strip.top, bottom: strip.bottom, height: strip.height },
+    dockTop: box('dock').top,
+    paneTop: box('control-pane').top,
+    bar: bar !== null,
+    barHeight: bar ? bar.height : 0,
+    tools: getComputedStyle(tools).display !== 'none',
+    toolsBottom: tools.getBoundingClientRect().bottom,
+    areaBottom: area.bottom,
+    areaHeight: area.height,
+  };
+}"""
+
+
+class PhoneLayout(TypedDict):
+    """What `PHONE_LAYOUT` measures."""
+
+    state: str | None
+    width: float
+    strip: dict[str, float] | None
+    dockTop: float  # noqa: N815 - the page's own camelCase keys
+    paneTop: float  # noqa: N815
+    bar: bool
+    barHeight: float  # noqa: N815
+    tools: bool
+    toolsBottom: float  # noqa: N815
+    areaBottom: float  # noqa: N815
+    areaHeight: float  # noqa: N815
 
 
 class BarLayout(TypedDict):
@@ -652,6 +700,36 @@ def main() -> int:
                     " const t = document.getElementById('scroll-tools').getBoundingClientRect();"
                     " return t.top - s.bottom; }"))
 
+            def check_phone_layout(page: Page, where: str, state: str | None) -> PhoneLayout:
+                # `scrubber-full-width`. Playing: the strip edge to edge, standing on the dock (the bottom
+                # row's top, with the dock's border between), the second row and the chips gone, and the
+                # list ending at the strip's top edge. Held: the same, and the chips back, standing on the
+                # strip. Stopped: no strip, and the second row and the chips back.
+                layout: PhoneLayout = page.evaluate(PHONE_LAYOUT)
+                check(layout["state"] == state, f"the root says {layout['state']!r}, not {state!r}, at {where}")
+                strip = layout["strip"]
+                if state is None:
+                    check(strip is None, f"the strip outlived the read at {where}: {layout}")
+                    check(layout["bar"] and layout["tools"], f"the second row or the chips did not come back at {where}: {layout}")
+                    return layout
+                check(strip is not None, f"no strip drawn while the read is {state} at {where}")
+                assert strip is not None
+                check(strip["left"] <= 0.5 and strip["right"] >= layout["width"] - 0.5,
+                      f"the strip is not full width at {where}: {strip['left']:.1f} to {strip['right']:.1f} of {layout['width']}")
+                check(abs(strip["bottom"] - layout["dockTop"]) <= 1 and layout["paneTop"] - strip["bottom"] <= 2,
+                      f"the strip is not flush on the bottom row at {where}: its foot {strip['bottom']:.1f},"
+                      f" the dock's top {layout['dockTop']:.1f}, the bottom row's {layout['paneTop']:.1f}")
+                check(not layout["bar"], f"the bar's second row is drawn while the read is {state} at {where}")
+                check(layout["areaBottom"] <= strip["top"] + 0.5,
+                      f"the list runs {layout['areaBottom'] - strip['top']:.1f}px under the strip at {where}")
+                if state == "playing":
+                    check(not layout["tools"], f"the chips are drawn while the read plays at {where}")
+                else:
+                    check(layout["tools"], f"the chips did not come back with the read held at {where}")
+                    check(layout["toolsBottom"] <= strip["top"] + 0.5,
+                          f"the chips stand {layout['toolsBottom'] - strip['top']:.1f}px into the strip at {where}")
+                return layout
+
             def check_strip_order(page: Page, where: str, desk: bool = False) -> None:
                 # `#442 read-strip-order`, `#537`: Previous, k of n, Next and nothing else, in one line, the
                 # markup's order on screen. The grip that moves it is drawn on a desk only.
@@ -721,8 +799,7 @@ def main() -> int:
                 check(lit_element(page).startswith("p:Where the overnight run got to."),
                       f"the first block is not the one lit: {lit_element(page)!r}")
                 check(author_line(page) == "reading 1 of 7", f"the row does not count the read: {author_line(page)!r}")
-                gap412 = strip_gap(page)
-                check(abs(gap412) <= 2, f"the strip floats {gap412:.1f}px off the chips row at 412x915 (`#433`)")
+                check_phone_layout(page, "412x915", "playing")
                 shot("1-first-block")
 
                 # 1b. Inside it, the sentence being said is lit, each in turn. `#379`.
@@ -928,14 +1005,13 @@ def main() -> int:
                 check_mode_left(page, "the desk's bar")
                 context.close()
 
-            # 9. At 393x852: the strip still hugs the chips row (`#433`), and the bar's Read holds
-            # and resumes the read where it was held (`#434`), the strip having no Pause (`#537`).
+            # 9. At 393x852: the strip stands on the bottom row (`scrubber-full-width`), and the bar's
+            # Read holds and resumes the read where it was held (`#434`), the strip having no Pause (`#537`).
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                 context, page = open_page(profile, 393, 852, True)
                 press(page, f"{row} .body", True)
                 wait_position(page, "1 of 7")
-                gap393 = strip_gap(page)
-                check(abs(gap393) <= 2, f"the strip floats {gap393:.1f}px off the chips row at 393x852 (`#433`)")
+                check_phone_layout(page, "393x852", "playing")
                 check_strip_order(page, "393x852")
                 bar393 = check_bar_stop(page, "393x852")
                 if args.screenshots:
@@ -947,6 +1023,7 @@ def main() -> int:
                          "the Read button's Pause did not stop the audio clock at 393x852")
                 check(position(page) == "2 of 7", f"the pause moved the read to {position(page)}")
                 check(page.text_content("#read-aloud-label") == "Resume", "the held read does not offer Resume")
+                check_phone_layout(page, "393x852 held", "paused")
                 # The status pill stacks over the strip rather than under its top edge (`#433`).
                 page.evaluate("() => setStatus('held at the second block')")
                 pill_gap = float(page.evaluate(
@@ -974,15 +1051,14 @@ def main() -> int:
                 check_mode_left(page, "393x852's bar")
                 context.close()
 
-            # 10. At 375x812, the narrow phone: the strip's targets still stand in one line on the
-            # chips row, the bar has Pause and Stop side by side, the keyboard-up slim row keeps both
-            # (`#429`), and the bar's Stop leaves reading mode (`#442`).
+            # 10. At 375x812, the narrow phone: the strip's targets still stand in one line, on the
+            # bottom row (`scrubber-full-width`), the bar has Pause and Stop side by side, the keyboard-up
+            # slim row keeps both (`#429`), and the bar's Stop leaves reading mode (`#442`).
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                 context, page = open_page(profile, 375, 812, True)
                 press(page, f"{row} .body", True)
                 wait_position(page, "1 of 7")
-                gap375 = strip_gap(page)
-                check(abs(gap375) <= 2, f"the strip floats {gap375:.1f}px off the chips row at 375x812")
+                check_phone_layout(page, "375x812", "playing")
                 check_strip_order(page, "375x812")
                 # A long message's count is two digits a side; the line still holds it.
                 wide = float(page.evaluate(
@@ -1001,6 +1077,7 @@ def main() -> int:
                 page.evaluate("() => { delete document.documentElement.dataset.keyboard; }")
                 press(page, "#read-aloud-stop", True)
                 check_mode_left(page, "375x812's bar")
+                check_phone_layout(page, "375x812 stopped", None)
                 context.close()
 
             # 11. `#451`: on a desk, a one-block read started with s outside reading mode. It draws
@@ -1037,13 +1114,68 @@ def main() -> int:
                       "stopping the one-off read left reading mode on")
                 context.close()
 
+            # 12. `scrubber-full-width`, at the owner's phone sizes in both schemes: playing, held and
+            # stopped, each measured and photographed. The list gets the second row's room: what it
+            # loses to the strip it gains from the row, and nothing runs under the strip. Through Next
+            # the layout never drops (`renderReadSteer` holds the strip through the jump).
+            grown: list[str] = []
+            for width, height in ((393, 852), (412, 915)):
+                for scheme in ("dark", "light"):
+                    where = f"{width}x{height} {scheme}"
+                    with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                        context, page = open_page(profile, width, height, True, scheme)
+                        stopped_before = check_phone_layout(page, f"{where} before the read", None)
+                        page.evaluate(
+                            "() => { window.readStripStates = [];"
+                            " new MutationObserver(() => window.readStripStates.push("
+                            "document.documentElement.getAttribute('data-read-strip')))"
+                            ".observe(document.documentElement, { attributes: true, attributeFilter: ['data-read-strip'] }); }")
+                        press(page, f"{row} .body", True)
+                        wait_position(page, "1 of 7")
+                        time.sleep(0.3)
+                        playing = check_phone_layout(page, where, "playing")
+                        assert playing["strip"] is not None
+                        check(playing["areaHeight"] + playing["strip"]["height"]
+                              >= stopped_before["areaHeight"] + stopped_before["barHeight"] - 2,
+                              f"the second row's room did not go to the list at {where}: {stopped_before} then {playing}")
+                        grown.append(f"{where}: list {stopped_before['areaHeight']:.0f}px under a"
+                                     f" {stopped_before['barHeight']:.0f}px second row, {playing['areaHeight']:.0f}px"
+                                     f" over a {playing['strip']['height']:.0f}px strip")
+                        shot_name = f"12-{width}-{scheme}"
+                        if args.screenshots:
+                            page.screenshot(path=str(args.screenshots / f"{shot_name}-playing.png"))
+                        press(page, "#read-next", True)
+                        wait_position(page, "2 of 7")
+                        press(page, "#read-aloud", True)
+                        wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                                 f"the Read button's Pause did not hold the read at {where}")
+                        time.sleep(0.3)
+                        check_phone_layout(page, f"{where} held", "paused")
+                        if args.screenshots:
+                            page.screenshot(path=str(args.screenshots / f"{shot_name}-paused.png"))
+                        press(page, "#read-aloud", True)
+                        wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                                 f"the Read button's Resume did not resume the read at {where}")
+                        check_phone_layout(page, f"{where} resumed", "playing")
+                        press(page, "#read-aloud-stop", True)
+                        check_mode_left(page, f"{where}'s bar")
+                        time.sleep(0.3)
+                        check_phone_layout(page, f"{where} stopped", None)
+                        if args.screenshots:
+                            page.screenshot(path=str(args.screenshots / f"{shot_name}-stopped.png"))
+                        states = page.evaluate("() => window.readStripStates")
+                        check(isinstance(states, list) and None not in states[:-1] and states[-1] is None,
+                              f"the layout dropped before the read stopped at {where}: {states}")
+                        context.close()
+
         print(f"{browser_version}: 7 blocks walked at 412x915, 393x852, 375x812 and on a desk. Block boundaries, voice"
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
               f" (worst {worst}, the voice's waits {waits} ms); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
               f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms;"
               f" {underruns} underrun(s) inside a block, the host late with the audio."
-              f" The strip's gap over the chips row: {gap412:.1f}px at 412x915, {gap393:.1f}px at 393x852,"
-              f" {gap_desk:.1f}px on a desk, {gap375:.1f}px at 375x812. Strip order Previous, k of n, Next, no"
+              f" On a phone the strip stands full width on the bottom row, playing, held and stopped at 393x852 and"
+              f" 412x915 in both schemes ({'; '.join(grown)}); on a desk it stands on the chips row, {gap_desk:.1f}px"
+              " off it. Strip order Previous, k of n, Next, no"
               f" Pause or Stop, in one line at 393, 375 and on a desk; the bar's Pause and Stop {bar375['readWidth']:.0f}px and"
               f" {bar375['stopWidth']:.0f}px wide at 375 ({slim['readWidth']:.0f}/{slim['stopWidth']:.0f}px in the"
               f" keyboard-up row), {bar393['readWidth']:.0f}/{bar393['stopWidth']:.0f}px at 393,"

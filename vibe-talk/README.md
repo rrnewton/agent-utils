@@ -878,6 +878,13 @@ it covers by the grip at its left: drag it, or focus it and use the arrow keys (
 steps). It stays inside the window and is remembered on that device; a double-click on the grip, or
 Home, puts it back on the chips row. On a phone it stays docked.
 
+On a phone the strip of a read playing is a **full-width row on the dock**
+(`scrubber-full-width`): it stands directly on the bottom row (Pace, Stop, Pause), the list ends at its
+top edge, and the bar's second row (the gear, the pickers, the Voice/Channel switch) and the floating
+chips are hidden, so the list gets their room. Paused, the chips come back on the strip, and the
+second row stays hidden, so a pause or a resume never resizes the list or moves the strip. Stop, or
+the end of the read, brings everything back. A desk keeps the layout above.
+
 On the server, preparation first looks at messages fetched for the page in the last 30 seconds,
 kept in memory (`src/read_ahead.rs`, apart from the voice catch-up's windows in `src/recent.rs`).
 It fetches only what is missing:

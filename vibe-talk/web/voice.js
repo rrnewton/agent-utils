@@ -374,6 +374,9 @@ if (typeof window.ResizeObserver === "function") {
     const landed = currentScreen === "main" && currentView === "discord" && entryLandingHolds();
     const pinned = !landed && currentScreen === "main" && followsNewest(area);
     el("frame-body").style.setProperty("--read-steer-clearance", room);
+    // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
+    // row of its own over the dock, and the list ends at its top edge (`data-read-strip`).
+    el("frame-body").style.setProperty("--read-steer-height", `${height}px`);
     const screen = leftEl("screen-main");
     if (!screen.hidden) screen.style.setProperty("--read-steer-clearance", room);
     if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
@@ -38039,9 +38042,15 @@ function renderReadSteer() {
   if (!strip) return;
   const position = readingPosition();
   const wasHidden = strip.hidden;
-  strip.hidden = position === "";
+  // `scrubber-full-width`. A jump that waits for its block has nothing playing, and the strip
+  // stays up through the wait as it stood, as the bar keeps Pause and Stop (`#442`): on a phone it
+  // is a row of the layout, and going and coming back would resize the list and put the bar's
+  // second row and the chips back for the moment of every Next. `renderReadLayout` takes it away
+  // if the jump ends without a block playing.
+  const held = position === "" && !wasHidden && readJumpPending;
+  strip.hidden = position === "" && !held;
   renderReadTransport();
-  renderReadTimeline();
+  if (!held) renderReadTimeline();
   if (position === "") return;
   el("read-steer-count").textContent = position;
   el("read-next").disabled = nowPlaying.segment + 1 >= nowPlaying.segments.length;
@@ -38297,6 +38306,35 @@ function renderReadTransport() {
   // strip to stop it from.
   const stop = el("read-aloud-stop");
   if (stop && button) stop.hidden = button.hidden || !readInProgress();
+  renderReadLayout();
+}
+
+/**
+ * `scrubber-full-width`. The owner, 2026-10-27, of a phone: "I would like the scrubber bar to the
+ * full width and the flush with the top of the bottom row of the controls. Those other controls
+ * you don't need to access while we are in active playback mode." So while the strip is up the
+ * root says whether its read is `playing` or `paused` (`data-read-strip`; absent with no strip),
+ * and the stylesheet lays a phone out for it: the strip a full-width row on the dock, and the
+ * bar's second row and the chips gone while it plays.
+ *
+ * PAUSED IS NOT STOPPED. A pause brings the chips back, which float and move nothing, and keeps
+ * the rest: the second row coming back would resize the list and lift the strip on every pause and
+ * resume, and a pause is the moment the reader reaches for the strip or the row's Reply (the car
+ * view's "pause, dictate, reply, resume"). Stop, or the read's end, takes the strip away and puts
+ * everything back. A desk keeps its layout: nothing there reads this.
+ */
+function renderReadLayout() {
+  const strip = el("read-steer");
+  if (!strip) return;
+  // A strip held up through a jump (`renderReadSteer`) goes when the jump ends with nothing playing.
+  if (!strip.hidden && readingPosition() === "" && !readJumpPending) {
+    strip.hidden = true;
+    renderReadTimeline();
+  }
+  const root = document.documentElement;
+  if (strip.hidden) root.removeAttribute("data-read-strip");
+  // Held through a jump, it says what it said: a held read's jump cues its block up held.
+  else if (nowPlaying !== null) root.setAttribute("data-read-strip", readingPaused() ? "paused" : "playing");
 }
 
 /** A read is playing or held, or moving to another of its blocks (`readJumpPending`). */

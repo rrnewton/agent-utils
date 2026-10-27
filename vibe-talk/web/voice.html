@@ -975,6 +975,11 @@
             #screen-main exactly as the chips are: anchored to #frame-body instead, its measured
             hug was off by the send card's height whenever that card docked in the frame's third
             row, because the two bottoms it measured between were not the same edge.
+
+            `scrubber-full-width`: on a phone, while its read plays or is held, it is instead a
+            full-width row standing on the dock's bottom row, the list ending at its top edge and
+            the bar's second row and (while it plays) the chips hidden. See `renderReadLayout` in
+            web/voice.js and `data-read-strip` in web/voice.css.
           -->
           <div id="read-steer" role="group" aria-label="Reading position" hidden>
             <button id="read-steer-grip" type="button" aria-label="Move the reading controls"
