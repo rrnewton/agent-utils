@@ -216,8 +216,17 @@ inspectability; all fixed reusing the strict loader definitions
 shards 494 + 493 passed alone). Upstream agentctl commits shared no
 files; rebased and pushed without a second gate.
 
-[muse watermelon] Slice 26 in progress: `wrkslotsd ensure-states`,
+[muse watermelon] Slice 26 landed (5b22315e): `wrkslotsd ensure-states`,
 the first writer slice, reproduces `_ensure_state_shard` (shard-pair
 bootstrap plus `state-imported` event initialization) behind the
-registry locks with atomic writes. Differential-tested only on
-temporary fixture registries, never on a live registry.
+registry locks with atomic writes. The writer refuses unless
+WRKSLOTSD_FIXTURE_WRITER=1 attests a temporary registry; the live
+registry stays on the Python edition until an approved cutover.
+Adversarial review found the missing fixture guard, multi-import
+derived logs, Invalid event-log fall-through, 5s lock waits (Python
+fails immediately), non-ASCII JSON bytes, and event-dir mode churn;
+all fixed with new differential cases (11 passed). Gate 37's ten
+failures were one rustfmt fix plus load flakes (validation-graph 149,
+wrkslots shards 499 + 499, cross agentctl 777, five vibe-talk browser
+checks all passed alone). Upstream agentctl commit shared no files;
+rebased and pushed without a second gate.
