@@ -202,6 +202,10 @@ pub const PUSH_NEWS_MS: i64 = 2 * 60 * 1000;
 /// created: without this bound they would go out again as news. A record this late is left to
 /// the poller, whose walk publishes what it never saw.
 pub const PUSH_STALE_MS: i64 = 15 * 60 * 1000;
+/// How long a stream may send nothing before its next record is taken as the stream coming back,
+/// and its channels' hot walks are asked for (`#595 cache-full-history`). A quiet workspace and an
+/// adapter that lost its connection look the same from here; a quiet one costs a hot walk.
+pub const STREAM_SILENCE_MS: i64 = 30 * 60 * 1000;
 
 /// How many threads per channel the relist remembers as recently active. `#452
 /// slack-live-ingest`.
@@ -422,6 +426,12 @@ pub struct LiveHub {
     /// Channels whose next relist was asked for early: a stream that lost records. `#452
     /// slack-live-ingest`; see [`crate::relist`].
     relist_wanted: Mutex<BTreeSet<ChannelId>>,
+    /// Channels whose hot walk was asked for early: a stream that lost records, or came back
+    /// after a silence. `#595 cache-full-history`; see [`crate::backfill`].
+    rewalk_wanted: Mutex<BTreeSet<ChannelId>>,
+    /// When the last stream record of any kind arrived, local time: what tells a stream that came
+    /// back after a silence ([`LiveHub::note_stream_record`]).
+    last_stream_record_ms: Mutex<Option<i64>>,
     /// The threads each channel's stream recently pushed a reply in, newest last, with when.
     /// `#452 slack-live-ingest`: what the relist reads besides each channel's newest page.
     active_threads: Mutex<BTreeMap<ChannelId, VecDeque<(String, i64)>>>,
@@ -501,6 +511,8 @@ impl LiveHub {
             feeds: Mutex::new(BTreeMap::new()),
             seeded: Mutex::new(BTreeMap::new()),
             relist_wanted: Mutex::new(BTreeSet::new()),
+            rewalk_wanted: Mutex::new(BTreeSet::new()),
+            last_stream_record_ms: Mutex::new(None),
             active_threads: Mutex::new(BTreeMap::new()),
             all: Mutex::new(AllFeed {
                 sender: all_sender,
@@ -1112,6 +1124,29 @@ impl LiveHub {
     #[must_use]
     pub fn take_relist_requests(&self) -> BTreeSet<ChannelId> {
         std::mem::take(&mut *lock(&self.relist_wanted))
+    }
+
+    /// Ask for `channel`'s hot walk now rather than at its interval: the stream may have missed
+    /// something. `#595 cache-full-history`.
+    pub fn request_rewalk(&self, channel: &ChannelId) {
+        lock(&self.rewalk_wanted).insert(channel.clone());
+    }
+
+    /// Take every channel whose hot walk was asked for early.
+    #[must_use]
+    pub fn take_rewalk_requests(&self) -> BTreeSet<ChannelId> {
+        std::mem::take(&mut *lock(&self.rewalk_wanted))
+    }
+
+    /// Note that a stream record arrived at `now_ms`, and say whether it ends a silence of at least
+    /// [`STREAM_SILENCE_MS`]: the adapter may have reconnected, and what the stream carried while it
+    /// was away is not known. The first record since the server started ends none: the walks a
+    /// start begins cover what happened while the server was down. `#595 cache-full-history`.
+    pub fn note_stream_record(&self, now_ms: i64) -> bool {
+        let mut last = lock(&self.last_stream_record_ms);
+        let silent = last.is_some_and(|last| now_ms.saturating_sub(last) >= STREAM_SILENCE_MS);
+        *last = Some(now_ms);
+        silent
     }
 
     /// Remember that a reply was just pushed in `thread` of `channel`, at `now_ms`.

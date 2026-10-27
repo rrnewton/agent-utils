@@ -246,17 +246,19 @@ impl Lifecycle {
         };
         let open = sink.cache().filter(|cache| cache.is_open());
         let available = open.is_some();
-        let (bytes, counts, oldest) = match open {
+        let config = table.clone();
+        let (bytes, counts, oldest, history) = match open {
             Some(cache) => tokio::task::spawn_blocking(move || {
                 (
                     cache.bytes_on_disk(),
                     cache.counts().served().unwrap_or_default(),
                     cache.oldest_covered().served().flatten(),
+                    Some(crate::backfill::history_of(&config, &cache).summary()),
                 )
             })
             .await
             .unwrap_or_default(),
-            None => (0, Counts::default(), None),
+            None => (0, Counts::default(), None, None),
         };
         let status = MessageCacheStatus {
             available,
@@ -268,6 +270,7 @@ impl Lifecycle {
             oldest_covered: oldest.map(crate::clock::iso_from_ms),
             max_days: table.max_days,
             max_megabytes: table.max_megabytes,
+            history,
         };
         let mut memo = self.memo();
         if memo.round == round {

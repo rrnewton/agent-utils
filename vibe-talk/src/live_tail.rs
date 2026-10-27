@@ -104,6 +104,19 @@ pub async fn ingest(
     record: TailRecord,
     now_ms: i64,
 ) -> Result<TailOutcome, ChatError> {
+    // `#595 cache-full-history`. A stream that comes back after a silence may have missed
+    // anything while it was away: its channels' hot walks read what it did not carry.
+    if state.live.note_stream_record(now_ms) {
+        let channels = channels_of(state, None);
+        for (channel, _) in &channels {
+            state.live.request_rewalk(&channel.id);
+        }
+        tracing::info!(
+            channels = channels.len(),
+            "the provider's event stream is back after a silence; re-reading its channels' recent \
+             history"
+        );
+    }
     match record {
         TailRecord::Control => Ok(TailOutcome::Ignored),
         TailRecord::Other { sequence, why } => {
@@ -118,6 +131,7 @@ pub async fn ingest(
             for (channel, _) in &channels {
                 wake(state, &channel.id);
                 state.live.request_relist(&channel.id);
+                state.live.request_rewalk(&channel.id);
             }
             tracing::warn!(
                 channels = channels.len(),

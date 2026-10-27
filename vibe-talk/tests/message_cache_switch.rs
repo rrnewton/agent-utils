@@ -771,6 +771,12 @@ async fn client_config_carries_the_status_only_with_a_table_in_numbers_and_never
     );
     // Rows with no proof of a whole listing cover nothing.
     assert!(status.get("oldest_covered").is_none(), "{status}");
+    // `#595 cache-full-history`: how much history it gathers, in counts and words.
+    assert_eq!(
+        status["history"],
+        json!({"mode": "recent", "channels": 1, "complete": 0}),
+        "{status}"
+    );
     // Numbers, booleans and codes: nothing that names a file, a channel or a message.
     let text = status.to_string();
     for leak in [
@@ -792,7 +798,8 @@ async fn client_config_carries_the_status_only_with_a_table_in_numbers_and_never
             "channels",
             "oldest_covered",
             "max_days",
-            "max_megabytes"
+            "max_megabytes",
+            "history"
         ]
         .contains(&name.as_str())),
         "{fields:?}"

@@ -195,11 +195,44 @@ ALTER TABLE scope_head ADD COLUMN checked_from_ms INTEGER;
 ALTER TABLE message_scope ADD COLUMN vouched_ms INTEGER;
 ";
 
+/// Cache schema 4: where the full-history walk of each channel stands, so that a restart resumes
+/// it rather than starting again from the newest page (`#595 cache-full-history`).
+///
+/// - `backfill.cursor`: the provider's own continuation the walk reads next; `NULL` once the walk
+///   has reached the channel's beginning.
+/// - `backfill.below_ms`: provider time of the oldest message the walk has proven so far.
+/// - `cycle_started_ms`, `cycle_pages`, `cycle_gaps`: when the walk now under way began (local
+///   time), how many of the channel's pages it has read, and how many of its reads proved nothing
+///   or were given up (a page from an older copy or with a notice, a thread that kept failing, a
+///   continuation that did not move): a walk with any reaches the beginning without making the
+///   channel complete.
+/// - `complete_ms`, `complete_started_ms`, `complete_pages`: when the latest walk that reached the
+///   channel's beginning ended and began (local time), and how many pages it read; `NULL` before
+///   any has.
+///
+/// Its compat is 3: code of schema 3 ignores the table, and an erase of a channel there takes its
+/// row with it, by its foreign key.
+const V4: &str = "
+CREATE TABLE backfill (
+    chan                INTEGER PRIMARY KEY REFERENCES channel (chan) ON DELETE CASCADE,
+    cursor              TEXT,
+    below_ms            INTEGER NOT NULL,
+    cycle_started_ms    INTEGER NOT NULL,
+    cycle_pages         INTEGER NOT NULL,
+    cycle_gaps          INTEGER NOT NULL DEFAULT 0,
+    complete_ms         INTEGER,
+    complete_started_ms INTEGER,
+    complete_pages      INTEGER,
+    updated_ms          INTEGER NOT NULL
+) STRICT;
+";
+
 /// Every step this code knows, in order. Step `n` (from 1) brings a file to `user_version = n`.
 pub const STEPS: &[Step] = &[
     Step { sql: V1, compat: 1 },
     Step { sql: V2, compat: 2 },
     Step { sql: V3, compat: 3 },
+    Step { sql: V4, compat: 3 },
 ];
 
 /// Why a file cannot be used.
@@ -540,7 +573,7 @@ mod tests {
             .expect("query")
             .collect::<Result<_, _>>()
             .expect("rows");
-        assert_eq!(tables.len(), 9, "{tables:?}");
+        assert_eq!(tables.len(), 10, "{tables:?}");
         for (name, strict) in tables {
             assert_eq!(strict, 1, "{name} is not STRICT");
         }

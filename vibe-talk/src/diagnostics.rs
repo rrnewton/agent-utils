@@ -173,6 +173,12 @@ pub struct DiagnosticsReport {
     /// table. `#208 persistent-cache`; see [`crate::cache::sink::Sink::report`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_cache: Option<crate::cache::sink::CacheReport>,
+    /// How the backfill stands: the mode and its intervals, and for each cached channel (by label
+    /// and id, as the channel checks name it) what the cache holds, whether its whole history is
+    /// held, and how far and how fast the full walk has gone. Absent with no `[message_cache]`
+    /// table or no file open. `#595 cache-full-history`; see [`crate::backfill::history`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_history: Option<crate::backfill::HistoryReport>,
 }
 
 /// Redact every secret this deployment holds out of a string.
@@ -385,6 +391,13 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         // Read after the checks, so the calls this report just made are counted too.
         upstream: upstream(state),
         message_cache: state.message_cache.report().await,
+        cache_history: {
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || crate::backfill::history(&state))
+                .await
+                .ok()
+                .flatten()
+        },
     }
 }
 

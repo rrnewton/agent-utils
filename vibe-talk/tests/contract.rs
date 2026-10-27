@@ -15,12 +15,13 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, ClientConfigResponse, ClientSettings, CommittedPostResponse,
-    LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheRequest,
-    MessageCacheStatus, MessagesResponse, NoiseRules, PendingPost, PendingPostResponse,
-    PinChangeResponse, PinsResponse, ProposalSettled, ProviderDescription, ReplayUnavailable,
-    ReplyDismissals, TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
-    UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
+    LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheHistory,
+    MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules, PendingPost,
+    PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled, ProviderDescription,
+    ReplayUnavailable, ReplyDismissals, TimelineResponse, TokenScope, TranscriptRole,
+    UpstreamClearAttemptView, UpstreamClearNowOutcome, UpstreamClearNowResponse,
+    UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame, VoicePostPrefix,
+    VoicePromptSettings, VoiceSend, VoiceSettings,
 };
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
@@ -340,6 +341,14 @@ fn message_cache_status(open: bool) -> MessageCacheStatus {
         oldest_covered: open.then(|| "2026-10-01T00:00:00Z".into()),
         max_days: 14,
         max_megabytes: 256,
+        // `#595 cache-full-history`: a full walk under way, one channel already whole.
+        history: open.then(|| MessageCacheHistory {
+            mode: "full",
+            channels: 3,
+            complete: 1,
+            reached: Some("2025-03-02T10:00:00Z".into()),
+            paused: None,
+        }),
     }
 }
 

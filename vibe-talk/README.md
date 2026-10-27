@@ -2564,7 +2564,7 @@ model provider or a real gateway.
 | Speech hold cap | `conversation.speech_hold_cap_seconds` | — (file only) | default `20`, at most `60`; the longest one page message waits for your speech; `0` turns the hold off |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
 | Config overlays | — | `VIBE_TALK_CONFIG_OVERLAY` | or `--config-overlay`, repeatable; TOML laid over the config file table by table, see [One config file, two hosts](#one-config-file-two-hosts) |
-| Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see; reads are answered from it only with `serve = true`** (`#208 persistent-cache`, `#384 cache-serve`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `serve` (default `false`: answer a newest timeline page and a fresh newest window from the cache at once, refreshing from the provider in the background; needs `enabled = true`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default: walk each cached channel's newest pages back into the cache while its provider is otherwise idle, see [The backfill](#the-backfill); or `off`), `timeline_fallback_ms` (default `10000`, 1000 to 60000; no effect yet), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false`. Turning it on, the preflight, rollback and what erases it: see [The message cache](#the-message-cache) |
+| Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see; reads are answered from it only with `serve = true`** (`#208 persistent-cache`, `#384 cache-serve`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `serve` (default `false`: answer a newest timeline page and a fresh newest window from the cache at once, refreshing from the provider in the background; needs `enabled = true`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (chosen at setup, see [The backfill](#the-backfill): `recent`, the default, `adaptive` being its earlier name, keeps each cached channel's last `recent_days` read and re-read while its provider is otherwise idle; `full` does that and gathers each channel's whole history, walked again every `full_cycle_hours`, with no age limit unless `max_days` is given, then 1 to 36500, and `max_megabytes` up to 16384; or `off`), `recent_days` (default `14`, 1 to 365), `rewalk_hot_hours` (default `24`, 1 to 168) and `rewalk_hot_minutes` (default `60`, 5 to 1440): the hot walk's stretch and interval, `rewalk_recent_hours` (default `24`, 1 to 168): the recent walk's interval, `full_reads_per_minute` (default `6`, 1 to 50, each provider) and `full_cycle_hours` (default `72`, 24 to 144), `timeline_fallback_ms` (default `10000`, 1000 to 60000; no effect yet), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false`. Turning it on, the preflight, rollback and what erases it: see [The message cache](#the-message-cache) |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
@@ -4188,6 +4188,24 @@ are in this section below and in detail in the design note for `#384 cache-serve
    `max_days = 14`, rather than the default 90, keeps less while it is unknown how long the
    provider keeps each conversation. A conversation kept upstream for a day gets its own entry:
    `[[message_cache.channel]]` with `id` and `max_days = 1`.
+
+   **Then choose how much history the server gathers** (`#595 cache-full-history`, see [The
+   backfill](#the-backfill)): leave `backfill` out for the recent days alone, or gather every
+   channel's whole history so that the server's search becomes complete:
+
+   ```toml
+   [message_cache]
+   enabled = true
+   backfill = "full"          # no max_days: every day is kept
+   max_megabytes = 2048       # about 8.4 KB a message, with room to spare
+   path = "/srv/vibe-talk-cache/vibe-talk.message-cache-web1.sqlite3"
+   ```
+
+   `vibe-talk cache-stats PATH` measures what a cache file holds, read-only and beside a running
+   server: its bytes on disk, per table and index and per message, and for each channel its
+   messages, replies, threads, text bytes, the span of days held and where its full walk stands.
+   It prints channel ids and numbers, never message text, and needs no `sqlite3` on the host
+   (whose own may be too old for the file's `STRICT` tables).
 4. **Restart, and read the startup line:** `the message cache is open; it is filled from what
    write-scope and server-owned reads see`, with the path, `max_days`, `max_megabytes` and
    `serve` (whether reads are answered from it: `false` unless the table says `serve = true`).
@@ -4578,33 +4596,114 @@ a slow timeline read is not waited out at all, it is the refresh behind an answe
 
 ### The backfill
 
-`#453 cache-backfill`. With `backfill = "adaptive"` (the default) and a cache open, the server
-walks each cached channel's own timeline from its newest page back through older ones, offering
-each page to the cache under the backfill's own grant, until the provider says nothing is older,
-the pages reach `max_days`, or 20 pages have been read; the whole walk is then offered as one
-listing of the channel's own timeline as of when it began, which is what proves the span its older
-pages cover (a walk with any page from an older copy, or with a notice, offers its rows only). It
-walks again every six hours, which also
-keeps what it holds revalidated. It begins no walk until the channel's provider has said which
-account it is and the file agrees, and a walk that loses that check part way (a suspension, an
-erase of the file) starts over from its newest page, as does a walk, over or not, whose channel,
-provider or file has been erased since it began: a walk begun before the check, or before such an
-erase, would write nothing, and prove nothing, and the next would not come for six hours (`#502
-cache-serve-coverage`). A provider whose account is never checked holds back no other provider's
-walks. For the same reason the live poller and the relist wait for every
-provider's check, up to 15 seconds, before their first read. It reads one page at a time, at least a second apart, and only
-while the provider has had nothing else running for two seconds: a page, the poller and a voice
-call always go first. Its reads are counted under the read reason `backfill`. `backfill = "off"`
-makes none.
+`#453 cache-backfill`, `#595 cache-full-history`. The server's own reads of each cached channel's
+history: what fills the cache beyond what readers happened to read, and what keeps what it holds
+true.
 
-What it does and does not buy, measured on the loopback Slack fake
-(`tests/slack_live_ingest.rs`, module `measure`, ten rounds of "a message arrives through the stream, then a
-reader asks for the newest Main page"): the shadow counted the newest page servable 0 of 10 times
-filled only by reads and pushes, 0 of 10 with the backfill alone, and 10 of 10, all agreeing with
-upstream, once the relist ([Stream records](#stream-records)) read the newest page after each
-arrival. Every fill-only miss was a `gap`: the pushed row sat above the head the last read listed,
-held only as the push brought it. The newest page needs the relist; the backfill gives the older
-history depth a step back into the past, a count, or a summary reads.
+**What the re-reading is for.** A provider's event stream carries new messages as they are
+written. It does not carry edits, deletions, or other bots' posts, and while an adapter is
+reconnecting, or the server is down, it carries nothing at all. The relist ([Stream
+records](#stream-records)) reads each channel's newest page every `[ingest] relist_seconds`, which
+catches what changes at the newest end. An edit of yesterday's message, a deletion last week, or a
+post the stream missed while it was away is found only by reading those older pages again. And the
+cache must find it: a held row that no read aware of edits and deletions has seen within a week is
+erased (see "Deletions and edits"), so that a message deleted upstream never outlives its deletion
+here by more than a week.
+
+**The choice made at setup.** `[message_cache] backfill` says how far back the server gathers each
+channel's history:
+
+| `backfill` | What the server reads | When to choose it |
+|---|---|---|
+| `recent` (the default; `adaptive` is its earlier name) | The last `recent_days` (by default `max_days`, as far back as before) of each cached channel, re-read in tiers. | A server whose readers look at the last days, as before. |
+| `full` | The same, and each channel's **whole history**, walked back to its beginning at a steady pace, resuming after a restart, and walked again every `full_cycle_hours` (72). | A new server for a workspace that has been running for months, whose search should find anything ever said in its channels. |
+| `off` | Nothing; the cache holds only what readers' reads brought. | |
+
+**The tiers.** Each walk reads one cached channel's own timeline from its newest page back through
+older ones, offering each page to the cache under the backfill's own grant, until the provider says
+nothing is older, the pages reach the walk's floor, or 20 pages have been read. The whole walk is
+then offered as one listing of the channel's own timeline as of when it began, which is what proves
+the span its older pages cover (a walk with any page from an older copy, or with a notice, offers its
+rows only).
+
+* **The hot walk** re-reads the last `rewalk_hot_hours` (24) every `rewalk_hot_minutes` (60). It
+  also runs at once for every channel a stream feeds when the stream says it lost records, and when
+  a stream record arrives after 30 minutes with none: the adapter may have reconnected, and a quiet
+  workspace and a lost connection look the same from here, so a quiet spell costs one hot walk.
+  The silence is counted over every stream the server is sent, not per adapter: with two adapters,
+  one that goes quiet while the other is busy is not noticed.
+* **The recent walk** re-reads the last `recent_days` every `rewalk_recent_hours` (24), and when
+  the server starts, which covers whatever happened while it was down. `recent_days` defaults to
+  `max_days`, so the recent walk reaches as far back as the single walk it replaced; under `full`
+  it defaults to 14, the full walk reading everything older. A recent walk counts as a hot walk
+  too.
+
+It reads one page at a time, at least a second apart, and only while the provider has had nothing
+else running for two seconds: a page, the poller and a voice call always go first. Its reads are
+counted under the read reason `backfill`.
+
+What the tiers cost, measured on the loopback Slack fake (`tests/slack_live_ingest.rs`,
+`measure_backfill_reads_a_day_before_and_after_the_tiers`: a day of a channel that already holds 30
+days, with `max_days = 14`, pages of 50, the walk a start makes left out), against the single walk
+they replaced (back to `max_days`, at most 20 pages, every six hours):
+
+| Channel | Before: 14 days every 6 h | After: 24 h hourly, 14 days daily |
+|---|---|---|
+| busy, a message every 5 minutes | 80 pages a day (240 calls of 20 rows) | 158 pages a day (474 calls) |
+| quiet, a message every 2 hours | 16 pages a day (48 calls) | 27 pages a day (81 calls) |
+
+So the tiers roughly double the backfill's reads, and in return the last day is checked every hour
+rather than every six. `rewalk_hot_minutes = 360` and `rewalk_recent_hours = 6` give the old single
+walk back.
+
+**The full walk** (`backfill = "full"`) reads each channel back to its beginning: its newest page,
+then one step back at a time with the provider's own continuation, each page offered as a listing
+of the stretch between its oldest message and the step before it, so that the walk proves its span
+page by page. Each thread a page shows with replies is read whole, page by page, before the walk
+steps back again; a thread whose read fails three times is left for the next walk, and that walk
+does not make the channel complete. Where the walk
+stands is kept in the cache file, and a restart resumes it there as long as the cache still holds
+the stretch it stopped at (an erase of the channel, eviction, or a stop of more than a week takes
+that away, and the walk starts again from the newest page), and the provider still takes the
+continuation: one that fails twice in a row (a Discord cursor lives five minutes and not across a
+restart) starts the walk again from the newest page. A provider's full walk stays on one channel
+until that walk is over, so its continuations are used while they are fresh. Its pace is at most
+`full_reads_per_minute` (6) reads a minute of each provider, its threads' reads included, only
+while the provider is otherwise idle. The pace counts this server's reads, not the provider's
+calls: a read of a Slack channel's history is usually one call of `conversations.history` and a
+thread's one of `conversations.replies`, which keeps 6 a minute well inside Slack's tier 3 (about 50
+calls a minute) and Discord's per-route buckets, but a page made mostly of system events, or a
+thread of hundreds of replies, can take several calls. Its reads ask for 100 rows.
+
+Because every held row must be read again within a week, the full walk does not stop at the
+beginning: the next walk of a channel begins `full_cycle_hours` (72) after the last began. A walk
+that takes longer than a week cannot keep the oldest history held, and its diagnostics say so
+(`last_cycle_hours` above 168): raise `full_reads_per_minute`. A channel is **complete** once a
+walk has reached its beginning, and stays so while the latest walk to reach it began less than a
+week ago: everything read since is newer than that walk's start, and everything older was read by
+it. A walk any of whose reads proved nothing (a page from a copy the provider could not bring up to
+date, or with a notice; a thread given up; a continuation that did not move) reaches the beginning
+without making the channel complete (`cycle_gaps` in the diagnostics), as does a page the cache had
+no room to queue until it is read again. What the walk cannot see, it cannot count: a Slack thread
+the client narrows to a short page is taken as read. There is no age limit under `full` unless `max_days` sets one (up to 36500), and then a channel
+is complete once the walk is past its limit. `max_megabytes` (up to 16384 under `full`) bounds the
+file, and the full walk waits while the file is above 85 % of it, so the cache's own eviction, which
+starts at the bound, does not take back what the walk just read.
+
+**What a full history costs.** Each message costs about 8.4 KB of file in the live store measured
+on 2026-10-27 (2,300 messages of a Slack workspace: 19.3 MB, of which the trigram full-text index is
+52 % and the message rows 44 %; the messages average 913 bytes of text, long agent reports). The
+`vibe-talk cache-stats` command (see [The message cache](#the-message-cache)) measures a file in
+place. Set `max_megabytes` to about 8.4 KB times the messages the channels hold, with room to spare.
+
+What it does and does not buy for serving, measured on the loopback Slack fake
+(`tests/slack_live_ingest.rs`, module `measure`, ten rounds of "a message arrives through the
+stream, then a reader asks for the newest Main page"): the shadow counted the newest page servable
+0 of 10 times filled only by reads and pushes, 0 of 10 with the backfill alone, and 10 of 10, all
+agreeing with upstream, once the relist read the newest page after each arrival. Every fill-only
+miss was a `gap`: the pushed row sat above the head the last read listed, held only as the push
+brought it. The newest page needs the relist; the backfill gives the older history depth a step
+back into the past, a count, a summary, or a search reads.
 
 ### Diagnostics and logs
 
@@ -4656,6 +4755,36 @@ path:
   ]
 }
 ```
+
+**`cache_history`**, a section of its own beside `message_cache` (`#595 cache-full-history`),
+says how the backfill stands: its mode and intervals, whether the full walk is waiting for room
+under `max_megabytes`, the file's bytes per message, and for each cached channel, by id and label
+as the channel checks name it, what the cache holds and how far its history goes:
+
+```jsonc
+"cache_history": {
+  "mode": "full", "recent_days": 14, "rewalk_hot_hours": 24, "rewalk_hot_minutes": 60,
+  "rewalk_recent_hours": 24, "full_reads_per_minute": 6, "full_cycle_hours": 72,
+  "bytes_per_message": 8378,          // the whole file, over the messages it holds
+  "channels": [
+    { "channel": "C0123456789", "label": "team", "messages": 9120, "content_bytes": 8330000,
+      "oldest": "2025-01-14T09:30:00Z", "newest": "2026-10-27T20:18:41Z",
+      "complete": false,              // every message back to the beginning is held
+      "walking": true, "reached": "2025-06-02T11:04:00Z",   // the full walk under way, and how far
+      "cycle_pages": 41, "cycle_gaps": 0, "pages_per_hour": 312.4,
+      "days_per_hour": 46.1,          // a first walk's pace: history gone back per hour
+      "last_cycle_pages": 96, "last_cycle_hours": 0.4,      // the latest walk that reached it
+      "eta_hours": 0.2 }              // from that walk's length and this one's pace
+  ]
+}
+```
+
+The cache status in client-config carries a `history` summary, in counts and words like the rest
+of that status, never naming a channel: the mode, how many channels the server holds and how many
+of them whole, the oldest message a full walk under way has reached, and whether the walk is
+waiting for room. Settings says it under the switch ("Complete history of 2 of 3 channels.
+Gathering older messages, back to Mar 2 so far."), and once every channel is whole, a search the
+browser's own messages do not answer says the server holds the channel's complete history.
 
 What the fields mean:
 

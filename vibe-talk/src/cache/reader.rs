@@ -486,6 +486,64 @@ pub(crate) fn account(
         .optional()
 }
 
+/// Where the full-history walk of one channel stands, if it has begun. `#595 cache-full-history`.
+pub(crate) fn frontier(
+    connection: &Connection,
+    chan: &ChanKey,
+) -> rusqlite::Result<Option<super::Frontier>> {
+    let Some(id) = chan_id(connection, chan)? else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT cursor, below_ms, cycle_started_ms, cycle_pages, complete_ms,
+                    complete_started_ms, complete_pages, updated_ms, cycle_gaps
+             FROM backfill WHERE chan = ?1",
+            [id],
+            |row| {
+                Ok(super::Frontier {
+                    cursor: row.get(0)?,
+                    below_ms: row.get(1)?,
+                    cycle_started_ms: row.get(2)?,
+                    cycle_pages: row.get(3)?,
+                    complete_ms: row.get(4)?,
+                    complete_started_ms: row.get(5)?,
+                    complete_pages: row.get(6)?,
+                    updated_ms: row.get(7)?,
+                    cycle_gaps: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+}
+
+/// What the file holds of each channel it names, erased ones aside: the history diagnostics and
+/// the storage projection. `#595 cache-full-history`.
+pub(crate) fn channel_stats(connection: &Connection) -> rusqlite::Result<Vec<super::ChannelStats>> {
+    let mut statement = connection.prepare(
+        "SELECT ch.provider_key, ch.channel_id, COUNT(m.row_id), COALESCE(SUM(LENGTH(m.content)), 0),
+                MIN(m.created_ms), MAX(m.created_ms)
+         FROM channel ch LEFT JOIN message m ON m.chan = ch.chan
+         WHERE ch.provider_key <> ?1
+         GROUP BY ch.chan ORDER BY ch.provider_key, ch.channel_id",
+    )?;
+    let stats = statement
+        .query_map([super::writer::ERASED_PROVIDER], |row| {
+            Ok(super::ChannelStats {
+                chan: ChanKey {
+                    provider_key: row.get(0)?,
+                    channel_id: row.get(1)?,
+                },
+                messages: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                content_bytes: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                oldest_ms: row.get(4)?,
+                newest_ms: row.get(5)?,
+            })
+        })?
+        .collect();
+    stats
+}
+
 /// The earliest time any coverage interval of a channel still on the file's list starts at: how
 /// far back the cache has proven it holds a scope's whole listing, somewhere. `None` with no
 /// coverage. A channel being erased is not counted: no read can reach it any more.
