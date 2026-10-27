@@ -140,6 +140,31 @@ impl fmt::Display for ChatServiceError {
 impl std::error::Error for ChatServiceError {}
 
 impl ChatServiceError {
+    /// Whether `chat run` starts its owner loop again after this failure instead of exiting: a
+    /// Herdr call that failed, timed out, or found Herdr unavailable, and a profile-config check
+    /// that git did not answer, all of which agentctl reports as an unavailable runtime. A
+    /// definite refusal, a damaged state and every other failure still end `chat run` (#581
+    /// bridge-git-timeout-fatal).
+    fn restarts_owner_loop(&self) -> bool {
+        matches!(
+            self,
+            Self::Agent(AgentError::Client(error)) if error.kind() == AdapterErrorKind::Unavailable
+        )
+    }
+
+    /// The kind of this failure, as `service-health.json` records it.
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Agent(AgentError::Client(_)) => "coordinator_unavailable",
+            Self::Agent(_) => "agent",
+            Self::Runtime(_) => "runtime",
+            Self::Io(_) => "io",
+            Self::Generation(_) => "generation",
+            Self::Outbound(_) => "outbound",
+            Self::Worker(_) => "worker",
+        }
+    }
+
     /// Whether this is a Herdr call that its caller cancelled, as a stop of the service does.
     fn is_cancelled_herdr_call(&self) -> bool {
         matches!(
@@ -4263,24 +4288,143 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     stale_composer: Option<StaleComposer>,
     reminders: Option<ReplyReminders>,
 ) -> Result<(), ChatServiceError> {
-    owner_loop_end(
-        stop,
-        owner_loop(
-            state,
-            client,
-            manager,
-            options,
+    let mut stale_composer = stale_composer.map(|guard| StaleComposerRun {
+        guard,
+        last_held: None,
+    });
+    let mut reminders = reminders;
+    let mut health = ServiceHealth::new(manager.registry());
+    let mut backoff = ProviderBackoff::new();
+    loop {
+        let started = Instant::now();
+        health.pass_started(started);
+        let result = owner_loop_end(
             stop,
-            cancellation,
-            output_wake,
-            overflowed,
-            notices,
-            reply_wakes,
-            transport,
-            stale_composer,
-            reminders,
-        ),
-    )
+            owner_loop_pass(
+                state,
+                client,
+                manager,
+                options,
+                stop,
+                cancellation,
+                output_wake,
+                overflowed,
+                notices,
+                reply_wakes,
+                transport,
+                &mut stale_composer,
+                &mut reminders,
+                &mut health,
+            ),
+        );
+        let error = match result {
+            Ok(()) => return Ok(()),
+            Err(error) if stop.is_stopped() || !error.restarts_owner_loop() => return Err(error),
+            Err(error) => error,
+        };
+        // A transient failure, such as a Herdr call that failed or timed out on a loaded host,
+        // starts the loop again after a backoff instead of ending `chat run`: the loop rebuilds
+        // everything it needs from the durable state, as a new `chat run` would, while the
+        // provider and reaction workers keep admitting messages (#581 bridge-git-timeout-fatal).
+        let wait = backoff.wait_after(started.elapsed());
+        let failures = match state.note_owner_loop_down(error.class(), &error.to_string()) {
+            Ok(failure) => failure.failures.to_string(),
+            Err(record) => {
+                service_log(format_args!(
+                    "agentctl: the service health record could not be saved: {record}"
+                ));
+                "?".to_owned()
+            }
+        };
+        health.owner_loop_down();
+        service_log(format_args!(
+            "agentctl: warning: the chat owner loop failed: {error}; starting it again in {}s \
+             (failure {failures} in a row); chat run keeps running",
+            wait.as_secs()
+        ));
+        // The pass's pane event stream is gone; the next pass publishes its own wake.
+        *output_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        stop.wait(wait);
+        if stop.is_stopped() {
+            return Ok(());
+        }
+    }
+}
+
+/// Keeps `service-health.json` current from the owner loop: the registry's profile-config check,
+/// as [`crate::profiles::ignore_check_failure`] reports it, and the end of an owner loop failure
+/// once a restarted loop has run for `PROVIDER_RETRY_MAX` (#581 bridge-git-timeout-fatal).
+struct ServiceHealth {
+    registry: PathBuf,
+    /// The profile-config check as last saved; `None` inside until the first save.
+    profile_policy: Option<Option<crate::profiles::IgnoreCheckFailure>>,
+    owner_loop_down: bool,
+    /// The first save also clears an owner loop failure an earlier run left behind.
+    owner_loop_synced: bool,
+    pass_started: Instant,
+    save_failed: bool,
+}
+
+impl ServiceHealth {
+    fn new(registry: &Path) -> Self {
+        Self {
+            registry: registry.to_path_buf(),
+            profile_policy: None,
+            owner_loop_down: false,
+            owner_loop_synced: false,
+            pass_started: Instant::now(),
+            save_failed: false,
+        }
+    }
+
+    fn pass_started(&mut self, at: Instant) {
+        self.pass_started = at;
+    }
+
+    fn owner_loop_down(&mut self) {
+        self.owner_loop_down = true;
+        self.owner_loop_synced = true;
+    }
+
+    /// Save what changed since the last call. A failed save is logged once and tried again at
+    /// the next call; it never stops the loop.
+    fn tick(&mut self, state: &BridgeState) {
+        let mut saved = Ok(());
+        let current = crate::profiles::ignore_check_failure(&self.registry);
+        if self.profile_policy.as_ref() != Some(&current) {
+            saved = state.note_profile_policy(current.as_ref());
+            if saved.is_ok() {
+                self.profile_policy = Some(current);
+            }
+        }
+        let recovered = self.owner_loop_down && self.pass_started.elapsed() >= PROVIDER_RETRY_MAX;
+        if saved.is_ok() && (recovered || !self.owner_loop_synced) {
+            saved = state.note_owner_loop_up();
+            if saved.is_ok() {
+                if recovered {
+                    service_log(format_args!(
+                        "agentctl: the chat owner loop has run for {}s since it last started again",
+                        PROVIDER_RETRY_MAX.as_secs()
+                    ));
+                }
+                self.owner_loop_down = false;
+                self.owner_loop_synced = true;
+            }
+        }
+        match saved {
+            Ok(()) => self.save_failed = false,
+            Err(error) => {
+                if !self.save_failed {
+                    service_log(format_args!(
+                        "agentctl: the service health record could not be saved: {error}"
+                    ));
+                }
+                self.save_failed = true;
+            }
+        }
+    }
 }
 
 /// How the owner loop ended, as `chat run` takes it. A stop cancels the Herdr call the loop is
@@ -4299,6 +4443,9 @@ fn owner_loop_end(
     }
 }
 
+/// One owner loop pass with fresh per-run state and no restart, as a test runs it: it reports
+/// a Herdr call that a stop cancelled, and any other failure, as `owner_loop_pass` returns it.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn owner_loop<A: ManagedApi + ?Sized>(
     state: &BridgeState,
@@ -4313,7 +4460,50 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     reply_wakes: &mpsc::Receiver<String>,
     transport: &mut Option<CommandOutboundTransport>,
     stale_composer: Option<StaleComposer>,
-    mut reminders: Option<ReplyReminders>,
+    reminders: Option<ReplyReminders>,
+) -> Result<(), ChatServiceError> {
+    let mut stale_composer = stale_composer.map(|guard| StaleComposerRun {
+        guard,
+        last_held: None,
+    });
+    let mut reminders = reminders;
+    let mut health = ServiceHealth::new(manager.registry());
+    owner_loop_pass(
+        state,
+        client,
+        manager,
+        options,
+        stop,
+        cancellation,
+        output_wake,
+        overflowed,
+        notices,
+        reply_wakes,
+        transport,
+        &mut stale_composer,
+        &mut reminders,
+        &mut health,
+    )
+}
+
+/// One run of the owner loop, from its startup recovery until a stop or a failure. `chat run`
+/// starts another after a transient failure: see [`run_owner_loop`].
+#[allow(clippy::too_many_arguments)]
+fn owner_loop_pass<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    client: &HerdrClient,
+    manager: &ManagedAgents<'_, A>,
+    options: ServiceOptions,
+    stop: &StopState,
+    cancellation: &SharedCancellation,
+    output_wake: &SharedWake,
+    overflowed: &AtomicBool,
+    notices: &mpsc::Receiver<ProviderNotice>,
+    reply_wakes: &mpsc::Receiver<String>,
+    transport: &mut Option<CommandOutboundTransport>,
+    stale_composer: &mut Option<StaleComposerRun>,
+    reminders: &mut Option<ReplyReminders>,
+    health: &mut ServiceHealth,
 ) -> Result<(), ChatServiceError> {
     let owner_runtime = StopRuntime::new(stop);
     // A reply reminder an earlier run left in the coordinator's queue is taken back out before
@@ -4323,10 +4513,6 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     let mut reminder_waiting = reminders
         .as_mut()
         .is_some_and(|reminders| reminders.settle(state, manager, stop));
-    let mut stale_composer = stale_composer.map(|guard| StaleComposerRun {
-        guard,
-        last_held: None,
-    });
     let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
     let mut control = PassControl {
         transport,
@@ -4424,6 +4610,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     let mut output_retry_delay = Duration::from_secs(1);
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
     while !stop.is_stopped() {
+        health.tick(state);
         if reminder_waiting {
             if let Some(reminders) = reminders.as_mut() {
                 reminder_waiting = reminders.settle(state, manager, stop);
@@ -13458,6 +13645,176 @@ esac
         );
         let queried = queried.expect("the loop stopped within three seconds of its read");
         assert!(queried < 20, "{queried} Herdr queries in three seconds");
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    /// `chat run`'s `service-health.json` in `state_root`, or `None` while nothing is failing.
+    fn service_health(state_root: &Path) -> Option<Value> {
+        let bytes = fs::read(state_root.join(chat_runtime::SERVICE_HEALTH_FILE)).ok()?;
+        Some(serde_json::from_slice(&bytes).expect("a service health record"))
+    }
+
+    #[test]
+    fn chat_run_keeps_running_while_git_check_ignore_hangs_and_recovers_when_it_answers() {
+        // #581 bridge-git-timeout-fatal: a chat bridge whose registry lives in a large Git
+        // repository on a loaded host exited when one `git check-ignore` of the registry's
+        // profile config timed out. Here every pane read checks that config through a Git that
+        // hangs past the timeout for a while: the loop goes on reading the pane with the earlier
+        // answer standing in, `service-health.json` and `chat status` report the failure, and
+        // both clear once git answers again.
+        let fixture = crate::subagents::tests::Fixture::new().with_registry_name(".agentctl");
+        assert!(std::process::Command::new("/usr/bin/git")
+            .args(["init", "-q"])
+            .arg(&fixture.root)
+            .status()
+            .expect("run git init")
+            .success());
+        fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").expect("write .gitignore");
+        let registry = fixture.root.join(".agentctl");
+        fs::create_dir(&registry).expect("create registry");
+        fs::set_permissions(&registry, fs::Permissions::from_mode(0o700))
+            .expect("private registry");
+        let profiles = registry.join("profiles.json");
+        fs::write(
+            &profiles,
+            r#"{"schema":"agentctl-profiles/v1","profiles":{}}"#,
+        )
+        .expect("write profile config");
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o600))
+            .expect("private profile config");
+        let git = crate::profiles::test_git::HangingGit::new(&fixture.root);
+        let _git = git.install(Duration::from_millis(300), Duration::from_millis(200));
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (state_root, state) = worker_bridge_state(&fixture, true);
+        let read_sources = &fixture.client.read_sources;
+        let reads = || read_sources.lock().expect("read sources").len();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let mut hung: Option<usize> = None;
+        let mut degraded: Option<(Value, Value)> = None;
+        let mut answering: Option<usize> = None;
+        let mut recovered = false;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            // A reconciliation reads the pane, and so checks the profile config, every 100 ms.
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            || {
+                if hung.is_none() && reads() >= 2 {
+                    git.hang(true);
+                    hung = Some(reads());
+                }
+                if let (Some(before), None) = (hung, &degraded) {
+                    let record = service_health(&state_root);
+                    let saved_failures = record
+                        .as_ref()
+                        .and_then(|record| record["profile_policy"]["failures"].as_u64());
+                    if saved_failures.is_some_and(|failures| failures >= 3) && reads() > before + 2
+                    {
+                        let status = state.status().expect("chat status");
+                        degraded =
+                            Some((record.expect("record"), status["service_health"].clone()));
+                        git.hang(false);
+                        answering = Some(reads());
+                    }
+                }
+                if let Some(before) = answering {
+                    recovered = crate::profiles::ignore_check_failure(&registry).is_none()
+                        && service_health(&state_root).is_none()
+                        && reads() > before + 2;
+                }
+                recovered
+            },
+        );
+        assert!(hung.is_some(), "the loop never read the pane twice");
+        let (record, status) = degraded.expect("the loop did not keep reading while git hung");
+        let failure = &record["profile_policy"];
+        assert_eq!(
+            failure["last_error_class"], "git_check_ignore_timeout",
+            "{record}"
+        );
+        assert!(
+            failure["failures"]
+                .as_u64()
+                .is_some_and(|failures| failures >= 3),
+            "{record}"
+        );
+        assert!(
+            failure["last_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("git check-ignore timed out")),
+            "{record}"
+        );
+        assert!(record.get("owner_loop").is_none(), "{record}");
+        assert_eq!(status["profile_policy"], *failure, "{status}");
+        assert!(recovered, "the failure did not clear once git answered");
+        assert_eq!(
+            state.status().expect("chat status")["service_health"],
+            json!({"owner_loop": null, "profile_policy": null})
+        );
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn chat_run_starts_its_owner_loop_again_after_herdr_fails_instead_of_exiting() {
+        // #581 bridge-git-timeout-fatal: a Herdr call that fails or times out at a
+        // reconciliation used to end `chat run`. The loop now starts again after a backoff,
+        // records the failure in `service-health.json`, and goes on reading the pane once Herdr
+        // answers again.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (state_root, state) = worker_bridge_state(&fixture, true);
+        let read_sources = &fixture.client.read_sources;
+        let reads = || read_sources.lock().expect("read sources").len();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let mut failing = false;
+        let mut recorded: Option<(Value, usize)> = None;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            || {
+                if !failing && reads() >= 2 {
+                    fixture
+                        .client
+                        .fail_panes
+                        .store(true, AtomicOrdering::SeqCst);
+                    failing = true;
+                }
+                if failing && recorded.is_none() {
+                    if let Some(record) = service_health(&state_root) {
+                        fixture
+                            .client
+                            .fail_panes
+                            .store(false, AtomicOrdering::SeqCst);
+                        recorded = Some((record, reads()));
+                    }
+                }
+                recorded
+                    .as_ref()
+                    .is_some_and(|(_, before)| reads() > before + 2)
+            },
+        );
+        let (record, before) = recorded.expect("no owner loop failure was recorded");
+        let failure = &record["owner_loop"];
+        assert_eq!(
+            failure["last_error_class"], "coordinator_unavailable",
+            "{record}"
+        );
+        assert_eq!(failure["failures"], 1, "{record}");
+        assert!(
+            reads() > before + 2,
+            "the restarted loop did not read the pane"
+        );
+        // The failure stays reported until a restarted loop has run for a minute.
+        assert!(service_health(&state_root).is_some());
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
     }

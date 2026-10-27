@@ -197,6 +197,10 @@ const _: () =
 // outbound send path are failing: see `ProviderHealthRecord`.
 const PROVIDER_HEALTH_SCHEMA: &str = "agentctl-chat-provider-health/v1";
 pub(crate) const PROVIDER_HEALTH_FILE: &str = "provider-health.json";
+// The schema of `service-health.json`, which records the failures `chat run` itself kept running
+// through: see `ServiceHealthRecord`.
+const SERVICE_HEALTH_SCHEMA: &str = "agentctl-chat-service-health/v1";
+pub(crate) const SERVICE_HEALTH_FILE: &str = "service-health.json";
 // The schema of `delivery-alarm-sources.json`, the value of each record behind
 // `delivery-alarm.json` as `chat run` last read it: see `AlarmSources`.
 const ALARM_SOURCES_SCHEMA: &str = "agentctl-chat-delivery-alarm-sources/v1";
@@ -2887,6 +2891,27 @@ impl PathFailure {
             && self.last_error_class.len() <= MAX_PROVIDER_ERROR_CLASS_BYTES
             && self.last_error.len() <= MAX_PROVIDER_ERROR_BYTES
     }
+}
+
+/// The failures `chat run` kept running through instead of exiting, as it saves them in
+/// `service-health.json` in the state directory and `chat status` reports them (#581
+/// bridge-git-timeout-fatal). A field is absent while that part works.
+///
+/// - `owner_loop`: the loop that types prompts and reads replies failed on a transient error,
+///   such as a Herdr call that failed or timed out, and was started again after a backoff. It
+///   clears once a restarted loop has run for a minute.
+/// - `profile_policy`: `git check-ignore` stopped answering for the registry's profile config,
+///   and its last answer that the config is ignored stands in until git answers again.
+///
+/// A separate file from `provider-health.json`, so a binary that predates it ignores it.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceHealthRecord {
+    schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_loop: Option<PathFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_policy: Option<PathFailure>,
 }
 
 /// The paths that are down, as `chat status` and `delivery-alarm.json` report them: those whose
@@ -6915,6 +6940,15 @@ impl BridgeState {
             acknowledgements.insert(ack_key.to_owned(), Value::from(ack_count.saturating_add(1)));
         }
         let provider_health = self.read_provider_health()?;
+        // What `chat run` kept running through. A damaged record is reported, not read as clear,
+        // and does not hide the rest of the status.
+        let service_health = match self.read_service_health() {
+            Ok(record) => serde_json::json!({
+                "owner_loop": record.owner_loop,
+                "profile_policy": record.profile_policy,
+            }),
+            Err(error) => serde_json::json!({ "unreadable": error.to_string() }),
+        };
         // The credential files as the running service saw them: this process may not have the
         // service's environment. `evidence` says how far that record can be trusted.
         let credential_record = self.read_credential_record();
@@ -7014,6 +7048,7 @@ impl BridgeState {
                     }))
                     .collect::<Vec<_>>(),
             }),
+            "service_health": service_health,
             "provider_health": {
                 "subscription": provider_health.subscription,
                 "sends": provider_health.sends,
@@ -7326,6 +7361,105 @@ impl BridgeState {
     /// Record that a provider generation subscribed, which ends any subscription failure.
     pub(crate) fn note_subscription_up(&self) -> Result<()> {
         self.update_provider_health(|record| record.subscription = None)
+    }
+
+    /// Read `service-health.json`: the default record when it does not exist yet. The caller
+    /// holds the state lock.
+    fn read_service_health(&self) -> Result<ServiceHealthRecord> {
+        let path = self.root.join(SERVICE_HEALTH_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(ChatRuntimeError::invalid(
+                    "the service health record is not a regular file",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ServiceHealthRecord {
+                    schema: SERVICE_HEALTH_SCHEMA.to_owned(),
+                    ..ServiceHealthRecord::default()
+                })
+            }
+            Err(error) => return Err(ChatRuntimeError::Io(error)),
+        }
+        let record: ServiceHealthRecord = read_document(&path, MAX_PROVIDER_HEALTH_BYTES)?;
+        if record.schema != SERVICE_HEALTH_SCHEMA
+            || [&record.owner_loop, &record.profile_policy]
+                .into_iter()
+                .flatten()
+                .any(|failure| !failure.valid())
+        {
+            return Err(ChatRuntimeError::invalid(
+                "the service health record is inconsistent",
+            ));
+        }
+        Ok(record)
+    }
+
+    /// Apply `change` to the service health record under the state lock and save it if it
+    /// changed. A record that cannot be read is replaced, as `chat run` owns it alone.
+    fn update_service_health(&self, change: impl FnOnce(&mut ServiceHealthRecord)) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let (mut record, readable) = match self.read_service_health() {
+            Ok(record) => (record, true),
+            Err(_) => (
+                ServiceHealthRecord {
+                    schema: SERVICE_HEALTH_SCHEMA.to_owned(),
+                    ..ServiceHealthRecord::default()
+                },
+                false,
+            ),
+        };
+        let before = record.clone();
+        change(&mut record);
+        if readable && record == before {
+            return Ok(());
+        }
+        if record.owner_loop.is_none() && record.profile_policy.is_none() {
+            return remove_if_exists(&self.root.join(SERVICE_HEALTH_FILE));
+        }
+        write_document(&self.root.join(SERVICE_HEALTH_FILE), &record)
+    }
+
+    /// Record that the owner loop failed with `error`, of kind `class`, and is to start again;
+    /// return the failure as now recorded.
+    pub(crate) fn note_owner_loop_down(&self, class: &str, error: &str) -> Result<PathFailure> {
+        let now = unix_millis();
+        let class = bounded_detail(class, MAX_PROVIDER_ERROR_CLASS_BYTES);
+        let mut recorded = None;
+        self.update_service_health(|record| {
+            let failure = next_failure(record.owner_loop.take(), now, class, error);
+            recorded = Some(failure.clone());
+            record.owner_loop = Some(failure);
+        })?;
+        Ok(recorded.expect("the change ran"))
+    }
+
+    /// Record that the owner loop works again.
+    pub(crate) fn note_owner_loop_up(&self) -> Result<()> {
+        self.update_service_health(|record| record.owner_loop = None)
+    }
+
+    /// Record the registry's profile-config check as `chat run` last saw it: `None` while git
+    /// answers it.
+    pub(crate) fn note_profile_policy(
+        &self,
+        failure: Option<&crate::profiles::IgnoreCheckFailure>,
+    ) -> Result<()> {
+        let failure = failure.map(|failure| PathFailure {
+            down_since_millis: failure.since_millis,
+            failures: failure.failures.max(1),
+            last_failure_at_millis: failure.last_at_millis.max(failure.since_millis),
+            last_error_class: if failure.last_error.contains("timed out") {
+                "git_check_ignore_timeout".to_owned()
+            } else {
+                "git_check_ignore_no_answer".to_owned()
+            },
+            last_error: bounded_detail(&failure.last_error, MAX_PROVIDER_ERROR_BYTES),
+        });
+        self.update_service_health(|record| record.profile_policy = failure)
     }
 
     /// Record the outcome of one outbound send: `Ok` for a send the provider applied, or the

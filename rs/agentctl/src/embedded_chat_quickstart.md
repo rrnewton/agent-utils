@@ -72,8 +72,12 @@ directory.
      --bridge-state /home/me/.local/state/agentctl/project-chat
    ```
 
-   Stop with SIGINT or SIGTERM. A service manager may restart the same `run`
-   command against the same state directory.
+   Stop with SIGINT or SIGTERM. Run it under a service manager that restarts
+   it on failure against the same state directory: a systemd unit needs
+   `Restart=on-failure`, and a transient one needs `systemd-run --user
+   -p Restart=on-failure -p RestartSec=5 ...`. Without that, the first failure
+   `chat run` cannot recover from stops chat until someone notices. The
+   userguide's "Service management" has a full unit.
 
 4. Invite temporary senders without re-initializing or restarting the bridge:
 
