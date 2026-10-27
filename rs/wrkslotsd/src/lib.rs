@@ -48,6 +48,7 @@ pub mod cli;
 mod config;
 mod config_validate;
 mod evidence;
+mod handoff_state;
 mod index;
 mod plan;
 mod policy;

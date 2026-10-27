@@ -53,4 +53,7 @@ configuration. No live-process, Git, or checkout-existence inspection.
 archive-id derivation, historical-import consistency, and archived
 checkout path/authority, emitting records as stored.
 
-[muse watermelon] Next slice: the handoff sidecar format reader, bound to the active record it belongs to.
+[muse watermelon] Slice 5 in progress: `wrkslotsd parse-handoff` reproduces
+`_load_handoff_sidecar` bound to its active record (bounded identity-bound
+file read, strict duplicate-refusing JSON, schema 1/2 provenance rules,
+content digest binding) and `_handoff_artifact_to_obj` output.

@@ -80,6 +80,18 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Validate one slot's generation-bound handoff sidecar and print it (or null)
+    ParseHandoff {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Active slot whose current-generation sidecar should be read
+        #[arg(long, value_name = "NAME")]
+        slot: String,
+    },
     /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
     ParseConfig {
         /// Configuration document to parse; it is never modified
@@ -187,6 +199,25 @@ pub fn run() -> u8 {
         }
         Command::ParseArchive { root, machine } => {
             match crate::archive_state::parse_archive(root.as_deref(), machine.as_deref()) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::ParseHandoff {
+            root,
+            machine,
+            slot,
+        } => {
+            match crate::handoff_state::parse_handoff(root.as_deref(), machine.as_deref(), &slot) {
                 Ok(value) => {
                     println!(
                         "{}",
