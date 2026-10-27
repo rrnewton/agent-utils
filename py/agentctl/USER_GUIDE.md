@@ -316,6 +316,65 @@ artifacts. Reusing a name requires stopping its current session first. The tool
 refuses a changed or unverified owner rather than treating a matching directory
 or pane title as proof that it found the same agent.
 
+### Registry layout
+
+The registry keeps its few fixed files at the top and gives every collection
+that grows with the number of agents a subdirectory of its own, so the fixed
+files stay easy to find however many agents have come and gone (layout 2):
+
+```text
+REGISTRY/
+  profiles.json  coordinator.json  restore.json  landing-queue.json
+  .identity.lock  .coordinator.lock  .restore.lock
+  agents/NAME/           one directory per active agent: agent.json, queue/, logs
+  agents/agent.json      the layout tripwire; not an agent
+  locks/NAME.lock        the agent's lifecycle lock (and NAME.rank.lock)
+  archive/NAME-TOKEN/    retired agents
+  .progress/  .waiting/  .renames/  .revives/  .inbox/
+```
+
+`archive`, `agents` and `locks` are therefore reserved and cannot name an agent.
+
+Builds before layout 2 kept each agent at `REGISTRY/NAME/` and its locks at
+`REGISTRY/.NAME.lock` and `REGISTRY/.NAME.rank.lock`. Both editions still read
+that layout until 2026-11-26 (#593 registry-agents-subdir; its removal is
+tracked as #597 registry-old-layout-removal), and always create new agents in
+layout 2. `agentctl migrate-layout` reports what it would move;
+`agentctl migrate-layout --apply` moves every agent, one at a time, each by one
+atomic rename while it holds that agent's old and new lifecycle locks and the
+registry's identity lock. Every command that changes an agent (`start`,
+`adopt`, `stop`, `send`, `rename`, `revive`, and the like) runs the same
+migration first, without waiting for any lock, and prints one notice on
+standard error when it moved anything; `AGENTCTL_LAYOUT_AUTO_MIGRATE=0` turns
+that off. Reads, dry runs, and the chat and inbox services never migrate.
+
+An agent stays where it is, and is listed under `left`, while another process
+works in its directory or holds a lock file there (a headless wrapper, a
+drain), while its record names a path inside that directory (a turn runner's
+runtime home), or while its lock stays busy for `--wait` seconds (default 10);
+a later run moves it. A name with an agent in both layouts is listed under
+`conflicts` and never touched: every command that uses that name refuses it
+until a person keeps one copy and moves the other aside. A layout-1 directory
+without a record beside a layout-2 agent is listed under `strays`: an older
+program that writes into a queue by path (an agent-teams build before layout 2)
+leaves one, and its queued items need moving into the agent's queue by hand.
+Running the migration again changes nothing.
+
+A build older than layout 2 cannot see moved agents, and two tripwires make it
+refuse the registry instead of misreading it. Before it starts, adopts, loads,
+or renames an agent it lists `.renames/`, and stops at the file
+`.renames/upgrade-agentctl-registry-layout-2` with an error naming it, before
+it has done anything. `agents/agent.json` holds a JSON string, which such a
+build reads as the unreadable record of an agent named `agents`, so its listing
+and doctor report an error row, and the wrkslots liveness probe answers
+`unverifiable` instead of calling a live agent dead. An older agent-teams is
+not stopped by either: it writes into the coordinator's queue by path and
+leaves a stray. So upgrade every program that uses a registry (each agentctl
+copy, including pinned chat bridge and watcher binaries, agent-teams, and
+copies of the liveness probe) before migrating it.
+Even before any migration, the first new agent a layout-2 build creates puts
+the tripwires in place.
+
 Workers run in the directory given by `--cwd` (default: the current directory).
 They share its files and credentials. Separate Git worktrees are an operator
 choice when simultaneous edits need isolation; agent control does not require
@@ -2031,7 +2090,7 @@ agentctl stop coordinator                   # clean stop, archive record, queue 
 `start --mode headless --harness claude` registers an `adapter: harness-wrapper`,
 `mode: headless` record with a new session UUID (`--resume UUID` keeps an existing
 session begun in the same working directory). Without `--no-launch` it also starts
-the wrapper as a detached process logging to `REGISTRY/NAME/headless.log`. With
+the wrapper as a detached process logging to `REGISTRY/agents/NAME/headless.log`. With
 `--no-launch` a supervisor runs `agentctl run-headless NAME`; `install-units
 --headless NAME` writes that user unit (`Restart=on-failure`, `KillMode=mixed`,
 `TimeoutStopSec=120`, the installing shell's PATH and CLAUDE_CONFIG_DIR, and the
@@ -2042,13 +2101,13 @@ wrapper owns `-p`, the formats, `--session-id`, `--resume`, `--continue` and
 tool call that would ask a human is denied and logged as `permission.denied`
 instead of waiting.
 
-**The wrapper** (`agentctl run-headless NAME`) holds `REGISTRY/NAME/headless.lock`,
+**The wrapper** (`agentctl run-headless NAME`) holds `REGISTRY/agents/NAME/headless.lock`,
 so one agent never has two harness processes. It starts Claude Code with
 `--resume SESSION` when Claude Code has a transcript for the session and with
 `--session-id SESSION` otherwise, and is the **only drainer** of the agent's
 queue: `send`, `drain`, agent-teams delivery, watcher and restore notices, and
 every other sender only enqueue into `inbox.v2/` and wake it through
-`REGISTRY/NAME/control.sock` (mode 0600, no network listener). Each item moves to
+`REGISTRY/agents/NAME/control.sock` (mode 0600, no network listener). Each item moves to
 `inflight/` with the usual at-most-once stamps and `harness_input_id` (a fresh
 UUID per attempt), then `paste_started_at`, then is handed to a writer thread
 that feeds the harness. It moves to `processed/` with `started_at` only when
@@ -2067,7 +2126,7 @@ replayed. An unexpected harness exit is restarted with `--resume` (backoff, at
 most 5 in 10 minutes, then exit 1 for the supervisor). When the harness died
 inside a turn, or the previous wrapper stopped uncleanly, the agent gets one
 notice telling it to re-read its records. The running harness's kernel identity
-is kept in `REGISTRY/NAME/harness.json` and in the record's `harness_identity`
+is kept in `REGISTRY/agents/NAME/harness.json` and in the record's `harness_identity`
 (so caller-ancestry checks and agent-teams sender proof find the agent); a new
 wrapper refuses to start while a harness an earlier wrapper started still lives.
 SIGTERM or `agentctl stop` closes the harness's input, waits up to 60 s for it to
@@ -2080,7 +2139,7 @@ wakes the wrapper and waits for the inputs pending at the call, with the usual
 exit status 0, 75 or 76. When no wrapper runs, inputs stay queued and both report
 `blocked`.
 
-**The event log** is `REGISTRY/NAME/events/<generation>.jsonl` (mode 0600, one
+**The event log** is `REGISTRY/agents/NAME/events/<generation>.jsonl` (mode 0600, one
 JSON object per line, appended with one write each) plus `index.json`. A
 generation's file is closed at 64 MiB and continued in `<generation>.1.jsonl`,
 `<generation>.2.jsonl` and so on, so a wrapper that runs for months never grows

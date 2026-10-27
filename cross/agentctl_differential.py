@@ -277,12 +277,12 @@ def _lifecycle(harness: Harness, report: Report) -> None:
             (root / "prompt.txt").write_text("file instruction\nwith newline\n", encoding="utf-8")
         _pair(harness, report, case, f"primary/{kind}/send-file", ("send", "worker", "--file", "<ROOT>/prompt.txt", *_COMMON))
         _pair(harness, report, case, f"primary/{kind}/read", ("read", "worker", "--lines", "17", *_COMMON))
-        report.require(f"primary/{kind}/read-snapshot", all((root / "registry/worker/output.json").is_file()
+        report.require(f"primary/{kind}/read-snapshot", all((root / "registry/agents/worker/output.json").is_file()
                        for root in (case.python_root, case.rust_root)), "read did not retain its documented terminal snapshot")
         _pair(harness, report, case, f"primary/{kind}/stop", ("stop", "worker", *_COMMON))
         _pair(harness, report, case, f"primary/{kind}/list-stopped", ("list", *_COMMON))
         report.require(f"primary/{kind}/exact-pane-retirement", all(
-            _state(root).get("closed_panes") == ["w1:p1"] and not (root / "registry/worker").exists()
+            _state(root).get("closed_panes") == ["w1:p1"] and not (root / "registry/agents/worker").exists()
             and len(list((root / "registry/archive").iterdir())) == 1
                        for root in (case.python_root, case.rust_root)), "owned pane or archival contract diverged")
 
@@ -333,7 +333,7 @@ def _conversations(harness: Harness, report: Report) -> None:
             "start", "worker", "--cwd", "<ROOT>", "--harness", "claude", f"--harness-arg={selector}", *_COMMON,
         ), 75)
         report.require(f"primary/conversation/claude/no-allocation-{selector}",
-                       all(not (root / "registry/worker").exists() for root in (rejected.python_root, rejected.rust_root)),
+                       all(not (root / "registry/agents/worker").exists() for root in (rejected.python_root, rejected.rust_root)),
                        "conflicting conversation allocated a runtime")
     forked = harness.case("primary-claude-resume-fork")
     _pair(harness, report, forked, "primary/conversation/claude/refuse-resume-fork", (
@@ -341,7 +341,7 @@ def _conversations(harness: Harness, report: Report) -> None:
         "--harness-arg=--fork-session", *_COMMON,
     ), 75)
     report.require("primary/conversation/claude/no-allocation-resume-fork",
-                   all(not (root / "registry/worker").exists() for root in (forked.python_root, forked.rust_root)),
+                   all(not (root / "registry/agents/worker").exists() for root in (forked.python_root, forked.rust_root)),
                    "fork selector allocated a replacement conversation")
     mismatch = harness.case("primary-resume-conversation-mismatch")
     _change(mismatch, {"session_value_override": "wrong-conversation"})
@@ -372,7 +372,7 @@ def _launch_specs(harness: Harness, report: Report) -> None:
                        f"start did not record its exact launch: {status!r}")
     _pair(harness, report, case, "primary/launch-spec/promote-running", ("promote", "worker", *_COMMON), 75)
     for root in (case.python_root, case.rust_root):
-        path = root / "registry/worker/agent.json"
+        path = root / "registry/agents/worker/agent.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         document["launch_spec"]["source"] = "guess"
         path.write_text(json.dumps(document), encoding="utf-8")
@@ -525,7 +525,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "primary/profile/agentcloud/python-start-refusal",
                 python_refusal.returncode == 2
                 and "only the Rust edition of agentctl implements" in python_refusal.stderr
-                and not (case.python_root / "registry" / "sub-cloud").exists(),
+                and not (case.python_root / "registry" / "agents" / "sub-cloud").exists(),
                 f"Python started or mis-refused a Rust-only agentcloud profile: {python_refusal!r}",
             )
         adapter = "herdr-pane" if profile in ("watermelon", "muse-literal") else "herdr"
@@ -578,7 +578,7 @@ def _profiles(harness: Harness, report: Report) -> None:
             ))
             original_records = {
                 root: json.loads(
-                    (root / "registry/worker/agent.json").read_text(encoding="utf-8")
+                    (root / "registry/agents/worker/agent.json").read_text(encoding="utf-8")
                 )
                 for root in (case.python_root, case.rust_root)
             }
@@ -596,7 +596,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                         changed["custom_process_identity"][field] = adjustment
                     else:
                         changed["custom_process_identity"][field] += adjustment
-                    (root / "registry/worker/agent.json").write_text(
+                    (root / "registry/agents/worker/agent.json").write_text(
                         json.dumps(changed), encoding="utf-8"
                     )
                 _pair(
@@ -609,14 +609,14 @@ def _profiles(harness: Harness, report: Report) -> None:
                     f"primary/profile/watermelon/refuse-{label}-stop",
                     all(outcome.returncode == 69 for outcome in refused)
                     and all(
-                        (root / "registry/worker/agent.json").is_file()
+                        (root / "registry/agents/worker/agent.json").is_file()
                         and not _state(root).get("closed")
                         for root in (case.python_root, case.rust_root)
                     ),
                     f"{label} identity mismatch allowed pane retirement: {refused!r}",
                 )
                 for root, original in original_records.items():
-                    (root / "registry/worker/agent.json").write_text(
+                    (root / "registry/agents/worker/agent.json").write_text(
                         json.dumps(original), encoding="utf-8"
                     )
             _change(case, {"wrong_custom_process_group": True})
@@ -630,7 +630,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "primary/profile/watermelon/refuse-process-group-stop",
                 all(outcome.returncode == 69 for outcome in refused)
                 and all(
-                    (root / "registry/worker/agent.json").is_file()
+                    (root / "registry/agents/worker/agent.json").is_file()
                     and not _state(root).get("closed")
                     for root in (case.python_root, case.rust_root)
                 ),
@@ -648,7 +648,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 for root, original in original_records.items():
                     changed = json.loads(json.dumps(original))
                     changed["custom_process_identity"][field] = value
-                    (root / "registry/worker/agent.json").write_text(
+                    (root / "registry/agents/worker/agent.json").write_text(
                         json.dumps(changed), encoding="utf-8"
                     )
                 _pair(
@@ -657,7 +657,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                     ("status", "worker", *_COMMON), 75,
                 )
                 for root, original in original_records.items():
-                    (root / "registry/worker/agent.json").write_text(
+                    (root / "registry/agents/worker/agent.json").write_text(
                         json.dumps(original), encoding="utf-8"
                     )
             prompt = "Muse literal $(unexpanded) delivery\nsecond line"
@@ -667,9 +667,9 @@ def _profiles(harness: Harness, report: Report) -> None:
             report.require("primary/profile/watermelon/pane-delivery",
                            all(_state(root).get("submitted") == [prompt]
                                and _state(root).get("paste_wrapped") is True
-                               and (root / "registry/worker/queue/processed/muse-first.json").is_file()
-                               and not list((root / "registry/worker/queue/inflight").glob("*.json"))
-                               and not list((root / "registry/worker/queue/failed").glob("*.json"))
+                               and (root / "registry/agents/worker/queue/processed/muse-first.json").is_file()
+                               and not list((root / "registry/agents/worker/queue/inflight").glob("*.json"))
+                               and not list((root / "registry/agents/worker/queue/failed").glob("*.json"))
                                for root in (case.python_root, case.rust_root)),
                            "Muse pane delivery lacked an exact post-Enter receipt")
             _change(case, {
@@ -680,7 +680,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "--working-timeout", "0.05", *_COMMON,
             ), 76)
             report.require("primary/profile/watermelon/redraw-quarantine", all(
-                (root / "registry/worker/queue/failed/muse-error.json").is_file()
+                (root / "registry/agents/worker/queue/failed/muse-error.json").is_file()
                 for root in (case.python_root, case.rust_root)
             ), "Muse draft/error redraw was incorrectly accepted as delivery")
             _change(case, {
@@ -692,7 +692,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "--working-timeout", "0.05", *_COMMON,
             ), 76)
             report.require("primary/profile/watermelon/repeated-quarantine", all(
-                (root / "registry/worker/queue/failed/muse-repeat.json").is_file()
+                (root / "registry/agents/worker/queue/failed/muse-repeat.json").is_file()
                 for root in (case.python_root, case.rust_root)
             ), "an old identical transcript entry was mistaken for a new submission")
         if profile not in ("watermelon", "muse-literal"):
@@ -783,8 +783,8 @@ def _profile_resume(harness: Harness, report: Report) -> None:
         _pair(harness, report, selected, f"primary/profile/resume/{kind}/list", ("list", *_COMMON))
         roots = (selected.python_root, selected.rust_root)
         before = {
-            root: ((_state(root).get("calls")), (root / "registry/worker/agent.json").read_bytes())
-            for root in roots if (root / "registry/worker/agent.json").exists()
+            root: ((_state(root).get("calls")), (root / "registry/agents/worker/agent.json").read_bytes())
+            for root in roots if (root / "registry/agents/worker/agent.json").exists()
         }
         _pair(harness, report, selected, f"primary/profile/resume/{kind}/occupied", (
             "start", "other-worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
@@ -792,9 +792,9 @@ def _profile_resume(harness: Harness, report: Report) -> None:
         ), 75)
         report.require(f"primary/profile/resume/{kind}/occupied-atomic",
                        len(before) == 2 and all(
-                           not (root / "registry/other-worker").exists()
+                           not (root / "registry/agents/other-worker").exists()
                            and _state(root).get("calls") == calls
-                           and (root / "registry/worker/agent.json").read_bytes() == record
+                           and (root / "registry/agents/worker/agent.json").read_bytes() == record
                            for root, (calls, record) in before.items()
                        ), "an occupied conversation changed its owner or allocated a new tab")
         _pair(harness, report, selected, f"primary/profile/resume/{kind}/stop", (
@@ -1036,7 +1036,7 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
     report.require(
         "primary/adopt/muse-mismatched-harness",
         all(outcome.returncode == 75 for outcome in outcomes)
-        and all(not (root / "registry/worker").exists()
+        and all(not (root / "registry/agents/worker").exists()
                 for root in (adopt_muse.python_root, adopt_muse.rust_root)),
         f"a different harness was adopted as Muse: {outcomes!r}",
     )
@@ -1196,7 +1196,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
         "primary/workspace/explicit-mismatch",
         all(outcome.returncode == 75 and "project configuration requires" in outcome.stderr
             for outcome in outcomes)
-        and all(not (root / ".agentctl/worker").exists()
+        and all(not (root / ".agentctl/agents/worker").exists()
                 for root in (mismatch.python_root, mismatch.rust_root)),
         f"workspace mismatch diverged or allocated a record: {outcomes!r}",
     )
@@ -1335,7 +1335,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     stopped = harness.invoke(missing, ("stop", "worker", *_COMMON))
     report.require("primary/custom/missing-executable-retained",
                    all(outcome.returncode == 69 for outcome in stopped)
-                   and all((root / "registry/worker/agent.json").is_file()
+                   and all((root / "registry/agents/worker/agent.json").is_file()
                            and not _state(root).get("closed")
                            for root in (missing.python_root, missing.rust_root)),
                    f"unobserved missing-executable launch was incorrectly retired: {stopped!r}")
@@ -1354,7 +1354,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     stopped = harness.invoke(wrong_process, ("stop", "worker", *_COMMON))
     report.require("primary/custom/exact-process-retained",
                    all(outcome.returncode == 69 for outcome in stopped)
-                   and all((root / "registry/worker/agent.json").is_file()
+                   and all((root / "registry/agents/worker/agent.json").is_file()
                            and not _state(root).get("closed")
                            for root in (wrong_process.python_root, wrong_process.rust_root)),
                    f"unobserved wrong-process launch was incorrectly retired: {stopped!r}")
@@ -1374,7 +1374,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     stopped = harness.invoke(wrong_identity, ("stop", "worker", *_COMMON))
     report.require("primary/custom/kernel-process-retained",
                    all(outcome.returncode == 69 for outcome in stopped)
-                   and all((root / "registry/worker/agent.json").is_file()
+                   and all((root / "registry/agents/worker/agent.json").is_file()
                            and not _state(root).get("closed")
                            for root in (wrong_identity.python_root, wrong_identity.rust_root)),
                    f"unobserved wrong-kernel launch was incorrectly retired: {stopped!r}")
@@ -1394,7 +1394,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     report.require("primary/muse/failed-start-cleanup",
                    all(outcome.returncode == 0 for outcome in stopped)
                    and all(_state(root).get("closed_panes") == ["w1:p1"]
-                           and not (root / "registry/worker").exists()
+                           and not (root / "registry/agents/worker").exists()
                            and len(list((root / "registry/archive").iterdir())) == 1
                            for root in (trust.python_root, trust.rust_root)),
                    f"retained failed Muse launch was not safely stoppable: {stopped!r}")
@@ -1415,7 +1415,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
             and all(
                 _state(root).get("custom_submitted") is False
                 and _state(root).get("submitted") == []
-                and (root / "registry/worker/queue/failed/exit-race.json").is_file()
+                and (root / "registry/agents/worker/queue/failed/exit-race.json").is_file()
                 for root in (exited.python_root, exited.rust_root)
             ),
             f"Muse exit between text and Enter submitted to a replacement: {outcomes!r}",
@@ -1455,7 +1455,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
         ), 75)
         report.require("primary/herdr-093/codex/busy-no-input", all(
             _submission_count(root, "compatibility follow-up") == 0
-            and (root / "registry/worker/queue/inbox/compat-next.json").is_file()
+            and (root / "registry/agents/worker/queue/inbox/compat-next.json").is_file()
             for root in (case.python_root, case.rust_root)),
             "an unknown busy composer received a queued follow-up")
         _change(case, {"composer_busy": False})
@@ -1464,7 +1464,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
         ))
         report.require("primary/herdr-093/codex/drain-once", all(
             _submission_count(root, "compatibility follow-up") == 1
-            and (root / "registry/worker/queue/processed/compat-next.json").is_file()
+            and (root / "registry/agents/worker/queue/processed/compat-next.json").is_file()
             for root in (case.python_root, case.rust_root)),
             "idle unknown Codex did not acknowledge the queued follow-up exactly once")
         _pair(harness, report, case, "primary/herdr-093/codex/stop", (
@@ -1510,7 +1510,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
             _state(root).get("submitted") == []
             and sum(call[:2] == ["agent", "start"]
                     for call in _fixture_calls(root)) == 1
-            and json.loads((root / "registry/worker/agent.json").read_text(
+            and json.loads((root / "registry/agents/worker/agent.json").read_text(
                 encoding="utf-8")).get("lifecycle") == "launch_failed"
             for root in (failed.python_root, failed.rust_root)),
             f"{label} caused a startup retry, input, or a running record")
@@ -1524,7 +1524,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
                   "--harness", "muse", "--startup-timeout", "0.2"):
             report.require(f"primary/herdr-093/muse/{mode}/kernel-pin", all(
                 _valid_foreign_shell_identity(json.loads(
-                    (root / "registry/worker/agent.json").read_text(encoding="utf-8")
+                    (root / "registry/agents/worker/agent.json").read_text(encoding="utf-8")
                 ).get("custom_process_identity"))
                 for root in (muse.python_root, muse.rust_root)),
                 "missing argv discarded the custom harness kernel identity")
@@ -1535,7 +1535,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
             report.require(f"primary/herdr-093/muse/{mode}/receipt", all(
                 _submission_count(root, "optional argv delivery") == 1
                 and _state(root).get("paste_wrapped") is True
-                and (root / "registry/worker/queue/processed/optional-argv.json").is_file()
+                and (root / "registry/agents/worker/queue/processed/optional-argv.json").is_file()
                 for root in (muse.python_root, muse.rust_root)),
                 "missing argv bypassed verified Muse delivery")
             _pair(harness, report, muse, f"primary/herdr-093/muse/{mode}/stop", (
@@ -1561,7 +1561,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
                        outcomes[0].returncode == outcomes[1].returncode
                        and outcomes[0].returncode in (69, 75)
                        and all(_state(root).get("submitted") == []
-                               and json.loads((root / "registry/worker/agent.json").read_text(
+                               and json.loads((root / "registry/agents/worker/agent.json").read_text(
                                    encoding="utf-8")).get("lifecycle") == "launch_failed"
                                for root in (failed.python_root, failed.rust_root)),
                        f"{label} became a verified Muse launch: {outcomes!r}")
@@ -1590,7 +1590,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
             "--cwd", "<ROOT>", "--harness", "muse", "--session", "session-1", *_COMMON,
         ), 75)
         report.require(f"primary/adopt/muse/refuse-{label}-atomic", all(
-            not (root / "registry/foreign").exists()
+            not (root / "registry/agents/foreign").exists()
             and not _state(root).get("closed")
             and not any(call[:2] in (["agent", "prompt"], ["pane", "send-text"],
                                      ["pane", "send-keys"], ["pane", "report-agent"],
@@ -1619,7 +1619,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
                        and record.get("adapter") == "herdr-foreign"
                        and isinstance(record.get("harness_identity"), dict)
                        and _valid_foreign_shell_identity(record.get("foreign_shell_identity"))
-                       and all(json.loads((root / "registry/foreign/agent.json").read_text(
+                       and all(json.loads((root / "registry/agents/foreign/agent.json").read_text(
                            encoding="utf-8")).get("custom_process_identity") is None
                            for root in (case.python_root, case.rust_root)),
                        f"adoption changed ownership or omitted mandatory Muse pins: {record!r}")
@@ -1634,7 +1634,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
         report.require(f"primary/adopt/muse/{label}/guarded-receipt", all(
             _submission_count(root, "foreign Muse literal mentions Auto-review\nsecond line") == 1
             and _state(root).get("paste_wrapped") is True
-            and (root / "registry/foreign/queue/processed/foreign-muse.json").is_file()
+            and (root / "registry/agents/foreign/queue/processed/foreign-muse.json").is_file()
             and not any(call[:2] in (["agent", "prompt"], ["pane", "report-agent"],
                                      ["agent", "rename"], ["tab", "rename"])
                         for call in _fixture_calls(root))
@@ -1650,12 +1650,12 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
         ), 75)
         report.require(f"primary/adopt/muse/{label}/yolo-no-input", all(
             _submission_count(root, "must not bypass Auto-review") == 0
-            and (root / "registry/foreign/queue/inbox/foreign-yolo.json").is_file()
-            and not (root / "registry/foreign/queue/failed/foreign-yolo.json").exists()
+            and (root / "registry/agents/foreign/queue/inbox/foreign-yolo.json").is_file()
+            and not (root / "registry/agents/foreign/queue/failed/foreign-yolo.json").exists()
             for root in (case.python_root, case.rust_root)),
             "foreign Muse delivery ignored Auto-review policy")
         for root in (case.python_root, case.rust_root):
-            (root / "registry/foreign/queue/inbox/foreign-yolo.json").unlink()
+            (root / "registry/agents/foreign/queue/inbox/foreign-yolo.json").unlink()
         _change(case, {"custom_permission": "Auto-review",
                        "fixture_shell_pid": harness.replacement_shell.pid})
         outcomes = harness.invoke(case, ("send", "foreign", "must not cross shell generation",
@@ -1673,7 +1673,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
         report.require(f"primary/adopt/muse/{label}/runtime-preserved",
                        isinstance(result, dict) and result.get("runtime_preserved") is True
                        and all(not _state(root).get("closed")
-                               and not (root / "registry/foreign").exists()
+                               and not (root / "registry/agents/foreign").exists()
                                and len(list((root / "registry/archive").glob("*/agent.json"))) == 1
                                for root in (case.python_root, case.rust_root)),
                        f"foreign Muse unregister closed or discarded its runtime: {result!r}")
@@ -1723,14 +1723,14 @@ def _muse14_status(harness: Harness, report: Report) -> None:
         # Test the declared queue chronology, not whether two wall-clock reads
         # happened to move forward. Names deliberately sort opposite to arrival.
         for root in (case.python_root, case.rust_root):
-            path = root / "registry/foreign/queue/inbox" / f"{1 - index}-muse14-{label}.json"
+            path = root / "registry/agents/foreign/queue/inbox" / f"{1 - index}-muse14-{label}.json"
             document = json.loads(path.read_text())
             document["queued_at"] = 100.0 + index
             path.write_text(json.dumps(document) + "\n")
     report.require("primary/muse14/held-without-input", all(
         not any(call[:2] in (["agent", "prompt"], ["pane", "send-text"], ["pane", "send-keys"])
                 for call in _fixture_calls(root))
-        and len(list((root / "registry/foreign/queue/inbox").glob("*.json"))) == 2
+        and len(list((root / "registry/agents/foreign/queue/inbox").glob("*.json"))) == 2
         for root in (case.python_root, case.rust_root)), "a paused or staged Muse editor took input")
     _change(case, {"status": "idle", "screen": ""})
     _pair(harness, report, case, "primary/muse14/resumed-drain", ("drain", "foreign", *_COMMON))
@@ -1772,20 +1772,20 @@ def _muse_busy_followup(harness: Harness, report: Report) -> None:
     report.require("primary/muse-busy/python-waits-for-idle",
                    python.returncode == 75
                    and _submission_count(case.python_root, prompt) == 0
-                   and (case.python_root / "registry/foreign/queue/inbox/busy.json").is_file(),
+                   and (case.python_root / "registry/agents/foreign/queue/inbox/busy.json").is_file(),
                    f"Python typed into a busy Muse or lost the prompt: {python!r}")
     report.require("primary/muse-busy/rust-steers-once",
                    rust.returncode == 0
                    and _submission_count(case.rust_root, prompt) == 1
                    and _state(case.rust_root).get("paste_wrapped") is True
-                   and (case.rust_root / "registry/foreign/queue/processed/busy.json").is_file(),
+                   and (case.rust_root / "registry/agents/foreign/queue/processed/busy.json").is_file(),
                    f"Rust did not steer the busy Muse exactly once: {rust!r}")
     _change(case, {"status": "idle", "custom_busy": False, "custom_submitted": False,
                    "custom_draft": ""})
     harness.invoke(case, ("drain", "foreign", *_COMMON))
     report.require("primary/muse-busy/delivered-once-each",
                    all(_submission_count(root, prompt) == 1
-                       and (root / "registry/foreign/queue/processed/busy.json").is_file()
+                       and (root / "registry/agents/foreign/queue/processed/busy.json").is_file()
                        for root in (case.python_root, case.rust_root)),
                    "the idle drain lost or repeated the busy-time prompt")
     _retire_fixture_processes(case)
@@ -1811,7 +1811,7 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
     _pair(harness, report, case, "primary/handoff/drain", ("drain", "worker", *_COMMON))
     report.require("primary/handoff/pending-once", all(_state(root).get("submitted") == ["queued before handoff"]
                    for root in (case.python_root, case.rust_root)) and
-                   _queue_snapshot(case.python_root, "registry/worker/queue") == _queue_snapshot(case.rust_root, "registry/worker/queue"),
+                   _queue_snapshot(case.python_root, "registry/agents/worker/queue") == _queue_snapshot(case.rust_root, "registry/agents/worker/queue"),
                    "resume lost, duplicated, or changed the pending request")
     _change(case, {"run_mode": "fail"})
     _pair(harness, report, case, "primary/handoff/ambiguous",
@@ -1820,7 +1820,7 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
     _pair(harness, report, case, "primary/handoff/no-replay", ("drain", "worker", *_COMMON))
     report.require("primary/handoff/uncertain-retained", all(
         _state(root).get("submitted") == ["queued before handoff", "uncertain request"]
-        and (root / "registry/worker/queue/failed/uncertain.json").exists()
+        and (root / "registry/agents/worker/queue/failed/uncertain.json").exists()
         for root in (case.python_root, case.rust_root)), "uncertain work was replayed or discarded")
 
 
@@ -1852,8 +1852,8 @@ def _queue_lanes(harness: Harness, report: Report) -> None:
     both(rust, "primary/lanes/send-cancelled", ("send", "worker", "cancelled prompt", "--ttl", "3600",
                                                  "--message-id", "gone", "--ready-timeout", "0", *_COMMON), 75)
     report.require("primary/lanes/second-inbox", all(
-        (root / "registry/worker/queue/inbox.v2/lane.json").is_file()
-        and not (root / "registry/worker/queue/inbox/lane.json").exists() for root in roots),
+        (root / "registry/agents/worker/queue/inbox.v2/lane.json").is_file()
+        and not (root / "registry/agents/worker/queue/inbox/lane.json").exists() for root in roots),
         "a prompt with --ttl did not go to inbox.v2/")
     outcomes = both(rust, "primary/lanes/cancel", ("cancel", "worker", "gone", "--reason", "superseded", *_COMMON), 0)
     report.require("primary/lanes/cancel-set-aside", all(
@@ -1872,20 +1872,20 @@ def _queue_lanes(harness: Harness, report: Report) -> None:
     both(rust, "primary/lanes/rust-drain", ("drain", "worker", *_COMMON), 0)
     report.require("primary/lanes/rust-typed-once", all(
         _state(root).get("submitted") == ["expiring prompt"]
-        and (root / "registry/worker/queue/processed/lane.json").is_file()
-        and (root / "registry/worker/queue/cancelled/gone.json").is_file() for root in roots),
+        and (root / "registry/agents/worker/queue/processed/lane.json").is_file()
+        and (root / "registry/agents/worker/queue/cancelled/gone.json").is_file() for root in roots),
         "the Rust drain did not type the expiring prompt once, or the cancelled one left cancelled/")
 
 
 def _registry_and_interop(harness: Harness, report: Report) -> None:
     defaults = harness.case("primary-default-registry")
     _pair(harness, report, defaults, "primary/default-registry/start", ("start", "worker", "--herdr-bin", "<HERDR>"))
-    report.require("primary/default-registry/location", all((root / ".agentctl/worker/agent.json").is_file()
+    report.require("primary/default-registry/location", all((root / ".agentctl/agents/worker/agent.json").is_file()
                    for root in (defaults.python_root, defaults.rust_root)), "default registry was not .agentctl")
     older = harness.case("primary-record-defaults")
     if _start(harness, report, older, "primary/old-record/start"):
         for root in (older.python_root, older.rust_root):
-            path = root / "registry/worker/agent.json"
+            path = root / "registry/agents/worker/agent.json"
             record = json.loads(path.read_text(encoding="utf-8"))
             for key in ("adapter", "mode", "backend", "paused", "runtime_home"):
                 record.pop(key, None)
@@ -1906,14 +1906,14 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
             _pair(harness, report, case, label + "/start", command("start", "worker"))
             _pair(harness, report, case, label + "/status", command("status", "worker"))
             report.require(label + "/default-record", all(
-                (root / "chosen/worker/agent.json").is_file() and not (root / ".agentctl").exists()
+                (root / "chosen/agents/worker/agent.json").is_file() and not (root / ".agentctl").exists()
                 and _state(root).get("launch_arguments") == ["--no-alt-screen"]
                 for root in (case.python_root, case.rust_root)), "registry alias/placement or native defaults changed")
     for label, producer, consumer in (("python-rust", harness.python, harness.rust), ("rust-python", harness.rust, harness.python)):
         case = harness.case(f"primary/interop/{label}")
         root = case.python_root
         started = harness._invoke_one(producer, root, ("start", "worker", *_COMMON))
-        path = root / "registry/worker/agent.json"
+        path = root / "registry/agents/worker/agent.json"
         if path.exists():
             record = json.loads(path.read_text(encoding="utf-8"))
             record["extension_metadata"] = {"purpose": "review", "labels": ["persistent"]}
@@ -1935,7 +1935,12 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
 
 
 def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None:
-    """Read and drain one literal pre-profile adopted record and queue artifact."""
+    """Read and drain one literal pre-profile adopted record and queue artifact.
+
+    The record sits in registry layout 1 (``registry/foreign``), as every build before #593
+    registry-agents-subdir wrote it. ``status`` reads it in place; ``drain`` writes, so both
+    editions first move it to layout 2 (``registry/agents/foreign``), identically.
+    """
 
     case = harness.case("primary-legacy-adopted-registry")
     # The field set is derived from AgentRecord in pre-profile revision
@@ -2042,17 +2047,43 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
         and queue_after_status == queue_before_status,
         "status rewrote the pre-profile record, binding, or queue",
     )
-    _pair(
-        harness, report, case, "primary/legacy-adopted/drain",
-        ("drain", "foreign", *_COMMON),
+    drained = harness.invoke(case, ("drain", "foreign", *_COMMON))
+    # The migration notice names each edition's own registry path.
+    notices = [
+        outcome.stderr.replace(str(root), "<ROOT>")
+        for outcome, root in zip(drained, (case.python_root, case.rust_root), strict=True)
+    ]
+    report.require(
+        "primary/legacy-adopted/drain",
+        drained[0].returncode == drained[1].returncode == 0
+        and _json(drained[0]) == _json(drained[1])
+        and notices[0] == notices[1],
+        f"editions disagree on draining a layout-1 agent: {drained!r}",
+    )
+    tripwires = [root / "registry/agents/agent.json" for root in (case.python_root, case.rust_root)]
+    report.require(
+        "primary/legacy-adopted/layout-migrated",
+        all(
+            not (root / "registry/foreign").exists()
+            and (root / "registry/agents/foreign/agent.json").is_file()
+            and not (root / "registry/.foreign.lock").exists()
+            and not (root / "registry/.foreign.rank.lock").exists()
+            for root in (case.python_root, case.rust_root)
+        )
+        and all(path.is_file() for path in tripwires)
+        and tripwires[0].read_bytes() == tripwires[1].read_bytes()
+        and isinstance(json.loads(tripwires[0].read_text(encoding="utf-8")), str)
+        and all("registry layout 2" in outcome.stderr for outcome in drained),
+        "a write did not move the layout-1 agent, or the editions moved it differently: "
+        f"{drained!r}",
     )
     snapshots = [
-        _queue_snapshot(root, "registry/foreign/queue")
+        _queue_snapshot(root, "registry/agents/foreign/queue")
         for root in (case.python_root, case.rust_root)
     ]
     immutable_after_drain = [
         {
-            relative: (root / "registry/foreign" / relative).read_bytes()
+            relative: (root / "registry/agents/foreign" / relative).read_bytes()
             for relative in immutable_paths
         }
         for root in (case.python_root, case.rust_root)
@@ -2061,8 +2092,8 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     report.require(
         "primary/legacy-adopted/drained-once",
         all(_state(root).get("submitted") == ["legacy fifo"]
-            and not list((root / "registry/foreign/queue/inbox").iterdir())
-            and (root / "registry/foreign/queue/processed/000000000007.json").is_file()
+            and not list((root / "registry/agents/foreign/queue/inbox").iterdir())
+            and (root / "registry/agents/foreign/queue/processed/000000000007.json").is_file()
             for root in (case.python_root, case.rust_root))
         and immutable_after_drain == immutable_before
         and snapshots[0] == snapshots[1]
@@ -2085,7 +2116,7 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     report.require(
         "primary/legacy-adopted/dead-stop-preserved",
         all(
-            (root / "registry/foreign/agent.json").is_file()
+            (root / "registry/agents/foreign/agent.json").is_file()
             and not _state(root).get("closed")
             and not _state(root).get("closed_panes")
             for root in (case.python_root, case.rust_root)
@@ -2098,7 +2129,7 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     for command, root in (
         (harness.python, case.python_root), (harness.rust, case.rust_root),
     ):
-        record_path = root / "registry/foreign/agent.json"
+        record_path = root / "registry/agents/foreign/agent.json"
         digest = hashlib.sha256(record_path.read_bytes()).hexdigest()
         capture_failures.append(harness._invoke_one(command, root, (
             "stop", "foreign", "--recover-legacy-adoption",
@@ -2109,7 +2140,7 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     report.require(
         "primary/legacy-adopted/capture-failure-is-busy",
         all(outcome.returncode == 75 for outcome in capture_failures)
-        and all((root / "registry/foreign/agent.json").is_file()
+        and all((root / "registry/agents/foreign/agent.json").is_file()
                 for root in (case.python_root, case.rust_root)),
         f"legacy recovery capture failures did not preserve delivery classification: {capture_failures!r}",
     )
@@ -2120,7 +2151,7 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     for command, root in (
         (harness.python, case.python_root), (harness.rust, case.rust_root),
     ):
-        record_path = root / "registry/foreign/agent.json"
+        record_path = root / "registry/agents/foreign/agent.json"
         digest = hashlib.sha256(record_path.read_bytes()).hexdigest()
         outcome = harness._invoke_one(command, root, (
             "stop", "foreign", "--recover-legacy-adoption",
@@ -2147,7 +2178,7 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     report.require(
         "primary/legacy-adopted/recovery-preserves-bytes-and-runtime",
         all(
-            not (root / "registry/foreign").exists()
+            not (root / "registry/agents/foreign").exists()
             and not _state(root).get("closed")
             and not _state(root).get("closed_panes")
             and len(list((root / "registry/archive").glob("*/agent.json"))) == 1
@@ -2181,7 +2212,7 @@ def _ownership(harness: Harness, report: Report) -> None:
             _pair(harness, report, case, f"primary/ownership/{label}/status", ("status", "worker", *_COMMON))
             outcomes = harness.invoke(case, ("stop", "worker", *_COMMON))
             report.require(f"primary/ownership/{label}/stop-refusal", all(outcome.returncode == 69 for outcome in outcomes)
-                           and all((root / "registry/worker/agent.json").exists() and not _state(root).get("closed")
+                           and all((root / "registry/agents/worker/agent.json").exists() and not _state(root).get("closed")
                            for root in (case.python_root, case.rust_root)), f"uncertain identity was retired: {outcomes!r}")
 
 
@@ -2225,7 +2256,7 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
     tokens: list[str] = []
     digests: list[str] = []
     for root in (case.python_root, case.rust_root):
-        directory = root / "registry/foreign"
+        directory = root / "registry/agents/foreign"
         path = directory / "agent.json"
         document = _record_document(path)
         token = document["token"]
@@ -2296,7 +2327,7 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
         ), f"invalid retirement syntax did not refuse with advice: {outcomes!r}")
     for label, change in (("token", "token"), ("same-token-raw-bytes", "format")):
         for index, (_command, root) in enumerate(consumers):
-            path = root / "registry/foreign/agent.json"
+            path = root / "registry/agents/foreign/agent.json"
             content = originals[index]["agent.json"]
             if change == "token":
                 document = _record_document(path)
@@ -2313,12 +2344,12 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
             outcome.returncode == 75
             and (arguments := _stop_recovery_arguments(outcome)) is not None
             and arguments[-1] == "doctor" for outcome in outcomes
-        ) and all((root / "registry/foreign/agent.json").is_file()
+        ) and all((root / "registry/agents/foreign/agent.json").is_file()
                   and _fixture_calls(root) == calls[index]
                   for index, (_command, root) in enumerate(consumers)),
                        f"stale command acquired new record authority: {outcomes!r}")
         for index, (_command, root) in enumerate(consumers):
-            (root / "registry/foreign/agent.json").write_bytes(originals[index]["agent.json"])
+            (root / "registry/agents/foreign/agent.json").write_bytes(originals[index]["agent.json"])
     retired = [
         harness._invoke_one(command, root, arguments[1:]) if arguments is not None
         else Outcome(1, "", "missing captured command")
@@ -2340,7 +2371,7 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
     report.require("primary/dead-adopted/result-parity", values[0] == values[1],
                    f"retirement result schema differs: {values!r}")
     report.require("primary/dead-adopted/whole-original-preserved", all(
-        not (root / "registry/foreign").exists()
+        not (root / "registry/agents/foreign").exists()
         and len(archived := list((root / "registry/archive").glob("*/agent.json"))) == 1
         and all((archived[0].parent / relative).read_bytes() == content
                 for relative, content in originals[index].items())
@@ -2357,7 +2388,7 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
             continue
         assertions: list[tuple[str, str]] = []
         for root in (guarded.python_root, guarded.rust_root):
-            path = root / "registry/foreign/agent.json"
+            path = root / "registry/agents/foreign/agent.json"
             document = _record_document(path)
             if label == "unknown-image":
                 identity = document.get("harness_identity")
@@ -2389,7 +2420,7 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
             outcome.returncode == 75
             and (arguments := _stop_recovery_arguments(outcome)) is not None
             and arguments[-1] == "doctor" for outcome in outcomes
-        ) and all((root / "registry/foreign/agent.json").is_file()
+        ) and all((root / "registry/agents/foreign/agent.json").is_file()
                   and _fixture_calls(root) == before[index]
                   for index, root in enumerate((guarded.python_root, guarded.rust_root))),
                        f"{label} record was retired or queried Herdr: {outcomes!r}")
@@ -2406,13 +2437,13 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     report.require(
         "primary/managed-dead/token-required",
         all(outcome.returncode == 75 for outcome in refused)
-        and all((root / "registry/worker/agent.json").is_file()
+        and all((root / "registry/agents/worker/agent.json").is_file()
                 and not _state(root).get("closed_panes")
                 for root in (case.python_root, case.rust_root)),
         f"managed-dead retirement did not require a token: {refused!r}",
     )
     tokens = [
-        json.loads((root / "registry/worker/agent.json").read_text(encoding="utf-8"))["token"]
+        json.loads((root / "registry/agents/worker/agent.json").read_text(encoding="utf-8"))["token"]
         for root in (case.python_root, case.rust_root)
     ]
     recovery_arguments = [_stop_recovery_arguments(outcome) for outcome in refused]
@@ -2430,7 +2461,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     )
     original_records: list[tuple[Path, bytes]] = []
     for root in (case.python_root, case.rust_root):
-        path = root / "registry/worker/agent.json"
+        path = root / "registry/agents/worker/agent.json"
         original = path.read_bytes()
         original_records.append((path, original))
         document = json.loads(original)
@@ -2453,7 +2484,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
             and not _option_values(arguments, "--expected-token")
             for outcome in stale_retries
         )
-        and all((root / "registry/worker/agent.json").is_file()
+        and all((root / "registry/agents/worker/agent.json").is_file()
                 and not _state(root).get("closed_panes")
                 for root in (case.python_root, case.rust_root)),
         f"stale advice acquired a replacement generation: {stale_retries!r}",
@@ -2475,7 +2506,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     report.require(
         "primary/managed-dead/capture-failure-is-busy",
         all(outcome.returncode == 75 for outcome in capture_failures)
-        and all((root / "registry/worker/agent.json").is_file()
+        and all((root / "registry/agents/worker/agent.json").is_file()
                 for root in (case.python_root, case.rust_root)),
         f"managed-dead capture failures did not preserve delivery classification: {capture_failures!r}",
     )
@@ -2494,7 +2525,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     report.require(
         "primary/managed-dead/procfs-failure-is-busy",
         all(outcome.returncode == 75 for outcome in proof_failures)
-        and all((root / "registry/worker/agent.json").is_file()
+        and all((root / "registry/agents/worker/agent.json").is_file()
                 for root in (case.python_root, case.rust_root)),
         f"managed-dead procfs failures diverged: {proof_failures!r}",
     )
@@ -2516,7 +2547,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     report.require(
         "primary/managed-dead/process-info-failure-is-busy",
         all(outcome.returncode == 75 for outcome in control_failures)
-        and all((root / "registry/worker/agent.json").is_file()
+        and all((root / "registry/agents/worker/agent.json").is_file()
                 for root in (case.python_root, case.rust_root)),
         f"managed-dead process-info failures diverged: {control_failures!r}",
     )
@@ -2524,7 +2555,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     for field, value in (("mode", "headless"), ("backend", "tmux")):
         original_documents: list[tuple[Path, dict[str, object]]] = []
         for root in (case.python_root, case.rust_root):
-            path = root / "registry/worker/agent.json"
+            path = root / "registry/agents/worker/agent.json"
             document = json.loads(path.read_text(encoding="utf-8"))
             original_documents.append((path, document.copy()))
             document[field] = value
@@ -2550,7 +2581,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
         for path, document in original_documents:
             path.write_text(json.dumps(document), encoding="utf-8")
     for root in (case.python_root, case.rust_root):
-        path = root / "registry/worker/agent.json"
+        path = root / "registry/agents/worker/agent.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         document["lifecycle"] = "stopping"
         path.write_text(json.dumps(document), encoding="utf-8")
@@ -2573,7 +2604,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
         f"unproved stopping generation was retired: {stopping!r}",
     )
     for root in (case.python_root, case.rust_root):
-        path = root / "registry/worker/agent.json"
+        path = root / "registry/agents/worker/agent.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         document["lifecycle"] = "running"
         path.write_text(json.dumps(document), encoding="utf-8")
@@ -2590,7 +2621,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
         and _json(outcomes[0]) == _json(outcomes[1])
         and all(
             _state(root).get("closed_panes") == ["w1:p1"]
-            and not (root / "registry/worker").exists()
+            and not (root / "registry/agents/worker").exists()
             and len(list((root / "registry/archive").glob("*/output.json"))) == 1
             for root in (case.python_root, case.rust_root)
         ),
@@ -2618,7 +2649,7 @@ def _stop_recovery_quoted_globals(harness: Harness, report: Report) -> None:
     refused = harness.invoke(case, ("stop", "worker", *common))
     commands = [_stop_recovery_arguments(outcome) for outcome in refused]
     tokens = [
-        json.loads((root / registry / "worker/agent.json").read_text(encoding="utf-8"))["token"]
+        json.loads((root / registry / "agents/worker/agent.json").read_text(encoding="utf-8"))["token"]
         for root in (case.python_root, case.rust_root)
     ]
     report.require(
@@ -2643,7 +2674,7 @@ def _stop_recovery_quoted_globals(harness: Harness, report: Report) -> None:
     report.require(
         "primary/stop/quoted-globals/execute",
         all(outcome.returncode == 0 for outcome in recovered)
-        and all(not (root / registry / "worker").exists()
+        and all(not (root / registry / "agents/worker").exists()
                 and _state(root).get("closed_panes") == ["w1:p1"]
                 and len(list((root / registry / "archive").glob("*/agent.json"))) == 1
                 for root in (case.python_root, case.rust_root)),
@@ -2692,7 +2723,7 @@ def _adoption(harness: Harness, report: Report) -> None:
                    and stopped.get("tab_closed") is False
                    and all(not _state(root).get("closed")
                            and not _state(root).get("closed_panes")
-                           and not (root / "registry/foreign").exists()
+                           and not (root / "registry/agents/foreign").exists()
                            and len(list((root / "registry/archive").glob("*/agent.json"))) == 1
                            and len(list((root / "registry/archive").glob(
                                "*/queue/processed/adopted-1.json"))) == 1
@@ -2735,7 +2766,7 @@ def _adoption(harness: Harness, report: Report) -> None:
             all(
                 not _state(root).get("closed")
                 and not _state(root).get("closed_panes")
-                and (root / "registry/foreign").exists() == (expected != 0)
+                and (root / "registry/agents/foreign").exists() == (expected != 0)
                 for root in (retirement.python_root, retirement.rust_root)
             ),
             f"foreign runtime mutation or registry outcome diverged for {label}",
@@ -2766,7 +2797,7 @@ def _adoption(harness: Harness, report: Report) -> None:
         report.require(
             f"primary/adopt/{label}/preserved",
             all(
-                (root / "registry/foreign/agent.json").is_file()
+                (root / "registry/agents/foreign/agent.json").is_file()
                 and not _state(root).get("closed")
                 and not _state(root).get("closed_panes")
                 for root in (replacement_case.python_root, replacement_case.rust_root)
@@ -2780,7 +2811,7 @@ def _adoption(harness: Harness, report: Report) -> None:
         "--cwd", "<ROOT>", "--harness", "codex", "--session", "session-1", *common,
     ))
     for root in (legacy_live.python_root, legacy_live.rust_root):
-        path = root / "registry/foreign/agent.json"
+        path = root / "registry/agents/foreign/agent.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         del document["foreign_shell_identity"]
         path.write_text(json.dumps(document), encoding="utf-8")
@@ -2795,7 +2826,7 @@ def _adoption(harness: Harness, report: Report) -> None:
     report.require(
         "primary/adopt/live-legacy/preserved",
         all(
-            (root / "registry/foreign/agent.json").is_file()
+            (root / "registry/agents/foreign/agent.json").is_file()
             and not _state(root).get("closed")
             and not _state(root).get("closed_panes")
             for root in (legacy_live.python_root, legacy_live.rust_root)
@@ -2825,7 +2856,7 @@ def _adoption(harness: Harness, report: Report) -> None:
         outcomes = harness.invoke(mismatch, arguments)
         report.require(f"primary/adopt/refuse-{label}", all(
             outcome.returncode == 75 for outcome in outcomes
-        ) and all(not (root / "registry/foreign").exists()
+        ) and all(not (root / "registry/agents/foreign").exists()
                   and not _state(root).get("closed")
                   for root in (mismatch.python_root, mismatch.rust_root)),
             f"identity mismatch was adopted or mutated: {outcomes!r}")
@@ -2878,8 +2909,8 @@ def _identity_and_rename(harness: Harness, report: Report) -> None:
     _pair(harness, report, case, "identity/rename", ("rename", "worker", "reviewer", *common))
     report.require("identity/rename-presentation", all(
         _state(root).get("name") == "reviewer" and _state(root).get("tab_label") == "reviewer"
-        and (root / "registry" / "reviewer" / "agent.json").exists()
-        and not (root / "registry" / "worker").exists()
+        and (root / "registry" / "agents" / "reviewer" / "agent.json").exists()
+        and not (root / "registry" / "agents" / "worker").exists()
         for root in (case.python_root, case.rust_root)), "rename left a stale name or label")
     _pair(harness, report, case, "identity/send-renamed", ("send", "reviewer", "after rename", *common))
     report.require("identity/send-renamed-delivered", all(
@@ -2916,8 +2947,8 @@ def _identity_and_rename(harness: Harness, report: Report) -> None:
         crashed = harness._invoke_one(first, root, ("rename", "reviewer", "lead", *common))
         blocked = harness._invoke_one(second, root, ("send", "lead", "blocked", *common))
         finished = harness._invoke_one(second, root, ("rename", "reviewer", "lead", *common))
-        record = json.loads((root / "registry" / "lead" / "agent.json").read_text(encoding="utf-8")) \
-            if (root / "registry" / "lead" / "agent.json").exists() else {}
+        record = json.loads((root / "registry" / "agents" / "lead" / "agent.json").read_text(encoding="utf-8")) \
+            if (root / "registry" / "agents" / "lead" / "agent.json").exists() else {}
         history = record.get("name_history", []) if isinstance(record, dict) else []
         report.require(f"identity/cross-recovery/{root.parent.name}",
                        crashed.returncode != 0 and blocked.returncode != 0
@@ -2990,6 +3021,135 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
                    for root in (case.python_root, case.rust_root)), "invalid syntax created persistent state")
 
 
+def _seed_layout_one(root: Path, names: Sequence[str]) -> None:
+    """A registry in layout 1, as builds before #593 registry-agents-subdir wrote it: one
+    directory per agent beside the fixed files, and two lock files per agent."""
+    registry = root / "registry"
+    registry.mkdir(mode=0o700, exist_ok=True)
+    registry.chmod(0o700)
+    for name in names:
+        directory = registry / name
+        directory.mkdir(mode=0o700)
+        # The pre-profile record shape of _legacy_adopted_registry_and_queue.
+        record = {
+            "name": name, "token": f"{name}-token", "harness": "codex", "cwd": str(root),
+            "created_at": 1.0, "schema": 1, "lifecycle": "running", "workspace_id": "w1",
+            "tab_id": "w1:t1", "pane_id": f"w1:p-{name}", "session_agent": "codex",
+            "session_value": f"session-{name}", "model": None, "resume": None, "arguments": [],
+            "error": None, "goal": None, "goal_delivery": None, "goal_session_id": None,
+            "goal_command": None, "goal_messages": {}, "goal_message_id": None,
+            "adapter": "herdr-foreign", "mode": "interactive", "backend": "herdr",
+            "paused": False, "runtime_home": None,
+        }
+        (directory / "agent.json").write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+        (directory / "agent.json").chmod(0o600)
+        for lock in (f".{name}.lock", f".{name}.rank.lock"):
+            (registry / lock).write_bytes(b"")
+            (registry / lock).chmod(0o600)
+    for fixed in (".identity.lock", ".coordinator.lock", ".gone.lock"):
+        (registry / fixed).write_bytes(b"")
+        (registry / fixed).chmod(0o600)
+
+
+def _layout_report(outcome: Outcome, root: Path) -> object:
+    """A migrate-layout report with the edition's own registry path normalized."""
+    value = _json(outcome)
+    if isinstance(value, dict) and isinstance(value.get("registry"), str):
+        value = {**value, "registry": value["registry"].replace(str(root), "<ROOT>")}
+    return value
+
+
+def _top_level(root: Path) -> list[str]:
+    return sorted(path.name for path in (root / "registry").iterdir())
+
+
+def _registry_layout_migration(harness: Harness, report: Report) -> None:
+    """Both editions migrate a layout-1 registry identically, idempotently, and read each
+    other's result (#593 registry-agents-subdir)."""
+    case = harness.case("primary-registry-layout-migration")
+    roots = (case.python_root, case.rust_root)
+    for root in roots:
+        _seed_layout_one(root, ("alpha", "beta"))
+    dry = harness.invoke(case, ("migrate-layout", *_COMMON))
+    dry_reports = [_layout_report(outcome, root) for outcome, root in zip(dry, roots, strict=True)]
+    report.require(
+        "primary/layout/dry-run",
+        all(outcome.returncode == 0 for outcome in dry)
+        and dry_reports[0] == dry_reports[1]
+        and isinstance(dry_reports[0], dict)
+        and dry_reports[0].get("would_move") == ["alpha", "beta"]
+        and dry_reports[0].get("would_remove_lock_files") == 5
+        and dry_reports[0].get("layout_before") == "1"
+        and all((root / "registry/alpha/agent.json").is_file() and not (root / "registry/agents").exists()
+                for root in roots),
+        f"the dry runs differ or changed the registry: {dry!r}",
+    )
+    applied = harness.invoke(case, ("migrate-layout", "--apply", *_COMMON))
+    applied_reports = [_layout_report(outcome, root) for outcome, root in zip(applied, roots, strict=True)]
+    report.require(
+        "primary/layout/apply",
+        all(outcome.returncode == 0 for outcome in applied)
+        and applied_reports[0] == applied_reports[1]
+        and isinstance(applied_reports[0], dict)
+        and applied_reports[0].get("moved") == ["alpha", "beta"]
+        and applied_reports[0].get("removed_lock_files") == 5
+        and applied_reports[0].get("layout") == "2"
+        and all(_top_level(root) == [".coordinator.lock", ".identity.lock", ".renames", "agents", "locks"]
+                for root in roots)
+        and (case.python_root / "registry/.renames/upgrade-agentctl-registry-layout-2").read_bytes()
+        == (case.rust_root / "registry/.renames/upgrade-agentctl-registry-layout-2").read_bytes()
+        and (case.python_root / "registry/agents/agent.json").read_bytes()
+        == (case.rust_root / "registry/agents/agent.json").read_bytes()
+        and all(
+            (root / "registry/agents/alpha/agent.json").read_bytes()
+            == json.dumps(json.loads((root / "registry/agents/alpha/agent.json").read_text(encoding="utf-8")),
+                          sort_keys=True).encode() + b"\n"
+            for root in roots
+        ),
+        f"the editions migrated differently: {applied!r}",
+    )
+    again = harness.invoke(case, ("migrate-layout", "--apply", *_COMMON))
+    again_reports = [_layout_report(outcome, root) for outcome, root in zip(again, roots, strict=True)]
+    report.require(
+        "primary/layout/idempotent",
+        all(outcome.returncode == 0 for outcome in again)
+        and again_reports[0] == again_reports[1]
+        and isinstance(again_reports[0], dict)
+        and again_reports[0].get("moved") == []
+        and again_reports[0].get("removed_lock_files") == 0,
+        f"a second migration changed something: {again!r}",
+    )
+    # Each edition reads the registry the other one migrated, and both read layout 1 unmoved.
+    crossed = (
+        harness._invoke_one(harness.rust, case.python_root, ("status", "alpha", *_COMMON)),
+        harness._invoke_one(harness.python, case.rust_root, ("status", "alpha", *_COMMON)),
+    )
+    statuses = [_json(outcome) for outcome in crossed]
+    report.require(
+        "primary/layout/interop",
+        all(isinstance(status, dict) and status.get("name") == "alpha" for status in statuses),
+        f"an edition could not read the registry the other migrated: {crossed!r}",
+    )
+    # A name in both layouts, as an older build creating an agent after the move would leave,
+    # is refused by both editions and never touched by a migration.
+    for root in roots:
+        _seed_layout_one(root, ("alpha",))
+    conflicted = harness.invoke(case, ("migrate-layout", "--apply", *_COMMON))
+    conflict_reports = [_layout_report(outcome, root) for outcome, root in zip(conflicted, roots, strict=True)]
+    refused = harness.invoke(case, ("status", "alpha", *_COMMON))
+    report.require(
+        "primary/layout/conflict",
+        all(outcome.returncode == 1 for outcome in conflicted)
+        and conflict_reports[0] == conflict_reports[1]
+        and isinstance(conflict_reports[0], dict)
+        and conflict_reports[0].get("conflicts") == ["alpha"]
+        and all((root / "registry/alpha/agent.json").is_file()
+                and (root / "registry/agents/alpha/agent.json").is_file() for root in roots)
+        and all(outcome.returncode != 0 and "both registry layouts" in outcome.stderr for outcome in refused),
+        f"a name in both layouts was not refused alike: {conflicted!r} {refused!r}",
+    )
+
+
 def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> Report:
     """Compare the canonical interface through independent executable clients."""
     report = Report()
@@ -3013,6 +3173,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _queue_lanes(harness, report)
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)
+            _registry_layout_migration(harness, report)
             _ownership(harness, report)
             _dead_adopted_retirement(harness, report)
             _managed_dead_recovery(harness, report)

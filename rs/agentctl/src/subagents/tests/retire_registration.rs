@@ -1,7 +1,7 @@
 use super::*;
 
 fn pins(fixture: &Fixture) -> RetireStaleOptions {
-    let bytes = fs::read(fixture.root.join("registry/worker/agent.json")).unwrap();
+    let bytes = fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap();
     let record = fixture.manager().read_record("worker").unwrap();
     RetireStaleOptions {
         expected_token: record.token,
@@ -18,8 +18,8 @@ fn retire_stale_archives_exact_record_and_queue_without_touching_runtime() {
     let fixture = Fixture::new();
     fixture.start(None);
     let options = pins(&fixture);
-    let bytes = fs::read(fixture.root.join("registry/worker/agent.json")).unwrap();
-    let queue = fixture.root.join("registry/worker/queue");
+    let bytes = fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap();
+    let queue = fixture.root.join("registry/agents/worker/queue");
     agent::enqueue(&queue, "preserve, never replay", Some("retained-prompt")).unwrap();
     fixture.client.panes.lock().unwrap().clear();
     let report = fixture
@@ -32,7 +32,7 @@ fn retire_stale_archives_exact_record_and_queue_without_touching_runtime() {
         agent::queued_prompts(&archive.join("queue")).unwrap(),
         ["retained-prompt"]
     );
-    assert!(!fixture.root.join("registry/worker").exists());
+    assert!(!fixture.root.join("registry/agents/worker").exists());
     assert!(fixture.client.closed.lock().unwrap().is_empty());
     assert!(fixture.client.runs.lock().unwrap().is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
@@ -73,7 +73,10 @@ fn retire_stale_refuses_live_rows_wrong_pins_and_unreachable_terminal_server() {
         .manager()
         .retire_stale_registration("worker", &options)
         .is_err());
-    assert!(fixture.root.join("registry/worker/agent.json").exists());
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
     assert!(!fixture.root.join("registry/archive").exists());
 }
 
@@ -90,7 +93,10 @@ fn retire_stale_dry_run_preserves_replaced_pane_and_registration() {
         .retire_stale_registration("worker", &options)
         .unwrap();
     assert_eq!(report["dry_run"], true);
-    assert!(fixture.root.join("registry/worker/agent.json").exists());
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
     assert!(!fixture.root.join("registry/archive").exists());
     assert!(fixture.client.closed.lock().unwrap().is_empty());
 }
@@ -136,7 +142,7 @@ fn retire_stale_requires_exact_pending_revive_and_preserves_every_artifact() {
         .manager()
         .retire_stale_registration("worker", &options)
         .is_err());
-    assert!(fixture.root.join("registry/worker").exists());
+    assert!(fixture.root.join("registry/agents/worker").exists());
     options.expected_revive_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
     let report = fixture
         .manager()
@@ -179,7 +185,10 @@ fn retire_stale_pins_live_candidate_and_resumes_after_journal_archival() {
         .manager()
         .retire_stale_registration("worker", &options)
         .is_err());
-    assert!(fixture.root.join("registry/worker/agent.json").exists());
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
     options.replacement_session = Some("verified-live-session".into());
     let report = fixture
         .manager()
@@ -209,7 +218,7 @@ fn retiring_an_old_generation_never_archives_a_new_registration() {
         .retire_stale_registration("worker", &options)
         .unwrap();
     fixture.start(None);
-    let path = fixture.root.join("registry/worker/agent.json");
+    let path = fixture.root.join("registry/agents/worker/agent.json");
     let before = fs::read(&path).unwrap();
     fixture
         .manager()

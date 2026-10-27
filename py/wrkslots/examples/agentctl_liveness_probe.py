@@ -33,6 +33,12 @@ for this registry only: an agent registered in some other registry looks unregis
 ``reason=no-agentctl-registry`` means the registry directory itself is missing, which says nothing
 about AGENT, so a misconfigured location never looks like "no record".
 
+Active records are read from both agentctl registry layouts: ``REGISTRY/agents/<name>/`` (layout 2)
+and ``REGISTRY/<name>/`` (layout 1, readable until 2026-11-26), skipping the registry's own
+``archive``, ``agents`` and ``locks`` directories. A probe older than layout 2 sees a migrated
+registry's tripwire ``agents/agent.json`` as an unreadable record and answers unverifiable; copy
+this probe again before migrating a registry (#593 registry-agents-subdir).
+
 This is one input to removal, not the whole decision. wrkslots still requires its own census of
 processes using the slot, its time-to-live, and its Git and path checks.
 """
@@ -48,6 +54,8 @@ from pathlib import Path
 from typing import cast
 
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+#: The registry's own directories, never agents (agentctl registry layout 2).
+RESERVED = ("archive", "agents", "locks")
 IDENTITY_KEYS = (
     "custom_process_identity", "foreign_shell_identity", "terminal_identity", "harness_identity",
 )
@@ -185,10 +193,19 @@ def check(agent: str, registry: Path) -> int:
             journal = load_record(path)
             if agent in (journal.get("old"), journal.get("new")):
                 return verdict(agent, 2, "rename-incomplete")
-    active_paths = sorted(
-        path / "agent.json" for path in registry.iterdir()
-        if NAME.fullmatch(path.name) and path.name != "archive" and (path / "agent.json").exists()
-    )
+    # The top level first, then agents/: a migration moves agents from the one to the other, so
+    # an agent that moves between the two listings is still seen in the second.
+    active_paths: list[Path] = []
+    for parent in (registry, registry / "agents"):
+        try:
+            entries = list(parent.iterdir())
+        except FileNotFoundError:
+            continue
+        active_paths.extend(
+            path / "agent.json" for path in entries
+            if NAME.fullmatch(path.name) and path.name not in RESERVED and (path / "agent.json").exists()
+        )
+    active_paths.sort()
     active = matching(active_paths, agent)
     for record in active:
         if identity_alive(record, current_boot):

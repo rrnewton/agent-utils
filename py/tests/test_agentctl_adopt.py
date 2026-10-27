@@ -97,7 +97,7 @@ def test_adopted_agent_supports_named_operations_and_preserves_native_identity(
     assert sessions.bind_session("foreign", "native-session")["source"] == "explicit"
     assert fake.submitted[-1] == "/goal finish adopted work"
 
-    binding = json.loads((tmp_path / "registry/foreign/queue/target.json").read_text())
+    binding = json.loads((tmp_path / "registry/agents/foreign/queue/target.json").read_text())
     assert binding["kind"] == "session"
     assert binding["agent"] == "codex"
     assert binding["value"] == "native-session"
@@ -156,7 +156,7 @@ def test_malformed_foreign_shell_identities_are_rejected(
 ) -> None:
     sessions, _fake, pane = setup_foreign(tmp_path, monkeypatch)
     adopt(sessions, pane, tmp_path)
-    path = sessions.registry / "foreign" / "agent.json"
+    path = sessions.registry / "agents" / "foreign" / "agent.json"
     original = json.loads(path.read_text(encoding="utf-8"))
     identity = original["foreign_shell_identity"]
     assert isinstance(identity, dict)
@@ -335,7 +335,7 @@ def test_stop_refuses_absent_legacy_foreign_record_without_shell_identity(
 ) -> None:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     original = adopt(sessions, pane, tmp_path)
-    path = sessions.registry / "foreign" / "agent.json"
+    path = sessions.registry / "agents" / "foreign" / "agent.json"
     document = json.loads(path.read_text(encoding="utf-8"))
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -356,7 +356,7 @@ def test_stop_refuses_live_legacy_foreign_record_without_shell_identity(
 ) -> None:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     original = adopt(sessions, pane, tmp_path)
-    path = sessions.registry / "foreign" / "agent.json"
+    path = sessions.registry / "agents" / "foreign" / "agent.json"
     document = json.loads(path.read_text(encoding="utf-8"))
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -374,7 +374,7 @@ def prepare_legacy_dead(
 ) -> tuple[str, str, bytes]:
     """Turn one newly adopted fixture into the exact old on-disk shape."""
     original = adopt(sessions, pane, Path(fake.infos[pane].cwd))
-    record_path = sessions.registry / "foreign" / "agent.json"
+    record_path = sessions.registry / "agents" / "foreign" / "agent.json"
     document = json.loads(record_path.read_text(encoding="utf-8"))
     del document["foreign_shell_identity"]
     record_path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
@@ -392,14 +392,14 @@ def test_explicit_legacy_recovery_archives_exact_record_queue_and_output_without
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     original = adopt(sessions, pane, tmp_path)
     sessions.send_session("foreign", "retained request")
-    path = sessions.registry / "foreign" / "agent.json"
+    path = sessions.registry / "agents" / "foreign" / "agent.json"
     document = json.loads(path.read_text(encoding="utf-8"))
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
     raw = path.read_bytes()
     queue_before = {
-        item.relative_to(sessions.registry / "foreign").as_posix(): item.read_bytes()
-        for item in (sessions.registry / "foreign" / "queue").rglob("*")
+        item.relative_to(sessions.registry / "agents" / "foreign").as_posix(): item.read_bytes()
+        for item in (sessions.registry / "agents" / "foreign" / "queue").rglob("*")
         if item.is_file()
     }
     fake.infos[pane] = replace(
@@ -435,7 +435,7 @@ def test_explicit_legacy_recovery_refuses_incomplete_or_mismatched_authority(
 ) -> None:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
-    path = sessions.registry / "foreign" / "agent.json"
+    path = sessions.registry / "agents" / "foreign" / "agent.json"
     if case == "explicit-null":
         document = json.loads(raw)
         document["foreign_shell_identity"] = None
@@ -529,7 +529,7 @@ def test_explicit_legacy_recovery_refuses_identity_or_presentation_change(
         )
 
     assert fake.closed == []
-    assert (sessions.registry / "foreign" / "agent.json").exists()
+    assert (sessions.registry / "agents" / "foreign" / "agent.json").exists()
 
 
 def test_explicit_legacy_recovery_maps_shell_proof_transport_failure_to_busy(
@@ -551,7 +551,7 @@ def test_explicit_legacy_recovery_maps_shell_proof_transport_failure_to_busy(
     assert raised.value.exit_code == 75
     assert "cannot prove supported idle shell generation" in str(raised.value)
     assert fake.closed == []
-    assert (sessions.registry / "foreign" / "agent.json").exists()
+    assert (sessions.registry / "agents" / "foreign" / "agent.json").exists()
 
 
 def test_explicit_legacy_recovery_refuses_record_directory_or_shell_change_during_capture(
@@ -566,12 +566,12 @@ def test_explicit_legacy_recovery_refuses_record_directory_or_shell_change_durin
 
         def changing_read(pane_id: str, *, source: str, lines: int) -> str:
             if mutation == "record":
-                record_path = sessions.registry / "foreign" / "agent.json"
+                record_path = sessions.registry / "agents" / "foreign" / "agent.json"
                 document = json.loads(record_path.read_text())
                 document["future_field"] = "replacement"
                 record_path.write_text(json.dumps(document), encoding="utf-8")
             elif mutation == "directory":
-                active = sessions.registry / "foreign"
+                active = sessions.registry / "agents" / "foreign"
                 displaced = sessions.registry / ".foreign-displaced"
                 if not displaced.exists():
                     active.rename(displaced)
@@ -592,7 +592,7 @@ def test_explicit_legacy_recovery_refuses_record_directory_or_shell_change_durin
                 expected_record_sha256=digest,
             )
         assert fake.closed == []
-        assert (sessions.registry / "foreign").is_dir()
+        assert (sessions.registry / "agents" / "foreign").is_dir()
 
 
 def test_explicit_legacy_recovery_binds_absent_key_and_parsed_record_to_same_bytes(
@@ -600,8 +600,8 @@ def test_explicit_legacy_recovery_binds_absent_key_and_parsed_record_to_same_byt
 ) -> None:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
-    record_path = sessions.registry / "foreign" / "agent.json"
-    output_path = sessions.registry / "foreign" / "output.json"
+    record_path = sessions.registry / "agents" / "foreign" / "agent.json"
+    output_path = sessions.registry / "agents" / "foreign" / "output.json"
     output_path.write_bytes(b'{"prior":"evidence"}\n')
     output_path.chmod(0o600)
     original_read = fake.read
@@ -620,7 +620,7 @@ def test_explicit_legacy_recovery_binds_absent_key_and_parsed_record_to_same_byt
         )
     assert fake.closed == []
     assert output_path.read_bytes() == b'{"prior":"evidence"}\n'
-    assert (sessions.registry / "foreign").is_dir()
+    assert (sessions.registry / "agents" / "foreign").is_dir()
 
 
 def test_explicit_legacy_recovery_rechecks_record_after_output_preparation(
@@ -628,7 +628,7 @@ def test_explicit_legacy_recovery_rechecks_record_after_output_preparation(
 ) -> None:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
-    output_path = sessions.registry / "foreign" / "output.json"
+    output_path = sessions.registry / "agents" / "foreign" / "output.json"
     prior = b'{"prior":"evidence"}\n'
     output_path.write_bytes(prior)
     output_path.chmod(0o600)
@@ -647,7 +647,7 @@ def test_explicit_legacy_recovery_rechecks_record_after_output_preparation(
             changed = True
             document = json.loads(raw)
             document["foreign_shell_identity"] = None
-            agent._atomic_json(str(sessions.registry / "foreign/agent.json"), document)
+            agent._atomic_json(str(sessions.registry / "agents/foreign/agent.json"), document)
         return installed
 
     monkeypatch.setattr(
@@ -664,7 +664,7 @@ def test_explicit_legacy_recovery_rechecks_record_after_output_preparation(
     assert changed is True
     assert fake.closed == []
     assert output_path.read_bytes() == prior
-    assert (sessions.registry / "foreign").is_dir()
+    assert (sessions.registry / "agents" / "foreign").is_dir()
     assert not list((sessions.registry / "archive").glob(f"foreign-{token}"))
 
 
@@ -686,8 +686,8 @@ def test_explicit_legacy_recovery_refuses_oversize_serialized_output(
         )
 
     assert fake.closed == []
-    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
-    assert not (sessions.registry / "foreign/output.json").exists()
+    assert (sessions.registry / "agents/foreign/agent.json").read_bytes() == raw
+    assert not (sessions.registry / "agents/foreign/output.json").exists()
     assert not list((sessions.registry / "archive").glob(f"foreign-{token}"))
 
 
@@ -719,7 +719,7 @@ def test_explicit_legacy_recovery_rename_race_rolls_back_output_exactly(
 ) -> None:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, digest, _raw = prepare_legacy_dead(sessions, fake, pane)
-    output_path = sessions.registry / "foreign" / "output.json"
+    output_path = sessions.registry / "agents" / "foreign" / "output.json"
     prior = b'{\n  "prior": "exact evidence"\n}\n'
     output_path.write_bytes(prior)
     output_path.chmod(0o600)
@@ -742,7 +742,7 @@ def test_explicit_legacy_recovery_rename_race_rolls_back_output_exactly(
         )
     assert output_path.read_bytes() == prior
     assert fake.closed == []
-    assert (sessions.registry / "foreign").is_dir()
+    assert (sessions.registry / "agents" / "foreign").is_dir()
     assert os.path.lexists(sessions.registry / "archive" / f"foreign-{token}")
 
 
@@ -765,7 +765,7 @@ def test_explicit_legacy_recovery_fsync_failure_reports_published_archive(
             expected_record_sha256=digest,
         )
     destination = sessions.registry / "archive" / f"foreign-{token}"
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
     assert (destination / "agent.json").read_bytes() == raw
     assert (destination / "output.json").is_file()
     assert fake.closed == []
@@ -787,7 +787,7 @@ def test_explicit_legacy_recovery_publication_refuses_postproof_directory_swap(
         if not swapped and destination_name.startswith("foreign-"):
             swapped = True
             displaced = sessions.registry / ".foreign-original"
-            active = sessions.registry / source_name
+            active = sessions.registry / "agents" / source_name
             active.rename(displaced)
             active.mkdir(mode=0o700)
             (active / "agent.json").write_bytes((displaced / "agent.json").read_bytes())
@@ -803,7 +803,7 @@ def test_explicit_legacy_recovery_publication_refuses_postproof_directory_swap(
     assert fake.closed == []
     destination = sessions.registry / "archive" / f"foreign-{token}"
     displaced = sessions.registry / ".foreign-original"
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
     assert (destination / "agent.json").is_file()
     assert (displaced / "agent.json").is_file()
     assert (displaced / "output.json").is_file()
@@ -827,7 +827,7 @@ def test_explicit_legacy_recovery_publication_refuses_postproof_record_swap(
             document = json.loads(raw)
             document["goal"] = "replacement record"
             agent._atomic_json(
-                str(sessions.registry / source_name / "agent.json"), document,
+                str(sessions.registry / "agents" / source_name / "agent.json"), document,
             )
         real_rename(source_parent, source_name, destination_parent, destination_name)
 
@@ -842,8 +842,8 @@ def test_explicit_legacy_recovery_publication_refuses_postproof_record_swap(
 
     assert changed is True
     assert fake.closed == []
-    assert (sessions.registry / "foreign").is_dir()
-    assert (sessions.registry / "foreign" / "output.json").is_file()
+    assert (sessions.registry / "agents" / "foreign").is_dir()
+    assert (sessions.registry / "agents" / "foreign" / "output.json").is_file()
     assert not list((sessions.registry / "archive").glob(f"foreign-{token}"))
 
 
@@ -852,7 +852,7 @@ def test_explicit_legacy_recovery_publication_archives_original_after_safe_aba(
 ) -> None:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
-    marker = sessions.registry / "foreign" / "queue" / "pending" / "marker"
+    marker = sessions.registry / "agents" / "foreign" / "queue" / "pending" / "marker"
     marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     marker.write_text("original", encoding="utf-8")
     marker.chmod(0o600)
@@ -867,7 +867,7 @@ def test_explicit_legacy_recovery_publication_archives_original_after_safe_aba(
         if not swapped and destination_name.startswith("foreign-"):
             swapped = True
             held = sessions.registry / ".foreign-held"
-            active = sessions.registry / source_name
+            active = sessions.registry / "agents" / source_name
             active.rename(held)
             active.mkdir(mode=0o700)
             (active / "agent.json").write_bytes(raw)
@@ -922,7 +922,7 @@ def test_explicit_legacy_recovery_preflights_archive_and_snapshot_failures(
                 expected_record_sha256=digest,
             )
         assert fake.closed == []
-        assert (sessions.registry / "foreign" / "agent.json").read_bytes() == raw
+        assert (sessions.registry / "agents" / "foreign" / "agent.json").read_bytes() == raw
 
 
 def test_stop_refuses_shell_generation_change_during_output_capture(
@@ -1222,7 +1222,7 @@ def test_adopt_refuses_live_identity_mismatch_without_registering(
         sessions.adopt("foreign", pane_id=pane, expected_workspace=workspace,
                        expected_cwd=str(cwd), harness="codex", session=session)
 
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
     assert fake.closed == [] and fake.submitted == []
 
 
@@ -1234,7 +1234,7 @@ def test_adopt_refuses_duplicate_pane_and_keeps_first_generation(
     with pytest.raises(AgentDeliveryError, match="already registered as 'foreign'"):
         adopt(sessions, pane, tmp_path, name="second")
     assert sessions.get("foreign").token == original["token"]
-    assert not (sessions.registry / "second").exists()
+    assert not (sessions.registry / "agents" / "second").exists()
 
 
 def test_same_provider_local_session_id_is_allowed_for_different_harnesses(
@@ -1262,7 +1262,7 @@ def test_adopt_refuses_same_harness_session_held_by_headless_record(
 ) -> None:
     sessions, _fake, pane = setup_foreign(tmp_path, monkeypatch)
     sessions._prepare()
-    (sessions.registry / "headless").mkdir(mode=0o700)
+    sessions._create_agent_directory(sessions._directory("headless"))
     sessions._save(AgentRecord(
         "headless", "headless-token", "codex", str(tmp_path), 1.0,
         lifecycle="running", session_value="native-session",
@@ -1271,7 +1271,7 @@ def test_adopt_refuses_same_harness_session_held_by_headless_record(
     ))
     with pytest.raises(AgentDeliveryError, match="already registered as 'headless'"):
         adopt(sessions, pane, tmp_path)
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
 
 
 def test_interactive_start_refuses_resume_claimed_by_adopted_agent(
@@ -1285,7 +1285,7 @@ def test_interactive_start_refuses_resume_claimed_by_adopted_agent(
             "owned", cwd=str(tmp_path), harness="codex",
             resume="native-session",
         )
-    assert not (sessions.registry / "owned").exists()
+    assert not (sessions.registry / "agents" / "owned").exists()
     assert fake.presentations == [presentation]
     assert fake.launched == [] and fake.closed == []
 
@@ -1359,7 +1359,7 @@ def test_adopt_refuses_a_reported_session_visible_in_two_live_panes(
     )
     with pytest.raises(AgentDeliveryError, match="exactly one live pane"):
         adopt(sessions, pane, tmp_path)
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
 
 
 @pytest.mark.parametrize("native_session", [True, False])
@@ -1373,7 +1373,7 @@ def test_adopt_archives_failed_generation_if_identity_changes_after_save(
 
     def changing(pane_id: str) -> AgentPaneInfo:
         info = original(pane_id)
-        if (sessions.registry / "foreign/agent.json").exists():
+        if (sessions.registry / "agents/foreign/agent.json").exists():
             return replace(info, session_agent="codex",
                            session_value="replacement-session")
         return info
@@ -1382,7 +1382,7 @@ def test_adopt_archives_failed_generation_if_identity_changes_after_save(
     with pytest.raises(AgentDeliveryError, match="was not registered"):
         adopt(sessions, pane, tmp_path)
 
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
     archives = list((sessions.registry / "archive").glob(
         "foreign-*-adopt-failed/agent.json"
     ))
@@ -1401,7 +1401,7 @@ def test_adopt_archives_failed_generation_if_shell_changes_after_save(
 
     def changing(pane_id: str) -> CustomProcessIdentity:
         identity = original(pane_id)
-        if (sessions.registry / "foreign/agent.json").exists():
+        if (sessions.registry / "agents/foreign/agent.json").exists():
             return replace(identity, starttime_ticks=identity.starttime_ticks + 1)
         return identity
 
@@ -1409,7 +1409,7 @@ def test_adopt_archives_failed_generation_if_shell_changes_after_save(
     with pytest.raises(AgentDeliveryError, match="was not registered"):
         adopt(sessions, pane, tmp_path)
 
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
     archives = list((sessions.registry / "archive").glob(
         "foreign-*-adopt-failed/agent.json"
     ))
@@ -1430,7 +1430,7 @@ def test_adopt_without_reported_session_can_be_bound_for_native_goal_inspection(
     sessions.bind_session("foreign", "native-session")
     assert sessions.goal("foreign")["native_status"] == "absent"
     sessions.send_session("foreign", "still pane-bound")
-    binding = json.loads((tmp_path / "registry/foreign/queue/target.json").read_text())
+    binding = json.loads((tmp_path / "registry/agents/foreign/queue/target.json").read_text())
     assert binding["kind"] == "pane" and binding["pane_id"] == pane
     assert fake.submitted == ["still pane-bound"]
 
@@ -1748,7 +1748,7 @@ def test_suggestion13_muse_adoption_does_not_accept_foreground_replacement_durin
     with pytest.raises(AgentDeliveryError, match="Muse foreground process changed"):
         sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
                        expected_cwd=str(tmp_path), harness="muse")
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
     assert fake.launched == [] and fake.closed == [] and fake.submitted == []
 
 
@@ -1766,7 +1766,7 @@ def test_suggestion13_muse_adoption_final_process_failure_archives_diagnostic_wi
     with pytest.raises(AgentDeliveryError, match="diagnostic record archived"):
         sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
                        expected_cwd=str(tmp_path), harness="muse")
-    assert not (sessions.registry / "foreign").exists()
+    assert not (sessions.registry / "agents" / "foreign").exists()
     archived = list((sessions.registry / "archive").iterdir())
     assert len(archived) == 1
     diagnostic = AgentRecord.load(archived[0] / "agent.json", "foreign")
@@ -1806,7 +1806,7 @@ def _suggestion4_dead_adoption(
 ) -> tuple[Sessions, FakeManagedClient, str, str, bytes]:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     original = adopt(sessions, pane, tmp_path)
-    path = sessions.registry / "foreign" / "agent.json"
+    path = sessions.registry / "agents" / "foreign" / "agent.json"
     document = json.loads(path.read_bytes())
     document["future_field"] = {"nested": [0.918216731832064, "unchanged"]}
     raw = (json.dumps(document, indent=3) + "\n\n").encode("utf-8")
@@ -1842,7 +1842,7 @@ def test_suggestion4_offline_retirement_preserves_exact_artifacts_and_lazy_queue
     queued: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
-    directory = sessions.registry / "foreign"
+    directory = sessions.registry / "agents" / "foreign"
     agent_inode = (directory / "agent.json").stat().st_ino
     (directory / "output.json").write_bytes(b"previous snapshot: retain exact bytes\x00\n")
     (directory / "output.json").chmod(0o600)
@@ -1909,7 +1909,7 @@ def test_suggestion4_kernel_generation_proof_preserves_live_replacement(
     else:
         record.harness_identity = identity
     sessions._save(record)
-    path = sessions.registry / "foreign" / "agent.json"
+    path = sessions.registry / "agents" / "foreign" / "agent.json"
     raw = path.read_bytes()
     sessions.client = client
     if generation == "probe-error":
@@ -1958,12 +1958,12 @@ def test_suggestion4_explicit_retirement_requires_exact_assertions_before_runtim
         expected_digest = digest[:-1]
     elif case == "same-token-raw-change":
         raw += b" \n"
-        (sessions.registry / "foreign/agent.json").write_bytes(raw)
+        (sessions.registry / "agents/foreign/agent.json").write_bytes(raw)
     with pytest.raises(AgentDeliveryError):
         sessions.stop("foreign", retire_dead_adoption=True,
                       recover_legacy_adoption=case == "legacy-overlap",
                       expected_token=expected_token, expected_record_sha256=expected_digest)
-    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert (sessions.registry / "agents/foreign/agent.json").read_bytes() == raw
     assert not (sessions.registry / "archive").exists()
 
 
@@ -1975,7 +1975,7 @@ def test_suggestion4_retirement_refuses_unproved_or_ineligible_records_without_r
     case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, fake, token, _digest, _raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
-    path = sessions.registry / "foreign/agent.json"
+    path = sessions.registry / "agents/foreign/agent.json"
     document = json.loads(path.read_bytes())
     if case == "missing-anchor":
         document["harness_identity"] = None
@@ -2019,7 +2019,7 @@ def test_suggestion4_final_publication_rechecks_bound_state_and_preserves_replac
     case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
-    directory = sessions.registry / "foreign"
+    directory = sessions.registry / "agents" / "foreign"
     queue = directory / "queue"
     if case in ("queue", "lock"):
         agent.enqueue(str(queue), "saved work", message_id="saved")
@@ -2095,7 +2095,7 @@ def test_suggestion4_interrupted_publication_keeps_the_archived_generation_exact
     case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
-    directory = sessions.registry / "foreign"
+    directory = sessions.registry / "agents" / "foreign"
     _suggestion4_no_runtime(fake, monkeypatch)
     monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
     real = subagents_module._rename_directory_noreplace_at
@@ -2129,7 +2129,7 @@ def test_suggestion4_retirement_refuses_unsafe_private_artifacts_without_runtime
     case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
-    directory = sessions.registry / "foreign"
+    directory = sessions.registry / "agents" / "foreign"
     record_path = directory / "agent.json"
     _suggestion4_no_runtime(fake, monkeypatch)
     monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
@@ -2181,7 +2181,7 @@ def test_suggestion4_queue_waiter_cannot_lock_a_replaced_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
-    directory = sessions.registry / "foreign"
+    directory = sessions.registry / "agents" / "foreign"
     queue = directory / "queue"
     agent.enqueue(str(queue), "saved work", message_id="saved")
     delivery_inode = (queue / ".delivery.lock").stat().st_ino
@@ -2230,7 +2230,7 @@ def test_suggestion4_pending_transactions_retain_authority_before_any_runtime_ac
     else:
         journal_directory = sessions.registry / ".revives"
         journal_directory.mkdir(mode=0o700)
-        metadata = (sessions.registry / "foreign").stat()
+        metadata = (sessions.registry / "agents" / "foreign").stat()
         agent._atomic_json(str(journal_directory / f"{token}.json"), {
             "schema": "agentctl-revive/v1", "name": "foreign", "old_token": token,
             "new_token": "new-generation", "phase": "launching", "started_at": 0.0,
@@ -2252,7 +2252,7 @@ def test_suggestion4_pending_transactions_retain_authority_before_any_runtime_ac
                       expected_record_sha256=digest if explicit else None)
     action = refused.value.recovery_action
     assert action is not None and action.command == transaction and action.token == token
-    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert (sessions.registry / "agents/foreign/agent.json").read_bytes() == raw
     assert not (sessions.registry / "archive").exists()
 
 
@@ -2265,10 +2265,10 @@ def test_suggestion4_late_corrupt_transaction_refuses_before_optional_advice_or_
 
     def pending(record: AgentRecord) -> None:
         if transaction == "move":
-            path = sessions.registry / "foreign/move.json"
+            path = sessions.registry / "agents/foreign/move.json"
         else:
             directory = sessions.registry / (".renames" if transaction == "rename" else ".revives")
-            directory.mkdir(mode=0o700)
+            directory.mkdir(mode=0o700, exist_ok=True)
             path = directory / f"{record.token}.json"
         agent._atomic_json(str(path), {})
         original(record)
@@ -2279,7 +2279,7 @@ def test_suggestion4_late_corrupt_transaction_refuses_before_optional_advice_or_
     with pytest.raises(AgentDeliveryError) as refused:
         sessions.stop("foreign")
     assert refused.value.recovery_action == RecoveryAction("doctor")
-    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert (sessions.registry / "agents/foreign/agent.json").read_bytes() == raw
     assert not (sessions.registry / "archive").exists()
 
 
@@ -2289,7 +2289,7 @@ def test_suggestion4_captured_advice_cannot_retire_a_replacement_and_replays_exa
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     sessions, fake, token, digest, raw = _suggestion4_dead_adoption(tmp_path, monkeypatch)
-    path = sessions.registry / "foreign/agent.json"
+    path = sessions.registry / "agents/foreign/agent.json"
     monkeypatch.setattr(fake, "process_liveness", lambda _identity: "dead", raising=False)
 
     def unavailable(_workspace_id: str | None = None) -> tuple[Pane, ...]:
@@ -2391,7 +2391,7 @@ def test_suggestion4_older_cli_retirement_and_stop_only_boundary_use_real_privat
     globals_ = ["--registry=" + str(sessions.registry), "--herdr-bin=offline-herdr"]
     assert legacy_cli.main([*globals_, "status", "foreign", "--retire-dead-adoption"]) == 2
     assert "--retire-dead-adoption is valid only with stop" in capsys.readouterr().err
-    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert (sessions.registry / "agents/foreign/agent.json").read_bytes() == raw
     assert not (sessions.registry / "archive").exists()
     assert legacy_cli.main([
         *globals_, "stop", "foreign", "--retire-dead-adoption",

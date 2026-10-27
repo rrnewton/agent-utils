@@ -6,7 +6,7 @@
 use super::*;
 
 fn record_path(fixture: &Fixture) -> PathBuf {
-    fixture.root.join("registry/worker/agent.json")
+    fixture.root.join("registry/agents/worker/agent.json")
 }
 
 fn stored(fixture: &Fixture) -> Value {

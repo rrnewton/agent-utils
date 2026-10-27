@@ -11,6 +11,8 @@
 //! - [`fsio`]: owner-only directories and locks, crash-safe JSON writes and no-replace renames.
 //! - [`identity`]: a process generation's identity, whether it is still alive, and whether it is
 //!   an ancestor of the caller.
+//! - [`registry`]: where an agentctl registry keeps each agent's directory and locks, in both
+//!   registry layouts, so every program that reads a registry finds the same agents.
 //!
 //! Typing into a terminal, readiness checks and the target lock that serializes typists across
 //! queues belong to the drainer, not to this library.
@@ -112,5 +114,6 @@ pub mod error;
 pub mod fsio;
 pub mod identity;
 pub mod queue;
+pub mod registry;
 
 pub use error::{Error, ErrorKind, Result};

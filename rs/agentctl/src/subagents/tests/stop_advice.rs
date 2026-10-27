@@ -23,7 +23,7 @@ fn retry_options(recovery: &RecoveryAction) -> StopOptions {
 fn managed_dead_advice_is_bound_to_the_original_generation_and_can_be_executed() {
     let fixture = Fixture::new();
     let (pane, token) = fixture.make_managed_dead();
-    let path = fixture.root.join("registry/worker/agent.json");
+    let path = fixture.root.join("registry/agents/worker/agent.json");
     let original = fs::read(&path).unwrap();
     let failure = fixture
         .manager()
@@ -71,7 +71,7 @@ fn managed_dead_advice_is_bound_to_the_original_generation_and_can_be_executed()
 fn legacy_advice_captures_exact_bytes_and_its_retry_preserves_the_foreign_runtime() {
     let fixture = Fixture::new();
     let (token, digest, original) = fixture.make_legacy_dead();
-    let path = fixture.root.join("registry/foreign/agent.json");
+    let path = fixture.root.join("registry/agents/foreign/agent.json");
     let failure = fixture
         .manager()
         .advised_stop_with_options("foreign", StopOptions::default())
@@ -118,7 +118,7 @@ fn unproved_legacy_recovery_uses_doctor_without_capturing_a_new_shell_identity()
     for case in ["null-key", "live-agent", "busy-shell"] {
         let fixture = Fixture::new();
         fixture.make_legacy_dead();
-        let path = fixture.root.join("registry/foreign/agent.json");
+        let path = fixture.root.join("registry/agents/foreign/agent.json");
         match case {
             "null-key" => {
                 let mut document = agent::read_private_json(&path).unwrap();
@@ -156,7 +156,7 @@ fn changed_or_untrusted_snapshot_cannot_supply_a_replacement_token_in_advice() {
         let manager = fixture.manager();
         let record = manager.load("worker").unwrap();
         let pinned = manager.pinned_agent_directory("worker").unwrap();
-        let path = fixture.root.join("registry/worker/agent.json");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         match case {
             "token" => {
@@ -171,12 +171,12 @@ fn changed_or_untrusted_snapshot_cannot_supply_a_replacement_token_in_advice() {
             "hardlink" => fs::hard_link(&path, fixture.root.join("record-link")).unwrap(),
             "directory" => {
                 fs::rename(
-                    fixture.root.join("registry/worker"),
+                    fixture.root.join("registry/agents/worker"),
                     fixture.root.join("displaced-record"),
                 )
                 .unwrap();
                 agent::create_private_directory(
-                    &fixture.root.join("registry/worker"),
+                    &fixture.root.join("registry/agents/worker"),
                     "replacement test record",
                     false,
                     false,
@@ -264,7 +264,7 @@ fn delayed_pending_rename_and_move_advice_only_inspects_a_replacement() {
         fixture.start(None);
         let replacement = fixture.manager().load("worker").unwrap();
         assert_ne!(replacement.token, old.token);
-        let path = fixture.root.join("registry/worker/agent.json");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
         let bytes = fs::read(&path).unwrap();
         let panes = fixture.client.panes.lock().unwrap().clone();
         let labels = fixture.client.labels.lock().unwrap().clone();
@@ -355,7 +355,7 @@ fn unavailable_and_unsupported_stop_refusals_keep_their_codes_and_use_doctor() {
         if case == "unavailable" {
             fixture.client.fail_panes.store(true, Ordering::Relaxed);
         } else if case == "headless" {
-            let path = fixture.root.join("registry/worker/agent.json");
+            let path = fixture.root.join("registry/agents/worker/agent.json");
             let mut document = agent::read_private_json(&path).unwrap();
             document["adapter"] = json!("turn-runner");
             document["mode"] = json!("headless");

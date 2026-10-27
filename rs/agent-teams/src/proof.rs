@@ -198,7 +198,9 @@ pub fn registry_coordinator_name(registry: &Path) -> Option<String> {
 /// Read one agent record's pinned harness identity, plus its `managed_by`
 /// controller name, when recorded.
 pub fn agent_record(registry: &Path, agent: &str) -> Option<(ProcessIdentity, Option<String>)> {
-    let text = std::fs::read_to_string(registry.join(agent).join("agent.json")).ok()?;
+    // Either registry layout (#593 registry-agents-subdir).
+    let directory = agent_queue::registry::directory(registry, agent).ok()?;
+    let text = std::fs::read_to_string(directory.join("agent.json")).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     // Records name the acting process either way: Muse panes pin
     // harness_identity, other harnesses custom_process_identity (the same
@@ -296,20 +298,15 @@ pub fn sender_standing(designation: &Designation, registry: Option<&Path>) -> Se
     }
     // Not the coordinator: is the caller at least a known agent of the registry?
     if let (Designation::Registry, Some(registry)) = (designation, registry) {
-        if let Ok(entries) = std::fs::read_dir(registry) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
+        if let Ok(names) = agent_queue::registry::names(registry) {
+            for name in names.iter().cloned() {
                 if let Some((identity, _)) = agent_record(registry, &name) {
                     if ancestry_contains(&identity) {
-                        let lieutenant = std::fs::read_dir(registry)
-                            .map(|all| {
-                                all.flatten().any(|other| {
-                                    agent_record(registry, &other.file_name().to_string_lossy())
-                                        .and_then(|(_, parent)| parent)
-                                        .is_some_and(|parent| parent == name)
-                                })
-                            })
-                            .unwrap_or(false);
+                        let lieutenant = names.iter().any(|other| {
+                            agent_record(registry, other)
+                                .and_then(|(_, parent)| parent)
+                                .is_some_and(|parent| parent == name)
+                        });
                         return SenderStanding::NotCoordinator {
                             agent: name,
                             lieutenant,
@@ -335,12 +332,11 @@ pub fn inside_unit(unit: &str) -> bool {
 /// Whether the ancestry contains any known agent harness process of a registry
 /// (a worker refused as itself cannot retry as a service).
 pub fn ancestry_has_agent(registry: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(registry) else {
+    let Ok(names) = agent_queue::registry::names(registry) else {
         return false;
     };
-    entries.flatten().any(|entry| {
-        agent_record(registry, &entry.file_name().to_string_lossy())
-            .is_some_and(|(identity, _)| ancestry_contains(&identity))
+    names.iter().any(|name| {
+        agent_record(registry, name).is_some_and(|(identity, _)| ancestry_contains(&identity))
     })
 }
 

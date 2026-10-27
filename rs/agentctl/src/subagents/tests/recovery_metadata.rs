@@ -263,7 +263,7 @@ fn profile_resume_rejects_an_occupied_asserted_conversation_before_opening_anoth
         assert!(error
             .to_string()
             .contains("already registered as \"owner\""));
-        assert!(!fixture.root.join("registry/worker").exists());
+        assert!(!fixture.root.join("registry/agents/worker").exists());
         assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
     }
 }
@@ -559,7 +559,7 @@ fn an_asserted_conversation_never_substitutes_for_a_routing_anchor() {
 fn old_records_default_recovery_fields_and_preserve_unknown_metadata() {
     let fixture = Fixture::new();
     fixture.start(None);
-    let path = fixture.root.join("registry/worker/agent.json");
+    let path = fixture.root.join("registry/agents/worker/agent.json");
     let mut document = agent::read_private_json(&path).unwrap();
     for key in [
         "native_session",
@@ -589,7 +589,7 @@ fn old_records_default_recovery_fields_and_preserve_unknown_metadata() {
 fn malformed_or_conflicting_recovery_metadata_is_rejected() {
     let fixture = Fixture::new();
     fixture.start(None);
-    let path = fixture.root.join("registry/worker/agent.json");
+    let path = fixture.root.join("registry/agents/worker/agent.json");
     let original = agent::read_private_json(&path).unwrap();
     let malformed = [
         (
@@ -661,7 +661,7 @@ fn asserted_conversations_participate_in_duplicate_session_checks() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("already registered"));
-    assert!(!fixture.root.join("registry/second").exists());
+    assert!(!fixture.root.join("registry/agents/second").exists());
 }
 
 #[test]
@@ -733,5 +733,5 @@ fn adoption_refuses_a_session_held_only_as_recovery_provenance() {
     options.pane_id = "reported".to_owned();
     let error = manager.adopt("other", options).unwrap_err();
     assert!(error.to_string().contains("already registered"));
-    assert!(!fixture.root.join("registry/other").exists());
+    assert!(!fixture.root.join("registry/agents/other").exists());
 }

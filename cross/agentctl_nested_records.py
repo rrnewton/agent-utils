@@ -66,7 +66,7 @@ def _fixture(root: Path, schema: str, *, session_value: str | None = "session-1"
 
 
 def _record_path(root: Path) -> Path:
-    return root / "registry" / "worker" / "agent.json"
+    return root / "registry" / "agents" / "worker" / "agent.json"
 
 
 def _write(case: PairCase, build: Callable[[Path], dict[str, object]]) -> None:

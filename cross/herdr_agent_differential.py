@@ -1481,7 +1481,7 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                 ))
                 report.require(label + "/start", started.returncode == 0,
                                f"producer failed to create the original record: {started!r}")
-                record_path = root / "registry/worker/agent.json"
+                record_path = root / "registry/agents/worker/agent.json"
                 if started.returncode != 0 or not record_path.exists():
                     continue
                 record = _revive_document(record_path)
@@ -1497,7 +1497,7 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                     "send", "worker", "old queued instruction", "--message-id", "pending-work",
                     "--ready-timeout", "0", *common,
                 ))
-                queue = root / "registry/worker/queue"
+                queue = root / "registry/agents/worker/queue"
                 report.require(
                     label + "/queued-before-death",
                     queued.returncode == 75 and (queue / "inbox/pending-work.json").is_file()
@@ -2385,7 +2385,7 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
             report.require(f"managed/{label}-pending", python.returncode == rust.returncode == 75
                            and '"outcome": "pending"' in python.stdout and '"outcome": "pending"' in rust.stdout,
                            f"prompt was not durably retained: {python!r} {rust!r}")
-            report.require(f"managed/{label}-durable-state", _queue_snapshot(case.python_root, "registry/worker/queue") == _queue_snapshot(case.rust_root, "registry/worker/queue"),
+            report.require(f"managed/{label}-durable-state", _queue_snapshot(case.python_root, "registry/agents/worker/queue") == _queue_snapshot(case.rust_root, "registry/agents/worker/queue"),
                            "pending managed queue artifacts differed")
         report.require(f"managed/{label}-no-mutation", _state(case.python_root).get("submitted") == []
                        and _state(case.rust_root).get("submitted") == []
@@ -2396,8 +2396,8 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
     common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
     python, rust = harness.invoke(case, ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common))
     report.require("managed/failed-launch-retained", python.returncode == rust.returncode == 75
-                   and (case.python_root / "registry/worker/agent.json").exists()
-                   and (case.rust_root / "registry/worker/agent.json").exists()
+                   and (case.python_root / "registry/agents/worker/agent.json").exists()
+                   and (case.rust_root / "registry/agents/worker/agent.json").exists()
                    and not _state(case.python_root).get("closed") and not _state(case.rust_root).get("closed"),
                    f"launch failed without inspectable state: {python!r} {rust!r}")
     for root in (case.python_root, case.rust_root):

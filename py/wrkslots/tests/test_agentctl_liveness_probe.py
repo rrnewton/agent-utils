@@ -243,3 +243,90 @@ def test_a_missing_registry_is_not_a_no_record_answer(tmp_path: Path) -> None:
     assert run(tmp_path, "hold-x") == (
         2, "unverifiable agent=hold-x rc=2 reason=no-agentctl-registry\n"
     )
+
+
+TRIPWIRE_TEXT = (
+    "agentctl registry layout 2: each agent lives in agents/<name>/ and its locks in locks/. "
+    "This file is not an agent; it makes agentctl builds older than layout 2 refuse this "
+    "registry instead of misreading it. Upgrade agentctl."
+)
+
+
+def layout_two(project: Path) -> Path:
+    """An agentctl registry in layout 2 (#593 registry-agents-subdir), with its tripwire."""
+    agents = project / ".agentctl/agents"
+    agents.mkdir(parents=True)
+    (project / ".agentctl/locks").mkdir()
+    (agents / "agent.json").write_text(json.dumps(TRIPWIRE_TEXT) + "\n", encoding="utf-8")
+    return agents
+
+
+def test_a_layout_two_live_agent_is_alive_and_a_stopped_one_is_dead(
+    tmp_path: Path, exited_identity: dict[str, object]
+) -> None:
+    agents = layout_two(tmp_path)
+    write_record(agents / "w1", "w1", custom_process_identity=identity(os.getpid()))
+    write_record(
+        tmp_path / ".agentctl/archive/w2-abc", "w2",
+        custom_process_identity=exited_identity, pane_id="wTEST:p-gone",
+    )
+    assert run(tmp_path, "w1")[0] == 1
+    assert run(tmp_path, "w2")[0] == 0
+    # The tripwire and the layout's own directories are not agents.
+    code, out = run(tmp_path, "agents")
+    assert (code, out.split()[3]) == (2, "reason=no-agentctl-record")
+
+
+def test_a_live_agent_moved_to_layout_two_never_looks_dead(
+    tmp_path: Path, exited_identity: dict[str, object]
+) -> None:
+    # An earlier agent of the same name was stopped; the live one now lives in agents/.
+    write_record(
+        tmp_path / ".agentctl/archive/w1-old", "w1",
+        custom_process_identity=exited_identity, pane_id="wTEST:p-gone",
+    )
+    agents = layout_two(tmp_path)
+    write_record(agents / "w1", "w1", custom_process_identity=identity(os.getpid()))
+    code, out = run(tmp_path, "w1")
+    assert (code, out.split()[:3]) == (1, ["alive", "agent=w1", "rc=1"])
+
+
+def test_both_layouts_are_read_while_a_registry_is_mixed(tmp_path: Path) -> None:
+    agents = layout_two(tmp_path)
+    write_record(tmp_path / ".agentctl/w1", "w1", custom_process_identity=identity(os.getpid()))
+    write_record(agents / "w2", "w2", custom_process_identity=identity(os.getpid()))
+    assert run(tmp_path, "w1")[0] == 1
+    assert run(tmp_path, "w2")[0] == 1
+
+
+def test_a_probe_older_than_layout_two_fails_closed_on_the_tripwire(
+    tmp_path: Path, exited_identity: dict[str, object]
+) -> None:
+    """The pre-layout-2 probe read only REGISTRY/*/agent.json, so it would miss a moved live agent
+    and, with a stopped namesake archived, call it dead. The tripwire makes it refuse instead."""
+    old_probe = PROBE.read_text(encoding="utf-8")
+    start = old_probe.index("    # The top level first, then agents/")
+    end = old_probe.index("    active = matching(active_paths, agent)")
+    legacy = old_probe[:start] + (
+        "    active_paths = sorted(\n"
+        "        path / \"agent.json\" for path in registry.iterdir()\n"
+        "        if NAME.fullmatch(path.name) and path.name != \"archive\" and (path / \"agent.json\").exists()\n"
+        "    )\n"
+    ) + old_probe[end:]
+    legacy_probe = tmp_path / "legacy_probe.py"
+    legacy_probe.write_text(legacy, encoding="utf-8")
+    project = tmp_path / "project"
+    write_record(
+        project / ".agentctl/archive/w1-old", "w1",
+        custom_process_identity=exited_identity, pane_id="wTEST:p-gone",
+    )
+    agents = layout_two(project)
+    write_record(agents / "w1", "w1", custom_process_identity=identity(os.getpid()))
+    env = {key: value for key, value in os.environ.items() if key != "AGENTCTL_REGISTRY"}
+    env["WRKSLOTS_PROJECT_ROOT"] = str(project)
+    done = subprocess.run(
+        [sys.executable, str(legacy_probe), "w1"], env=env, capture_output=True, text=True,
+        check=False,
+    )
+    assert done.returncode == 2, done.stdout
+    assert done.stdout.startswith("unverifiable agent=w1 rc=2"), done.stdout

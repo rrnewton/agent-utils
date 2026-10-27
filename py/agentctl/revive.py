@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
 
-from agentctl import agent, launch_spec
+from agentctl import agent, launch_spec, registry_layout
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable, RecoveryAction, _with_recovery
 from agentctl.profiles import configuration_root, load_profiles, reasoning_arguments, validate_structured_harness_argument_conflicts
@@ -720,7 +720,11 @@ def _complete_locked(manager: ManagedAgents, journal: dict[str, object]) -> dict
     if not published:
         _read_record(manager, stage, name, identity=new_identity, digest=_digest(ready_bytes))
         _ready(manager, candidate, original, cast(dict[str, object], journal["proof"]))
-        with manager._pinned_parent_directory(operation, label="revive operation") as parent, manager._pinned_parent_directory(manager.registry, label="agent registry") as registry:
+        # The old generation has left its directory, so the new one is published in layout 2
+        # whichever layout the old one used (#593 registry-agents-subdir).
+        registry_layout.prepare(manager.registry)
+        active = manager._directory(name)
+        with manager._pinned_parent_directory(operation, label="revive operation") as parent, manager._pinned_parent_directory(active.parent, label="agent registry") as registry:
             staged = os.stat("new", dir_fd=parent.descriptor, follow_symlinks=False)
             if (staged.st_dev, staged.st_ino) != new_identity:
                 raise AgentDeliveryError("revive candidate directory changed before publication")
@@ -922,7 +926,7 @@ def revive_all(manager: ManagedAgents, *, dry_run: bool = False, startup_timeout
     names = {cast(str, journal["name"]) for journal in journals(manager)}
     if manager.registry.exists():
         agent._validate_private_directory(str(manager.registry), "agent registry")
-        names.update(path.name for path in manager.registry.iterdir() if _NAME.fullmatch(path.name) and path.name != "archive")
+        names.update(registry_layout.names(manager.registry))
     rows: list[dict[str, object]] = []
     revived = blocked = 0
     for name in sorted(names):

@@ -210,11 +210,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "agent {agent_name:?} already registered; stop it before reusing the name"
             )));
         }
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&self.registry)?;
+        self.create_agent_directory(&directory)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
@@ -703,6 +699,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     /// Queue `/compact` for a headless agent; it runs when the current turn ends.
     pub fn compact_headless(&self, agent_name: &str) -> Result<Value> {
+        // Held while the queue path is found and written, so a registry migration cannot move
+        // the agent in between (#593 registry-agents-subdir).
+        let lock = self.lock(agent_name)?;
         let queue_root = self.queue(agent_name)?;
         if !self.load(agent_name)?.is_headless() {
             return Err(fail(format!("agent {agent_name:?} is not headless")));
@@ -715,6 +714,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "turn-boundary",
             None,
         )?;
+        drop(lock);
         let blocked = self.wake(agent_name);
         Ok(
             json!({"name": agent_name, "message_id": id, "blocked": blocked,

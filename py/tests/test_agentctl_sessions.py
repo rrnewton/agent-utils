@@ -130,7 +130,7 @@ def test_claude_raw_conversation_selectors_refuse_before_allocation(
     sessions, fake, _calls = setup(tmp_path, monkeypatch)
     with pytest.raises(AgentDeliveryError, match="conversation selectors must use --resume"):
         sessions.start_session("worker", cwd=str(tmp_path), harness="claude", harness_args=arguments, resume=resume)
-    assert fake.launched == [] and not (sessions.registry / "worker").exists()
+    assert fake.launched == [] and not (sessions.registry / "agents" / "worker").exists()
 
 
 def test_flat_launch_metadata_validates_and_survives_rename_and_archival(
@@ -166,7 +166,7 @@ def test_invalid_resume_refuses_before_allocating_a_record(
     sessions, fake, _calls = setup(tmp_path, monkeypatch)
     with pytest.raises(AgentDeliveryError, match="native session id must be nonempty"):
         sessions.start_session("worker", cwd=str(tmp_path), resume=resume)
-    assert fake.launched == [] and not (sessions.registry / "worker").exists()
+    assert fake.launched == [] and not (sessions.registry / "agents" / "worker").exists()
 
 
 def test_legacy_resume_cannot_be_rebound_to_a_different_conversation(
@@ -179,7 +179,7 @@ def test_legacy_resume_cannot_be_rebound_to_a_different_conversation(
     record.session_agent = record.session_value = None
     sessions._save(record)
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], session_agent=None, session_value=None)
-    path = sessions.registry / "worker/agent.json"
+    path = sessions.registry / "agents/worker/agent.json"
     before = path.read_bytes()
     with pytest.raises(AgentDeliveryError, match="already bound"):
         sessions.bind_session("worker", "replacement-conversation")
@@ -299,7 +299,7 @@ def test_cli_list_reports_every_row_and_exits_nonzero_for_malformed_record(
 ) -> None:
     sessions, fake, _calls = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path))
-    invalid = sessions.registry / "broken"
+    invalid = sessions.registry / "agents" / "broken"
     invalid.mkdir(mode=0o700)
     (invalid / "agent.json").write_text("{}", encoding="utf-8")
     (invalid / "agent.json").chmod(0o600)
@@ -328,7 +328,7 @@ def test_modes_share_names_and_preserve_the_original_generation(first: str, seco
 def test_retirement_reuses_a_name_only_with_a_new_generation_and_stable_lock(mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions, _, _ = setup(tmp_path, monkeypatch)
     original = sessions.start_session("worker", cwd=str(tmp_path), mode=mode)
-    lock = tmp_path / "registry/.worker.lock"
+    lock = tmp_path / "registry/locks/worker.lock"
     inode = lock.stat().st_ino
     stopped = sessions.stop("worker")
     archive = Path(str(stopped["archive"]))
@@ -727,7 +727,7 @@ def test_tmux_attach_uses_exact_window_identity_and_releases_lifecycle_lock(insi
         return CompletedProcess(command, 0, "@123\n", "")
 
     def attach(command: list[str], **_: object) -> CompletedProcess[str]:
-        descriptor = os.open(tmp_path / "registry/.worker.lock", os.O_RDONLY)
+        descriptor = os.open(tmp_path / "registry/locks/worker.lock", os.O_RDONLY)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
@@ -789,7 +789,7 @@ def test_live_idle_runner_remains_ready_when_only_its_presentation_is_lost(tmp_p
 
     def status(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
         assert action == "status" and record.token == original["token"]
-        descriptor = os.open(tmp_path / "registry/.worker.lock", os.O_RDONLY)
+        descriptor = os.open(tmp_path / "registry/locks/worker.lock", os.O_RDONLY)
         try:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -934,7 +934,7 @@ def test_slot_failures_are_refused_before_registry_or_tab_creation(
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, behaviour)))
     with pytest.raises(AgentDeliveryError, match=re.escape(expected)):
         sessions.start_session("worker", cwd=str(tmp_path), harness=harness, slot="s9", slot_isolation=isolation)
-    assert not (sessions.registry / "worker").exists()
+    assert not (sessions.registry / "agents" / "worker").exists()
 
 
 def test_slot_needs_wrkslots_and_slot_options_need_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -989,7 +989,7 @@ def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypat
     assert [(kind, line) for kind, _pane, line in launched] == [("codex", "exec boxed-shell")]
     argv = (tmp_path / "argv-root").read_text(encoding="utf-8").splitlines()
     assert argv[argv.index("--") + 1] == "/opt/bin/codex"
-    record = json.loads((sessions.registry / "worker" / "agent.json").read_text(encoding="utf-8"))
+    record = json.loads((sessions.registry / "agents" / "worker" / "agent.json").read_text(encoding="utf-8"))
     assert record["adapter"] == "herdr-relay" and record["pane_reported_by_agentctl"] is True
     assert record["custom_process_identity"]["pid"] == 4242
     # REGRESSION 2026-10-25 (devbig014): root slots kept owner null, so finished ones were
@@ -1007,7 +1007,7 @@ def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypat
     (tmp_path / "owner-refuse").write_text("", encoding="utf-8")
     from agentctl.subagents import AgentRecord, _bind_launched_slot_owner
 
-    loaded = AgentRecord.load(sessions.registry / "worker" / "agent.json", "worker")
+    loaded = AgentRecord.load(sessions.registry / "agents" / "worker" / "agent.json", "worker")
     assert _bind_launched_slot_owner(loaded, "s1", project, sessions.registry) == {
         "slot": "s1", "action": "refused", "owner_pid": 4242,
         "reason": "transfer-owner refused: REFUSED: slot s1 owner is live",
@@ -1073,7 +1073,7 @@ def test_profiles_come_from_the_registry_project_when_cwd_has_none(
     ]) == 0
     capsys.readouterr()
     assert len(fake.launched) == 1
-    record = json.loads((registry / "worker" / "agent.json").read_text(encoding="utf-8"))
+    record = json.loads((registry / "agents" / "worker" / "agent.json").read_text(encoding="utf-8"))
     assert record["cwd"] == str(slot.resolve())
 
 
@@ -1212,7 +1212,7 @@ def test_stop_refusal_headless_unavailable_keeps_record_and_prints_doctor(
 ) -> None:
     sessions, fake, _calls = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path), mode="headless", backend="tmux")
-    before = (sessions.registry / "worker/agent.json").read_bytes()
+    before = (sessions.registry / "agents/worker/agent.json").read_bytes()
 
     def unavailable(_record: AgentRecord, _action: str, **_options: object) -> dict[str, object]:
         raise HerdrUnavailable("headless worker control unavailable")
@@ -1223,7 +1223,7 @@ def test_stop_refusal_headless_unavailable_keeps_record_and_prints_doctor(
     captured = capsys.readouterr()
     assert "headless worker control unavailable" in captured.err
     assert _cli_stop_recovery_argv(captured.err)[3:] == ["doctor"]
-    assert (sessions.registry / "worker/agent.json").read_bytes() == before and fake.closed == []
+    assert (sessions.registry / "agents/worker/agent.json").read_bytes() == before and fake.closed == []
 
 
 def _profile_resume_setup(
@@ -1414,13 +1414,13 @@ def test_profile_resume_cli_refuses_an_already_registered_native_conversation_be
     ]
     assert cli.main(["start", "first", *arguments]) == 0
     capsys.readouterr()
-    original = (sessions.registry / "first/agent.json").read_bytes()
+    original = (sessions.registry / "agents/first/agent.json").read_bytes()
     assert cli.main(["start", "second", *arguments]) == 75
     captured = capsys.readouterr()
     assert "already registered as 'first'" in captured.err and captured.out == ""
     assert len(fake.launched) == 1 and len(fake.environments) == 1 and fake.submitted == []
-    assert not (sessions.registry / "second").exists()
-    assert (sessions.registry / "first/agent.json").read_bytes() == original
+    assert not (sessions.registry / "agents" / "second").exists()
+    assert (sessions.registry / "agents/first/agent.json").read_bytes() == original
 
 
 @pytest.mark.parametrize("harness", ["codex", "muse"])

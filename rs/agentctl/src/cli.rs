@@ -166,6 +166,12 @@ enum Commands {
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
+    /// Move a registry's agents from the old layout (REGISTRY/NAME/, REGISTRY/.NAME.lock) to layout 2 (REGISTRY/agents/NAME/, REGISTRY/locks/NAME.lock), so the registry's fixed files are not buried among per-agent entries. Reports what it would do unless --apply
+    #[command(
+        name = "migrate-layout",
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl migrate-layout\n  agentctl --registry ~/project/.agentctl migrate-layout --apply\n  agentctl --registry ~/project/.agentctl migrate-layout --apply --wait 60\n\nEach agent moves by one atomic rename while agentctl holds its old and new lifecycle locks and the registry's\nidentity lock; a crash leaves every agent wholly in one layout, and a rerun continues. An agent whose directory\nanother process has open or works in (a headless wrapper, a drain), whose record names paths inside it (a turn\nrunner's home), or whose lock stays busy for --wait, is left where it is and listed under left; rerun once it is idle. A name with an agent in both layouts is listed under\nconflicts and never touched; a layout-1 directory without a record beside a layout-2 agent (left by an older\nprogram that writes queues by path) is listed under strays. After the move, the old lock files nobody holds are deleted; .coordinator.lock stays.\nRunning it again changes nothing. Prints {registry, apply, layout_before, layout, moved | would_move, left,\nconflicts, strays, removed_lock_files | would_remove_lock_files, kept_lock_files, legacy_support_ends, removal_issue};\nexit 0, or 1 when something was left or conflicts.\n\nCommands that change an agent (start, adopt, stop, send, rename, revive, ...) run the same migration first, without\nwaiting for any lock, and print one notice on standard error when anything moved; set AGENTCTL_LAYOUT_AUTO_MIGRATE=0 to turn that off. Builds older than layout 2 cannot\nsee moved agents, and the tripwire REGISTRY/agents/agent.json makes them refuse to start, adopt or deliver in the\nregistry instead of misreading it: upgrade every agentctl and agent-teams that uses a registry, and the wrkslots\nliveness probe copies, before migrating it. The old layout stays readable until 2026-11-26."
+    )]
+    MigrateLayout(MigrateLayout),
     /// Archive an exact stale registration and its queued work without stopping any runtime; then use adopt to register the verified live pane
     #[command(
         after_help = "First inspect agent.json and compute sha256sum. Use --dry-run before applying. A matching live registration is refused. An incomplete revive additionally requires its journal SHA-256; a live candidate must be pinned by pane and observed session. Archives preserve the original record, queue and revive artifacts. Rerun the same pins after an interruption; never replay the archived prompts automatically."
@@ -199,12 +205,12 @@ enum Commands {
     Drain(Drain),
     /// Follow a headless agent's event log: one line per event (turns, prose, tools, inputs with their sender), read-only and lock-free
     #[command(
-        after_help = "Examples:\n  agentctl tail coordinator --follow\n  agentctl tail coordinator --last 50 --types assistant.text,turn.\n  agentctl tail coordinator --json --since 4180\n  agentctl tail coordinator --at 4182\n\nThe log is REGISTRY/NAME/events/<generation>.jsonl (schema v1, one JSON object per line; see\n`agentctl userguide`). Any number of tails may run beside the agent; closing one never touches it.\nA hole in the sequence (pruned or unreadable lines) prints as a gap line. Not to be confused with\n`agentctl read --output tail`, which reads an interactive agent's pane."
+        after_help = "Examples:\n  agentctl tail coordinator --follow\n  agentctl tail coordinator --last 50 --types assistant.text,turn.\n  agentctl tail coordinator --json --since 4180\n  agentctl tail coordinator --at 4182\n\nThe log is REGISTRY/agents/NAME/events/<generation>.jsonl (schema v1, one JSON object per line; see\n`agentctl userguide`). Any number of tails may run beside the agent; closing one never touches it.\nA hole in the sequence (pruned or unreadable lines) prints as a gap line. Not to be confused with\n`agentctl read --output tail`, which reads an interactive agent's pane."
     )]
     Tail(Tail),
     /// Run a headless agent's wrapper in the foreground: one persistent harness process (Claude Code stream-json) that is the only drainer of the agent's queue; normally run by a systemd user unit
     #[command(
-        after_help = "Examples:\n  agentctl run-headless coordinator\n  agentctl install-units --headless coordinator --dest ~/.config/systemd/user\n\nThe wrapper resumes the agent's recorded session when Claude Code has a transcript for it,\nrecovers inputs a previous wrapper left in flight from that transcript, writes the event log,\nand serves REGISTRY/NAME/control.sock. SIGTERM closes the harness's input, waits up to 60 s for\nit to finish, and exits 0. An unexpected harness exit restarts it with --resume (backoff, at\nmost 5 in 10 minutes), then exits 1. Exit 75 when another wrapper already serves NAME."
+        after_help = "Examples:\n  agentctl run-headless coordinator\n  agentctl install-units --headless coordinator --dest ~/.config/systemd/user\n\nThe wrapper resumes the agent's recorded session when Claude Code has a transcript for it,\nrecovers inputs a previous wrapper left in flight from that transcript, writes the event log,\nand serves REGISTRY/agents/NAME/control.sock. SIGTERM closes the harness's input, waits up to 60 s for\nit to finish, and exits 0. An unexpected harness exit restarts it with --resume (backoff, at\nmost 5 in 10 minutes), then exits 1. Exit 75 when another wrapper already serves NAME."
     )]
     RunHeadless(RunHeadless),
     /// Interrupt a headless agent's running turn; queued inputs stay queued and run next
@@ -679,6 +685,16 @@ struct Doctor {
     /// Restore the tab label and Herdr agent name of owned agents whose every other anchor still matches
     #[arg(long)]
     repair_labels: bool,
+}
+
+#[derive(Args)]
+struct MigrateLayout {
+    /// Move the agents and delete the old lock files (default: only report what would happen)
+    #[arg(long)]
+    apply: bool,
+    /// Seconds to wait for a busy agent or registry lock before leaving that agent where it is (default: 10)
+    #[arg(long, value_name = "SECONDS", default_value_t = 10.0, value_parser = seconds)]
+    wait: f64,
 }
 
 #[derive(Args)]
@@ -1907,7 +1923,8 @@ fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
             "invalid agent name {name:?}: use 1-32 lowercase letters, digits, and hyphens"
         )));
     }
-    let directory = registry.join(name);
+    let directory = agent_queue::registry::directory(registry, name)
+        .map_err(|error| Failure::Usage(error.to_string()))?;
     if !directory.is_dir() {
         return Err(Failure::Usage(format!(
             "unknown agent {name:?} in {}; use list to inspect the registry",
@@ -1948,6 +1965,40 @@ fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
         return Ok(1);
     }
     Ok(0)
+}
+
+/// Whether `command` changes agents' state, so that [`crate::registry_layout::auto_migrate`]
+/// runs before it. Everything else, including every read, dry run, and service whose own writes
+/// are not agents' state (chat, inbox, hold, progress), leaves the registry's layout alone.
+fn writes_registry(command: &Commands) -> bool {
+    match command {
+        Commands::Restore(value) => !value.dry_run,
+        Commands::Revive(value) => !value.dry_run,
+        Commands::RetireStaleRegistration(value) => !value.dry_run,
+        Commands::Coordinator(value) => !matches!(value.command, CoordinatorCommand::Show),
+        Commands::Start(_)
+        | Commands::Adopt(_)
+        | Commands::AttachSelf(_)
+        | Commands::Manage(_)
+        | Commands::Move(_)
+        | Commands::Rename(_)
+        | Commands::Anchor(_)
+        | Commands::Promote(_)
+        | Commands::Stop(_)
+        | Commands::Send(_)
+        | Commands::Drain(_)
+        | Commands::RunHeadless(_)
+        | Commands::Interrupt(_)
+        | Commands::Compact(_)
+        | Commands::Cancel(_)
+        | Commands::Answer(_)
+        | Commands::Goal(_)
+        | Commands::BindSession(_)
+        | Commands::Pause(_)
+        | Commands::Reset(_)
+        | Commands::Resume(_) => true,
+        _ => false,
+    }
 }
 
 fn plugin_discovery_required(command: &Commands) -> bool {
@@ -1996,7 +2047,31 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             ));
         }
     }
+    if writes_registry(&command) {
+        // New writes use layout 2, and whatever layout-1 agents are idle move first (#593
+        // registry-agents-subdir).
+        if let Some(notice) = crate::registry_layout::auto_migrate(&args.registry, environment) {
+            eprintln!("{notice}");
+        }
+    }
     match command {
+        Commands::MigrateLayout(value) => {
+            let report = crate::registry_layout::migrate(
+                &args.registry,
+                crate::registry_layout::MigrateOptions {
+                    apply: value.apply,
+                    wait: Duration::from_secs_f64(value.wait),
+                },
+            )?;
+            write_json(&report).map_err(Failure::Output)?;
+            let unsettled = report["left"]
+                .as_array()
+                .is_some_and(|left| !left.is_empty())
+                || report["conflicts"]
+                    .as_array()
+                    .is_some_and(|conflicts| !conflicts.is_empty());
+            return Ok(i32::from(unsettled));
+        }
         Commands::Capabilities => {
             let (selected, _explicit) = crate::term::select_backend(
                 args.term_backend.as_deref(),
@@ -2910,6 +2985,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Pause(value) => manager.pause(&value.name, true)?,
         Commands::Resume(value) => manager.pause(&value.name, false)?,
         Commands::Capabilities
+        | Commands::MigrateLayout(_)
         | Commands::Quickstart
         | Commands::Userguide
         | Commands::Chat(_)
@@ -3588,6 +3664,7 @@ mod tests {
                 .as_nanos()
         ));
         crate::agent::create_private_directory(&registry, "registry", true, true).unwrap();
+        agent_queue::registry::prepare(&registry).unwrap();
         let lock = crate::agent::open_private_lock(
             &crate::lock_wait::lock_path(&registry, "coordinator"),
             "lock",

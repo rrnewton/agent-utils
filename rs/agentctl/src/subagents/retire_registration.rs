@@ -148,7 +148,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             self.retire_revive_archive(&record, &destination, &journal, &operation, options).map_err(|error| fail(format!("registration archived at {}; revive archival incomplete: {error}; rerun with the same pins", destination.display())))?;
         }
         agent::sync_directory(&archive)?;
-        agent::sync_directory(&self.registry)?;
+        agent::sync_directory(source.parent().unwrap_or(&self.registry))?;
         Ok(report)
     }
 }

@@ -26,12 +26,45 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Ok(false);
         }
         // Observers never wait behind a sender or identity writer.
-        let lock = agent::open_private_lock(
-            &crate::lock_wait::lock_path(&self.registry, agent_name),
-            "agent lifecycle lock",
-        )?;
+        let location = agent_queue::registry::locate(&self.registry, agent_name)
+            .map_err(|error| fail(error.to_string()))?;
+        let (lock_path, _) =
+            agent_queue::registry::lock_paths(&self.registry, agent_name, location);
+        let lock = agent::open_private_lock(&lock_path, "agent lifecycle lock")?;
         lock.try_lock_exclusive()
             .map_err(|_| fail("session follow deferred: lifecycle busy"))?;
+        // A layout-1 agent is also locked where layout 2 locks it, as every new build does.
+        let _current = if location == agent_queue::registry::Location::Legacy {
+            let (current_path, _) = agent_queue::registry::lock_paths(
+                &self.registry,
+                agent_name,
+                agent_queue::registry::Location::Current,
+            );
+            agent::create_private_directory(
+                &agent_queue::registry::locks_directory(&self.registry),
+                "agent lock collection",
+                false,
+                true,
+            )?;
+            let current = agent::open_private_lock(&current_path, "agent lifecycle lock")?;
+            current
+                .try_lock_exclusive()
+                .map_err(|_| fail("session follow deferred: lifecycle busy"))?;
+            Some(current)
+        } else {
+            None
+        };
+        if !crate::registry_layout::lock_still_current(
+            &self.registry,
+            agent_name,
+            location,
+            &lock,
+            &lock_path,
+        )? {
+            return Err(fail(
+                "session follow deferred: the agent moved between registry layouts",
+            ));
+        }
         let identity =
             agent::open_private_lock(&self.registry.join(".identity.lock"), "agent identity lock")?;
         identity

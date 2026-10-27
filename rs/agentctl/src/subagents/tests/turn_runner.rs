@@ -22,8 +22,8 @@ impl Worker {
     fn new() -> Self {
         let fixture = Fixture::new();
         let token = fixture.start(None)["token"].as_str().unwrap().to_owned();
-        let path = fixture.root.join("registry/worker/agent.json");
-        let home = fixture.root.join("registry/worker/runtime");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
+        let home = fixture.root.join("registry/agents/worker/runtime");
         let mut document = agent::read_private_json(&path).unwrap();
         document["adapter"] = json!("turn-runner");
         document["mode"] = json!("headless");
@@ -85,7 +85,7 @@ impl Worker {
     }
 
     fn record(&self) -> Vec<u8> {
-        fs::read(self.fixture.root.join("registry/worker/agent.json")).unwrap()
+        fs::read(self.fixture.root.join("registry/agents/worker/agent.json")).unwrap()
     }
 
     fn archive(&self) -> PathBuf {
@@ -161,7 +161,7 @@ fn recycled_runner_pid_is_proved_dead_and_the_record_is_archived() {
             },
         })
     );
-    assert!(!worker.fixture.root.join("registry/worker").exists());
+    assert!(!worker.fixture.root.join("registry/agents/worker").exists());
     let archived = agent::read_private_json(&archive.join("agent.json")).unwrap();
     assert_eq!(archived["lifecycle"], "stopped");
     assert_eq!(archived["adapter"], "turn-runner");

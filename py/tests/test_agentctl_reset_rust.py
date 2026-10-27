@@ -50,7 +50,7 @@ def _copy_fixture(source: Path, runtime: Path, target: Path) -> tuple[Path, Path
     shutil.copytree(source, registry)
     new_runtime = target / "runtime"
     shutil.copytree(runtime, new_runtime)
-    record_path = registry / "worker" / "agent.json"
+    record_path = registry / "agents" / "worker" / "agent.json"
     document = json.loads(record_path.read_text())
     document["runtime_home"] = str(new_runtime)
     record_path.write_text(json.dumps(document))
@@ -82,8 +82,8 @@ def test_rust_reset_matches_python(tmp_path: Path, monkeypatch: object) -> None:
         str(rust_runtime), "<runtime>")
     assert rust_document == python_document
 
-    python_record = json.loads((python_registry / "worker" / "agent.json").read_text())
-    rust_record = json.loads((rust_registry / "worker" / "agent.json").read_text())
+    python_record = json.loads((python_registry / "agents" / "worker" / "agent.json").read_text())
+    rust_record = json.loads((rust_registry / "agents" / "worker" / "agent.json").read_text())
     for key in ("mode", "backend", "session_value", "native_session", "pane_id"):
         assert rust_record.get(key) == python_record.get(key), key
     python_rows = json.loads((python_runtime / "registry.json").read_text())

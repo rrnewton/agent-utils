@@ -356,6 +356,7 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
     // Stop closes the owned pane and archives the record.
     let stopped = fixture.agentctl_json(&["stop", "worker"]);
     assert_eq!(stopped["pane_closed"], json!(true));
+    assert!(!fixture.registry.join("agents/worker").exists());
     assert!(!fixture.registry.join("worker").exists());
     let list = fixture.agentctl(&["list"]);
     assert!(list.status.success());

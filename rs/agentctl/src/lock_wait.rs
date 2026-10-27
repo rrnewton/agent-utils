@@ -35,17 +35,26 @@ fn now() -> f64 {
         .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
-/// The lifecycle lock file of `agent` in `registry`.
+/// Where `agent`'s locks are: beside its directory's layout (#593 registry-agents-subdir). A
+/// name that cannot be located (one in both layouts) answers layout 2, whose lock no older build
+/// takes; whoever uses that name will meet the conflict.
+fn lock_location(registry: &Path, agent: &str) -> agent_queue::registry::Location {
+    agent_queue::registry::locate(registry, agent)
+        .unwrap_or(agent_queue::registry::Location::Current)
+}
+
+/// The lifecycle lock file of `agent` in `registry`: `locks/<agent>.lock`, or `.<agent>.lock` for
+/// an agent still in layout 1.
 #[must_use]
 pub fn lock_path(registry: &Path, agent: &str) -> PathBuf {
-    registry.join(format!(".{agent}.lock"))
+    agent_queue::registry::lock_paths(registry, agent, lock_location(registry, agent)).0
 }
 
 /// The companion lock that ranks waiters for `agent`'s lifecycle lock: see
 /// the queue library's ranked lock (`lock_exclusive_ranked`).
 #[must_use]
 pub fn rank_path(registry: &Path, agent: &str) -> PathBuf {
-    registry.join(format!(".{agent}.rank.lock"))
+    agent_queue::registry::lock_paths(registry, agent, lock_location(registry, agent)).1
 }
 
 fn waiting_directory(registry: &Path, agent: &str) -> PathBuf {
@@ -207,6 +216,20 @@ fn flock_holder(locks: &str, device: u64, inode: u64) -> Option<u64> {
         .map(|(_, _, pid)| *pid)
 }
 
+/// The process holding a `flock` on the file at `path`, if any (reads `/proc/locks`).
+#[must_use]
+pub(crate) fn holder_of(path: &Path) -> Option<u64> {
+    let metadata = fs::metadata(path).ok()?;
+    let locks = fs::read_to_string("/proc/locks").ok()?;
+    flock_holder(&locks, metadata.dev(), metadata.ino())
+}
+
+/// The command line of process `pid`, for a report, or `None` when it cannot be read.
+#[must_use]
+pub(crate) fn command_of(pid: u64) -> Option<String> {
+    command_line(pid)
+}
+
 /// Who holds `agent`'s lifecycle lock in `registry` and who is waiting for it:
 /// `{"holder": {"pid", "command"} | null, "waiters": [{"pid", "priority", "waiting_seconds",
 /// "command"}]}`, waiters longest first. Reads only; never takes the lock.
@@ -296,6 +319,7 @@ mod tests {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         crate::agent::create_private_directory(&registry, "registry", true, true).unwrap();
+        agent_queue::registry::prepare(&registry).unwrap();
         let lock =
             crate::agent::open_private_lock(&lock_path(&registry, "worker"), "lock").unwrap();
         fs2::FileExt::try_lock_exclusive(&lock).unwrap();

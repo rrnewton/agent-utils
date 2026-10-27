@@ -668,7 +668,11 @@ fn deliverer_accepts_explicit_agent_name() {
     assert_eq!(deliverer.kind(), "agentctl-queue");
     assert_eq!(
         deliverer.target().queue_dir,
-        Some(PathBuf::from("/nonexistent-registry/coordinator/queue"))
+        // An agent not registered yet is resolved where new agents are created: registry
+        // layout 2 (#593 registry-agents-subdir).
+        Some(PathBuf::from(
+            "/nonexistent-registry/agents/coordinator/queue"
+        ))
     );
 }
 

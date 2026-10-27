@@ -28,6 +28,7 @@ pub mod plugins;
 pub(crate) mod profiles;
 pub mod progress_metric;
 pub(crate) mod prompt_time;
+pub mod registry_layout;
 pub mod restore;
 pub(crate) mod skill_install;
 pub mod stale_composer;
