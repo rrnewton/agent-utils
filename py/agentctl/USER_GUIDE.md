@@ -1002,13 +1002,37 @@ in `REGISTRY/.progress/NAME.json` (schema `agentctl-progress/v1`).
 A long turn with input queued behind it (see "Input queued behind a running
 turn") is `turn-queued` once its age passes `--turn-minutes`; the age is the
 harness's turn timer, else how long the watcher has seen the agent working. It
-is reported, and nothing more, unless the agent is named with
-`--auto-deliver NAME` (repeatable, off for every agent by default): then the
-watcher interrupts the turn and submits the queued input as `send --urgent`
-does, once per episode, and the notice says what happened.
+is reported; being long is not by itself a reason to interrupt it.
+
+The **auto-interrupt** policy (#574) acts only on a stuck turn. On by default,
+it presses Escape and delivers the input queued for an agent (submitting what
+its harness held, or draining agentctl's queue) only when every one of these
+holds: input a drain would still type is queued; nothing moved on at least
+`--auto-deliver-checks` consecutive passes (default 2) spanning
+`--auto-deliver-after` minutes (default 60; 0 turns the policy off), where
+moving means the screen changed with its turn timer and queued-input block
+masked, a tool under the agent used CPU or moved bytes, or its harness
+transcript (or a sub-agent's) recorded something new; its tools could be
+sampled from /proc; no approval prompt, dialog, draft or scrolled-up view
+shows; it is not named with `--no-auto-deliver NAME`; and it was not
+auto-interrupted within the window. Just before Escape the screen is read
+again, and a turn that moved since the pass is left alone. Input marked urgent
+in its first line (`URGENT:`, `(urgent)`) uses `--auto-deliver-urgent-after`
+(default 15). Each interrupt is an `auto-interrupt` notice of its own to the
+coordinator saying why. `--auto-deliver NAME`, the old per-agent opt-in, is
+accepted and ignored.
+
+The harness's own transcript is read too: Claude Code's session JSONL (by the
+record's session id), Codex's rollout and Muse's journal (through the files the
+harness process holds open). It names an open model request in a
+`stream-silent` notice and the call in flight, with its command and timeout, in
+a `tool-blocked` one, where a call no process runs for (an MCP tool, a
+sub-agent) counts once nothing moves; `untimed-tool` reports a call that set no
+timeout running past `--untimed-tool-minutes` (default 60). The pass report's
+`activity` lists what each transcript says.
 
 The watcher never answers a prompt and never types into any agent except
-those recipients and the agents named with `--auto-deliver`. A condition past its threshold becomes **one notice per episode**,
+those recipients and, under the auto-interrupt policy, a stuck agent's pane. A condition past its threshold becomes **one notice per episode**,
 and every message goes through the same durable queue as `agentctl send`,
 delivered even while the coordinator works, so a coordinator that is busy
 simply keeps it queued. A `child-done` notice is a message of its own, sent in

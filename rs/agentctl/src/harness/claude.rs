@@ -117,6 +117,25 @@ impl HarnessAdapter for ClaudeCode {
     fn read_transcript(&self, lines: &[&[u8]], activity: &mut super::transcript::Activity) {
         read_transcript(lines, activity);
     }
+
+    /// Claude Code writes each sub-agent's conversation to `<session>/subagents/*.jsonl` beside
+    /// the session's own transcript.
+    fn related_transcripts(
+        &self,
+        _hints: &super::transcript::Hints<'_>,
+        main: &std::path::Path,
+    ) -> Vec<PathBuf> {
+        let directory = main.with_extension("").join("subagents");
+        std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Whether `screen` shows the folder-trust screen with its refusal, as a managed send checks
@@ -416,6 +435,13 @@ fn read_transcript(lines: &[&[u8]], activity: &mut super::transcript::Activity) 
                 }
                 activity.output(at, label);
             }
+            // Skill bodies, hook output and compaction summaries are written as user entries the
+            // harness made itself.
+            "user" if entry["isMeta"] == true || entry["isCompactSummary"] == true => {
+                if let Some(at) = at {
+                    activity.bookkeeping(at, "meta");
+                }
+            }
             "user" => {
                 let Some(at) = at else { continue };
                 let mut results = 0;
@@ -493,6 +519,42 @@ mod tests {
         assert_eq!(tool.limit, ToolLimit::Explicit(600.0));
         assert_eq!(tool.describe(), "Bash `make validate`");
         assert_eq!(activity.last_output.as_deref(), Some("tool call"));
+    }
+
+    #[test]
+    fn harness_made_user_entries_are_bookkeeping_and_keep_calls_in_flight() {
+        let mut text = FIXTURE.to_owned();
+        text.push_str(
+            "{\"type\":\"user\",\"isMeta\":true,\"timestamp\":\"2026-10-27T10:30:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"skill body\"}}\n",
+        );
+        let all: Vec<&[u8]> = text.lines().map(str::as_bytes).collect();
+        let mut activity = Activity::default();
+        read_transcript(&all, &mut activity);
+        assert_eq!(activity.tool.expect("still in flight").name, "Agent");
+        assert_eq!(activity.prompt_at, Some(T0));
+        assert_eq!(activity.last_event.as_deref(), Some("meta"));
+        assert_eq!(activity.last_progress_at, Some(T0 + 306.0));
+    }
+
+    #[test]
+    fn sub_agent_transcripts_beside_the_session_are_related() {
+        let home = crate::turn_state::tests::scratch();
+        let main = home.join("s1.jsonl");
+        std::fs::write(&main, FIXTURE).unwrap();
+        std::fs::create_dir_all(home.join("s1/subagents")).unwrap();
+        std::fs::write(home.join("s1/subagents/agent-a.jsonl"), "{}\n").unwrap();
+        let hints = Hints {
+            session: None,
+            cwd: None,
+            home: None,
+            pid: None,
+            proc: None,
+        };
+        assert_eq!(
+            ClaudeCode.related_transcripts(&hints, &main),
+            [home.join("s1/subagents/agent-a.jsonl")]
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]

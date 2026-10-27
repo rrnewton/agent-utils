@@ -157,6 +157,19 @@ impl HarnessAdapter for Codex {
     fn read_transcript(&self, lines: &[&[u8]], activity: &mut super::transcript::Activity) {
         read_transcript(lines, activity);
     }
+
+    /// The other rollouts the process holds open: its sub-agent threads.
+    fn related_transcripts(
+        &self,
+        hints: &super::transcript::Hints<'_>,
+        main: &Path,
+    ) -> Vec<PathBuf> {
+        hints
+            .open_files()
+            .into_iter()
+            .filter(|path| rollout_name(path) && path != main)
+            .collect()
+    }
 }
 
 /// The hint a busy Codex shows under staged text: Tab queues it for the end of the turn.
@@ -610,7 +623,7 @@ fn read_transcript(lines: &[&[u8]], activity: &mut super::transcript::Activity) 
                 activity.prompt(at);
                 activity.request(at);
             }
-            ("event_msg", "task_complete") => {
+            ("event_msg", "task_complete" | "turn_aborted") => {
                 open.clear();
                 activity.event(at, "turn complete");
                 activity.request_since = None;
@@ -649,6 +662,20 @@ fn read_transcript(lines: &[&[u8]], activity: &mut super::transcript::Activity) 
                     activity.request(at);
                 }
             }
+            // Streamed while the model works, before the item it builds is written.
+            (
+                "event_msg",
+                "agent_reasoning"
+                | "agent_reasoning_delta"
+                | "agent_reasoning_raw_content"
+                | "agent_message"
+                | "agent_message_delta"
+                | "token_count"
+                | "item_completed"
+                | "exec_command_begin"
+                | "exec_command_output_delta"
+                | "exec_command_end",
+            ) => activity.event(at, item),
             _ => activity.bookkeeping(at, if item.is_empty() { kind } else { item }),
         }
     }
@@ -710,6 +737,15 @@ mod tests {
         read_transcript(&all, &mut activity);
         assert!(activity.tool.is_none(), "a finished turn holds no call");
         assert_eq!(activity.last_event.as_deref(), Some("turn complete"));
+        let aborted = FIXTURE.to_owned()
+            + "{\"timestamp\":\"2026-10-27T10:12:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"}}\n";
+        let all: Vec<&[u8]> = aborted.lines().map(str::as_bytes).collect();
+        let mut activity = Activity::default();
+        read_transcript(&all, &mut activity);
+        assert!(activity.tool.is_none(), "an interrupted turn holds no call");
+        assert_eq!(activity.request_since, None);
+        // Streamed reasoning and token counts are progress before the item is written.
+        assert_eq!(read(usize::MAX).last_progress_at, Some(T0 + 700.0));
     }
 
     #[test]

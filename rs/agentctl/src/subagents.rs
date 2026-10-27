@@ -8881,7 +8881,76 @@ its drain would type first, so it was not queued",
     /// the agent's lifecycle lock, so no sender types in between. Nothing is pressed when the
     /// screen shows neither a running turn nor queued input.
     pub fn interrupt_and_submit(&self, agent_name: &str) -> Result<Value> {
-        let _lock = self.lock(agent_name)?;
+        self.interrupt_with(agent_name, true, None)
+    }
+
+    /// Interrupt a stuck turn and deliver everything queued for the agent (the watcher's
+    /// auto-interrupt policy, #574 harness-adapters): input its harness holds is submitted as
+    /// [`Self::interrupt_and_submit`] does, and input still in agentctl's queue (a Claude Code
+    /// agent is typed into only when idle) is drained once the interrupt has stopped the turn.
+    pub fn interrupt_and_deliver(&self, agent_name: &str, expected: u64) -> Result<Value> {
+        let queue = self.queue(agent_name)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+        let waiting = crate::turn_state::backlog(&queue, now, None).deliverable;
+        let mut report = self.interrupt_with(agent_name, waiting == 0, Some(expected))?;
+        if waiting > 0 && report["interrupted"] == true {
+            let detail = report["detail"].as_str().unwrap_or_default().to_owned();
+            let record = self.load(agent_name)?;
+            if crate::turn_state::read_screen(&self.turn_screen(&record)?).running {
+                // The harness took its own queued input and works on it: agentctl's queue is
+                // typed by the next delivery, not by a drain waiting here for idle.
+                report["detail"] = json!(format!(
+                    "{detail}; agentctl's queue ({waiting} waiting) is left for the next delivery, since a new turn is running"
+                ));
+            } else {
+                // Bounded, so one interrupt cannot hold the watcher's pass.
+                let options = DrainOptions {
+                    ready_timeout: Duration::from_secs(60),
+                    lock_timeout: Some(Duration::from_secs(30)),
+                    deadline: Some(Duration::from_secs(120)),
+                    max_items: Some(waiting),
+                    ..DrainOptions::default()
+                };
+                match self.drain(agent_name, options) {
+                    Ok(result) => {
+                        report["detail"] = json!(format!(
+                            "{detail}; drained agentctl's queue ({waiting} waiting): {:?}",
+                            result.outcome
+                        ));
+                        report["drained"] = json!(result);
+                    }
+                    Err(error) => {
+                        report["detail"] = json!(format!(
+                            "{detail}; draining agentctl's queue ({waiting} waiting) failed: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// [`Self::interrupt_and_submit`]; with `require_held` false the turn is interrupted even
+    /// when its harness holds no input, because the input waits in agentctl's queue. `watched`
+    /// is the watcher's [`crate::turn_state::quiet_rows`] hash: then the lifecycle lock is waited
+    /// for at most 30 s, Escape is pressed only while the same kind of read still shows a running
+    /// turn with that hash and no dialog, and a turn Escape did not stop is reported, not an
+    /// error, since a key was pressed.
+    fn interrupt_with(
+        &self,
+        agent_name: &str,
+        require_held: bool,
+        watched: Option<u64>,
+    ) -> Result<Value> {
+        let system = agent::SystemRuntime::default();
+        let bounded = agent::UntilRuntime::after(&system, Duration::from_secs(30));
+        let _lock = if watched.is_some() {
+            self.lock_with_runtime(agent_name, &bounded)?
+        } else {
+            self.lock(agent_name)?
+        };
         let record = self.load(agent_name)?;
         record.input_allowed()?;
         if record.is_cloud() {
@@ -8900,7 +8969,7 @@ its drain would type first, so it was not queued",
             .ok_or_else(|| fail(format!("agent {agent_name:?} has no confirmed pane")))?;
         let first = self.turn_screen(&record)?;
         let before = crate::turn_state::read_screen(&first);
-        if before.queued == 0 {
+        if before.queued == 0 && require_held {
             return Ok(json!({
                 "interrupted": false,
                 "submitted": false,
@@ -8919,6 +8988,25 @@ its drain would type first, so it was not queued",
                 "{agent_name:?}'s input box holds a draft ({} characters) that Enter would submit with the queue; nothing was pressed",
                 draft.chars().count()
             )));
+        }
+        if let Some(expected) = watched {
+            // The watcher's decision is a pass old; act on it only if nothing moved since.
+            let same = agent::read(
+                self.client,
+                &self.target(&record)?,
+                crate::agent_watch::SCREEN_LINES,
+            )?;
+            let moved = !crate::turn_state::read_screen(&same).running
+                || crate::agent_watch::stable_hash(&crate::turn_state::quiet_rows(&same))
+                    != expected
+                || crate::agent_watch::interactive_prompt(&same, None);
+            if moved {
+                return Ok(json!({
+                    "interrupted": false,
+                    "submitted": false,
+                    "detail": "the turn moved, ended or showed a dialog since the watcher looked; nothing was pressed",
+                }));
+            }
         }
         let queue = self.queue(&record.name)?;
         let client = WorkspaceClient {
@@ -8944,10 +9032,18 @@ its drain would type first, so it was not queued",
                 break;
             }
             if Instant::now() >= deadline {
-                return Err(fail(format!(
+                let detail = format!(
                     "Escape did not stop {agent_name:?}'s turn within {} s; nothing was submitted",
                     INTERRUPT_SETTLE.as_secs()
-                )));
+                );
+                if watched.is_some() {
+                    return Ok(json!({
+                        "interrupted": true,
+                        "submitted": false,
+                        "detail": format!("pressed Escape, but {detail}"),
+                    }));
+                }
+                return Err(fail(detail));
             }
             std::thread::sleep(Duration::from_millis(250));
             screen = self.turn_screen(&record)?;

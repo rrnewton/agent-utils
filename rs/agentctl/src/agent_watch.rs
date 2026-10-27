@@ -44,7 +44,7 @@ use crate::subagents::{controller_of, ManagedAgents, ManagedApi};
 pub const STATE_SCHEMA: &str = "agentctl-agent-watch/v1";
 
 /// Visible screen lines read per agent per pass.
-const SCREEN_LINES: usize = 200;
+pub(crate) const SCREEN_LINES: usize = 200;
 /// Bottom screen lines scanned for an approval or permission prompt. Harnesses draw
 /// prompts at the bottom of the screen; scanning the whole transcript would match an
 /// agent merely discussing a prompt.
@@ -101,15 +101,54 @@ pub struct WatchAgentsOptions {
     pub delivery_wait: Duration,
     /// How long a turn may run, with input queued behind it, before it is reported.
     pub turn: Duration,
-    /// Agents whose long turn with queued input is interrupted and the input submitted, not
-    /// only reported (off for every agent unless named).
-    pub auto_deliver: Vec<String>,
+    /// How long a tool call that set no timeout, and that its harness does not bound, may run
+    /// (per the harness's transcript) before it is reported.
+    pub untimed_tool: Duration,
+    /// When a stuck agent's turn is interrupted so input queued for it is delivered.
+    pub auto_deliver: AutoDeliver,
     /// How many times in a row the same command or error must show to count as a loop.
     pub loop_repeats: usize,
     /// How long a loop or a retry banner may hold before it is reported.
     pub loop_hold: Duration,
     /// Recorded gate step durations, for a step running past its p95.
     pub step_history: crate::work_state::StepHistory,
+}
+
+/// The auto-interrupt policy (#574 harness-adapters): the watcher interrupts an agent's turn
+/// and delivers the input queued for it only when every one of these holds:
+///
+/// * input is queued for it, in its harness's queue or in agentctl's;
+/// * it has made no progress on at least `checks` consecutive passes spanning at least `after`
+///   (`urgent_after` when queued input is marked urgent): its screen did not change (the turn
+///   timer and the queued-input block masked), no tool or gate step under it used CPU or moved
+///   bytes, and its transcript recorded nothing new;
+/// * its tools could be sampled from /proc at all, so a progressing tool is ruled out, however
+///   long it has run;
+/// * no approval prompt and no operator draft shows;
+/// * it is not opted out, and it was not auto-interrupted within `after`.
+#[derive(Clone, Debug)]
+pub struct AutoDeliver {
+    /// How long without progress; zero turns the policy off.
+    pub after: Duration,
+    /// Consecutive passes without progress.
+    pub checks: u32,
+    /// How long without progress when queued input is marked urgent.
+    pub urgent_after: Duration,
+    /// Agents never auto-interrupted.
+    pub opt_out: Vec<String>,
+}
+
+impl AutoDeliver {
+    /// The policy turned off.
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            after: Duration::ZERO,
+            checks: 2,
+            urgent_after: Duration::ZERO,
+            opt_out: Vec::new(),
+        }
+    }
 }
 
 impl WatchAgentsOptions {
@@ -125,8 +164,12 @@ impl WatchAgentsOptions {
             EpisodeKind::Dead => self.dead,
             EpisodeKind::TurnQueued => self.turn,
             EpisodeKind::Looping => self.loop_hold,
-            // Each carries its own window: the step's p95, the metric's declared hours.
-            EpisodeKind::OverExpected | EpisodeKind::NoProgress => Duration::ZERO,
+            EpisodeKind::UntimedTool => self.untimed_tool,
+            // Each carries its own window: the step's p95, the metric's declared hours; an
+            // auto-interrupt is news at once.
+            EpisodeKind::OverExpected | EpisodeKind::NoProgress | EpisodeKind::AutoInterrupt => {
+                Duration::ZERO
+            }
         }
     }
 }
@@ -160,6 +203,11 @@ pub enum EpisodeKind {
     Looping,
     /// The agent waits on background work that is gone or idle.
     BackgroundWait,
+    /// A tool call that set no timeout has run past `--untimed-tool-minutes`, per the harness's
+    /// transcript.
+    UntimedTool,
+    /// The watcher interrupted a stuck turn to deliver the input queued for it.
+    AutoInterrupt,
 }
 
 impl EpisodeKind {
@@ -179,6 +227,8 @@ impl EpisodeKind {
             Self::OverExpected => "over-expected",
             Self::Looping => "looping",
             Self::BackgroundWait => "background-wait",
+            Self::UntimedTool => "untimed-tool",
+            Self::AutoInterrupt => "auto-interrupt",
         }
     }
 
@@ -194,6 +244,8 @@ impl EpisodeKind {
                 | Self::OverExpected
                 | Self::Looping
                 | Self::BackgroundWait
+                | Self::UntimedTool
+                | Self::AutoInterrupt
         )
     }
 
@@ -237,6 +289,11 @@ impl EpisodeKind {
                 minutes(options.loop_hold)
             ),
             Self::BackgroundWait => "waiting on background work that is gone or idle".to_owned(),
+            Self::UntimedTool => format!(
+                "a tool call with no timeout running for over {} minutes",
+                minutes(options.untimed_tool)
+            ),
+            Self::AutoInterrupt => "interrupted to deliver input queued behind a stuck turn".to_owned(),
         }
     }
 
@@ -278,7 +335,13 @@ pub struct Observation {
     pub work: Option<crate::work_state::WorkSample>,
     /// The agent's declared progress metric, read this pass.
     pub progress: Option<crate::progress_metric::Reading>,
+    /// The harness the record names (`claude`, `codex`, `muse`, ...).
+    pub harness: Option<String>,
+    /// What the harness's own transcript says the agent is doing, when it could be found.
+    pub transcript: Option<Activity>,
 }
+
+use crate::harness::transcript::Activity;
 
 /// Prompt phrases, lowercased, matched against the bottom of the screen: every harness's
 /// approval, permission and trust phrases ([`crate::harness::approval_patterns`]).
@@ -406,7 +469,7 @@ fn turn_running(screen: &str) -> bool {
 
 /// FNV-1a over `text`. Persisted hashes must read the same in every process, so the
 /// standard library's per-process-keyed hasher cannot be used for them.
-fn stable_hash(text: &str) -> u64 {
+pub(crate) fn stable_hash(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);
@@ -470,6 +533,28 @@ struct AgentMemory {
     /// When the progress metric last changed (or was first read).
     #[serde(default)]
     progress_changed_at: f64,
+    /// Hash of the screen with the turn timer and any queued-input block masked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quiet_hash: Option<u64>,
+    /// The newest transcript progress seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript_progress: Option<f64>,
+    /// The newest change seen to a related transcript (a sub-agent's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    related_progress: Option<f64>,
+    /// When anything last showed the agent moving: that screen, its tools, its transcript.
+    #[serde(default)]
+    moved_at: f64,
+    /// Consecutive passes, inside a turn, in which nothing moved.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    still_passes: u32,
+    /// When the watcher last interrupted the agent's turn under the auto-interrupt policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_interrupted_at: Option<f64>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// A condition one observation shows: its kind and the line proving it, and, when the condition
@@ -588,11 +673,23 @@ pub trait Notifier {
     fn notify_urgent(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
         self.notify(coordinator, text, message_id)
     }
-    /// Interrupt `agent`'s running turn and submit the input its harness holds for later
-    /// (`--auto-deliver`), returning one line saying what happened. The default cannot.
-    fn interrupt_and_submit(&mut self, agent: &str) -> Result<String> {
+    /// Interrupt `agent`'s running turn and deliver the input queued for it, in its harness or
+    /// in agentctl's queue (the auto-interrupt policy), but only while its screen still shows a
+    /// running turn whose [`crate::turn_state::quiet_rows`] hash to `expected`: a turn that moved
+    /// since the pass looked is left alone. An error means nothing was pressed. The default
+    /// cannot.
+    fn interrupt_and_deliver(&mut self, agent: &str, _expected: u64) -> Result<Interrupt> {
         Err(fail(format!("this watcher cannot interrupt {agent}")))
     }
+}
+
+/// What an auto-interrupt did.
+#[derive(Clone, Debug)]
+pub struct Interrupt {
+    /// Whether Escape was pressed.
+    pub pressed: bool,
+    /// One line saying what happened.
+    pub detail: String,
 }
 
 /// The watcher's clock, injectable for tests.
@@ -974,16 +1071,76 @@ fn working_finding(
     let Some(work) = observation.work.as_ref() else {
         return Some(Finding::new(EpisodeKind::Stalled, "screen unchanged"));
     };
-    if let Some(finding) = blocked_work(observation, options, memory, now) {
+    let activity = observation.transcript.as_ref();
+    if let Some(mut finding) = blocked_work(observation, options, memory, now) {
+        if let Some(tool) = activity.and_then(|activity| activity.tool.as_ref()) {
+            finding.detail.push_str(&format!(
+                "; the transcript shows {} called {} ago, {}",
+                tool.describe(),
+                ago(now, tool.started_at),
+                tool.describe_limit()
+            ));
+        }
         return Some(finding);
     }
-    if work.items.is_empty() {
-        let since = memory.screen_changed_at.max(memory.work_changed_at);
-        if now - since >= options.stall.as_secs_f64() {
-            let moved = if turn.tokens.is_some() {
-                "the transcript and the token counter have not moved"
+    // A call that set no timeout, and that its harness does not bound, is reported once it has
+    // run past --untimed-tool-minutes, working or not: nothing will stop it.
+    if let Some(tool) = activity.and_then(|activity| activity.tool.as_ref()) {
+        if tool.untimed() && now - tool.started_at >= options.untimed_tool.as_secs_f64() {
+            let state = if work.items.is_empty() {
+                "no process under the harness"
+            } else if now - memory.work_changed_at >= options.stall.as_secs_f64() {
+                "its processes use no CPU and move no bytes"
             } else {
-                "the screen has not moved"
+                "its processes are working"
+            };
+            return Some(Finding::timed(
+                EpisodeKind::UntimedTool,
+                format!(
+                    "tool call running {} with no timeout: {}; {state}",
+                    ago(now, tool.started_at),
+                    tool.describe()
+                ),
+                tool.started_at,
+                Some(options.untimed_tool.as_secs_f64()),
+            ));
+        }
+    }
+    if work.items.is_empty() {
+        let since = memory.screen_changed_at.max(memory.work_changed_at).max(
+            activity
+                .and_then(|activity| activity.last_progress_at)
+                .unwrap_or(0.0),
+        );
+        if now - since >= options.stall.as_secs_f64() {
+            // The transcript can name a call no process runs for: an MCP tool, a web fetch, a
+            // sub-agent inside the harness.
+            if let Some(tool) = activity.and_then(|activity| activity.tool.as_ref()) {
+                return Some(Finding::timed(
+                    EpisodeKind::ToolBlocked,
+                    format!(
+                        "tool blocked {}: the transcript shows {} called {} ago, {}, with no process under the harness and no output since",
+                        ago(now, since),
+                        tool.describe(),
+                        ago(now, tool.started_at),
+                        tool.describe_limit()
+                    ),
+                    since,
+                    None,
+                ));
+            }
+            let moved = match activity {
+                Some(activity) if activity.request_since.is_some() => format!(
+                    "a model request has been open {} with nothing back",
+                    ago(now, activity.request_since.unwrap_or(now))
+                ),
+                Some(_) => {
+                    "the screen, the token counter and the transcript have not moved".to_owned()
+                }
+                None if turn.tokens.is_some() => {
+                    "the transcript and the token counter have not moved".to_owned()
+                }
+                None => "the screen has not moved".to_owned(),
             };
             return Some(Finding::timed(
                 EpisodeKind::StreamSilent,
@@ -1086,7 +1243,8 @@ fn episode_window(episode: &Episode, options: &WatchAgentsOptions) -> f64 {
 
 /// Bring the counters of the agent's tools and gate steps, its working stretch, and its
 /// progress metric up to date with `observation`.
-fn remember_work(memory: &mut AgentMemory, observation: &Observation, now: f64) {
+fn remember_work(memory: &mut AgentMemory, observation: &Observation, now: f64) -> bool {
+    let mut work_moved = false;
     if let Some(work) = observation.work.as_ref() {
         let mut marks = BTreeMap::new();
         let mut moved = work.items.len() != memory.work.len();
@@ -1110,6 +1268,7 @@ fn remember_work(memory: &mut AgentMemory, observation: &Observation, now: f64) 
         if moved {
             memory.work_changed_at = now;
         }
+        work_moved = moved;
         memory.work = marks;
     } else {
         memory.work.clear();
@@ -1142,6 +1301,184 @@ fn remember_work(memory: &mut AgentMemory, observation: &Observation, now: f64) 
             memory.progress_changed_at = 0.0;
         }
     }
+    work_moved
+}
+
+/// Bring the auto-interrupt policy's view of the agent up to date with `observation`: whether
+/// anything moved this pass (its screen with the turn timer and queued-input block masked, the
+/// counters of a tool under it, its transcript), and for how many passes inside a turn nothing
+/// has. A pass outside a turn is not stillness.
+fn remember_motion(
+    memory: &mut AgentMemory,
+    observation: &Observation,
+    now: f64,
+    work_moved: bool,
+) {
+    let Some(screen) = observation.screen.as_deref() else {
+        return;
+    };
+    let quiet = stable_hash(&crate::turn_state::quiet_rows(screen));
+    let mut moved = work_moved || memory.quiet_hash != Some(quiet);
+    memory.quiet_hash = Some(quiet);
+    if let Some(at) = observation
+        .transcript
+        .as_ref()
+        .and_then(|activity| activity.last_progress_at)
+    {
+        if memory.transcript_progress.is_none_or(|seen| at > seen) {
+            memory.transcript_progress = Some(at);
+            moved = true;
+        }
+    }
+    if let Some(at) = observation
+        .transcript
+        .as_ref()
+        .and_then(|activity| activity.related_progress_at)
+    {
+        if memory.related_progress.is_none_or(|seen| at > seen) {
+            memory.related_progress = Some(at);
+            moved = true;
+        }
+    }
+    let in_turn = observation.status == "working" || crate::turn_state::screen_running(screen);
+    if moved || !in_turn {
+        memory.moved_at = now;
+        memory.still_passes = 0;
+    } else {
+        memory.still_passes = memory.still_passes.saturating_add(1);
+    }
+}
+
+/// What the transcript says about a still agent, as a clause for a notice.
+fn transcript_clause(activity: Option<&Activity>, now: f64) -> String {
+    let Some(activity) = activity else {
+        return "no transcript found".to_owned();
+    };
+    if let Some(error) = &activity.error {
+        return format!("transcript unreadable: {error}");
+    }
+    if let Some(tool) = &activity.tool {
+        return format!(
+            "transcript: {} called {} ago, {}",
+            tool.describe(),
+            ago(now, tool.started_at),
+            tool.describe_limit()
+        );
+    }
+    if let Some(since) = activity.request_since {
+        return format!(
+            "transcript: a model request open {} with nothing back",
+            ago(now, since)
+        );
+    }
+    match (activity.last_output_at, activity.last_output.as_deref()) {
+        (Some(at), Some(kind)) => format!(
+            "transcript: last model output ({kind}) {} ago",
+            ago(now, at)
+        ),
+        _ => "transcript: no model output in its tail".to_owned(),
+    }
+}
+
+/// Why `observation`'s turn is due an auto-interrupt now, as a notice clause, or `None` while
+/// any condition of [`AutoDeliver`] fails.
+fn auto_interrupt_reason(
+    memory: &AgentMemory,
+    observation: &Observation,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Option<(String, u64)> {
+    let policy = &options.auto_deliver;
+    if policy.after.is_zero() || policy.opt_out.contains(&observation.name) {
+        return None;
+    }
+    let screen = observation.screen.as_deref()?;
+    // Without a /proc sample a long tool that is still working cannot be ruled out.
+    let work = observation.work.as_ref()?;
+    let turn = crate::turn_state::read_screen(screen);
+    // Only input a drain would still type counts: a cancelled or expired item does not.
+    let queued = turn.queued + observation.backlog.deliverable;
+    if queued == 0
+        || observation.status == "blocked"
+        || approval_prompt_line(screen).is_some()
+        || interactive_prompt(screen, observation.transcript.as_ref())
+        || crate::turn_state::composer_draft(screen).is_some()
+        || crate::harness::claude::scrolled_below(screen).is_some()
+    {
+        return None;
+    }
+    let urgent = observation.backlog.urgent > 0
+        || turn
+            .queued_preview
+            .iter()
+            .any(|preview| crate::turn_state::urgent(preview));
+    let after = if urgent && !policy.urgent_after.is_zero() {
+        policy.urgent_after.min(policy.after)
+    } else {
+        policy.after
+    };
+    if memory.still_passes < policy.checks
+        || now - memory.moved_at < after.as_secs_f64()
+        || memory
+            .auto_interrupted_at
+            .is_some_and(|at| now - at < policy.after.as_secs_f64())
+    {
+        return None;
+    }
+    let tools = if work.items.is_empty() {
+        "no tool running".to_owned()
+    } else {
+        format!("{} tool(s) with no CPU or I/O", work.items.len())
+    };
+    Some((
+        format!(
+            "no progress for {} over {} checks (screen unchanged, {tools}; {}); {queued} input(s) queued{}",
+            ago(now, memory.moved_at),
+            memory.still_passes,
+            transcript_clause(observation.transcript.as_ref(), now),
+            if urgent { ", marked urgent" } else { "" },
+        ),
+        stable_hash(&crate::turn_state::quiet_rows(screen)),
+    ))
+}
+
+/// Tools that wait on the user: a turn parked in one is not stuck, and Escape would answer it.
+const INTERACTIVE_TOOLS: [&str; 5] = [
+    "AskUserQuestion",
+    "ExitPlanMode",
+    "request_user_input",
+    "ask_user",
+    "ask_followup_question",
+];
+
+/// Phrases, lowercased, of dialogs wider than [`approval_prompt_line`]'s list (`Do you want to
+/// make this edit to ...?`, `Would you like to make the following edits?`, menu hints), read only
+/// to keep the auto-interrupt away from them: Escape on a dialog answers it.
+const DIALOG_HINTS: [&str; 6] = [
+    "do you want to",
+    "would you like to",
+    "enter to select",
+    "enter to confirm",
+    "esc to cancel",
+    "↑/↓ to navigate",
+];
+
+/// Whether the bottom of `screen`, or the transcript's open call, shows the agent waiting on a
+/// person rather than stuck.
+pub(crate) fn interactive_prompt(screen: &str, activity: Option<&Activity>) -> bool {
+    if activity
+        .and_then(|activity| activity.tool.as_ref())
+        .is_some_and(|tool| INTERACTIVE_TOOLS.contains(&tool.name.as_str()))
+    {
+        return true;
+    }
+    let lines: Vec<&str> = screen.lines().collect();
+    lines[lines.len().saturating_sub(PROMPT_WINDOW_LINES)..]
+        .iter()
+        .any(|line| {
+            let lowered = line.to_ascii_lowercase();
+            DIALOG_HINTS.iter().any(|hint| lowered.contains(hint))
+        })
 }
 
 /// Append at most one new notice for `observation`, after updating its episode memory.
@@ -1185,7 +1522,8 @@ fn update_episode(
             }
         }
     }
-    remember_work(&mut memory, observation, now);
+    let work_moved = remember_work(&mut memory, observation, now);
+    remember_motion(&mut memory, observation, now, work_moved);
     let found = classify(observation, options, &memory, now)
         .map(|finding| (finding.kind, finding.detail, finding.since, finding.window));
     // A view scrolled up hides whatever would show progress or a verdict, so neither a stall
@@ -1622,21 +1960,54 @@ fn watch_agents_once(
                 })
         });
     }
-    // An agent named with --auto-deliver whose long turn holds queued input has the turn
-    // interrupted and the input submitted, once per episode; the notice says what happened.
-    if !options.check_only {
-        for notice in &mut state.pending {
-            if notice.kind == EpisodeKind::TurnQueued
-                && notice.delivery.is_none()
-                && options.auto_deliver.contains(&notice.agent)
-            {
-                let outcome = match notifier.interrupt_and_submit(&notice.agent) {
-                    Ok(line) => format!("auto-delivered: {line}"),
-                    Err(error) => format!("auto-deliver failed: {error}"),
-                };
-                notice.detail = format!("{}; {outcome}", notice.detail);
-                notice.delivery = Some(outcome);
+    // The auto-interrupt policy ([`AutoDeliver`]): a stuck turn with input queued behind it is
+    // interrupted and the input delivered, and the coordinator is told why in a line of its own.
+    let mut auto_interrupts = Vec::new();
+    if probe_error.is_null() {
+        for observation in &observations {
+            let Some((reason, expected)) = state
+                .agents
+                .get(&observation.name)
+                .and_then(|memory| auto_interrupt_reason(memory, observation, now, options))
+            else {
+                continue;
+            };
+            if options.check_only {
+                auto_interrupts.push(json!({"agent": observation.name, "due": true, "acted": false, "reason": reason}));
+                continue;
             }
+            // Nothing pressed (the turn moved, ended, or showed a prompt or draft since the pass
+            // looked, or the agent's lock stayed busy): no notice, and the next pass judges again.
+            let outcome = match notifier.interrupt_and_deliver(&observation.name, expected) {
+                Ok(Interrupt {
+                    pressed: true,
+                    detail,
+                }) => detail,
+                Ok(Interrupt { detail, .. }) => {
+                    auto_interrupts.push(json!({"agent": observation.name, "due": true, "acted": false, "reason": reason, "outcome": detail}));
+                    continue;
+                }
+                Err(error) => {
+                    auto_interrupts.push(json!({"agent": observation.name, "due": true, "acted": false, "reason": reason, "outcome": error.to_string()}));
+                    continue;
+                }
+            };
+            if let Some(memory) = state.agents.get_mut(&observation.name) {
+                memory.auto_interrupted_at = Some(now);
+                memory.still_passes = 0;
+                memory.moved_at = now;
+            }
+            auto_interrupts.push(json!({"agent": observation.name, "due": true, "acted": true, "reason": reason, "outcome": outcome}));
+            state.pending.push(PendingNotice {
+                agent: observation.name.clone(),
+                kind: EpisodeKind::AutoInterrupt,
+                since: now,
+                detail: format!("auto-interrupted: {reason}; {outcome}"),
+                next: Vec::new(),
+                recipient: None,
+                redirected: false,
+                delivery: Some(outcome),
+            });
         }
     }
     // Whom to tell is decided again each pass from the latest observation, so a notice still
@@ -1647,7 +2018,11 @@ fn watch_agents_once(
         .map(|batch| batch.keys.clone())
         .unwrap_or_default();
     for notice in &mut state.pending {
-        if notice.redirected || in_flight.contains(&notice.key()) {
+        // An auto-interrupt is the coordinator's news, whoever manages the agent.
+        if notice.redirected
+            || notice.kind == EpisodeKind::AutoInterrupt
+            || in_flight.contains(&notice.key())
+        {
             continue;
         }
         if let Some(observation) = observations.iter().find(|row| row.name == notice.agent) {
@@ -1695,6 +2070,20 @@ fn watch_agents_once(
         "child_done": child_done,
         "waiting": state.pending.len(),
         "delivery_waits": delivery_waits,
+        "auto_interrupts": auto_interrupts,
+        "activity": observations
+            .iter()
+            .map(|row| {
+                let memory = state.agents.get(&row.name);
+                json!({
+                    "agent": row.name,
+                    "harness": row.harness,
+                    "transcript": row.transcript,
+                    "still_passes": memory.map_or(0, |memory| memory.still_passes),
+                    "still_seconds": memory.map(|memory| (now - memory.moved_at).max(0.0)),
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -1947,6 +2336,8 @@ pub struct ManagedProbe<'a, A: ManagedApi + ?Sized> {
     /// Keep idle agents' screens for the next pass (off for a single pass, which has none).
     keep_screens: bool,
     screens: BTreeMap<String, KeptScreen>,
+    /// Transcripts read in earlier passes, reread only when they change.
+    transcripts: crate::harness::transcript::Cache,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
@@ -1960,6 +2351,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             verbose: false,
             keep_screens: true,
             screens: BTreeMap::new(),
+            transcripts: crate::harness::transcript::Cache::default(),
         }
     }
 
@@ -2096,6 +2488,45 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             }),
             _ => None,
         };
+        let harness = row["harness"].as_str().map(str::to_owned);
+        let transcript = if gone {
+            None
+        } else {
+            harness
+                .as_deref()
+                .and_then(crate::harness::adapter)
+                .and_then(|adapter| {
+                    // The pinned process is trusted only once its sample checked its start time.
+                    let pid = work
+                        .as_ref()
+                        .and(identity["pid"].as_u64())
+                        .and_then(|pid| u32::try_from(pid).ok());
+                    let home = pid
+                        .and_then(|pid| crate::work_state::ProcView::environ(proc_view, pid))
+                        .and_then(|entries| {
+                            entries
+                                .iter()
+                                .find_map(|entry| entry.strip_prefix("HOME=").map(PathBuf::from))
+                        })
+                        .or_else(|| row["runtime_home"].as_str().map(PathBuf::from))
+                        .or_else(crate::harness::home);
+                    let session = row["launch_spec"]["native_session"]["value"]
+                        .as_str()
+                        .or_else(|| row["native_session"]["value"].as_str())
+                        .or_else(|| row["session_value"].as_str());
+                    crate::harness::transcript::read_cached(
+                        adapter,
+                        &crate::harness::transcript::Hints {
+                            session,
+                            cwd: row["cwd"].as_str().map(Path::new),
+                            home: home.as_deref(),
+                            pid,
+                            proc: Some(proc_view),
+                        },
+                        Some(&self.transcripts),
+                    )
+                })
+        };
         let progress = match crate::progress_metric::load(&self.registry, &name) {
             Ok(Some(declaration)) => {
                 let cwd = row["cwd"]
@@ -2148,6 +2579,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             backlog,
             work,
             progress,
+            harness,
+            transcript,
             name,
         }
     }
@@ -2395,6 +2828,8 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
                 backlog: crate::turn_state::Backlog::default(),
                 work: None,
                 progress: None,
+                harness: None,
+                transcript: None,
             });
         }
         Ok(observations)
@@ -2452,13 +2887,16 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
         )
     }
 
-    fn interrupt_and_submit(&mut self, agent: &str) -> Result<String> {
-        let report =
-            ManagedAgents::new(self.client, &self.registry)?.interrupt_and_submit(agent)?;
-        Ok(report["detail"]
-            .as_str()
-            .unwrap_or("interrupted")
-            .to_owned())
+    fn interrupt_and_deliver(&mut self, agent: &str, expected: u64) -> Result<Interrupt> {
+        let report = ManagedAgents::new(self.client, &self.registry)?
+            .interrupt_and_deliver(agent, expected)?;
+        Ok(Interrupt {
+            pressed: report["interrupted"] == true,
+            detail: report["detail"]
+                .as_str()
+                .unwrap_or("interrupted")
+                .to_owned(),
+        })
     }
 }
 
@@ -2543,7 +2981,8 @@ mod tests {
             landing_queue: None,
             delivery_wait: Duration::from_secs(600),
             turn: Duration::from_secs(7200),
-            auto_deliver: Vec::new(),
+            untimed_tool: Duration::from_secs(3600),
+            auto_deliver: AutoDeliver::off(),
             loop_repeats: 3,
             loop_hold: Duration::from_secs(600),
             step_history: crate::work_state::StepHistory::default(),
@@ -2562,6 +3001,8 @@ mod tests {
             backlog: crate::turn_state::Backlog::default(),
             work: None,
             progress: None,
+            harness: None,
+            transcript: None,
         }
     }
 
@@ -2647,12 +3088,20 @@ mod tests {
         fail_attempts: usize,
         urgent: Vec<String>,
         interrupted: Vec<String>,
+        press_nothing: bool,
     }
 
     impl Notifier for RecordingNotifier {
-        fn interrupt_and_submit(&mut self, agent: &str) -> Result<String> {
+        fn interrupt_and_deliver(&mut self, agent: &str, _expected: u64) -> Result<Interrupt> {
             self.interrupted.push(agent.to_owned());
-            Ok("interrupted the turn after 46 h 54 m and submitted the 4 queued input(s) it put back in the input box".to_owned())
+            Ok(Interrupt {
+                pressed: !self.press_nothing,
+                detail: if self.press_nothing {
+                    "the turn moved since the watcher looked; nothing was pressed".to_owned()
+                } else {
+                    "interrupted the turn after 46 h 54 m and submitted the 4 queued input(s) it put back in the input box".to_owned()
+                },
+            })
         }
 
         fn notify_urgent(
@@ -3961,6 +4410,7 @@ mod tests {
 
     // ---- #570 agent-progress-monitoring: what "working" means -------------------------------
 
+    use crate::harness::transcript::{Activity, ToolCall, ToolLimit};
     use crate::work_state::fake::FakeProc;
     use crate::work_state::{sample, WorkSample};
 
@@ -4004,61 +4454,368 @@ mod tests {
         assert!(notifier.interrupted.is_empty(), "report only by default");
     }
 
+    fn auto_options() -> WatchAgentsOptions {
+        WatchAgentsOptions {
+            auto_deliver: AutoDeliver {
+                after: Duration::from_secs(3600),
+                checks: 2,
+                urgent_after: Duration::from_secs(900),
+                opt_out: vec!["lane-b".to_owned()],
+            },
+            ..options()
+        }
+    }
+
+    /// A harness with no tool under it, as one /proc sample.
+    fn idle_harness() -> Option<WorkSample> {
+        let mut proc = FakeProc::default();
+        proc.spawn(100, 1, 'S', "codex");
+        sample(&proc, 100, None)
+    }
+
+    /// A harness whose one tool has used `ticks` of CPU.
+    fn busy_harness(ticks: u64) -> Option<WorkSample> {
+        let mut proc = FakeProc::default();
+        proc.spawn(100, 1, 'S', "codex")
+            .spawn(200, 100, 'S', "/bin/bash -c make validate")
+            .burn(200, ticks);
+        sample(&proc, 100, None)
+    }
+
     #[test]
-    fn auto_deliver_interrupts_a_named_agents_long_turn_and_says_so() {
-        let mut options = options();
-        options.auto_deliver = vec!["lane-a".to_owned()];
+    fn a_stuck_turn_with_queued_input_is_interrupted_once_after_the_window_and_the_notice_says_why()
+    {
+        let options = auto_options();
+        let round = || {
+            vec![
+                working("lane-a", CODEX_LONG, idle_harness()),
+                working("lane-b", CODEX_LONG, idle_harness()),
+            ]
+        };
+        let mut probe = ScriptedProbe(vec![round(), round(), round(), round()]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let early = pass(&mut probe, &mut notifier, &mut state, 1_800.0, &options);
+        assert!(
+            notifier.interrupted.is_empty(),
+            "one still pass is not enough: {early}"
+        );
+        let report = pass(&mut probe, &mut notifier, &mut state, 3_700.0, &options);
+        assert_eq!(
+            notifier.interrupted,
+            ["lane-a"],
+            "lane-b opted out: {report}"
+        );
+        assert_eq!(report["auto_interrupts"][0]["acted"], true, "{report}");
+        let text = notifier
+            .sent
+            .iter()
+            .map(|(_, text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("- lane-a: auto-interrupted: no progress for 1 h 1 m over 2 checks (screen unchanged, no tool running; no transcript found); 4 input(s) queued; interrupted the turn after 46 h 54 m"),
+            "{text}"
+        );
+        assert!(!text.contains("- lane-b: auto-interrupted"), "{text}");
+        pass(&mut probe, &mut notifier, &mut state, 3_760.0, &options);
+        assert_eq!(notifier.interrupted, ["lane-a"], "once per stuck stretch");
+    }
+
+    #[test]
+    fn a_progressing_tool_or_new_transcript_output_holds_off_the_interrupt() {
+        let options = auto_options();
+        let progressing = |ticks: u64, output: f64| {
+            vec![
+                working("cpu", CODEX_LONG, busy_harness(ticks)),
+                Observation {
+                    transcript: Some(Activity {
+                        last_progress_at: Some(output),
+                        last_output_at: Some(output),
+                        ..Activity::default()
+                    }),
+                    ..working("talking", CODEX_LONG, idle_harness())
+                },
+            ]
+        };
+        let mut probe = ScriptedProbe(vec![
+            progressing(10, 0.0),
+            progressing(20, 1_700.0),
+            progressing(30, 3_600.0),
+            progressing(40, 5_000.0),
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        for now in [0.0, 1_800.0, 3_700.0, 5_600.0] {
+            pass(&mut probe, &mut notifier, &mut state, now, &options);
+        }
+        assert!(
+            notifier.interrupted.is_empty(),
+            "{:?}",
+            notifier.interrupted
+        );
+        assert_eq!(state.agents["cpu"].still_passes, 0);
+    }
+
+    #[test]
+    fn urgent_input_is_delivered_after_the_shorter_window() {
+        let options = auto_options();
+        let urgent = || {
+            vec![Observation {
+                backlog: crate::turn_state::Backlog {
+                    waiting: 1,
+                    deliverable: 1,
+                    urgent: 1,
+                    ..crate::turn_state::Backlog::default()
+                },
+                ..working("lane-a", CODEX_AFTER, idle_harness())
+            }]
+        };
+        let mut probe = ScriptedProbe(vec![urgent(), urgent(), urgent()]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        for now in [0.0, 500.0, 1_000.0] {
+            pass(&mut probe, &mut notifier, &mut state, now, &options);
+        }
+        assert_eq!(notifier.interrupted, ["lane-a"]);
+        assert!(
+            notifier
+                .sent
+                .iter()
+                .any(|(_, text, _)| text.contains("1 input(s) queued, marked urgent")),
+            "{:?}",
+            notifier.sent
+        );
+    }
+
+    #[test]
+    fn nothing_queued_a_prompt_a_draft_or_no_proc_sample_means_no_interrupt() {
+        let mut options = auto_options();
+        options.auto_deliver.opt_out.clear();
+        let prompt = format!("{CODEX_LONG}\nWould you like to run the following command?\n");
+        let draft = CODEX_LONG.replace(
+            "» Ask Codex to do anything",
+            "» an operator's half-typed note",
+        );
+        let round = || {
+            vec![
+                working("nothing-queued", CODEX_AFTER, idle_harness()),
+                working("prompt", &prompt, idle_harness()),
+                working("draft", &draft, idle_harness()),
+                working("unsampled", CODEX_LONG, None),
+            ]
+        };
+        let mut probe = ScriptedProbe(vec![round(), round(), round()]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        for now in [0.0, 1_800.0, 3_700.0] {
+            pass(&mut probe, &mut notifier, &mut state, now, &options);
+        }
+        assert!(
+            notifier.interrupted.is_empty(),
+            "{:?}",
+            notifier.interrupted
+        );
+        // Off entirely.
+        let mut options = auto_options();
+        options.auto_deliver.after = Duration::ZERO;
+        let mut probe = ScriptedProbe(vec![
+            vec![working("lane-a", CODEX_LONG, idle_harness())],
+            vec![working("lane-a", CODEX_LONG, idle_harness())],
+            vec![working("lane-a", CODEX_LONG, idle_harness())],
+        ]);
+        let mut state = WatchState::default();
+        for now in [0.0, 1_800.0, 3_700.0] {
+            pass(&mut probe, &mut notifier, &mut state, now, &options);
+        }
+        assert!(notifier.interrupted.is_empty());
+    }
+
+    #[test]
+    fn an_interrupt_that_pressed_nothing_sends_no_notice_and_the_next_pass_judges_again() {
+        let options = auto_options();
+        let round = || vec![working("lane-a", CODEX_LONG, idle_harness())];
+        let mut probe = ScriptedProbe(vec![round(), round(), round(), round()]);
+        let mut notifier = RecordingNotifier {
+            press_nothing: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        for now in [0.0, 1_800.0] {
+            pass(&mut probe, &mut notifier, &mut state, now, &options);
+        }
+        let report = pass(&mut probe, &mut notifier, &mut state, 3_700.0, &options);
+        assert_eq!(notifier.interrupted, ["lane-a"]);
+        assert_eq!(report["auto_interrupts"][0]["acted"], false, "{report}");
+        assert!(
+            !notifier
+                .sent
+                .iter()
+                .any(|(_, text, _)| text.contains("auto-interrupted")),
+            "{:?}",
+            notifier.sent
+        );
+        assert!(state.agents["lane-a"].auto_interrupted_at.is_none());
+        pass(&mut probe, &mut notifier, &mut state, 3_760.0, &options);
+        assert_eq!(notifier.interrupted, ["lane-a", "lane-a"], "tried again");
+    }
+
+    #[test]
+    fn a_turn_waiting_on_a_person_or_a_moving_sub_agent_is_not_interrupted() {
+        let options = auto_options();
+        let asking = Activity {
+            tool: Some(call(
+                "AskUserQuestion",
+                "Which branch?",
+                0.0,
+                ToolLimit::None,
+            )),
+            open_tools: 1,
+            ..Activity::default()
+        };
+        let dialog = format!("{CODEX_LONG}\n Do you want to make this edit to main.rs?\n");
+        let sub_agent = |at: f64| Activity {
+            related_progress_at: Some(at),
+            ..Activity::default()
+        };
+        let round = |at: f64| {
+            vec![
+                Observation {
+                    transcript: Some(asking.clone()),
+                    ..working("asking", CODEX_LONG, idle_harness())
+                },
+                working("dialog", &dialog, idle_harness()),
+                Observation {
+                    transcript: Some(sub_agent(at)),
+                    ..working("delegating", CODEX_LONG, idle_harness())
+                },
+            ]
+        };
+        let mut probe = ScriptedProbe(vec![round(0.0), round(1_000.0), round(3_000.0)]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        for now in [0.0, 1_800.0, 3_700.0] {
+            pass(&mut probe, &mut notifier, &mut state, now, &options);
+        }
+        assert!(
+            notifier.interrupted.is_empty(),
+            "{:?}",
+            notifier.interrupted
+        );
+    }
+
+    #[test]
+    fn a_check_only_pass_reports_a_due_interrupt_without_pressing_anything() {
+        let mut options = auto_options();
+        options.check_only = true;
+        let round = || vec![working("lane-a", CODEX_LONG, idle_harness())];
+        let mut probe = ScriptedProbe(vec![round(), round(), round()]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        pass(&mut probe, &mut notifier, &mut state, 1_800.0, &options);
+        let report = pass(&mut probe, &mut notifier, &mut state, 3_700.0, &options);
+        assert!(notifier.interrupted.is_empty());
+        assert_eq!(report["auto_interrupts"][0]["due"], true, "{report}");
+        assert_eq!(report["auto_interrupts"][0]["acted"], false, "{report}");
+    }
+
+    const THINKING: &str =
+        "● Looking into it.\n\n✻ Pondering… (5m 0s · ↓ 2.1k tokens · esc to interrupt)\n";
+
+    fn with_transcript(name: &str, activity: Activity) -> Observation {
+        Observation {
+            harness: Some("claude".to_owned()),
+            transcript: Some(activity),
+            ..working(name, THINKING, idle_harness())
+        }
+    }
+
+    fn call(name: &str, command: &str, started_at: f64, limit: ToolLimit) -> ToolCall {
+        ToolCall {
+            id: "call".to_owned(),
+            name: name.to_owned(),
+            command: Some(command.to_owned()),
+            started_at,
+            limit,
+        }
+    }
+
+    #[test]
+    fn a_tool_call_with_no_timeout_is_reported_once_it_runs_past_its_window() {
+        let options = options();
+        let activity = Activity {
+            last_progress_at: Some(100.0),
+            tool: Some(call("Agent", "Review the change", 100.0, ToolLimit::None)),
+            open_tools: 1,
+            ..Activity::default()
+        };
+        let mut probe = ScriptedProbe(vec![
+            vec![with_transcript("lane-a", activity.clone())],
+            vec![with_transcript("lane-a", activity)],
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 3_000.0, &options);
+        let report = pass(&mut probe, &mut notifier, &mut state, 4_000.0, &options);
+        assert_eq!(report["episodes"][0]["kind"], "untimed-tool", "{report}");
+        assert_eq!(
+            only_notice(&notifier).lines().nth(1).unwrap(),
+            "- lane-a: tool call running 1 h 5 m with no timeout: Agent `Review the change`; no process under the harness"
+        );
+        assert_eq!(
+            report["activity"][0]["transcript"]["tool"]["name"], "Agent",
+            "{report}"
+        );
+        assert_eq!(
+            report["activity"][0]["transcript"]["tool"]["limit"]["kind"], "none",
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_call_no_process_runs_for_is_tool_blocked_and_an_open_request_is_named_when_silent() {
+        let options = options();
+        let blocked = Activity {
+            last_progress_at: Some(100.0),
+            tool: Some(call(
+                "WebFetch",
+                "https://example.invalid/report",
+                100.0,
+                ToolLimit::Explicit(600.0),
+            )),
+            open_tools: 1,
+            ..Activity::default()
+        };
+        let waiting = Activity {
+            last_progress_at: Some(150.0),
+            request_since: Some(150.0),
+            ..Activity::default()
+        };
         let mut probe = ScriptedProbe(vec![
             vec![
-                working("lane-a", CODEX_LONG, None),
-                working("lane-b", CODEX_LONG, None),
+                with_transcript("fetch", blocked.clone()),
+                with_transcript("asking", waiting.clone()),
             ],
             vec![
-                working("lane-a", CODEX_LONG, None),
-                working("lane-b", CODEX_LONG, None),
+                with_transcript("fetch", blocked),
+                with_transcript("asking", waiting),
             ],
         ]);
         let mut notifier = RecordingNotifier::default();
         let mut state = WatchState::default();
-        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
-        assert_eq!(notifier.interrupted, ["lane-a"], "only the named agent");
+        pass(&mut probe, &mut notifier, &mut state, 200.0, &options);
+        let report = pass(&mut probe, &mut notifier, &mut state, 2_100.0, &options);
         let text = only_notice(&notifier);
         assert!(
-            text.contains("- lane-a: inside one turn for 46 h 54 m;"),
-            "{text}"
+            text.contains("- fetch: tool blocked 31 min: the transcript shows WebFetch `https://example.invalid/report` called 33 min ago, timeout 600 s, with no process under the harness and no output since"),
+            "{text}\n{report}"
         );
         assert!(
-            text.contains("; auto-delivered: interrupted the turn after 46 h 54 m"),
-            "{text}"
+            text.contains("- asking: model stream silent 31 min: a model request has been open 32 min with nothing back and no tool is running"),
+            "{text}\n{report}"
         );
-        assert!(!text.contains("- lane-b: inside one turn for 46 h 54 m; 4 inputs queued in Codex's queued follow-up inputs, submitted only when the turn ends; auto"));
-        pass(&mut probe, &mut notifier, &mut state, 60.0, &options);
-        assert_eq!(notifier.interrupted, ["lane-a"], "once per episode");
-    }
-
-    #[test]
-    fn an_auto_delivery_is_reported_even_after_the_turn_it_ended() {
-        let mut options = options();
-        options.auto_deliver = vec!["lane-a".to_owned()];
-        options.min_notice_interval = Duration::from_secs(600);
-        let mut probe = ScriptedProbe(vec![
-            vec![working("lane-a", CODEX_LONG, None)],
-            vec![working("lane-a", CODEX_AFTER, None)],
-            vec![working("lane-a", CODEX_AFTER, None)],
-        ]);
-        let mut notifier = RecordingNotifier::default();
-        let mut state = WatchState {
-            last_notice_at: Some(0.0),
-            ..WatchState::default()
-        };
-        pass(&mut probe, &mut notifier, &mut state, 60.0, &options);
-        assert_eq!(notifier.interrupted, ["lane-a"]);
-        assert!(notifier.sent.is_empty(), "held by the rate limit");
-        // The interrupt ended the turn; the notice saying so is not withdrawn with it.
-        pass(&mut probe, &mut notifier, &mut state, 120.0, &options);
-        assert_eq!(state.pending.len(), 1);
-        pass(&mut probe, &mut notifier, &mut state, 660.0, &options);
-        assert!(only_notice(&notifier).contains("auto-delivered: interrupted the turn"));
     }
 
     #[test]

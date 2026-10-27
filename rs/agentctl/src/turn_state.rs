@@ -362,11 +362,113 @@ pub struct Backlog {
     pub sent_during_turn: usize,
     /// Seconds since the oldest of those was queued.
     pub oldest_sent_during_turn_seconds: Option<f64>,
+    /// How many waiting prompts are marked urgent ([`urgent`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub urgent: usize,
+    /// How many prompts waiting to be typed a drain would still type: neither cancelled nor
+    /// past their `not_after`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub deliverable: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// Whether a prompt is marked urgent (#574 harness-adapters): its first line holds `urgent`
+/// (any case) written as a marker, `URGENT:`, `urgent:`, `(urgent)` or `[urgent]`, and not
+/// negated (`not urgent:` is not). The watcher interrupts a stuck turn sooner for urgent input.
+#[must_use]
+pub fn urgent(text: &str) -> bool {
+    let line = text.lines().next().unwrap_or_default().to_ascii_lowercase();
+    line.match_indices("urgent").any(|(at, word)| {
+        let before = &line[..at];
+        let after = &line[at + word.len()..];
+        let opened = before.ends_with('(') || before.ends_with('[');
+        let closed = after.starts_with(')') || after.starts_with(']');
+        let marker = (opened && closed) || after.starts_with(':');
+        let starts_word = before.chars().last().is_none_or(|c| !c.is_alphanumeric());
+        let previous = before
+            .trim_end_matches(['(', '['])
+            .split_whitespace()
+            .last()
+            .unwrap_or_default();
+        marker && starts_word && !matches!(previous, "not" | "non" | "no")
+    })
+}
+
+/// Rows, at the bottom of the masked screen, that [`quiet_rows`] keeps.
+pub const QUIET_ROWS: usize = 24;
+
+/// What of `screen` shows progress, for telling a still agent from a moving one (#574
+/// harness-adapters): the screen without its running-turn timer ([`without_timer`]) and without
+/// any queued-input block ([`without_queue`]), trailing blank rows dropped, cut to its bottom
+/// [`QUIET_ROWS`] rows. New output always reaches the bottom; a queued block that grows, or rows
+/// that scroll off the top of a read, do not change it. The watcher and the interrupt it sends
+/// compute it from the same kind of read, so the interrupt can refuse a screen that moved.
+#[must_use]
+pub fn quiet_rows(screen: &str) -> String {
+    let masked = without_queue(&without_timer(screen));
+    let lines: Vec<&str> = masked.lines().collect();
+    let end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(0, |index| index + 1);
+    lines[end.saturating_sub(QUIET_ROWS)..end].join("\n")
+}
+
+/// `screen` without the rows of any queued-input block (Codex's held messages and their edit
+/// hint, Muse's `◆ Queued input` items, Claude Code's queued-message hint), so input sent to a
+/// stuck agent does not read as the agent making progress.
+#[must_use]
+pub fn without_queue(screen: &str) -> String {
+    let lines: Vec<&str> = screen.lines().collect();
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim_end();
+        let heading = line
+            .strip_prefix("• ")
+            .unwrap_or(line)
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(
+            heading.as_str(),
+            "queued follow-up inputs"
+                | "messages to be submitted at end of turn"
+                | "messages to be submitted after next tool call"
+        ) {
+            index += 1;
+            while index < lines.len() {
+                let row = lines[index];
+                if row.trim().is_empty() || !row.starts_with(' ') {
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        if line.starts_with("◆ Queued input") {
+            index += 1;
+            while index < lines.len() && lines[index].trim().starts_with('└') {
+                index += 1;
+            }
+            continue;
+        }
+        if !line.contains("Press up to edit queued messages") {
+            kept.push(lines[index]);
+        }
+        index += 1;
+    }
+    kept.join("\n")
+}
+
+fn queue_item(path: &Path) -> Option<Value> {
+    serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()
 }
 
 fn queued_at(path: &Path) -> Option<f64> {
-    let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<Value>(&text).ok()?["queued_at"].as_f64()
+    queue_item(path)?["queued_at"].as_f64()
 }
 
 fn json_files(directory: &Path) -> Vec<(std::path::PathBuf, Option<f64>)> {
@@ -394,10 +496,37 @@ fn json_files(directory: &Path) -> Vec<(std::path::PathBuf, Option<f64>)> {
 #[must_use]
 pub fn backlog(queue: &Path, now: f64, turn_start: Option<f64>) -> Backlog {
     let mut result = Backlog::default();
+    let directories = agent_queue::queue::QueueDirectories::new(queue);
+    let now_millis = (now * 1000.0).max(0.0) as u64;
     for lane in ["inbox", "inbox.v2", "inflight"] {
         for (path, modified) in json_files(&queue.join(lane)) {
             result.waiting += 1;
-            if let Some(at) = queued_at(&path).or(modified) {
+            let item = queue_item(&path);
+            let set_aside = item
+                .as_ref()
+                .and_then(Value::as_object)
+                .is_some_and(|document| {
+                    let id = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or_default();
+                    agent_queue::queue::set_aside_reason(&directories, id, document, now_millis)
+                        .is_some()
+                });
+            if lane != "inflight" && !set_aside {
+                result.deliverable += 1;
+                if item
+                    .as_ref()
+                    .and_then(|item| item["text"].as_str())
+                    .is_some_and(urgent)
+                {
+                    result.urgent += 1;
+                }
+            }
+            if let Some(at) = item
+                .and_then(|item| item["queued_at"].as_f64())
+                .or(modified)
+            {
                 let age = (now - at).max(0.0);
                 result.oldest_waiting_seconds = Some(
                     result
@@ -775,6 +904,70 @@ pub(crate) mod tests {
 
     fn backlog_missing_is_empty() -> bool {
         backlog(Path::new("/nonexistent/agentctl-queue"), 0.0, Some(0.0)) == Backlog::default()
+    }
+
+    #[test]
+    fn urgent_input_is_marked_in_its_first_line_and_queued_blocks_can_be_masked() {
+        assert!(urgent("owner (urgent): stop the gate"));
+        assert!(urgent("URGENT: disk full"));
+        assert!(
+            !urgent("an urgently worded note"),
+            "the word, not a prefix of another"
+        );
+        assert!(!urgent("status?\nnot urgent at all"), "first line only");
+        assert!(urgent("coordinator: URGENT: disk full"));
+        assert!(urgent("[urgent] look now"));
+        assert!(!urgent("not urgent: when you get a chance"), "negated");
+        assert!(!urgent("this is urgent, I think"), "prose is not a marker");
+        let masked = without_queue(CODEX_LONG);
+        assert!(!masked.contains("coordinator:"), "{masked}");
+        assert!(masked.contains("Working (46h 54m 14s"), "{masked}");
+        assert!(masked.contains("Ask Codex to do anything"), "{masked}");
+        assert!(!without_queue(MUSE_QUEUED).contains("Queued input"));
+        assert!(!without_queue(CLAUDE_QUEUED).contains("Press up to edit queued messages"));
+        let directory = scratch();
+        let inbox = directory.join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(
+            inbox.join("a.json"),
+            r#"{"queued_at": 1.0, "text": "owner (urgent): look"}"#,
+        )
+        .unwrap();
+        fs::write(
+            inbox.join("b.json"),
+            r#"{"queued_at": 2.0, "text": "status?"}"#,
+        )
+        .unwrap();
+        fs::write(
+            inbox.join("c.json"),
+            r#"{"queued_at": 3.0, "not_after": 5000, "text": "URGENT: stale"}"#,
+        )
+        .unwrap();
+        let cancel = directory.join("cancel");
+        fs::create_dir_all(&cancel).unwrap();
+        fs::write(
+            inbox.join("d.json"),
+            r#"{"queued_at": 4.0, "text": "(urgent) withdrawn"}"#,
+        )
+        .unwrap();
+        fs::write(cancel.join("d.json"), r#"{"reason": "withdrawn"}"#).unwrap();
+        let backlog = backlog(&directory, 10.0, None);
+        assert_eq!(
+            (backlog.waiting, backlog.deliverable, backlog.urgent),
+            (4, 2, 1),
+            "an expired or cancelled item is waiting but will never be typed"
+        );
+        // Quiet rows ignore a queued block that grows above the bottom and rows scrolled away.
+        let grown = CODEX_LONG.replace(
+            "    shift+← edit last queued message",
+            "  ↳ coordinator: one more\n    shift+← edit last queued message",
+        );
+        assert_eq!(quiet_rows(CODEX_LONG), quiet_rows(&grown));
+        let tall = format!("{}{CODEX_LONG}", "• earlier output\n".repeat(30));
+        let scrolled: String = tall.lines().skip(3).collect::<Vec<_>>().join("\n");
+        assert_eq!(quiet_rows(&tall), quiet_rows(&scrolled));
+        assert_ne!(quiet_rows(CODEX_LONG), quiet_rows(CODEX_AFTER));
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]

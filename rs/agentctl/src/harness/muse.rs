@@ -100,6 +100,25 @@ impl HarnessAdapter for Muse {
     fn read_transcript(&self, lines: &[&[u8]], activity: &mut super::transcript::Activity) {
         read_transcript(lines, activity);
     }
+
+    /// The sub-agent sessions the runtime holds locked.
+    fn related_transcripts(
+        &self,
+        hints: &super::transcript::Hints<'_>,
+        _main: &std::path::Path,
+    ) -> Vec<PathBuf> {
+        hints
+            .open_files()
+            .into_iter()
+            .filter(|path| {
+                let text = path.to_string_lossy();
+                path.file_name().is_some_and(|name| name == ".session.lock")
+                    && text.contains("/muse/sessions/")
+                    && text.contains("/subagent/")
+            })
+            .filter_map(|lock| Some(lock.parent()?.join("session.jsonl")))
+            .collect()
+    }
 }
 
 /// Muse's journal for `hints`: `<sessions>/YYYY/MM/DD/<session>/session.jsonl`, `<sessions>`

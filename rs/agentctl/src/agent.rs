@@ -516,9 +516,19 @@ impl Default for DrainOptions {
 
 /// A runtime that behaves as `inner` and also counts as cancelled from `until` on (by `inner`'s
 /// clock): how a bounded drain stops waiting for a lock.
-struct UntilRuntime<'a> {
+pub(crate) struct UntilRuntime<'a> {
     inner: &'a dyn AgentRuntime,
     until: Duration,
+}
+
+impl<'a> UntilRuntime<'a> {
+    /// `inner`, cancelled once `limit` has passed from now.
+    pub(crate) fn after(inner: &'a dyn AgentRuntime, limit: Duration) -> Self {
+        Self {
+            until: inner.monotonic().saturating_add(limit),
+            inner,
+        }
+    }
 }
 
 impl AgentRuntime for UntilRuntime<'_> {

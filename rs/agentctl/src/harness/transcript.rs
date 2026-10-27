@@ -170,10 +170,16 @@ pub struct Activity {
     pub last_output_at: Option<f64>,
     /// Its kind.
     pub last_output: Option<String>,
+    /// The newest entry that shows the agent moving: output, a request, a prompt, a tool call
+    /// starting or finishing. Harness bookkeeping does not count.
+    pub last_progress_at: Option<f64>,
     /// When the newest model request was sent, when no output has come back since.
     pub request_since: Option<f64>,
     /// The newest prompt that started a turn.
     pub prompt_at: Option<f64>,
+    /// The newest modification of a related transcript (a sub-agent's session or thread).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_progress_at: Option<f64>,
     /// The oldest foreground tool call still in flight.
     pub tool: Option<ToolCall>,
     /// How many tool calls are in flight, background ones included.
@@ -184,17 +190,20 @@ pub struct Activity {
 }
 
 impl Activity {
-    /// Note an entry of `kind` at `at`.
+    /// Note an entry of `kind` at `at` that shows the agent moving.
     pub fn event(&mut self, at: f64, kind: &str) {
-        if self.last_event_at.is_none_or(|last| at >= last) {
-            self.last_event_at = Some(at);
-            self.last_event = Some(kind.to_owned());
+        self.bookkeeping(at, kind);
+        if self.last_progress_at.is_none_or(|last| at >= last) {
+            self.last_progress_at = Some(at);
         }
     }
 
     /// Note harness bookkeeping: it moves only the last-event clock.
     pub fn bookkeeping(&mut self, at: f64, kind: &str) {
-        self.event(at, kind);
+        if self.last_event_at.is_none_or(|last| at >= last) {
+            self.last_event_at = Some(at);
+            self.last_event = Some(kind.to_owned());
+        }
     }
 
     /// Note model output of `kind` at `at`; it answers any request sent before it.
@@ -315,18 +324,70 @@ pub fn tail_lines(path: &Path, limit: u64) -> std::io::Result<Vec<Vec<u8>>> {
 /// an [`Activity`] with `error` set when one was found and could not be read.
 #[must_use]
 pub fn read(adapter: &dyn HarnessAdapter, hints: &Hints<'_>) -> Option<Activity> {
+    read_cached(adapter, hints, None)
+}
+
+/// A transcript's identity for [`Cache`]: its length and modification time.
+type Stamp = (u64, Option<std::time::SystemTime>);
+
+/// Activities already read, by transcript path: a pass rereads only transcripts that changed.
+pub type Cache = std::sync::Mutex<std::collections::HashMap<PathBuf, (Stamp, Activity)>>;
+
+fn modified_seconds(path: &Path) -> Option<f64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|age| age.as_secs_f64())
+}
+
+/// [`read`], reusing `cache`'s activity for a transcript whose length and modification time
+/// have not changed since it was read.
+#[must_use]
+pub fn read_cached(
+    adapter: &dyn HarnessAdapter,
+    hints: &Hints<'_>,
+    cache: Option<&Cache>,
+) -> Option<Activity> {
     let path = adapter.transcript_path(hints)?;
-    let mut activity = Activity {
-        path: Some(path.display().to_string()),
-        ..Activity::default()
-    };
-    match tail_lines(&path, TAIL_BYTES) {
-        Ok(lines) => {
-            let lines: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
-            adapter.read_transcript(&lines, &mut activity);
+    let stamp: Option<Stamp> = fs::metadata(&path)
+        .ok()
+        .map(|meta| (meta.len(), meta.modified().ok()));
+    let cached = cache.zip(stamp).and_then(|(cache, stamp)| {
+        let entries = cache.lock().ok()?;
+        entries
+            .get(&path)
+            .filter(|(seen, _)| *seen == stamp)
+            .map(|(_, activity)| activity.clone())
+    });
+    let mut activity = cached.unwrap_or_else(|| {
+        let mut activity = Activity {
+            path: Some(path.display().to_string()),
+            ..Activity::default()
+        };
+        match tail_lines(&path, TAIL_BYTES) {
+            Ok(lines) => {
+                let lines: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+                adapter.read_transcript(&lines, &mut activity);
+            }
+            Err(error) => activity.error = Some(error.to_string()),
         }
-        Err(error) => activity.error = Some(error.to_string()),
-    }
+        if let (Some(cache), Some(stamp)) = (cache, stamp) {
+            if let Ok(mut entries) = cache.lock() {
+                entries.insert(path.clone(), (stamp, activity.clone()));
+            }
+        }
+        activity
+    });
+    activity.related_progress_at = adapter
+        .related_transcripts(hints, &path)
+        .iter()
+        .filter_map(|related| modified_seconds(related))
+        .fold(None, |newest: Option<f64>, at| {
+            Some(newest.map_or(at, |newest| newest.max(at)))
+        });
     Some(activity)
 }
 
@@ -425,5 +486,12 @@ mod tests {
         assert_eq!(activity.request_since, None);
         assert_eq!(activity.last_event.as_deref(), Some("prompt"));
         assert_eq!(activity.last_output_at, Some(25.0));
+        activity.bookkeeping(50.0, "attachment");
+        assert_eq!(activity.last_event_at, Some(50.0));
+        assert_eq!(
+            activity.last_progress_at,
+            Some(40.0),
+            "bookkeeping is not progress"
+        );
     }
 }

@@ -166,6 +166,15 @@ pub trait HarnessAdapter: Sync {
     fn transcript_path(&self, _hints: &transcript::Hints<'_>) -> Option<PathBuf> {
         None
     }
+    /// Other transcripts the same agent writes while its main transcript can be quiet (its
+    /// sub-agents' sessions and threads), whose growth also shows it moving.
+    fn related_transcripts(
+        &self,
+        _hints: &transcript::Hints<'_>,
+        _main: &std::path::Path,
+    ) -> Vec<PathBuf> {
+        Vec::new()
+    }
     /// What the transcript's complete lines `lines`, oldest first, say the agent is doing.
     fn read_transcript(&self, _lines: &[&[u8]], _activity: &mut transcript::Activity) {}
 }
