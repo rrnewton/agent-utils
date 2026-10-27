@@ -3037,3 +3037,188 @@ fn a_full_queue_drops_events_and_counts_them_and_a_file_erase_tells_nothing() {
         "erasing the file says nothing about any message"
     );
 }
+
+// ---- search (#521 server-side-search) ----------------------------------------------------------
+
+#[test]
+fn a_cache_search_matches_with_the_shared_language_and_says_how_far_back_it_looked() {
+    use super::search::{SearchRequest, SearchView};
+    let fx = Fixture::new("cache-search");
+    let first = T0 + 10 * STEP + 1_000;
+    fx.clock.set(first);
+    let mut rows: Vec<Message> = (1..=6).map(m).collect();
+    rows[1].content = "Meet at the Café".to_owned();
+    rows[4].content = "the handoff is written".to_owned();
+    fx.list(rows, first, Some(newest_proof(ListStart::At(T0 + STEP))));
+    fx.list_scope(
+        Scope::Thread("m3".to_owned()),
+        vec![reply("r1", "m3", "a cafe reply", T0 + 3 * STEP + 500)],
+        first,
+        Some(newest_proof(ListStart::ScopeStart)),
+    );
+    let head = fx
+        .cache
+        .head(&fx.chan, &Scope::Main)
+        .served()
+        .expect("served")
+        .expect("a head");
+    let day = |d: crate::search_query::Day| d.start_ms_at_offset(0);
+    let search = |query: &str, view: SearchView, limit: usize, budget: usize| {
+        let query = crate::search_query::parse(query);
+        let request = SearchRequest {
+            query: &query,
+            view,
+            below_ms: i64::MAX,
+            limit,
+            budget,
+            day_start_ms: &day,
+        };
+        fx.cache
+            .search(&fx.chan, &request)
+            .served()
+            .expect("served")
+    };
+    let hit_ids = |hits: &[CachedMessage]| -> Vec<String> {
+        hits.iter().map(|h| h.message.id.0.clone()).collect()
+    };
+
+    // Accents and infixes, newest first, every row tested, and the horizon down to the claim.
+    let whole = search("cafe OR andoff", SearchView::Main, 10, 100);
+    assert_eq!(hit_ids(&whole.hits), ids(&["m5", "m2"]));
+    assert_eq!((whole.examined, whole.resume_below_ms), (6, None));
+    let horizon = whole.horizon.expect("a horizon");
+    assert_eq!(
+        (horizon.from_ms, horizon.to_ms),
+        (T0 + STEP, head.settled_top())
+    );
+    assert!(!horizon.at_age_limit);
+    assert_eq!(whole.searched_back_to_ms(i64::MAX), Some(T0 + STEP));
+
+    // All brings the replies the cache holds; Main does not; in:thread picks them out.
+    assert_eq!(
+        hit_ids(&search("cafe", SearchView::All, 10, 100).hits),
+        ids(&["r1", "m2"])
+    );
+    assert_eq!(
+        hit_ids(&search("cafe", SearchView::Main, 10, 100).hits),
+        ids(&["m2"])
+    );
+    assert_eq!(
+        hit_ids(&search("cafe in:thread", SearchView::All, 10, 100).hits),
+        ids(&["r1"])
+    );
+
+    // A budget or a limit stops it, and it says where to go on and how far it can vouch.
+    let budgeted = search("cafe OR andoff", SearchView::Main, 10, 3);
+    assert_eq!(hit_ids(&budgeted.hits), ids(&["m5"]));
+    assert_eq!(budgeted.resume_below_ms, Some(T0 + 4 * STEP));
+    assert_eq!(budgeted.searched_back_to_ms(i64::MAX), Some(T0 + 4 * STEP));
+    let limited = search("cafe OR andoff", SearchView::Main, 1, 100);
+    assert_eq!(
+        (limited.examined, limited.resume_below_ms),
+        (2, Some(T0 + 5 * STEP))
+    );
+    // Nothing tested vouches for nothing, and a search starting below the horizon says nothing.
+    for zero in [
+        search("cafe", SearchView::Main, 0, 100),
+        search("cafe", SearchView::Main, 10, 0),
+    ] {
+        assert!(zero.hits.is_empty());
+        assert_eq!(zero.resume_below_ms, Some(i64::MAX));
+        assert_eq!(zero.searched_back_to_ms(i64::MAX), None);
+    }
+    assert_eq!(whole.searched_back_to_ms(T0 + STEP), None);
+
+    // No search vouches for nothing.
+    let empty = search("  ", SearchView::Main, 10, 100);
+    assert!(empty.hits.is_empty());
+    assert_eq!(empty.searched_back_to_ms(i64::MAX), None);
+}
+
+#[test]
+fn a_cache_search_horizon_stops_at_the_age_limit() {
+    use super::search::{SearchRequest, SearchView};
+    let fx = Fixture::with_limits(
+        "cache-search-age",
+        Limits {
+            max_days: 1,
+            ..Limits::default()
+        },
+    );
+    let first = T0 + 10 * STEP + 1_000;
+    fx.clock.set(first);
+    fx.list(
+        (1..=6).map(m).collect(),
+        first,
+        Some(newest_proof(ListStart::At(T0 + STEP))),
+    );
+    let query = crate::search_query::parse("body");
+    let day = |d: crate::search_query::Day| d.start_ms_at_offset(0);
+    let horizon_at = |now: i64| {
+        fx.clock.set(now);
+        let request = SearchRequest {
+            query: &query,
+            view: SearchView::Main,
+            below_ms: i64::MAX,
+            limit: 100,
+            budget: 100,
+            day_start_ms: &day,
+        };
+        fx.cache
+            .search(&fx.chan, &request)
+            .served()
+            .expect("served")
+            .horizon
+    };
+    // A day after the third message the claim still starts at T0 + STEP, but rows older than a
+    // day may be gone, so the horizon is the age limit.
+    let horizon = horizon_at(T0 + 3 * STEP + DAY_MS).expect("a horizon");
+    assert!(horizon.at_age_limit);
+    assert_eq!(horizon.from_ms, T0 + 3 * STEP);
+    // Once the limit passes the head's settled top, nothing held is vouched for.
+    assert_eq!(horizon_at(T0 + 8 * STEP + DAY_MS), None);
+}
+
+#[test]
+fn a_cache_search_stops_only_on_a_whole_millisecond() {
+    use super::search::{SearchRequest, SearchView};
+    // A provider that stamps whole seconds gives many rows one millisecond. A search stopped by
+    // its limit or its budget among them must test them all, or a continuation below that
+    // millisecond would skip the rest and still vouch for them.
+    let fx = Fixture::new("cache-search-ties");
+    let first = T0 + 10 * STEP + 1_000;
+    fx.clock.set(first);
+    let at = T0 + 3 * STEP;
+    let rows = vec![
+        message("a", "ada", "match one", at),
+        message("b", "ada", "match two", at),
+        message("c", "ada", "match three", at),
+        message("d", "ada", "match older", T0 + 2 * STEP),
+    ];
+    fx.list(rows, first, Some(newest_proof(ListStart::At(T0 + STEP))));
+    let day = |d: crate::search_query::Day| d.start_ms_at_offset(0);
+    let query = crate::search_query::parse("match");
+    let run = |below_ms: i64, limit: usize, budget: usize| {
+        let request = SearchRequest {
+            query: &query,
+            view: SearchView::Main,
+            below_ms,
+            limit,
+            budget,
+            day_start_ms: &day,
+        };
+        fx.cache
+            .search(&fx.chan, &request)
+            .served()
+            .expect("served")
+    };
+    for (limit, budget) in [(1, 100), (100, 1)] {
+        let first_page = run(i64::MAX, limit, budget);
+        assert_eq!(first_page.hits.len(), 3, "limit {limit}, budget {budget}");
+        assert_eq!(first_page.resume_below_ms, Some(at));
+        let second = run(at, limit, budget);
+        let ids: Vec<String> = second.hits.iter().map(|h| h.message.id.0.clone()).collect();
+        assert_eq!(ids, vec!["d".to_owned()], "limit {limit}, budget {budget}");
+        assert_eq!(second.resume_below_ms, None);
+    }
+}

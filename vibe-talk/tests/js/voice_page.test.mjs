@@ -5663,6 +5663,10 @@ const TUNING_BANDS = {
     "how long the hosted agent's speaker must be quiet before its first message counts as over. " +
     "Under a second a network stall mid-message opens the microphone to the rest of it; past four " +
     "the owner's first answer is held for the agent's next one too"],
+  SEARCH_MAX_UPSTREAM_QUERIES: [4, 4,
+    "how many upstream queries one search's alternatives may become (#521 server-side-search). It is " +
+    "MAX_UPSTREAM_QUERIES in src/search_query.rs, and the shared corpus's too-many-alternatives cases " +
+    "pin it: any other value here and the page plans upstream differently from the server"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -85881,4 +85885,56 @@ test("`#529 page-build-stale-notice`: a read saying the server serves another pa
   await showDiscord(unknown, data.messages);
   await unknown.settle();
   assert.equal(unknown.el("page-update").hidden, true, "a page with no build of its own offered a reload");
+});
+
+/**
+ * `#521 server-side-search`. The search language's conformance corpus, which src/search_query.rs is
+ * held to as well: the page's twin must fold, parse, match and plan upstream queries exactly as it
+ * says. Values cross out of the page's realm through JSON, so a tree is compared as data.
+ */
+const SEARCH_CORPUS = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "search_query.json"), "utf8"));
+
+function searchCorpusDisagreements(page) {
+  const fold = page.pure("searchFold");
+  const parse = page.pure("searchQueryParse");
+  const tree = page.pure("searchQueryTree");
+  const matches = page.pure("searchQueryMatches");
+  const subject = page.pure("searchSubject");
+  const plan = page.pure("searchUpstreamPlan");
+  const data = (value) => JSON.parse(JSON.stringify(value ?? null));
+  const wrong = [];
+  for (const { in: input, out } of SEARCH_CORPUS.fold) {
+    if (fold(input) !== out) wrong.push(`fold ${JSON.stringify(input)} gave ${JSON.stringify(fold(input))}`);
+  }
+  for (const { query, tree: expected } of SEARCH_CORPUS.parse) {
+    const got = data(tree(parse(query)));
+    if (JSON.stringify(got) !== JSON.stringify(expected)) wrong.push(`parse ${JSON.stringify(query)} gave ${JSON.stringify(got)}`);
+  }
+  for (const { query, message, matches: expected, tz_offset_minutes: offset = 0 } of SEARCH_CORPUS.match) {
+    const folded = subject({ author: message.author ?? "", authorId: message.author_id ?? "", text: message.text ?? "",
+      links: message.links ?? [], createdMs: Date.parse(message.created), inThread: message.in_thread ?? false });
+    const dayStart = (day) => Date.UTC(day.year, day.month - 1, day.day) - offset * 60_000;
+    if (matches(parse(query), folded, dayStart) !== expected) wrong.push(`match ${JSON.stringify(query)} on ${JSON.stringify(message.text)}`);
+  }
+  for (const { query, queries, scan } of SEARCH_CORPUS.upstream) {
+    const got = data(plan(parse(query)));
+    if (JSON.stringify(got) !== JSON.stringify({ queries, scan })) wrong.push(`upstream ${JSON.stringify(query)} gave ${JSON.stringify(got)}`);
+  }
+  return wrong;
+}
+
+test("`#521 server-side-search`: the page's search language folds, parses, matches and plans exactly as the shared corpus says", () => {
+  const counted = ["fold", "parse", "match", "upstream"].map((kind) => SEARCH_CORPUS[kind].length);
+  assert.ok(counted.every((n) => n >= 20), `the corpus shrank: ${counted}`);
+  assert.deepEqual(searchCorpusDisagreements(newPage()), []);
+});
+
+test("`#521 server-side-search`: the corpus catches a page that lost one fold entry or bound OR loosely (negative controls)", () => {
+  // Without final sigma folded, ΟΣ (lower-cased to ος) no longer finds ΟΣΑ (οσα).
+  const sigma = brokenScript("[\"ς\", \"σ\"], ", "");
+  assert.ok(searchCorpusDisagreements(newPage(new Map(), sigma)).some((line) => line.includes("ΟΔΟΣ")));
+  // OR taking whatever follows it as a whole conjunction disagrees with Gmail's binding of its neighbours.
+  const looseOr = brokenScript("    while (tokens[at] === \"OR\") {\n      at += 1;\n      const node = unary();",
+    "    while (tokens[at] === \"OR\") {\n      at += 1;\n      const node = and(false);");
+  assert.ok(searchCorpusDisagreements(newPage(new Map(), looseOr)).some((line) => line.startsWith("parse \"a OR b c\"")));
 });

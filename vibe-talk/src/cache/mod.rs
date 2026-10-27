@@ -2288,6 +2288,40 @@ impl MessageCache {
         })
     }
 
+    /// Search what the cache holds of `chan`, newest first, and say how far back that proves
+    /// anything: the view's [`coverage::Horizon`] at the channel's age limit, read in the same
+    /// snapshot as the rows. `#521 server-side-search`. No route calls this yet; a route must
+    /// first apply the serving rules [`sink::Sink::try_serve`] applies (the account the rows were
+    /// read with, a suspended provider, a channel in doubt).
+    #[must_use]
+    pub fn search(
+        &self,
+        chan: &ChanKey,
+        request: &search::SearchRequest<'_>,
+    ) -> Read<search::SearchOutcome> {
+        let cutoff_ms = self
+            .shared
+            .limits
+            .cutoff_ms(&chan.channel_id, self.now_ms());
+        let scope_key = request.view.horizon_scope().key();
+        self.read_scope(chan, &scope_key, |connection| {
+            let snapshot = connection.unchecked_transaction()?;
+            let (rows, more) = reader::search_rows(
+                &snapshot,
+                chan,
+                request.view.scope_sql(),
+                request.below_ms,
+                request.budget,
+            )?;
+            let intervals = reader::coverage(&snapshot, chan, &scope_key)?;
+            let head = reader::head(&snapshot, chan, &scope_key)?;
+            snapshot.finish()?;
+            let mut outcome = search::test_rows(rows, more, request);
+            outcome.horizon = coverage::horizon(&intervals, head.as_ref(), cutoff_ms);
+            Ok(outcome)
+        })
+    }
+
     /// The head of one scope, if a read of its newest end has landed.
     #[must_use]
     pub fn head(&self, chan: &ChanKey, scope: &Scope) -> Read<Option<coverage::Head>> {

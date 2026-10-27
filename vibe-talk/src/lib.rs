@@ -95,6 +95,7 @@ pub mod render;
 pub mod replay;
 pub mod reply_read;
 pub mod retrieval;
+pub mod search_query;
 pub mod send_approval;
 pub mod send_intent;
 pub mod send_refusal;

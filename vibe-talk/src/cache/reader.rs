@@ -319,6 +319,63 @@ pub(crate) fn message_and_home(
         .optional()
 }
 
+/// One row a cache search tests: the message, and what the matcher needs beyond it.
+pub(crate) struct SearchRow {
+    pub(crate) message: CachedMessage,
+    /// The `search_text` column: lower-cased author, content, drawn text and link addresses,
+    /// capped at [`super::search_text::MAX_BYTES`].
+    pub(crate) search_text: String,
+    /// Whether the row is a thread reply.
+    pub(crate) in_thread: bool,
+}
+
+/// The newest rows of `chan` created before `below_ms` in the scopes `scope_sql` selects (a
+/// condition on `s.scope_key`), newest first: `budget` of them, and then every other row sharing
+/// the last one's millisecond, so a batch always ends on a whole millisecond and a continuation
+/// below it skips nothing. Also whether older rows remain.
+pub(crate) fn search_rows(
+    connection: &Connection,
+    chan: &ChanKey,
+    scope_sql: &str,
+    below_ms: i64,
+    budget: usize,
+) -> rusqlite::Result<(Vec<SearchRow>, bool)> {
+    let Some(chan_id) = chan_id(connection, chan)? else {
+        return Ok((Vec::new(), false));
+    };
+    let select = |condition: &str, limit: i64, upper_ms: i64| -> rusqlite::Result<Vec<SearchRow>> {
+        let mut statement = connection.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS}, m.search_text, m.thread_id IS NOT NULL AND m.is_root = 0
+             FROM message m
+             WHERE m.chan = ?1 AND {condition}
+               AND EXISTS (SELECT 1 FROM message_scope s
+                           WHERE s.row_id = m.row_id AND s.chan = ?1 AND ({scope_sql}))
+             ORDER BY m.created_ms DESC, m.numeric_id DESC, m.message_id DESC LIMIT ?3"
+        ))?;
+        let rows = statement
+            .query_map(params![chan_id, upper_ms, limit], |row| {
+                Ok(SearchRow {
+                    message: cached(&chan.channel_id, row)?,
+                    search_text: row.get(10)?,
+                    in_thread: row.get(11)?,
+                })
+            })?
+            .collect();
+        rows
+    };
+    let limit = i64::try_from(budget).unwrap_or(i64::MAX);
+    let mut rows = select("m.created_ms < ?2", limit, below_ms)?;
+    let Some(last_ms) = rows.last().map(|r| r.message.created_ms) else {
+        let more = budget == 0 && !select("m.created_ms < ?2", 1, below_ms)?.is_empty();
+        return Ok((rows, more));
+    };
+    // The rest of the last millisecond, whatever the budget.
+    rows.retain(|r| r.message.created_ms != last_ms);
+    rows.extend(select("m.created_ms = ?2", i64::MAX, last_ms)?);
+    let more = !select("m.created_ms < ?2", 1, last_ms)?.is_empty();
+    Ok((rows, more))
+}
+
 pub(crate) fn tombstoned(
     connection: &Connection,
     chan: &ChanKey,

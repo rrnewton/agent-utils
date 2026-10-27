@@ -484,6 +484,74 @@ pub fn covers(intervals: &[Interval], from_ms: i64, to_ms: i64) -> Option<Cover>
     None
 }
 
+/// How far back a scope's holdings are proven whole: every message of the scope created in
+/// `[from_ms, to_ms)` was listed into the cache as of `as_of_ms`. A search of the cache that tested
+/// every row it holds in that stretch may say "searched back to `from_ms`". `#521
+/// server-side-search`, its horizon (section 4 of the design).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Horizon {
+    /// Provider time, inclusive: the oldest edge of the claim chain that reaches the head.
+    pub from_ms: i64,
+    /// Provider time, exclusive: the head's settled top. Newer rows are held only by the read of
+    /// the newest end that listed them, the unsettled band no claim enters; the page's live
+    /// stream covers that edge, and the line says so rather than assuming it.
+    pub to_ms: i64,
+    /// Local time: the oldest `listed_ms` among the claims used, the honest "as of".
+    pub as_of_ms: i64,
+    /// Whether every claim used is complete. A Slack read that dropped a row it could not show
+    /// is not, so "every message" is then "every message such reads list".
+    pub complete: bool,
+    /// Whether `from_ms` was raised to the cache's age limit: rows older than that may have been
+    /// evicted, so the claims below it no longer prove the cache holds them.
+    pub at_age_limit: bool,
+}
+
+/// The [`Horizon`] of a scope from its stored `intervals` (sorted, disjoint), its `head`, and the
+/// cache's age cutoff for the channel. `None` when no read of the newest end has landed, or no
+/// claim reaches the head's settled top (a gap directly below it), or the cutoff is at or above
+/// that top: then nothing below the head is proven.
+///
+/// The chain is followed down from the settled top through claims that touch, and stops at the
+/// first gap. It does not depend on any query, so one horizon serves every search of the scope,
+/// and it only moves back as claims are added; what can move it forward is said by the caller
+/// (eviction past the age limit, an erase puncturing a claim, the oldest claim dropped past
+/// [`MAX_INTERVALS`]).
+#[must_use]
+pub fn horizon(intervals: &[Interval], head: Option<&Head>, cutoff_ms: i64) -> Option<Horizon> {
+    let to_ms = head?.settled_top();
+    let mut cursor = to_ms;
+    let mut found: Option<(i64, bool)> = None;
+    for interval in intervals.iter().rev() {
+        if interval.t0_ms >= cursor {
+            continue;
+        }
+        if interval.t1_ms < cursor {
+            break;
+        }
+        cursor = interval.t0_ms;
+        found = Some(match found {
+            None => (interval.listed_ms, interval.complete),
+            Some((as_of, complete)) => {
+                (as_of.min(interval.listed_ms), complete && interval.complete)
+            }
+        });
+        if cursor <= cutoff_ms {
+            break;
+        }
+    }
+    let (as_of_ms, complete) = found?;
+    if cutoff_ms >= to_ms {
+        return None;
+    }
+    Some(Horizon {
+        from_ms: cursor.max(cutoff_ms),
+        to_ms,
+        as_of_ms,
+        complete,
+        at_age_limit: cursor < cutoff_ms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,6 +1012,102 @@ mod tests {
                 }
             }
             assert!(out.len() <= params.max_intervals, "seed {seed}");
+        }
+    }
+
+    fn horizon_claim(t0_ms: i64, t1_ms: i64, listed_ms: i64, complete: bool) -> Interval {
+        Interval {
+            t0_ms,
+            t1_ms,
+            listed_ms,
+            full_ms: None,
+            complete,
+            source: Source::Read,
+        }
+    }
+
+    fn head_at(settled_top: i64) -> Head {
+        // A settled band: `unsettled_from_ms` past the head, so `settled_top` is head + 1.
+        Head {
+            head_ms: settled_top - 1,
+            unsettled_from_ms: settled_top,
+            head_listed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn the_horizon_follows_touching_claims_down_from_the_head_and_stops_at_a_gap() {
+        let intervals = [
+            horizon_claim(0, 10, 5, true),
+            horizon_claim(20, 30, 7, true),
+            horizon_claim(30, 50, 9, false),
+        ];
+        let horizon = horizon(&intervals, Some(&head_at(50)), i64::MIN).expect("a horizon");
+        assert_eq!(
+            horizon,
+            Horizon {
+                from_ms: 20,
+                to_ms: 50,
+                as_of_ms: 7,
+                complete: false,
+                at_age_limit: false,
+            }
+        );
+        assert_eq!(
+            super::horizon(&intervals, None, i64::MIN),
+            None,
+            "no head, no claim"
+        );
+        assert_eq!(
+            super::horizon(&intervals, Some(&head_at(60)), i64::MIN),
+            None,
+            "a gap right below the head proves nothing"
+        );
+        let clamped = super::horizon(&intervals, Some(&head_at(50)), 25).expect("a horizon");
+        assert_eq!((clamped.from_ms, clamped.at_age_limit), (25, true));
+        assert_eq!(super::horizon(&intervals, Some(&head_at(50)), 50), None);
+    }
+
+    #[test]
+    fn the_horizon_is_the_oldest_edge_covers_agrees_with() {
+        // Property: whatever the claims, head and cutoff, the horizon is a stretch `covers`
+        // vouches for with the same as-of and completeness, and (below the age limit) no older
+        // edge would be.
+        for seed in 0..2_000_u64 {
+            let mut rng = Rng(seed);
+            let mut intervals = Vec::new();
+            let mut t = i64::try_from(rng.next() % 4).expect("small");
+            while t < 60 && intervals.len() < 8 {
+                let len = 1 + i64::try_from(rng.next() % 9).expect("small");
+                intervals.push(horizon_claim(
+                    t,
+                    t + len,
+                    i64::try_from(rng.next() % 100).expect("small"),
+                    rng.next() % 3 != 0,
+                ));
+                t += len + i64::try_from(rng.next() % 3).expect("small");
+            }
+            let top = 1 + i64::try_from(rng.next() % 70).expect("small");
+            let cutoff = i64::try_from(rng.next() % 40).expect("small") - 10;
+            match horizon(&intervals, Some(&head_at(top)), cutoff) {
+                Some(h) => {
+                    let cover = covers(&intervals, h.from_ms, h.to_ms)
+                        .unwrap_or_else(|| panic!("seed {seed}: {h:?} is not covered"));
+                    assert_eq!(cover.listed_ms, h.as_of_ms, "seed {seed}");
+                    assert_eq!(cover.complete, h.complete, "seed {seed}");
+                    assert!(h.from_ms >= cutoff, "seed {seed}");
+                    if !h.at_age_limit && h.from_ms > cutoff {
+                        assert!(
+                            covers(&intervals, h.from_ms - 1, h.to_ms).is_none(),
+                            "seed {seed}: {h:?} stopped short"
+                        );
+                    }
+                }
+                None => assert!(
+                    cutoff >= top || covers(&intervals, (top - 1).max(cutoff), top).is_none(),
+                    "seed {seed}: a horizon was missed"
+                ),
+            }
         }
     }
 

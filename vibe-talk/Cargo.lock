@@ -2242,6 +2242,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "two-face",
+ "unicode-normalization",
  "url",
  "webpki-roots 0.26.11",
 ]

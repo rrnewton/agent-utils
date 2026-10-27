@@ -16,8 +16,20 @@
 //!
 //! Search terms are never logged, and an FTS error is reported by result code only: SQLite's
 //! FTS syntax errors quote the query.
+//!
+//! [`MessageCache::search`](super::MessageCache::search) is the first caller (`#521
+//! server-side-search`), reachable from no route yet: it scans newest first and matches every row
+//! with the shared language of [`crate::search_query`], case- and accent-insensitively. It does not
+//! use the index yet. The stored `search_text` is lower-cased but not folded, so a trigram of
+//! `cafe` does not find "café"; the index can drive once the column is rebuilt folded (a new
+//! [`super::search_text::SearchTextSource`] version), and until then a scan is the only path that
+//! keeps the language's promise.
 
 use rusqlite::{params, Connection, OptionalExtension as _};
+
+use super::coverage::Horizon;
+use super::rows::{CachedMessage, Scope};
+use crate::search_query::{Day, Query, Subject};
 
 /// Rare terms: the index first. Bind `:q`, `:chan`, `:from_ms`, `:before_ms`, `:limit`.
 pub const RARE_SQL: &str = "
@@ -144,6 +156,148 @@ pub fn choose(connection: &Connection, chan: i64, terms: &[String]) -> rusqlite:
 pub fn rematch(text: &str, terms: &[String]) -> bool {
     let text = text.to_lowercase();
     terms.iter().all(|term| text.contains(&term.to_lowercase()))
+}
+
+/// Which messages of a channel a search covers, as the page's views name them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchView {
+    /// Top-level messages.
+    Main,
+    /// Slack's All: top-level messages and the replies of every thread the cache holds.
+    All,
+    /// A bridge's space-level list, replies included.
+    Flat,
+}
+
+impl SearchView {
+    /// The condition on `s.scope_key` selecting the view's rows.
+    pub(crate) const fn scope_sql(self) -> &'static str {
+        match self {
+            Self::Main => "s.scope_key = 'main'",
+            Self::All => "s.scope_key = 'main' OR s.scope_key GLOB 'thread:*'",
+            Self::Flat => "s.scope_key = 'flat'",
+        }
+    }
+
+    /// The scope whose coverage is the view's horizon. On Slack's All that is Main's, so the
+    /// horizon is of top-level messages only: no claim says which threads' replies are all held.
+    #[must_use]
+    pub const fn horizon_scope(self) -> Scope {
+        match self {
+            Self::Main | Self::All => Scope::Main,
+            Self::Flat => Scope::Flat,
+        }
+    }
+}
+
+/// A search of what the cache holds: the newest rows first, below `below_ms`.
+pub struct SearchRequest<'a> {
+    /// The parsed query; an empty one finds nothing.
+    pub query: &'a Query,
+    /// Which rows.
+    pub view: SearchView,
+    /// Only rows created before this provider time (exclusive): the page's loaded floor.
+    pub below_ms: i64,
+    /// Stop after this many hits (more when the last hit shares its millisecond with others:
+    /// a search always stops on a whole millisecond). Zero tests nothing.
+    pub limit: usize,
+    /// Stop after testing about this many rows (more when rows share the last one's millisecond).
+    /// Zero tests nothing.
+    pub budget: usize,
+    /// The start of a calendar day in the reader's time zone, for `before:` and `after:`.
+    pub day_start_ms: &'a dyn Fn(Day) -> i64,
+}
+
+/// What a search of the cache found, and how far it can vouch for its absence of hits.
+#[derive(Clone, Debug)]
+pub struct SearchOutcome {
+    /// Matching rows, newest first. A row held only as a pushed snippet (`content_partial`) is
+    /// matched on the snippet and is never served as the message: a route fetches it whole first.
+    pub hits: Vec<CachedMessage>,
+    /// Rows tested.
+    pub examined: usize,
+    /// Where to continue: every row held in `[resume_below_ms, below_ms)` was tested, and older
+    /// ones were not. A search stops only on a whole millisecond, so a continuation with
+    /// `below_ms = resume_below_ms` skips nothing and repeats nothing. `None` when the search
+    /// reached the oldest row the view holds.
+    pub resume_below_ms: Option<i64>,
+    /// Rows whose `search_text` was cut at its cap: a term only past the cap is not found in them.
+    pub capped: usize,
+    /// Rows held only as a pushed snippet, not yet read whole: matched on the snippet.
+    pub partial: usize,
+    /// The view's horizon, when its claims reach the head.
+    pub horizon: Option<Horizon>,
+}
+
+impl SearchOutcome {
+    /// How far back this search can say it looked: the oldest provider time from which every
+    /// message of the view, created before `below_ms`, is both held (the horizon) and was tested.
+    /// `None` without a horizon, or when the search stopped above it. On Slack's All, of
+    /// top-level messages only ([`SearchView::horizon_scope`]).
+    #[must_use]
+    pub fn searched_back_to_ms(&self, below_ms: i64) -> Option<i64> {
+        let horizon = self.horizon?;
+        let from = self
+            .resume_below_ms
+            .unwrap_or(i64::MIN)
+            .max(horizon.from_ms);
+        (from < horizon.to_ms.min(below_ms)).then_some(from)
+    }
+}
+
+/// Test `rows` (newest first, as [`super::reader::search_rows`] lists them: ending on a whole
+/// millisecond) against the request, stopping at its limit on a whole millisecond; `more` says
+/// whether older rows remained past the budget.
+pub(crate) fn test_rows(
+    rows: Vec<super::reader::SearchRow>,
+    more: bool,
+    request: &SearchRequest<'_>,
+) -> SearchOutcome {
+    let mut outcome = SearchOutcome {
+        hits: Vec::new(),
+        examined: 0,
+        resume_below_ms: None,
+        capped: 0,
+        partial: 0,
+        horizon: None,
+    };
+    if request.query.is_empty() || request.limit == 0 || request.budget == 0 {
+        // Nothing tested, so nothing below `below_ms` is vouched for.
+        outcome.resume_below_ms = Some(request.below_ms);
+        return outcome;
+    }
+    let total = rows.len();
+    let mut last_ms = None;
+    for row in rows {
+        let created_ms = row.message.created_ms;
+        if outcome.hits.len() >= request.limit && last_ms != Some(created_ms) {
+            break;
+        }
+        outcome.examined += 1;
+        last_ms = Some(created_ms);
+        outcome.capped += usize::from(super::search_text::was_capped(&row.search_text));
+        outcome.partial += usize::from(row.message.content_partial);
+        let message = &row.message.message;
+        // The server has no drawn form of a cached row yet: the haystack is `search_text`, which
+        // also holds the raw content (a parity gap with the page, design section 3, closed when
+        // the column is rebuilt from the page's haystack), and a link is approximated as "://"
+        // anywhere in it.
+        let subject = Subject::new(
+            &row.search_text,
+            &message.author,
+            message.author_id.as_str(),
+            created_ms,
+            row.in_thread,
+            row.search_text.contains("://"),
+        );
+        if request.query.matches(&subject, request.day_start_ms) {
+            outcome.hits.push(row.message);
+        }
+    }
+    if outcome.examined < total || more {
+        outcome.resume_below_ms = Some(last_ms.unwrap_or(request.below_ms));
+    }
+    outcome
 }
 
 #[cfg(test)]
