@@ -1,13 +1,14 @@
 ---
 title: 'cargo-runner-cachedir-tag: refresh refuses an untagged rs/target silently'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - rust
 - launcher
 created_at: 2026-10-27T08:10:04.266167077+00:00
-updated_at: 2026-10-27T08:10:04.266167077+00:00
+updated_at: 2026-10-27T08:46:34.008170177+00:00
+closed_at: 2026-10-27T08:46:34.008170027+00:00
 ---
 
 # Description
