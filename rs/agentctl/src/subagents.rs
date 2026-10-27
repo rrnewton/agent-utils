@@ -52,7 +52,7 @@ pub(crate) use cloud::{
 pub use cloud::{CloudLaunch, CloudTools};
 pub(crate) use control::{controller_of, tree_order};
 pub use control::{render_tree, ManageAction};
-pub use headless::HeadlessStart;
+pub use headless::{HeadlessStart, TakeoverOptions};
 pub(crate) use stop_advice::{stop_reason, StopContext};
 pub use stop_advice::{RecoveryAction, StopFailure};
 
@@ -18113,6 +18113,8 @@ fi
     mod control;
     /// Offline retirement of an exact adopted generation with no runtime mutation.
     mod dead_adoption;
+    /// Takeover and handback of a headless agent: one writer per session.
+    mod headless_takeover;
     /// Herdr readiness and adopted Muse process ownership compatibility.
     mod herdr_compatibility;
     /// Recipient checks around input, anchors, rename transactions and doctor.

@@ -72,6 +72,23 @@ input left queued while idle is `stalled` after the dead threshold; a dead or un
 wrapper is `dead`; there is no `blocked`. The harness process sample (`/proc`) is taken as for
 interactive agents but not yet used for headless tool-blocked findings.
 
+Takeover (`#591 headless-takeover`, 7.3; `release-headless` is named `handback`): `agentctl
+takeover NAME` marks the record, holds the wrapper's deliveries (a new control op) while it waits
+for the turn to end (or `--interrupt`s it), stops the wrapper, and opens `claude --resume SESSION`
+in a Herdr tab through a holder process that keeps `headless.lock` and gives the interactive
+harness its own process group and the terminal; `agentctl handback NAME` ends that session and
+starts the wrapper again (through its systemd unit when it had one, else detached). A session's
+writers are found by command line (`--resume`/`--session-id SESSION` in `/proc/PID/cmdline`):
+on this host `/usr/local/bin/claude` is a launcher whose native child survived a SIGTERM to the
+launcher while still holding the session (found in the first live run), so neither the lock nor
+a recorded PID is enough. The wrapper now also ends its harness's whole process group and any
+writer left when its harness exits, and refuses to start beside a writer. Verified live on
+2026-10-27 with scratch agents (four cycles, one with `--interrupt` mid-turn): the interactive
+session showed and used the headless turns; after handback the wrapper recalled facts given only
+in the interactive sessions; afterwards the only processes on the session were the new
+wrapper's harness. Differences from 7.3: the queue is not rebound to the tab (inputs wait for
+handback), and the interactive session is not registered as an interactive agentctl agent.
+
 Verified on Claude Code 2.1.310 (the 3.1 "to verify in M2" list): `--input-format stream-json`
 with `--resume` keeps the session; two inputs written together while idle run strictly in order,
 one turn each; `system/init` opens every turn; `result` carries a per-result cost in
@@ -79,8 +96,7 @@ one turn each; `system/init` opens every turn; `result` carries a per-result cos
 transcript records for an input queued and then cancelled.
 
 Not built yet: the bridge's request journal and `agentctl ledger` (12.1); the Python extension's
-v1 events; `agentctl say`, `takeover` and `release-headless` (takeover is manual: stop, then
-`claude --resume SESSION`); per-input cancel of a written input; the provenance header of section
+v1 events; `agentctl say`; per-input cancel of a written input; the provenance header of section
 10; the post-compaction records prompt of 9.5; `HeadlessDelivery` in the bridge (M3); Codex and Muse wrappers (after the
 Claude cutover, per the owner's answer to question 5).
 

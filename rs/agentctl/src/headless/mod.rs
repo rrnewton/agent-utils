@@ -46,7 +46,7 @@ pub fn capabilities() -> serde_json::Value {
         "harnesses": HARNESSES,
         "event_log": format!("v{}", events::VERSION),
         "commands": ["start --mode headless", "run-headless", "tail", "interrupt", "compact",
-                     "send", "drain", "status", "stop", "install-units --headless"],
+                     "send", "drain", "status", "stop", "install-units --headless", "takeover", "handback"],
         "claude": claude::capabilities(),
     })
 }

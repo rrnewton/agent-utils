@@ -8,6 +8,10 @@
 use super::*;
 use crate::headless::{self as hl, claude, control as hcontrol, events, wrapper};
 
+mod takeover;
+pub use takeover::TakeoverOptions;
+use takeover::{takeover_marker, takeover_needs_handback};
+
 /// Schema of the `headless` block in a headless agent's record.
 const SPEC_SCHEMA: &str = "agentctl-headless/v1";
 /// How long `stop` waits for a running wrapper to finish and release its lock.
@@ -373,6 +377,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 record.lifecycle
             )));
         }
+        if let Some(marker) = takeover_marker(&record) {
+            // Exit 0, so a supervisor that restarts on failure does not loop.
+            eprintln!(
+                "agentctl run-headless: {agent_name} is taken over by an interactive session (tab {}); run `agentctl handback {agent_name}` to resume it headless",
+                marker["tab"].as_str().unwrap_or("?")
+            );
+            return Ok(0);
+        }
         let session = record.headless_session()?;
         let directory = self.directory(agent_name)?;
         let mut config =
@@ -605,6 +617,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let socket = hcontrol::socket_path(&directory);
         let (agent_status, wrapper) = if record.lifecycle != "running" {
             ("stopped", Value::Null)
+        } else if let Some(marker) = takeover_marker(record) {
+            result["takeover"] = marker.clone();
+            result["takeover_needs_handback"] = json!(takeover_needs_handback(marker));
+            ("taken-over", Value::Null)
         } else {
             match hcontrol::request(&socket, &json!({"op": "status"}), Duration::from_secs(10)) {
                 Ok(answer) => {
@@ -670,6 +686,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         {
             return Err(fail(format!(
                 "agent {name:?} was replaced before this operation"
+            )));
+        }
+        if let Some(marker) = takeover_marker(&record) {
+            return Err(fail(format!(
+                "agent {name:?} is taken over by an interactive session (tab {}); run agentctl handback {name} first, or exit that session",
+                marker["tab"].as_str().unwrap_or("?")
             )));
         }
         let directory = self.directory(&name)?;

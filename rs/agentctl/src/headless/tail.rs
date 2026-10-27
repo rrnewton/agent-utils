@@ -307,7 +307,15 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
         "lifecycle.released" => cx.line(
             ts,
             &[],
-            &[s(palette::LIFECYCLE.bold(), "══ handed back to headless ══")],
+            &[s(
+                palette::LIFECYCLE.bold(),
+                &format!(
+                    "══ interactive session ended{}; agentctl handback resumes it headless ══",
+                    data["code"]
+                        .as_i64()
+                        .map_or_else(String::new, |code| format!(" (exit {code})"))
+                ),
+            )],
         ),
         "interrupt.requested" => cx.line(ts, &[], &[s(palette::INTERRUPT, "!! interrupt requested")]),
         "status" => cx.line(

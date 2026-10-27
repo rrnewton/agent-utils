@@ -1113,6 +1113,22 @@ fn classify_headless(
                 None,
             ))
         }
+        "taken-over" => {
+            // Only a takeover whose interactive session is over is observed (see `check`):
+            // nothing runs the agent's queue until `handback`.
+            let since = view.last_event_at.unwrap_or(now);
+            Some(Finding::timed(
+                EpisodeKind::Stalled,
+                format!(
+                    "interactive takeover over for {} with {} input(s) queued; run agentctl handback {} to resume it headless",
+                    age(since),
+                    observation.backlog.waiting,
+                    observation.name
+                ),
+                since,
+                Some(options.idle.as_secs_f64()),
+            ))
+        }
         "idle" => {
             let backlog = &observation.backlog;
             if backlog.deliverable > 0 {
@@ -2554,8 +2570,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
                 || (matches!(row["lifecycle"].as_str(), Some("running" | "starting"))
                     && row["adapter"].as_str() != Some("agentcloud")
                     // A headless agent taken over by an interactive terminal has its owner at
-                    // the keyboard; nothing to watch until it is handed back.
-                    && row["agent_status"] != "taken-over"));
+                    // the keyboard; it is watched again only once that session is over and
+                    // nothing serves its queue until `handback`.
+                    && (row["agent_status"] != "taken-over"
+                        || row["takeover_needs_handback"] == true)));
         if !watched {
             return (!expired()).then_some(Checked {
                 row,

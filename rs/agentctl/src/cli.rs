@@ -210,6 +210,19 @@ enum Commands {
     /// Interrupt a headless agent's running turn; queued inputs stay queued and run next
     #[command(after_help = "Example: agentctl interrupt coordinator")]
     Interrupt(Named),
+    /// Move a headless agent's session to an interactive Claude Code in a new Herdr tab: wait for the running turn to end (or interrupt it), stop the wrapper, and run `claude --resume SESSION` there
+    #[command(
+        after_help = "Examples:\n  agentctl takeover coordinator\n  agentctl takeover coordinator --interrupt --workspace wV\n\nThe record is marked taken over before the wrapper is asked to stop, so no supervisor can start\na wrapper until `agentctl handback`; a wrapper started meanwhile exits 0 at once. Deliveries\nare held while the running turn ends, so none starts between that check and the stop. The tab\nruns `agentctl takeover-hold`, which holds the agent's headless lock, refuses to start while any\nprocess runs Claude Code on the session (--resume or --session-id SESSION in its command line),\nruns the interactive Claude Code in its own process group with the terminal, and when it exits\nends whatever is left of that session before it releases the lock. The interactive session gets the record's harness arguments without --permission-prompts, the\nagent's working directory, and the wrapper's CLAUDE_CONFIG_DIR. Inputs sent meanwhile stay\nqueued and run after handback. The event log records lifecycle.takeover and, when the\ninteractive session exits, lifecycle.released."
+    )]
+    Takeover(TakeoverArgs),
+    /// End a takeover: ask the interactive Claude Code to exit, close its tab, and start the headless wrapper again on the same session
+    #[command(
+        after_help = "Examples:\n  agentctl handback coordinator\n  agentctl handback coordinator --wait 120\n\nEvery process running Claude Code on the session gets SIGTERM, and SIGKILL after half of --wait;\nhandback then waits for the holder to record the end and release the headless lock (it refuses\nwhile a takeover is still stopping the wrapper), closes the takeover tab, clears the record's takeover mark, and starts\nthe wrapper: through `systemctl --user start` when the wrapper ran under its systemd unit at\ntakeover, otherwise (or when that unit will not start) as a detached process. The wrapper resumes the session, so it sees the\ninteractive turns."
+    )]
+    Handback(HandbackArgs),
+    /// Internal: the pane command of a takeover (holds the headless lock and runs the interactive Claude Code)
+    #[command(hide = true)]
+    TakeoverHold(TakeoverHold),
     /// Queue /compact for a headless agent; it runs when the current turn ends and the log records compact.started and compact.completed with token counts
     #[command(after_help = "Example: agentctl compact coordinator")]
     Compact(Named),
@@ -412,6 +425,45 @@ struct Tail {
     /// Print the event with this sequence number and the rest of its turn, then exit; exit 1 when it does not exist
     #[arg(long, value_name = "SEQ", conflicts_with_all = ["follow", "since", "last"])]
     at: Option<u64>,
+}
+
+#[derive(Args)]
+struct TakeoverArgs {
+    #[command(flatten)]
+    agent: Named,
+    /// Herdr workspace for the interactive tab (default: the caller's own, from HERDR_WORKSPACE_ID)
+    #[arg(long, value_name = "ID")]
+    workspace: Option<String>,
+    /// Interrupt a running turn instead of waiting for it to end
+    #[arg(long)]
+    interrupt: bool,
+    /// Seconds to wait for a running turn to end before giving up with the agent unchanged (default: 600)
+    #[arg(long, default_value = "600", value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
+    wait: u64,
+    /// Claude Code executable for the interactive session (default: the one the wrapper ran when it was named by absolute path, else claude on the tab's PATH)
+    #[arg(long, value_name = "PATH")]
+    claude_bin: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct HandbackArgs {
+    #[command(flatten)]
+    agent: Named,
+    /// Seconds to wait for the interactive session to end; SIGKILL follows SIGTERM after half of it (default: 60)
+    #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
+    wait: u64,
+}
+
+#[derive(Args)]
+struct TakeoverHold {
+    #[command(flatten)]
+    agent: Named,
+    /// The takeover's token from the record
+    #[arg(long)]
+    token: String,
+    /// Claude Code executable
+    #[arg(long, value_name = "PATH")]
+    claude_bin: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -2730,6 +2782,25 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         }
         Commands::Interrupt(value) => manager.headless_control(&value.name, "interrupt")?,
         Commands::Compact(value) => manager.compact_headless(&value.name)?,
+        Commands::Takeover(value) => manager.takeover_headless(
+            &value.agent.name,
+            &crate::subagents::TakeoverOptions {
+                workspace: value.workspace.clone(),
+                interrupt: value.interrupt,
+                wait: Duration::from_secs(value.wait),
+                claude_bin: value.claude_bin.clone(),
+            },
+        )?,
+        Commands::Handback(value) => {
+            manager.handback_headless(&value.agent.name, Duration::from_secs(value.wait))?
+        }
+        Commands::TakeoverHold(value) => {
+            return Ok(manager.run_takeover_hold(
+                &value.agent.name,
+                &value.token,
+                value.claude_bin.as_deref(),
+            )?);
+        }
         Commands::RunHeadless(value) => {
             let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {

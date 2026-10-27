@@ -619,3 +619,51 @@ fn a_live_harness_of_an_earlier_wrapper_blocks_a_new_one() {
     assert_eq!(code, EXIT_LOCKED);
     assert!(fixture.events().is_empty());
 }
+
+#[test]
+fn a_takeover_generation_that_was_released_counts_as_a_clean_stop() {
+    let root = std::env::temp_dir().join(format!(
+        "agentctl-released-{}-{}",
+        std::process::id(),
+        events::now_millis()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let dir = root.join("events");
+    let mut writer = EventWriter::open(&dir, "a").unwrap();
+    writer
+        .append("lifecycle.takeover", None, json!({"tab": "t"}))
+        .unwrap();
+    drop(writer);
+    assert!(
+        previous_ended_uncleanly(&dir, u64::MAX),
+        "a takeover that never ended is not clean"
+    );
+    let mut writer = EventWriter::open(&dir, "a").unwrap();
+    writer
+        .append("lifecycle.takeover", None, json!({"tab": "t"}))
+        .unwrap();
+    writer
+        .append("lifecycle.released", None, json!({"code": 0}))
+        .unwrap();
+    drop(writer);
+    assert!(!previous_ended_uncleanly(&dir, u64::MAX));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn held_deliveries_stay_queued_until_released() {
+    let fixture = Fixture::new("hold", "normal");
+    let handle = fixture.start();
+    fixture.wait("idle", || fixture.request("status")["status"] == "idle");
+    assert_eq!(fixture.request("hold")["held"], true);
+    fixture.enqueue("m1", "hello", json!({"from": "owner"}));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_ne!(fixture.state("m1"), Some(queue::MessageState::Processed));
+    assert_eq!(fixture.request("status")["held"], true);
+    assert!(!fixture.has_event("input.queued", |_| true));
+    assert_eq!(fixture.request("release")["held"], false);
+    fixture.wait("processed", || {
+        fixture.state("m1") == Some(queue::MessageState::Processed)
+    });
+    fixture.stop(handle);
+}

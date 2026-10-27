@@ -249,6 +249,9 @@ struct Wrapper {
     interrupt_requested: bool,
     stopping: Option<String>,
     stop_deadline: Option<Instant>,
+    /// Deliver nothing until released (a takeover holds deliveries while it waits for the turn
+    /// to end, so no new turn starts between its check and its stop).
+    held: bool,
     status: &'static str,
     rescan: bool,
     last_scan: Instant,
@@ -459,6 +462,7 @@ impl Wrapper {
     fn maybe_deliver(&mut self) -> Result<()> {
         if self.current.is_some()
             || self.stopping.is_some()
+            || self.held
             || self.pause_until.is_some_and(|until| Instant::now() < until)
             || self
                 .harness
@@ -867,6 +871,7 @@ impl Wrapper {
                 "current": self.current.as_ref().map(|current| current.queue_id.clone()),
                 "last_seq": self.writer.next_seq().saturating_sub(1),
                 "stopping": self.stopping,
+                "held": self.held,
             }),
             "interrupt" => {
                 let input = self
@@ -904,6 +909,15 @@ impl Wrapper {
                     self.stopping = Some("stop-request".to_owned());
                 }
                 json!({"ok": true, "stopping": true})
+            }
+            "hold" => {
+                self.held = true;
+                json!({"ok": true, "held": true, "busy": self.busy})
+            }
+            "release" => {
+                self.held = false;
+                self.rescan = true;
+                json!({"ok": true, "held": false})
             }
             other => json!({"ok": false, "error": format!("unknown op {other:?}")}),
         };
@@ -980,7 +994,15 @@ impl Wrapper {
         drop(harness.input.take());
         let status = wait_bounded(&mut harness.child, Duration::from_secs(10));
         let code = status.and_then(|status| status.code());
+        // A launcher can exit while its real harness, in the same process group, keeps the
+        // session open; nothing of the group may outlive the harness record.
+        let group = harness.child.id();
         drop(harness);
+        end_process_group(group, Duration::from_secs(5));
+        let leftovers = session_processes(&self.config.session);
+        if !leftovers.is_empty() {
+            end_processes(&leftovers, Duration::from_secs(5));
+        }
         self.clear_harness_record();
         if self.busy && self.stopping.is_none() {
             self.restart_notice = true;
@@ -1047,15 +1069,7 @@ impl Wrapper {
     /// Remember the running harness's kernel identity, so a later wrapper refuses to start a
     /// second harness while this one lives (for example after this wrapper was killed).
     fn record_harness(&mut self, pid: u32) {
-        let identity = agent_queue::identity::observe(u64::from(pid))
-            .ok()
-            .and_then(|live| serde_json::to_value(live.identity).ok());
-        if let Some(identity) = identity {
-            let _ = atomic_json(
-                &self.harness_record_path(),
-                &json!({"schema": "agentctl-headless-harness/v1", "identity": identity}),
-            );
-        }
+        record_harness_file(&self.config.agent_directory, pid);
     }
 
     fn clear_harness_record(&self) {
@@ -1161,28 +1175,148 @@ fn wait_bounded(child: &mut Child, limit: Duration) -> Option<std::process::Exit
 
 /// SIGTERM the harness's process group, then SIGKILL it after five seconds.
 fn terminate_group(child: &mut Child) {
-    let Ok(pid) = i32::try_from(child.id()) else {
+    end_process_group(child.id(), Duration::from_secs(5));
+    let _ = child.try_wait();
+}
+
+/// Whether any process is left in process group `group`.
+fn group_alive(group: i32) -> bool {
+    // SAFETY: signal 0 only checks that the group exists.
+    unsafe { libc::kill(-group, 0) == 0 }
+}
+
+/// SIGTERM every process of group `group` (a harness group made with `process_group(0)`), wait
+/// up to `grace` for the whole group to be gone, not only its leader, then SIGKILL what is left.
+pub fn end_process_group(group: u32, grace: Duration) {
+    let Ok(group) = i32::try_from(group) else {
         return;
     };
-    // SAFETY: signalling our own child's process group, which `process_group(0)` created.
-    unsafe {
-        libc::kill(-pid, libc::SIGTERM);
+    if group <= 1 || !group_alive(group) {
+        return;
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
+    // SAFETY: signalling the harness's own process group.
+    unsafe {
+        libc::kill(-group, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline && group_alive(group) {
         thread::sleep(Duration::from_millis(50));
     }
-    // SAFETY: as above.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
+    if group_alive(group) {
+        // SAFETY: as above.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && group_alive(group) {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
-/// The PID of a harness a previous wrapper started that is still alive, if any.
-fn live_previous_harness(agent_directory: &Path) -> Option<u64> {
+/// SIGTERM `pids`, wait up to `grace` for them to exit, then SIGKILL the rest.
+pub fn end_processes(pids: &[u32], grace: Duration) {
+    let alive = |pid: u32| {
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    };
+    for pid in pids {
+        // SAFETY: kill only sends a signal.
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline && pids.iter().any(|pid| alive(*pid)) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    for pid in pids.iter().filter(|pid| alive(**pid)) {
+        // SAFETY: as above.
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Whether `argv` runs Claude Code on `session`: the session ID right after `--resume`, `-r` or
+/// `--session-id`, or joined to them with `=`.
+#[must_use]
+pub fn argv_names_session(argv: &[&str], session: &str) -> bool {
+    argv.windows(2)
+        .any(|pair| matches!(pair[0], "--resume" | "-r" | "--session-id") && pair[1] == session)
+        || argv.iter().any(|argument| {
+            ["--resume=", "--session-id="]
+                .iter()
+                .any(|flag| argument.strip_prefix(flag) == Some(session))
+        })
+}
+
+/// Every process of this user other than this one that runs Claude Code on `session`, read
+/// from `/proc/PID/cmdline` ([`argv_names_session`]). A writer of the session is one of these,
+/// whatever started it: a wrapper's harness, a launcher's native child left behind, or an
+/// interactive takeover.
+#[must_use]
+pub fn session_processes(session: &str) -> Vec<u32> {
+    let own = std::process::id();
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        // A zombie has an empty command line and writes nothing.
+        let argv: Vec<&str> = cmdline
+            .split(|byte| *byte == 0)
+            .filter_map(|part| std::str::from_utf8(part).ok())
+            .collect();
+        // agentctl's own commands can name a session (`start --resume`) without running it.
+        let agentctl = argv.first().is_some_and(|program| {
+            Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("agentctl"))
+        });
+        if !agentctl && argv_names_session(&argv, session) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// Record `pid` as the harness of the session in `agent_directory`'s `harness.json`, so no
+/// wrapper starts a second harness while it lives. Also used by a takeover for its interactive
+/// harness.
+pub fn record_harness_file(agent_directory: &Path, pid: u32) {
+    let identity = agent_queue::identity::observe(u64::from(pid))
+        .ok()
+        .and_then(|live| serde_json::to_value(live.identity).ok());
+    if let Some(identity) = identity {
+        let _ = atomic_json(
+            &agent_directory.join(HARNESS_FILE),
+            &json!({"schema": "agentctl-headless-harness/v1", "identity": identity}),
+        );
+    }
+}
+
+/// Forget the harness recorded by [`record_harness_file`].
+pub fn clear_harness_file(agent_directory: &Path) {
+    let _ = std::fs::remove_file(agent_directory.join(HARNESS_FILE));
+}
+
+/// The PID of a harness a previous wrapper (or a takeover) started that is still alive, if any.
+pub fn live_previous_harness(agent_directory: &Path) -> Option<u64> {
     let document = agent_queue::fsio::read_json(&agent_directory.join(HARNESS_FILE)).ok()?;
     let identity: agent_queue::identity::ProcessIdentity =
         serde_json::from_value(document.get("identity")?.clone()).ok()?;
@@ -1218,8 +1352,11 @@ fn previous_ended_uncleanly(events_dir: &Path, generation: u64) -> bool {
         .rev()
         .find(|event| event.kind == "turn.started" || event.kind == "turn.completed")
         .is_some_and(|event| event.kind == "turn.started");
+    // A takeover's generation ends with `lifecycle.released` once its interactive session has
+    // ended: that is a clean hand-off, not a crash.
     let clean = events.last().is_some_and(|event| {
-        event.kind == "lifecycle.stopped" && event.data["cause"] != "restart-limit"
+        (event.kind == "lifecycle.stopped" && event.data["cause"] != "restart-limit")
+            || event.kind == "lifecycle.released"
     });
     !clean || busy_at_end
 }
@@ -1270,6 +1407,14 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
         );
         return Ok(EXIT_LOCKED);
     }
+    let writers = session_processes(&config.session);
+    if !writers.is_empty() {
+        eprintln!(
+            "agentctl run-headless: process(es) {writers:?} already run Claude Code on session {} of {}; refusing a second writer",
+            config.session, config.agent
+        );
+        return Ok(EXIT_LOCKED);
+    }
     let queue_root = config.agent_directory.join("queue");
     let directories = prepare(&queue_root)?;
     queue::prepare_lane(&queue_root, &directories.inbox_v2)?;
@@ -1307,6 +1452,7 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
         interrupt_requested: false,
         stopping: None,
         stop_deadline: None,
+        held: false,
         status: "starting",
         rescan: true,
         last_scan: Instant::now(),

@@ -1,6 +1,6 @@
 ---
 title: 'headless-takeover: agentctl takeover and handback between headless and interactive'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-565: parent-child
 created_at: 2026-10-27T17:37:14.509245390+00:00
-updated_at: 2026-10-27T17:37:14.509245390+00:00
+updated_at: 2026-10-27T20:59:50.497086310+00:00
+closed_at: 2026-10-27T20:59:50.497086200+00:00
 ---
 
 # Description

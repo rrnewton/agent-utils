@@ -2179,10 +2179,32 @@ recorded in `lifecycle.started`.
 }
 ```
 
-**Taking over.** To use the TUI on the same conversation, `agentctl stop NAME`
-(the receipt names the session), then run `claude --resume SESSION` in the
-agent's working directory; start a headless agent with `--resume SESSION` to go
-back.
+**Taking over.** `agentctl takeover NAME` moves the conversation to an
+interactive Claude Code in a new Herdr tab (`--workspace ID`, default the
+caller's): it marks the record taken over, holds the wrapper's deliveries and
+waits for the running turn to end (`--wait`, default 600 s; `--interrupt` ends it
+instead), stops the wrapper, and runs `claude --resume SESSION` in the agent's
+working directory with the wrapper's `CLAUDE_CONFIG_DIR` and the record's
+harness arguments minus `--permission-prompts`. The interactive session sees the
+headless turns. `agentctl handback NAME` ends it (SIGTERM, then SIGKILL after
+half of `--wait`), closes the tab, and starts the wrapper again (with
+`systemctl --user start` when the wrapper ran under its unit, else detached),
+which resumes the session and so sees the interactive turns.
+
+One session never has two writers. A writer is any process whose command line
+runs Claude Code on the session (`--resume SESSION` or `--session-id SESSION`),
+checked directly in `/proc` because a launcher can exit while the real harness
+it started keeps the session open. While the record is marked taken over a
+wrapper exits 0 at once and `stop` refuses; a wrapper never starts beside a
+writer, and when its own harness exits it ends the rest of that harness's
+process group and any writer left. The tab's holder process keeps
+`headless.lock`, runs the interactive harness in its own process group with the
+terminal, and when it exits ends whatever is left of that session before it
+records `lifecycle.released` and releases the lock. Handback refuses while a
+takeover is still stopping the wrapper. Inputs sent while taken over stay
+queued and run after handback; `status` reports `taken-over`, and
+`watch-agents` reports a takeover whose interactive session is over while no
+handback has followed.
 
 **Watching.** `watch-agents` judges a headless agent from its wrapper's status
 and the newest 512 KiB of its event log instead of a screen: a turn whose log
