@@ -155,6 +155,50 @@ def _legacy_journal() -> dict[str, object]:
     }
 
 
+FENCED_TOKEN = "c" * 32
+
+
+def _ownerless_journal(root: Path, with_exclusion: bool) -> dict[str, object]:
+    raw_fenced = f"worktrees/validate/.slot-a.ownerless-validate.{FENCED_TOKEN}"
+    journal: dict[str, object] = {
+        "schema": 2,
+        "kind": "ownerless-validate-remove",
+        "machine": "node-a",
+        "slot": "slot-a",
+        "phase": "prepared",
+        "fenced": raw_fenced,
+        "authorization": {
+            "target_kind": "checkout",
+            "path": "worktrees/validate/slot-a",
+            "identity": [1, 2, 3],
+            "actor": _identity(789),
+            "evidence": {},
+            "no_authored_work": True,
+            "no_live_use": True,
+            "repository": None,
+            "head": None,
+            "remote_url_sha256": None,
+            "parent_identity": None,
+        },
+    }
+    if with_exclusion:
+        config = wrkslots_cli._load_config(str(root), None)
+        guard_name = wrkslots_cli._ownerless_validation_exclusion_name(
+            config, config.root / raw_fenced
+        )
+        journal["exclusion"] = {
+            "schema": 1,
+            "phase": "guard-created",
+            "root": "/data/misc",
+            "root_identity": [1, 2, 3],
+            "guard": f"/data/misc/{guard_name}",
+            "guard_identity": [4, 5, 6],
+            "source_alias": "/data/misc/alias-source",
+            "payload_identity": [1, 2],
+        }
+    return journal
+
+
 def _write(root: Path, name: str, payload: dict[str, object]) -> Path:
     path = root / "worktrees" / name
     path.write_text(json.dumps(payload))
@@ -193,6 +237,39 @@ def test_parse_journal_matches_python(
     result = _rust(root, name)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == _expected(root, path)
+
+
+@pytest.mark.parametrize("with_exclusion", [False, True])
+def test_parse_journal_ownerless_matches_python(tmp_path: Path, with_exclusion: bool) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    path = _write(root, name, _ownerless_journal(root, with_exclusion))
+    result = _rust(root, name)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root, path)
+
+
+@pytest.mark.parametrize(
+    ("with_exclusion", "fragment"),
+    [(False, "unknown ownerless validation phase"), (True, "paths are not canonical")],
+)
+def test_parse_journal_ownerless_refusals(tmp_path: Path, with_exclusion: bool, fragment: str) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    journal = _ownerless_journal(root, with_exclusion)
+    if with_exclusion:
+        exclusion = journal["exclusion"]
+        assert isinstance(exclusion, dict)
+        exclusion["guard"] = "/data/misc/.wrkslots-ownerless-validation.nope"
+    else:
+        journal["phase"] = "bogus"
+    path = _write(root, name, journal)
+    with pytest.raises(Exception) as caught:
+        _expected(root, path)
+    assert fragment in str(caught.value)
+    result = _rust(root, name)
+    assert result.returncode == 1
+    assert fragment in result.stderr
 
 
 @pytest.mark.parametrize(

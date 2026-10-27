@@ -197,7 +197,7 @@ pub(crate) fn normpath(raw: &str) -> String {
     }
 }
 
-fn relative_inside(root: &Path, raw: &str, label: &str) -> Result<(String, PathBuf)> {
+pub(crate) fn relative_inside(root: &Path, raw: &str, label: &str) -> Result<(String, PathBuf)> {
     let parts: Vec<&str> = raw.split('/').collect();
     if raw.starts_with('/') || raw.is_empty() || parts.contains(&"..") {
         return Err(format!(

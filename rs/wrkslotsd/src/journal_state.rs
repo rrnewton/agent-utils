@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use sha2::{Digest as _, Sha256};
+
 use crate::active_state::load_cfg;
 use crate::active_state::{
     as_int, as_list, as_mapping, as_str, checkout_from_obj, exact_keys, identity_from_obj,
-    is_digest, is_sha, parse_timestamp, record_from_obj, scope_from_obj, validate_ref,
+    is_digest, is_sha, parse_timestamp, record_from_obj, scope_from_obj, validate_ref, Cfg,
 };
 use crate::config_validate::{
     refuse_symlink, validate_full_ref, validate_hook, validate_name, validate_remote,
@@ -228,8 +230,7 @@ fn regular_identity(raw: &Map<String, Value>, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn removal_proof(value: &Value) -> Result<(String, i64)> {
-    let label = "validation removal proof";
+fn removal_proof(value: &Value, label: &str) -> Result<(String, i64)> {
     let raw = as_mapping(value, label)?;
     exact_keys(
         raw,
@@ -526,7 +527,8 @@ fn finish_shape(
         }
     }
     if let Some(proof) = raw.get("validation_removal_proof") {
-        let (proof_slot, proof_generation) = removal_proof(proof)?;
+        let (proof_slot, proof_generation) =
+            removal_proof(proof, "finish journal.validation_removal_proof")?;
         if record.slot_type != "validate"
             || record.checkouts.len() != 1
             || proof_slot != record.slot
@@ -538,6 +540,399 @@ fn finish_shape(
                     .to_owned(),
             );
         }
+    }
+    Ok(())
+}
+
+fn validation_authorization(value: &Value) -> Result<(String, String)> {
+    let label = "validation recovery authorization";
+    let raw = as_mapping(value, label)?;
+    exact_keys(
+        raw,
+        &[
+            "target_kind",
+            "path",
+            "identity",
+            "actor",
+            "evidence",
+            "no_authored_work",
+            "no_live_use",
+            "repository",
+            "head",
+            "remote_url_sha256",
+            "parent_identity",
+        ],
+        &[
+            "stable_identity",
+            "removal_proof",
+            "proof_original_mode",
+            "proof_private_identity",
+        ],
+        label,
+    )?;
+    let actor = identity_from_obj(&raw["actor"], "validation recovery actor")?;
+    if actor.is_none()
+        || raw["no_authored_work"] != Value::Bool(true)
+        || raw["no_live_use"] != Value::Bool(true)
+    {
+        return Err("validation recovery authorization is incomplete".to_owned());
+    }
+    let identity = as_list(&raw["identity"], "validation path identity")?;
+    for item in identity {
+        as_int(item, "validation path identity", 0)?;
+    }
+    let parent_len = match &raw["parent_identity"] {
+        Value::Null => None,
+        value => {
+            let items = as_list(value, "validation parent identity")?;
+            for item in items {
+                as_int(item, "validation parent identity", 0)?;
+            }
+            Some(items.len())
+        }
+    };
+    if identity.len() != 3 || parent_len.is_some_and(|len| len != 3) {
+        return Err("validation recovery directory identity must have three fields".to_owned());
+    }
+    if let Some(stable) = raw.get("stable_identity") {
+        if !stable.is_null() {
+            private_census(stable, "validation stable path identity")?;
+        }
+    }
+    let has_proof = match raw.get("removal_proof") {
+        None | Some(Value::Null) => false,
+        Some(proof) => {
+            removal_proof(proof, "validation recovery removal proof")?;
+            true
+        }
+    };
+    let proof_mode = match raw.get("proof_original_mode") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(as_int(value, "validation recovery proof original mode", 0)?),
+    };
+    if proof_mode.is_some_and(|mode| mode > 0o7777) {
+        return Err("validation recovery proof original mode exceeds permission bits".to_owned());
+    }
+    let has_proof_identity = match raw.get("proof_private_identity") {
+        None | Some(Value::Null) => false,
+        Some(value) => {
+            private_census(value, "validation recovery proof private identity")?;
+            true
+        }
+    };
+    if !has_proof && (proof_mode.is_some() || has_proof_identity) {
+        return Err("validation recovery has a proof seal without a proof".to_owned());
+    }
+    if proof_mode.is_some() != has_proof_identity {
+        return Err("validation recovery proof seal is incomplete".to_owned());
+    }
+    let target_kind = as_str(&raw["target_kind"], "validation target kind")?.to_owned();
+    let path = as_str(&raw["path"], "validation path")?.to_owned();
+    as_mapping(&raw["evidence"], "validation recovery evidence")?;
+    for (key, field_label) in [
+        ("repository", "validation repository"),
+        ("head", "validation HEAD"),
+        ("remote_url_sha256", "validation remote digest"),
+    ] {
+        if !raw[key].is_null() {
+            as_str(&raw[key], field_label)?;
+        }
+    }
+    Ok((target_kind, path))
+}
+
+fn managed_worktrees_root(cfg: &Cfg) -> PathBuf {
+    if cfg
+        .worktrees
+        .file_name()
+        .is_some_and(|name| name == "slots")
+    {
+        return cfg
+            .worktrees
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+    }
+    cfg.worktrees.clone()
+}
+
+fn normpath_absolute(raw: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+fn frozen_directory(cfg: &Cfg) -> PathBuf {
+    let root_name = cfg
+        .root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    cfg.root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join(format!(".{root_name}-frozen-validate"))
+}
+
+fn recovery_target(cfg: &Cfg, raw_path: &str, target_kind: &str) -> Result<PathBuf> {
+    if target_kind == "frozen-checkout" {
+        if !raw_path.starts_with('/') {
+            return Err(
+                "frozen validation checkout is not an absolute path; pass the exact absolute checkout path and retry"
+                    .to_owned(),
+            );
+        }
+        if raw_path.split('/').any(|part| part == "..") {
+            return Err(
+                "frozen validation checkout path contains '..'; pass its normalized exact absolute path and retry"
+                    .to_owned(),
+            );
+        }
+        let canonical = normpath_absolute(raw_path);
+        if raw_path != canonical {
+            return Err(format!(
+                "frozen validation checkout must use its exact canonical absolute spelling; pass {canonical:?} and retry"
+            ));
+        }
+        let target = PathBuf::from(&canonical);
+        let frozen_root = frozen_directory(cfg);
+        let name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if target.parent() != Some(frozen_root.as_path()) || !name.starts_with("validate-fresh-") {
+            return Err(format!(
+                "frozen checkout path is outside the exact sibling validation directory: {}; preserve it or move it under {}/validate-fresh-* before retrying",
+                target.display(),
+                frozen_root.display()
+            ));
+        }
+        validate_name(&name, "validation recovery path name")?;
+        let allowed_root = cfg.root.parent().map(Path::to_path_buf).unwrap_or_default();
+        crate::config_validate::ensure_no_symlink_components(
+            &allowed_root,
+            &target,
+            "frozen validation recovery path",
+        )?;
+        return Ok(target);
+    }
+    let (_relative, target) =
+        crate::config_validate::relative_inside(&cfg.root, raw_path, "validation recovery path")?;
+    let validate_root = managed_worktrees_root(cfg).join("validate");
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = target.parent().map(Path::to_path_buf).unwrap_or_default();
+    let allowed = match target_kind {
+        "checkout" => {
+            parent == validate_root
+                || (parent == cfg.root.join("ignored") && name.starts_with("validate-fresh-"))
+        }
+        "cargo-home" => {
+            name.starts_with("validate-cargo-")
+                && (parent == validate_root
+                    || parent
+                        == cfg
+                            .root
+                            .join("ignored")
+                            .join("validate")
+                            .join("cargo-homes"))
+        }
+        _ => {
+            return Err(format!(
+                "unknown validation recovery target kind {target_kind:?}"
+            ))
+        }
+    };
+    if !allowed {
+        return Err(format!(
+            "{target_kind} path is outside the exact validation directories: {}",
+            target.display()
+        ));
+    }
+    validate_name(&name, "validation recovery path name")?;
+    Ok(target)
+}
+
+fn directory_identity(value: &Value, label: &str) -> Result<()> {
+    let fields = as_list(value, label)?;
+    if fields.len() != 3 {
+        return Err(format!("{label} must contain device, inode, and mount id"));
+    }
+    for (index, item) in fields.iter().enumerate() {
+        as_int(item, &format!("{label}[{index}]"), 1)?;
+    }
+    Ok(())
+}
+
+fn exclusion_name(cfg: &Cfg, fenced: &Path) -> Result<String> {
+    let name = fenced
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let token = name.rsplit('.').next().unwrap_or_default();
+    if !(token.len() == 32
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    {
+        return Err("fenced validation path has no exclusion identity".to_owned());
+    }
+    let mut bytes = cfg.root.to_string_lossy().into_owned().into_bytes();
+    bytes.push(0);
+    bytes.extend(fenced.to_string_lossy().into_owned().into_bytes());
+    let context = format!("{:x}", Sha256::digest(&bytes));
+    Ok(format!(
+        ".wrkslots-ownerless-validation.{token}.{}",
+        &context[..16]
+    ))
+}
+
+fn exclusion_from_obj(cfg: &Cfg, fenced: &Path, value: &Value) -> Result<()> {
+    let label = "ownerless validation exclusion";
+    let raw = as_mapping(value, label)?;
+    exact_keys(
+        raw,
+        &[
+            "schema",
+            "phase",
+            "root",
+            "root_identity",
+            "guard",
+            "guard_identity",
+            "source_alias",
+            "payload_identity",
+        ],
+        &[],
+        label,
+    )?;
+    if as_int(&raw["schema"], &format!("{label}.schema"), 0)? != 1 {
+        return Err("ownerless validation exclusion schema is unsupported".to_owned());
+    }
+    let phase = as_str(&raw["phase"], &format!("{label}.phase"))?;
+    if !matches!(phase, "guard-created" | "payload-moved") {
+        return Err(format!(
+            "unknown ownerless validation exclusion phase {phase:?}"
+        ));
+    }
+    let root = as_str(&raw["root"], &format!("{label}.root"))?;
+    let guard = as_str(&raw["guard"], &format!("{label}.guard"))?;
+    let source_alias = as_str(&raw["source_alias"], &format!("{label}.source_alias"))?;
+    if root != "/data/misc" || !root.starts_with('/') {
+        return Err("ownerless validation exclusion paths are not canonical".to_owned());
+    }
+    let expected_guard = PathBuf::from(root).join(exclusion_name(cfg, fenced)?);
+    if guard != expected_guard.to_string_lossy()
+        || !source_alias.starts_with('/')
+        || source_alias.split('/').any(|part| part == "..")
+        || [root, guard, source_alias]
+            .iter()
+            .any(|path| path.contains(['\n', '\0']))
+    {
+        return Err("ownerless validation exclusion paths are not canonical".to_owned());
+    }
+    let payload = as_list(
+        &raw["payload_identity"],
+        &format!("{label}.payload_identity"),
+    )?;
+    if payload.len() != 2 {
+        return Err(format!(
+            "{label} payload identity must contain device and inode"
+        ));
+    }
+    for (index, item) in payload.iter().enumerate() {
+        as_int(item, &format!("{label}.payload_identity[{index}]"), 1)?;
+    }
+    directory_identity(&raw["root_identity"], &format!("{label}.root_identity"))?;
+    directory_identity(&raw["guard_identity"], &format!("{label}.guard_identity"))?;
+    Ok(())
+}
+
+fn ownerless_validate_shape(
+    cfg: &Cfg,
+    raw: &Map<String, Value>,
+    journal_machine: &str,
+) -> Result<()> {
+    exact_keys(
+        raw,
+        &[
+            "schema",
+            "kind",
+            "machine",
+            "slot",
+            "phase",
+            "fenced",
+            "authorization",
+        ],
+        &["exclusion"],
+        "ownerless validation journal",
+    )?;
+    let phase = as_str(&raw["phase"], "ownerless validation journal.phase")?;
+    if !matches!(phase, "prepared" | "fenced" | "removing" | "removed") {
+        return Err(format!("unknown ownerless validation phase {phase:?}"));
+    }
+    as_str(&raw["fenced"], "ownerless validation journal.fenced")?;
+    let (target_kind, auth_path) = validation_authorization(&raw["authorization"])?;
+    if let Some(exclusion) = raw.get("exclusion") {
+        if as_int(&raw["schema"], "ownerless validation journal.schema", 0)? != SCHEMA
+            || raw["kind"] != Value::String("ownerless-validate-remove".to_owned())
+            || raw["machine"].as_str() != Some(journal_machine)
+        {
+            return Err("ownerless validation journal identity is invalid".to_owned());
+        }
+        let target = recovery_target(cfg, &auth_path, &target_kind)?;
+        let target_name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if as_str(&raw["slot"], "ownerless validation slot")? != target_name {
+            return Err("ownerless validation journal slot differs from its path".to_owned());
+        }
+        let raw_fenced = as_str(&raw["fenced"], "fenced validation path")?;
+        let fenced = if target_kind == "frozen-checkout" {
+            if !raw_fenced.starts_with('/') {
+                return Err("fenced frozen validation path must be absolute".to_owned());
+            }
+            let fenced = PathBuf::from(normpath_absolute(raw_fenced));
+            if fenced.parent() != Some(frozen_directory(cfg).as_path()) {
+                return Err("fenced frozen validation path has the wrong parent".to_owned());
+            }
+            let allowed_root = cfg.root.parent().map(Path::to_path_buf).unwrap_or_default();
+            crate::config_validate::ensure_no_symlink_components(
+                &allowed_root,
+                &fenced,
+                "fenced frozen validation path",
+            )?;
+            fenced
+        } else {
+            crate::config_validate::relative_inside(&cfg.root, raw_fenced, "fenced path")?.1
+        };
+        let prefix = format!(".{target_name}.ownerless-validate.");
+        let fenced_name = fenced
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tail = fenced_name.strip_prefix(&prefix).unwrap_or_default();
+        if fenced.parent() != target.parent()
+            || !fenced_name.starts_with(&prefix)
+            || !(tail.len() == 32
+                && tail
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+        {
+            return Err("fenced validation path does not match its target".to_owned());
+        }
+        exclusion_from_obj(cfg, &fenced, exclusion)?;
     }
     Ok(())
 }
@@ -677,6 +1072,9 @@ pub(crate) fn parse_journal(
                         .to_owned(),
                 );
             }
+        }
+        "ownerless-validate-remove" => {
+            ownerless_validate_shape(&cfg, raw, &machine)?;
         }
         _ => return Err(format!("unsupported recovery journal kind {kind:?}")),
     }
