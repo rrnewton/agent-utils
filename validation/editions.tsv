@@ -9,6 +9,7 @@ parallel-experiment-runner	python	absent
 pr-landing-planner	rust	parity	
 tick-hub	rust	parity	
 wrkslots	python	absent	
+wrkslotsd	rust	absent	
 wrkviz	python	absent	
 agent-teams	rust	absent	
 agent-usage	rust	absent	

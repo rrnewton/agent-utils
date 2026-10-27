@@ -69,7 +69,7 @@ setup_py() {
 
 setup_rs() {
   local runner legacy unexpected launcher tool target
-  local -a rust_tools=(dagrun cpuset-alloc tick-hub pr-landing-planner herdr-run herdr-agent agentctl)
+  local -a rust_tools=(dagrun cpuset-alloc tick-hub pr-landing-planner herdr-run herdr-agent agentctl wrkslotsd)
   echo "==> [rs] verify/build tracked Cargo-backed launchers"
   command -v cargo >/dev/null || { echo "rs: cargo not found. Install the Rust toolchain (https://rustup.rs), or run ./setup py and use paired tools with DAGRUN_ENGINE=python." >&2; return 1; }
   command -v flock >/dev/null || { echo "rs: flock not found" >&2; return 1; }

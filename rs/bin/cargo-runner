@@ -36,6 +36,10 @@ case "$TOOL" in
     PACKAGE="agentctl"
     PACKAGE_TOOLS=(agentctl herdr-agent)
     ;;
+  wrkslotsd)
+    PACKAGE="wrkslotsd"
+    PACKAGE_TOOLS=(wrkslotsd)
+    ;;
   cargo-runner)
     echo "cargo-runner: invoke through an rs/bin tool symlink" >&2
     exit 2

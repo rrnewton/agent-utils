@@ -50,6 +50,7 @@ mod plan;
 mod policy;
 mod replay;
 mod schema;
+mod yamlconfig;
 
 use std::error::Error;
 use std::fmt;

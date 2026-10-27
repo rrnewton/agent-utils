@@ -53,6 +53,12 @@ pub(crate) enum Command {
         #[arg(long)]
         slot: String,
     },
+    /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
+    ParseConfig {
+        /// Configuration document to parse; it is never modified
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
     /// Partition reconstructed decisions into a bounded, non-executing pressure report
     Plan {
         /// Existing disposable SQLite index
@@ -122,6 +128,35 @@ pub fn run() -> u8 {
             target_bytes,
             limit,
         } => read_pressure_plan(&index, target_bytes, limit).and_then(|plan| encode_value(&plan)),
+        Command::ParseConfig { config } => {
+            let parsed = std::fs::read_to_string(&config)
+                .map_err(|error| {
+                    crate::ObserverError::invalid(format!(
+                        "cannot read config {}: {error}",
+                        config.display()
+                    ))
+                })
+                .and_then(|text| {
+                    crate::yamlconfig::load_document(&text)
+                        .map_err(|error| crate::ObserverError::invalid(error.to_string()))
+                });
+            match parsed {
+                Ok((value, format)) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({"format": format, "value": value})
+                        )
+                        .unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
     };
     match result {
         Ok(value) => {

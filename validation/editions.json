@@ -101,6 +101,15 @@
       "note": "Python-only CLI. rs/wrkslotsd is a separate read-only observer/index CLI (not a daemon and not a wrkslots edition); the campaign grows it into the Rust edition subcommand by subcommand (milestone 4)."
     },
     {
+      "name": "wrkslotsd",
+      "primary": "rust",
+      "mirror": {"edition": "python", "state": "absent"},
+      "parity_check": null,
+      "rust_entrypoint": "rs/bin/wrkslotsd",
+      "python_entrypoint": null,
+      "note": "Rust observer/CLI growing into the wrkslots Rust edition (#562 rust-primary-wrkslots); today it replays EVENTS logs and parses .wrkslots.yml documents (parse-config) at parity with the Python loader."
+    },
+    {
       "name": "wrkviz",
       "primary": "python",
       "mirror": {"edition": "rust", "state": "absent"},

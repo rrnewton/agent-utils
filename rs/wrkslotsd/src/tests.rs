@@ -5029,7 +5029,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         names,
-        BTreeSet::from(["explain", "plan", "rebuild", "status"])
+        BTreeSet::from(["explain", "parse-config", "plan", "rebuild", "status"])
     );
     for subcommand in command.get_subcommands() {
         for argument in subcommand.get_arguments() {
