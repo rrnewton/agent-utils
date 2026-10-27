@@ -18,6 +18,7 @@ pub(crate) mod credentials;
 pub mod error;
 pub mod harness;
 pub mod harness_tui;
+pub mod headless;
 pub(crate) mod inbox;
 pub mod landing_queue;
 pub mod legacy_cli;
