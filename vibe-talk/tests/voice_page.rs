@@ -48,8 +48,8 @@ fn run_slice(root: &PathBuf, index: usize, count: usize) -> (Output, String) {
         // Held to what a slice keeps alive: on a host with a lot of memory V8 otherwise lets
         // garbage pile up to gigabytes a slice, and these run side by side.
         .arg("--max-old-space-size=1024")
-        // Importing `node:test` runs the suite and emits TAP. Calling the file directly works on
-        // Node 16 too; its experimental `--test` mode otherwise reports the whole file as one test.
+        // The result parser consumes TAP; do not depend on Node's default reporter.
+        .arg("--test-reporter=tap")
         .arg(SUITE)
         .env("VOICE_PAGE_SHARD", format!("{index}/{count}"))
         .output()

@@ -796,20 +796,8 @@ async fn a_band_row_the_latest_read_did_not_list_is_never_served_in_a_window_nor
     assert_eq!(count.misses.gap, 1, "{count:?}");
 }
 
-/// Capture this thread's log at INFO, as [`testing::LogCapture::info_only`] does, once a global
-/// subscriber that takes INFO and writes nothing is in place. Without one, another test's capture
-/// dropped on another thread rebuilds each callsite's interest from the captures alive at that
-/// moment, and may leave the diagnostics' callsites cached as of interest to no one just as this
-/// thread's capture begins: its line would then never reach it.
+/// The shared capture keeps a permanent interested subscriber for parallel logging tests.
 fn capture_info() -> testing::LogCapture {
-    static GLOBAL: std::sync::Once = std::sync::Once::new();
-    GLOBAL.call_once(|| {
-        let quiet = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(std::io::sink)
-            .finish();
-        let _ = tracing::subscriber::set_global_default(quiet);
-    });
     testing::LogCapture::info_only()
 }
 

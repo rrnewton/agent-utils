@@ -1732,6 +1732,18 @@ impl LogCapture {
     }
 
     fn at(level: tracing::Level) -> Self {
+        // Keep callsites enabled while captures on other threads come and go. Without a
+        // permanent interested subscriber, a parallel capture's drop can leave a callsite
+        // cached as disabled just as this thread installs its subscriber. Only the thread's
+        // scoped subscriber records messages; the permanent subscriber discards them.
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let quiet = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(quiet);
+        });
         let buffer = SharedBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buffer.clone())

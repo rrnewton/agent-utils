@@ -1214,6 +1214,8 @@ fn the_browser_validators_accept_the_samples_and_refuse_broken_values() {
     const SUITE: &str = "tests/js/contract.test.mjs";
     let output = std::process::Command::new("node")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
+        // The assertions below parse TAP; Node's default reporter varies by version.
+        .arg("--test-reporter=tap")
         .arg(SUITE)
         .output()
         .unwrap_or_else(|error| panic!("could not run node, which {SUITE} needs: {error}"));

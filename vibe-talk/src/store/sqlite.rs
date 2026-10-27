@@ -4980,8 +4980,17 @@ mod tests {
                 change.unpinned.is_empty(),
                 "pin {n} unpinned something under the bound"
             );
-            // The bound orders by `pinned_at_ms`; a gap keeps two pins out of one millisecond.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // Give this fixture an explicit pin order. Sleeping cannot guarantee increasing
+            // wall-clock timestamps when the host adjusts its clock during a parallel suite.
+            store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .execute(
+                    "UPDATE pins SET pinned_at_ms = ?3 WHERE channel_id = ?1 AND message_id = ?2",
+                    rusqlite::params![channel.as_str(), id(n), 1_700_000_000_000_i64 + n as i64],
+                )
+                .expect("order the fixture's pins");
         }
         // A repeat of the oldest pin at the bound: not a new pin, so nothing is dropped, and it
         // does not move to the back of the queue.

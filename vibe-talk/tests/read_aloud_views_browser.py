@@ -325,12 +325,18 @@ class Walk:
                 self.page.wait_for_timeout(25)
             self.desk.check(len(self.api.tickets(message_id)) > tickets_before,
                             f"{label}: the agent's voice was never asked for {message_id}")
+            # resume() is asynchronous: a source may be scheduled while its context is still
+            # suspended. Check the live context, then prove its clock moves, rather than the
+            # historical state recorded at source.start().
             self.wait_for(f"{label}: no audio started", f"() => window.audioProbe.sources.length > {audio_before}"
-                          " && window.audioProbe.sources.slice(-1)[0].state === 'running'")
+                          " && window.audioProbe.contexts.slice(-1)[0].state === 'running'")
             clock = self.page.evaluate("() => window.audioProbe.contexts.slice(-1)[0].currentTime")
-            self.page.wait_for_timeout(300)
-            moved = self.page.evaluate("() => window.audioProbe.contexts.slice(-1)[0].currentTime") - clock
-            self.desk.check(moved > 0.15, f"{label}: the audio clock stood still ({moved:.3f}s in 300ms)")
+            # A loaded browser can advance its audio clock slower than wall time. Require
+            # actual progress within a bound, rather than a real-time speed ratio.
+            self.wait_for(f"{label}: the audio clock stood still",
+                          f"() => window.audioProbe.contexts.slice(-1)[0].currentTime > {clock + 0.15}",
+                          seconds=2)
+
         else:
             # The message's first sentence, or more (`#554 read-pause-reply-resume`: one sentence an utterance).
             words = json.dumps(self.message_words(message_id))
