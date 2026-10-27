@@ -39,12 +39,12 @@ pub(crate) struct Cfg {
 }
 
 #[derive(Clone)]
-struct Identity {
-    pid: i64,
-    start_ticks: i64,
-    boot_id: String,
+pub(crate) struct Identity {
+    pub(crate) pid: i64,
+    pub(crate) start_ticks: i64,
+    pub(crate) boot_id: String,
     host_id: String,
-    cgroup_path: String,
+    pub(crate) cgroup_path: String,
 }
 
 pub(crate) struct CheckoutRec {
@@ -59,24 +59,25 @@ pub(crate) struct ImportRec {
     pub(crate) row: Map<String, Value>,
 }
 
-struct ScopeRec {
-    cgroup_path: String,
-    boot_id: String,
-    leader_pid: i64,
-    leader_start_ticks: i64,
+pub(crate) struct ScopeRec {
+    pub(crate) cgroup_path: String,
+    pub(crate) boot_id: String,
+    pub(crate) leader_pid: i64,
+    pub(crate) leader_start_ticks: i64,
 }
 
-struct RecordRec {
-    slot: String,
+pub(crate) struct RecordRec {
+    pub(crate) slot: String,
     agent: String,
     task: String,
     purpose: String,
-    slot_type: String,
-    machine: String,
+    pub(crate) slot_type: String,
+    pub(crate) machine: String,
+    pub(crate) generation: i64,
     created_at: String,
     layout: Option<String>,
     owner: Option<Identity>,
-    checkouts: Vec<CheckoutRec>,
+    pub(crate) checkouts: Vec<CheckoutRec>,
     import_source: Option<ImportRec>,
     normalized: Value,
 }
@@ -168,21 +169,21 @@ fn is_naive_iso(value: &str) -> bool {
         .any(|format| chrono::NaiveDateTime::parse_from_str(value, format).is_ok())
 }
 
-fn is_sha(value: &str) -> bool {
+pub(crate) fn is_sha(value: &str) -> bool {
     value.len() == 40
         && value
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-fn is_digest(value: &str) -> bool {
+pub(crate) fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-fn validate_ref(value: &str, label: &str) -> Result<()> {
+pub(crate) fn validate_ref(value: &str, label: &str) -> Result<()> {
     if value.is_empty()
         || value.starts_with('-')
         || value.chars().any(char::is_whitespace)
@@ -195,7 +196,7 @@ fn validate_ref(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn identity_from_obj(value: &Value, label: &str) -> Result<Option<Identity>> {
+pub(crate) fn identity_from_obj(value: &Value, label: &str) -> Result<Option<Identity>> {
     if value.is_null() {
         return Ok(None);
     }
@@ -336,7 +337,7 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
     })
 }
 
-fn scope_from_obj(value: &Value, label: &str) -> Result<ScopeRec> {
+pub(crate) fn scope_from_obj(value: &Value, label: &str) -> Result<ScopeRec> {
     let raw = as_mapping(value, label)?;
     exact_keys(
         raw,
@@ -596,7 +597,7 @@ fn assert_import_matches(record: &RecordRec, source: &ImportRec, label: &str) ->
     Ok(())
 }
 
-fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
+pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
     let raw = as_mapping(value, label)?;
     exact_keys(
         raw,
@@ -645,7 +646,7 @@ fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
         Some(value) => as_str(value, &format!("{label}.slot_type"))?.to_owned(),
     };
     let machine = as_str(&raw["machine"], &format!("{label}.machine"))?.to_owned();
-    as_int(&raw["generation"], &format!("{label}.generation"), 1)?;
+    let generation = as_int(&raw["generation"], &format!("{label}.generation"), 1)?;
     let created_at = as_str(&raw["created_at"], &format!("{label}.created_at"))?.to_owned();
     let heartbeat_at = as_str(&raw["heartbeat_at"], &format!("{label}.heartbeat_at"))?.to_owned();
     as_int(
@@ -729,6 +730,7 @@ fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
         purpose,
         slot_type,
         machine,
+        generation,
         created_at,
         layout,
         owner,

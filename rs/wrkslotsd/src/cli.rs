@@ -104,6 +104,18 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         slot: String,
     },
+    /// Shape-validate one recovery journal in the control directory and print it as stored
+    ParseJournal {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+        /// Journal file name inside the control directory
+        #[arg(long, value_name = "NAME")]
+        name: String,
+    },
     /// Parse a .wrkslots.yml document (the strict subset or JSON) and print it as canonical JSON
     ParseConfig {
         /// Configuration document to parse; it is never modified
@@ -260,6 +272,25 @@ pub fn run() -> u8 {
                 return 1;
             }
         },
+        Command::ParseJournal {
+            root,
+            machine,
+            name,
+        } => {
+            match crate::journal_state::parse_journal(root.as_deref(), machine.as_deref(), &name) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
         Command::ParseConfig { config } => {
             let parsed = std::fs::read_to_string(&config)
                 .map_err(|error| {

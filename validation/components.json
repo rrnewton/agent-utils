@@ -323,6 +323,7 @@
         "py/wrkslots/tests/test_event_memo.py",
         "py/wrkslots/tests/test_handoff_state_rust.py",
         "py/wrkslots/tests/test_hold_state_rust.py",
+        "py/wrkslots/tests/test_journal_state_rust.py",
         "py/wrkslots/tests/test_network.py",
         "py/wrkslots/tests/test_owner_transfer.py",
         "py/wrkslots/tests/test_ownerless_clone.py",

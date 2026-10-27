@@ -62,4 +62,7 @@ content digest binding) and `_handoff_artifact_to_obj` output.
 `_load_hold_snapshot` for the HOLD.<machine>.<slot>.json record
 (absent = null; exact keys, schema, filename identity, timestamp, reason).
 
-[muse watermelon] Next slice: `parse-journal` for recovery journal shape (create/import/finish kinds).
+[muse watermelon] Slice 7 in progress: `wrkslotsd parse-journal` reproduces
+`_validate_journal_shape` for create, import-existing, and finish journals
+(filename agreement, planned/created shapes, embedded records, finish
+phase/archive-id and optional evidence bundles). Other kinds still refuse.

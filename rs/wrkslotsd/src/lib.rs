@@ -51,6 +51,7 @@ mod evidence;
 mod handoff_state;
 mod hold_state;
 mod index;
+mod journal_state;
 mod plan;
 mod policy;
 mod replay;

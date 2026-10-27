@@ -301,7 +301,7 @@ fn string_tuple(
     Ok(result)
 }
 
-fn validate_hook(value: &str) -> Result<String> {
+pub(crate) fn validate_hook(value: &str) -> Result<String> {
     if value.trim().is_empty() || value.contains('\0') {
         return Err("post-provision hooks must be non-empty shell commands".to_owned());
     }
