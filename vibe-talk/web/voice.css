@@ -6840,6 +6840,80 @@ a.search-hit-link {
   display: none;
 }
 
+/* `scrubber-full-width`. ON A PHONE, A READ PLAYING HAS THE BOTTOM OF THE SCREEN. The owner,
+   2026-10-27: "I want to conserve screen real estate and I would like the scrubber bar to the full
+   width and the flush with the top of the bottom row of the controls. Those other controls you don't
+   need to access while we are in active playback mode." `data-read-strip` on the root says the strip
+   is up and whether its read plays or is held (`renderReadLayout` in web/voice.js).
+ *
+ *   * THE STRIP IS A ROW, edge to edge, standing on the dock: on the bottom row (Pace, Stop, Pause)
+ *     with nothing between. Its insets are the safe area's, so the curve of a phone's corners keeps
+ *     clear of Previous and Next. Previous and Next go to the two edges, under the thumbs, with the
+ *     count between, and the timeline takes the whole width under them.
+ *   * THE LIST ENDS AT ITS TOP EDGE. #screen-main keeps the strip's measured height
+ *     (`--read-steer-height`) under the list, so no message scrolls under the strip and the lists'
+ *     feet keep no room for it besides (`--read-steer-clearance` is nothing inside). The chips, the
+ *     status pill and the pull's report stand on it (`--chips-foot`; over a send card docked under
+ *     the screen, on the card and the strip both: `placeChipsOverComposer`).
+ *   * WHILE IT PLAYS, the bar's second row (the gear, the pickers, the switch: in the dock, or in the
+ *     header where the reader moved it, and the header with it while the bar is all it holds) and the
+ *     chips go. The list grows into the room.
+ *   * HELD, the chips come back, floating over the list on the strip as they do over the dock. The
+ *     second row stays away until the read stops, so a pause or a resume never resizes the list's
+ *     frame or lifts the strip from under the thumb reaching for it (only the room the list's foot
+ *     keeps for the chips comes and goes with them, as it does whenever a chip does).
+ *
+ * Coarse pointers only, as `#429 keyboard-hides-bar`: a desk's strip floats on its chips row as it
+ * did, and moves by its grip. */
+@media (pointer: coarse) {
+  :root[data-read-strip] #screen-main {
+    padding-bottom: var(--read-steer-height, 0px);
+  }
+
+  :root[data-read-strip] #read-steer {
+    bottom: 0;
+    inset-inline: 0;
+    width: auto;
+    max-width: none;
+    margin-inline: 0;
+    justify-content: space-between;
+    padding: 0.35rem calc(0.6rem + env(safe-area-inset-right)) 0.35rem
+      calc(0.6rem + env(safe-area-inset-left));
+    border-width: 1px 0 0;
+    border-radius: 0;
+    box-shadow: none;
+    background: var(--dock);
+  }
+
+  :root[data-read-strip] #read-timeline {
+    padding-inline: 0;
+  }
+
+  :root[data-read-strip] #frame-body {
+    --chips-foot: max(calc(var(--read-steer-height, 0px) + 0.5rem), calc(var(--composer-top, 0px) + 0.25rem));
+  }
+
+  :root[data-read-strip] #scroll-area,
+  :root[data-read-strip] #side-column,
+  :root[data-read-strip] #status-line,
+  :root[data-read-strip] #pull-refresh {
+    --read-steer-clearance: 0px;
+  }
+
+  :root[data-read-strip] #control-bar,
+  :root[data-read-strip] #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))),
+  :root[data-read-strip="playing"] #scroll-tools {
+    display: none;
+  }
+
+  /* The header gone this way is not `hidden`, so the body takes the top safe-area inset over here as
+     `#197 floating-search` has it do for a hidden header: a read lasts minutes, and the notch would
+     sit on the list's first line and the glass for all of them. */
+  :root[data-read-strip] #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))) + #frame-body {
+    padding-top: env(safe-area-inset-top);
+  }
+}
+
 /* The block being read, inside the row being read: the row's own colour, stronger. */
 .md [data-reading-block="current"] {
   background: color-mix(in srgb, var(--warn) 45%, var(--theirs));

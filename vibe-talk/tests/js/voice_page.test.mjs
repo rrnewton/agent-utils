@@ -12239,7 +12239,6 @@ test("`#442 read-strip-order`: a jump that waits for its block keeps Pause and S
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "1 of 3");
   await page.el("read-next").click();
-  assert.equal(page.el("read-steer").hidden, true, "the premise: the jump is waiting, with nothing playing");
   assert.equal(page.el("read-aloud-stop").hidden, false, "the bar's Stop folded away during the jump");
   assert.equal(page.el("read-aloud-label").text(), "Pause", "Read turned into a Stop under the thumb during the jump");
   await page.el("read-aloud").click();
@@ -12247,6 +12246,139 @@ test("`#442 read-strip-order`: a jump that waits for its block keeps Pause and S
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "2 of 3", "the jump did not land");
   assert.equal(page.el("read-aloud-stop").hidden, false);
+});
+
+/** What the root tells the stylesheet about the strip (`scrubber-full-width`): "playing", "paused" or null. */
+const readStrip = (page) => page.documentElement.getAttribute("data-read-strip");
+
+test("`scrubber-full-width`: the root says whether the strip's read plays or is held, and nothing once it stops", async () => {
+  // The owner, 2026-10-27: the scrubber "full width and flush with the top of the bottom row of the
+  // controls. Those other controls you don't need to access while we are in active playback mode."
+  // The stylesheet hides them by this attribute; held, only the second row stays away, and a stop
+  // brings everything back.
+  const { page, rows } = await blockedRead();
+  assert.equal(readStrip(page), null, "the root claims a strip with reading mode on and nothing playing");
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer").hidden, false, "the premise: the strip is up");
+  assert.equal(readStrip(page), "playing", "a read playing does not lay the phone out for playback");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the premise: the read is held");
+  assert.equal(readStrip(page), "paused", "a held read still says it plays, so the chips stay away");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(readStrip(page), "playing", "the resumed read does not say it plays again");
+  await page.el("read-aloud-stop").click();
+  await page.settle();
+  assertReadingModeLeft(page, "the bar's Stop");
+  assert.equal(readStrip(page), null, "the playback layout outlived the read");
+
+  // A tap on the block being read stops it too; a message of one block draws no strip, and no layout.
+  await page.el("read-aloud").click();
+  await page.settle();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(readStrip(page), "playing");
+  await rows[0].dispatch("click", { target: blockElements(rows[0])[0] });
+  await page.settle();
+  assert.equal(page.el("read-steer").hidden, true, "the premise: the tap stopped the read");
+  assert.equal(readStrip(page), null, "a read stopped by a tap kept the playback layout");
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Pause", "the premise: the one-block read plays");
+  assert.equal(readStrip(page), null, "a one-block read, which draws no strip, laid the phone out for one");
+});
+
+test("`scrubber-full-width`: a jump that waits for its block keeps the strip and the layout, and a Stop then ends both", async () => {
+  // On a phone the strip is a row of the layout: hidden for a jump's wait, the list would grow into its
+  // room and the second row and the chips come back for the moment of a Next.
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.speechBlocks[BLOCKED_ID] = BLOCKED_KINDS;
+  page.speechTicketTtlSeconds = 200;
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID,
+    content: "The run finished.\n\n- the budget landed\n- the rewrite is a draft", content_html: BLOCKED_HTML })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const blocks = page.el("read-timeline").children.length;
+  await page.el("read-next").click();
+  assert.equal(page.el("read-steer").hidden, false, "the strip went for the jump's wait");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3", "the held strip does not say where the read was");
+  assert.equal(page.el("read-timeline").children.length, blocks, "the held strip lost its timeline");
+  assert.equal(readStrip(page), "playing", "the playback layout dropped for the jump's wait");
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the jump did not land");
+  assert.equal(readStrip(page), "playing");
+
+  await page.el("read-next").click();
+  assert.equal(page.el("read-steer").hidden, false, "the premise: the strip is held for the jump");
+  await page.el("read-aloud-stop").click();
+  await page.settle();
+  assertReadingModeLeft(page, "the bar's Stop during a jump");
+  assert.equal(readStrip(page), null, "the playback layout outlived a read stopped mid-jump");
+  assert.equal(page.el("read-timeline").children.length, 0, "the timeline outlived the read");
+});
+
+/** Every `@media (pointer: coarse)` body in the stylesheet, joined: the rules a phone gets. */
+function coarseBodies() {
+  const bodies = [];
+  let from = 0;
+  for (;;) {
+    const at = CSS_CODE.indexOf("@media (pointer: coarse)", from);
+    if (at < 0) return bodies.join("\n");
+    const open = CSS_CODE.indexOf("{", at);
+    let depth = 0;
+    let end = open;
+    for (; end < CSS_CODE.length; end += 1) {
+      if (CSS_CODE[end] === "{") depth += 1;
+      else if (CSS_CODE[end] === "}" && (depth -= 1) === 0) break;
+    }
+    bodies.push(CSS_CODE.slice(open + 1, end));
+    from = end;
+  }
+}
+
+test("`scrubber-full-width`: on a phone the strip playing is a full-width row on the dock, the second row and the chips hidden; a desk is untouched", () => {
+  const phone = coarseBodies();
+  const rule = (selector) => {
+    const blocks = cssRules(phone, selector);
+    assert.ok(blocks.length > 0, `no phone rule for "${selector}"`);
+    return blocks.join("\n");
+  };
+  const strip = rule(":root[data-read-strip] #read-steer");
+  assert.match(strip, /bottom:\s*0;/, "the strip does not stand on the dock");
+  assert.match(strip, /inset-inline:\s*0;/);
+  assert.match(strip, /max-width:\s*none;/, "the strip is still narrower than the screen");
+  assert.match(strip, /margin-inline:\s*0;/);
+  assert.match(strip, /padding:[^;]*safe-area-inset-right[^;]*safe-area-inset-left[^;]*;/,
+    "the full-width strip's insets are not the safe area's on both sides");
+  // The list ends at its top edge: the screen keeps the strip's measured height under the list, and the
+  // list's foot keeps no second room for it.
+  assert.match(rule(":root[data-read-strip] #screen-main"), /padding-bottom:\s*var\(--read-steer-height, 0px\);/,
+    "the list runs under the strip");
+  assert.match(rule(":root[data-read-strip] #scroll-area"), /--read-steer-clearance:\s*0px;/,
+    "the list's foot keeps room for a strip it no longer runs under");
+  assert.match(rule(":root[data-read-strip] #frame-body"), /--chips-foot:\s*max\(calc\(var\(--read-steer-height, 0px\) \+ 0\.5rem\)/,
+    "the chips and the pill do not stand on the strip");
+  assert.match(SCRIPT_CODE, /"--read-steer-height"[\s\S]*?\.observe\(el\("read-steer"\)\)/, "nothing measures the strip's height");
+  // Playing: the second row (in the dock or the header) and the chips go. Held: the second row only.
+  assert.match(rule(":root[data-read-strip] #control-bar"), /display:\s*none;/, "the second row stays up during playback");
+  // (By the text: the rule parser splits a selector at the commas inside its `:has`.)
+  assert.match(phone, /:root\[data-read-strip\] #topbar:has\(#control-bar-top > #control-bar\):not\([^{]*\{\s*display:\s*none;/,
+    "the header holding only the bar stays up during playback");
+  // A header gone this way is not `hidden`, so the body takes the notch's inset over (`#197`).
+  assert.match(phone, /:root\[data-read-strip\] #topbar:has\([^{]*\+ #frame-body\s*\{\s*padding-top:\s*env\(safe-area-inset-top\);/,
+    "the header gone for playback leaves the list under the notch");
+  assert.match(rule(":root[data-read-strip] #side-column"), /--read-steer-clearance:\s*0px;/,
+    "the thread list keeps room for a strip it no longer runs under");
+  assert.match(rule(':root[data-read-strip="playing"] #scroll-tools'), /display:\s*none;/, "the chips stay up while the read plays");
+  assert.equal(cssRules(phone, ":root[data-read-strip] #scroll-tools").length + cssRules(phone, ':root[data-read-strip="paused"] #scroll-tools').length,
+    0, "the chips are hidden while the read is held too");
+  // A desk is untouched: every rule that reads the attribute is inside a phone's query.
+  const uses = (css) => (css.match(/data-read-strip/g) || []).length;
+  assert.equal(uses(CSS_CODE), uses(phone), "a playback layout rule applies outside a coarse pointer");
 });
 
 test("`#442 read-strip-order`: the phone tile gives Stop a fourth column on Pause's left, only while it shows", () => {
@@ -34684,6 +34816,10 @@ test("A READ CUT OFF BY A RESTART prepares again and carries on from the block i
   await page.settle();
   assert.match(page.el("status").textContent, /cut off; trying again/);
   assert.equal(rowState(page, 0).pending, "true", "the row does not say its read is coming back");
+  // `scrubber-full-width`: the strip, and a phone's layout for it, stay up through the wait.
+  assert.equal(page.el("read-steer").hidden, false, "the strip went for the wait to try again");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  assert.equal(readStrip(page), "playing", "the playback layout dropped for the wait to try again");
   assert.equal(page.expireTimers(page.pure("READ_RECOVERY_WAITS_MS")[0]), 1, "nothing waited to try again");
   await page.settle();
   assert.ok(page.prepareCalls.slice(before).some((call) => (call.ids || []).includes(BLOCKED_ID)),
@@ -34745,9 +34881,13 @@ test("a tap during the wait to try again is the reader's own: the try leaves it 
   page.audioStreams[0].controller.fail();
   await page.settle();
   assert.match(page.el("status").textContent, /cut off; trying again/);
+  assert.equal(page.el("read-steer").hidden, false, "the premise: the strip is held through the wait");
   // A tap on the row whose read is coming back stops it, as a tap on a row being read does.
   await page.el("discord-log").children[0].dispatch("click", {});
   await page.settle();
+  // `scrubber-full-width`: and the strip held through the wait goes with it.
+  assert.equal(page.el("read-steer").hidden, true, "the strip held through the wait outlived the stop");
+  assert.equal(readStrip(page), null, "the playback layout outlived the stop during the wait");
   const asked = page.audioStreams.length;
   page.expireTimers(10_000);
   await page.settle();

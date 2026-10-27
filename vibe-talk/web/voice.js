@@ -374,7 +374,12 @@ if (typeof window.ResizeObserver === "function") {
     const landed = currentScreen === "main" && currentView === "discord" && entryLandingHolds();
     const pinned = !landed && currentScreen === "main" && followsNewest(area);
     el("frame-body").style.setProperty("--read-steer-clearance", room);
+    // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
+    // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on
+    // the hidden screen as the room is, so the list comes back laid out with it (`#280`).
+    el("frame-body").style.setProperty("--read-steer-height", `${height}px`);
     const screen = leftEl("screen-main");
+    if (!screen.hidden) screen.style.setProperty("--read-steer-height", `${height}px`);
     if (!screen.hidden) screen.style.setProperty("--read-steer-clearance", room);
     if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
     if (pinned) area.scrollTop = area.scrollHeight;
@@ -430,6 +435,14 @@ function placeChipsOverComposer() {
     }
   } else if (docked) {
     top = Math.max(0, Math.round(leftEl("frame-body").getBoundingClientRect().bottom - card.getBoundingClientRect().top));
+    // `scrubber-full-width`. A phone's strip playing is a row at the screen's foot, over the card:
+    // what stands on the card stands on the strip as well (the stylesheet's floor for the strip is
+    // the larger of the two, not their sum).
+    const steer = el("read-steer");
+    if (steer && !steer.hidden && document.documentElement.getAttribute("data-read-strip") !== null &&
+        steer.getBoundingClientRect().bottom >= leftEl("screen-main").getBoundingClientRect().bottom - 1) {
+      top += Math.round(steer.getBoundingClientRect().height);
+    }
   }
   if (top === composerTop) return;
   composerTop = top;
@@ -38039,9 +38052,16 @@ function renderReadSteer() {
   if (!strip) return;
   const position = readingPosition();
   const wasHidden = strip.hidden;
-  strip.hidden = position === "";
+  // `scrubber-full-width`. A jump that waits for its block has nothing playing, and the strip
+  // stays up through the wait as it stood, as the bar keeps Pause and Stop (`#442`): on a phone it
+  // is a row of the layout, and going and coming back would resize the list and put the bar's
+  // second row and the chips back for the moment of every Next. So too through the wait before a
+  // read cut off is tried again (`recoverRead`). `renderReadLayout` takes it away if either ends
+  // without a block playing. (On a desk too: there it no longer blinks out on a Next.)
+  const held = position === "" && !wasHidden && (readJumpPending || readRecovering);
+  strip.hidden = position === "" && !held;
   renderReadTransport();
-  renderReadTimeline();
+  if (!held) renderReadTimeline();
   if (position === "") return;
   el("read-steer-count").textContent = position;
   el("read-next").disabled = nowPlaying.segment + 1 >= nowPlaying.segments.length;
@@ -38246,6 +38266,11 @@ let readJumping = false;
  * that leaves reading mode for the moment the next block is still being fetched.
  */
 let readJumpPending = false;
+/**
+ * `scrubber-full-width`. True from `recoverRead` stopping a read cut off until its retry is under way
+ * (then `readJumpPending`) or abandoned: the strip stays up through the wait, as through a jump's.
+ */
+let readRecovering = false;
 
 /** Previous (-1) or Next (+1). Previous on the first block starts it again. */
 function stepReading(delta) {
@@ -38278,7 +38303,10 @@ function renderReadTransport() {
     // (`#451 read-strip-followups`).
     button.setAttribute("data-active", readingMode || readInProgress() || pendingRead !== null ? "true" : "false");
   }
-  if (nowPlaying !== null || (pendingRead === null && !readJumping)) readJumpPending = false;
+  if (nowPlaying !== null || (pendingRead === null && !readJumping)) {
+    readJumpPending = false;
+    readRecovering = false;
+  }
   const label = el("read-aloud-label");
   if (label) {
     // `#451 read-strip-followups`. A read in progress is what makes Read its Pause, in the mode or
@@ -38297,6 +38325,35 @@ function renderReadTransport() {
   // strip to stop it from.
   const stop = el("read-aloud-stop");
   if (stop && button) stop.hidden = button.hidden || !readInProgress();
+  renderReadLayout();
+}
+
+/**
+ * `scrubber-full-width`. The owner, 2026-10-27, of a phone: "I would like the scrubber bar to the
+ * full width and the flush with the top of the bottom row of the controls. Those other controls
+ * you don't need to access while we are in active playback mode." So while the strip is up the
+ * root says whether its read is `playing` or `paused` (`data-read-strip`; absent with no strip),
+ * and the stylesheet lays a phone out for it: the strip a full-width row on the dock, and the
+ * bar's second row and the chips gone while it plays.
+ *
+ * PAUSED IS NOT STOPPED. A pause brings the chips back, which float and move nothing, and keeps
+ * the rest: the second row coming back would resize the list and lift the strip on every pause and
+ * resume, and a pause is the moment the reader reaches for the strip or the row's Reply (the car
+ * view's "pause, dictate, reply, resume"). Stop, or the read's end, takes the strip away and puts
+ * everything back. A desk keeps its layout: nothing there reads this.
+ */
+function renderReadLayout() {
+  const strip = el("read-steer");
+  if (!strip) return;
+  // A strip held up through a jump or a recovery (`renderReadSteer`) goes when that ends with nothing playing.
+  if (!strip.hidden && readingPosition() === "" && !readJumpPending && !readRecovering) {
+    strip.hidden = true;
+    renderReadTimeline();
+  }
+  const root = document.documentElement;
+  if (strip.hidden) root.removeAttribute("data-read-strip");
+  // Held through a jump, it says what it said: a held read's jump cues its block up held.
+  else if (nowPlaying !== null) root.setAttribute("data-read-strip", readingPaused() ? "paused" : "playing");
 }
 
 /** A read is playing or held, or moving to another of its blocks (`readJumpPending`). */
@@ -38411,6 +38468,8 @@ const READ_RECOVERY_WAITS_MS = [1000, 3000, 8000];
 function recoverRead(parts, from, wait) {
   // Every ticket minted before this may be as dead as the one that failed.
   forgetPreparedSpeech();
+  // `scrubber-full-width`: the strip stays up through the wait, as through a jump's.
+  readRecovering = true;
   // Stopped as a jump stops it: the media keys and the audio output stay with the read.
   readJumping = true;
   try {
@@ -38430,6 +38489,7 @@ function recoverRead(parts, from, wait) {
     if (ticket !== readingTicket || pendingRead !== id) return;
     readJumping = true;
     readJumpPending = true;
+    readRecovering = false;
     let attempt;
     try {
       attempt = readAloud(parts, from);
