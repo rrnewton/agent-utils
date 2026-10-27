@@ -67,6 +67,8 @@ content digest binding) and `_handoff_artifact_to_obj` output.
 (filename agreement, planned/created shapes, embedded records, finish
 phase/archive-id and optional evidence bundles). Other kinds still refuse.
 
-[muse watermelon] Slice 8 in progress: `parse-journal` also covers the
+[muse watermelon] Slice 8 landed (e47d3cfd): `parse-journal` also covers the
 legacy-validate-remove journal kind (exact fields, actor identity,
 coordinator authorization flag).
+
+[muse watermelon] State-format readers now cover config, ACTIVE, ARCHIVED, handoff sidecar, hold, and create/import/finish/legacy journals. Ownerless/absent journal kinds remain Python-only (filesystem-path input validation). Next: record these formats in validation/editions.json and take stock toward a composed read command.
