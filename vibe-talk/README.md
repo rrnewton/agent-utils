@@ -7127,7 +7127,7 @@ Oct 3"** — the day that column reaches back to ("Search replies before …" in
 **Enter** in the search field, a phone keyboard's Search key, does the same as a press. One press reads
 up to **five** older pages, starts no page that the last one's time says would end past **fifteen
 seconds**, and stops at the end of the page that brings **three** new matches. Meanwhile the button
-says **"Searching… 2 of 5 · Stop"**, and pressing it aborts the read on the wire. Every press is one
+says **"Fetching… 50 older messages · Stop"**, and pressing it aborts the read on the wire. Every press is one
 more search and nothing chains pages by itself; the button always says how far back the next one
 starts. Any change to the search, closing the right column's thread, leaving two columns, another
 channel or view, a reply's jump or a filter's own walk back ends a walk where it is, and only one runs
@@ -7137,14 +7137,36 @@ from; that read is not counted as one of the five.
 What a walk found is counted among messages **older than where it started**, so a message arriving
 live or a poll can neither stop it nor be reported as found, and in messages, as the count is: a
 combined row is every message it holds, so the count beside the field and the lines between matches
-add up. It is said once, under the button, until the search changes: *Found 3 in 2 pages (98
-messages), back to Sep 30.* A walk stopped over matches says what it read even when it found nothing
-more — *Stopped. Nothing more in 1 page (50 messages), back to Oct 2.*, or *Stopped before any older
-page was read.* — where it used to say nothing. The button holds still while the walk runs and the matches open directly
+add up. It is said once, under the button, until the search changes: *Found 3 more matches among 98
+older messages fetched from Slack, back to Sep 30, 2:15 PM.* A walk always says what it did — *None of
+the 50 older messages fetched from Slack, back to Oct 2, 4:10 PM, match.*, *Stopped before any older
+messages arrived.*, *Slack sent nothing older this time, though it says older messages exist.*, or
+*Could not fetch older messages from Slack: <the reason>.* — where it used to say nothing. The button holds still while the walk runs and the matches open directly
 under it, the line above the first saying how many unmatched messages it skips; scroll away while it
 reads and the message you scrolled to is kept where it is instead. With nothing matched,
-the sentence where the messages were says how far back that is: *Nothing in the 643 messages loaded so
-far, back to Sep 28, matches that search.*
+the sentence where the messages were says how many were searched, where, and how far back with no
+gaps (`#578 search-status-clarity`, below).
+
+`#578 search-status-clarity`. The owner, 2026-10-27: *"it shows me no hits and a button 'Search before
+October 25'. I press it and it does nothing for a while and then shows THE SAME button"*, and of
+*"Nothing in the 82 messages loaded so far"*: *"Is that a dense chronological history from time
+T0-present? Or just whatever random sparse set we have loaded?"* On Slack one step back of All takes
+ten to fifteen seconds (Main's page and up to ten threads' replies through the shim), so a press read
+one page; fifty more messages of a busy channel were of the same day, the button named the day alone,
+and over a list the search had emptied the walk said nothing. Now the button names the oldest message
+to the minute (*Search before Oct 25, 9:02 AM*), so every press that brings anything moves it, and
+every walk leaves a note. The sentence over an emptied list says *Searched 82 messages in this
+browser, a complete history back to Oct 26, 3:14 PM (no gaps), plus 4 scattered older ones. None
+match.* The stretch with no gaps is one the reads proved: the view's pages, each read from the cursor
+the one before handed over, and a newest read that reaches down to the newest message an earlier read
+carried. One that does not — the page was away while more than a page arrived — leaves the rows below
+it *scattered*. Rows saved on the device that no read has checked claim no stretch (*saved on this
+device, not yet checked for gaps*). In All on a channel with threads the claim is the top-level
+messages and their threads: *every top-level message back to …, and every reply in 20 of their 31
+threads*; All is whole only when it reaches the first message and holds every reply, and the notice
+under the button counts the threads on screen whose replies All has not loaded. The search runs in
+this browser; the server's search of its message cache and the chat services' own search are designed
+in `#521 server-side-search` and not built, so nothing says either ran.
 
 **Hide read steps aside while a search chooses rows**, on a chat service with threads, as Fold read
 does: an old match is read by definition, and a walk under Hide read would read pages and draw almost

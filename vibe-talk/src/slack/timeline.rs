@@ -752,9 +752,11 @@ impl HttpSlackClient {
             has_more: page.has_more,
             next_before: page.next_before,
             notice: bounded.then(|| {
+                // In threads and messages, not pages: `#578 search-status-clarity`.
                 format!(
-                    "Flat view includes replies for at most {FLAT_MAX_THREADS} threads per page and \
-                     the newest {FLAT_MAX_REPLIES} replies of each; open a thread to read all of it."
+                    "Some threads' replies are not in All: it brings the replies of the \
+                     {FLAT_MAX_THREADS} most active threads among each {limit} top-level messages, \
+                     and the newest {FLAT_MAX_REPLIES} of each; open a thread to read all of it."
                 )
             }),
             ..TimelinePage::default()
