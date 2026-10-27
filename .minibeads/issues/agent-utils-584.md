@@ -1,12 +1,13 @@
 ---
 title: 'thread-view-bookmark-chip: b and Shift+B in the Threads view say there are no bookmarks there'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-27T16:33:03.871911537+00:00
-updated_at: 2026-10-27T16:33:03.871911537+00:00
+updated_at: 2026-10-27T16:50:01.677031257+00:00
+closed_at: 2026-10-27T16:50:01.677031136+00:00
 ---
 
 # Description

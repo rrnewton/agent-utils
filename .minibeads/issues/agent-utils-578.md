@@ -1,13 +1,14 @@
 ---
 title: 'search-status-clarity: the search loading view says what was searched, where, and how far back with no gaps'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - search
 created_at: 2026-10-27T15:18:31.921931905+00:00
-updated_at: 2026-10-27T15:18:31.921931905+00:00
+updated_at: 2026-10-27T16:50:01.674820048+00:00
+closed_at: 2026-10-27T16:50:01.674819938+00:00
 ---
 
 # Description
