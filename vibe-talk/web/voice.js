@@ -29005,7 +29005,9 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
 }
 
 /** The words a server's notice that All left some threads' replies out begins with, then and now. */
-const BOUNDED_ALL_NOTICE = /^(Some threads' replies are not in All|Flat view includes replies)/;
+// The apostrophe is escaped: a bare one in a regular expression reads as an open quote to the page
+// suite's scan of this file's code outside its strings.
+const BOUNDED_ALL_NOTICE = /^(Some threads\x27 replies are not in All|Flat view includes replies)/;
 
 /**
  * What the notice under the step back says over All of a page the server says it bounded: in threads,
