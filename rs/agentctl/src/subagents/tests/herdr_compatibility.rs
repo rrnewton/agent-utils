@@ -231,7 +231,7 @@ fn herdr_093_muse_adoption_keeps_foreign_ownership_and_initial_runtime_anchors()
         let processed = agent::read_private_json(
             &fixture
                 .root
-                .join("registry/foreign/queue/processed/literal.json"),
+                .join("registry/agents/foreign/queue/processed/literal.json"),
         )
         .unwrap();
         assert_eq!(processed["delivery_state"], "processed");
@@ -297,7 +297,7 @@ fn herdr_093_muse_adoption_requires_process_and_terminal_even_when_native_sessio
                 error.to_string().contains("harness") || error.to_string().contains("terminal"),
                 "{failure}: {error}"
             );
-            assert!(!fixture.root.join("registry/foreign").exists());
+            assert!(!fixture.root.join("registry/agents/foreign").exists());
             no_input(&fixture);
         }
     }
@@ -316,7 +316,7 @@ fn herdr_093_muse_adoption_refuses_native_contradictions_and_duplicate_owners() 
         *fixture.client.session_override.lock().unwrap() =
             Some((pair.0.map(str::to_owned), pair.1.map(str::to_owned)));
         assert!(fixture.manager().adopt("foreign", options).is_err());
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
         no_input(&fixture);
     }
     let fixture = Fixture::new();
@@ -331,7 +331,7 @@ fn herdr_093_muse_adoption_refuses_native_contradictions_and_duplicate_owners() 
         .duplicate_session
         .store(true, Ordering::Relaxed);
     assert!(fixture.manager().adopt("foreign", options).is_err());
-    assert!(!fixture.root.join("registry/foreign").exists());
+    assert!(!fixture.root.join("registry/agents/foreign").exists());
     no_input(&fixture);
 }
 
@@ -359,7 +359,7 @@ fn herdr_093_muse_adoption_archives_failed_final_generation_without_touching_run
             error.to_string().contains("was not registered"),
             "{failure}: {error}"
         );
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
         let archived = fs::read_dir(fixture.root.join("registry/archive"))
             .unwrap()
             .next()
@@ -575,7 +575,7 @@ fn herdr_093_managed_codex_unknown_status_drains_with_saved_recipient_checks() {
     let document = agent::read_private_json(
         &fixture
             .root
-            .join("registry/worker/queue/processed/unknown.json"),
+            .join("registry/agents/worker/queue/processed/unknown.json"),
     )
     .unwrap();
     assert_eq!(document["delivery_state"], "processed");
@@ -638,7 +638,7 @@ fn herdr_093_managed_codex_unknown_readiness_cannot_replace_saved_recipient_or_c
             let document = agent::read_private_json(
                 &fixture
                     .root
-                    .join("registry/worker/queue/inbox/guarded.json"),
+                    .join("registry/agents/worker/queue/inbox/guarded.json"),
             )
             .unwrap();
             assert_eq!(document["delivery_attempts"], 0);

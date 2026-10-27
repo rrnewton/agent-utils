@@ -400,7 +400,7 @@ def test_unreadable_record_refuses_input_conservatively(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake, _pane = _started(tmp_path, monkeypatch)
-    broken = manager.registry / "broken"
+    broken = manager.registry / "agents" / "broken"
     broken.mkdir(mode=0o700)
     (broken / "agent.json").write_text("{", encoding="utf-8")
     with pytest.raises(AgentPending, match="cannot prove that pane ownership is unique"):
@@ -471,7 +471,7 @@ def test_anchor_migrates_a_nested_record_to_schema_1(
     from .test_herdr_subagents import _nested_v2_record
 
     manager, fake, pane = _started(tmp_path, monkeypatch)
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     flat = json.loads(path.read_text(encoding="utf-8"))
     for key in ("terminal_id", "harness_identity", "name_history"):
         flat.pop(key)

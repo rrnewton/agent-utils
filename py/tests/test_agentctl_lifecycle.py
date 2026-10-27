@@ -31,7 +31,7 @@ def test_start_holds_its_generation_lock_through_brief_and_returned_status(tmp_p
     original_info = fake.pane_info
 
     def info(pane: str) -> AgentPaneInfo:
-        descriptor = os.open(tmp_path / "registry/.worker.lock", os.O_RDONLY)
+        descriptor = os.open(tmp_path / "registry/locks/worker.lock", os.O_RDONLY)
         try:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -71,7 +71,7 @@ def test_start_session_change_leaves_launch_failed_record_stoppable(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     original_info = fake.pane_info
-    record_path = tmp_path / "registry/worker/agent.json"
+    record_path = tmp_path / "registry/agents/worker/agent.json"
 
     def info(pane: str) -> AgentPaneInfo:
         result = original_info(pane)
@@ -192,7 +192,7 @@ def test_managed_dead_stop_refuses_expanded_stopped_record_before_close(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     _pane, token = make_managed_dead(manager, fake, tmp_path)
-    active = manager.registry / "worker"
+    active = manager.registry / "agents" / "worker"
     record_path = active / "agent.json"
     document = json.loads(record_path.read_text())
     document["future_padding"] = ["x"] * 150_000
@@ -249,7 +249,7 @@ def test_managed_dead_stop_refuses_identity_changes_without_closing_or_archiving
                     starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1,
                 )
             elif change == "directory":
-                active = manager.registry / "worker"
+                active = manager.registry / "agents" / "worker"
                 displaced = manager.registry / ".worker-displaced"
                 if not displaced.exists():
                     active.rename(displaced)
@@ -257,7 +257,7 @@ def test_managed_dead_stop_refuses_identity_changes_without_closing_or_archiving
                     (active / "agent.json").write_bytes((displaced / "agent.json").read_bytes())
                     (active / "agent.json").chmod(0o600)
             else:
-                path = manager.registry / "worker" / "agent.json"
+                path = manager.registry / "agents" / "worker" / "agent.json"
                 document = json.loads(path.read_text())
                 document["token"] = "replacement-generation"
                 agent._atomic_json(str(path), document)
@@ -268,7 +268,7 @@ def test_managed_dead_stop_refuses_identity_changes_without_closing_or_archiving
         manager.stop("worker", expected_token=token)
 
     assert fake.closed == []
-    assert (manager.registry / "worker").is_dir()
+    assert (manager.registry / "agents" / "worker").is_dir()
     assert not list((manager.registry / "archive").glob("worker-*")) if (
         manager.registry / "archive"
     ).exists() else True
@@ -279,7 +279,7 @@ def test_managed_dead_stop_reproves_runtime_after_artifact_preparation(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     _pane, token = make_managed_dead(manager, fake, tmp_path)
-    record_path = manager.registry / "worker" / "agent.json"
+    record_path = manager.registry / "agents" / "worker" / "agent.json"
     original_record = record_path.read_bytes()
     original_atomic = ManagedAgents._atomic_snapshot_bytes
     changed = False
@@ -311,7 +311,7 @@ def test_managed_dead_stop_reproves_runtime_after_artifact_preparation(
     assert changed is True
     assert fake.closed == []
     assert record_path.read_bytes() == original_record
-    assert not (manager.registry / "worker" / "output.json").exists()
+    assert not (manager.registry / "agents" / "worker" / "output.json").exists()
     assert not list((manager.registry / "archive").glob("worker-*"))
 
 
@@ -321,7 +321,7 @@ def test_managed_dead_stop_rechecks_registry_after_artifact_preparation(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     _pane, token = make_managed_dead(manager, fake, tmp_path)
-    record_path = manager.registry / "worker" / "agent.json"
+    record_path = manager.registry / "agents" / "worker" / "agent.json"
     original_record = record_path.read_bytes()
     original_atomic = ManagedAgents._atomic_snapshot_bytes
     changed = False
@@ -343,14 +343,14 @@ def test_managed_dead_stop_rechecks_registry_after_artifact_preparation(
             agent._atomic_json(str(record_path), document)
         elif change == "directory":
             displaced = manager.registry / ".worker-original"
-            (manager.registry / "worker").rename(displaced)
-            (manager.registry / "worker").mkdir(mode=0o700)
-            replacement = manager.registry / "worker" / "agent.json"
+            (manager.registry / "agents" / "worker").rename(displaced)
+            (manager.registry / "agents" / "worker").mkdir(mode=0o700)
+            replacement = manager.registry / "agents" / "worker" / "agent.json"
             replacement.write_bytes((displaced / "agent.json").read_bytes())
             replacement.chmod(0o600)
         else:
-            output = manager.registry / "worker" / "output.json"
-            output.rename(manager.registry / "worker" / ".prepared-output")
+            output = manager.registry / "agents" / "worker" / "output.json"
+            output.rename(manager.registry / "agents" / "worker" / ".prepared-output")
             output.write_bytes(b"replacement output")
             output.chmod(0o600)
         return installed
@@ -369,15 +369,15 @@ def test_managed_dead_stop_rechecks_registry_after_artifact_preparation(
     if change == "record":
         assert json.loads(record_path.read_text())["goal"] == "replacement record"
         assert record_path.read_bytes() != original_record
-        assert not (manager.registry / "worker" / "output.json").exists()
+        assert not (manager.registry / "agents" / "worker" / "output.json").exists()
     elif change == "directory":
         displaced = manager.registry / ".worker-original"
         assert (displaced / "agent.json").read_bytes() == original_record
         assert not (displaced / "output.json").exists()
-        assert (manager.registry / "worker").is_dir()
+        assert (manager.registry / "agents" / "worker").is_dir()
     else:
         assert record_path.read_bytes() == original_record
-        assert (manager.registry / "worker" / "output.json").read_bytes() == (
+        assert (manager.registry / "agents" / "worker" / "output.json").read_bytes() == (
             b"replacement output"
         )
 
@@ -388,7 +388,7 @@ def test_managed_dead_stop_rechecks_registry_during_final_record_proof(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     _pane, token = make_managed_dead(manager, fake, tmp_path)
-    active = manager.registry / "worker"
+    active = manager.registry / "agents" / "worker"
     record_path = active / "agent.json"
     original_record = record_path.read_bytes()
     original_record_bytes = manager._record_bytes
@@ -445,7 +445,7 @@ def test_managed_dead_stop_rechecks_pane_after_final_record_proof(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     pane, token = make_managed_dead(manager, fake, tmp_path)
-    active = manager.registry / "worker"
+    active = manager.registry / "agents" / "worker"
     original_record_bytes = manager._record_bytes
     changed = False
 
@@ -496,7 +496,7 @@ def test_managed_dead_stop_rechecks_pane_after_final_shell_proof(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     pane, token = make_managed_dead(manager, fake, tmp_path)
-    active = manager.registry / "worker"
+    active = manager.registry / "agents" / "worker"
     original_shell_proof = fake.pane_idle_shell_identity
     changed = False
 
@@ -548,7 +548,7 @@ def test_managed_dead_stop_retries_after_close_result_is_uncertain(
     with pytest.raises(HerdrUnavailable, match="result loss after close"):
         manager.stop("worker", expected_token=token)
 
-    active = manager.registry / "worker"
+    active = manager.registry / "agents" / "worker"
     assert json.loads((active / "agent.json").read_text())["lifecycle"] == "running"
     assert not fake.presentations
     monkeypatch.setattr(fake, "close_pane", original_close)
@@ -589,7 +589,7 @@ def test_managed_dead_stop_preflights_archive_and_snapshot_failures_before_close
         with pytest.raises(AgentDeliveryError):
             manager.stop("worker", expected_token=token)
         assert fake.closed == []
-        assert (manager.registry / "worker").is_dir()
+        assert (manager.registry / "agents" / "worker").is_dir()
 
 
 def test_managed_dead_stop_refuses_stopping_record_without_prior_proof(
@@ -597,7 +597,7 @@ def test_managed_dead_stop_refuses_stopping_record_without_prior_proof(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     _pane, token = make_managed_dead(manager, fake, tmp_path)
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     document = json.loads(path.read_text())
     document["lifecycle"] = "stopping"
     agent._atomic_json(str(path), document)
@@ -614,7 +614,7 @@ def test_managed_dead_stop_refuses_crossed_mode_or_backend(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     _pane, token = make_managed_dead(manager, fake, tmp_path)
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     document = json.loads(path.read_text())
     document[field] = value
     agent._atomic_json(str(path), document)
@@ -645,7 +645,7 @@ def test_managed_dead_stop_rename_race_preserves_truthful_stopped_record(
     with pytest.raises(AgentDeliveryError, match="existing agent archive"):
         manager.stop("worker", expected_token=token)
 
-    active = manager.registry / "worker"
+    active = manager.registry / "agents" / "worker"
     assert fake.closed == ["w1:t1"]
     assert json.loads((active / "agent.json").read_text())["lifecycle"] == "stopped"
     assert (active / "output.json").is_file()
@@ -674,7 +674,7 @@ def test_managed_dead_stop_fsync_failure_attempts_both_and_leaves_one_complete_a
         manager.stop("worker", expected_token=token)
     destination = manager.registry / "archive" / f"worker-{token}"
     assert fake.closed == ["w1:t1"]
-    assert not (manager.registry / "worker").exists()
+    assert not (manager.registry / "agents" / "worker").exists()
     assert json.loads((destination / "agent.json").read_text())["lifecycle"] == "stopped"
     assert (destination / "output.json").is_file()
     assert calls[-2:] == ["published agent archive", "published agent registry"]
@@ -689,7 +689,7 @@ def test_directory_pin_rejects_validate_to_open_replacement(
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     prepare_legacy_dead(manager, fake, pane)
     if target_kind == "agent":
-        target = manager.registry / "foreign"
+        target = manager.registry / "agents" / "foreign"
     else:
         target = manager.registry / "archive"
         target.mkdir(mode=0o700)
@@ -732,7 +732,7 @@ def test_pinned_directory_recheck_refuses_postopen_permission_change(
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     prepare_legacy_dead(manager, fake, pane)
     if target_kind == "agent":
-        target = manager.registry / "foreign"
+        target = manager.registry / "agents" / "foreign"
         with manager._pinned_agent_directory("foreign") as pinned:
             target.chmod(0o755)
             with pytest.raises(AgentDeliveryError):
@@ -755,7 +755,7 @@ def test_atomic_snapshot_close_failure_is_delivery_and_retains_installed_output(
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     real_close = os.close
     injected = False
 
@@ -784,7 +784,7 @@ def test_atomic_snapshot_never_unlinks_reused_temp_name_after_install(
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     real_replace = os.replace
     reused: Path | None = None
 
@@ -836,7 +836,7 @@ def test_atomic_snapshot_reports_primary_and_cleanup_failures(
     assert raised.value.exit_code == 75
     assert "cannot write pinned registry artifact" in message
     assert "registry artifact cleanup failed" in message
-    assert not (manager.registry / "foreign" / "output.json").exists()
+    assert not (manager.registry / "agents" / "foreign" / "output.json").exists()
 
 
 @pytest.mark.parametrize("collision", ["file", "symlink"])
@@ -847,7 +847,7 @@ def test_atomic_snapshot_never_unlinks_unowned_staging_collision(
     prepare_legacy_dead(manager, fake, pane)
     nonce = "0" * 32
     temporary = (
-        manager.registry / "foreign"
+        manager.registry / "agents" / "foreign"
         / f".output.json-recovery-{os.getpid()}-{nonce}"
     )
     if collision == "file":
@@ -877,7 +877,7 @@ def test_atomic_snapshot_refuses_replaced_owned_staging_name_and_preserves_repla
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     held = active / ".held-original-staging"
     content = b'{"new":true}\n'
     real_write = os.write
@@ -914,7 +914,7 @@ def test_atomic_snapshot_reproves_installed_generation_and_preserves_new_temp_na
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     held = active / ".held-installed-output"
     content = b'{"new":true}\n'
     real_replace = os.replace
@@ -954,7 +954,7 @@ def test_legacy_recovery_never_restores_over_replaced_artifact_generations(
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, digest, raw = prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     prior = b'{"prior":true}\n'
     (active / "output.json").write_bytes(prior)
     (active / "output.json").chmod(0o600)
@@ -1019,7 +1019,7 @@ def test_managed_dead_preparation_never_restores_over_replaced_artifact_generati
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     _pane, token = make_managed_dead(manager, fake, tmp_path)
-    active = manager.registry / "worker"
+    active = manager.registry / "agents" / "worker"
     prior = b'{"prior":true}\n'
     (active / "output.json").write_bytes(prior)
     (active / "output.json").chmod(0o600)
@@ -1079,7 +1079,7 @@ def test_publication_reconciles_successful_rename_reported_as_error(
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, _digest, raw = prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     (active / "output.json").write_bytes(b'{"prior":true}\n')
     (active / "output.json").chmod(0o600)
     archive = manager.registry / "archive"
@@ -1126,7 +1126,7 @@ def test_publication_reconciles_late_destination_collision_and_restores_output(
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, _digest, raw = prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     prior = b'{"prior":true}\n'
     (active / "output.json").write_bytes(prior)
     (active / "output.json").chmod(0o600)
@@ -1159,7 +1159,7 @@ def test_publication_parent_close_failure_retains_published_output(
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, _digest, raw = prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     (active / "output.json").write_bytes(b'{"prior":true}\n')
     (active / "output.json").chmod(0o600)
     archive = manager.registry / "archive"
@@ -1211,7 +1211,7 @@ def test_publication_refuses_reappeared_source_without_mutating_published_archiv
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, _digest, raw = prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     archive = manager.registry / "archive"
     archive.mkdir(mode=0o700)
     destination = archive / f"foreign-{token}"
@@ -1282,7 +1282,7 @@ def test_publication_refuses_postrename_permission_change(
                 before_publish=lambda: None,
             )
 
-    assert not (manager.registry / "foreign").exists()
+    assert not (manager.registry / "agents" / "foreign").exists()
     assert stat.S_IMODE(destination.stat().st_mode) == 0o755
     assert json.loads((destination / "output.json").read_text())["text"] == (
         "new retained output"
@@ -1324,9 +1324,9 @@ def test_publication_maps_postrename_stat_failure_to_delivery_and_rolls_back(
             )
 
     assert injected is True
-    assert (manager.registry / "foreign").is_dir()
+    assert (manager.registry / "agents" / "foreign").is_dir()
     assert not destination.exists()
-    assert not (manager.registry / "foreign" / "output.json").exists()
+    assert not (manager.registry / "agents" / "foreign" / "output.json").exists()
 
 
 def test_publication_never_promotes_replaced_archive_entry_during_rollback(
@@ -1336,7 +1336,7 @@ def test_publication_never_promotes_replaced_archive_entry_during_rollback(
     token, _digest, raw = prepare_legacy_dead(manager, fake, pane)
     archive = manager.registry / "archive"
     archive.mkdir(mode=0o700)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     destination = archive / f"foreign-{token}"
     displaced = archive / ".held-original"
     real_rename = subagents_module._rename_directory_noreplace_at
@@ -1380,7 +1380,7 @@ def test_publication_reproves_generation_after_inverse_rollback(
     token, _digest, raw = prepare_legacy_dead(manager, fake, pane)
     archive = manager.registry / "archive"
     archive.mkdir(mode=0o700)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     destination = archive / f"foreign-{token}"
     displaced = manager.registry / ".foreign-after-rollback"
     real_rename = subagents_module._rename_directory_noreplace_at
@@ -1422,7 +1422,7 @@ def test_publication_refuses_replaced_archive_parent_and_rolls_back(
 ) -> None:
     manager, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, _digest, raw = prepare_legacy_dead(manager, fake, pane)
-    active = manager.registry / "foreign"
+    active = manager.registry / "agents" / "foreign"
     archive = manager.registry / "archive"
     archive.mkdir(mode=0o700)
     displaced_archive = manager.registry / ".archive-original"
@@ -1503,10 +1503,10 @@ def test_publication_reports_each_rollback_fsync_failure(
 
     assert injected is True
     assert calls[-2:] == ["agent archive rollback", "agent registry rollback"]
-    assert (manager.registry / "foreign").is_dir()
+    assert (manager.registry / "agents" / "foreign").is_dir()
     assert not destination.exists()
     assert json.loads(
-        (manager.registry / "foreign" / "output.json").read_text()
+        (manager.registry / "agents" / "foreign" / "output.json").read_text()
     )["text"] == "new retained output"
 
 
@@ -1526,7 +1526,7 @@ def test_managed_dead_publication_refuses_postproof_directory_swap(
         if not swapped and destination_name.startswith("worker-"):
             swapped = True
             displaced = manager.registry / ".worker-original"
-            active = manager.registry / source_name
+            active = manager.registry / "agents" / source_name
             active.rename(displaced)
             active.mkdir(mode=0o700)
             (active / "agent.json").write_bytes((displaced / "agent.json").read_bytes())
@@ -1539,7 +1539,7 @@ def test_managed_dead_publication_refuses_postproof_directory_swap(
     destination = manager.registry / "archive" / f"worker-{token}"
     displaced = manager.registry / ".worker-original"
     assert fake.closed == ["w1:t1"]
-    assert not (manager.registry / "worker").exists()
+    assert not (manager.registry / "agents" / "worker").exists()
     assert (destination / "agent.json").is_file()
     assert json.loads((destination / "agent.json").read_text())["lifecycle"] == "stopped"
     assert (displaced / "agent.json").is_file()
@@ -1612,7 +1612,7 @@ def test_explicit_send_serializes_id_reservation_against_delivery_transitions(tm
 def test_unknown_metadata_survives_ownership_and_session_updates_without_a_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, _ = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
-    path = tmp_path / "registry/worker/agent.json"
+    path = tmp_path / "registry/agents/worker/agent.json"
     record = json.loads(path.read_text())
     record["future_metadata"] = {"nested": [1, "preserve"]}
     agent._atomic_json(str(path), record)
@@ -2416,7 +2416,7 @@ def test_stop_refusal_managed_dead_command_is_quoted_and_bound_to_failed_generat
     selected = tmp_path / "registry space's $(literal)"
     manager.registry.rename(selected)
     manager.registry = selected
-    record_path = selected / "worker/agent.json"
+    record_path = selected / "agents/worker/agent.json"
     original = record_path.read_bytes()
     binary = "herdr path's $(literal); --literal"
     run = _stop_cli(edition, manager, monkeypatch)
@@ -2466,9 +2466,9 @@ def test_stop_refusal_changed_pinned_snapshot_does_not_borrow_replacement_token(
         nonlocal changed
         if not changed:
             changed = True
-            document = json.loads((manager.registry / "worker/agent.json").read_text())
+            document = json.loads((manager.registry / "agents/worker/agent.json").read_text())
             document["token"] = "replacement-during-refusal"
-            agent._atomic_json(str(manager.registry / "worker/agent.json"), document)
+            agent._atomic_json(str(manager.registry / "agents/worker/agent.json"), document)
         return original(instance, pinned, expected_token=expected_token)
 
     monkeypatch.setattr(ManagedAgents, "_managed_record_snapshot", replace_before_snapshot)
@@ -2486,7 +2486,7 @@ def test_stop_refusal_legacy_adoption_command_binds_exact_raw_digest(
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     token, digest, original = prepare_legacy_dead(sessions, fake, pane)
     run = _stop_cli(edition, sessions, monkeypatch)
-    record_path = sessions.registry / "foreign/agent.json"
+    record_path = sessions.registry / "agents/foreign/agent.json"
     presentation = list(fake.presentations)
 
     assert run(["--registry", str(sessions.registry), "stop", "foreign"]) == 75
@@ -2519,7 +2519,7 @@ def test_stop_refusal_ineligible_legacy_adoption_uses_doctor_and_preserves_statu
 ) -> None:
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     prepare_legacy_dead(sessions, fake, pane)
-    path = sessions.registry / "foreign/agent.json"
+    path = sessions.registry / "agents/foreign/agent.json"
     if case == "null":
         document = json.loads(path.read_text())
         document["foreign_shell_identity"] = None
@@ -2556,7 +2556,7 @@ def test_stop_refusal_corrupt_move_intent_has_readonly_advice_and_no_inline_muta
     manager.start("worker", cwd=str(tmp_path))
     record = manager.get("worker")
     manager._write_move_intent(record, "w-project")
-    path = manager.registry / "worker/move.json"
+    path = manager.registry / "agents/worker/move.json"
     if case == "unreadable":
         path.write_bytes(b"{")
     elif case == "invalid":
@@ -2774,3 +2774,136 @@ def test_revive_retry_rechecks_native_uniqueness_in_other_workspaces(
     with pytest.raises(AgentDeliveryError):
         manager.revive("worker", expected_token=old.token)
     assert registry_bytes(manager.registry) == before and len(fake.launched) == 2 and fake.closed == []
+
+
+# Registry layout 2 (#593 registry-agents-subdir).
+
+from agentctl import registry_layout  # noqa: E402
+
+
+def _layout_one(registry: Path, *names: str) -> None:
+    registry.mkdir(mode=0o700, exist_ok=True)
+    for name in names:
+        directory = registry / name
+        directory.mkdir(mode=0o700)
+        (directory / "agent.json").write_text(json.dumps({"name": name}), encoding="utf-8")
+        for lock in (f".{name}.lock", f".{name}.rank.lock"):
+            os.close(agent._open_private_lock(str(registry / lock), "test lock"))
+
+
+def test_layout_migration_moves_idle_agents_once_and_keeps_fixed_items(tmp_path: Path) -> None:
+    registry = tmp_path / "registry"
+    _layout_one(registry, "alpha", "beta")
+    (registry / "profiles.json").write_text("{}", encoding="utf-8")
+    for fixed in (".identity.lock", ".coordinator.lock", ".gone.lock"):
+        os.close(agent._open_private_lock(str(registry / fixed), "test lock"))
+    dry = registry_layout.migrate(registry, apply=False, wait=0)
+    assert dry["would_move"] == ["alpha", "beta"] and dry["would_remove_lock_files"] == 5
+    assert (registry / "alpha/agent.json").is_file()
+    first = registry_layout.migrate(registry, apply=True, wait=0)
+    assert (first["layout_before"], first["layout"]) == ("1", "2")
+    assert first["moved"] == ["alpha", "beta"] and first["removed_lock_files"] == 5
+    assert sorted(path.name for path in registry.iterdir()) == [
+        ".coordinator.lock", ".identity.lock", ".renames", "agents", "locks", "profiles.json",
+    ]
+    assert [path.name for path in (registry / ".renames").iterdir()] == [registry_layout.RENAMES_TRIPWIRE]
+    assert registry_layout.is_tripwire(registry / "agents/agent.json")
+    second = registry_layout.migrate(registry, apply=True, wait=0)
+    assert second["moved"] == [] and second["removed_lock_files"] == 0
+    assert registry_layout.auto_migrate(registry) is None
+
+
+def test_layout_migration_leaves_busy_self_named_and_conflicting_agents(tmp_path: Path) -> None:
+    registry = tmp_path / "registry"
+    _layout_one(registry, "busy", "runner", "twice", "idle")
+    (registry / "runner/agent.json").write_text(
+        json.dumps({"name": "runner", "runtime_home": str(registry / "runner/runtime")}), encoding="utf-8")
+    registry_layout.prepare(registry)
+    (registry / "agents/twice").mkdir(mode=0o700)
+    held = agent._open_private_lock(str(registry / ".busy.lock"), "test lock")
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        report = registry_layout.migrate(registry, apply=True, wait=0)
+    finally:
+        os.close(held)
+    assert report["moved"] == ["idle"] and report["conflicts"] == ["twice"]
+    reasons = {row["name"]: row["reason"] for row in cast(list[dict[str, str]], report["left"])}
+    assert reasons["busy"] == "its lifecycle lock is busy"
+    assert "runtime home" in reasons["runner"]
+    assert report["layout"] == "mixed"
+    notice = registry_layout.notice(report)
+    assert notice is not None and "moved 1 agent(s)" in notice and "left 2" in notice
+    with pytest.raises(AgentDeliveryError, match="both registry layouts"):
+        registry_layout.directory(registry, "twice")
+    assert registry_layout.migrate(registry, apply=True, wait=0)["moved"] == ["busy"]
+
+
+def test_auto_migration_can_be_turned_off_and_a_stale_lock_is_retaken(tmp_path: Path) -> None:
+    registry = tmp_path / "registry"
+    _layout_one(registry, "alpha")
+    assert registry_layout.auto_migrate(
+        registry, lambda name: "0" if name == "AGENTCTL_LAYOUT_AUTO_MIGRATE" else None) is None
+    path, _rank = registry_layout.lock_paths(registry, "alpha", registry_layout.LEGACY)
+    descriptor = agent._open_private_lock(str(path), "test lock")
+    try:
+        assert registry_layout.lock_still_current(registry, "alpha", registry_layout.LEGACY, descriptor, path)
+        notice = registry_layout.auto_migrate(registry, lambda _name: None)
+        assert notice is not None and "moved 1 agent(s)" in notice
+        assert not registry_layout.lock_still_current(registry, "alpha", registry_layout.LEGACY, descriptor, path)
+    finally:
+        os.close(descriptor)
+    assert registry_layout.locate(registry, "alpha") == registry_layout.CURRENT
+
+
+def test_a_build_older_than_layout_two_fails_closed_on_the_tripwire(tmp_path: Path) -> None:
+    """Layout-1 builds read every name-shaped entry as an agent and refuse a record that is not
+    a JSON object when they prove pane ownership; the tripwire is exactly such a record."""
+    registry = tmp_path / "registry"
+    _layout_one(registry, "alpha")
+    registry_layout.migrate(registry, apply=True, wait=0)
+    names = [path.name for path in registry.iterdir() if subagents_module._NAME.fullmatch(path.name)
+             and path.name != "archive"]
+    assert sorted(names) == ["agents", "locks"]
+    document = json.loads((registry / "agents/agent.json").read_text(encoding="utf-8"))
+    assert not isinstance(document, dict)
+
+
+def test_new_agents_and_renames_use_layout_two(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    assert (manager.registry / "agents/worker/agent.json").is_file()
+    assert (manager.registry / "locks/worker.lock").is_file()
+    assert not (manager.registry / "worker").exists()
+    assert not (manager.registry / ".worker.lock").exists()
+    with pytest.raises(AgentDeliveryError, match="reserved"):
+        manager.start("locks", cwd=str(tmp_path), harness="codex")
+
+
+def test_layout_migration_leaves_a_wrapper_held_agent_and_moves_an_identity_agent(tmp_path: Path) -> None:
+    registry = tmp_path / "registry"
+    _layout_one(registry, "served", "identity")
+    held = agent._open_private_lock(str(registry / "served/headless.lock"), "test lock")
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        report = registry_layout.migrate(registry, apply=True, wait=0)
+    finally:
+        os.close(held)
+    assert report["moved"] == ["identity"]
+    left = cast(list[dict[str, str]], report["left"])
+    assert left[0]["name"] == "served" and left[0]["reason"].startswith("in use by process")
+    assert (registry / ".identity.lock").exists()
+    assert registry_layout.migrate(registry, apply=True, wait=0)["moved"] == ["served"]
+
+
+def test_a_stray_left_by_an_older_queue_writer_is_reported_not_moved(tmp_path: Path) -> None:
+    registry = tmp_path / "registry"
+    _layout_one(registry, "coordinator")
+    registry_layout.migrate(registry, apply=True, wait=0)
+    (registry / "coordinator/queue/inbox").mkdir(parents=True)
+    assert registry_layout.locate(registry, "coordinator") == registry_layout.CURRENT
+    report = registry_layout.migrate(registry, apply=True, wait=0)
+    assert (report["strays"], report["conflicts"], report["moved"]) == (["coordinator"], [], [])
+    assert registry_layout.auto_migrate(registry, lambda _name: None) is None
+    (registry / "agents/agent.json").write_text('{"name": "agents"}', encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="named 'agents'"):
+        registry_layout.prepare(registry)

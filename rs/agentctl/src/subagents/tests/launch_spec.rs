@@ -205,7 +205,7 @@ fn revive_refuses_a_spec_whose_program_is_not_the_harness() {
 fn record_with_a_malformed_spec_is_refused() {
     let fixture = Fixture::new();
     fixture.start(None);
-    let path = fixture.root.join("registry/worker/agent.json");
+    let path = fixture.root.join("registry/agents/worker/agent.json");
     let mut document = agent::read_private_json(&path).unwrap();
     document["launch_spec"]["argv"] = json!(["", "x"]);
     agent::atomic_json(&path, &document).unwrap();

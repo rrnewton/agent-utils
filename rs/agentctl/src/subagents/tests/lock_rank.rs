@@ -18,6 +18,19 @@ impl agent::AgentRuntime for Paced {
     }
 }
 
+/// Wait (at most 30 s) until `count` senders wait for `worker`'s lifecycle lock.
+fn waiters_reach(registry: &Path, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while crate::lock_wait::contention(registry, "worker")["waiters"]
+        .as_array()
+        .map_or(0, Vec::len)
+        < count
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn a_priority_manager_takes_a_contended_lifecycle_lock_first_and_waiters_are_visible() {
     let fixture = Fixture::new();
@@ -43,7 +56,8 @@ fn a_priority_manager_takes_a_contended_lifecycle_lock_first_and_waiters_are_vis
                 std::thread::sleep(Duration::from_millis(30));
             });
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // Wait until every ordinary sender is visibly waiting, however loaded the host is.
+        waiters_reach(&registry, 3);
         let (fixture, order) = (&fixture, &order);
         scope.spawn(move || {
             let slow = Paced {
@@ -57,7 +71,7 @@ fn a_priority_manager_takes_a_contended_lifecycle_lock_first_and_waiters_are_vis
             order.lock().unwrap().push("bridge");
             std::thread::sleep(Duration::from_millis(30));
         });
-        std::thread::sleep(Duration::from_millis(125));
+        waiters_reach(&registry, 4);
 
         let report = crate::lock_wait::contention(&registry, "worker");
         let waiters = report["waiters"].as_array().expect("waiters");

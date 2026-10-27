@@ -140,7 +140,9 @@ fn options(fixture: &Fixture, record: &AgentRecord) -> StopOptions {
         expected_token: Some(record.token.clone()),
         expected_record_sha256: Some(format!(
             "{:x}",
-            Sha256::digest(fs::read(fixture.root.join("registry/foreign/agent.json")).unwrap())
+            Sha256::digest(
+                fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap()
+            )
         )),
         retire_dead_adoption: true,
         ..StopOptions::default()
@@ -182,7 +184,7 @@ fn artifacts(root: &Path) -> ArtifactSnapshot {
 #[test]
 fn dead_adoption_retirement_preserves_every_original_artifact_without_server_calls() {
     let (fixture, record) = adopted();
-    let directory = fixture.root.join("registry/foreign");
+    let directory = fixture.root.join("registry/agents/foreign");
     let path = directory.join("agent.json");
     let mut document = agent::read_private_json(&path).unwrap();
     document["owner_extension"] = json!({"number":0.10960662360346242,"literal":"preserve"});
@@ -277,7 +279,7 @@ fn dead_adoption_retirement_preserves_every_original_artifact_without_server_cal
 #[test]
 fn dead_adoption_retirement_keeps_a_missing_queue_absent() {
     let (fixture, record) = adopted();
-    let directory = fixture.root.join("registry/foreign");
+    let directory = fixture.root.join("registry/agents/foreign");
     let before = artifacts(&directory);
     let client = OfflineClient::new(record.harness_anchor().unwrap(), &[ProcessLiveness::Dead]);
     let result = offline_manager(&fixture, &client)
@@ -298,7 +300,7 @@ fn dead_adoption_retirement_refuses_live_unknown_and_changed_final_death_proofs(
         vec![ProcessLiveness::Dead, ProcessLiveness::Unknown],
     ] {
         let (fixture, record) = adopted();
-        let path = fixture.root.join("registry/foreign/agent.json");
+        let path = fixture.root.join("registry/agents/foreign/agent.json");
         let raw = fs::read(&path).unwrap();
         let client = OfflineClient::new(record.harness_anchor().unwrap(), &states);
         let failure = offline_manager(&fixture, &client)
@@ -332,7 +334,7 @@ fn dead_adoption_retirement_requires_the_exact_token_raw_digest_and_selector() {
         "cloud-halt",
     ] {
         let (fixture, record) = adopted();
-        let path = fixture.root.join("registry/foreign/agent.json");
+        let path = fixture.root.join("registry/agents/foreign/agent.json");
         let raw = fs::read(&path).unwrap();
         let mut assertions = options(&fixture, &record);
         match case {
@@ -374,7 +376,7 @@ fn dead_adoption_retirement_never_backfills_a_missing_or_obsolete_pin() {
         "stopped",
     ] {
         let (fixture, record) = adopted();
-        let path = fixture.root.join("registry/foreign/agent.json");
+        let path = fixture.root.join("registry/agents/foreign/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         match case {
             "missing-pin" => document["harness_identity"] = Value::Null,
@@ -444,7 +446,7 @@ fn dead_adoption_retirement_refuses_a_valid_cloud_record_before_any_control_call
         loaded, record,
         "the test must exercise a valid parsed cloud record"
     );
-    let path = fixture.root.join("registry/foreign/agent.json");
+    let path = fixture.root.join("registry/agents/foreign/agent.json");
     let raw = fs::read(&path).unwrap();
     let client = OfflineClient::new(&old_pin, &[ProcessLiveness::Dead]);
     let manager = offline_manager(&fixture, &client).with_cloud_tools(CloudTools {
@@ -479,7 +481,7 @@ fn dead_adoption_retirement_refuses_a_valid_cloud_record_before_any_control_call
 fn dead_adoption_advice_is_captured_before_the_first_failing_runtime_probe() {
     let (fixture, record) = adopted();
     let assertions = options(&fixture, &record);
-    let path = fixture.root.join("registry/foreign/agent.json");
+    let path = fixture.root.join("registry/agents/foreign/agent.json");
     let original = fs::read(&path).unwrap();
     let client = OfflineClient::new(record.harness_anchor().unwrap(), &[ProcessLiveness::Dead]);
     *client.probe_hook.lock().unwrap() = Some(Box::new({
@@ -528,7 +530,7 @@ fn dead_adoption_advice_does_not_replace_a_runtime_error_when_capture_is_unprove
         "lock-public",
     ] {
         let (fixture, record) = adopted();
-        let directory = fixture.root.join("registry/foreign");
+        let directory = fixture.root.join("registry/agents/foreign");
         let path = directory.join("agent.json");
         match case {
             "record-hardlink" => fs::hard_link(&path, fixture.root.join("record-link")).unwrap(),
@@ -579,7 +581,7 @@ fn dead_adoption_retirement_rechecks_raw_file_directory_queue_and_lock_generatio
         "lock-replacement",
     ] {
         let (fixture, record) = adopted();
-        let directory = fixture.root.join("registry/foreign");
+        let directory = fixture.root.join("registry/agents/foreign");
         let path = directory.join("agent.json");
         let original = fs::read(&path).unwrap();
         if matches!(case, "queue-replacement" | "lock-replacement") {
@@ -666,7 +668,7 @@ fn dead_adoption_retirement_rechecks_raw_file_directory_queue_and_lock_generatio
 fn dead_adoption_retirement_rechecks_mutations_during_the_final_kernel_proof() {
     for case in ["record", "queue", "lock"] {
         let (fixture, record) = adopted();
-        let directory = fixture.root.join("registry/foreign");
+        let directory = fixture.root.join("registry/agents/foreign");
         let path = directory.join("agent.json");
         let raw = fs::read(&path).unwrap();
         agent::enqueue(&directory.join("queue"), "retained", Some("retained")).unwrap();
@@ -731,7 +733,10 @@ fn dead_adoption_retirement_refuses_an_existing_archive_and_preserves_it() {
         .stop_with_options("foreign", options(&fixture, &record))
         .unwrap_err();
     assert_eq!(artifacts(&archive), before);
-    assert!(fixture.root.join("registry/foreign/agent.json").is_file());
+    assert!(fixture
+        .root
+        .join("registry/agents/foreign/agent.json")
+        .is_file());
     assert_eq!(client.rpc_calls.load(Ordering::Relaxed), 0);
 }
 
@@ -759,7 +764,7 @@ fn dead_adoption_retirement_preserves_a_late_archive_collision() {
             }
         }),
     ));
-    let directory = fixture.root.join("registry/foreign");
+    let directory = fixture.root.join("registry/agents/foreign");
     let before = artifacts(&directory);
     let failure = offline_manager(&fixture, &client)
         .advised_stop_with_options("foreign", options(&fixture, &record))
@@ -778,7 +783,7 @@ fn dead_adoption_retirement_preserves_a_late_archive_collision() {
 fn dead_adoption_retirement_holds_all_authority_locks_before_the_kernel_proof() {
     let (fixture, record) = adopted();
     agent::enqueue(
-        &fixture.root.join("registry/foreign/queue"),
+        &fixture.root.join("registry/agents/foreign/queue"),
         "retained",
         Some("retained"),
     )
@@ -790,10 +795,10 @@ fn dead_adoption_retirement_holds_all_authority_locks_before_the_kernel_proof() 
             let registry = fixture.root.join("registry");
             move || {
                 for suffix in [
-                    ".foreign.lock",
+                    "locks/foreign.lock",
                     ".identity.lock",
-                    "foreign/queue/.delivery.lock",
-                    "foreign/queue/.binding.lock",
+                    "agents/foreign/queue/.delivery.lock",
+                    "agents/foreign/queue/.binding.lock",
                 ] {
                     let file = agent::open_private_lock(
                         &registry.join(suffix),
@@ -817,7 +822,7 @@ fn dead_adoption_retirement_holds_all_authority_locks_before_the_kernel_proof() 
 #[test]
 fn dead_adoption_advice_rejects_changes_during_its_final_death_proof() {
     let (fixture, record) = adopted();
-    let path = fixture.root.join("registry/foreign/agent.json");
+    let path = fixture.root.join("registry/agents/foreign/agent.json");
     let original = fs::read(&path).unwrap();
     let client = OfflineClient::new(record.harness_anchor().unwrap(), &[ProcessLiveness::Dead]);
     *client.proof_hook.lock().unwrap() = Some((
@@ -857,7 +862,7 @@ fn dead_adoption_retirement_refuses_unsafe_private_record_and_queue_authority() 
         "lock-fifo",
     ] {
         let (fixture, record) = adopted();
-        let directory = fixture.root.join("registry/foreign");
+        let directory = fixture.root.join("registry/agents/foreign");
         let path = directory.join("agent.json");
         let assertions = options(&fixture, &record);
         let raw = fs::read(&path).unwrap();
@@ -964,7 +969,10 @@ fn dead_adoption_retirement_respects_pending_name_and_move_reservations() {
         );
         assert_eq!(client.rpc_calls.load(Ordering::Relaxed), 0, "{operation}");
         assert!(
-            fixture.root.join("registry/foreign/agent.json").is_file(),
+            fixture
+                .root
+                .join("registry/agents/foreign/agent.json")
+                .is_file(),
             "{operation}"
         );
     }
@@ -993,7 +1001,7 @@ fn dead_adoption_retirement_does_not_change_ordinary_live_foreign_stop() {
 #[test]
 fn dead_adoption_supplemental_capture_failure_keeps_ordinary_foreign_stop_success() {
     let (fixture, _) = adopted();
-    let queue = fixture.root.join("registry/foreign/queue");
+    let queue = fixture.root.join("registry/agents/foreign/queue");
     agent::enqueue(&queue, "retained", Some("retained")).unwrap();
     fs::set_permissions(
         queue.join(".delivery.lock"),
@@ -1085,7 +1093,7 @@ fn dead_adoption_retirement_uses_kernel_death_with_the_control_executable_absent
     let client =
         HerdrClient::with_executable("direct", &fixture.root.join("absent-herdr")).unwrap();
     let manager = ManagedAgents::new(&client, &fixture.root.join("registry")).unwrap();
-    let path = fixture.root.join("registry/foreign/agent.json");
+    let path = fixture.root.join("registry/agents/foreign/agent.json");
     let raw = fs::read(&path).unwrap();
     let error = manager
         .stop_with_options("foreign", options(&fixture, &record))

@@ -15,11 +15,11 @@
 //! in its registry directory beside the record:
 //!
 //! ```text
-//! <registry>/<agent>/agent.json      the record
-//! <registry>/<agent>/queue/          the durable queue (inbox.v2 lane); only the wrapper drains it
-//! <registry>/<agent>/events/         the event log
-//! <registry>/<agent>/control.sock    the wrapper's control socket, while it runs
-//! <registry>/<agent>/headless.lock   held by the running wrapper
+//! <registry>/agents/<agent>/agent.json      the record
+//! <registry>/agents/<agent>/queue/          the durable queue (inbox.v2 lane); only the wrapper drains it
+//! <registry>/agents/<agent>/events/         the event log
+//! <registry>/agents/<agent>/control.sock    the wrapper's control socket, while it runs
+//! <registry>/agents/<agent>/headless.lock   held by the running wrapper
 //! ```
 
 pub mod claude;

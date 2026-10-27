@@ -2643,14 +2643,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
         screen: Option<String>,
         proc_view: &crate::work_state::PassProc,
     ) -> Observation {
+        let directory = || {
+            agent_queue::registry::directory(&self.registry, &name)
+                .unwrap_or_else(|_| agent_queue::registry::current_directory(&self.registry, &name))
+        };
         let queue = row["queue"]
             .as_str()
-            .map_or_else(|| self.registry.join(&name).join("queue"), PathBuf::from);
+            .map_or_else(|| directory().join("queue"), PathBuf::from);
         let now = SystemClock.now();
         let headless =
             (row["adapter"].as_str() == Some(crate::headless::ADAPTER) && !gone).then(|| {
                 let events = row["event_log"].as_str().map_or_else(
-                    || crate::headless::events::directory(&self.registry.join(&name)),
+                    || crate::headless::events::directory(&directory()),
                     PathBuf::from,
                 );
                 crate::headless::watch::read(&events).unwrap_or_default()

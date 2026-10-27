@@ -719,7 +719,11 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
         unlock(lock);
         return None;
     }
-    let queue_dir = PathBuf::from(target.get("queue_dir").and_then(Value::as_str)?);
+    // A queue recorded before its registry moved to layout 2 is found where it is now (#593
+    // registry-agents-subdir).
+    let queue_dir = agent_queue::registry::relocated(&PathBuf::from(
+        target.get("queue_dir").and_then(Value::as_str)?,
+    ));
     let queue_state = agent_queue::queue::message_state(&queue_dir, id)
         .ok()
         .flatten();

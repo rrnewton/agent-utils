@@ -258,10 +258,15 @@ def scan_muse(host: str, root: Path) -> list[Session]:
 
 
 def load_registry(host: str, registry: Path) -> list[RegistryAgent]:
-    """Every agent record in an agent manager's registry, live and archived."""
+    """Every agent record in an agent manager's registry, live and archived.
+
+    Live records are read from both registry layouts, ``agents/<name>/`` and the older
+    ``<name>/``; the layout's tripwire ``agents/agent.json`` is not a record object and is skipped.
+    """
 
     agents = []
-    for path in sorted([*registry.glob("*/agent.json"), *registry.glob("archive/**/agent.json")]):
+    for path in sorted([*registry.glob("*/agent.json"), *registry.glob("agents/*/agent.json"),
+                        *registry.glob("archive/**/agent.json")]):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
@@ -297,7 +302,8 @@ def load_queue(host: str, registry: Path) -> list[tuple[str, str, float]]:
 
     messages = []
     for path in sorted(
-        [*registry.glob("*/queue/*/*.json"), *registry.glob("archive/**/queue/*/*.json")]
+        [*registry.glob("*/queue/*/*.json"), *registry.glob("agents/*/queue/*/*.json"),
+         *registry.glob("archive/**/queue/*/*.json")]
     ):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))

@@ -212,7 +212,7 @@ fn restore_dry_run_changes_nothing_and_reads_slot_warnings() {
     let host = ScriptedHost::new();
     let config = config(&fixture, None);
     let registry = fixture.root.join("registry");
-    let before = fs::read(registry.join("lane/agent.json")).unwrap();
+    let before = fs::read(registry.join("agents/lane/agent.json")).unwrap();
     let report = restore(
         &fixture.client,
         &registry,
@@ -228,7 +228,10 @@ fn restore_dry_run_changes_nothing_and_reads_slot_warnings() {
     assert_eq!(report["complete"], false);
     assert_eq!(report["would_complete"], true);
     assert!(host.commands().is_empty());
-    assert_eq!(fs::read(registry.join("lane/agent.json")).unwrap(), before);
+    assert_eq!(
+        fs::read(registry.join("agents/lane/agent.json")).unwrap(),
+        before
+    );
     assert!(!fixture.root.join("reports").exists());
 
     host.answer(

@@ -482,7 +482,8 @@ pub(super) fn pending_claim_records(registry: &Path) -> Result<Vec<AgentRecord>>
         let old_path = if archived {
             archive
         } else {
-            registry.join(&journal.name)
+            agent_queue::registry::directory(registry, &journal.name)
+                .map_err(|error| fail(error.to_string()))?
         };
         let (old_directory, old, old_bytes) = read_record_at(&old_path, &journal.name)?;
         let old_digest = digest(&old_bytes);
@@ -503,7 +504,10 @@ pub(super) fn pending_claim_records(registry: &Path) -> Result<Vec<AgentRecord>>
         result.push(old);
         let candidate = operation_directory(registry, &journal).join("new");
         let candidate = match fs::symlink_metadata(&candidate) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => registry.join(&journal.name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                agent_queue::registry::directory(registry, &journal.name)
+                    .map_err(|error| fail(error.to_string()))?
+            }
             Err(error) => return Err(fail(error.to_string())),
             Ok(_) => candidate,
         };
@@ -1894,7 +1898,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     fn finish_revive(&self, journal: &mut Journal, old: &AgentRecord) -> Result<Value> {
         let (_, stopped) = stopped_artifact(&self.registry, journal)?;
-        let active_path = self.directory(&journal.name)?;
+        let mut active_path = self.directory(&journal.name)?;
         let archive_path = self
             .registry
             .join("archive")
@@ -2023,6 +2027,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 }
             }
             self.verify_candidate(&candidate, old, &journal.proof)?;
+            // The old generation has left its directory, so the new one is published in layout 2
+            // whichever layout the old one used (#593 registry-agents-subdir).
+            self.prepare_layout()?;
+            active_path = self.directory(&journal.name)?;
             publish_candidate(&staged, &active_path, &staged_bytes)?;
             checkpoint("published")?;
         }
@@ -2113,13 +2121,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let mut generations = BTreeMap::new();
         if self.registry.exists() {
             agent::validate_private_directory(&self.registry, "agent registry", false)?;
-            for entry in fs::read_dir(&self.registry).map_err(|error| fail(error.to_string()))? {
-                let entry = entry.map_err(|error| fail(error.to_string()))?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name_pattern(&name) && name != "archive" {
-                    let record = self.read_record(&name)?;
-                    generations.insert(name, record.token);
-                }
+            for name in self.registered_names()? {
+                let record = self.read_record(&name)?;
+                generations.insert(name, record.token);
             }
         }
         for journal in journals(&self.registry)? {

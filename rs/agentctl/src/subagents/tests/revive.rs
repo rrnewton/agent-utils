@@ -115,7 +115,7 @@ fn revive_resumes_without_reports_using_independent_process_and_terminal_anchors
 #[test]
 fn revive_keeps_the_control_edges_and_answers_to_its_former_token() {
     let (fixture, old) = recoverable("claude", false);
-    let path = fixture.root.join("registry/worker/agent.json");
+    let path = fixture.root.join("registry/agents/worker/agent.json");
     let mut document = agent::read_private_json(&path).unwrap();
     let edge = json!({"agent": "lieutenant", "registry": "/r", "token": "t", "proof": "assigned"});
     document["managed_by"] = edge.clone();
@@ -153,7 +153,7 @@ fn revive_preserves_entire_old_queue_and_requested_task_without_replaying_either
     old.extra
         .insert("owner_extension".to_owned(), json!({"retained":true}));
     fixture.manager().save(&old).unwrap();
-    let old_directory = fixture.root.join("registry/worker");
+    let old_directory = fixture.root.join("registry/agents/worker");
     let queue = old_directory.join("queue");
     agent::create_private_directory(&queue, "test old queue", false, false).unwrap();
     for directory in ["pending", "failed", "processed"] {
@@ -196,7 +196,7 @@ fn revive_preserves_entire_old_queue_and_requested_task_without_replaying_either
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
     assert!(!fixture
         .root
-        .join("registry/worker/queue/pending/message.json")
+        .join("registry/agents/worker/queue/pending/message.json")
         .exists());
 }
 
@@ -214,7 +214,7 @@ fn revive_preserves_producer_decimals_in_stopped_and_resumed_generations() {
             .insert("preserved_numbers".to_owned(), numbers.clone());
         fixture.manager().save(&old).unwrap();
         let original: Value = serde_json::from_slice(
-            &fs::read(fixture.root.join("registry/worker/agent.json")).unwrap(),
+            &fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(original["created_at"].as_f64(), Some(timestamp));
@@ -231,7 +231,7 @@ fn revive_preserves_producer_decimals_in_stopped_and_resumed_generations() {
         expected_stopped["lifecycle"] = json!("stopped");
         assert_eq!(stopped, expected_stopped);
         let candidate_path = if point == "published" {
-            fixture.root.join("registry/worker/agent.json")
+            fixture.root.join("registry/agents/worker/agent.json")
         } else {
             operation.join("new/agent.json")
         };
@@ -315,8 +315,11 @@ fn revive_live_unknown_and_unanchored_processes_never_allocate_a_tab() {
             .is_err());
         // Actual attempts may create lifecycle locks; all record bytes are retained.
         assert_eq!(
-            fs::read(fixture.root.join("registry/worker/agent.json")).unwrap(),
-            before[Path::new("worker/agent.json")].3.clone().unwrap()
+            fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap(),
+            before[Path::new("agents/worker/agent.json")]
+                .3
+                .clone()
+                .unwrap()
         );
         assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
         assert!(fixture.client.closed.lock().unwrap().is_empty());
@@ -547,7 +550,7 @@ fn revive_refuses_partial_or_different_provider_legacy_routing_identity() {
 fn revive_pending_dry_run_detects_replaced_old_directory_and_unstopped_archive() {
     for modification in ["directory", "archive"] {
         let (fixture, old) = recoverable("claude", false);
-        let original = fs::read(fixture.root.join("registry/worker/agent.json")).unwrap();
+        let original = fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap();
         super::super::revive::fail_once(if modification == "directory" {
             "ready"
         } else {
@@ -558,7 +561,7 @@ fn revive_pending_dry_run_detects_replaced_old_directory_and_unstopped_archive()
             .revive("worker", false, None, TIMEOUT)
             .is_err());
         if modification == "directory" {
-            let active = fixture.root.join("registry/worker");
+            let active = fixture.root.join("registry/agents/worker");
             fs::rename(&active, fixture.root.join("retained-original")).unwrap();
             DirBuilder::new().mode(0o700).create(&active).unwrap();
             fs::write(active.join("agent.json"), &original).unwrap();
@@ -882,13 +885,13 @@ fn revive_rejects_a_different_reported_conversation_before_retirement() {
     let (fixture, old) = recoverable("claude", true);
     *fixture.client.session_override.lock().unwrap() =
         Some((Some("claude".to_owned()), Some("different".to_owned())));
-    let old_bytes = fs::read(fixture.root.join("registry/worker/agent.json")).unwrap();
+    let old_bytes = fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap();
     assert!(fixture
         .manager()
         .revive("worker", false, None, TIMEOUT)
         .is_err());
     assert_eq!(
-        fs::read(fixture.root.join("registry/worker/agent.json")).unwrap(),
+        fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap(),
         old_bytes
     );
     assert!(journal_path(&fixture, &old).exists());
@@ -1144,7 +1147,7 @@ fn revive_staged_pane_and_session_stay_reserved_across_archive_publication_gap()
         .manager()
         .revive("worker", false, None, TIMEOUT)
         .is_err());
-    assert!(!fixture.root.join("registry/worker").exists());
+    assert!(!fixture.root.join("registry/agents/worker").exists());
     let candidate =
         agent::read_private_json(&stage_path(&fixture, &old).join("agent.json")).unwrap();
     let mut options = fixture.adopt_options();
@@ -1155,7 +1158,7 @@ fn revive_staged_pane_and_session_stay_reserved_across_archive_publication_gap()
         .unwrap_err()
         .to_string();
     assert!(error.contains("already registered"), "{error}");
-    assert!(!fixture.root.join("registry/alias").exists());
+    assert!(!fixture.root.join("registry/agents/alias").exists());
     assert!(fixture
         .manager()
         .start(
@@ -1279,7 +1282,7 @@ fn revive_published_retry_does_not_require_the_new_harness_to_still_run() {
         .revive("worker", false, None, TIMEOUT)
         .is_err());
     let new: AgentRecord = serde_json::from_value(
-        agent::read_private_json(&fixture.root.join("registry/worker/agent.json")).unwrap(),
+        agent::read_private_json(&fixture.root.join("registry/agents/worker/agent.json")).unwrap(),
     )
     .unwrap();
     kill_owned(&fixture, &new);
@@ -1305,7 +1308,7 @@ fn revive_published_retry_retains_the_journal_if_a_stage_reappears() {
     let stage = stage_path(&fixture, &old);
     DirBuilder::new().mode(0o700).create(&stage).unwrap();
     fs::copy(
-        fixture.root.join("registry/worker/agent.json"),
+        fixture.root.join("registry/agents/worker/agent.json"),
         stage.join("agent.json"),
     )
     .unwrap();
@@ -1340,7 +1343,7 @@ fn revive_detects_changed_old_bytes_and_staged_directory_generation() {
             .is_err());
         match mutation {
             "old-bytes" => {
-                let path = fixture.root.join("registry/worker/agent.json");
+                let path = fixture.root.join("registry/agents/worker/agent.json");
                 let mut value = agent::read_private_json(&path).unwrap();
                 value["opaque"] = json!("changed");
                 agent::atomic_json(&path, &value).unwrap();
@@ -1431,7 +1434,7 @@ fn revive_all_snapshots_tokens_and_continues_independent_blocked_records() {
     peer.pane_id = Some("unknown-pane".to_owned());
     peer.tab_id = Some("unknown-tab".to_owned());
     peer.terminal_id = Some("unknown-terminal".to_owned());
-    let directory = fixture.root.join("registry/peer");
+    let directory = fixture.root.join("registry/agents/peer");
     agent::create_private_directory(&directory, "test blocked peer", false, false).unwrap();
     manager.save(&peer).unwrap();
     let plan = manager.revive_all(true, TIMEOUT).unwrap();

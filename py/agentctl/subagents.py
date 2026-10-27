@@ -29,7 +29,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import NoReturn, TypeVar, cast
 
-from agentctl import agent, launch_spec
+from agentctl import agent, launch_spec, registry_layout
 from agentctl.client import (
     AgentPaneInfo,
     CustomProcessIdentity,
@@ -267,8 +267,8 @@ def _close_descriptor(
 
 
 def _name(value: str) -> str:
-    if not _NAME.fullmatch(value) or value == "archive":
-        raise AgentDeliveryError("agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; 'archive' is reserved")
+    if not _NAME.fullmatch(value) or value in registry_layout.RESERVED_NAMES:
+        raise AgentDeliveryError("agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; 'archive', 'agents' and 'locks' are reserved")
     return value
 
 
@@ -1941,14 +1941,36 @@ class ManagedAgents:
     @contextmanager
     def _lock(self, name: str) -> Iterator[None]:
         self._prepare()
-        # Locks live outside agent directories, so stop/reuse cannot replace a held inode.
-        path = self.registry / f".{_name(name)}.lock"
-        descriptor = agent._open_private_lock(str(path), "agent lifecycle lock")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
-            os.close(descriptor)
+        _name(name)
+        registry_layout.prepare_locks(self.registry)
+        # Locks live outside agent directories, so stop/reuse cannot replace a held inode. The
+        # lock follows the agent's directory (#593 registry-agents-subdir): a layout-1 agent is
+        # locked first where older builds lock it, so they still exclude each other, and then
+        # where layout 2 locks it, so an operation that moves it between layouts still excludes
+        # every new build. A migration that moved the agent while this waited makes the lock
+        # stale, so it is taken again.
+        for _ in range(8):
+            location = registry_layout.locate(self.registry, name)
+            held = (registry_layout.LEGACY, registry_layout.CURRENT) if location == registry_layout.LEGACY \
+                else (registry_layout.CURRENT,)
+            descriptors: list[int] = []
+            try:
+                for which in held:
+                    path, _rank = registry_layout.lock_paths(self.registry, name, which)
+                    descriptor = agent._open_private_lock(str(path), "agent lifecycle lock")
+                    descriptors.append(descriptor)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                first, _rank = registry_layout.lock_paths(self.registry, name, location)
+                if not registry_layout.lock_still_current(self.registry, name, location, descriptors[0], first):
+                    continue
+                yield
+                return
+            finally:
+                for descriptor in reversed(descriptors):
+                    os.close(descriptor)
+        raise AgentDeliveryError(
+            f"agent {name!r} kept moving between registry layouts while its lifecycle lock was taken"
+        )
 
     @contextmanager
     def _identity_transaction(self) -> Iterator[None]:
@@ -1964,7 +1986,26 @@ class ManagedAgents:
             os.close(descriptor)
 
     def _directory(self, name: str) -> Path:
-        return self.registry / _name(name)
+        """The agent's directory in whichever registry layout holds it; a new agent's is in layout 2."""
+        return registry_layout.directory(self.registry, _name(name))
+
+    def _registered_names(self) -> builtins.list[str]:
+        """Every agent name in either registry layout, sorted."""
+        return registry_layout.names(self.registry)
+
+    def _create_agent_directory(self, directory: Path) -> None:
+        """Create a new agent's directory, privately, and publish its entry."""
+        if directory.parent != self.registry:
+            registry_layout.prepare(self.registry)
+        directory.mkdir(mode=0o700)
+        agent._fsync_dir(str(directory.parent))
+
+    def _move_to_archive(self, name: str, destination: Path, archive: Path) -> None:
+        """Move the agent's directory, from either layout, into the archive and publish both entries."""
+        source = self._directory(name)
+        os.rename(source, destination)
+        agent._fsync_dir(str(archive))
+        agent._fsync_dir(str(source.parent))
 
     def _load(self, name: str) -> AgentRecord:
         directory = self._directory(name)
@@ -2681,28 +2722,31 @@ class ManagedAgents:
         """
         def claims() -> builtins.list[tuple[str, str, str | None]]:
             found: builtins.list[tuple[str, str, str | None]] = []
-            for path in sorted(self.registry.iterdir()):
-                if not _NAME.fullmatch(path.name) or path.name in ("archive", name):
-                    continue
+            for other_name, path in (
+                (other_name, path) for other_name in self._registered_names() if other_name != name
+                # A name in both registry layouts claims whatever either copy claims: one
+                # conflicted name must not stop input to every other agent.
+                for path in registry_layout.record_directories(self.registry, other_name)
+            ):
                 try:
                     raw = json.loads((path / "agent.json").read_text(encoding="utf-8"))
                 except FileNotFoundError:
                     continue
                 except (OSError, ValueError) as exc:
                     raise AgentDeliveryError(
-                        f"cannot prove that pane ownership is unique: record {path.name!r} "
+                        f"cannot prove that pane ownership is unique: record {other_name!r} "
                         f"is unreadable ({exc}); run `agentctl doctor`"
                     ) from exc
                 if not isinstance(raw, dict):
                     raise AgentDeliveryError(
-                        f"cannot prove that pane ownership is unique: record {path.name!r} "
+                        f"cannot prove that pane ownership is unique: record {other_name!r} "
                         "is not a JSON object; run `agentctl doctor`"
                     )
                 if raw.get("lifecycle") in ("stopped", "launch_failed"):
                     continue
                 pane, terminal = raw.get("pane_id"), raw.get("terminal_id")
                 if isinstance(pane, str):
-                    found.append((path.name, pane, terminal if isinstance(terminal, str) else None))
+                    found.append((other_name, pane, terminal if isinstance(terminal, str) else None))
             from agentctl.revive import candidate_records
             for candidate in candidate_records(self):
                 if candidate.name != name and candidate.pane_id is not None:
@@ -2714,11 +2758,11 @@ class ManagedAgents:
         """Panes of every other readable record, for locating a misrouted prompt."""
         def panes() -> builtins.list[str]:
             found: builtins.list[str] = []
-            for path in sorted(self.registry.iterdir()):
-                if not _NAME.fullmatch(path.name) or path.name in ("archive", name):
+            for other_name in self._registered_names():
+                if other_name == name:
                     continue
                 try:
-                    other = AgentRecord.load(path / "agent.json", path.name)
+                    other = AgentRecord.load(self._directory(other_name) / "agent.json", other_name)
                 except AgentDeliveryError:
                     continue
                 if other.pane_id is not None and other.lifecycle == "running":
@@ -2765,12 +2809,12 @@ class ManagedAgents:
         if not self.registry.exists():
             return None
         agent._validate_private_directory(str(self.registry), "agent registry")
-        for path in self.registry.iterdir():
-            if (not _NAME.fullmatch(path.name) or path.name == "archive"
-                    or path.name == exclude):
+        for other_name in self._registered_names():
+            if other_name == exclude:
                 continue
+            path = self._directory(other_name)
             agent._validate_private_directory(str(path), "agent directory")
-            other = AgentRecord.load(path / "agent.json", path.name)
+            other = AgentRecord.load(path / "agent.json", other_name)
             if ((other.session_agent or other.harness) == session_agent
                     and session_value in (other.resume, other.session_value, other.goal_session_id,
                                           None if other.native_session is None else other.native_session["value"])):
@@ -2992,8 +3036,7 @@ class ManagedAgents:
                 self._refuse_pending_rename(name)
                 if os.path.lexists(directory):
                     raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
-                directory.mkdir(mode=0o700)
-                agent._fsync_dir(str(self.registry))
+                self._create_agent_directory(directory)
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(),
                                      model=model, resume=resume, arguments=list(arguments),
                                      native_session=None if conversation is None else _native_session(harness, conversation, "asserted"),
@@ -3269,11 +3312,10 @@ class ManagedAgents:
                 raise AgentDeliveryError(f"pane {pane_id!r} is already registered as {session_owner.name!r}")
         if self.registry.exists():
             agent._validate_private_directory(str(self.registry), "agent registry")
-            for path in self.registry.iterdir():
-                if not _NAME.fullmatch(path.name) or path.name == "archive":
-                    continue
+            for other_name in self._registered_names():
+                path = self._directory(other_name)
                 agent._validate_private_directory(str(path), "agent directory")
-                other = AgentRecord.load(path / "agent.json", path.name)
+                other = AgentRecord.load(path / "agent.json", other_name)
                 same_session = (info.session_value is not None
                                 and (other.session_agent or other.harness)
                                     == info.session_agent
@@ -3323,8 +3365,7 @@ class ManagedAgents:
             raise AgentDeliveryError(
                 f"refusing pane {pane_id}: terminal changed before adoption"
             )
-        directory.mkdir(mode=0o700)
-        agent._fsync_dir(str(self.registry))
+        self._create_agent_directory(directory)
         record = AgentRecord(
             name, uuid.uuid4().hex, harness, root, time.time(),
             lifecycle="running", workspace_id=info.workspace_id,
@@ -3383,9 +3424,7 @@ class ManagedAgents:
         archive.mkdir(mode=0o700, exist_ok=True)
         agent._validate_private_directory(str(archive), "agent archive")
         destination = archive / f"{record.name}-{record.token}-adopt-failed"
-        os.rename(self._directory(record.name), destination)
-        agent._fsync_dir(str(archive))
-        agent._fsync_dir(str(self.registry))
+        self._move_to_archive(record.name, destination, archive)
         record.lifecycle = "adopt_failed"
         record.error = error
         agent._atomic_json(str(destination / "agent.json"), record.to_document())
@@ -3751,14 +3790,12 @@ class ManagedAgents:
             return []
         agent._validate_private_directory(str(self.registry), "agent registry")
         rows: list[dict[str, object]] = []
-        for path in sorted(self.registry.iterdir()):
-            if not _NAME.fullmatch(path.name) or path.name == "archive":
-                continue
+        for other_name in self._registered_names():
             try:
-                rows.append(self.status(path.name))
+                rows.append(self.status(other_name))
             except HerdrRunError as exc:
                 rows.append({
-                    "name": path.name,
+                    "name": other_name,
                     "agent_status": "unknown",
                     "probe_error": str(exc),
                     "record_error": True,
@@ -4337,8 +4374,9 @@ class ManagedAgents:
             raise AgentDeliveryError("invalid agent archive destination")
         publication_state = False
         try:
+            # The directory holding the agent: `REGISTRY/agents`, or the registry for layout 1.
             with self._pinned_parent_directory(
-                self.registry, label="agent registry",
+                pinned.path.parent, label="agent registry",
             ) as registry_parent, self._pinned_parent_directory(
                 archive_path, label="agent archive",
             ) as archive_parent:
@@ -5342,9 +5380,7 @@ class ManagedAgents:
                 )
             record.lifecycle = "stopped"
             self._save(record)
-            os.rename(self._directory(name), destination)
-            agent._fsync_dir(str(archive))
-            agent._fsync_dir(str(self.registry))
+            self._move_to_archive(name, destination, archive)
             return {"name": name, "archive": str(destination),
                     "pane_closed": False, "tab_closed": False,
                     "runtime_preserved": True}
@@ -5406,9 +5442,7 @@ class ManagedAgents:
                 tab_closed = None
         record.lifecycle = "stopped"
         self._save(record)
-        os.rename(self._directory(name), destination)
-        agent._fsync_dir(str(archive))
-        agent._fsync_dir(str(self.registry))
+        self._move_to_archive(name, destination, archive)
         return {"name": name, "archive": str(destination), "pane_closed": bool(owned), "tab_closed": tab_closed}
 
     def _closed_foreign_target(self, record: AgentRecord) -> tuple[str, str] | None:
@@ -5446,9 +5480,7 @@ class ManagedAgents:
         })
         record.lifecycle = "stopped"
         self._save(record)
-        os.rename(self._directory(name), destination)
-        agent._fsync_dir(str(archive))
-        agent._fsync_dir(str(self.registry))
+        self._move_to_archive(name, destination, archive)
         return {"name": name, "archive": str(destination),
                 "pane_closed": False, "tab_closed": False, "source": missing}
 
@@ -5467,6 +5499,8 @@ class ManagedAgents:
         for path in sorted(directory.iterdir()):
             if path.name.startswith("."):
                 continue  # an atomic writer's temporary file
+            if path.name == registry_layout.RENAMES_TRIPWIRE:
+                continue  # stops builds older than registry layout 2, not this one
             if not path.name.endswith(".json"):
                 raise AgentDeliveryError(f"unexpected entry in rename journal directory: {path}")
             value = agent._read_queue_json(str(path), "rename journal", require_private=True)
@@ -5835,14 +5869,21 @@ class ManagedAgents:
                     "journal_id": journal["journal_id"],
                 })
             agent._atomic_json(str(self._directory(old) / "agent.json"), record.to_document())
-            registry = os.open(
-                self.registry, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-            )
+            # A layout-1 agent leaves the registry's top level as it is renamed: the new name is
+            # always created in layout 2 (#593 registry-agents-subdir).
+            registry_layout.prepare(self.registry)
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+            source = os.open(self._directory(old).parent, flags)
             try:
-                _rename_directory_noreplace_at(registry, old, registry, new)
-                os.fsync(registry)
+                destination = os.open(registry_layout.agents_directory(self.registry), flags)
+                try:
+                    _rename_directory_noreplace_at(source, old, destination, new)
+                    os.fsync(destination)
+                    os.fsync(source)
+                finally:
+                    os.close(destination)
             finally:
-                os.close(registry)
+                os.close(source)
         elif not any(entry["journal_id"] == journal["journal_id"] for entry in record.name_history):
             raise AgentDeliveryError(
                 f"agent {new!r} was moved without its rename history; refusing to guess"
@@ -5896,17 +5937,15 @@ class ManagedAgents:
         journal_names = {str(name) for journal in journals for name in (journal["old"], journal["new"])}
         records: list[AgentRecord] = []
         if self.registry.exists():
-            for path in sorted(self.registry.iterdir()):
-                if not _NAME.fullmatch(path.name) or path.name == "archive":
-                    continue
+            for other_name in self._registered_names():
                 try:
-                    records.append(AgentRecord.load(path / "agent.json", path.name))
+                    records.append(AgentRecord.load(self._directory(other_name) / "agent.json", other_name))
                 except AgentDeliveryError as exc:
-                    if path.name in journal_names:
-                        rows.append({"name": path.name, "findings": ["rename-incomplete"],
+                    if other_name in journal_names:
+                        rows.append({"name": other_name, "findings": ["rename-incomplete"],
                                      "detail": str(exc)})
                     else:
-                        rows.append({"name": path.name, "findings": ["record-unreadable"],
+                        rows.append({"name": other_name, "findings": ["record-unreadable"],
                                      "detail": str(exc)})
         panes = {pane.pane_id: pane for pane in self.client.panes()}
         agent_names = self.client.agent_names()

@@ -227,9 +227,13 @@ def _read_json(path: Path) -> Mapping[str, object] | None:
 
 
 def _record_dirs(registry: Path) -> Iterator[Path]:
-    for parent in (registry, registry / "archive"):
+    # Live agents in both agentctl registry layouts (agents/<name>/ and the older <name>/), then
+    # the archive. The registry's own directories are never records.
+    for parent in (registry / "agents", registry, registry / "archive"):
         if parent.is_dir():
             for child in sorted(parent.iterdir()):
+                if parent == registry and child.name in ("agents", "locks", "archive"):
+                    continue
                 if (child / "agent.json").is_file():
                     yield child
 

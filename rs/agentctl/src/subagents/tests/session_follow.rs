@@ -87,7 +87,7 @@ fn session_follow_refuses_changed_process_terminal_directory_assertions_and_miss
             _ => {}
         }
         manager.save(&record).unwrap();
-        let bytes = fs::read(fixture.root.join("registry/foreign/agent.json")).unwrap();
+        let bytes = fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap();
         let _busy = (mutation == "busy").then(|| manager.lock("foreign").unwrap());
         rotated(&fixture);
         assert!(
@@ -95,7 +95,7 @@ fn session_follow_refuses_changed_process_terminal_directory_assertions_and_miss
             "{mutation}"
         );
         assert_eq!(
-            fs::read(fixture.root.join("registry/foreign/agent.json")).unwrap(),
+            fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap(),
             bytes,
             "{mutation}"
         );
@@ -114,7 +114,7 @@ fn session_follow_validates_launch_metadata_before_changing_queue_binding() {
     let target = record.target().unwrap();
     agent::rebind_queue(&queue, &target, &target).unwrap();
     let old_binding = fs::read(queue.join("target.json")).unwrap();
-    let old_record = fs::read(fixture.root.join("registry/foreign/agent.json")).unwrap();
+    let old_record = fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap();
     fixture.client.command_lines.lock().unwrap().insert(
         record.harness_identity.as_ref().unwrap().pid,
         vec!["/opt/bin/codex\0invalid".into()],
@@ -123,7 +123,7 @@ fn session_follow_validates_launch_metadata_before_changing_queue_binding() {
     assert!(manager.follow_observed_session("foreign").is_err());
     assert_eq!(fs::read(queue.join("target.json")).unwrap(), old_binding);
     assert_eq!(
-        fs::read(fixture.root.join("registry/foreign/agent.json")).unwrap(),
+        fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap(),
         old_record
     );
     assert!(fixture.client.runs.lock().unwrap().is_empty());

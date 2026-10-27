@@ -146,7 +146,7 @@ class Sessions(ManagedAgents):
                 directory = self._directory(name)
                 if os.path.lexists(directory):
                     raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
-                directory.mkdir(mode=0o700)
+                self._create_agent_directory(directory)
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(), model=model,
                     profile=profile, reasoning_effort=reasoning_effort,
                     adapter="turn-runner", mode=mode, backend=backend, runtime_home=str(directory / "runtime"))
@@ -331,11 +331,10 @@ class Sessions(ManagedAgents):
             archive.mkdir(mode=0o700, exist_ok=True)
             agent._validate_private_directory(str(archive), "agent archive")
             destination = archive / f"{name}-{current.token}"
-            os.rename(self._directory(name), destination)
-            agent._fsync_dir(str(archive))
-            agent._fsync_dir(str(self.registry))
+            source = self._directory(name)
+            self._move_to_archive(name, destination, archive)
             return {"name": name, "archive": str(destination),
-                "runtime": _relocate_receipt_paths(result, self._directory(name), destination)}
+                "runtime": _relocate_receipt_paths(result, source, destination)}
 
     def pause(self, name: str, *, paused: bool = True) -> dict[str, object]:
         """Hand off input after in-flight work; preserve the running conversation."""

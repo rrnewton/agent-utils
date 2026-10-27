@@ -433,7 +433,7 @@ def test_managed_legacy_workspace_binding_is_accepted_without_rewrite(
         fake.infos[record.pane_id], session_agent=None, session_value=None,
     )
     manager.send("worker", "create binding")
-    target = manager.registry / "worker" / "queue" / "target.json"
+    target = manager.registry / "agents" / "worker" / "queue" / "target.json"
     document = json.loads(target.read_text(encoding="utf-8"))
     document["expected_workspace"] = "legacy-project"
     target.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
@@ -525,14 +525,14 @@ def test_move_recovers_only_with_durable_intent_and_rebinds_delivery(
         manager.stop("worker")
     replacement = replace(record.target(), pane_id="w-project:p1")
     delivery._atomic_json(
-        str(manager.registry / "worker" / "queue" / "target.json"),
+        str(manager.registry / "agents" / "worker" / "queue" / "target.json"),
         delivery._binding(replacement),
     )
     recovered = manager.move_to_project_workspace("worker")
     assert recovered["recovered"] is True
     manager.send("worker", "after recovery")
     assert fake.submitted[-1] == "after recovery"
-    assert not (manager.registry / "worker" / "move.json").exists()
+    assert not (manager.registry / "agents" / "worker" / "move.json").exists()
 
 
 def test_stale_completed_move_intent_is_row_local_and_rerun_clears_it(
@@ -557,9 +557,9 @@ def test_stale_completed_move_intent_is_row_local_and_rerun_clears_it(
 
     repeated = manager.move_to_project_workspace("worker")
     assert repeated["moved"] is False
-    assert not (manager.registry / "worker" / "move.json").exists()
+    assert not (manager.registry / "agents" / "worker" / "move.json").exists()
 
-    delivery._atomic_json(str(manager.registry / "worker" / "move.json"), {})
+    delivery._atomic_json(str(manager.registry / "agents" / "worker" / "move.json"), {})
     invalid = manager.status("worker")
     assert invalid["agent_status"] == "unknown"
     assert "rerun `agentctl move worker`" in str(invalid["probe_error"])
@@ -579,7 +579,7 @@ def test_pending_move_can_finish_after_workspace_policy_is_removed(
     moved = manager.move_to_project_workspace("worker")
     assert moved["workspace_id"] == "w-project"
     assert fake.moves == [("w1:p1", "w-project", "worker")]
-    assert not (manager.registry / "worker" / "move.json").exists()
+    assert not (manager.registry / "agents" / "worker" / "move.json").exists()
     assert manager.stop("worker")["pane_closed"] is True
 
 
@@ -612,7 +612,7 @@ def test_move_preflights_binding_and_preserves_queued_states(
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
     manager.send("worker", "bind queue")
-    queue = manager.registry / "worker" / "queue"
+    queue = manager.registry / "agents" / "worker" / "queue"
     target = queue / "target.json"
     document = json.loads(target.read_text(encoding="utf-8"))
     document.update({"kind": "pane", "pane_id": "foreign", "value": None})
@@ -688,7 +688,7 @@ def test_move_refuses_name_and_final_presentation_mismatches(
     monkeypatch.setattr(fake, "move_pane_to_new_tab", lose_name)
     with pytest.raises(AgentDeliveryError, match="managed name did not follow"):
         manager.move_to_project_workspace("worker")
-    assert (manager.registry / "worker" / "move.json").exists()
+    assert (manager.registry / "agents" / "worker" / "move.json").exists()
 
     presentation, presentation_fake = setup(tmp_path / "presentation", monkeypatch)
     presentation.start("worker", cwd=str(tmp_path))
@@ -704,7 +704,7 @@ def test_move_refuses_name_and_final_presentation_mismatches(
     monkeypatch.setattr(presentation_fake, "move_pane_to_new_tab", wrong_result)
     with pytest.raises(AgentDeliveryError, match="final presentation verification failed"):
         presentation.move_to_project_workspace("worker")
-    assert (presentation.registry / "worker" / "move.json").exists()
+    assert (presentation.registry / "agents" / "worker" / "move.json").exists()
 
 
 def test_failed_pre_herdr_move_clears_intent_and_cannot_authorize_recovery(
@@ -721,7 +721,7 @@ def test_failed_pre_herdr_move_clears_intent_and_cannot_authorize_recovery(
     monkeypatch.setattr(fake, "move_pane_to_new_tab", refuse)
     with pytest.raises(HerdrUnavailable, match="before mutation"):
         manager.move_to_project_workspace("worker")
-    assert not (manager.registry / "worker" / "move.json").exists()
+    assert not (manager.registry / "agents" / "worker" / "move.json").exists()
 
     fake.presentations = [Pane("replacement", "other", "w-project")]
     fake.infos["replacement"] = replace(
@@ -871,7 +871,7 @@ def test_launch_only_v2_record_is_read_and_rewritten_without_flat_duplicates(
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     path.write_text(json.dumps(nested), encoding="utf-8")
 
@@ -893,7 +893,7 @@ def test_launch_only_v3_record_decodes_nested_goal_and_native_session(
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     nested["schema"] = "agentctl-session/v3"
     session_agent = nested.pop("session_agent")
@@ -927,7 +927,7 @@ def test_v2_observed_and_asserted_session_fields_round_trip_separately(
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     if source == "observed":
         nested["session_agent"] = "codex"
@@ -960,7 +960,7 @@ def test_v3_native_session_source_controls_live_routing_identity(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     nested["schema"] = "agentctl-session/v3"
     nested.pop("session_agent")
@@ -997,7 +997,7 @@ def test_v3_bind_session_persists_one_asserted_native_authority(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     nested["schema"] = "agentctl-session/v3"
     nested.pop("session_agent")
@@ -1034,7 +1034,7 @@ def test_nested_launch_rejects_duplicate_flat_authority(
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     nested["harness"] = "claude"
     path.write_text(json.dumps(nested), encoding="utf-8")
@@ -1080,7 +1080,7 @@ def test_nested_launch_rejects_malformed_runtime_authority(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     mutation(nested)
     path.write_text(json.dumps(nested), encoding="utf-8")
@@ -1095,7 +1095,7 @@ def test_nested_launch_rejects_nonnull_interactive_permission_mode(
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     launch = cast(dict[str, object], nested["launch"])
     launch["schema"] = "agentctl-launch/v2"
@@ -1110,7 +1110,7 @@ def test_running_nested_muse_without_process_identity_cannot_close_pane(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="muse")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
     assert nested["custom_process_identity"] is not None
     nested["custom_process_identity"] = None
@@ -1126,7 +1126,7 @@ def test_list_reports_malformed_row_without_hiding_healthy_sessions(
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="codex")
-    invalid = manager.registry / "broken"
+    invalid = manager.registry / "agents" / "broken"
     invalid.mkdir(mode=0o700)
     (invalid / "agent.json").write_text("{}", encoding="utf-8")
     (invalid / "agent.json").chmod(0o600)
@@ -1186,7 +1186,7 @@ def test_start_sets_environment_only_on_the_created_tab(
     assert fake.environments == [entries]
     assert "environment" not in status
     assert all(value not in json.dumps(status) for value in entries)
-    saved = json.loads((tmp_path / "registry/worker/agent.json").read_text())
+    saved = json.loads((tmp_path / "registry/agents/worker/agent.json").read_text())
     assert "environment" not in saved
     assert all(value not in json.dumps(saved) for value in entries)
 
@@ -1310,7 +1310,7 @@ def test_suggestion13_muse_adoption_requires_terminal_and_process_anchors(
             "worker", pane_id="w1:p1", expected_workspace="subagents",
             expected_cwd=str(tmp_path), harness="muse",
         )
-    assert not (manager.registry / "worker").exists()
+    assert not (manager.registry / "agents" / "worker").exists()
     assert fake.launched == [] and fake.closed == [] and fake.submitted == []
     assert fake.labels == {"w1:t1": "foreign"}
 
@@ -1465,7 +1465,7 @@ def test_unreported_starting_muse_without_identity_is_not_assumed_to_own_idle_sh
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="muse")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     document = json.loads(path.read_text(encoding="utf-8"))
     document["lifecycle"] = "starting"
     document["pane_reported_by_agentctl"] = False
@@ -1718,7 +1718,7 @@ def test_wait_does_not_take_idle_just_after_a_delivery_as_readiness(
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
     manager.send("worker", "do the task")
-    processed = list((manager.registry / "worker" / "queue" / "processed").glob("*.json"))
+    processed = list((manager.registry / "agents" / "worker" / "queue" / "processed").glob("*.json"))
     delivered_at = float(json.loads(processed[0].read_text())["confirmed_at"])
     # The prompt left the composer, but the terminal server still reads idle.
     with pytest.raises(AgentDeliveryError, match="has not been seen working"):
@@ -1743,7 +1743,7 @@ def test_wait_does_not_take_idle_just_after_a_delivery_as_readiness(
 def test_private_state_and_malformed_record_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
-    record = manager.registry / "worker" / "agent.json"
+    record = manager.registry / "agents" / "worker" / "agent.json"
     document = json.loads(record.read_text())
     document["schema"] = True
     record.write_text(json.dumps(document))
@@ -1759,7 +1759,7 @@ def test_malformed_custom_process_identities_are_rejected(
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="muse")
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     original = json.loads(path.read_text(encoding="utf-8"))
     identity = original["custom_process_identity"]
     assert isinstance(identity, dict)
@@ -1850,7 +1850,7 @@ def test_explicit_session_binding_preserves_existing_queue_authority(tmp_path: P
     manager._save(record)
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], session_agent=None, session_value=None)
     manager.send("worker", "before native binding")
-    binding = manager.registry / "worker" / "queue" / "target.json"
+    binding = manager.registry / "agents" / "worker" / "queue" / "target.json"
     original = binding.read_bytes()
     manager.bind_session("worker", "explicit-session", goal_command=("codex", "app-server", "--stdio"))
     assert binding.read_bytes() == original
@@ -1921,7 +1921,7 @@ def test_queued_goals_keep_confirmation_authority_across_restart(tmp_path: Path,
 def test_goal_operation_identifiers_cannot_escape_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: object) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
-    path = manager.registry / "worker" / "agent.json"
+    path = manager.registry / "agents" / "worker" / "agent.json"
     record = json.loads(path.read_text())
     record[field] = value
     path.write_text(json.dumps(record))

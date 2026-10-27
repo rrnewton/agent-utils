@@ -722,7 +722,8 @@ fn register_elsewhere<A: ManagedApi + ?Sized>(
         .to_owned();
     let result = (|| -> Result<Value> {
         let manager = ManagedAgents::new(client, &other.registry)?;
-        let record_path = other.registry.join(&other.name).join("agent.json");
+        let record_path =
+            agent_queue::registry::directory(&other.registry, &other.name)?.join("agent.json");
         let existing = match fs::read(&record_path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -808,7 +809,7 @@ fn slot_agents(registry: &Path, names: &[String], config: &RestoreConfig) -> Vec
         .iter()
         .filter(|name| !config.exclude.contains(name))
         .filter_map(|name| {
-            let bytes = fs::read(registry.join(name).join("agent.json")).ok()?;
+            let bytes = fs::read(record_path(registry, name)?).ok()?;
             let record: Value = serde_json::from_slice(&bytes).ok()?;
             let lifecycle = record["lifecycle"].as_str()?;
             matches!(lifecycle, "running" | "launch_failed").then_some(())?;
@@ -977,25 +978,20 @@ fn systemctl(host: &dyn Host, verb: &str, unit: &str) -> CommandOutcome {
     )
 }
 
-/// The registered names, sorted; restore's own files never look like names.
+/// The registered names, in either registry layout, sorted; restore's own files never look like
+/// names.
 fn registered_names(registry: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    match fs::read_dir(registry) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(|error| fail(error.to_string()))?;
-                if let Some(name) = entry.file_name().to_str() {
-                    if agent_name(name) && entry.path().join("agent.json").is_file() {
-                        names.push(name.to_owned());
-                    }
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(fail(format!("cannot list {}: {error}", registry.display()))),
-    }
-    names.sort();
+    let mut names = agent_queue::registry::names(registry)
+        .map_err(|error| fail(format!("cannot list {}: {error}", registry.display())))?;
+    names.retain(|name| record_path(registry, name).is_some_and(|path| path.is_file()));
     Ok(names)
+}
+
+/// `agent.json` of agent `name`, in whichever layout holds it; `None` for a name in both.
+fn record_path(registry: &Path, name: &str) -> Option<PathBuf> {
+    agent_queue::registry::directory(registry, name)
+        .ok()
+        .map(|directory| directory.join("agent.json"))
 }
 
 /// Every boot id the registry's anchors were pinned under.
@@ -1006,7 +1002,7 @@ fn anchored_boots(registry: &Path, names: &[String]) -> Vec<String> {
     let mut boots = names
         .iter()
         .filter_map(|name| {
-            let bytes = fs::read(registry.join(name).join("agent.json")).ok()?;
+            let bytes = fs::read(record_path(registry, name)?).ok()?;
             let record: Value = serde_json::from_slice(&bytes).ok()?;
             (record["lifecycle"] == "running").then_some(())?;
             ["harness_identity", "custom_process_identity"]

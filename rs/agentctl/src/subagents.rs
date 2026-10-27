@@ -128,6 +128,30 @@ fn rename_directory_noreplace_at(
     }
 }
 
+/// An agent's held lifecycle lock: its layout-2 lock file, and for an agent still in registry
+/// layout 1 also the layout-1 lock file older builds take (#593 registry-agents-subdir).
+#[must_use]
+#[derive(Debug)]
+pub(crate) struct LifecycleLock {
+    _files: Vec<File>,
+}
+
+/// Move an agent directory between registry layouts with one no-replace rename; see
+/// [`crate::registry_layout`].
+pub(crate) fn rename_agent_directory(
+    source_parent: &File,
+    source_name: &str,
+    destination_parent: &File,
+    destination_name: &str,
+) -> Result<()> {
+    rename_directory_noreplace_at(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InstalledArtifact {
     device: u64,
@@ -529,14 +553,14 @@ fn message_id(value: &str) -> bool {
 pub(crate) fn name(value: &str) -> Result<&str> {
     if value.is_empty()
         || value.len() > 32
-        || value == "archive"
+        || agent_queue::registry::RESERVED_NAMES.contains(&value)
         || !value.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
         || !value
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
         return Err(fail(
-            "agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; 'archive' is reserved",
+            "agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; 'archive', 'agents' and 'locks' are reserved",
         ));
     }
     Ok(value)
@@ -2140,6 +2164,8 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
     goal_objective: Mutex<Option<String>>,
     custom_submission: Mutex<Option<CustomPaneSubmission>>,
     queue: Option<&'a Path>,
+    /// The registry holding the agent, for checks that read the other agents' records.
+    registry: Option<&'a Path>,
     check_prompt: bool,
     expected_workspace: Option<String>,
     /// A longer read-back limit than [`READBACK`], for a just-started harness.
@@ -2939,7 +2965,7 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
     /// Each record is read as plain JSON, so a record this edition cannot fully decode still
     /// counts; one that is not readable JSON refuses input outright.
     fn peer_claims(&self) -> crate::error::Result<Vec<(String, String, Option<String>)>> {
-        let Some(registry) = self.queue.and_then(Path::parent).and_then(Path::parent) else {
+        let (Some(_), Some(registry)) = (self.queue, self.registry) else {
             return Ok(Vec::new());
         };
         registry_claims(registry, &self.record.name).map_err(AdapterError::unavailable)
@@ -2968,49 +2994,54 @@ fn registry_claims(
     registry: &Path,
     exclude: &str,
 ) -> std::result::Result<Vec<(String, String, Option<String>)>, String> {
-    let Ok(entries) = fs::read_dir(registry) else {
-        return Ok(Vec::new());
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-        .filter(|name| name != "archive" && name != exclude && name_pattern(name))
-        .collect();
-    names.sort();
+    let mut names = agent_queue::registry::names(registry).map_err(|error| {
+        format!("cannot prove that pane ownership is unique: {error}; run `agentctl doctor`")
+    })?;
+    names.retain(|name| name != exclude);
     let mut claims = Vec::new();
     for name in names {
-        let path = registry.join(&name).join("agent.json");
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
+        // A name in both registry layouts claims whatever either copy claims: one conflicted
+        // name must not stop input to every other agent.
+        let directories =
+            agent_queue::registry::record_directories(registry, &name).map_err(|error| {
+                format!(
+                    "cannot prove that pane ownership is unique: {error}; run `agentctl doctor`"
+                )
+            })?;
+        for directory in directories {
+            let path = directory.join("agent.json");
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot prove that pane ownership is unique: record '{name}' is \
+                         unreadable ({error}); run `agentctl doctor`"
+                    ))
+                }
+            };
+            let Ok(Value::Object(document)) = serde_json::from_slice::<Value>(&bytes) else {
                 return Err(format!(
-                    "cannot prove that pane ownership is unique: record '{name}' is unreadable \
-                     ({error}); run `agentctl doctor`"
-                ))
+                    "cannot prove that pane ownership is unique: record '{name}' is not a JSON \
+                     object; run `agentctl doctor`"
+                ));
+            };
+            if matches!(
+                document.get("lifecycle").and_then(Value::as_str),
+                Some("stopped" | "launch_failed")
+            ) {
+                continue;
             }
-        };
-        let Ok(Value::Object(document)) = serde_json::from_slice::<Value>(&bytes) else {
-            return Err(format!(
-                "cannot prove that pane ownership is unique: record '{name}' is not a JSON \
-                 object; run `agentctl doctor`"
-            ));
-        };
-        if matches!(
-            document.get("lifecycle").and_then(Value::as_str),
-            Some("stopped" | "launch_failed")
-        ) {
-            continue;
-        }
-        if let Some(pane) = document.get("pane_id").and_then(Value::as_str) {
-            claims.push((
-                name,
-                pane.to_owned(),
-                document
-                    .get("terminal_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            ));
+            if let Some(pane) = document.get("pane_id").and_then(Value::as_str) {
+                claims.push((
+                    name.clone(),
+                    pane.to_owned(),
+                    document
+                        .get("terminal_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                ));
+            }
         }
     }
     for record in revive::pending_claim_records(registry).map_err(|error| error.to_string())? {
@@ -3789,22 +3820,21 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
 
     /// Panes of every other running record in this registry, for locating a misroute.
     fn peer_panes(&self) -> Vec<String> {
-        let Some(registry) = self.queue.and_then(Path::parent).and_then(Path::parent) else {
+        let (Some(_), Some(registry)) = (self.queue, self.registry) else {
             return Vec::new();
         };
-        let Ok(entries) = fs::read_dir(registry) else {
+        let Ok(names) = agent_queue::registry::names(registry) else {
             return Vec::new();
         };
-        let mut panes: Vec<String> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name().to_str()?.to_owned();
-                if name == "archive" || name == self.record.name || !name_pattern(&name) {
+        let mut panes: Vec<String> = names
+            .into_iter()
+            .filter_map(|name| {
+                if name == self.record.name {
                     return None;
                 }
+                let directory = agent_queue::registry::directory(registry, &name).ok()?;
                 let document: Value =
-                    serde_json::from_slice(&fs::read(entry.path().join("agent.json")).ok()?)
-                        .ok()?;
+                    serde_json::from_slice(&fs::read(directory.join("agent.json")).ok()?).ok()?;
                 (document.get("lifecycle").and_then(Value::as_str) == Some("running"))
                     .then(|| document.get("pane_id")?.as_str().map(str::to_owned))
                     .flatten()
@@ -4898,11 +4928,53 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(target)
     }
 
+    /// The agent's directory in whichever registry layout holds it; a new agent's goes in
+    /// layout 2 (`REGISTRY/agents/<name>`).
     fn directory(&self, agent_name: &str) -> Result<PathBuf> {
-        Ok(self.registry.join(name(agent_name)?))
+        agent_queue::registry::directory(&self.registry, name(agent_name)?)
+            .map_err(|error| fail(error.to_string()))
     }
 
-    fn lock(&self, agent_name: &str) -> Result<File> {
+    /// The directory that holds the agent's directory: `REGISTRY/agents`, or the registry itself
+    /// for a layout-1 agent.
+    fn agent_parent(&self, agent_name: &str) -> Result<PathBuf> {
+        let directory = self.directory(agent_name)?;
+        Ok(directory
+            .parent()
+            .map_or_else(|| self.registry.clone(), Path::to_path_buf))
+    }
+
+    /// Create layout 2's directories and tripwire before the first layout-2 write.
+    fn prepare_layout(&self) -> Result<()> {
+        agent_queue::registry::prepare(&self.registry).map_err(|error| fail(error.to_string()))
+    }
+
+    /// Move agent `agent_name`'s directory, from whichever layout holds it, to `destination` in
+    /// `archive`, and publish both directory entries.
+    fn move_to_archive(&self, agent_name: &str, destination: &Path, archive: &Path) -> Result<()> {
+        let source = self.directory(agent_name)?;
+        fs::rename(&source, destination).map_err(|error| fail(error.to_string()))?;
+        agent::sync_directory(archive)?;
+        agent::sync_directory(source.parent().unwrap_or(&self.registry))
+    }
+
+    /// Create a new agent's `directory` (from [`Self::directory`]), private, and publish its
+    /// entry; a layout-2 directory gets the layout's directories and tripwire first.
+    pub(crate) fn create_agent_directory(&self, directory: &Path) -> Result<()> {
+        let parent = directory
+            .parent()
+            .ok_or_else(|| fail("agent directory has no parent"))?;
+        if parent != self.registry {
+            self.prepare_layout()?;
+        }
+        DirBuilder::new()
+            .mode(0o700)
+            .create(directory)
+            .map_err(|error| fail(error.to_string()))?;
+        agent::sync_directory(parent)
+    }
+
+    fn lock(&self, agent_name: &str) -> Result<LifecycleLock> {
         self.lock_with_runtime(agent_name, &agent::SystemRuntime::default())
     }
 
@@ -4910,34 +4982,73 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         &self,
         agent_name: &str,
         runtime: &dyn agent::AgentRuntime,
-    ) -> Result<File> {
+    ) -> Result<LifecycleLock> {
+        use agent_queue::registry::Location;
         name(agent_name)?;
         agent::create_private_directory(&self.registry, "agent registry", true, true)?;
-        let path = crate::lock_wait::lock_path(&self.registry, agent_name);
-        let file = agent::open_private_lock(&path, "agent lifecycle lock")?;
-        // Every sender waits in rank behind any priority sender, and one that has to wait at
-        // all says so, so status and the watcher can show it (#556 chat-delivery-latency).
-        let gate_path = crate::lock_wait::rank_path(&self.registry, agent_name);
-        let gate = agent::open_private_lock(&gate_path, "agent lifecycle rank lock")?;
-        let waiting = std::cell::RefCell::new(None);
-        agent::lock_exclusive_ranked_with_runtime(
-            &file,
-            &path,
-            "agent lifecycle",
-            runtime,
-            (&gate, self.lock_priority),
-            &|| {
-                let mut waiting = waiting.borrow_mut();
-                if waiting.is_none() {
-                    *waiting = Some(crate::lock_wait::register(
-                        &self.registry,
-                        agent_name,
-                        self.lock_priority,
-                    ));
-                }
-            },
+        agent::create_private_directory(
+            &agent_queue::registry::locks_directory(&self.registry),
+            "agent lock collection",
+            false,
+            true,
         )?;
-        Ok(file)
+        // The lock follows the agent's directory (#593 registry-agents-subdir). A layout-1 agent
+        // is locked first where older builds lock it, so they still exclude each other, and then
+        // where layout 2 locks it, so an operation that moves it between layouts (a revive, a
+        // rename) still excludes every new build. A migration that moved the agent while this
+        // waited makes the lock stale, so take it again.
+        for _ in 0..8 {
+            let location = agent_queue::registry::locate(&self.registry, agent_name)
+                .map_err(|error| fail(error.to_string()))?;
+            let locations: &[Location] = match location {
+                Location::Legacy => &[Location::Legacy, Location::Current],
+                Location::Current => &[Location::Current],
+            };
+            let waiting = std::cell::RefCell::new(None);
+            let mut files = Vec::new();
+            for &held in locations {
+                let (path, gate_path) =
+                    agent_queue::registry::lock_paths(&self.registry, agent_name, held);
+                let file = agent::open_private_lock(&path, "agent lifecycle lock")?;
+                // Every sender waits in rank behind any priority sender, and one that has to
+                // wait at all says so, so status and the watcher can show it (#556
+                // chat-delivery-latency).
+                let gate = agent::open_private_lock(&gate_path, "agent lifecycle rank lock")?;
+                agent::lock_exclusive_ranked_with_runtime(
+                    &file,
+                    &path,
+                    "agent lifecycle",
+                    runtime,
+                    (&gate, self.lock_priority),
+                    &|| {
+                        let mut waiting = waiting.borrow_mut();
+                        if waiting.is_none() {
+                            *waiting = Some(crate::lock_wait::register(
+                                &self.registry,
+                                agent_name,
+                                self.lock_priority,
+                            ));
+                        }
+                    },
+                )?;
+                files.push((file, path));
+            }
+            let (first, first_path) = &files[0];
+            if crate::registry_layout::lock_still_current(
+                &self.registry,
+                agent_name,
+                location,
+                first,
+                first_path,
+            )? {
+                return Ok(LifecycleLock {
+                    _files: files.into_iter().map(|(file, _)| file).collect(),
+                });
+            }
+        }
+        Err(fail(format!(
+            "agent {agent_name:?} kept moving between registry layouts while its lifecycle lock was taken"
+        )))
     }
 
     fn identity_lock(&self) -> Result<File> {
@@ -5625,6 +5736,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: None,
+            registry: None,
             check_prompt: false,
             expected_workspace: None,
             readback: None,
@@ -5724,6 +5836,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .unwrap_or_default();
             if file_name.starts_with('.') {
                 continue; // an atomic writer's temporary file
+            }
+            if file_name == agent_queue::registry::RENAMES_TRIPWIRE {
+                continue; // stops builds older than registry layout 2, not this one
             }
             if !file_name.ends_with(".json") {
                 return Err(fail(format!(
@@ -6486,23 +6601,33 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             // The renamed content is published inside OLD first, so a crash before the move
             // leaves a record a rerun recognises by its token and journal id.
             agent::atomic_json(&self.directory(old)?.join("agent.json"), &json!(record))?;
-            let registry = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-                .open(&self.registry)
-                .map_err(|error| fail(format!("cannot open agent registry: {error}")))?;
+            // A layout-1 agent leaves the registry's top level as it is renamed: the new name is
+            // always created in layout 2 (#593 registry-agents-subdir).
+            self.prepare_layout()?;
+            let open_parent = |path: &Path| {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .open(path)
+                    .map_err(|error| fail(format!("cannot open agent registry: {error}")))
+            };
+            let source = open_parent(&self.agent_parent(old)?)?;
+            let destination =
+                open_parent(&agent_queue::registry::agents_directory(&self.registry))?;
             #[cfg(test)]
             if FAIL_RENAME_DIRECTORY_MOVE.with(|fail_once| fail_once.replace(false)) {
                 return Err(fail("simulated crash before the directory move"));
             }
-            rename_directory_noreplace_at(&registry, old, &registry, new).map_err(|error| {
+            rename_directory_noreplace_at(&source, old, &destination, new).map_err(|error| {
                 fail(format!(
                     "cannot move agent directory '{old}' to '{new}': {error}"
                 ))
             })?;
-            registry
-                .sync_all()
-                .map_err(|error| fail(format!("cannot sync agent registry: {error}")))?;
+            for parent in [&destination, &source] {
+                parent
+                    .sync_all()
+                    .map_err(|error| fail(format!("cannot sync agent registry: {error}")))?;
+            }
         } else if !recorded_once {
             return Err(fail(format!(
                 "agent '{new}' was moved without its rename history; refusing to guess"
@@ -6609,13 +6734,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .collect();
         let mut records = Vec::new();
         if self.registry.exists() {
-            let mut names = fs::read_dir(&self.registry)
-                .map_err(|error| fail(error.to_string()))?
-                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-                .collect::<std::result::Result<Vec<_>, _>>()
+            let names = agent_queue::registry::names(&self.registry)
                 .map_err(|error| fail(error.to_string()))?;
-            names.retain(|value| name(value).is_ok());
-            names.sort();
             for agent_name in names {
                 match self.read_record(&agent_name) {
                     Ok(record) => records.push(record),
@@ -6871,11 +6991,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if !self.registry.exists() {
             return Ok(None);
         }
-        agent::validate_private_directory(&self.registry, "agent registry", false)?;
-        for entry in fs::read_dir(&self.registry).map_err(|error| fail(error.to_string()))? {
-            let entry = entry.map_err(|error| fail(error.to_string()))?;
-            let existing_name = entry.file_name().to_string_lossy().into_owned();
-            if name(&existing_name).is_err() || Some(existing_name.as_str()) == exclude {
+        for existing_name in self.registered_names()? {
+            if Some(existing_name.as_str()) == exclude {
                 continue;
             }
             let other = self.read_record(&existing_name)?;
@@ -7147,11 +7264,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "agent {agent_name:?} already registered; stop it before reusing the name"
             )));
         }
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&self.registry)?;
+        self.create_agent_directory(&directory)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
@@ -7489,12 +7602,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 )));
             }
         }
-        for entry in fs::read_dir(&self.registry).map_err(|error| fail(error.to_string()))? {
-            let entry = entry.map_err(|error| fail(error.to_string()))?;
-            let existing_name = entry.file_name().to_string_lossy().into_owned();
-            if name(&existing_name).is_err() {
-                continue;
-            }
+        for existing_name in self.registered_names()? {
             let other = self.read_record(&existing_name)?;
             let same_session = info.session_value.is_some()
                 && ((other.session_agent.as_deref().unwrap_or(&other.harness)
@@ -7587,11 +7695,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 ));
             }
         }
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&self.registry)?;
+        self.create_agent_directory(&directory)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
@@ -7710,10 +7814,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let archive = self.registry.join("archive");
         agent::create_private_directory(&archive, "agent archive", false, false)?;
         let destination = archive.join(format!("{}-{}-adopt-failed", record.name, record.token));
-        fs::rename(self.directory(&record.name)?, &destination)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&archive)?;
-        agent::sync_directory(&self.registry)?;
+        self.move_to_archive(&record.name, &destination, &archive)?;
         record.lifecycle = "adopt_failed".to_owned();
         record.error = Some(error.to_owned());
         agent::atomic_json(&destination.join("agent.json"), &json!(record))?;
@@ -7793,6 +7894,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
+                registry: None,
                 check_prompt: true,
                 expected_workspace: None,
                 readback: None,
@@ -7965,6 +8067,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
+                registry: None,
                 check_prompt: false,
                 expected_workspace: None,
                 readback: None,
@@ -7983,6 +8086,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
+                registry: None,
                 check_prompt,
                 expected_workspace: self.project_workspace()?,
                 readback: None,
@@ -8025,10 +8129,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )?;
         record.lifecycle = "stopped".to_owned();
         self.save(&record)?;
-        fs::rename(self.directory(agent_name)?, &destination)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&archive)?;
-        agent::sync_directory(&self.registry)?;
+        self.move_to_archive(agent_name, &destination, &archive)?;
         Ok(json!({
             "name": agent_name,
             "archive": destination,
@@ -8357,6 +8458,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     goal_objective: Mutex::new(None),
                     custom_submission: Mutex::new(None),
                     queue: None,
+                    registry: None,
                     check_prompt: true,
                     expected_workspace: None,
                     readback: None,
@@ -8501,6 +8603,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
+                registry: None,
                 check_prompt: false,
                 expected_workspace: None,
                 readback: None,
@@ -8570,6 +8673,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: None,
+            registry: None,
             check_prompt: false,
             expected_workspace: None,
             readback: None,
@@ -8667,14 +8771,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Ok(Vec::new());
         }
         agent::validate_private_directory(&self.registry, "agent registry", false)?;
-        let mut names = fs::read_dir(&self.registry)
-            .map_err(|error| fail(error.to_string()))?
-            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| fail(error.to_string()))?;
-        names.retain(|value| name(value).is_ok());
-        names.sort();
-        Ok(names)
+        agent_queue::registry::names(&self.registry).map_err(|error| fail(error.to_string()))
     }
 
     /// The `list` row of a record this build cannot read.
@@ -8797,6 +8894,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
+            registry: Some(&self.registry),
             check_prompt: true,
             expected_workspace: self.project_workspace()?,
             readback: None,
@@ -8857,6 +8955,7 @@ its drain would type first, so it was not queued",
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
+            registry: Some(&self.registry),
             check_prompt: true,
             expected_workspace: self.project_workspace()?,
             readback: None,
@@ -9139,6 +9238,7 @@ its drain would type first, so it was not queued",
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
+            registry: Some(&self.registry),
             check_prompt: false,
             expected_workspace: self.project_workspace()?,
             readback: None,
@@ -9362,6 +9462,7 @@ its drain would type first, so it was not queued",
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
+            registry: Some(&self.registry),
             check_prompt: true,
             expected_workspace: self.project_workspace()?,
             readback,
@@ -9467,6 +9568,7 @@ its drain would type first, so it was not queued",
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: Some(&self.queue(agent_name)?),
+                registry: Some(&self.registry),
                 check_prompt: true,
                 expected_workspace: self.project_workspace()?,
                 readback: None,
@@ -9498,6 +9600,7 @@ its drain would type first, so it was not queued",
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: Some(&queue),
+                registry: Some(&self.registry),
                 check_prompt: true,
                 expected_workspace: self.project_workspace()?,
                 readback: None,
@@ -9547,6 +9650,7 @@ its drain would type first, so it was not queued",
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: None,
+            registry: None,
             check_prompt: false,
             expected_workspace: self.project_workspace()?,
             readback: None,
@@ -9638,6 +9742,7 @@ its drain would type first, so it was not queued",
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
+                registry: None,
                 check_prompt: false,
                 expected_workspace: None,
                 readback: None,
@@ -9925,6 +10030,7 @@ its drain would type first, so it was not queued",
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
+            registry: Some(&self.registry),
             check_prompt: true,
             expected_workspace: self.project_workspace()?,
             readback: None,
@@ -10282,7 +10388,12 @@ its drain would type first, so it was not queued",
             .and_then(|value| value.to_str())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| fail("invalid agent archive destination name"))?;
-        let registry_parent = Self::pinned_parent_directory(&self.registry, "agent registry")?;
+        // The directory holding the agent: `REGISTRY/agents`, or the registry for layout 1.
+        let active_parent = pinned
+            .path
+            .parent()
+            .ok_or_else(|| fail("agent directory has no parent"))?;
+        let registry_parent = Self::pinned_parent_directory(active_parent, "agent registry")?;
         let archive_parent = Self::pinned_parent_directory(archive_path, "agent archive")?;
         Self::verify_pinned_agent_directory(pinned)?;
         if Self::child_directory_identity(&registry_parent.file, &pinned.name)?
@@ -11399,10 +11510,7 @@ its drain would type first, so it was not queued",
             }
             record.lifecycle = "stopped".to_owned();
             self.save(&record)?;
-            fs::rename(self.directory(agent_name)?, &destination)
-                .map_err(|error| fail(error.to_string()))?;
-            agent::sync_directory(&archive)?;
-            agent::sync_directory(&self.registry)?;
+            self.move_to_archive(agent_name, &destination, &archive)?;
             return Ok(json!({
                 "name": agent_name,
                 "archive": destination,
@@ -11486,10 +11594,7 @@ its drain would type first, so it was not queued",
         }
         record.lifecycle = "stopped".to_owned();
         self.save(&record)?;
-        fs::rename(self.directory(agent_name)?, &destination)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&archive)?;
-        agent::sync_directory(&self.registry)?;
+        self.move_to_archive(agent_name, &destination, &archive)?;
         let tab_closed = if owned.is_empty() {
             Some(false)
         } else {
@@ -11735,7 +11840,7 @@ pub(crate) mod tests {
 
         fn make_legacy_dead(&self) -> (String, String, Vec<u8>) {
             let adopted = self.adopt();
-            let path = self.root.join("registry/foreign/agent.json");
+            let path = self.root.join("registry/agents/foreign/agent.json");
             let mut document = agent::read_private_json(&path).unwrap();
             document
                 .as_object_mut()
@@ -11769,7 +11874,8 @@ pub(crate) mod tests {
         let registry = fixture.root.join("registry");
         let manager = ManagedAgents::new(&fixture.client, &registry).expect("manager");
         agent::create_private_directory(&registry, "agent registry", true, true).expect("registry");
-        let path = registry.join(".coordinator.lock");
+        agent_queue::registry::prepare(&registry).expect("registry layout");
+        let path = registry.join("locks/coordinator.lock");
         let holder = agent::open_private_lock(&path, "held lifecycle lock").expect("holder");
         holder.lock_exclusive().expect("hold lifecycle lock");
         let runtime = CancelLifecycleWait::default();
@@ -11788,7 +11894,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new();
         fixture.start(None);
         let manager = fixture.manager();
-        let queue = fixture.root.join("registry/worker/queue");
+        let queue = fixture.root.join("registry/agents/worker/queue");
         let runtime = agent::SystemRuntime::default();
         let options = DrainOptions {
             ready_timeout: Duration::ZERO,
@@ -11943,6 +12049,7 @@ pub(crate) mod tests {
                 prior_transcript_count: 0,
             })),
             queue: None,
+            registry: None,
             check_prompt: false,
             expected_workspace: None,
             readback: None,
@@ -12310,7 +12417,7 @@ pub(crate) mod tests {
             }
             if self.require_start_lock.load(Ordering::Relaxed) {
                 let lock = agent::open_private_lock(
-                    &self.root.join("registry/.worker.lock"),
+                    &self.root.join("registry/locks/worker.lock"),
                     "test lifecycle lock",
                 )
                 .unwrap();
@@ -12323,14 +12430,18 @@ pub(crate) mod tests {
                 return Err(AdapterError::unavailable("missing pane"));
             }
             let changed_after_save = self.change_session_after_save.load(Ordering::Relaxed)
-                && self.root.join("registry/foreign/agent.json").exists();
-            let owned_changed_after_save =
-                self.change_owned_session_after_save.load(Ordering::Relaxed)
-                    && agent::read_private_json(&self.root.join("registry/worker/agent.json"))
-                        .ok()
-                        .and_then(|record| record["lifecycle"].as_str().map(str::to_owned))
-                        .as_deref()
-                        == Some("running");
+                && self
+                    .root
+                    .join("registry/agents/foreign/agent.json")
+                    .exists();
+            let owned_changed_after_save = self
+                .change_owned_session_after_save
+                .load(Ordering::Relaxed)
+                && agent::read_private_json(&self.root.join("registry/agents/worker/agent.json"))
+                    .ok()
+                    .and_then(|record| record["lifecycle"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("running");
             let changed_after_save = changed_after_save || owned_changed_after_save;
             let dead = self.dead_panes.lock().unwrap().contains(pane);
             let stale_report = self.stale_reported_panes.lock().unwrap().contains(pane);
@@ -12500,7 +12611,7 @@ pub(crate) mod tests {
                 .swap(false, Ordering::Relaxed)
             {
                 for name in ["foreign", "worker"] {
-                    let path = self.root.join(format!("registry/{name}/agent.json"));
+                    let path = self.root.join(format!("registry/agents/{name}/agent.json"));
                     if path.is_file() {
                         let mut document = agent::read_private_json(&path).unwrap();
                         document["token"] = json!("replacement-generation");
@@ -12512,7 +12623,7 @@ pub(crate) mod tests {
                 .add_null_shell_identity_on_read
                 .swap(false, Ordering::Relaxed)
             {
-                let path = self.root.join("registry/foreign/agent.json");
+                let path = self.root.join("registry/agents/foreign/agent.json");
                 if path.is_file() {
                     let mut document = agent::read_private_json(&path).unwrap();
                     document["foreign_shell_identity"] = Value::Null;
@@ -12524,7 +12635,7 @@ pub(crate) mod tests {
                 .swap(false, Ordering::Relaxed)
             {
                 for name in ["foreign", "worker"] {
-                    let active = self.root.join(format!("registry/{name}"));
+                    let active = self.root.join(format!("registry/agents/{name}"));
                     if active.is_dir() {
                         let displaced = self.root.join(format!("registry/.{name}-displaced"));
                         fs::rename(&active, &displaced).unwrap();
@@ -12850,7 +12961,10 @@ pub(crate) mod tests {
             pane: &str,
             expected: &CustomProcessIdentity,
         ) -> AdapterResult<bool> {
-            if self.root.join("registry/foreign/agent.json").exists()
+            if self
+                .root
+                .join("registry/agents/foreign/agent.json")
+                .exists()
                 && self
                     .replace_harness_after_save
                     .swap(false, Ordering::Relaxed)
@@ -13085,7 +13199,7 @@ pub(crate) mod tests {
             persist_identity(identity)?;
             if self.custom_fails_after_identity.load(Ordering::Relaxed) {
                 let record =
-                    agent::read_private_json(&self.root.join("registry/worker/agent.json"))
+                    agent::read_private_json(&self.root.join("registry/agents/worker/agent.json"))
                         .expect("identity callback persisted the starting record");
                 assert_eq!(record["lifecycle"], "starting");
                 assert_eq!(record["custom_process_identity"]["pid"], 4242);
@@ -13131,7 +13245,10 @@ pub(crate) mod tests {
         fn pane_shell_identity(&self, _: &str) -> AdapterResult<CustomProcessIdentity> {
             let mut identity = self.foreign_shell_identity.lock().unwrap().clone();
             if self.change_foreign_shell_after_save.load(Ordering::Relaxed)
-                && self.root.join("registry/foreign/agent.json").exists()
+                && self
+                    .root
+                    .join("registry/agents/foreign/agent.json")
+                    .exists()
             {
                 identity.starttime_ticks += 1;
             }
@@ -13158,7 +13275,11 @@ pub(crate) mod tests {
                 identity: self.foreign_shell_identity.lock().unwrap().clone(),
                 executable_path: self.foreign_shell_path.lock().unwrap().clone(),
             });
-            if self.root.join("registry/worker/output.json").exists() {
+            if self
+                .root
+                .join("registry/agents/worker/output.json")
+                .exists()
+            {
                 match self.shell_proof_mutation.swap(0, Ordering::Relaxed) {
                     1 => self.panes.lock().unwrap().push(Self::pane("human")),
                     2 => self.started.store(true, Ordering::Relaxed),
@@ -13365,11 +13486,15 @@ pub(crate) mod tests {
         let separator = argv.iter().position(|item| *item == "--").unwrap();
         assert_eq!(argv[separator + 1], "/opt/bin/codex");
         let record: AgentRecord = serde_json::from_value(
-            agent::read_private_json(&fixture.root.join("registry/worker/agent.json")).unwrap(),
+            agent::read_private_json(&fixture.root.join("registry/agents/worker/agent.json"))
+                .unwrap(),
         )
         .unwrap();
         record
-            .validate_loaded(&fixture.root.join("registry/worker/agent.json"), "worker")
+            .validate_loaded(
+                &fixture.root.join("registry/agents/worker/agent.json"),
+                "worker",
+            )
             .unwrap();
     }
 
@@ -13947,7 +14072,7 @@ fi
             .unwrap();
         assert_eq!(status["workspace_id"], "elsewhere");
         let record: Value = serde_json::from_slice(
-            &fs::read(inherited.root.join("registry/worker/agent.json")).unwrap(),
+            &fs::read(inherited.root.join("registry/agents/worker/agent.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(record["workspace_id"], "elsewhere");
@@ -14008,7 +14133,9 @@ fi
             manager
                 .send("worker", "create binding", DrainOptions::default())
                 .unwrap();
-            let path = fixture.root.join("registry/worker/queue/target.json");
+            let path = fixture
+                .root
+                .join("registry/agents/worker/queue/target.json");
             let mut document = agent::read_private_json(&path).unwrap();
             document["expected_workspace"] = json!("legacy-project");
             agent::atomic_json(&path, &document).unwrap();
@@ -14122,7 +14249,7 @@ fi
         let mut replacement = record.target().unwrap();
         replacement.pane_id = Some("project-pane".to_owned());
         agent::rebind_queue(
-            &fixture.root.join("registry/worker/queue"),
+            &fixture.root.join("registry/agents/worker/queue"),
             &record.target().unwrap(),
             &replacement,
         )
@@ -14142,7 +14269,10 @@ fi
                 .map(String::as_str),
             Some("after recovery")
         );
-        assert!(!fixture.root.join("registry/worker/move.json").exists());
+        assert!(!fixture
+            .root
+            .join("registry/agents/worker/move.json")
+            .exists());
     }
 
     #[test]
@@ -14174,9 +14304,16 @@ fi
 
         let repeated = manager.move_to_project_workspace("worker").unwrap();
         assert_eq!(repeated["moved"], false);
-        assert!(!fixture.root.join("registry/worker/move.json").exists());
+        assert!(!fixture
+            .root
+            .join("registry/agents/worker/move.json")
+            .exists());
 
-        agent::atomic_json(&fixture.root.join("registry/worker/move.json"), &json!({})).unwrap();
+        agent::atomic_json(
+            &fixture.root.join("registry/agents/worker/move.json"),
+            &json!({}),
+        )
+        .unwrap();
         let invalid = manager.status("worker").unwrap();
         assert_eq!(invalid["agent_status"], "unknown");
         assert!(invalid["probe_error"]
@@ -14208,7 +14345,10 @@ fi
                 "worker".to_owned(),
             )]
         );
-        assert!(!fixture.root.join("registry/worker/move.json").exists());
+        assert!(!fixture
+            .root
+            .join("registry/agents/worker/move.json")
+            .exists());
         assert_eq!(manager.stop("worker").unwrap()["pane_closed"], true);
     }
 
@@ -14220,7 +14360,7 @@ fi
             .manager()
             .send("worker", "bind", DrainOptions::default())
             .unwrap();
-        let queue = fixture.root.join("registry/worker/queue");
+        let queue = fixture.root.join("registry/agents/worker/queue");
         agent::atomic_json(
             &queue.join("target.json"),
             &json!({
@@ -14316,7 +14456,7 @@ fi
             .move_to_project_workspace("worker")
             .unwrap_err();
         assert!(error.to_string().contains("managed name did not follow"));
-        assert!(name.root.join("registry/worker/move.json").exists());
+        assert!(name.root.join("registry/agents/worker/move.json").exists());
 
         let presentation = Fixture::new();
         presentation.start(None);
@@ -14333,7 +14473,10 @@ fi
         assert!(error
             .to_string()
             .contains("final presentation verification failed"));
-        assert!(presentation.root.join("registry/worker/move.json").exists());
+        assert!(presentation
+            .root
+            .join("registry/agents/worker/move.json")
+            .exists());
     }
 
     #[test]
@@ -14349,7 +14492,10 @@ fi
             .with_project_workspace(Some("project-agents"));
         let error = manager.move_to_project_workspace("worker").unwrap_err();
         assert!(error.to_string().contains("before mutation"));
-        assert!(!fixture.root.join("registry/worker/move.json").exists());
+        assert!(!fixture
+            .root
+            .join("registry/agents/worker/move.json")
+            .exists());
 
         fixture
             .client
@@ -14500,6 +14646,7 @@ fi
             goal_objective: Mutex::new(Some("replace the active objective".to_owned())),
             custom_submission: Mutex::new(None),
             queue: None,
+            registry: None,
             check_prompt: false,
             expected_workspace: None,
             readback: None,
@@ -14674,7 +14821,7 @@ fi
                 || error.to_string().contains("expected \"muse\""),
             "{error}"
         );
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
         assert!(fixture.client.runs.lock().unwrap().is_empty());
     }
@@ -14782,9 +14929,12 @@ fi
             *fixture.client.runs.lock().unwrap(),
             ["follow up", "/goal finish adopted work"]
         );
-        let binding =
-            agent::read_private_json(&fixture.root.join("registry/foreign/queue/target.json"))
-                .unwrap();
+        let binding = agent::read_private_json(
+            &fixture
+                .root
+                .join("registry/agents/foreign/queue/target.json"),
+        )
+        .unwrap();
         assert_eq!(binding["kind"], "session");
         assert_eq!(binding["agent"], "codex");
         assert_eq!(binding["value"], "thread");
@@ -14835,7 +14985,7 @@ fi
             .unwrap_err();
 
         assert!(error.to_string().contains("was not registered"));
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
         let archives = fs::read_dir(fixture.root.join("registry/archive"))
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -14957,7 +15107,7 @@ fi
     fn stopping_an_absent_legacy_adopted_agent_refuses_missing_shell_identity() {
         let fixture = Fixture::new();
         fixture.adopt();
-        let path = fixture.root.join("registry/foreign/agent.json");
+        let path = fixture.root.join("registry/agents/foreign/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         document
             .as_object_mut()
@@ -14990,7 +15140,7 @@ fi
             .manager()
             .send("foreign", "retained request", DrainOptions::default())
             .unwrap();
-        let record_path = fixture.root.join("registry/foreign/agent.json");
+        let record_path = fixture.root.join("registry/agents/foreign/agent.json");
         let mut document = agent::read_private_json(&record_path).unwrap();
         document
             .as_object_mut()
@@ -15002,7 +15152,7 @@ fi
         let queue_before = fs::read(
             fixture
                 .root
-                .join("registry/foreign/queue/processed")
+                .join("registry/agents/foreign/queue/processed")
                 .read_dir()
                 .unwrap()
                 .next()
@@ -15066,7 +15216,7 @@ fi
             let fixture = Fixture::new();
             let (token, mut digest, _) = fixture.make_legacy_dead();
             if case == "null" {
-                let path = fixture.root.join("registry/foreign/agent.json");
+                let path = fixture.root.join("registry/agents/foreign/agent.json");
                 let mut document = agent::read_private_json(&path).unwrap();
                 document["foreign_shell_identity"] = Value::Null;
                 agent::atomic_json(&path, &document).unwrap();
@@ -15096,7 +15246,7 @@ fi
                 .stop_with_options("foreign", options)
                 .is_err());
             assert!(fixture.client.closed.lock().unwrap().is_empty());
-            assert!(fixture.root.join("registry/foreign").is_dir());
+            assert!(fixture.root.join("registry/agents/foreign").is_dir());
         }
     }
 
@@ -15158,7 +15308,7 @@ fi
                 .unwrap_err();
             assert!(error.to_string().contains("runtime identity changed"));
             assert!(fixture.client.closed.lock().unwrap().is_empty());
-            assert!(fixture.root.join("registry/foreign").is_dir());
+            assert!(fixture.root.join("registry/agents/foreign").is_dir());
         }
     }
 
@@ -15202,7 +15352,7 @@ fi
                 )
                 .is_err());
             assert!(fixture.client.closed.lock().unwrap().is_empty());
-            assert!(fixture.root.join("registry/foreign").is_dir());
+            assert!(fixture.root.join("registry/agents/foreign").is_dir());
         }
     }
 
@@ -15246,7 +15396,7 @@ fi
                 assert_eq!(error.exit_code(), 75);
             }
             assert!(fixture.client.closed.lock().unwrap().is_empty());
-            assert!(fixture.root.join("registry/foreign").is_dir());
+            assert!(fixture.root.join("registry/agents/foreign").is_dir());
         }
     }
 
@@ -15254,7 +15404,7 @@ fi
     fn explicit_legacy_recovery_binds_absent_key_and_parsed_record_to_same_bytes() {
         let fixture = Fixture::new();
         let (token, digest, _) = fixture.make_legacy_dead();
-        let output = fixture.root.join("registry/foreign/output.json");
+        let output = fixture.root.join("registry/agents/foreign/output.json");
         let prior = b"{\"prior\":\"evidence\"}\n";
         fs::write(&output, prior).unwrap();
         fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
@@ -15291,7 +15441,7 @@ fi
         let manager = fixture.manager();
         let record = manager.load("foreign").unwrap();
         let pinned = manager.pinned_agent_directory("foreign").unwrap();
-        let path = fixture.root.join("registry/foreign/agent.json");
+        let path = fixture.root.join("registry/agents/foreign/agent.json");
         let options = StopOptions {
             expected_token: Some(token),
             recover_legacy_adoption: true,
@@ -15311,8 +15461,11 @@ fi
         assert!(error
             .to_string()
             .contains("requires foreign_shell_identity to be absent"));
-        assert!(fixture.root.join("registry/foreign").is_dir());
-        assert!(!fixture.root.join("registry/foreign/output.json").exists());
+        assert!(fixture.root.join("registry/agents/foreign").is_dir());
+        assert!(!fixture
+            .root
+            .join("registry/agents/foreign/output.json")
+            .exists());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 
@@ -15338,10 +15491,13 @@ fi
 
         assert!(error.to_string().contains("output.json larger"));
         assert_eq!(
-            fs::read(fixture.root.join("registry/foreign/agent.json")).unwrap(),
+            fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap(),
             raw
         );
-        assert!(!fixture.root.join("registry/foreign/output.json").exists());
+        assert!(!fixture
+            .root
+            .join("registry/agents/foreign/output.json")
+            .exists());
         assert!(!fixture
             .root
             .join(format!("registry/archive/foreign-{token}"))
@@ -15390,7 +15546,7 @@ fi
                 fixture.make_legacy_dead();
                 let manager = fixture.manager();
                 let target = if target_kind == "agent" {
-                    fixture.root.join("registry/foreign")
+                    fixture.root.join("registry/agents/foreign")
                 } else {
                     let path = fixture.root.join("registry/archive");
                     fs::create_dir(&path).unwrap();
@@ -15439,7 +15595,7 @@ fi
         let fixture = Fixture::new();
         fixture.make_legacy_dead();
         let manager = fixture.manager();
-        let agent_path = fixture.root.join("registry/foreign");
+        let agent_path = fixture.root.join("registry/agents/foreign");
         let agent_pinned = manager.pinned_agent_directory("foreign").unwrap();
         fs::set_permissions(&agent_path, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(ManagedAgents::<Fake>::verify_pinned_agent_directory(&agent_pinned).is_err());
@@ -15465,7 +15621,7 @@ fi
             fixture.make_legacy_dead();
             let manager = fixture.manager();
             let pinned = manager.pinned_agent_directory("foreign").unwrap();
-            let active = fixture.root.join("registry/foreign");
+            let active = fixture.root.join("registry/agents/foreign");
             let held = active.join(format!(".held-{phase}"));
             let content = b"{\"new\":true}\n";
             let result = atomic_replace_bytes_with(
@@ -15550,7 +15706,7 @@ fi
             let record = manager.load("foreign").unwrap();
             let (_archive, destination) = manager.archive_destination(&record).unwrap();
             let pinned = manager.pinned_agent_directory("foreign").unwrap();
-            let active = fixture.root.join("registry/foreign");
+            let active = fixture.root.join("registry/agents/foreign");
             let prior = b"{\"prior\":true}\n";
             fs::write(active.join("output.json"), prior).unwrap();
             fs::set_permissions(
@@ -15631,7 +15787,7 @@ fi
         let (_token, _digest, _) = fixture.make_legacy_dead();
         let manager = fixture.manager();
         let record = manager.load("foreign").unwrap();
-        let output = fixture.root.join("registry/foreign/output.json");
+        let output = fixture.root.join("registry/agents/foreign/output.json");
         let prior = b"{\n  \"prior\": \"exact evidence\"\n}\n";
         fs::write(&output, prior).unwrap();
         fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
@@ -15651,7 +15807,7 @@ fi
             .unwrap_err();
         assert!(error.to_string().contains("existing agent archive"));
         assert_eq!(fs::read(&output).unwrap(), prior);
-        assert!(fixture.root.join("registry/foreign").is_dir());
+        assert!(fixture.root.join("registry/agents/foreign").is_dir());
 
         fs::remove_file(&destination).unwrap();
         let error = manager
@@ -15674,7 +15830,7 @@ fi
             )
             .unwrap_err();
         assert!(error.to_string().contains("published"));
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
         assert!(destination.is_dir());
         assert_eq!(
             agent::read_private_json(&destination.join("output.json")).unwrap()["text"],
@@ -15690,7 +15846,7 @@ fi
             let manager = fixture.manager();
             let record = manager.load("foreign").unwrap();
             let (_archive, destination) = manager.archive_destination(&record).unwrap();
-            let active = fixture.root.join("registry/foreign");
+            let active = fixture.root.join("registry/agents/foreign");
             fs::write(active.join("output.json"), b"{\"prior\":true}\n").unwrap();
             fs::set_permissions(
                 active.join("output.json"),
@@ -15754,7 +15910,7 @@ fi
         let manager = fixture.manager();
         let record = manager.load("foreign").unwrap();
         let (_archive, destination) = manager.archive_destination(&record).unwrap();
-        let active = fixture.root.join("registry/foreign");
+        let active = fixture.root.join("registry/agents/foreign");
         let prior = b"{\"prior\":true}\n";
         fs::write(active.join("output.json"), prior).unwrap();
         fs::set_permissions(
@@ -15828,7 +15984,7 @@ fi
                 calls,
                 ["published agent archive", "published agent registry"]
             );
-            assert!(!fixture.root.join("registry/foreign").exists());
+            assert!(!fixture.root.join("registry/agents/foreign").exists());
             assert_eq!(
                 agent::read_private_json(&destination.join("output.json")).unwrap()["text"],
                 "new retained output"
@@ -15844,7 +16000,7 @@ fi
         let record = manager.load("foreign").unwrap();
         let (_archive, destination) = manager.archive_destination(&record).unwrap();
         let pinned = manager.pinned_agent_directory("foreign").unwrap();
-        let active = fixture.root.join("registry/foreign");
+        let active = fixture.root.join("registry/agents/foreign");
         let displaced = fixture.root.join("registry/.foreign-original");
         let mut published = false;
 
@@ -15883,7 +16039,7 @@ fi
         let record = manager.load("foreign").unwrap();
         let (_archive, destination) = manager.archive_destination(&record).unwrap();
         let pinned = manager.pinned_agent_directory("foreign").unwrap();
-        let active = fixture.root.join("registry/foreign");
+        let active = fixture.root.join("registry/agents/foreign");
 
         let error = manager
             .publish_archive_with(
@@ -15952,7 +16108,7 @@ fi
             .unwrap_err();
 
         assert!(error.to_string().contains("not a private directory"));
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
         assert_eq!(
             fs::symlink_metadata(&destination)
                 .unwrap()
@@ -15975,7 +16131,7 @@ fi
         let record = manager.load("foreign").unwrap();
         let (_archive, destination) = manager.archive_destination(&record).unwrap();
         let pinned = manager.pinned_agent_directory("foreign").unwrap();
-        let active = fixture.root.join("registry/foreign");
+        let active = fixture.root.join("registry/agents/foreign");
         let displaced = fixture.root.join("registry/archive/.held-original");
 
         let error = manager
@@ -16022,7 +16178,7 @@ fi
         let record = manager.load("foreign").unwrap();
         let (_archive, destination) = manager.archive_destination(&record).unwrap();
         let pinned = manager.pinned_agent_directory("foreign").unwrap();
-        let active = fixture.root.join("registry/foreign");
+        let active = fixture.root.join("registry/agents/foreign");
         let displaced = fixture.root.join("registry/.foreign-after-rollback");
 
         let mut wrong_record = raw.clone();
@@ -16064,7 +16220,7 @@ fi
         let record = manager.load("foreign").unwrap();
         let (archive, destination) = manager.archive_destination(&record).unwrap();
         let pinned = manager.pinned_agent_directory("foreign").unwrap();
-        let active = fixture.root.join("registry/foreign");
+        let active = fixture.root.join("registry/agents/foreign");
         let displaced_archive = fixture.root.join("registry/.archive-original");
         let mut published = false;
 
@@ -16105,7 +16261,7 @@ fi
             let record = manager.load("foreign").unwrap();
             let (_archive, destination) = manager.archive_destination(&record).unwrap();
             let pinned = manager.pinned_agent_directory("foreign").unwrap();
-            let active_record = fixture.root.join("registry/foreign/agent.json");
+            let active_record = fixture.root.join("registry/agents/foreign/agent.json");
             let published_record = destination.join("agent.json");
             let mut calls = Vec::new();
 
@@ -16149,11 +16305,11 @@ fi
             assert!(message.contains("rollback completed"));
             assert!(message.contains("durability is uncertain"));
             assert!(message.contains(failing_label));
-            assert!(fixture.root.join("registry/foreign").is_dir());
+            assert!(fixture.root.join("registry/agents/foreign").is_dir());
             assert!(!destination.exists());
             assert_eq!(calls, ["agent archive rollback", "agent registry rollback"]);
             assert_eq!(
-                agent::read_private_json(&fixture.root.join("registry/foreign/output.json"))
+                agent::read_private_json(&fixture.root.join("registry/agents/foreign/output.json"))
                     .unwrap()["text"],
                 "new retained output"
             );
@@ -16168,7 +16324,7 @@ fi
         let record = manager.load("foreign").unwrap();
         let (_archive, destination) = manager.archive_destination(&record).unwrap();
         let pinned = manager.pinned_agent_directory("foreign").unwrap();
-        let record_path = fixture.root.join("registry/foreign/agent.json");
+        let record_path = fixture.root.join("registry/agents/foreign/agent.json");
         let mut published = false;
 
         let mut document = agent::read_private_json(&record_path).unwrap();
@@ -16194,7 +16350,7 @@ fi
         assert!(error
             .to_string()
             .contains("record changed during archival publication"));
-        assert!(fixture.root.join("registry/foreign").is_dir());
+        assert!(fixture.root.join("registry/agents/foreign").is_dir());
         assert!(!destination.exists());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
@@ -16207,7 +16363,7 @@ fi
         let record = manager.load("foreign").unwrap();
         let (_archive, destination) = manager.archive_destination(&record).unwrap();
         let pinned = manager.pinned_agent_directory("foreign").unwrap();
-        let active = fixture.root.join("registry/foreign");
+        let active = fixture.root.join("registry/agents/foreign");
         let held = fixture.root.join("registry/.foreign-held");
         let mut published = false;
 
@@ -16246,7 +16402,7 @@ fi
         for case in ["collision", "snapshot"] {
             let fixture = Fixture::new();
             let (token, digest, raw) = fixture.make_legacy_dead();
-            let active = fixture.root.join("registry/foreign");
+            let active = fixture.root.join("registry/agents/foreign");
             if case == "collision" {
                 let destination = fixture
                     .root
@@ -16344,7 +16500,7 @@ fi
     fn stopping_a_live_legacy_adopted_agent_refuses_missing_shell_identity() {
         let fixture = Fixture::new();
         fixture.adopt();
-        let path = fixture.root.join("registry/foreign/agent.json");
+        let path = fixture.root.join("registry/agents/foreign/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         document
             .as_object_mut()
@@ -16671,21 +16827,21 @@ fi
             .push(Fake::pane("owned"));
         let manager = fixture.manager();
         assert!(manager.adopt("foreign", fixture.adopt_options()).is_err());
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
 
         let fixture = Fixture::new();
         fixture.prepare_foreign();
         let mut options = fixture.adopt_options();
         options.harness = "claude".to_owned();
         assert!(fixture.manager().adopt("foreign", options).is_err());
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
 
         let fixture = Fixture::new();
         fixture.prepare_foreign();
         let mut options = fixture.adopt_options();
         options.expected_workspace = "wrong".to_owned();
         assert!(fixture.manager().adopt("foreign", options).is_err());
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
 
         let fixture = Fixture::new();
         fixture.prepare_foreign();
@@ -16694,14 +16850,14 @@ fi
         let mut options = fixture.adopt_options();
         options.cwd = wrong;
         assert!(fixture.manager().adopt("foreign", options).is_err());
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
 
         let fixture = Fixture::new();
         fixture.prepare_foreign();
         let mut options = fixture.adopt_options();
         options.session = Some("wrong-thread".to_owned());
         assert!(fixture.manager().adopt("foreign", options).is_err());
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
     }
 
     #[test]
@@ -16717,7 +16873,7 @@ fi
             fixture.manager().get("foreign").unwrap()["token"],
             adopted["token"]
         );
-        assert!(!fixture.root.join("registry/second").exists());
+        assert!(!fixture.root.join("registry/agents/second").exists());
     }
 
     #[test]
@@ -16740,7 +16896,7 @@ fi
     fn list_reports_an_unreadable_record_as_its_own_row() {
         let fixture = Fixture::new();
         fixture.adopt();
-        let broken = fixture.root.join("registry/broken");
+        let broken = fixture.root.join("registry/agents/broken");
         fs::create_dir(&broken).unwrap();
         fs::set_permissions(&broken, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(broken.join("agent.json"), b"{").unwrap();
@@ -16755,7 +16911,7 @@ fi
         let good = rows.iter().find(|row| row["name"] == "foreign").unwrap();
         assert!(good.get("record_error").is_none());
 
-        let nested = fixture.root.join("registry/nested");
+        let nested = fixture.root.join("registry/agents/nested");
         fs::create_dir(&nested).unwrap();
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
@@ -16777,7 +16933,7 @@ fi
     fn adoption_refuses_same_harness_session_held_by_headless_record() {
         let fixture = Fixture::new();
         fixture.start(None);
-        let path = fixture.root.join("registry/worker/agent.json");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         document["adapter"] = json!("turn-runner");
         document["mode"] = json!("headless");
@@ -16796,7 +16952,7 @@ fi
         options.pane_id = "foreign".to_owned();
         let error = fixture.manager().adopt("foreign", options).unwrap_err();
         assert!(error.to_string().contains("already registered as"));
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
     }
 
     #[test]
@@ -16816,7 +16972,7 @@ fi
             )
             .unwrap_err();
         assert!(error.to_string().contains("already registered as"));
-        assert!(!fixture.root.join("registry/second").exists());
+        assert!(!fixture.root.join("registry/agents/second").exists());
         assert_eq!(*fixture.client.panes.lock().unwrap(), [presentation]);
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
@@ -16858,7 +17014,7 @@ fi
     fn conflicting_started_pane_remains_stoppable_if_initial_close_fails() {
         let fixture = Fixture::new();
         fixture.start(None);
-        let holder_path = fixture.root.join("registry/worker/agent.json");
+        let holder_path = fixture.root.join("registry/agents/worker/agent.json");
         let mut holder = agent::read_private_json(&holder_path).unwrap();
         holder["adapter"] = json!("turn-runner");
         holder["mode"] = json!("headless");
@@ -16906,7 +17062,7 @@ fi
             .adopt("foreign", fixture.adopt_options())
             .unwrap_err();
         assert!(error.to_string().contains("exactly one live pane"));
-        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(!fixture.root.join("registry/agents/foreign").exists());
     }
 
     #[test]
@@ -16927,7 +17083,7 @@ fi
                 .adopt("foreign", fixture.adopt_options())
                 .unwrap_err();
             assert!(error.to_string().contains("was not registered"));
-            assert!(!fixture.root.join("registry/foreign").exists());
+            assert!(!fixture.root.join("registry/agents/foreign").exists());
             let records: Vec<PathBuf> = fs::read_dir(fixture.root.join("registry/archive"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path().join("agent.json"))
@@ -16959,9 +17115,12 @@ fi
         manager
             .send("foreign", "still pane bound", DrainOptions::default())
             .unwrap();
-        let binding =
-            agent::read_private_json(&fixture.root.join("registry/foreign/queue/target.json"))
-                .unwrap();
+        let binding = agent::read_private_json(
+            &fixture
+                .root
+                .join("registry/agents/foreign/queue/target.json"),
+        )
+        .unwrap();
         assert_eq!(binding["kind"], "pane");
         assert_eq!(binding["pane_id"], "owned");
     }
@@ -17225,7 +17384,7 @@ fi
                 },
             )
             .unwrap();
-        let path = fixture.root.join("registry/worker/agent.json");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
         let mut record = agent::read_private_json(&path).unwrap();
         record["custom_process_identity"]
             .as_object_mut()
@@ -17241,7 +17400,7 @@ fi
         let fixture = Fixture::new();
         fixture.adopt();
         let manager = fixture.manager();
-        let path = fixture.root.join("registry/foreign/agent.json");
+        let path = fixture.root.join("registry/agents/foreign/agent.json");
         let original = agent::read_private_json(&path).unwrap();
 
         let mut malformed = original.clone();
@@ -17399,7 +17558,7 @@ fi
     fn managed_dead_stop_refuses_expanded_stopped_record_before_close() {
         let fixture = Fixture::new();
         let (_pane, token) = fixture.make_managed_dead();
-        let path = fixture.root.join("registry/worker/agent.json");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         document["future_padding"] = json!(vec!["x"; 150_000]);
         let mut raw = serde_json::to_vec(&document).unwrap();
@@ -17427,7 +17586,10 @@ fi
         assert!(error.to_string().contains("stopped agent record larger"));
         assert!(fixture.client.closed.lock().unwrap().is_empty());
         assert_eq!(fs::read(&path).unwrap(), raw);
-        assert!(!fixture.root.join("registry/worker/output.json").exists());
+        assert!(!fixture
+            .root
+            .join("registry/agents/worker/output.json")
+            .exists());
         assert!(!fixture
             .root
             .join(format!("registry/archive/worker-{token}"))
@@ -17442,7 +17604,7 @@ fi
             let manager = fixture.manager();
             let record = manager.load("worker").unwrap();
             let pinned = manager.pinned_agent_directory("worker").unwrap();
-            let active = fixture.root.join("registry/worker");
+            let active = fixture.root.join("registry/agents/worker");
             let prior = b"{\"prior\":true}\n";
             fs::write(active.join("output.json"), prior).unwrap();
             fs::set_permissions(
@@ -17520,7 +17682,7 @@ fi
     fn managed_dead_stop_refuses_stopping_record_without_prior_proof() {
         let fixture = Fixture::new();
         let (_pane, token) = fixture.make_managed_dead();
-        let path = fixture.root.join("registry/worker/agent.json");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         document["lifecycle"] = json!("stopping");
         agent::atomic_json(&path, &document).unwrap();
@@ -17547,7 +17709,7 @@ fi
         for (field, value) in [("mode", "headless"), ("backend", "tmux")] {
             let fixture = Fixture::new();
             let (_pane, token) = fixture.make_managed_dead();
-            let path = fixture.root.join("registry/worker/agent.json");
+            let path = fixture.root.join("registry/agents/worker/agent.json");
             let mut document = agent::read_private_json(&path).unwrap();
             document[field] = json!(value);
             agent::atomic_json(&path, &document).unwrap();
@@ -17620,7 +17782,7 @@ fi
                 )
                 .is_err());
             assert!(fixture.client.closed.lock().unwrap().is_empty());
-            assert!(fixture.root.join("registry/worker").is_dir());
+            assert!(fixture.root.join("registry/agents/worker").is_dir());
         }
     }
 
@@ -17631,7 +17793,7 @@ fi
         let manager = fixture.manager();
         let record = manager.load("worker").unwrap();
         let pinned = manager.pinned_agent_directory("worker").unwrap();
-        let record_path = fixture.root.join("registry/worker/agent.json");
+        let record_path = fixture.root.join("registry/agents/worker/agent.json");
         let original_record = fs::read(&record_path).unwrap();
 
         let error = manager
@@ -17658,7 +17820,10 @@ fi
         assert!(error.to_string().contains("immediately before close"));
         assert!(fixture.client.closed.lock().unwrap().is_empty());
         assert_eq!(fs::read(record_path).unwrap(), original_record);
-        assert!(!fixture.root.join("registry/worker/output.json").exists());
+        assert!(!fixture
+            .root
+            .join("registry/agents/worker/output.json")
+            .exists());
         assert!(fs::read_dir(fixture.root.join("registry/archive"))
             .unwrap()
             .next()
@@ -17673,7 +17838,7 @@ fi
             let manager = fixture.manager();
             let record = manager.load("worker").unwrap();
             let pinned = manager.pinned_agent_directory("worker").unwrap();
-            let active = fixture.root.join("registry/worker");
+            let active = fixture.root.join("registry/agents/worker");
             let record_path = active.join("agent.json");
             let original_record = fs::read(&record_path).unwrap();
 
@@ -17755,7 +17920,7 @@ fi
             let manager = fixture.manager();
             let record = manager.load("worker").unwrap();
             let pinned = manager.pinned_agent_directory("worker").unwrap();
-            let active = fixture.root.join("registry/worker");
+            let active = fixture.root.join("registry/agents/worker");
 
             let error = manager
                 .retire_managed_dead_locked_with(
@@ -17826,8 +17991,11 @@ fi
             };
             assert!(error.to_string().contains(expected));
             assert!(fixture.client.closed.lock().unwrap().is_empty());
-            assert!(fixture.root.join("registry/worker").is_dir());
-            assert!(!fixture.root.join("registry/worker/output.json").exists());
+            assert!(fixture.root.join("registry/agents/worker").is_dir());
+            assert!(!fixture
+                .root
+                .join("registry/agents/worker/output.json")
+                .exists());
             assert!(fs::read_dir(fixture.root.join("registry/archive"))
                 .unwrap()
                 .next()
@@ -17856,8 +18024,8 @@ fi
             .unwrap_err();
         assert!(error.to_string().contains("result loss after close"));
         assert_eq!(
-            agent::read_private_json(&fixture.root.join("registry/worker/agent.json")).unwrap()
-                ["lifecycle"],
+            agent::read_private_json(&fixture.root.join("registry/agents/worker/agent.json"))
+                .unwrap()["lifecycle"],
             "running"
         );
         assert!(fixture.client.panes.lock().unwrap().is_empty());
@@ -17873,7 +18041,7 @@ fi
             )
             .unwrap();
         let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
-        assert!(!fixture.root.join("registry/worker").exists());
+        assert!(!fixture.root.join("registry/agents/worker").exists());
         assert_eq!(
             agent::read_private_json(&archive.join("agent.json")).unwrap()["lifecycle"],
             "stopped"
@@ -17906,7 +18074,7 @@ fi
             )
             .is_err());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
-        assert!(fixture.root.join("registry/worker").is_dir());
+        assert!(fixture.root.join("registry/agents/worker").is_dir());
     }
 
     #[test]
@@ -17914,7 +18082,7 @@ fi
         let fixture = Fixture::new();
         fixture.start(None);
         let manager = fixture.manager();
-        let path = fixture.root.join("registry/worker/agent.json");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         document["future_metadata"] = json!({"nested":true});
         agent::atomic_json(&path, &document).unwrap();
@@ -18028,7 +18196,7 @@ fi
             viewport_rows: 52,
         };
         // Each read persists what it read as the agent's latest snapshot.
-        let snapshot = fixture.root.join("registry/worker/output.json");
+        let snapshot = fixture.root.join("registry/agents/worker/output.json");
         let took_snapshot = || {
             let written = agent::read_private_json(&snapshot).unwrap();
             fs::remove_file(&snapshot).unwrap();
@@ -18107,7 +18275,7 @@ fi
     fn foreign_runtime_metadata_is_visible_without_herdr_mutation() {
         let fixture = Fixture::new();
         fixture.start(None);
-        let path = fixture.root.join("registry/worker/agent.json");
+        let path = fixture.root.join("registry/agents/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
         document["adapter"] = json!("turn-runner");
         document["mode"] = json!("headless");

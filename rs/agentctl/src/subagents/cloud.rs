@@ -996,7 +996,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         reasoning_effort: Option<&str>,
         cloud: CloudRecord,
         arguments: Vec<String>,
-    ) -> Result<(File, AgentRecord)> {
+    ) -> Result<(super::LifecycleLock, AgentRecord)> {
         let lock = self.lock(agent_name)?;
         let directory = self.directory(agent_name)?;
         if fs::symlink_metadata(&directory).is_ok() {
@@ -1004,11 +1004,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "agent {agent_name:?} already registered; stop it before reusing the name"
             )));
         }
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&self.registry)?;
+        self.create_agent_directory(&directory)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
@@ -1857,10 +1853,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         record.lifecycle = "stopped".to_owned();
         self.save(&record)?;
-        fs::rename(self.directory(&agent_name)?, &destination)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&archive)?;
-        agent::sync_directory(&self.registry)?;
+        self.move_to_archive(&agent_name, &destination, &archive)?;
         let tab_closed = if !pane_closed {
             Some(false)
         } else {
@@ -2303,7 +2296,8 @@ exit 0
         }
 
         fn record(&self) -> Value {
-            agent::read_private_json(&self.root.join("registry/sub-worker/agent.json")).unwrap()
+            agent::read_private_json(&self.root.join("registry/agents/sub-worker/agent.json"))
+                .unwrap()
         }
 
         fn list_row(&self, running: bool) {
@@ -2520,7 +2514,7 @@ exit 0
             .unwrap_err()
             .to_string();
         assert!(message.contains("--agentcloudctl-bin"));
-        assert!(!fixture.root.join("registry/sub-worker").exists());
+        assert!(!fixture.root.join("registry/agents/sub-worker").exists());
     }
 
     #[test]
@@ -2596,7 +2590,7 @@ exit 0
             .to_string()
             .contains("agentterm --ws-url ENDPOINT -s SESSION_ID"));
         assert!(fixture.calls().is_empty());
-        assert!(!fixture.root.join("registry/sub-worker").exists());
+        assert!(!fixture.root.join("registry/agents/sub-worker").exists());
 
         let mut options = fixture.options(None);
         options.harness_args = strings(&["--skill=builder", "--narration"]);
@@ -2833,7 +2827,7 @@ exit 0
             "DONE\n"
         );
         let snapshot =
-            agent::read_private_json(&fixture.root.join("registry/sub-worker/output.json"))
+            agent::read_private_json(&fixture.root.join("registry/agents/sub-worker/output.json"))
                 .unwrap();
         assert_eq!(snapshot["text"], "DONE\n");
         assert_eq!(
@@ -2888,7 +2882,7 @@ exit 0
                 .any(|call| *call
                     == strings(&["archive", "--ws-url", ENDPOINT, "--session", SESSION]))
         );
-        assert!(!fixture.root.join("registry/sub-worker").exists());
+        assert!(!fixture.root.join("registry/agents/sub-worker").exists());
         let archived = stopped["archive"].as_str().unwrap();
         let record = agent::read_private_json(&Path::new(archived).join("agent.json")).unwrap();
         assert_eq!(record["lifecycle"], "stopped");
@@ -2909,7 +2903,10 @@ exit 0
         assert!(message.contains("exited 1: unknown session"));
         assert!(message.contains("--skip-cloud-halt"));
         assert!(fixture.herdr.closed.lock().unwrap().is_empty());
-        assert!(fixture.root.join("registry/sub-worker/agent.json").exists());
+        assert!(fixture
+            .root
+            .join("registry/agents/sub-worker/agent.json")
+            .exists());
 
         let stopped = fixture
             .manager()
@@ -3129,7 +3126,10 @@ exit 0
             .to_string();
         assert!(message.contains("agentterm"), "{message}");
         assert!(fixture.herdr.closed.lock().unwrap().is_empty());
-        assert!(fixture.root.join("registry/sub-worker/agent.json").exists());
+        assert!(fixture
+            .root
+            .join("registry/agents/sub-worker/agent.json")
+            .exists());
 
         // Once the viewer has exited back to its shell, the owned tab may close.
         fixture.herdr.busy_foreign.store(false, Ordering::Relaxed);
@@ -3164,7 +3164,7 @@ exit 0
             fixture.calls().is_empty(),
             "no session is created with a malformed endpoint"
         );
-        assert!(!fixture.root.join("registry/sub-worker").exists());
+        assert!(!fixture.root.join("registry/agents/sub-worker").exists());
 
         fixture.list_row(false);
         fixture.start(None).unwrap();
@@ -3227,7 +3227,10 @@ exit 0
             assert!(message.contains("--agentcloud-url"), "{message}");
         }
         assert_eq!(fixture.calls().len(), before);
-        assert!(fixture.root.join("registry/sub-worker/agent.json").exists());
+        assert!(fixture
+            .root
+            .join("registry/agents/sub-worker/agent.json")
+            .exists());
     }
 
     /// Split a printed POSIX shell command (plain words, single quotes, backslash escapes).
@@ -3619,7 +3622,7 @@ exit 0
         let fixture = Fixture::new();
         fixture.list_row(false);
         fixture.start(None).unwrap();
-        let path = fixture.root.join("registry/sub-worker/agent.json");
+        let path = fixture.root.join("registry/agents/sub-worker/agent.json");
         let mut record = agent::read_private_json(&path).unwrap();
         record["agentcloud"]
             .as_object_mut()
@@ -3730,7 +3733,7 @@ exit 0
             fixture.calls().is_empty(),
             "no session is created on a policy refusal"
         );
-        assert!(!fixture.root.join("registry/sub-worker").exists());
+        assert!(!fixture.root.join("registry/agents/sub-worker").exists());
 
         fixture.list_row(false);
         let mut options = fixture.options(None);
@@ -3749,7 +3752,7 @@ exit 0
             let fixture = Fixture::new();
             fixture.list_row(false);
             fixture.start(None).unwrap();
-            let path = fixture.root.join("registry/sub-worker/agent.json");
+            let path = fixture.root.join("registry/agents/sub-worker/agent.json");
             let mut record = agent::read_private_json(&path).unwrap();
             record["agentcloud"]
                 .as_object_mut()
@@ -4095,7 +4098,7 @@ exit 0
             message.contains("already registered as \"sub-worker\""),
             "{message}"
         );
-        assert!(!fixture.root.join("registry/sub-again").exists());
+        assert!(!fixture.root.join("registry/agents/sub-again").exists());
 
         // Agents this session starts without an explicit workspace join the attached one.
         // The fake gives every label the same workspace, so move the attached tab elsewhere.
@@ -4113,7 +4116,8 @@ exit 0
         );
         manager.start("sub-child", &fixture.root, options).unwrap();
         let child: Value =
-            agent::read_private_json(&fixture.root.join("registry/sub-child/agent.json")).unwrap();
+            agent::read_private_json(&fixture.root.join("registry/agents/sub-child/agent.json"))
+                .unwrap();
         assert_eq!(child["workspace_id"], "self-workspace");
 
         let stopped = manager.stop("sub-worker").unwrap();
@@ -4128,7 +4132,7 @@ exit 0
             "stop must never halt or archive the caller's own session: {:?}",
             fixture.verbs()
         );
-        assert!(!fixture.root.join("registry/sub-worker").exists());
+        assert!(!fixture.root.join("registry/agents/sub-worker").exists());
     }
 
     #[test]
@@ -4156,6 +4160,6 @@ exit 0
         assert!(message.contains("not a complete session ID"), "{message}");
         assert!(fixture.calls().is_empty());
         assert!(fixture.herdr.commands.lock().unwrap().is_empty());
-        assert!(!fixture.root.join("registry/sub-worker").exists());
+        assert!(!fixture.root.join("registry/agents/sub-worker").exists());
     }
 }

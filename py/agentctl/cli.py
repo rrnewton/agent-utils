@@ -13,7 +13,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agentctl import __version__
+from agentctl import __version__, registry_layout
 from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
@@ -291,6 +291,24 @@ def parser() -> argparse.ArgumentParser:
         "agentctl migrate worker --backend herdr", named=True)
     migrate.add_argument("--backend", choices=("herdr", "tmux"), required=True, help="destination terminal host")
     migrate.add_argument("--mode", choices=("interactive", "headless"), help="destination execution mode; default: retain current mode")
+    migrate_layout = command("migrate-layout",
+        "Move a registry's agents from the old layout (REGISTRY/NAME/, REGISTRY/.NAME.lock) to layout 2 "
+        "(REGISTRY/agents/NAME/, REGISTRY/locks/NAME.lock), so the registry's fixed files are not buried among "
+        "per-agent entries. Reports what it would do unless --apply.",
+        "agentctl --registry ~/project/.agentctl migrate-layout --apply")
+    migrate_layout.add_argument("--apply", action="store_true",
+        help="move the agents and delete the old lock files (default: only report what would happen)")
+    migrate_layout.add_argument("--wait", type=_ascii_float, default=10.0, metavar="SECONDS",
+        help="seconds to wait for a busy agent or registry lock before leaving that agent where it is (default: 10)")
+    migrate_layout.epilog = (migrate_layout.epilog or "") + (
+        "\n\nEach agent moves by one atomic rename while agentctl holds its old and new lifecycle locks and the\n"
+        "registry's identity lock; a rerun after a crash continues. An agent another process uses, whose record names\n"
+        "paths inside its directory (a turn runner's home), or whose lock stays busy is listed under left; a name with a\n"
+        "directory in both layouts is listed under conflicts and never touched. Running it again changes nothing.\n"
+        "Exit 0, or 1 when something was left or conflicts. Commands that change an agent run the same migration\n"
+        "first without waiting for any lock (AGENTCTL_LAYOUT_AUTO_MIGRATE=0 turns that off). Builds older than layout 2 cannot see\n"
+        "moved agents and refuse the registry: upgrade every agentctl and agent-teams that uses it, and the wrkslots\n"
+        "liveness probe copies, before migrating. The old layout stays readable until 2026-11-26.")
     command("quickstart", "Print a short working setup, available offline.", "agentctl quickstart")
     command("userguide", "Print the complete installed operator guide.", "agentctl userguide")
     profiles = command("profiles", "List safe metadata for ignored private launch profiles.",
@@ -337,6 +355,20 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
 _RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "tree",
               "progress")
+
+
+#: Commands that change agents' state, so idle layout-1 agents move to layout 2 first (not before a
+#: dry run). Everything else, reads and the chat services included, leaves the layout alone.
+_WRITES_AGENTS = frozenset(("start", "adopt", "move", "rename", "anchor", "promote", "stop", "revive",
+                            "send", "drain", "answer", "goal", "bind-session", "pause", "resume",
+                            "reset", "repair", "migrate"))
+
+
+def _auto_migrate(registry: Path) -> None:
+    """New writes use layout 2, and idle layout-1 agents move first (#593 registry-agents-subdir)."""
+    notice = registry_layout.auto_migrate(registry)
+    if notice:
+        print(notice, file=sys.stderr)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -402,6 +434,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         for key in ("max_attempts", "lines"):
             if getattr(args, key, 1) <= 0:
                 raise ValueError(f"{key.replace('_', '-')} must be positive")
+        if args.command == "migrate-layout":
+            report = registry_layout.migrate(Path(args.registry), apply=args.apply, wait=args.wait)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 1 if report["left"] or report["conflicts"] else 0
+        if args.command in _WRITES_AGENTS and not getattr(args, "dry_run", False):
+            _auto_migrate(Path(args.registry))
         sessions = Sessions(HerdrClient(herdr_bin=args.herdr_bin), args.registry)
         options: dict[str, object] = {key: getattr(args, key) for key in
             ("ready_timeout", "working_timeout", "max_attempts") if hasattr(args, key)}

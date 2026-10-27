@@ -261,6 +261,27 @@ If something is delivered but unverified in some respect, close it and say what
 is unverified. A new problem found later is a new issue, not evidence that the
 old one should have stayed open.
 
+## Design rules
+
+### A growing collection gets its own directory
+
+Never put a collection that grows with use (one entry per agent, slot, run,
+message, receipt, log, or lock) in the same directory as fixed items:
+configuration, state files, registry-wide locks. Give the collection a
+subdirectory of its own, such as `agents/<name>/`, `locks/<name>.lock`, or
+`runs/<id>/`. Mixed together, a few hundred entries bury the handful of files a
+person came to find, and every program that scans the directory has to tell the
+two kinds apart. A directory that holds only one collection is fine however
+large it grows, and so is one collection nested inside another's entries.
+
+This applies to every tool here, including state directories outside the
+repository that a tool creates for its users. When an existing layout breaks
+the rule, move it with a migration: new writes use the new layout at once,
+readers accept both for a stated deprecation period, an explicit command
+migrates (dry run by default), and an issue with a due date removes the old
+layout's support. `agentctl migrate-layout` (#593 registry-agents-subdir) is
+the worked example.
+
 ## Documentation
 
 `common/docs/` is for settled, user-facing documentation. Put working designs,

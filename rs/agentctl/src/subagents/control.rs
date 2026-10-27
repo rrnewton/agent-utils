@@ -455,14 +455,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if !self.registry.exists() {
             return Ok(Vec::new());
         }
-        agent::validate_private_directory(&self.registry, "agent registry", false)?;
-        let mut names = fs::read_dir(&self.registry)
-            .map_err(|error| fail(error.to_string()))?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|value| name(value).is_ok())
-            .collect::<Vec<_>>();
-        names.sort();
+        let names = self.registered_names()?;
         Ok(names
             .iter()
             .filter_map(|name| self.read_record(name).ok())

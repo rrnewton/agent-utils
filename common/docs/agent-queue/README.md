@@ -14,6 +14,10 @@ enqueues, a status reader) share one on-disk format:
 - `identity`: the identity of a process generation (`boot_id`, `pid`,
   `starttime_ticks` and executable image), whether it is still alive, and
   whether it is an ancestor of the calling process.
+- `registry`: where an agent registry keeps each agent's directory and
+  lifecycle locks (`agents/<name>/`, `locks/<name>.lock`, and the older
+  layout's `<name>/` and `.<name>.lock`), so every program reading a registry
+  finds the same agents in either layout.
 
 An item moves to `inflight/` before it is typed, so a crash can never cause a
 second paste: an item found there afterwards is quarantined, not replayed.

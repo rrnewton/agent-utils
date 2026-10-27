@@ -8,8 +8,13 @@ fn registry(fixture: &Fixture) -> PathBuf {
     fixture.root.join("registry")
 }
 
+/// Agent `agent_name`'s directory, where the registry layout puts it.
+fn agent_directory(fixture: &Fixture, agent_name: &str) -> PathBuf {
+    agent_queue::registry::directory(&registry(fixture), agent_name).unwrap()
+}
+
 fn record(fixture: &Fixture, agent_name: &str) -> Value {
-    agent::read_private_json(&registry(fixture).join(agent_name).join("agent.json")).unwrap()
+    agent::read_private_json(&agent_directory(fixture, agent_name).join("agent.json")).unwrap()
 }
 
 /// A registered agent `agent_name` whose pinned harness is process `pid`, copied from a worker
@@ -33,8 +38,8 @@ fn register(fixture: &Fixture, agent_name: &str, pid: u64) -> String {
     ] {
         document.as_object_mut().unwrap().remove(key);
     }
-    let directory = registry(fixture).join(agent_name);
-    agent::create_private_directory(&registry(fixture), "agent registry", true, true).unwrap();
+    agent_queue::registry::prepare(&registry(fixture)).unwrap();
+    let directory = agent_directory(fixture, agent_name);
     DirBuilder::new().mode(0o700).create(&directory).unwrap();
     agent::atomic_json(&directory.join("agent.json"), &document).unwrap();
     token
@@ -162,7 +167,7 @@ fn the_designation_names_one_generation_and_reports_what_became_of_it() {
     let mut document = record(&fixture, "coordinator");
     document["token"] = json!("someone-else");
     agent::atomic_json(
-        &registry(&fixture).join("coordinator/agent.json"),
+        &registry(&fixture).join("agents/coordinator/agent.json"),
         &document,
     )
     .unwrap();
@@ -171,8 +176,8 @@ fn the_designation_names_one_generation_and_reports_what_became_of_it() {
 
     // Stopped: its record is archived under NAME-TOKEN.
     fs::rename(
-        registry(&fixture).join("coordinator"),
-        registry(&fixture).join("stale-copy"),
+        registry(&fixture).join("agents/coordinator"),
+        registry(&fixture).join("agents/stale-copy"),
     )
     .unwrap();
     assert_eq!(manager.coordinator_show().unwrap()["state"], "missing");
@@ -204,7 +209,7 @@ fn the_designation_follows_a_revived_generation_through_its_former_tokens() {
     document["token"] = json!("coordinator-revived");
     document["former_tokens"] = json!([token]);
     agent::atomic_json(
-        &registry(&fixture).join("coordinator/agent.json"),
+        &registry(&fixture).join("agents/coordinator/agent.json"),
         &document,
     )
     .unwrap();
@@ -301,14 +306,14 @@ fn the_tree_hangs_every_agent_under_its_manager_and_the_rest_under_the_coordinat
 
     // A manager that is gone leaves its worker under the coordinator, said as such.
     fs::rename(
-        registry(&fixture).join("lieutenant"),
-        registry(&fixture).join("gone"),
+        registry(&fixture).join("agents/lieutenant"),
+        registry(&fixture).join("agents/gone"),
     )
     .unwrap();
     let mut gone = record(&fixture, "gone");
     gone["name"] = json!("gone");
     gone["token"] = json!("gone-generation");
-    agent::atomic_json(&registry(&fixture).join("gone/agent.json"), &gone).unwrap();
+    agent::atomic_json(&registry(&fixture).join("agents/gone/agent.json"), &gone).unwrap();
     let text = render_tree(&manager.tree().unwrap());
     assert!(
         text.contains("worker (running; managed by lieutenant outside this registry or stopped)"),

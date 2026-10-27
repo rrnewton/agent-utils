@@ -14330,7 +14330,7 @@ esac
         let fixture = crate::subagents::tests::Fixture::new();
         fixture.start(None);
         let (_, state) = worker_bridge_state(&fixture, true);
-        let snapshot = fixture.root.join("registry/worker/output.json");
+        let snapshot = fixture.root.join("registry/agents/worker/output.json");
         assert!(!snapshot.exists(), "{}", snapshot.display());
         let manager = fixture.manager();
         let stop = StopState::default();
@@ -17603,7 +17603,7 @@ sends that reply once the pane shows it"
             })
             .expect("record the stale reminder");
         crate::agent::enqueue(
-            &fixture.root.join("registry/worker/queue"),
+            &fixture.root.join("registry/agents/worker/queue"),
             &reminder.prompt,
             Some(&message_id),
         )

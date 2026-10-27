@@ -4,13 +4,19 @@ fn registry(fixture: &Fixture) -> PathBuf {
     fixture.root.join("registry")
 }
 
+/// Agent `agent_name`'s directory, where the registry layout puts it.
+fn agent_directory(fixture: &Fixture, agent_name: &str) -> PathBuf {
+    agent_queue::registry::directory(&registry(fixture), agent_name).unwrap()
+}
+
 fn record(fixture: &Fixture, agent_name: &str) -> Value {
-    agent::read_private_json(&registry(fixture).join(agent_name).join("agent.json")).unwrap()
+    agent::read_private_json(&agent_directory(fixture, agent_name).join("agent.json")).unwrap()
 }
 
 fn write_record(fixture: &Fixture, agent_name: &str, document: &Value) {
-    let directory = registry(fixture).join(agent_name);
+    let directory = agent_directory(fixture, agent_name);
     if !directory.exists() {
+        agent_queue::registry::prepare(&registry(fixture)).unwrap();
         DirBuilder::new().mode(0o700).create(&directory).unwrap();
     }
     agent::atomic_json(&directory.join("agent.json"), document).unwrap();
@@ -26,7 +32,7 @@ fn write_claiming_record(fixture: &Fixture, agent_name: &str) {
 }
 
 fn failed_documents(fixture: &Fixture, agent_name: &str) -> Vec<Value> {
-    let failed = registry(fixture).join(agent_name).join("queue/failed");
+    let failed = agent_directory(fixture, agent_name).join("queue/failed");
     let Ok(entries) = fs::read_dir(&failed) else {
         return Vec::new();
     };
@@ -155,11 +161,11 @@ fn start_refuses_a_pane_another_record_already_claims() {
     other["native_session"] = Value::Null;
     // The live record moves away, so only the claim on pane `owned` remains.
     fs::rename(
-        registry(&fixture).join("worker"),
-        registry(&fixture).join("other"),
+        registry(&fixture).join("agents/worker"),
+        registry(&fixture).join("agents/other"),
     )
     .unwrap();
-    agent::atomic_json(&registry(&fixture).join("other/agent.json"), &other).unwrap();
+    agent::atomic_json(&registry(&fixture).join("agents/other/agent.json"), &other).unwrap();
     // The fake reallocates pane `owned` for the next start.
     fixture.client.panes.lock().unwrap().clear();
     let error = fixture
@@ -208,7 +214,7 @@ fn a_harness_replaced_before_send_types_nothing_and_stays_pending() {
 }
 
 fn misroutes(fixture: &Fixture, agent_name: &str) -> Vec<Value> {
-    let path = registry(fixture).join(agent_name).join("misroutes.jsonl");
+    let path = agent_directory(fixture, agent_name).join("misroutes.jsonl");
     fs::read_to_string(path)
         .map(|text| {
             text.lines()
@@ -487,7 +493,7 @@ fn rename_moves_registry_name_herdr_name_and_label_together() {
         .as_str()
         .unwrap()
         .contains("'worker'"));
-    assert!(!registry(&fixture).join("worker").exists());
+    assert!(!registry(&fixture).join("agents/worker").exists());
     let renamed = record(&fixture, "reviewer");
     assert_eq!(renamed["name"], "reviewer");
     assert_eq!(renamed["pane_id"], "owned");
@@ -522,7 +528,7 @@ fn rename_preconditions_refuse_before_any_change() {
         match prepare {
             "registered" => DirBuilder::new()
                 .mode(0o700)
-                .create(registry(&fixture).join("reviewer"))
+                .create(registry(&fixture).join("agents/reviewer"))
                 .unwrap(),
             "herdr-name" => {
                 fixture
@@ -552,7 +558,7 @@ fn rename_preconditions_refuse_before_any_change() {
             .rename("worker", "reviewer")
             .expect_err(prepare);
         assert!(error.to_string().contains(message), "{prepare}: {error}");
-        assert!(registry(&fixture).join("worker/agent.json").exists());
+        assert!(registry(&fixture).join("agents/worker/agent.json").exists());
         assert_eq!(label(&fixture, "tab"), "worker", "{prepare}");
         assert_eq!(journal_count(&fixture), 0, "{prepare}");
     }
@@ -584,7 +590,7 @@ fn a_crash_after_the_journal_blocks_both_names_and_a_rerun_completes() {
         )
         .expect_err("start of the reserved name");
     assert!(error.to_string().contains("incomplete"), "{error}");
-    assert!(!registry(&fixture).join("reviewer").exists());
+    assert!(!registry(&fixture).join("agents/reviewer").exists());
     let error = fixture
         .manager()
         .rename("worker", "other")
@@ -616,7 +622,7 @@ fn a_crash_between_publication_and_the_directory_move_recovers_with_one_history_
     let result = fixture.manager().rename("worker", "reviewer").unwrap();
     assert_eq!(result["recovered"], true);
     assert_eq!(history_names(&record(&fixture, "reviewer")), ["worker"]);
-    assert!(!registry(&fixture).join("worker").exists());
+    assert!(!registry(&fixture).join("agents/worker").exists());
 }
 
 #[test]
@@ -639,8 +645,8 @@ fn rename_recovery_after_the_harness_exits_finishes_the_registry_only() {
         "{result}"
     );
     assert_eq!(journal_count(&fixture), 0);
-    assert!(registry(&fixture).join("reviewer").exists());
-    assert!(!registry(&fixture).join("worker").exists());
+    assert!(registry(&fixture).join("agents/reviewer").exists());
+    assert!(!registry(&fixture).join("agents/worker").exists());
 }
 
 #[test]
@@ -657,7 +663,7 @@ fn an_existing_duplicate_claim_refuses_input() {
 fn an_unreadable_record_refuses_input_conservatively() {
     let fixture = Fixture::new();
     fixture.start(None);
-    let broken = registry(&fixture).join("broken");
+    let broken = registry(&fixture).join("agents/broken");
     fs::create_dir(&broken).unwrap();
     fs::write(broken.join("agent.json"), "{").unwrap();
     let error = send(&fixture, "worker", "held until readable").expect_err("unreadable");
@@ -689,7 +695,7 @@ fn rename_refuses_at_the_history_limit() {
         error.to_string().contains("the most a record keeps"),
         "{error}"
     );
-    assert!(registry(&fixture).join("worker").exists());
+    assert!(registry(&fixture).join("agents/worker").exists());
 }
 
 #[test]
@@ -705,8 +711,8 @@ fn rename_recovery_with_the_pane_gone_finishes_the_registry_only() {
         .retain(|pane| pane.pane_id != "owned");
     let result = fixture.manager().rename("worker", "reviewer").unwrap();
     assert_eq!(result["herdr_steps"], "skipped-pane-missing");
-    assert!(registry(&fixture).join("reviewer").exists());
-    assert!(!registry(&fixture).join("worker").exists());
+    assert!(registry(&fixture).join("agents/reviewer").exists());
+    assert!(!registry(&fixture).join("agents/worker").exists());
     assert_eq!(journal_count(&fixture), 0);
 }
 
@@ -717,7 +723,7 @@ fn rename_recovery_refuses_when_both_directories_exist() {
     crash_rename(&fixture);
     DirBuilder::new()
         .mode(0o700)
-        .create(registry(&fixture).join("reviewer"))
+        .create(registry(&fixture).join("agents/reviewer"))
         .unwrap();
     let error = fixture
         .manager()
@@ -1395,8 +1401,12 @@ fn a_peer_pane_herdr_reports_missing_is_skipped_by_the_snapshot() {
     send(&fixture, "worker", LONG).expect("delivered");
     assert!(runs(&fixture).contains(&LONG.to_owned()));
     assert!(failed_documents(&fixture, "worker").is_empty());
-    let readback =
-        fs::read_to_string(registry(&fixture).join("worker").join("readback.jsonl")).unwrap();
+    let readback = fs::read_to_string(
+        registry(&fixture)
+            .join("agents/worker")
+            .join("readback.jsonl"),
+    )
+    .unwrap();
     let entries: Vec<(String, String, String)> = readback
         .lines()
         .map(|line| {

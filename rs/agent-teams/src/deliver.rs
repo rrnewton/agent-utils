@@ -436,6 +436,14 @@ pub fn run_auto_drain(
 
 impl AgentctlQueueDeliverer {
     fn enqueue(&self, id: &str, envelope: &Value, rendered: &str) -> Handover {
+        // A queue created in layout 2 needs the layout's directories and tripwires first, as
+        // every agentctl writer prepares them.
+        if !self.queue_dir.exists()
+            && self.queue_dir.parent().and_then(Path::parent)
+                == Some(agent_queue::registry::agents_directory(&self.registry).as_path())
+        {
+            let _ = agent_queue::registry::prepare(&self.registry);
+        }
         let result = agent_queue::queue::enqueue_into(
             &self.queue_dir,
             agent_queue::queue::Lane::InboxV2,
@@ -635,6 +643,12 @@ pub fn deliverer_for(
                     .and_then(Value::as_u64)
                     .unwrap_or(120),
             };
+            // Either registry layout (#593 registry-agents-subdir); a coordinator not yet
+            // registered gets the layout-2 path new agents are created at. A coordinator with a
+            // record in both layouts is refused, as agentctl refuses it, rather than guessed.
+            let queue_dir = agent_queue::registry::directory(&registry, &coordinator)
+                .map_err(|error| crate::jsonfile::DataError::new("io", error.to_string()))?
+                .join("queue");
             // team_state_dir is <state>/teams.d/<team>; the drain lock and
             // content-free log belong to the state root.
             let drain_state_dir = team_state_dir
@@ -646,7 +660,7 @@ pub fn deliverer_for(
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default(),
-                queue_dir: registry.join(&coordinator).join("queue"),
+                queue_dir,
                 ledger_path: ledger_path.to_path_buf(),
                 registry,
                 agent: coordinator,
