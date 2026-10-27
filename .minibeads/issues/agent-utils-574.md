@@ -1,13 +1,14 @@
 ---
 title: 'harness-adapters: one module per harness for screen hacks, plus transcript-aware stall detection'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - agentctl
 - watch-agents
 created_at: 2026-10-27T12:39:13.623884282+00:00
-updated_at: 2026-10-27T12:39:13.623884282+00:00
+updated_at: 2026-10-27T15:24:08.436397713+00:00
+closed_at: 2026-10-27T15:24:08.436397492+00:00
 ---
 
 # Description
