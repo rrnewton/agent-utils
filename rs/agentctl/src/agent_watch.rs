@@ -32,7 +32,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1681,6 +1681,12 @@ fn watch_agents_once(
         Err(error) => (Vec::new(), json!(error.to_string())),
     };
     let seen: Vec<String> = observations.iter().map(|row| row.name.clone()).collect();
+    // An agent the pass ran out of time for keeps its memory as it was: its episodes neither
+    // advance nor end, and the report says the pass was partial (#571 watch-agents-scale).
+    let (unchecked, observations): (Vec<Observation>, Vec<Observation>) = observations
+        .into_iter()
+        .partition(|row| row.status == UNCHECKED);
+    let unchecked: Vec<String> = unchecked.into_iter().map(|row| row.name).collect();
     let mut episodes = Vec::new();
     if probe_error.is_null() {
         for observation in &observations {
@@ -1764,6 +1770,7 @@ fn watch_agents_once(
         "coordinator": options.coordinator,
         "ok": probe_error.is_null()
             && scrolled.is_empty()
+            && unchecked.is_empty()
             && episodes.iter().all(|row| {
                 // A finished child is news for its coordinator, not a fault in the team.
                 row["kind"] == EpisodeKind::ChildDone.as_str()
@@ -1773,6 +1780,7 @@ fn watch_agents_once(
         "agents": seen.len(),
         "episodes": episodes,
         "scrolled": scrolled,
+        "unchecked": unchecked,
         "notice": notice,
         "child_done": child_done,
         "waiting": state.pending.len(),
@@ -1941,6 +1949,17 @@ pub fn watch_agents(
         if let Some(error) = report["probe_error"].as_str() {
             eprintln!("agentctl watch-agents: {error}");
         }
+        if let Some(names) = report["unchecked"]
+            .as_array()
+            .filter(|names| !names.is_empty())
+        {
+            let names: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
+            eprintln!(
+                "agentctl watch-agents: the pass budget ran out before {} agent(s) were checked: {}",
+                names.len(),
+                names.join(", ")
+            );
+        }
         for row in report["episodes"].as_array().into_iter().flatten() {
             if row["reported"] == true {
                 eprintln!(
@@ -1967,13 +1986,57 @@ pub fn watch_agents(
     }
 }
 
+/// Agents checked at once in a pass. A check is mostly waiting on Herdr, and a loaded server
+/// can take seconds to read one busy pane's scrollback.
+const PASS_WORKERS: usize = 8;
+/// The longest any one Herdr call may run in a pass: Herdr's usual control timeout.
+pub const PASS_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest the pass's one `agentcloudctl list` may run (it unpacks itself first, so it is
+/// given longer than a Herdr call), and never past the pass's budget.
+const PASS_CLOUD_TIMEOUT: Duration = Duration::from_secs(30);
+/// The status of an agent the pass ran out of time to check: it is reported as unchecked, and
+/// its episodes neither advance nor end.
+const UNCHECKED: &str = "unchecked";
+
+/// The recent screen last read of an idle agent, with what it was read under: while the agent
+/// stays idle in the same pane, at the bottom, with the same visible rows, nothing new can have
+/// reached its screen, so the costly recent read is not repeated.
+#[derive(Clone)]
+struct KeptScreen {
+    pane: String,
+    status: String,
+    visible: u64,
+    recent: String,
+}
+
+/// One agent's check, made on a pool thread.
+struct Checked {
+    row: Value,
+    observation: Option<Observation>,
+    kept: Option<KeptScreen>,
+    /// The screen came from the last pass, not from Herdr.
+    reused: bool,
+}
+
 /// The production probe: one registry, read through Herdr. The coordinator itself,
 /// paused agents, cloud sessions viewed through a terminal, and records that are not
 /// running are not watched; a `launch_failed` record was already reported by `start`.
+///
+/// A pass checks only records that are running or starting and not paused (#571
+/// watch-agents-scale): the rest are judged from the record alone. Up to [`PASS_WORKERS`]
+/// agents are checked at once; Herdr's read-only answers are kept for the pass (see
+/// [`crate::client::HerdrClient::snapshotting`]), and so are `/proc`'s process and lock
+/// tables. A pass that reaches its budget reports the agents it had no time for as unchecked
+/// instead of reporting nothing.
 pub struct ManagedProbe<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
     registry: PathBuf,
     coordinator: String,
+    budget: Option<Duration>,
+    verbose: bool,
+    /// Keep idle agents' screens for the next pass (off for a single pass, which has none).
+    keep_screens: bool,
+    screens: BTreeMap<String, KeptScreen>,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
@@ -1983,8 +2046,241 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             client,
             registry: registry.to_owned(),
             coordinator: coordinator.to_owned(),
+            budget: None,
+            verbose: false,
+            keep_screens: true,
+            screens: BTreeMap::new(),
         }
     }
+
+    /// End each pass's checks after `budget` (`None`: no limit), and, when `verbose`, say on
+    /// standard error what each check found and how long it took.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Option<Duration>, verbose: bool) -> Self {
+        self.budget = budget;
+        self.verbose = verbose;
+        self
+    }
+
+    /// Whether a pass keeps idle agents' screens for the next one; a watcher that runs one
+    /// pass (`--once`) has no next pass, so it skips the extra visible read that keeping needs.
+    #[must_use]
+    pub fn keeping_screens(mut self, keep: bool) -> Self {
+        self.keep_screens = keep;
+        self
+    }
+
+    fn progress(&self, line: &str) {
+        if self.verbose {
+            eprintln!("agentctl watch-agents: {line}");
+        }
+    }
+
+    /// Check one running agent: its status, and, for an agent the watcher judges, its screen,
+    /// the work under its harness, and its progress metric. `None` once the pass is out of
+    /// time: a check that straddled the deadline may have had calls cancelled, and a cancelled
+    /// call must not read as a dead agent.
+    fn check(
+        &self,
+        manager: &ManagedAgents<'_, A>,
+        row: &Value,
+        proc_view: &crate::work_state::PassProc,
+        deadline: Option<Instant>,
+    ) -> Option<Checked> {
+        let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if expired() {
+            return None;
+        }
+        let name = row["name"].as_str().unwrap_or_default().to_owned();
+        let row = manager.watch_status(&name, &mut crate::subagents::FleetCache::new());
+        let watched = name != self.coordinator
+            && row["paused"] != true
+            && row["move_pending"] != true
+            && (row["record_error"] == true
+                || (matches!(row["lifecycle"].as_str(), Some("running" | "starting"))
+                    && row["adapter"].as_str() != Some("agentcloud")));
+        if !watched {
+            return (!expired()).then_some(Checked {
+                row,
+                observation: None,
+                kept: None,
+                reused: false,
+            });
+        }
+        let gone = row["agent_status"] == "unknown" && !row["probe_error"].is_null();
+        let status = row["agent_status"].as_str().unwrap_or("unknown").to_owned();
+        let (screen, kept, reused) = if gone {
+            (None, None, false)
+        } else {
+            self.screen(manager, &name, &status)
+        };
+        let observation = self.observation(row.clone(), name, gone, screen, proc_view);
+        (!expired()).then_some(Checked {
+            row,
+            observation: Some(observation),
+            kept,
+            reused,
+        })
+    }
+
+    /// The agent's recent screen, the screen to keep for the next pass, and whether the screen
+    /// was kept from the last pass rather than read.
+    fn screen(
+        &self,
+        manager: &ManagedAgents<'_, A>,
+        name: &str,
+        status: &str,
+    ) -> (Option<String>, Option<KeptScreen>, bool) {
+        // Only an idle or finished agent's screen holds still long enough to be worth keeping.
+        let visible = (self.keep_screens && matches!(status, "idle" | "done"))
+            .then(|| manager.watch_visible(name, SCREEN_LINES).ok())
+            .flatten()
+            .filter(|(pane, _)| self.client.pane_at_bottom(pane))
+            .map(|(pane, text)| (pane, stable_hash(&text)));
+        if let (Some((pane, visible)), Some(kept)) = (visible.as_ref(), self.screens.get(name)) {
+            if kept.pane == *pane && kept.status == status && kept.visible == *visible {
+                return (Some(kept.recent.clone()), Some(kept.clone()), true);
+            }
+        }
+        let recent = manager.watch_read(name, SCREEN_LINES).ok();
+        let kept = match (visible, recent.as_ref()) {
+            (Some((pane, visible)), Some(recent)) => Some(KeptScreen {
+                pane,
+                status: status.to_owned(),
+                visible,
+                recent: recent.clone(),
+            }),
+            _ => None,
+        };
+        (recent, kept, false)
+    }
+
+    fn observation(
+        &self,
+        row: Value,
+        name: String,
+        gone: bool,
+        screen: Option<String>,
+        proc_view: &crate::work_state::PassProc,
+    ) -> Observation {
+        let queue = row["queue"]
+            .as_str()
+            .map_or_else(|| self.registry.join(&name).join("queue"), PathBuf::from);
+        let now = SystemClock.now();
+        let started = screen.as_deref().and_then(|screen| {
+            crate::turn_state::turn_age(&crate::turn_state::read_screen(screen), None)
+                .map(|age| now - age)
+        });
+        let backlog = crate::turn_state::backlog(&queue, now, started);
+        // The pinned harness process (a custom-pane harness such as Muse is pinned as its
+        // custom process), checked against its start time so a reused PID is never read as
+        // the agent.
+        let identity = if row["harness_identity"].is_object() {
+            &row["harness_identity"]
+        } else {
+            &row["custom_process_identity"]
+        };
+        let work = match (gone, identity["pid"].as_u64()) {
+            (false, Some(pid)) => u32::try_from(pid).ok().and_then(|pid| {
+                crate::work_state::sample(proc_view, pid, identity["starttime_ticks"].as_u64())
+            }),
+            _ => None,
+        };
+        let progress = match crate::progress_metric::load(&self.registry, &name) {
+            Ok(Some(declaration)) => {
+                let cwd = row["cwd"]
+                    .as_str()
+                    .map_or_else(|| self.registry.clone(), PathBuf::from);
+                Some(crate::progress_metric::read(&declaration, &cwd))
+            }
+            Ok(None) => None,
+            Err(error) => Some(crate::progress_metric::Reading {
+                error: Some(error.to_string()),
+                window_seconds: f64::INFINITY,
+                source: crate::progress_metric::path(&self.registry, &name)
+                    .display()
+                    .to_string(),
+                ..crate::progress_metric::Reading::default()
+            }),
+        };
+        Observation {
+            detail: if row["record_error"] == true {
+                format!(
+                    "record could not be read: {}",
+                    row["probe_error"].as_str().unwrap_or("unknown error")
+                )
+                .chars()
+                .take(200)
+                .collect()
+            } else if gone {
+                row["probe_error"]
+                    .as_str()
+                    .unwrap_or("unreachable")
+                    .chars()
+                    .take(200)
+                    .collect()
+            } else {
+                String::new()
+            },
+            status: if gone {
+                "gone".to_owned()
+            } else {
+                row["agent_status"].as_str().unwrap_or("unknown").to_owned()
+            },
+            screen,
+            has_delivered: queue_has_entries(&queue, "processed"),
+            has_pending: ["pending", "inflight"].iter().any(|field| {
+                row[field]
+                    .as_array()
+                    .is_some_and(|values| !values.is_empty())
+            }),
+            recipient: None,
+            backlog,
+            work,
+            progress,
+            name,
+        }
+    }
+}
+
+/// Run `job` on every item, at most `workers` at once, keeping the items' order. A thread the
+/// system refuses (a process limit under load) leaves the remaining items to the threads that
+/// started, or to this one.
+fn bounded_map<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    job: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<R>>> =
+        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let work = || loop {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(item) = items.get(index) else {
+            break;
+        };
+        let result = job(item);
+        *results[index].lock().expect("result lock poisoned") = Some(result);
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..workers.clamp(1, items.len().max(1)) {
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, work)
+                .is_err()
+            {
+                break;
+            }
+        }
+        work();
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("result lock poisoned")
+                .expect("every item ran")
+        })
+        .collect()
 }
 
 fn queue_has_entries(queue: &Path, child: &str) -> bool {
@@ -2016,32 +2312,135 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
     }
 
     fn observe(&mut self) -> Result<Vec<Observation>> {
-        let manager = ManagedAgents::new(self.client, &self.registry)?;
-        let rows = manager.list()?;
-        let watched: Vec<&Value> = rows
-            .iter()
-            .filter(|row| {
-                if row["name"].as_str() == Some(self.coordinator.as_str())
-                    || row["paused"] == true
-                    // A mid-move agent is being handled by `agentctl move`; its
-                    // unknown status is not a death.
-                    || row["move_pending"] == true
-                {
-                    return false;
-                }
-                // A record this build cannot read is watched as unreachable rather
-                // than silently dropped: the coordinator should hear about it.
-                row["record_error"] == true
-                    || (matches!(row["lifecycle"].as_str(), Some("running" | "starting"))
-                        && row["adapter"].as_str() != Some("agentcloud"))
+        let started = Instant::now();
+        let deadline = self.budget.map(|budget| started + budget);
+        self.client.begin_pass(deadline);
+        let cloud_timeout = deadline.map_or(PASS_CLOUD_TIMEOUT, |deadline| {
+            PASS_CLOUD_TIMEOUT.min(deadline.saturating_duration_since(started))
+        });
+        let manager = ManagedAgents::new(self.client, &self.registry)?
+            .with_project_workspace_resolved()
+            .with_cloud_list_timeout(cloud_timeout);
+        let mut rows = manager.watch_rows()?;
+        // Only a running or starting record that is not paused is checked live; for every
+        // other record its row is already all the watcher reads.
+        let live: Vec<usize> = (0..rows.len())
+            .filter(|&index| {
+                let row = &rows[index];
+                row["record_error"] != true
+                    && row["paused"] != true
+                    && matches!(row["lifecycle"].as_str(), Some("running" | "starting"))
             })
             .collect();
+        let (cloud, local): (Vec<usize>, Vec<usize>) = live
+            .into_iter()
+            .partition(|&index| rows[index]["adapter"].as_str() == Some("agentcloud"));
+        self.progress(&format!(
+            "{} records, {} to check through Herdr, {} agentcloud",
+            rows.len(),
+            local.len(),
+            cloud.len()
+        ));
+        let proc_view = crate::work_state::PassProc::default();
+        let total = local.len();
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let (checks, cloud_rows) = {
+            let this = &*self;
+            let manager = &manager;
+            let rows = &rows;
+            std::thread::scope(|scope| {
+                // agentcloud sessions share one fleet listing, fetched only when a running
+                // cloud record needs it, beside the Herdr checks.
+                let cloud_thread = scope.spawn(|| {
+                    let mut fleet = crate::subagents::FleetCache::new();
+                    cloud
+                        .iter()
+                        .map(|&index| {
+                            let name = rows[index]["name"].as_str().unwrap_or_default();
+                            (index, manager.watch_status(name, &mut fleet))
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let checks = bounded_map(&local, PASS_WORKERS, |&index| {
+                    let begun = Instant::now();
+                    let checked = this.check(manager, &rows[index], &proc_view, deadline);
+                    let count = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let name = rows[index]["name"].as_str().unwrap_or("?");
+                    match &checked {
+                        Some(checked) => this.progress(&format!(
+                            "[{count}/{total}] {name}: {} in {:.1} s{}",
+                            checked.row["agent_status"]
+                                .as_str()
+                                .unwrap_or("not watched"),
+                            begun.elapsed().as_secs_f64(),
+                            if checked.reused {
+                                ", screen unchanged"
+                            } else {
+                                ""
+                            },
+                        )),
+                        None => this.progress(&format!(
+                            "[{count}/{total}] {name}: not checked, the pass budget ran out"
+                        )),
+                    }
+                    (index, checked)
+                });
+                (checks, cloud_thread.join().unwrap_or_default())
+            })
+        };
+        for (index, row) in cloud_rows {
+            rows[index] = row;
+        }
+        let mut observations = Vec::new();
+        let mut unchecked = Vec::new();
+        let mut screens = BTreeMap::new();
+        let mut reused = 0;
+        for (index, checked) in checks {
+            match checked {
+                Some(checked) => {
+                    reused += usize::from(checked.reused);
+                    if let Some(observation) = checked.observation {
+                        if let Some(kept) = checked.kept {
+                            screens.insert(observation.name.clone(), kept);
+                        }
+                        observations.push(observation);
+                    }
+                    rows[index] = checked.row;
+                }
+                None => unchecked.push(index),
+            }
+        }
+        self.screens = screens;
+        // A record this build cannot read is watched as unreachable rather than silently
+        // dropped: the coordinator should hear about it.
+        for row in &rows {
+            // A record that became unreadable while its check ran was observed by that check.
+            if row["record_error"] == true
+                && row["name"] != self.coordinator.as_str()
+                && !observations
+                    .iter()
+                    .any(|seen| row["name"] == seen.name.as_str())
+            {
+                let name = row["name"].as_str().unwrap_or_default().to_owned();
+                observations.push(self.observation(row.clone(), name, true, None, &proc_view));
+            }
+        }
+        self.progress(&format!(
+            "checked {} agents in {:.1} s ({} watched, {} of their screens unchanged since the last pass, {} not checked)",
+            total - unchecked.len(),
+            started.elapsed().as_secs_f64(),
+            observations.len(),
+            reused,
+            unchecked.len()
+        ));
         // When every watched agent is unreachable at once the terminal server, not
         // every harness, is gone; `agentctl watch` reports and repairs that.
-        let all_gone = !watched.is_empty()
-            && watched
+        // A partial pass cannot say that: the agents it had no time for may be fine.
+        let all_gone = unchecked.is_empty()
+            && !observations.is_empty()
+            && observations
                 .iter()
-                .all(|row| row["agent_status"] == "unknown" && !row["probe_error"].is_null());
+                .all(|observation| observation.status == "gone");
         if all_gone {
             return Err(fail(
                 "no watched agent could be probed; the terminal server may be down",
@@ -2057,97 +2456,35 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
                     && !(row["agent_status"] == "unknown" && !row["probe_error"].is_null());
             }
         }
-        let mut observations = Vec::with_capacity(watched.len());
-        for row in watched {
-            let name = row["name"].as_str().unwrap_or_default().to_owned();
-            let recipient = controller_of(&nodes, &registry, Some(&self.coordinator), &name)
-                .filter(|recipient| *recipient != self.coordinator);
-            let gone = row["agent_status"] == "unknown" && !row["probe_error"].is_null();
-            let queue = row["queue"]
-                .as_str()
-                .map_or_else(|| self.registry.join(&name).join("queue"), PathBuf::from);
-            let screen = if gone {
-                None
-            } else {
-                manager.read(&name, SCREEN_LINES).ok()
-            };
-            let now = SystemClock.now();
-            let started = screen.as_deref().and_then(|screen| {
-                crate::turn_state::turn_age(&crate::turn_state::read_screen(screen), None)
-                    .map(|age| now - age)
-            });
-            let backlog = crate::turn_state::backlog(&queue, now, started);
-            // The pinned harness process (a custom-pane harness such as Muse is pinned as its
-            // custom process), checked against its start time so a reused PID is never read as
-            // the agent.
-            let identity = if row["harness_identity"].is_object() {
-                &row["harness_identity"]
-            } else {
-                &row["custom_process_identity"]
-            };
-            let work = match (gone, identity["pid"].as_u64()) {
-                (false, Some(pid)) => u32::try_from(pid).ok().and_then(|pid| {
-                    crate::work_state::sample(
-                        &crate::work_state::LinuxProc,
-                        pid,
-                        identity["starttime_ticks"].as_u64(),
-                    )
-                }),
-                _ => None,
-            };
-            let progress = match crate::progress_metric::load(&self.registry, &name) {
-                Ok(Some(declaration)) => {
-                    let cwd = row["cwd"]
-                        .as_str()
-                        .map_or_else(|| self.registry.clone(), PathBuf::from);
-                    Some(crate::progress_metric::read(&declaration, &cwd))
-                }
-                Ok(None) => None,
-                Err(error) => Some(crate::progress_metric::Reading {
-                    error: Some(error.to_string()),
-                    window_seconds: f64::INFINITY,
-                    source: crate::progress_metric::path(&self.registry, &name)
-                        .display()
-                        .to_string(),
-                    ..crate::progress_metric::Reading::default()
-                }),
-            };
+        for observation in &mut observations {
+            observation.recipient = controller_of(
+                &nodes,
+                &registry,
+                Some(&self.coordinator),
+                &observation.name,
+            )
+            .filter(|recipient| *recipient != self.coordinator);
+        }
+        // An agent the pass had no time for is named, so the report says the pass was partial.
+        for index in unchecked {
+            let name = rows[index]["name"].as_str().unwrap_or_default().to_owned();
+            if name == self.coordinator {
+                continue;
+            }
             observations.push(Observation {
-                detail: if row["record_error"] == true {
-                    format!(
-                        "record could not be read: {}",
-                        row["probe_error"].as_str().unwrap_or("unknown error")
-                    )
-                    .chars()
-                    .take(200)
-                    .collect()
-                } else if gone {
-                    row["probe_error"]
-                        .as_str()
-                        .unwrap_or("unreachable")
-                        .chars()
-                        .take(200)
-                        .collect()
-                } else {
-                    String::new()
-                },
-                status: if gone {
-                    "gone".to_owned()
-                } else {
-                    row["agent_status"].as_str().unwrap_or("unknown").to_owned()
-                },
-                screen,
-                has_delivered: queue_has_entries(&queue, "processed"),
-                has_pending: ["pending", "inflight"].iter().any(|field| {
-                    row[field]
-                        .as_array()
-                        .is_some_and(|values| !values.is_empty())
-                }),
-                recipient,
-                backlog,
-                work,
-                progress,
                 name,
+                status: UNCHECKED.to_owned(),
+                screen: None,
+                has_delivered: false,
+                has_pending: false,
+                detail: format!(
+                    "not checked: the pass's {} s budget ran out",
+                    self.budget.map_or(0, |budget| budget.as_secs())
+                ),
+                recipient: None,
+                backlog: crate::turn_state::Backlog::default(),
+                work: None,
+                progress: None,
             });
         }
         Ok(observations)
@@ -2272,10 +2609,14 @@ impl<A: ManagedApi + ?Sized> ManagedNotifier<'_, A> {
 }
 
 #[cfg(test)]
+#[path = "agent_watch_scale_tests.rs"]
+mod scale_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn options() -> WatchAgentsOptions {
+    pub(super) fn options() -> WatchAgentsOptions {
         WatchAgentsOptions {
             coordinator: "coordinator".to_owned(),
             interval: Duration::from_secs(60),

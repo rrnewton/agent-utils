@@ -896,7 +896,110 @@ pub struct HerdrClient {
     executable: PathBuf,
     /// Whether the running server advertises `input-expect`, read once.
     input_expect: std::sync::OnceLock<bool>,
+    /// Read-only answers kept for one watch pass; `None` asks Herdr every time.
+    snapshot: Option<std::sync::Arc<PassSnapshot>>,
 }
+
+/// The read-only Herdr queries a pass snapshot answers once: listings, single-object gets,
+/// process information and screen reads. Everything else, every input above all, is always
+/// sent to Herdr.
+const SNAPSHOT_QUERIES: [[&str; 2]; 10] = [
+    ["pane", "list"],
+    ["pane", "get"],
+    ["pane", "process-info"],
+    ["pane", "read"],
+    ["agent", "list"],
+    ["agent", "get"],
+    ["workspace", "list"],
+    ["workspace", "get"],
+    ["tab", "list"],
+    ["tab", "get"],
+];
+
+/// Herdr's read-only answers during one pass of `agentctl watch-agents` (#571
+/// watch-agents-scale). Checking one agent asks Herdr for the same pane, agent, workspace and
+/// process information several times over (its status, then its screen, each verifying the
+/// pane), so a registry of sixty agents in a workspace of a hundred panes made hundreds of
+/// serial calls a pass. Within a pass each distinct query runs once, concurrent askers wait for
+/// the one answer, and a `pane get` or `agent get` is answered from the pass's one `pane list`
+/// or `agent list` when that listing names it. Every call is bounded by the snapshot's own
+/// timeout and is cancelled at the pass's deadline.
+/// One query's answer within a pass, shared by every caller that asks while it is running.
+type SnapshotAnswer = std::sync::Arc<std::sync::OnceLock<Result<CommandOutput>>>;
+
+#[derive(Debug)]
+struct PassSnapshot {
+    call_timeout: Duration,
+    deadline: std::sync::Mutex<Option<Instant>>,
+    answers: std::sync::Mutex<HashMap<Vec<String>, SnapshotAnswer>>,
+}
+
+impl PassSnapshot {
+    fn expired(&self) -> bool {
+        self.deadline
+            .lock()
+            .expect("snapshot deadline lock poisoned")
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn forget(&self, args: &[String], slot: &SnapshotAnswer) {
+        let mut answers = self.answers.lock().expect("snapshot answers lock poisoned");
+        if answers
+            .get(args)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, slot))
+        {
+            answers.remove(args);
+        }
+    }
+
+    fn slot(&self, args: &[String]) -> SnapshotAnswer {
+        self.answers
+            .lock()
+            .expect("snapshot answers lock poisoned")
+            .entry(args.to_vec())
+            .or_default()
+            .clone()
+    }
+}
+
+/// The entry for `id` in a memoized `pane list` or `agent list`, rewrapped as the answer of the
+/// matching `pane get` or `agent get`: Herdr prints the same object in both.
+fn listed_answer(
+    listing: &CommandOutput,
+    collection: &str,
+    key: &str,
+    id: &str,
+    kind: &str,
+) -> Option<CommandOutput> {
+    if listing.status != 0 {
+        return None;
+    }
+    let document = serde_json::from_str::<Value>(&listing.stdout).ok()?;
+    // Only a unique match is answered: Herdr refuses a name two terminals share, so that case
+    // is left to Herdr itself.
+    let mut matches = document["result"][collection]
+        .as_array()?
+        .iter()
+        .filter(|entry| entry[key].as_str() == Some(id));
+    let entry = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let (noun, field) = match kind {
+        "pane" => ("pane", "pane_info"),
+        _ => ("agent", "agent_info"),
+    };
+    let answer = serde_json::json!({
+        "id": format!("cli:{noun}:get"),
+        "result": {noun: entry, "type": field},
+    });
+    Some(CommandOutput {
+        status: 0,
+        stdout: answer.to_string(),
+        stderr: String::new(),
+    })
+}
+
 impl HerdrClient {
     /// Select a configured Herdr executable. Only the direct adapter is supported.
     pub fn with_executable(adapter: &str, executable: &Path) -> Result<Self> {
@@ -908,12 +1011,105 @@ impl HerdrClient {
         Ok(Self {
             executable: executable.to_owned(),
             input_expect: std::sync::OnceLock::new(),
+            snapshot: None,
         })
+    }
+    /// Answer read-only queries once per pass, each call bounded by `call_timeout`; see
+    /// [`Self::begin_pass`]. Meant only for an observer such as `agentctl watch-agents`, which
+    /// types into no pane through this client.
+    #[must_use]
+    pub fn snapshotting(mut self, call_timeout: Duration) -> Self {
+        self.snapshot = Some(std::sync::Arc::new(PassSnapshot {
+            call_timeout,
+            deadline: std::sync::Mutex::new(None),
+            answers: std::sync::Mutex::new(HashMap::new()),
+        }));
+        self
+    }
+    /// Forget the previous pass's answers, and cancel every call still running at `deadline`.
+    /// Does nothing on a client that does not snapshot.
+    pub fn begin_pass(&self, deadline: Option<Instant>) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot
+                .answers
+                .lock()
+                .expect("snapshot answers lock poisoned")
+                .clear();
+            *snapshot
+                .deadline
+                .lock()
+                .expect("snapshot deadline lock poisoned") = deadline;
+        }
+    }
+    /// The pane's `scroll.offset_from_bottom` is zero in this pass's answers: its visible rows
+    /// end at the newest output. `false` when unknown.
+    pub fn pane_at_bottom(&self, pane_id: &str) -> bool {
+        self.call(&strings(&["pane", "get", pane_id]), "pane get")
+            .ok()
+            .is_some_and(|result| result["pane"]["scroll"]["offset_from_bottom"] == 0)
     }
     fn invoke_with_timeout(&self, args: &[String], timeout: Duration) -> Result<CommandOutput> {
         self.invoke_with_timeout_and_cancellation(args, timeout, &|| false)
     }
     fn invoke_with_timeout_and_cancellation(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CommandOutput> {
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return self.invoke_now(args, timeout, cancelled);
+        };
+        let timeout = timeout.min(snapshot.call_timeout);
+        let bounded = || cancelled() || snapshot.expired();
+        let query = args.len() >= 2
+            && SNAPSHOT_QUERIES
+                .iter()
+                .any(|[noun, verb]| args[0] == *noun && args[1] == *verb);
+        if !query {
+            return self.invoke_now(args, timeout, &bounded);
+        }
+        let slot = snapshot.slot(args);
+        let answer = slot
+            .get_or_init(|| {
+                let listed = match (args[0].as_str(), args[1].as_str(), args.get(2)) {
+                    ("pane", "get", Some(pane)) if args.len() == 3 => self
+                        .invoke_with_timeout_and_cancellation(
+                            &strings(&["pane", "list"]),
+                            timeout,
+                            cancelled,
+                        )
+                        .ok()
+                        .and_then(|listing| {
+                            listed_answer(&listing, "panes", "pane_id", pane, "pane")
+                        }),
+                    ("agent", "get", Some(name)) if args.len() == 3 => self
+                        .invoke_with_timeout_and_cancellation(
+                            &strings(&["agent", "list"]),
+                            timeout,
+                            cancelled,
+                        )
+                        .ok()
+                        .and_then(|listing| {
+                            listed_answer(&listing, "agents", "name", name, "agent")
+                        }),
+                    _ => None,
+                };
+                match listed {
+                    Some(answer) => Ok(answer),
+                    None => self.invoke_now(args, timeout, &bounded),
+                }
+            })
+            .clone();
+        // Herdr's refusal is an answer and is kept; a call that could not finish (it timed out,
+        // was cancelled, or could not start) is not, so the next asker tries again instead of
+        // every agent in the pass inheriting one transient failure.
+        if answer.is_err() {
+            snapshot.forget(args, &slot);
+        }
+        answer
+    }
+    fn invoke_now(
         &self,
         args: &[String],
         timeout: Duration,

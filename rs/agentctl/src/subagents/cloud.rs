@@ -410,7 +410,7 @@ fn with_endpoint(mut arguments: Vec<String>, endpoint: &str) -> Vec<String> {
 }
 
 /// Fleet listings fetched during one invocation, keyed by endpoint.
-pub(super) type FleetCache = BTreeMap<String, std::result::Result<Vec<Value>, String>>;
+pub(crate) type FleetCache = BTreeMap<String, std::result::Result<Vec<Value>, String>>;
 
 /// A fleet-listing activity word such as `waiting`; never a session identity.
 fn valid_activity(value: &str) -> bool {
@@ -1085,7 +1085,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 run_tool(
                     &executable,
                     &with_endpoint(vec!["list".to_owned()], endpoint),
-                    control_timeout(),
+                    self.cloud_list_timeout
+                        .map_or_else(control_timeout, |bound| bound.min(control_timeout())),
                     self.child_session(),
                 )
                 .map_err(|error| error.to_string())

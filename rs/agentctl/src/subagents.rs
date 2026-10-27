@@ -41,6 +41,7 @@ mod revive;
 mod stop_advice;
 mod turn_runner;
 
+pub(crate) use cloud::FleetCache;
 pub(crate) use cloud::{
     validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,
 };
@@ -896,6 +897,15 @@ pub trait ManagedApi: AgentApi {
     fn process_liveness(&self, _expected: &CustomProcessIdentity) -> ProcessLiveness {
         ProcessLiveness::Unknown
     }
+    /// Start one observer pass: a client that keeps read-only answers for a pass forgets the
+    /// previous pass's and cancels calls still running at `deadline` (see
+    /// [`HerdrClient::snapshotting`]); others ignore it.
+    fn begin_pass(&self, _deadline: Option<std::time::Instant>) {}
+    /// Whether the pane's visible rows end at its newest output (it is not scrolled back);
+    /// `false` when unknown.
+    fn pane_at_bottom(&self, _pane: &str) -> bool {
+        false
+    }
     /// Resolve a unique workspace label.
     fn workspace_id_for_label(&self, label: &str) -> crate::error::Result<Option<String>>;
     /// Create a workspace and return its workspace, tab, and pane IDs.
@@ -1324,6 +1334,12 @@ pub trait ManagedApi: AgentApi {
 impl ManagedApi for HerdrClient {
     fn process_liveness(&self, expected: &CustomProcessIdentity) -> ProcessLiveness {
         HerdrClient::process_liveness(self, expected)
+    }
+    fn begin_pass(&self, deadline: Option<std::time::Instant>) {
+        HerdrClient::begin_pass(self, deadline);
+    }
+    fn pane_at_bottom(&self, pane: &str) -> bool {
+        HerdrClient::pane_at_bottom(self, pane)
     }
     /// Each read is its own Herdr request, and a loaded server can take over 12 s to read a busy
     /// pane's scrollback, so a send that inspects every running agent's pane makes the reads at
@@ -4787,14 +4803,19 @@ pub struct StopOptions {
 pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
     registry: PathBuf,
-    /// Test-only project workspace override. Production policy is loaded lazily
-    /// for each operation that needs it, so long-running managers do not cache it.
-    project_workspace_override: Option<String>,
+    /// The project workspace, when fixed for this manager's lifetime: a test's override, or
+    /// the one resolution of a watch pass ([`Self::with_project_workspace_resolved`]).
+    /// Otherwise policy is loaded lazily for each operation that needs it, so long-running
+    /// managers do not cache it.
+    project_workspace_override: Option<Option<String>>,
     /// Workspace inherited from the launching Herdr pane (`HERDR_WORKSPACE_ID`),
     /// used when a start names none.
     inherited_workspace: Option<String>,
     /// Executables for agentcloud-backed agents.
     cloud_tools: CloudTools,
+    /// How long one `agentcloudctl list` may run, when shorter than the control timeout: see
+    /// [`Self::with_cloud_list_timeout`].
+    cloud_list_timeout: Option<Duration>,
     /// Wait for an agent's lifecycle lock as a priority sender: see [`Self::with_lock_priority`].
     lock_priority: bool,
     #[cfg(test)]
@@ -4822,6 +4843,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             project_workspace_override: None,
             inherited_workspace,
             cloud_tools: CloudTools::default(),
+            cloud_list_timeout: None,
             lock_priority: false,
             #[cfg(test)]
             revive_wrkslots_executable: None,
@@ -4834,6 +4856,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     #[must_use]
     pub fn with_cloud_tools(mut self, tools: CloudTools) -> Self {
         self.cloud_tools = tools;
+        self
+    }
+
+    /// Bound each agentcloud fleet listing by `timeout` instead of the two-minute control
+    /// timeout, so one slow `agentcloudctl list` cannot hold a watch pass past its budget (#571
+    /// watch-agents-scale).
+    #[must_use]
+    pub(crate) fn with_cloud_list_timeout(mut self, timeout: Duration) -> Self {
+        self.cloud_list_timeout = Some(timeout);
         self
     }
 
@@ -4858,7 +4889,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     #[cfg(test)]
     fn with_project_workspace(mut self, workspace: Option<&str>) -> Self {
-        self.project_workspace_override = workspace.map(str::to_owned);
+        self.project_workspace_override = workspace.map(|workspace| Some(workspace.to_owned()));
+        self
+    }
+
+    /// Resolve the project workspace policy once, for a manager that lives for one watch pass:
+    /// checking every agent would otherwise load the profiles (and ask git whether they are
+    /// ignored) once per agent and again per screen read (#571 watch-agents-scale). A policy
+    /// that cannot be loaded is left to fail each operation as before.
+    #[must_use]
+    pub(crate) fn with_project_workspace_resolved(mut self) -> Self {
+        if self.project_workspace_override.is_none() {
+            if let Ok(workspace) = crate::profiles::workspace_for_registry(&self.registry) {
+                self.project_workspace_override = Some(workspace);
+            }
+        }
         self
     }
 
@@ -4868,7 +4913,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     fn project_workspace(&self) -> Result<Option<String>> {
         match self.project_workspace_override.as_ref() {
-            Some(workspace) => Ok(Some(workspace.clone())),
+            Some(workspace) => Ok(workspace.clone()),
             None => crate::profiles::workspace_for_registry(&self.registry),
         }
     }
@@ -8492,9 +8537,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn status_record(&self, record: &AgentRecord) -> Result<Value> {
-        if record.is_cloud() {
-            return self.cloud_status_record(record, &mut cloud::FleetCache::new());
-        }
+        self.status_record_viewing(record, true)
+    }
+
+    /// A `list` row's fields that need no live check: the record, its edges, queue and goal.
+    fn record_row(&self, record: &AgentRecord) -> Result<Value> {
         let agent_name = &record.name;
         let mut result = record.document()?;
         for key in [control::CREATED_BY, control::MANAGED_BY] {
@@ -8510,6 +8557,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             Value::Null
         };
         result["goal_delivery"] = json!(self.goal_delivery(record));
+        Ok(result)
+    }
+
+    /// [`Self::status_record`], with the running-turn view (a screen read of its own) only when
+    /// `turn` is set.
+    fn status_record_viewing(&self, record: &AgentRecord, turn: bool) -> Result<Value> {
+        if record.is_cloud() {
+            return self.cloud_status_record(record, &mut cloud::FleetCache::new());
+        }
+        let agent_name = &record.name;
+        let mut result = self.record_row(record)?;
         match self.pending_move_destination(record) {
             Ok(Some(destination)) => {
                 result["agent_status"] = json!("unknown");
@@ -8551,8 +8609,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     .expect("record object")
                     .extend(json!(status).as_object().expect("status object").clone());
                 result["probe_error"] = Value::Null;
-                if let Some(turn) = self.turn_view(record, &pane) {
-                    result["turn"] = turn;
+                if let Some(view) = turn.then(|| self.turn_view(record, &pane)).flatten() {
+                    result["turn"] = view;
                 }
             }
             Err(error) => {
@@ -8626,8 +8684,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(json!({"name": record.name, "progress": declaration}))
     }
 
-    /// List every registered agent, preserving records when Herdr is unavailable.
-    pub fn list(&self) -> Result<Vec<Value>> {
+    /// The registered agent names, sorted.
+    fn registered_names(&self) -> Result<Vec<String>> {
         if !self.registry.exists() {
             return Ok(Vec::new());
         }
@@ -8639,25 +8697,87 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .map_err(|error| fail(error.to_string()))?;
         names.retain(|value| name(value).is_ok());
         names.sort();
+        Ok(names)
+    }
+
+    /// The `list` row of a record this build cannot read.
+    fn record_error_row(name: &str, error: &AgentError) -> Value {
+        json!({
+            "name": name,
+            "agent_status": "unknown",
+            "probe_error": error.to_string(),
+            "record_error": true,
+        })
+    }
+
+    /// List every registered agent, preserving records when Herdr is unavailable.
+    pub fn list(&self) -> Result<Vec<Value>> {
         // One non-attaching agentcloud listing serves every cloud agent in this pass.
         let mut fleet = cloud::FleetCache::new();
         // Each row stands alone: a record this build cannot read is reported as its own error row
         // instead of hiding every other agent in the registry.
-        Ok(names
+        Ok(self
+            .registered_names()?
             .iter()
             .map(|name| {
                 self.load(name)
                     .and_then(|record| self.status_record_listed(&record, &mut fleet))
-                    .unwrap_or_else(|error| {
-                        json!({
-                            "name": name,
-                            "agent_status": "unknown",
-                            "probe_error": error.to_string(),
-                            "record_error": true,
-                        })
-                    })
+                    .unwrap_or_else(|error| Self::record_error_row(name, &error))
             })
             .collect())
+    }
+
+    /// Every registered agent's `list` row with no live check, for `agentctl watch-agents` (#571
+    /// watch-agents-scale), which then checks only the records it judges: the fields of
+    /// [`Self::list`] that come from the record, or the error row of a record that cannot be read.
+    pub(crate) fn watch_rows(&self) -> Result<Vec<Value>> {
+        Ok(self
+            .registered_names()?
+            .iter()
+            .map(|name| {
+                self.load(name)
+                    .and_then(|record| self.record_row(&record))
+                    .unwrap_or_else(|error| Self::record_error_row(name, &error))
+            })
+            .collect())
+    }
+
+    /// One agent's [`Self::list`] row for `agentctl watch-agents`, without the running-turn view,
+    /// which the watcher derives from the screen it reads itself. `fleet` keeps the pass's one
+    /// agentcloud listing.
+    pub(crate) fn watch_status(&self, agent_name: &str, fleet: &mut FleetCache) -> Value {
+        self.load(agent_name)
+            .and_then(|record| {
+                if record.is_cloud() {
+                    self.cloud_status_record(&record, fleet)
+                } else {
+                    self.status_record_viewing(&record, false)
+                }
+            })
+            .unwrap_or_else(|error| Self::record_error_row(agent_name, &error))
+    }
+
+    /// Read an agent's recent screen as [`Self::read`] does, for an observer: without the
+    /// agent's lifecycle lock, which a send holds until its delivery is confirmed, so a watcher
+    /// never waits behind one, and without rewriting `output.json`, so watching writes nothing
+    /// into the registry.
+    pub(crate) fn watch_read(&self, agent_name: &str, lines: usize) -> Result<String> {
+        let record = self.load(agent_name)?;
+        self.checked_policy(&record, false)?;
+        agent::read(self.client, &self.target(&record)?, lines)
+    }
+
+    /// The agent's visible rows, bottom `lines` of them, read as plain text after the same
+    /// checks as [`Self::watch_read`]: a cheap read that tells an observer whether the screen
+    /// changed.
+    pub(crate) fn watch_visible(&self, agent_name: &str, lines: usize) -> Result<(String, String)> {
+        let record = self.load(agent_name)?;
+        let info = self.checked_policy(&record, false)?;
+        let text = self
+            .client
+            .read(&info.pane_id, "visible", Some(lines))
+            .map_err(agent::AgentError::Client)?;
+        Ok((info.pane_id, text))
     }
 
     /// Serialize against stop and durably deliver one prompt.
