@@ -1,0 +1,11 @@
+● I'll run the focused tests before the gate.
+
+● Bash(cargo test -p agentctl --lib turn_state)
+  ⎿  Running…
+
+✻ Sautéing… (12m 4s · ↓ 8.4k tokens · esc to interrupt)
+
+────────────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · esc to interrupt

@@ -23,7 +23,11 @@ Use the installed command as the authority:
 - `agentctl start --help`
 - `agentctl profiles --cwd WORKDIR`
 - `agentctl status NAME`
-- `agentctl send NAME --file PROMPT`
+- `agentctl send NAME --file PROMPT` (a `queued:` warning means the prompt waits behind a running
+  turn; `status` shows the turn's age and queue, and `send NAME --urgent --file PROMPT` interrupts
+  the turn and submits the queued input instead of anyone pressing Escape and Enter by hand)
+- `agentctl progress NAME --file STATUS --matching TEXT --hours H` (declare what progress looks
+  like, so `watch-agents` can tell activity from progress)
 - `agentctl read NAME --lines 500`
 - `agentctl prompts NAME` (reveal a collapsed question for inspection; never select or submit)
 - `agentctl answer NAME --option N` or `--text TEXT` (recognized forms only)

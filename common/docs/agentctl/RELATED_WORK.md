@@ -177,6 +177,28 @@ spec and proves the old process dead first, and the watch follows the Monit
 model (check, repair, then alert) for the services around the agents, including
 the timer failure systemd's own semantics make silent.
 
+## Telling a stuck worker from a busy one
+
+Service supervisors separate "the process is alive" from "the process is doing
+its job". Kubernetes runs distinct liveness, readiness and startup probes, and
+systemd's watchdog (`WatchdogSec=`) restarts a service that stops calling
+`sd_notify("WATCHDOG=1")`. Both depend on the supervised program cooperating:
+it exposes an endpoint or sends the heartbeat. A coding agent's harness offers
+neither, and its own heartbeat-like output (a ticking turn timer, an hourly
+status line) is exactly what misleads.
+
+`agentctl watch-agents` therefore observes from outside, the way an operator
+would with `top`, `/proc/PID/wchan` and `lsof`: CPU time and I/O counters of the
+tool processes under the agent's pinned harness, the kernel wait channel of a
+sleeping tool, and `/proc/locks` for the holder of a file lock it waits on.
+Like Claude Squad's readiness check it reads terminal text, but it masks the
+turn timer first, so a clock is not mistaken for output. Where a dispatcher
+can say what progress means, a declared metric plays the role of the
+application-level health check that the other systems ask the supervised
+program to implement. None of this proves a worker is right; it says which of
+"progressing", "blocked on X", "silent" and "inside a turn that will not read
+its queued input until it ends" the evidence supports.
+
 ## Lifecycle guarantees and component boundaries
 
 `agentctl` separates the caller (CLI, MCP, or Chat), the named-session manager,

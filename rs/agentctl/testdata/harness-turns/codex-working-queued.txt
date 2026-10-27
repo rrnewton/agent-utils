@@ -1,0 +1,46 @@
+• Ran cat > /work/scratch/notes/buffered-read-correction.txt <<'EOF'
+  │ Source inspection and the twins audit agree on one narrow inefficiency: the candidate verifier reads both ~9MB schedules through an
+  │ unbuffered reader; the unchanged formatter does the same. Authorize ONE signed descendant changing these two readers to buffered ones.
+  │ … +20 lines
+  └ {
+      "blocked": null,
+      "delivered": [
+    +7 lines (^t to view transcript)
+
+• Ran env ISSUE_ACTOR=lane-b /work/project/bin/issues comments --help
+  └ Manage issue comments
+
+    Usage: issues comments [OPTIONS] <COMMAND>
+    +19 lines (^t to view transcript)
+
+• Ran python3 - <<'PY'
+  │ from pathlib import Path
+  │ import subprocess,os,json,datetime
+  │ … +24 lines
+  └ rc 0
+    {
+      "id": "is-gxmvo-c488b671b15",
+    +8 lines (^t to view transcript)
+
+• Ran agentctl read helper-replay --lines 90
+  └
+      Absolute source/shared-target interval now 04:00Z, with the existing 1800s producer and 870s consumer bounds, 16GiB/CPU200%/Tasks256, 88GB target/120GB lane and source-
+      local growth 1GB unchanged. One normal producer for this source change and one run per target, no rerun-until-green. Final new-head review and actual
+    +87 lines (^t to view transcript)
+
+• Working (2h 40m 18s • esc to interrupt)
+
+• Queued follow-up inputs
+  ↳ coordinator DISK, urgent: /data is losing about 64 GiB/h tonight. Your slot is now 352 GB (331 at 4 PM), almost 3x the 120 GB lane budget in
+    the disk budget, and I haven't seen a reply about its contents. Now, before any new build: (1) cargo clean every target/debug|release you aren't building in
+    this hour, and clean idle isolation dirs, keeping evidence outside target/; (2) reply with du before/after. If you can't get under 120 GB, tell me exactly
+    …
+  ↳ coordinator: the relay RAN and is CLOSED (H aebcfbf3 + PR 4718 body; R 2aa963ba + PR 1131 body; custody returned at 06:48Z). Receipt and the inventory
+    pointer are in my latest queue NOTE. coordinator: decision on your admission-guard conflict is in my latest queue NOTE: narrow it to your own target, don't wait for
+    global quiet. coordinator: guard review = CHANGES REQUESTED (4 blocking points). Text: /work/scratch/reviews/lane-b-target-scoped-guard-
+    …
+    shift+← edit last queued message
+
+» Ask Codex to do anything
+
+  GPT-6-Astra ultra · ~/work/project · Prepare the 0.5.0 release · Main [default]                                                     ⚠ 2 warnings · f2 to view

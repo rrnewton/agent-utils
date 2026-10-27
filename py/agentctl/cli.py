@@ -266,6 +266,8 @@ def parser() -> argparse.ArgumentParser:
          "agentctl manage worker-1 --by lieutenant"),
         ("tree", "Print the control tree of coordinator, managers, and workers (Rust edition only; this "
          "edition refuses).", "agentctl tree"),
+        ("progress", "Declare what counts as progress for an agent, for watch-agents to judge (Rust edition only; "
+         "this edition refuses).", "agentctl progress lane-a --file status.md --hours 6"),
     ):
         command(rust_only, purpose, example)
     for name, purpose in (
@@ -333,7 +335,8 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
-_RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "tree")
+_RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "tree",
+              "progress")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

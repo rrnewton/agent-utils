@@ -853,6 +853,13 @@ coordinator when a condition holds past its threshold:
 | `idle-no-verdict` | `--idle-minutes` (default 5) | idle or done, timed from the last screen change, work was delivered and drained, and the last reply has no verdict |
 | `stalled` | `--stall-minutes` (default 30) | marked working, or idle or done while the screen shows work running (a running turn or background work), timed from the last screen change |
 | `dead` | `--dead-minutes` (default 5) | the record says running but the harness cannot be reached |
+| `turn-queued` | `--turn-minutes` (default 120) | inside one turn that long with input queued behind it (in the harness's queue or agentctl's) |
+| `no-progress` | the hours declared with `agentctl progress` | working while the declared progress metric stands still |
+| `tool-blocked` | `--stall-minutes` | a gate step, or every tool command with the screen still, has used no CPU and moved no bytes; the notice names what it waits on |
+| `stream-silent` | `--stall-minutes` | working, no tool running, and neither the transcript nor the token counter has moved |
+| `over-expected` | the step's recorded p95 | a gate step running past the p95 of its history in `--step-history` |
+| `looping` | `--loop-minutes` (default 10) | the same command `--loop-repeats` times in a row, the same error in that many attempts, or a retry banner |
+| `background-wait` | `--idle-minutes` if gone, `--stall-minutes` if idle | idle while the screen counts background shells that no longer run, or that use no CPU and move no bytes |
 
 A verdict is a prose line of the agent's last reply that starts with a
 `--done-marker` once its indentation and any reply bullet are stripped; the
@@ -914,8 +921,67 @@ means that recipient. Each recipient gets its own batches and its own
 `--min-notice-interval`, and a manager that cannot take a batch has its notices
 redirected to the coordinator.
 
+#### What "working" means
+
+A working agent is not necessarily making progress, and one that looks still is
+not necessarily stuck. The watcher masks the harness's running-turn timer
+before it compares screens, so a clock that ticks every second is not new
+output (the token counter is kept: tokens moving is the model streaming). It
+also looks under the agent's pinned harness process in `/proc`: the tool
+commands the harness runs (the shells it starts them in), and the gate steps of
+any step runner among them that keeps an evidence journal (`journal.jsonl`, one
+`step_start` and `step_end` record per step) open. Between two passes a tool that used CPU or moved bytes is progressing,
+whatever the screen shows. One that did neither is blocked, and the kernel's
+wait channel and the tool's open files say on what: a file lock (the holder's
+PID and command come from `/proc/locks`), terminal input, a network socket, a
+pipe, or a child that is itself idle. A gate step is judged on its own, so one
+step stuck behind a lock is reported while its siblings run:
+
+```text
+- lane-a: gate step unit-tests blocked 40 min: `make unit-tests` (PID 300) waits on a file lock on /work/build/.lock held by `make release` (PID 900)
+```
+
+With no tool running, a screen and token counter that have not moved for
+`--stall-minutes` is a silent stream. A step running past the p95 of its
+recorded runs (`--step-history`, a per-step profile CSV with `step` and
+`elapsed_s` columns, at least 5 runs) is `over-expected`. Where no `/proc`
+sample can be taken (no pinned harness process recorded, or that process gone),
+the screen rule alone applies and the condition is `stalled`. A harness owned by
+another user is still sampled, but without its I/O counters or open files, so
+only CPU time counts as progress and wait causes that need open files (a lock's
+path and holder, a socket) are not named. Each notice is
+one line that says what is wrong; only command lines, wait channels, open-file
+targets and counters are read, never a process's environment.
+
+Activity is not progress either. A lane can write a status line every hour and
+still not move its goal for a day. A dispatcher that knows what progress looks
+like declares it right after `agentctl start`:
+
+```sh
+agentctl progress lane-a --file status.md --matching 'crashes recorded' --hours 6
+agentctl progress lane-a --command 'ls results/*.json | wc -l' --hours 4
+agentctl progress lane-a           # show
+agentctl progress lane-a --clear
+```
+
+A file metric is the file (a relative path is read from the agent's working
+directory), narrowed with `--matching` to the lines that carry the count, so an
+appended heartbeat does not count as a change; a command metric is the
+standard output of `sh -c COMMAND`, run in the agent's working directory for at
+most 30 seconds each pass. A metric that has not changed for `--hours` while
+the agent works is `no-progress`, with its last value quoted. Declarations live
+in `REGISTRY/.progress/NAME.json` (schema `agentctl-progress/v1`).
+
+A long turn with input queued behind it (see "Input queued behind a running
+turn") is `turn-queued` once its age passes `--turn-minutes`; the age is the
+harness's turn timer, else how long the watcher has seen the agent working. It
+is reported, and nothing more, unless the agent is named with
+`--auto-deliver NAME` (repeatable, off for every agent by default): then the
+watcher interrupts the turn and submits the queued input as `send --urgent`
+does, once per episode, and the notice says what happened.
+
 The watcher never answers a prompt and never types into any agent except
-those recipients. A condition past its threshold becomes **one notice per episode**,
+those recipients and the agents named with `--auto-deliver`. A condition past its threshold becomes **one notice per episode**,
 and every message goes through the same durable queue as `agentctl send`,
 delivered even while the coordinator works, so a coordinator that is busy
 simply keeps it queued. A `child-done` notice is a message of its own, sent in
@@ -1135,6 +1201,64 @@ may move a long-running foreground command to the background to take it. Only
 agents agentctl manages (started or adopted) take Muse follow-ups; a raw pane
 target, as `herdr-agent` uses, has no verified Muse editor path and still waits
 for idle. The Python edition still waits for an idle Muse editor.
+
+### Input queued behind a running turn (Rust edition)
+
+A follow-up typed into a busy harness leaves the composer, which is what
+delivery checks, but it can still wait a long time before the model reads it.
+Codex puts it in its `Queued follow-up inputs` block and submits that block
+only when the running turn ends; Claude Code holds a queued message until its
+next tool boundary; Muse holds a Tab-queued input for the next turn. A turn can
+run for days: one Codex lane stayed inside a single turn for 46 h 54 m while
+every message sent to it waited in that block.
+
+`status` and `list` therefore add a `turn` object for an interactive agent
+whose screen shows a running turn or queued input:
+
+```json
+"turn": {
+  "running": true, "age_seconds": 168854, "timer_scope": "turn", "tokens": null,
+  "harness_queued": 4, "harness_queued_exact": true, "harness_queue": "codex-end-of-turn",
+  "harness_queued_oldest_seconds": 140400, "sent_during_turn": 6,
+  "agentctl_waiting": 0, "agentctl_oldest_waiting_seconds": null, "undelivered": 6,
+  "summary": "inside one turn for 46 h 54 m; 4 inputs queued in Codex's queued follow-up inputs, submitted only when the turn ends; 6 messages typed during this turn, the oldest 39 h 0 m ago"
+}
+```
+
+`age_seconds` is the turn timer the harness draws (`• Working (46h 54m 14s •
+esc to interrupt)` in Codex, `✻ Baking… (12m 4s · ↓ 8.4k tokens · esc to
+interrupt)` in Claude Code); Muse's row times the current step, so its
+`timer_scope` is `step` and `age_seconds` is null. `harness_queue` is
+`codex-end-of-turn`, `codex-next-tool-call`, `claude-queued` or `muse-queued`;
+Claude Code shows only a hint while messages wait, so its count is "one or
+more" (`harness_queued_exact` false). `sent_during_turn` counts the prompts
+agentctl typed after the turn began, and `undelivered` is what is known not to
+have reached the model, counting both queues.
+
+When a delivered `send` finds its prompt in such a queue, it says so on
+standard error and in its JSON (`queued_behind_turn`, `warning`, `turn`)
+instead of reporting a quiet success:
+
+```text
+agentctl send: queued: lane-a has been inside one turn for 46 h 54 m; the prompt waits in Codex's queued follow-up inputs, submitted only when the turn ends; 5 earlier messages are also undelivered. `agentctl send lane-a --urgent TEXT` interrupts the turn and submits them
+```
+
+`send --urgent` delivers now, so nobody drives keys by hand. It types the
+prompt even while the agent works, waits up to `--boundary-wait` seconds
+(default 60) for the harness to take it at a tool boundary (its queued-input
+block empties: Muse steers at once, Claude Code takes queued messages between
+tool calls), and if it is still queued, presses Escape to interrupt the turn
+and, once the turn has stopped, Enter on whatever the harness put back in its
+input box. Codex moves its queued follow-up inputs into the input box when a
+turn is interrupted, so Enter submits all of them together with the new
+prompt. Both keys go through the same recipient checks as a prompt, under the
+agent's lifecycle lock. The JSON gains an `urgent` object: `interrupted`,
+`submitted`, `waited_seconds`, `queued_before`, and a `detail` line. Escape
+stops a running tool command as well, so `--urgent` is for a turn that is not
+going to end soon. Nothing is pressed when the harness holds no queued input, and the
+interrupt is refused, with nothing pressed, while an approval prompt shows
+(Escape would answer it), while the input box holds a draft (Enter would submit
+it with the queue), and for an agent behind a slot relay.
 
 To inspect a question without selecting or submitting an answer:
 
@@ -1545,6 +1669,19 @@ agentctl doctor --repair-labels
 agentctl anchor reviewer
 agentctl rename reviewer release-reviewer
 ```
+
+The pinned harness process (its PID, start time and executable, recorded by
+`start`, `adopt` and `anchor`) is also what keeps an agent reachable when
+Herdr's detection goes wrong. Herdr guesses a pane's agent kind from what runs
+in it; after a Claude Code agent ran Muse commands inside its pane, Herdr
+reported the pane as a finished Muse agent and `agent get` no longer found its
+name. While Herdr reports another agent kind for the recorded pane and the
+pinned process is still that pane's foreground process, agentctl takes the
+record's harness and native session over Herdr's report and
+reads the status from the screen (a running turn's row or `esc to interrupt`),
+so `status`, `send` and `watch-agents` keep working. Without that proof, or
+when Herdr still reports the right kind but the agent's name has gone to
+another pane or agent, the identity is uncertain and the pane is refused.
 
 Herdr routes input by pane ID, and a pane can come to hold another program: a
 server restart can reuse the ID, or a different harness can start in the same
