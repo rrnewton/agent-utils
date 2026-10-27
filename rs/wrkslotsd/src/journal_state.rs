@@ -1274,6 +1274,141 @@ fn ownerless_clone_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
     Ok(())
 }
 
+fn host_id() -> Result<String> {
+    let mut failures: Vec<String> = Vec::new();
+    for candidate in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        match std::fs::read_to_string(candidate) {
+            Ok(text) => {
+                let value = text.trim();
+                if !value.is_empty() {
+                    return Ok(value.to_owned());
+                }
+                failures.push(format!("{candidate}: empty"));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("{candidate}: {error}")),
+        }
+    }
+    let detail = if failures.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", failures.join("; "))
+    };
+    Err(format!(
+        "cannot establish the stable machine identity{detail}"
+    ))
+}
+
+fn ownerless_cache_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    exact_keys(
+        raw,
+        &[
+            "schema",
+            "kind",
+            "machine",
+            "host_id",
+            "slot",
+            "phase",
+            "source",
+            "destination",
+            "fenced",
+            "identity",
+            "actor",
+        ],
+        &[],
+        "ownerless agent cache journal",
+    )?;
+    if as_int(&raw["schema"], "ownerless agent cache journal.schema", 0)? != SCHEMA
+        || raw["kind"] != Value::String("ownerless-agent-cache-relocate".to_owned())
+        || raw["machine"].as_str() != Some(journal_machine)
+        || raw["slot"].as_str() != Some("ignored")
+    {
+        return Err("ownerless agent cache journal identity is invalid".to_owned());
+    }
+    if as_str(&raw["host_id"], "ownerless agent cache host_id")? != host_id()? {
+        return Err("ownerless agent cache journal belongs to another host identity".to_owned());
+    }
+    let expected_source = cfg.worktrees.join("ignored");
+    let expected_destination = cfg
+        .root
+        .join("ignored")
+        .join("validate")
+        .join("cache")
+        .join("wrkslots-agent-ignored");
+    let (_relative, source) = crate::config_validate::relative_inside(
+        &cfg.root,
+        as_str(&raw["source"], "ownerless agent cache source")?,
+        "cache source",
+    )?;
+    let (_relative, destination) = crate::config_validate::relative_inside(
+        &cfg.root,
+        as_str(&raw["destination"], "ownerless agent cache destination")?,
+        "cache destination",
+    )?;
+    let (_relative, fenced) = crate::config_validate::relative_inside(
+        &cfg.root,
+        as_str(&raw["fenced"], "ownerless agent cache fence")?,
+        "cache fence",
+    )?;
+    if source != expected_source || destination != expected_destination {
+        return Err("ownerless agent cache journal names a non-canonical path".to_owned());
+    }
+    let prefix = ".ignored.ownerless-agent-cache.";
+    let fenced_name = fenced
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tail = fenced_name.strip_prefix(prefix).unwrap_or_default();
+    if fenced.parent() != source.parent()
+        || !fenced_name.starts_with(prefix)
+        || !(tail.len() == 32
+            && tail
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    {
+        return Err("ownerless agent cache fence is invalid".to_owned());
+    }
+    let mut identity = Vec::new();
+    for item in as_list(&raw["identity"], "ownerless agent cache identity")? {
+        identity.push(as_int(item, "ownerless agent cache identity", 0)?);
+    }
+    if identity.len() != 3 {
+        return Err("ownerless agent cache identity must have three fields".to_owned());
+    }
+    if identity_from_obj(&raw["actor"], "ownerless agent cache actor")?.is_none() {
+        return Err("ownerless agent cache journal has no actor".to_owned());
+    }
+    let phase = as_str(&raw["phase"], "ownerless agent cache phase")?;
+    if !matches!(phase, "prepared" | "fenced" | "relocated") {
+        return Err(format!("unknown ownerless agent cache phase {phase:?}"));
+    }
+    let present = |path: &PathBuf| path.symlink_metadata().is_ok();
+    let candidates = [source.clone(), fenced.clone(), destination.clone()];
+    let present_paths: Vec<&PathBuf> = candidates.iter().filter(|path| present(path)).collect();
+    if present_paths.len() > 1 {
+        return Err("more than one ownerless agent cache path exists; preserve all".to_owned());
+    }
+    let active = present_paths.first().map(|path| (*path).clone());
+    if let Some(active) = &active {
+        if active.is_symlink()
+            || !active.is_dir()
+            || open_directory_identity(active, "ownerless agent cache")?
+                != (identity[0], identity[1], identity[2])
+        {
+            return Err("ownerless agent cache identity changed; preserve it".to_owned());
+        }
+    }
+    let effective_phase = if phase != "relocated" && active.as_ref() == Some(&destination) {
+        "relocated"
+    } else {
+        phase
+    };
+    if effective_phase == "relocated" && active.as_ref() != Some(&destination) {
+        return Err("relocated ownerless agent cache is missing from its destination".to_owned());
+    }
+    Ok(())
+}
+
 fn absent_validate_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
     const LABEL: &str = "absent-validation-row journal";
     exact_keys(
@@ -1650,6 +1785,9 @@ pub(crate) fn parse_journal(
         }
         "ownerless-clone-remove" => {
             ownerless_clone_shape(&cfg, raw, &machine)?;
+        }
+        "ownerless-agent-cache-relocate" => {
+            ownerless_cache_shape(&cfg, raw, &machine)?;
         }
         _ => return Err(format!("unsupported recovery journal kind {kind:?}")),
     }

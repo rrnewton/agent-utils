@@ -97,4 +97,6 @@ ownerless-clone-remove (clone authorization, target/fenced agreement,
 directory identity). Remaining: ownerless-agent-cache-relocate and
 recover-absent-agent-row.
 
-[muse watermelon] Next slices: ownerless-agent-cache-relocate, then recover-absent-agent-row, which completes the recovery-journal kinds.
+[muse watermelon] Slice 14 in progress: `parse-journal` also covers
+ownerless-agent-cache-relocate (host identity, canonical cache paths,
+fence, directory identity). Remaining: recover-absent-agent-row.

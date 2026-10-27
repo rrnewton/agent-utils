@@ -442,6 +442,51 @@ def test_parse_journal_ownerless_clone_refusals(tmp_path: Path, mutate: str) -> 
     assert fragment in result.stderr
 
 
+def _ownerless_cache_journal() -> dict[str, object]:
+    return {
+        "schema": 2,
+        "kind": "ownerless-agent-cache-relocate",
+        "machine": "node-a",
+        "host_id": wrkslots_cli._host_id(),
+        "slot": "ignored",
+        "phase": "prepared",
+        "source": "worktrees/ignored",
+        "destination": "ignored/validate/cache/wrkslots-agent-ignored",
+        "fenced": f"worktrees/.ignored.ownerless-agent-cache.{'c' * 32}",
+        "identity": [1, 2, 3],
+        "actor": _identity(789),
+    }
+
+
+def test_parse_journal_ownerless_cache_matches_python(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    path = _write(root, name, _ownerless_cache_journal())
+    result = _rust(root, name)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root, path)
+
+
+@pytest.mark.parametrize("mutate", ["host", "source"])
+def test_parse_journal_ownerless_cache_refusals(tmp_path: Path, mutate: str) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    journal = _ownerless_cache_journal()
+    if mutate == "host":
+        journal["host_id"] = "another-host"
+        fragment = "belongs to another host identity"
+    else:
+        journal["source"] = "worktrees/cache"
+        fragment = "names a non-canonical path"
+    path = _write(root, name, journal)
+    with pytest.raises(Exception) as caught:
+        _expected(root, path)
+    assert fragment in str(caught.value)
+    result = _rust(root, name)
+    assert result.returncode == 1
+    assert fragment in result.stderr
+
+
 @pytest.mark.parametrize("with_exclusion", [False, True])
 def test_parse_journal_ownerless_matches_python(tmp_path: Path, with_exclusion: bool) -> None:
     root = _root(tmp_path)
