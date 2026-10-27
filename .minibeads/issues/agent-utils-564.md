@@ -1,12 +1,13 @@
 ---
 title: 'message-summary-toggle: collapsed-message summaries off by default, quiet on failure, and never wider than the screen'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-26T23:37:24.169381914+00:00
-updated_at: 2026-10-26T23:37:24.169381914+00:00
+updated_at: 2026-10-27T01:24:29.918657450+00:00
+closed_at: 2026-10-27T01:24:29.918657301+00:00
 ---
 
 # Description
