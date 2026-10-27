@@ -57,6 +57,14 @@ headless-tail-pretty`):
   by the wrapper instead of `tail`, because the 200-byte tool summary cannot hold the text. It
   still only describes; nothing consumes it to act.
 
+Event log rotation (`#590 headless-log-rotation`): a generation's file is closed at 64 MiB and
+continued in `<generation>.<n>.jsonl`; retention (90 days, 2 GiB) prunes whole segments at start
+and at every rotation, never the one being written. `tail` follows across segments, and its
+`--since`, `--last` and `--at` read only the segments they need; `--follow` without a selection
+starts with the last 200 events instead of the whole log. A writer that restarts after a crash
+right after a rotation takes `seq` from the newest segment that holds an event, not from a
+stale index.
+
 Verified on Claude Code 2.1.310 (the 3.1 "to verify in M2" list): `--input-format stream-json`
 with `--resume` keeps the session; two inputs written together while idle run strictly in order,
 one turn each; `system/init` opens every turn; `result` carries a per-result cost in

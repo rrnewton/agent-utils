@@ -1,6 +1,6 @@
 ---
 title: 'headless-tail-pretty: readable, colored agentctl tail with Markdown rendering'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-565: parent-child
 created_at: 2026-10-27T17:36:53.447460489+00:00
-updated_at: 2026-10-27T17:36:53.447460489+00:00
+updated_at: 2026-10-27T18:14:06.496520363+00:00
+closed_at: 2026-10-27T18:14:06.496520142+00:00
 ---
 
 # Description

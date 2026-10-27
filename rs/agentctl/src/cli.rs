@@ -382,10 +382,10 @@ struct InstallUnits {
 struct Tail {
     #[command(flatten)]
     agent: Named,
-    /// Keep printing new events until interrupted (polls every 250 ms, across wrapper restarts)
+    /// Keep printing new events until interrupted (polls every 250 ms, across wrapper restarts and segment rotations); without --last or --since it starts with the last 200 events
     #[arg(long, short = 'f')]
     follow: bool,
-    /// Print only events after this sequence number
+    /// Print only events after this sequence number (use --since 0 with --follow for the whole log)
     #[arg(long, value_name = "SEQ", conflicts_with = "last")]
     since: Option<u64>,
     /// Print only the last N matching events (then follow, with --follow)

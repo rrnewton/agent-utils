@@ -2081,7 +2081,10 @@ exit status 0, 75 or 76. When no wrapper runs, inputs stay queued and both repor
 `blocked`.
 
 **The event log** is `REGISTRY/NAME/events/<generation>.jsonl` (mode 0600, one
-JSON object per line, appended with one write each) plus `index.json`. Every
+JSON object per line, appended with one write each) plus `index.json`. A
+generation's file is closed at 64 MiB and continued in `<generation>.1.jsonl`,
+`<generation>.2.jsonl` and so on, so a wrapper that runs for months never grows
+one file without bound. Every
 event has `v` (1), `seq` (one more than the previous event of this agent, across
 wrapper generations: `events#SEQ` is a stable address), `id`, `ts` (Unix ms),
 `agent`, `generation`, `session`, `turn`, `causation` (the queue item that caused
@@ -2105,8 +2108,9 @@ send`, so re-reading a log repeats nothing.
 | `interrupt.requested`, `error` | request ID; error class and message |
 
 A starting wrapper continues `seq` from the larger of `index.json` and the last
-complete line of the newest file, truncating a partial final line. Generations
-older than 90 days, then the oldest beyond 2 GiB, are pruned at start.
+complete line of the newest segment, truncating a partial final line. Segments
+older than 90 days, then the oldest beyond 2 GiB, are pruned when the wrapper
+starts and at every rotation; the segment being written is never pruned.
 
 **`agentctl tail NAME`** reads the log without a lock. Each event is a line
 with a dimmed time; inputs show their sender and delivery above the text, each
@@ -2123,9 +2127,10 @@ terminal's width, read again before every event; `--width COLS` fixes it.
 without colors and with the Markdown markers kept; `--pretty` forces colors, as
 for `less -R`. Control characters in sender or model text are shown as U+FFFD,
 never sent to the terminal. `--follow` keeps printing across wrapper restarts,
-`--last N` and `--since SEQ` select, `--types tool.,turn.completed` filters,
-`--json` prints events verbatim, and `--at SEQ` prints one event's whole turn
-(exit 1 when it is gone).
+`--last N` and `--since SEQ` select (a `--follow` with neither starts with the
+last 200 events; `--since 0` prints the whole log), `--types tool.,turn.completed`
+filters, `--json` prints events verbatim, and `--at SEQ` prints one event's whole
+turn (exit 1 when it is gone). Only the segments a selection needs are read.
 A hole in `seq` prints a gap line. It is unrelated to `read --output tail`.
 
 **Permissions.** A headless agent cannot ask anyone, so its settings file decides

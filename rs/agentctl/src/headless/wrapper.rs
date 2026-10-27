@@ -1192,13 +1192,25 @@ fn live_previous_harness(agent_directory: &Path) -> Option<u64> {
 
 /// Whether the previous generation ended without a clean, idle stop.
 fn previous_ended_uncleanly(events_dir: &Path, generation: u64) -> bool {
-    let Ok(files) = events::generation_files(events_dir) else {
+    let Ok(all) = events::segments(events_dir) else {
         return false;
     };
-    let Some((_, path)) = files.iter().rev().find(|(number, _)| *number < generation) else {
+    let Some(previous) = all
+        .iter()
+        .rev()
+        .find(|segment| segment.generation < generation)
+        .map(|segment| segment.generation)
+    else {
         return false;
     };
-    let Ok((events, _, _)) = events::read_from(path, 0) else {
+    // The last two segments of that generation: a rotation may have just begun a new one, and
+    // the last turn boundary is then in the segment before.
+    let mut tail: Vec<events::Segment> = all
+        .into_iter()
+        .filter(|segment| segment.generation == previous)
+        .collect();
+    tail.drain(..tail.len().saturating_sub(2));
+    let Ok(events) = events::read_segments(&tail) else {
         return false;
     };
     let busy_at_end = events

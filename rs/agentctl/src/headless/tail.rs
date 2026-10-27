@@ -646,31 +646,87 @@ impl Printer<'_> {
     }
 }
 
+/// Events `--follow` prints before following when neither `--last` nor `--since` is given.
+pub const FOLLOW_DEFAULT_LAST: usize = 200;
+
+/// The index of the first segment to read so that at least `last` events matching `types` are
+/// read, counting back from the newest segment.
+fn start_for_last(
+    segments: &[events::Segment],
+    last: usize,
+    types: &[String],
+) -> io::Result<usize> {
+    let mut count = 0;
+    for index in (0..segments.len()).rev() {
+        count += events::read_segments(&segments[index..=index])?
+            .iter()
+            .filter(|event| type_matches(types, &event.kind))
+            .count();
+        if count >= last {
+            return Ok(index);
+        }
+    }
+    Ok(0)
+}
+
+/// The events of the turn holding `target`: the segment holding it, widened to neighbouring
+/// segments while the turn continues across their boundary.
+fn turn_of(segments: &[events::Segment], target: u64) -> io::Result<Option<Vec<Event>>> {
+    if segments.is_empty() {
+        return Ok(None);
+    }
+    let index = events::segment_holding(segments, target)?;
+    let (mut low, mut high) = (index, index);
+    let mut window = events::read_segments(&segments[low..=high])?;
+    let Some(turn) = window
+        .iter()
+        .find(|event| event.seq == target)
+        .map(|event| event.turn)
+    else {
+        return Ok(None);
+    };
+    while low > 0 && window.first().is_none_or(|event| event.turn == turn) {
+        low -= 1;
+        let mut earlier = events::read_segments(&segments[low..=low])?;
+        earlier.append(&mut window);
+        window = earlier;
+    }
+    while high + 1 < segments.len() && window.last().is_none_or(|event| event.turn == turn) {
+        high += 1;
+        window.extend(events::read_segments(&segments[high..=high])?);
+    }
+    Ok(Some(window))
+}
+
 /// Run `tail` over the log in `dir`, writing to `out`. With `follow`, poll until `stop` returns
-/// true. Returns `false` when `--at` named an event that does not exist.
+/// true. Returns `false` when `--at` named an event that does not exist. Only the segments the
+/// selection needs are read: `--since` starts at the segment holding it, `--last` at the newest
+/// segments that hold enough events, and `--at` at the turn's own segments.
 pub fn run(
     dir: &Path,
     options: &TailOptions,
     out: &mut dyn Write,
     stop: &dyn Fn() -> bool,
 ) -> io::Result<bool> {
-    let mut follower = Follower::new(dir);
-    let initial = follower.poll()?;
+    let all = events::segments(dir)?;
     let mut printer = Printer {
         options,
         out,
         last_seq: None,
         senders: HashMap::new(),
     };
-    // Senders of earlier inputs label the turn headers of what is printed.
-    for event in &initial {
-        printer.remember(event);
-    }
     if let Some(target) = options.at {
-        let Some(found) = initial.iter().find(|event| event.seq == target) else {
+        let Some(window) = turn_of(&all, target)? else {
             return Ok(false);
         };
-        for event in initial.iter().filter(|event| event.turn == found.turn) {
+        let turn = window
+            .iter()
+            .find(|event| event.seq == target)
+            .map_or(0, |event| event.turn);
+        for event in &window {
+            printer.remember(event);
+        }
+        for event in window.iter().filter(|event| event.turn == turn) {
             let marker = if event.seq == target { "▶ " } else { "  " };
             if options.json {
                 serde_json::to_writer(&mut *printer.out, event)?;
@@ -684,6 +740,22 @@ pub fn run(
         printer.out.flush()?;
         return Ok(true);
     }
+    let last = options
+        .last
+        .or_else(|| (options.follow && options.since.is_none()).then_some(FOLLOW_DEFAULT_LAST));
+    let start = match (options.since, last) {
+        (Some(since), _) => events::segment_holding(&all, since.saturating_add(1))?,
+        (None, Some(last)) => start_for_last(&all, last, &options.types)?,
+        (None, None) => 0,
+    };
+    let mut follower = all
+        .get(start)
+        .map_or_else(|| Follower::new(dir), |segment| Follower::at(dir, segment));
+    let initial = follower.poll()?;
+    // Senders of earlier inputs label the turn headers of what is printed.
+    for event in &initial {
+        printer.remember(event);
+    }
     let mut selected: Vec<&Event> = initial
         .iter()
         .filter(|event| options.since.is_none_or(|since| event.seq > since))
@@ -691,7 +763,7 @@ pub fn run(
     if let Some(since) = options.since {
         printer.last_seq = Some(since);
     }
-    if let Some(last) = options.last {
+    if let Some(last) = last {
         let matching: Vec<usize> = selected
             .iter()
             .enumerate()
@@ -701,8 +773,8 @@ pub fn run(
         if matching.len() > last {
             let start = matching[matching.len() - last];
             selected.drain(..start);
-            printer.last_seq = selected.first().map(|event| event.seq.saturating_sub(1));
         }
+        printer.last_seq = selected.first().map(|event| event.seq.saturating_sub(1));
     }
     for event in selected {
         printer.event(event)?;
@@ -1100,6 +1172,104 @@ mod tests {
             "snapshot {} differs (rerun with UPDATE_SNAPSHOTS=1 to accept):\n{actual}",
             path.display()
         );
+    }
+
+    /// A log of `turns` turns of five events each, in segments of about two turns.
+    fn segmented(dir: &Path, turns: u64) {
+        let mut writer = EventWriter::open(dir, "a").unwrap();
+        writer.set_segment_limit(1400);
+        for _ in 0..turns {
+            writer.begin_turn();
+            writer
+                .append("turn.started", None, json!({"cause": "self"}))
+                .unwrap();
+            for n in 0..3 {
+                writer
+                    .append(
+                        "assistant.text",
+                        None,
+                        json!({"text": format!("line {n} {}", "w".repeat(60))}),
+                    )
+                    .unwrap();
+            }
+            writer
+                .append("turn.completed", None, json!({"outcome": "completed"}))
+                .unwrap();
+        }
+    }
+
+    fn seqs(text: &str) -> Vec<u64> {
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| value["seq"].as_u64())
+            .collect()
+    }
+
+    #[test]
+    fn selections_read_across_segments_and_skip_the_ones_they_do_not_need() {
+        let dir = scratch("segments");
+        segmented(&dir, 12);
+        let all = events::segments(&dir).unwrap();
+        assert!(all.len() >= 5, "{all:?}");
+        // A turn that straddles a segment boundary prints whole with --at.
+        let boundary = events::first_seq(&all[2].path).unwrap().unwrap();
+        let json = |options: TailOptions| {
+            output(
+                &dir,
+                &TailOptions {
+                    json: true,
+                    ..options
+                },
+            )
+        };
+        let (found, text) = json(TailOptions {
+            at: Some(boundary),
+            ..TailOptions::default()
+        });
+        assert!(found);
+        let turn: Vec<u64> = seqs(&text);
+        assert_eq!(turn.len(), 5, "{text}");
+        assert!(turn.contains(&boundary));
+        // --last and --since never open the oldest segments: make them unreadable.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&all[0].path, fs::Permissions::from_mode(0o000)).unwrap();
+        let (_, text) = json(TailOptions {
+            last: Some(3),
+            ..TailOptions::default()
+        });
+        assert_eq!(seqs(&text), vec![58, 59, 60]);
+        let (_, text) = json(TailOptions {
+            since: Some(55),
+            ..TailOptions::default()
+        });
+        assert_eq!(seqs(&text), vec![56, 57, 58, 59, 60]);
+        // --follow alone starts with the last FOLLOW_DEFAULT_LAST events: here, all of them.
+        fs::set_permissions(&all[0].path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (_, text) = json(TailOptions {
+            follow: true,
+            ..TailOptions::default()
+        });
+        assert_eq!(seqs(&text), (1..=60).collect::<Vec<u64>>());
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn follow_starts_with_the_last_events_of_a_long_log() {
+        let dir = scratch("followlast");
+        segmented(&dir, 50);
+        let (_, text) = output(
+            &dir,
+            &TailOptions {
+                follow: true,
+                json: true,
+                ..TailOptions::default()
+            },
+        );
+        let printed = seqs(&text);
+        assert_eq!(printed.len(), FOLLOW_DEFAULT_LAST);
+        assert_eq!(*printed.last().unwrap(), 250);
+        assert!(!text.contains("gap"), "{text}");
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]
