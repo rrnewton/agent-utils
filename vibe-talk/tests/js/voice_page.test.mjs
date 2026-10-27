@@ -65946,6 +65946,53 @@ test("`#578 search-status-clarity`: rows saved on this device claim no stretch u
     "a read that joined what was saved did not vouch for it");
 });
 
+test("`#578 search-status-clarity`: without threads a gap is saved with the rows, and a reload still says what is scattered", async () => {
+  const later = (all) => {
+    const from = Date.parse(all[39].timestamp);
+    for (let i = 1; i <= 6; i += 1) {
+      all.push(message({ id: String(8700000000000000100n + BigInt(i)), content: `later ${i}`,
+        timestamp: new Date(from + i * 60000).toISOString() }));
+    }
+  };
+  const { page, all } = await searchPage({ pages: 10 });
+  await search(page, "engine");
+  await page.settle();
+  await page.el("load-older").click();
+  await settleWalk(page);
+  later(all);
+  await reReadChannel(page);
+  await page.settle();
+  const said = `Searched 4 messages in this browser, a complete history back to ${searchMoment(page, all[all.length - 4].timestamp)} ` +
+    "(no gaps), plus 24 scattered older ones. None match.";
+  assert.equal(page.el("search-empty").textContent, said);
+  let reads = null;
+  const reloaded = reloadPage(page.storage, (p) => {
+    later(searchHistory(p, { pages: 10 }));
+    reads = gate(p.channelPage);
+    p.channelPage = reads.respond;
+  });
+  await reloaded.settle();
+  await search(reloaded, "engine");
+  await reloaded.settle();
+  assert.match(reloaded.el("search-empty").textContent, /^Searched 28 messages saved on this device, back to .+, not yet checked for gaps\. None match\.$/,
+    "rows drawn from the device claimed a stretch before any read");
+  reads.open();
+  await reloaded.settle();
+  await reloaded.settle();
+  assert.equal(reloaded.el("search-empty").textContent, said, "the reload forgot the gap");
+});
+
+test("`#578 search-status-clarity`: only the notice that All left replies out is said in threads; a forum's own stays as it came", async () => {
+  const page = newPage();
+  threadsHistory(page, { threads: 3, replies: 2, size: 50 });
+  const forum = "This channel contains threads. Open a thread to post a reply.";
+  allLeavingOut(page, [], forum);
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  assert.equal(page.el("timeline-notice").textContent, forum);
+  assert.equal(page.el("timeline-notice").hidden, false);
+});
+
 // --- `#271 settings-groups` -----------------------------------------------------------------------
 //
 // The owner: "organize the settings page a little more logically so it doesn't look like so many

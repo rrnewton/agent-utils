@@ -24512,6 +24512,8 @@ function saveChannelScope() {
       threads: [],
       more: discordMoreAbove !== false,
       cursor: null,
+      // `#578 search-status-clarity`: where the rows saved stop being one stretch, if they do.
+      gapFrom: plainGapFrom,
       dismissed: [...archivedIds].filter((id) => shown.has(id)),
       bookmark: bookmarkToSave(key),
     };
@@ -24551,6 +24553,7 @@ function hydrateChannelScope() {
   try {
     el("discord-log").replaceChildren();
     const loaded = applyNewestPage(payload, true);
+    plainGapFrom = Number.isFinite(entry.gapFrom) ? entry.gapFrom : null;
     renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
   } catch (_error) {
     clearChannelScreen();
@@ -26393,6 +26396,10 @@ function inheritAllCover(view, threadId = null, summary = null) {
     own.live = true;
     own.at = all.at;
     own.fromAll = true;
+    // `#578 search-status-clarity`. All's newest read speaks for Main's rows too, and so does a gap it
+    // found: below it, Main's rows walked back to earlier are scattered as All's are.
+    if (Number.isFinite(all.dense)) own.dense = Number.isFinite(own.dense) ? Math.max(own.dense, all.dense) : all.dense;
+    if (Number.isFinite(all.top)) own.top = Number.isFinite(own.top) ? Math.max(own.top, all.top) : all.top;
   } else if (view === "thread" && !own && allReachesThread(threadId, summary) && !storeLacksReplies(threadId, summary)) {
     channelCanon.views.set(key, { ...all, cursor: null, newest: null, fullAt: 0 });
   } else {
@@ -28997,6 +29004,9 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   return channelView === "threads" ? timelineThreads : shown;
 }
 
+/** The words a server's notice that All left some threads' replies out begins with, then and now. */
+const BOUNDED_ALL_NOTICE = /^(Some threads' replies are not in All|Flat view includes replies)/;
+
 /**
  * What the notice under the step back says over All of a page the server says it bounded: in threads,
  * not pages (`#578 search-status-clarity`). The owner: "PAGES are not a concept in vibe talk. THREADS
@@ -29007,7 +29017,8 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
  * @param {string} notice
  */
 function allNoticeWords(notice) {
-  if (!notice || !threadingSupported || channelView !== "flat") return notice;
+  // Only the notice that All left replies out: a forum's own words on All, say, are another matter.
+  if (!notice || !threadingSupported || channelView !== "flat" || !BOUNDED_ALL_NOTICE.test(notice)) return notice;
   const tally = replyTally();
   let lacking = 0;
   let unknown = false;
@@ -41297,6 +41308,9 @@ function searchDayWords(key, clock = dayClock()) {
  */
 let plainGapFrom = null;
 
+/** Without threads: whether the rows on screen were drawn from this device, and no read has landed since. */
+let plainSaved = false;
+
 /**
  * @typedef {object} HistoryReach
  * @property {number} total the messages loaded in the column being worked on, as the search counts them
@@ -41342,6 +41356,8 @@ function historyReach() {
   } else {
     // Hide read's own list is a to-do list, not a stretch of the channel (`loadTodo`).
     if (todoMode || discordMoreAbove === undefined) return reach;
+    // Drawn from this device: what was saved, and nothing it may have missed since.
+    reach.saved = plainSaved;
     if (plainGapFrom !== null) floor = plainGapFrom;
     else if (discordMoreAbove === false) reach.start = true;
     else floor = -Infinity;
@@ -42129,6 +42145,7 @@ function applyNewestPage(payload, saved = false) {
   // reaches down into what was loaded, so messages may lie between that no read brought, and the rows
   // kept are scattered below the page (`historyReach`). Once a gap, always one, until a fresh list.
   const keptRows = kept.filter(isMessageRow);
+  plainSaved = saved;
   if (keptRows.length === 0) plainGapFrom = null;
   else if (keptRows.length === before.length && messages.length > 0) {
     const from = Date.parse(String(messages[0].timestamp || ""));
