@@ -82,6 +82,11 @@ pub(super) fn unsupported_message(record: &AgentRecord) -> String {
             "agent {:?} is a headless turn-runner worker (mode {:?}, backend {:?}); this agentctl does not drive turn runners. Once its runner has exited, retire it with: agentctl stop {} --expected-token={}",
             record.name, record.mode, record.backend, record.name, record.token
         )
+    } else if record.is_headless() {
+        format!(
+            "agent {:?} is a headless agent (adapter {:?}); it has no pane. Use agentctl tail, status, send, drain, interrupt, compact or stop",
+            record.name, record.adapter
+        )
     } else {
         format!(
             "agent {:?} uses adapter {:?}, mode {:?}, backend {:?}, which this agentctl does not run",
@@ -886,7 +891,7 @@ pub(super) fn relocate_receipt_paths(value: Value, source: &Path, destination: &
     }
 }
 
-fn unavailable(message: String) -> AgentError {
+pub(super) fn unavailable(message: String) -> AgentError {
     AgentError::Client(AdapterError::unavailable(message))
 }
 

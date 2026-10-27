@@ -1,0 +1,19 @@
+# Installed by `agentctl install-units --headless @NAME@`. Runs the headless wrapper of agent
+# @NAME@: one persistent harness process that is the only drainer of the agent's queue. A clean
+# stop (`agentctl stop @NAME@`, or systemctl stop) exits 0 and is not restarted; a wrapper that
+# gave up on its harness exits 1 and is restarted, at most 5 times in 10 minutes.
+[Unit]
+Description=agentctl headless agent @NAME@
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=@AGENTCTL@ --registry @REGISTRY@ run-headless @NAME@
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

@@ -1,11 +1,51 @@
 # headless-coordinator: running the coordinator agent without a TUI
 
-Status: design (milestone M0 of `#565 headless-coordinator`); nothing here is implemented.
+Status: design (milestone M0 of `#565 headless-coordinator`). Since 2026-10-27, the event log
+and `agentctl tail` (M1, `#582 headless-m1-event-log`) and the Claude Code wrapper (M2, `#583
+headless-m2-claude-wrapper`) are implemented; see "Implementation status" below for what was
+built, what differs from this note, and what remains.
 Written 2026-10-26 at the owner's request, revised the same day after an adversarial review.
 Harness behaviour marked **verified** was observed on this host that day with Claude Code
 2.1.310, the Codex CLI and the Muse CLI installed here (section 3 and the appendix give the
 commands and what each run showed). Everything else is cited or labelled as inference or
 "to verify".
+
+## Implementation status (2026-10-27)
+
+Built (operator reference: `agentctl userguide`, "Headless Claude agents"):
+
+- The v1 event log and `agentctl tail` as in 5.2 and 7.1, with two additions to the type list:
+  `lifecycle.harness_spawned` / `lifecycle.harness` / `lifecycle.harness_exited` (harness process
+  and version, separate from the wrapper's generation) and `interrupt.requested`. `--follow` polls
+  every 250 ms; inotify is not used.
+- The wrapper is built into `agentctl` as `agentctl run-headless NAME`, not a separate
+  `agentctl-harness-claude` executable, so pinned single-binary installs carry it, and
+  `agentctl capabilities` reports it per binary (lesson 3 of section 4). The record is `adapter:
+  harness-wrapper`, `mode: headless`; the session lives in the record's `headless` block. Launch
+  profiles are unchanged (both editions still refuse a headless Claude profile); harness options go
+  through `--harness-arg`.
+- Delivery as in 5.1, with the lock held per transition rather than across the acknowledgement
+  wait (the wrapper is the only drainer, so nothing else waits on it). `send --urgent` is
+  `urgent` + `now`; plain `send` and every item without fields is `normal` + `turn-boundary`.
+  `agentctl drain` on a headless agent wakes the wrapper and waits, so agent-teams delivery
+  (enqueue, then `agentctl drain`) works unchanged.
+- `interrupt`, `compact` (queues `/compact`), `status`/`list` from the wrapper's control socket,
+  `stop` (clean stop, archive), `install-units --headless NAME`, `--permission-prompts none` by
+  default, and an example settings file with deny rules
+  (`rs/agentctl/src/headless/coordinator-settings.example.json`).
+
+Verified on Claude Code 2.1.310 (the 3.1 "to verify in M2" list): `--input-format stream-json`
+with `--resume` keeps the session; two inputs written together while idle run strictly in order,
+one turn each; `system/init` opens every turn; `result` carries a per-result cost in
+`model_usage_since_last_result`. Not exercised: cancelling one queued input, and what the
+transcript records for an input queued and then cancelled.
+
+Not built yet: the bridge's request journal and `agentctl ledger` (12.1); the Python extension's
+v1 events; `agentctl say`, `takeover` and `release-headless` (takeover is manual: stop, then
+`claude --resume SESSION`); per-input cancel of a written input; the provenance header of section
+10; the post-compaction records prompt of 9.5; status from events in `watch-agents`, which skips
+headless agents for now; `HeadlessDelivery` in the bridge (M3); Codex and Muse wrappers (after the
+Claude cutover, per the owner's answer to question 5).
 
 ## 0. Summary
 

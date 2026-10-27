@@ -1,0 +1,38 @@
+{
+  "$comment": "Example Claude Code settings for a headless coordinator (agentctl start --mode headless --harness-arg=--settings=FILE). Review it against your Claude Code version, add host-specific paths in a private copy, and have the owner sign it off: nothing can ask a human, so these rules are the whole policy. Deny rules are the guard that holds even when host settings or a sandbox would allow more.",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(agentctl *)",
+      "Bash(agent-teams *)",
+      "Bash(wrkslots *)",
+      "Bash(herdr-run *)",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(git fetch*)",
+      "Bash(git rev-parse*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(date*)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Bash(sudo *)",
+      "Bash(systemctl --user stop *)",
+      "Bash(systemctl --user disable *)",
+      "Bash(pkill *)",
+      "Bash(killall *)",
+      "Edit(~/.config/systemd/**)"
+    ]
+  }
+}

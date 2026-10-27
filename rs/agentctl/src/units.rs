@@ -17,6 +17,7 @@ const HERDR_SERVER: &str = include_str!("systemd/herdr-server.service");
 const AGENT_RESTORE: &str = include_str!("systemd/agent-restore.service");
 const AGENT_WATCH: &str = include_str!("systemd/agent-watch.service");
 const BRIDGE_AFTER_HERDR: &str = include_str!("systemd/bridge-after-herdr.conf");
+const HEADLESS: &str = include_str!("systemd/agentctl-headless.service");
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -98,14 +99,80 @@ pub fn rendered(options: &InstallOptions) -> Result<Vec<(PathBuf, String)>> {
 
 /// Write the rendered units; refuse to replace a different existing file without `force`.
 pub fn install(options: &InstallOptions) -> Result<Value> {
+    let files = rendered(options)?;
+    let (written, unchanged) = write_files(options, &files)?;
+    let enable = [
+        "herdr-server.service",
+        "agent-restore.service",
+        "agent-watch.service",
+    ];
+    Ok(json!({
+        "dry_run": options.dry_run,
+        "written": written,
+        "unchanged": unchanged,
+        "next_steps": [
+            "review the files",
+            "systemctl --user daemon-reload",
+            format!("systemctl --user enable {}", enable.join(" ")),
+            "loginctl enable-linger \"$USER\"   # once, so the units start at boot without a login",
+        ],
+    }))
+}
+
+/// The unit that runs the headless agent `name`, rendered, as `(file name, contents)`.
+pub fn rendered_headless(options: &InstallOptions, name: &str) -> Result<(PathBuf, String)> {
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(fail(format!(
+            "--headless takes an agent name (1-32 lowercase letters, digits, and hyphens), not {name:?}"
+        )));
+    }
+    let agentctl = unit_path("agentctl", &options.agentctl)?;
+    let registry = unit_path("registry", &options.registry)?;
+    Ok((
+        PathBuf::from(format!("agentctl-headless-{name}.service")),
+        HEADLESS
+            .replace("@AGENTCTL@", &agentctl)
+            .replace("@REGISTRY@", &registry)
+            .replace("@NAME@", name),
+    ))
+}
+
+/// Write only the unit of the headless agent `name`; refuse to replace a different existing
+/// file without `force`. Enables and starts nothing.
+pub fn install_headless(options: &InstallOptions, name: &str) -> Result<Value> {
+    let file = rendered_headless(options, name)?;
+    let unit = file.0.display().to_string();
+    let (written, unchanged) = write_files(options, &[file])?;
+    Ok(json!({
+        "dry_run": options.dry_run,
+        "written": written,
+        "unchanged": unchanged,
+        "next_steps": [
+            "review the file",
+            "systemctl --user daemon-reload",
+            format!("systemctl --user enable --now {unit}"),
+            format!("agentctl --registry {} tail {name} --follow", options.registry.display()),
+        ],
+    }))
+}
+
+/// Write `files` under `options.dest`, returning the paths written and those already current.
+fn write_files(
+    options: &InstallOptions,
+    files: &[(PathBuf, String)],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     if !options.dest.is_absolute() {
         return Err(fail("--dest must be an absolute directory"));
     }
-    let files = rendered(options)?;
     let mut written = Vec::new();
     let mut unchanged = Vec::new();
     let mut conflicts = Vec::new();
-    for (relative, contents) in &files {
+    for (relative, contents) in files {
         let path = options.dest.join(relative);
         match fs::read_to_string(&path) {
             Ok(existing) if existing == *contents => unchanged.push(path),
@@ -124,7 +191,7 @@ pub fn install(options: &InstallOptions) -> Result<Value> {
         )));
     }
     if !options.dry_run {
-        for (relative, contents) in &files {
+        for (relative, contents) in files {
             let path = options.dest.join(relative);
             if !written.contains(&path) {
                 continue;
@@ -155,22 +222,7 @@ pub fn install(options: &InstallOptions) -> Result<Value> {
                 .map_err(|error| fail(format!("cannot install {}: {error}", path.display())))?;
         }
     }
-    let enable = [
-        "herdr-server.service",
-        "agent-restore.service",
-        "agent-watch.service",
-    ];
-    Ok(json!({
-        "dry_run": options.dry_run,
-        "written": written,
-        "unchanged": unchanged,
-        "next_steps": [
-            "review the files",
-            "systemctl --user daemon-reload",
-            format!("systemctl --user enable {}", enable.join(" ")),
-            "loginctl enable-linger \"$USER\"   # once, so the units start at boot without a login",
-        ],
-    }))
+    Ok((written, unchanged))
 }
 
 #[cfg(test)]
@@ -194,6 +246,23 @@ mod tests {
             std::env::temp_dir().join(format!("agentctl-units-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[test]
+    fn headless_unit_runs_the_wrapper_and_is_written_alone() {
+        let dest = scratch("headless");
+        let (name, contents) = rendered_headless(&options(&dest), "coordinator").unwrap();
+        assert_eq!(name, PathBuf::from("agentctl-headless-coordinator.service"));
+        assert!(contents.contains(
+            "ExecStart=/opt/agentctl/bin/agentctl --registry /home/owner/project/.agentctl run-headless coordinator"
+        ));
+        assert!(contents.contains("Restart=on-failure"));
+        assert!(!contents.contains('@'), "{contents}");
+        assert!(rendered_headless(&options(&dest), "../x").is_err());
+        let report = install_headless(&options(&dest), "coordinator").unwrap();
+        assert_eq!(report["written"].as_array().unwrap().len(), 1);
+        assert!(!dest.join("agent-watch.service").exists());
+        let _ = fs::remove_dir_all(&dest);
     }
 
     #[test]

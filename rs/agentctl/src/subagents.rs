@@ -35,6 +35,7 @@ use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts}
 
 mod cloud;
 mod control;
+mod headless;
 mod launch_spec;
 mod nested;
 mod revive;
@@ -48,6 +49,7 @@ pub(crate) use cloud::{
 pub use cloud::{CloudLaunch, CloudTools};
 pub(crate) use control::{controller_of, tree_order};
 pub use control::{render_tree, ManageAction};
+pub use headless::HeadlessStart;
 pub(crate) use stop_advice::{stop_reason, StopContext};
 pub use stop_advice::{RecoveryAction, StopFailure};
 
@@ -8530,6 +8532,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if record.is_cloud() {
             return self.cloud_status_record(record, &mut cloud::FleetCache::new());
         }
+        if record.is_headless() {
+            return self.headless_status_record(record);
+        }
         let agent_name = &record.name;
         let mut result = self.record_row(record)?;
         match self.pending_move_destination(record) {
@@ -11092,6 +11097,9 @@ its drain would type first, so it was not queued",
         }
         if record.adapter == turn_runner::ADAPTER {
             return self.retire_turn_runner(record, options, recovery);
+        }
+        if record.is_headless() {
+            return self.retire_headless(record, options);
         }
         if options.retire_dead_adoption {
             Self::dead_adoption_anchor(&record)?;

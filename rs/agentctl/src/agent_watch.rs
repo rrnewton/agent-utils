@@ -2400,7 +2400,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             && row["move_pending"] != true
             && (row["record_error"] == true
                 || (matches!(row["lifecycle"].as_str(), Some("running" | "starting"))
-                    && row["adapter"].as_str() != Some("agentcloud")));
+                    && row["adapter"].as_str() != Some("agentcloud")
+                    // A headless agent has no screen; its event log is its status (#565).
+                    && row["adapter"].as_str() != Some(crate::headless::ADAPTER)));
         if !watched {
             return (!expired()).then_some(Checked {
                 row,
