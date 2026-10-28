@@ -6,10 +6,11 @@ issue_type: bug
 labels:
 - vibe-talk
 depends_on:
+  agent-utils-624: blocks
   agent-utils-630: related
   agent-utils-621: related
 created_at: 2026-10-28T14:53:37.722656369+00:00
-updated_at: 2026-10-28T14:53:37.722656369+00:00
+updated_at: 2026-10-28T17:38:43.633646370+00:00
 ---
 
 # Description

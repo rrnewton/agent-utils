@@ -5,8 +5,10 @@ priority: 2
 issue_type: task
 labels:
 - vibe-talk
+depends_on:
+  agent-utils-624: blocks
 created_at: 2026-10-28T15:13:15.881850231+00:00
-updated_at: 2026-10-28T15:13:15.881850231+00:00
+updated_at: 2026-10-28T17:38:43.639036754+00:00
 ---
 
 # Description

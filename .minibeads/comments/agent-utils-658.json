@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-658-c06d92a344b",
+    "issue_id": "agent-utils-658",
+    "author": "coordinator",
+    "body": "[opus 5.5] Owner 2026-10-28 11:37-11:54 ET design direction: global id = Slack ts; optional short id in a prefixed namespace, B343 (B is not thread-specific and does not clash with Meta D/P/T/S ids); prompts and reply markers carry the full short id (CHAT_REPLY_B343). Only the bridge coins B-numbers (for every request it receives, from native Slack or vibe-talk), so the sequence stays dense; the bridge attaches hidden Slack app metadata to each reply it posts ({bridge, request, request_ts}); vibe-talk reads it (as with #465 op-key metadata) and displays the labels; vibe-talk coins its own prefix (e.g. V) only when no bridge is attached. vibe-talk sends already carry op-key metadata, so they can be labelled at send time; native Slack messages get theirs when the first reply arrives. A bridge option chooses short or global ids in reply tags (TUI scraping only; headless needs none). Error data 2026-10-20..28 for this coordinator: 0 wrong-id warnings; 2 no-closing-line notices; lost blocks 237-241, 365, 377, 387 (block followed by a tool call); 122 pane captures vs 449 chat-reply commands. Also: count capture failures as log events.",
+    "created_at": "2026-10-28T17:38:43.641718746Z",
+    "updated_at": "2026-10-28T17:38:43.641718746Z"
+  }
+]

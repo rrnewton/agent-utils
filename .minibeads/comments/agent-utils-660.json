@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-660-cf0e8684b07",
+    "issue_id": "agent-utils-660",
+    "author": "coordinator",
+    "body": "[opus 5.5] Owner 2026-10-28 11:42 ET: also cover closed-source platforms the owner has not used (Cursor background agents, Devin, GitHub Copilot coding agent, Google Jules, OpenAI Codex cloud, Factory, Replit Agent) from public docs, and for each specifically its MOBILE control story (native app, mobile web, Slack/Teams only) and any VOICE integration, with sources and dates. Gas Town is the one the owner has tried.",
+    "created_at": "2026-10-28T17:38:43.644334668Z",
+    "updated_at": "2026-10-28T17:38:43.644334668Z"
+  }
+]
