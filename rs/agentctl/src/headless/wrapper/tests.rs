@@ -7,7 +7,11 @@ use std::os::unix::fs::DirBuilderExt;
 
 /// A stand-in for `claude -p` stream-json that follows the observed protocol: `queued`,
 /// `started`, `init`, text, `result`, `completed`; `SLOW` runs a tool until an interrupt or a
-/// mid-turn input arrives; `REPLY` runs an `agent-teams reply --file` command;
+/// mid-turn input arrives; `REPLY` runs an `agent-teams reply --file` command; `ASK` runs a tool
+/// call that raises a `can_use_tool` permission prompt and waits for its answer, as Claude Code
+/// 2.1.310 does (`ASKLONG` with a command too long to show whole, `WITHDRAW` withdrawing the
+/// prompt and running the call as a host hook allowed it, `SELFASK` also trying to answer it
+/// itself through the control socket); `HOOKDENY` runs one a hook refuses outright;
 /// `FAKE_MODE=silent` never acknowledges; `FAKE_MODE=crash` exits on
 /// the first input; `FAKE_MODE=queueonly` acknowledges but never starts; `FAKE_MODE=crashmid`
 /// exits inside a `SLOW` turn. It appends its argv to `FAKE_ARGS_LOG` and records received inputs in
@@ -40,6 +44,60 @@ def record(uuid):
 def control(message):
     out({"type": "control_response", "response": {"subtype": "success",
          "request_id": message["request_id"], "response": {"still_queued": []}}})
+def ask(denials, command="git push origin main", withdraw=False, selfask=False):
+    out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": command}}]}})
+    out({"type": "control_request", "request_id": "perm-1", "request": {"subtype": "can_use_tool",
+         "tool_name": "Bash", "input": {"command": command}, "description": "Push",
+         "decision_reason": "Pushes need a human.", "decision_reason_type": "hook", "tool_use_id": "t3"}})
+    if withdraw:
+        time.sleep(0.2)
+        out({"type": "control_cancel_request", "request_id": "perm-1"})
+        out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t3", "content": "ran"}]},
+            "tool_result_meta": [{"id": "t3", "permission_decision": {"decision": "accept", "source": "hook"}}]})
+        return
+    if selfask:
+        import socket
+        client = socket.socket(socket.AF_UNIX)
+        client.connect(os.environ["FAKE_SOCKET"])
+        client.sendall((json.dumps({"op": "approval", "decision": "approve", "by": "console:me"}) + "\n").encode())
+        with open(os.environ["FAKE_SELF_LOG"], "w") as log:
+            log.write(client.makefile().readline())
+    held = []
+    answer = None
+    deadline = time.time() + 25
+    while time.time() < deadline and answer is None:
+        try:
+            message = inputs.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        if message is None:
+            break
+        if message.get("type") == "control_response" and message["response"]["request_id"] == "perm-1":
+            answer = message["response"]["response"]
+        else:
+            held.append(message)
+    for message in held:
+        inputs.put(message)
+    if answer and answer.get("behavior") == "allow":
+        out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t3", "content": "pushed " + answer["updatedInput"]["command"][:40]}]},
+            "tool_result_meta": [{"id": "t3", "permission_decision": {"decision": "accept", "source": "user_temporary"}}]})
+    else:
+        text = answer["message"] if answer else "no answer"
+        out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t3", "content": text, "is_error": True}]},
+            "tool_result_meta": [{"id": "t3", "permission_decision": {"decision": "reject", "source": "user_reject"}}]})
+        denials.append({"tool_name": "Bash", "tool_use_id": "t3", "tool_input": {"command": command}})
+def hookdeny(denials):
+    out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_use", "id": "t4", "name": "Bash", "input": {"command": "cd /x && make"}}]}})
+    out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t4", "is_error": True,
+         "content": "PreToolUse:Bash hook error: [hook]: Refused by the permission hook: never cd in a compound command.\nUse absolute paths."}]},
+        "tool_result_meta": [{"id": "t4", "permission_decision": {"decision": "reject", "source": "hook"}}]})
+    denials.append({"tool_name": "Bash", "tool_use_id": "t4", "tool_input": {"command": "cd /x && make"}})
 def turn(first):
     batch = [first]
     life(first["uuid"], "started")
@@ -53,6 +111,18 @@ def turn(first):
         out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
             {"type": "tool_result", "tool_use_id": "t2",
              "content": "sent\nkey AbCdEfGh1234567890AbCdEfGh12345678\n3\n4\n5\n6\n7\n8\n9\n10\n"}]}})
+    denials = []
+    content = first["message"]["content"]
+    if "ASKLONG" in content:
+        ask(denials, command="echo " + "x" * 4000)
+    elif "WITHDRAW" in content:
+        ask(denials, withdraw=True)
+    elif "SELFASK" in content:
+        ask(denials, selfask=True)
+    elif "ASK" in content:
+        ask(denials)
+    if "HOOKDENY" in first["message"]["content"]:
+        hookdeny(denials)
     if "SLOW" in first["message"]["content"]:
         out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "sleep 30"}}]}})
@@ -88,7 +158,7 @@ def turn(first):
         out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
             {"type": "text", "text": "echo: " + item["message"]["content"]}]}})
     out({"type": "result", "subtype": "success", "duration_ms": 5,
-         "usage": {"input_tokens": 1, "output_tokens": 2},
+         "usage": {"input_tokens": 1, "output_tokens": 2}, "permission_denials": denials,
          "model_usage_since_last_result": {"fake": {"costUSD": 0.001}}})
     for item in batch:
         life(item["uuid"], "completed")
@@ -132,13 +202,21 @@ impl Fixture {
         fs::write(&script, FAKE_HARNESS).unwrap();
         let cwd = root.join("work");
         fs::create_dir_all(&cwd).unwrap();
-        let session = "6b4a1c1e-2f6e-4f7e-9a51-1d0c3e2a9b10";
+        // A session of its own: a wrapper ends every process that names its session when its
+        // harness exits, which would end a concurrent test's harness on a shared one.
+        let session = claude::random_uuid().unwrap();
+        let session = session.as_str();
         let mut config = WrapperConfig::new("agent", &agent_directory, &cwd, session);
         let claude_config = root.join("claude-config");
         config.command = vec![
             "env".to_owned(),
             format!("FAKE_MODE={mode}"),
             format!("FAKE_ARGS_LOG={}", root.join("args.log").display()),
+            format!(
+                "FAKE_SOCKET={}",
+                control::socket_path(&agent_directory).display()
+            ),
+            format!("FAKE_SELF_LOG={}", root.join("self.log").display()),
             format!(
                 "FAKE_TRANSCRIPT={}",
                 claude::transcript_path(&cwd, session, &claude_config).display()
@@ -147,6 +225,8 @@ impl Fixture {
             script.display().to_string(),
         ];
         config.config_directory = Some(claude_config);
+        // The test, its harness and its answers share one control group.
+        config.approval_cgroup_check = false;
         config.ack_deadline = Duration::from_secs(10);
         config.startup_grace = Duration::ZERO;
         config.stop_timeout = Duration::from_secs(10);
@@ -665,5 +745,370 @@ fn held_deliveries_stay_queued_until_released() {
     fixture.wait("processed", || {
         fixture.state("m1") == Some(queue::MessageState::Processed)
     });
+    fixture.stop(handle);
+}
+
+impl Fixture {
+    fn answer(&self, body: Value) -> Value {
+        control::request(
+            &control::socket_path(&self.agent_directory),
+            &body,
+            Duration::from_secs(20),
+        )
+        .unwrap_or_else(|error| json!({"ok": false, "error": error.to_string()}))
+    }
+
+    /// The ID of the one `approval.requested` event, once logged.
+    fn approval_id(&self) -> String {
+        self.wait("approval.requested", || {
+            self.has_event("approval.requested", |_| true)
+        });
+        self.events()
+            .into_iter()
+            .find(|event| event.kind == "approval.requested")
+            .and_then(|event| event.data["id"].as_str().map(str::to_owned))
+            .unwrap()
+    }
+
+    fn event_data(&self, kind: &str) -> Value {
+        self.events()
+            .into_iter()
+            .find(|event| event.kind == kind)
+            .map(|event| event.data)
+            .unwrap_or_else(|| panic!("no {kind} event in {:?}", self.kinds()))
+    }
+}
+
+#[test]
+fn an_owner_approval_from_chat_lets_the_call_run_and_its_message_is_consumed() {
+    let fixture = Fixture::new("approve", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK to push", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    let asked = fixture.event_data("approval.requested");
+    assert_eq!(asked["tool"], "Bash");
+    assert_eq!(asked["summary"], "git push origin main");
+    assert_eq!(asked["reason"], "Pushes need a human.");
+    assert_eq!(asked["reason_type"], "hook");
+    assert_eq!(asked["timeout_s"], 600);
+    let pending = fixture.request("approvals");
+    assert_eq!(pending["approvals"][0]["id"], id.as_str(), "{pending}");
+    assert_eq!(fixture.request("status")["approvals_pending"], 1);
+    // The bridge passes the owner's answer first, then queues the chat message that carried it.
+    let answer = fixture.answer(json!({"op": "approval", "id": id, "decision": "approve",
+                                       "by": "chat:U1", "queue_id": "chat-k1"}));
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["approval"]["decision"], "approved");
+    let again = fixture.answer(json!({"op": "approval", "id": id, "decision": "approve",
+                                      "by": "chat:U1", "queue_id": "chat-k1"}));
+    assert_eq!(again["already"], true, "{again}");
+    fixture.enqueue(
+        "chat-k1",
+        &format!("Sent 1 s ago by the owner: approve {id}"),
+        json!({"from": "agentctl", "priority": "urgent", "deliver": "now"}),
+    );
+    fixture.wait("the call ran", || {
+        fixture.has_event("tool.completed", |data| {
+            data["ok"] == true && data["preview"][0] == "pushed git push origin main"
+        })
+    });
+    fixture.wait("consumed", || {
+        fixture.has_event("input.consumed", |data| data["queue_id"] == "chat-k1")
+    });
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    let decided = fixture.event_data("approval.decided");
+    assert_eq!(decided["decision"], "approved");
+    assert_eq!(decided["by"], "chat:U1");
+    let item = queue::load_message(&fixture.queue().join("processed/chat-k1.json")).unwrap();
+    assert_eq!(item["consumed"], "approval");
+    assert_eq!(item["approval_id"], id.as_str());
+    // The harness never saw the answer as a prompt.
+    assert!(!fixture.has_event("input.queued", |data| data["queue_id"] == "chat-k1"));
+    assert!(!fixture.has_event("assistant.text", |data| data["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("approve"))));
+    let args = fs::read_to_string(fixture.root.join("args.log")).unwrap();
+    assert!(
+        args.contains(r#""--permission-prompts", "host", "--permission-prompt-tool", "stdio""#),
+        "{args}"
+    );
+    assert!(fixture.has_event("lifecycle.started", |data| data["approvals"] == true));
+    fixture.stop(handle);
+}
+
+#[test]
+fn an_owner_denial_reaches_the_model_with_its_reason_and_is_logged_in_full() {
+    let fixture = Fixture::new("deny", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK to push", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    // No ID answers the only pending prompt.
+    let answer = fixture.answer(
+        json!({"op": "approval", "decision": "deny", "by": "console:owner",
+                                       "reason": "not now"}),
+    );
+    assert_eq!(answer["ok"], true, "{answer}");
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    let decided = fixture.event_data("approval.decided");
+    assert_eq!(decided["decision"], "denied");
+    assert_eq!(decided["by"], "console:owner");
+    assert_eq!(decided["reason"], "not now");
+    let completed = fixture.event_data("tool.completed");
+    assert_eq!(completed["ok"], false);
+    assert_eq!(completed["summary"], "git push origin main");
+    assert_eq!(completed["denied"]["source"], "approval");
+    assert_eq!(
+        completed["denied"]["reason"],
+        format!("The owner denied this call at the console (approval {id}): not now")
+    );
+    let denied = fixture.event_data("permission.denied");
+    assert_eq!(denied["tool_use_id"], "t3");
+    assert_eq!(denied["source"], "approval");
+    assert_eq!(denied["reason"], completed["denied"]["reason"]);
+    let none =
+        fixture.answer(json!({"op": "approval", "decision": "approve", "by": "console:owner"}));
+    assert_eq!(none["class"], "not_pending", "{none}");
+    fixture.stop(handle);
+}
+
+#[test]
+fn an_unanswered_prompt_is_denied_at_the_timeout() {
+    let mut fixture = Fixture::new("timeout", "normal");
+    fixture.config.approval_timeout = Duration::from_secs(1);
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK to push", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    let decided = fixture.event_data("approval.decided");
+    assert_eq!(decided["decision"], "denied");
+    assert_eq!(decided["by"], "timeout");
+    assert!(decided["waited_ms"].as_u64().unwrap() >= 1000, "{decided}");
+    let completed = fixture.event_data("tool.completed");
+    let reason = completed["denied"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("(approval {id}), and no answer came within 1 s")),
+        "{reason}"
+    );
+    let late =
+        fixture.answer(json!({"op": "approval", "id": id, "decision": "approve", "by": "chat:U1"}));
+    assert_eq!(late["class"], "not_pending", "{late}");
+    fixture.stop(handle);
+}
+
+#[test]
+fn the_agent_cannot_answer_its_own_prompt_and_bad_answers_are_refused() {
+    let fixture = Fixture::new("selfapprove", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK to push", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    // A process that runs as the agent (as its own tool calls do) is refused.
+    let socket = control::socket_path(&fixture.agent_directory);
+    let client = "import json, socket, sys\n\
+        s = socket.socket(socket.AF_UNIX)\n\
+        s.connect(sys.argv[1])\n\
+        s.sendall((json.dumps({'op': 'approval', 'id': sys.argv[2], 'decision': 'approve', 'by': 'chat:U1'}) + '\\n').encode())\n\
+        print(s.makefile().readline())\n";
+    let output = std::process::Command::new("python3")
+        .args(["-c", client])
+        .arg(&socket)
+        .arg(&id)
+        .env("AGENTCTL_AGENT", "agent")
+        .output()
+        .unwrap();
+    let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["class"], "refused", "{answer}");
+    assert!(fixture.has_event("approval.refused", |data| data["by"] == "chat:U1"));
+    for (body, class) in [
+        (
+            json!({"op": "approval", "decision": "yes", "by": "chat:U1"}),
+            "invalid",
+        ),
+        (
+            json!({"op": "approval", "decision": "approve", "by": "agent:x"}),
+            "invalid",
+        ),
+        (
+            json!({"op": "approval", "id": "a999999", "decision": "approve", "by": "chat:U1"}),
+            "not_pending",
+        ),
+    ] {
+        let answer = fixture.answer(body);
+        assert_eq!(answer["class"], class, "{answer}");
+    }
+    // Still pending: nothing above answered it.
+    assert_eq!(
+        fixture.request("approvals")["approvals"][0]["id"],
+        id.as_str()
+    );
+    assert!(!fixture.has_event("approval.decided", |_| true));
+    let answer =
+        fixture.answer(json!({"op": "approval", "id": id, "decision": "deny", "by": "chat:U1"}));
+    assert_eq!(answer["ok"], true, "{answer}");
+    fixture.stop(handle);
+}
+
+#[test]
+fn a_hook_refusal_stays_a_refusal_and_keeps_its_whole_reason() {
+    let fixture = Fixture::new("hookdeny", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "HOOKDENY build", json!({"from": "owner"}));
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    assert!(!fixture.has_event("approval.requested", |_| true));
+    let completed = fixture.event_data("tool.completed");
+    assert_eq!(completed["denied"]["source"], "hook");
+    assert_eq!(
+        completed["denied"]["reason"],
+        "PreToolUse:Bash hook error: [hook]: Refused by the permission hook: never cd in a compound command.\nUse absolute paths."
+    );
+    assert_eq!(completed["summary"], "cd /x && make");
+    let denied = fixture.event_data("permission.denied");
+    assert_eq!(denied["source"], "hook");
+    fixture.stop(handle);
+}
+
+#[test]
+fn approvals_off_runs_the_harness_with_prompts_denied() {
+    let mut fixture = Fixture::new("noapprove", "normal");
+    fixture.config.approvals = false;
+    let handle = fixture.start();
+    fixture.enqueue("m1", "hello", json!({"from": "owner"}));
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    let args = fs::read_to_string(fixture.root.join("args.log")).unwrap();
+    assert!(args.contains(r#""--permission-prompts", "none""#), "{args}");
+    assert!(!args.contains("--permission-prompt-tool"), "{args}");
+    fixture.stop(handle);
+}
+
+#[test]
+fn a_chat_answer_must_name_the_prompt_and_cannot_approve_a_call_not_shown_whole() {
+    let fixture = Fixture::new("asklong", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASKLONG", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    let asked = fixture.event_data("approval.requested");
+    assert_eq!(asked["complete"], false, "{asked}");
+    assert!(asked["detail"].as_str().unwrap().len() <= claude::DETAIL_BYTES + 3);
+    let bare = fixture.answer(json!({"op": "approval", "decision": "approve", "by": "chat:U1"}));
+    assert_eq!(bare["class"], "invalid", "{bare}");
+    let chat =
+        fixture.answer(json!({"op": "approval", "id": id, "decision": "approve", "by": "chat:U1"}));
+    assert_eq!(chat["class"], "incomplete", "{chat}");
+    assert!(
+        fixture.has_event("approval.refused", |data| data["class"] == "incomplete"
+            && data["id"] == id.as_str()
+            && data["by"] == "chat:U1")
+    );
+    // The owner at the console may approve it.
+    let console =
+        fixture.answer(json!({"op": "approval", "decision": "approve", "by": "console:owner"}));
+    assert_eq!(console["ok"], true, "{console}");
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    assert!(fixture.has_event("tool.completed", |data| data["ok"] == true));
+    fixture.stop(handle);
+}
+
+#[test]
+fn a_prompt_the_harness_withdraws_ends_cancelled_and_nothing_is_answered() {
+    let fixture = Fixture::new("withdraw", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "WITHDRAW", json!({"from": "owner"}));
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    let decided = fixture.event_data("approval.decided");
+    assert_eq!(decided["decision"], "cancelled");
+    assert_eq!(decided["by"], "harness");
+    assert_eq!(fixture.request("approvals")["approvals"], json!([]));
+    fixture.stop(handle);
+}
+
+#[test]
+fn the_harness_and_its_children_cannot_answer_their_own_prompt() {
+    let fixture = Fixture::new("selfask", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "SELFASK", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    fixture.wait("the harness's own answer", || {
+        fixture.root.join("self.log").exists()
+            && fs::metadata(fixture.root.join("self.log")).unwrap().len() > 0
+    });
+    let own: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.root.join("self.log")).unwrap()).unwrap();
+    assert_eq!(own["class"], "refused", "{own}");
+    assert!(
+        own["error"]
+            .as_str()
+            .unwrap()
+            .contains("inside the agent's own harness"),
+        "{own}"
+    );
+    assert_eq!(
+        fixture.request("approvals")["approvals"][0]["id"],
+        id.as_str()
+    );
+    let answer =
+        fixture.answer(json!({"op": "approval", "id": id, "decision": "deny", "by": "chat:U1"}));
+    assert_eq!(answer["ok"], true, "{answer}");
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    fixture.stop(handle);
+}
+
+#[test]
+fn with_approvals_off_a_prompt_is_denied_at_once() {
+    let mut fixture = Fixture::new("offask", "normal");
+    fixture.config.approvals = false;
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK", json!({"from": "owner"}));
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    assert!(!fixture.has_event("approval.requested", |_| true));
+    let completed = fixture.event_data("tool.completed");
+    assert_eq!(completed["denied"]["source"], "approval");
+    assert!(completed["denied"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("takes no approvals"));
+    fixture.stop(handle);
+}
+
+#[test]
+fn an_answer_from_the_harnesss_control_group_is_refused() {
+    let mut fixture = Fixture::new("cgroup", "normal");
+    fixture.config.approval_cgroup_check = true;
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    let harness = fixture.request("status")["harness_pid"].as_u64().unwrap() as u32;
+    let shared = approval::cgroup_of(harness).is_some()
+        && approval::cgroup_of(harness) == approval::cgroup_of(std::process::id());
+    let answer =
+        fixture.answer(json!({"op": "approval", "id": id, "decision": "approve", "by": "chat:U1"}));
+    if shared {
+        assert_eq!(answer["class"], "refused", "{answer}");
+        assert!(
+            answer["error"].as_str().unwrap().contains("control group"),
+            "{answer}"
+        );
+        let deny = fixture
+            .answer(json!({"op": "approval", "id": id, "decision": "deny", "by": "chat:U1"}));
+        assert_eq!(deny["class"], "refused");
+    } else {
+        assert_eq!(answer["ok"], true, "{answer}");
+    }
     fixture.stop(handle);
 }

@@ -127,6 +127,7 @@ mod palette {
     pub const REPLY_BAR: Style = Style::fg(Color::Magenta);
     pub const INTERRUPT: Style = Style::fg(Color::BrightYellow).bold();
     pub const ERROR: Style = Style::fg(Color::BrightRed).bold();
+    pub const APPROVAL: Style = Style::fg(Color::BrightYellow).bold();
     pub const TURN: Style = Style::fg(Color::White).bold();
     pub const TURN_RULE: Style = Style::fg(Color::Blue).bold();
     pub const DETAIL: Style = Style::dim();
@@ -192,6 +193,39 @@ impl Context<'_> {
 
 /// Columns taken by the `HH:MM:SS ` timestamp.
 const HEAD_COLUMNS: usize = 9;
+
+/// Longest refusal reason `tail` prints, in bytes; the event keeps all of it.
+pub const REASON_BYTES: usize = 600;
+
+/// A refusal or approval reason on one paragraph: whitespace runs (line breaks too) become one
+/// space, unsafe characters are dropped, and it is cut to [`REASON_BYTES`].
+fn reason_text(reason: &str) -> String {
+    let flat = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    events::excerpt(&render::sanitize(&flat), REASON_BYTES)
+}
+
+/// Who refused a call, as `tool.completed`'s `denied.source` says.
+fn denial_source(source: &str) -> String {
+    match source {
+        "hook" => "a permission hook".to_owned(),
+        "approval" => "the approval answer".to_owned(),
+        "no-approval-surface" => "the harness: approval needed and nobody to ask".to_owned(),
+        "" | "permission" => "the harness's permission rules".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+impl Context<'_> {
+    /// `label` then `text` wrapped under the header, indented past the timestamp.
+    fn detail(&self, label: &str, text: &str, style: Style) -> Vec<Line> {
+        let lead = vec![self.pad(), self.span(palette::DETAIL, label)];
+        let hang = vec![self.span(
+            Style::PLAIN,
+            &" ".repeat(HEAD_COLUMNS + render::width_of(label)),
+        )];
+        render::wrap(&[self.span(style, text)], self.width, &lead, &hang)
+    }
+}
 
 /// The human rendering of one event as plain text lines, safe to print to a terminal.
 #[must_use]
@@ -475,6 +509,27 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
             &[s(palette::TOOL, &format!("$ {}  ", text_of(data, "tool")))],
             &[s(palette::TOOL_TEXT, text_of(data, "summary"))],
         ),
+        "tool.completed" if data["denied"].is_object() => {
+            let denied = &data["denied"];
+            let mut lines = cx.line(
+                ts,
+                &[
+                    s(Style::PLAIN, "  "),
+                    s(palette::ERROR, &format!("⛔ denied {}  ", text_of(data, "tool"))),
+                ],
+                &[s(palette::TOOL_TEXT, &render::sanitize(text_of(data, "summary")))],
+            );
+            lines.extend(cx.detail(
+                "   by: ",
+                &denial_source(text_of(denied, "source")),
+                palette::DETAIL,
+            ));
+            let reason = reason_text(text_of(denied, "reason"));
+            if !reason.is_empty() {
+                lines.extend(cx.detail("   reason: ", &reason, palette::FAIL.dimmed()));
+            }
+            lines
+        }
         "tool.completed" => {
             let ok = data["ok"] != false;
             let mut detail = format!(" {}", seconds(data["duration_ms"].as_u64()));
@@ -522,10 +577,120 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
             }
             lines
         }
-        "permission.denied" => cx.line(
+        "permission.denied" => {
+            let mut lines = cx.line(
+                ts,
+                &[s(palette::ERROR, &format!("⛔ denied {}  ", text_of(data, "tool")))],
+                &[s(palette::TOOL_TEXT, &render::sanitize(text_of(data, "summary")))],
+            );
+            // The whole reason is under the call's own line; repeat a line of it here, where a
+            // `--types permission.` view finds it.
+            let reason = reason_text(text_of(data, "reason"));
+            if !reason.is_empty() {
+                let room = cx.width.saturating_sub(HEAD_COLUMNS + 11).max(20);
+                lines.push(vec![
+                    cx.pad(),
+                    s(palette::DETAIL, "   reason: "),
+                    s(palette::FAIL.dimmed(), &render::truncate(&reason, room)),
+                ]);
+            }
+            lines
+        }
+        "approval.requested" => {
+            let id = text_of(data, "id");
+            let mut lines = cx.line(
+                ts,
+                &[s(
+                    palette::APPROVAL,
+                    &format!("⚠ approval {id} · {}  ", text_of(data, "tool")),
+                )],
+                &[s(palette::TOOL_TEXT, &render::sanitize(text_of(data, "summary")))],
+            );
+            let reason = reason_text(text_of(data, "reason"));
+            if !reason.is_empty() {
+                let label = format!("   asked by {}: ", text_of(data, "reason_type"));
+                lines.extend(cx.detail(&label, &reason, palette::DETAIL));
+            }
+            let detail = text_of(data, "detail");
+            if !detail.is_empty() && detail != text_of(data, "summary") {
+                lines.extend(cx.detail("   call: ", &reason_text(detail), palette::TOOL_TEXT));
+            }
+            if data["complete"] == false {
+                lines.extend(cx.detail(
+                    "   ",
+                    "shown cut or masked: only the console can approve it",
+                    palette::DETAIL,
+                ));
+            }
+            if let Some(path) = data["blocked_path"].as_str() {
+                lines.extend(cx.detail(
+                    "   outside the allowed directories: ",
+                    &render::sanitize(path),
+                    palette::DETAIL,
+                ));
+            }
+            lines.extend(cx.detail(
+                "   waiting for the owner: ",
+                &format!(
+                    "reply `approve {id}` or `deny {id}` in chat, or agentctl approve|deny {} {id}; denied after {} s",
+                    event.agent,
+                    data["timeout_s"].as_u64().unwrap_or(0)
+                ),
+                palette::APPROVAL.dimmed(),
+            ));
+            lines
+        }
+        "approval.decided" => {
+            let decision = text_of(data, "decision");
+            let by = text_of(data, "by");
+            let (glyph, style) = match decision {
+                "approved" => ("✓", palette::OK),
+                "denied" => ("✗", palette::ERROR),
+                _ => ("…", palette::STATUS),
+            };
+            let who = match by {
+                "timeout" => "no answer in time".to_owned(),
+                "harness" => "the harness withdrew it".to_owned(),
+                "harness-exit" => "the harness exited".to_owned(),
+                "turn-end" => "the turn ended".to_owned(),
+                by => by.to_owned(),
+            };
+            let mut text = format!(
+                "{glyph} approval {} {decision} · {who} · {}",
+                text_of(data, "id"),
+                seconds(data["waited_ms"].as_u64())
+            );
+            if let Some(reason) = data["reason"].as_str() {
+                text.push_str(&format!(" · {}", reason_text(reason)));
+            }
+            cx.line(ts, &[], &[s(style, &text)])
+        }
+        "approval.refused" => cx.line(
             ts,
-            &[s(palette::ERROR, &format!("⛔ denied {}  ", text_of(data, "tool")))],
-            &[s(palette::TOOL_TEXT, text_of(data, "summary"))],
+            &[],
+            &[s(
+                palette::ERROR,
+                &format!(
+                    "!! answer `{} {}` from {} not taken ({}): {}",
+                    text_of(data, "decision"),
+                    text_of(data, "id"),
+                    text_of(data, "by"),
+                    text_of(data, "class"),
+                    render::sanitize(text_of(data, "message"))
+                ),
+            )],
+        ),
+        "input.consumed" => cx.line(
+            ts,
+            &[],
+            &[s(
+                palette::STARTED,
+                &format!(
+                    "  ↳ [{}] taken as the answer to approval {}",
+                    text_of(data, "queue_id"),
+                    text_of(data, "approval_id")
+                ),
+            )],
         ),
         "compact.started" => cx.line(ts, &[], &[s(palette::STATUS, "⋯ compacting")]),
         "compact.completed" => cx.line(
@@ -890,6 +1055,126 @@ mod tests {
         );
         assert!(!text.contains('\u{1b}'), "{text}");
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_refused_call_prints_who_refused_it_and_why_in_full() {
+        let reason = format!(
+            "Refused by the permission hook: never cd in a compound command.\nUse absolute paths. {}",
+            "More context. ".repeat(60)
+        );
+        let lines = render(
+            &event(
+                7,
+                "tool.completed",
+                json!({"tool": "Bash", "tool_use_id": "t1", "ok": false, "summary": "cd /x && make",
+                       "denied": {"source": "hook", "reason": reason}}),
+            ),
+            80,
+        );
+        let text = lines.join("\n");
+        assert!(
+            lines[0].ends_with("  ⛔ denied Bash  cd /x && make"),
+            "{text}"
+        );
+        assert!(text.contains("   by: a permission hook"), "{text}");
+        assert!(
+            text.contains("reason: Refused by the permission hook: never cd in a compound"),
+            "{text}"
+        );
+        // Wrapped to the width, the line break flattened, cut near 600 bytes with a mark.
+        assert!(
+            lines.iter().all(|line| render::width_of(line) <= 80),
+            "{text}"
+        );
+        assert!(text.contains("command. Use absolute paths."), "{text}");
+        let shown: usize = lines[2..].iter().map(|line| line.trim().len()).sum();
+        assert!((560..760).contains(&shown), "{shown}: {text}");
+        assert!(text.contains('…'), "{text}");
+        // Without a reason the turn's denial line stays one line; with one it names it.
+        let plain = render(
+            &event(
+                7,
+                "permission.denied",
+                json!({"tool": "Bash", "summary": "touch x"}),
+            ),
+            80,
+        );
+        assert_eq!(plain.len(), 1);
+        assert!(plain[0].ends_with("⛔ denied Bash  touch x"), "{plain:?}");
+        let named = render(
+            &event(
+                7,
+                "permission.denied",
+                json!({"tool": "Bash", "summary": "touch x",
+                "source": "no-approval-surface", "reason": "Permission for this tool use was denied. It requires approval."}),
+            ),
+            80,
+        );
+        assert_eq!(named.len(), 2, "{named:?}");
+        assert!(
+            named[1].contains("reason: Permission for this tool use was denied."),
+            "{named:?}"
+        );
+    }
+
+    #[test]
+    fn approvals_print_the_question_the_answer_and_how_to_give_it() {
+        let asked = render(
+            &event(
+                7,
+                "approval.requested",
+                json!({"id": "a7", "tool": "Bash", "summary": "git push github HEAD:main",
+                       "reason": "pushes need the owner", "reason_type": "hook", "timeout_s": 600}),
+            ),
+            200,
+        )
+        .join("\n");
+        assert!(
+            asked.contains("⚠ approval a7 · Bash  git push github HEAD:main"),
+            "{asked}"
+        );
+        assert!(
+            asked.contains("asked by hook: pushes need the owner"),
+            "{asked}"
+        );
+        assert!(asked.contains("reply `approve a7` or `deny a7` in chat, or agentctl approve|deny coordinator a7; denied after 600 s"), "{asked}");
+        let approved = render(
+            &event(
+                7,
+                "approval.decided",
+                json!({"id": "a7", "decision": "approved", "by": "chat:U1", "waited_ms": 4200}),
+            ),
+            120,
+        );
+        assert!(
+            approved[0].ends_with("✓ approval a7 approved · chat:U1 · 4.2 s"),
+            "{approved:?}"
+        );
+        let timed_out = render(
+            &event(
+                7,
+                "approval.decided",
+                json!({"id": "a7", "decision": "denied", "by": "timeout", "waited_ms": 600000}),
+            ),
+            120,
+        );
+        assert!(
+            timed_out[0].ends_with("✗ approval a7 denied · no answer in time · 600 s"),
+            "{timed_out:?}"
+        );
+        let consumed = render(
+            &event(
+                7,
+                "input.consumed",
+                json!({"queue_id": "chat-1", "approval_id": "a7"}),
+            ),
+            120,
+        );
+        assert!(
+            consumed[0].ends_with("↳ [chat-1] taken as the answer to approval a7"),
+            "{consumed:?}"
+        );
     }
 
     #[test]

@@ -2157,6 +2157,9 @@ agentctl tail coordinator --follow          # in a Herdr tab: the view of the ag
 agentctl send coordinator 'Status of the open lanes?'
 agentctl send coordinator --urgent 'Stop what you are doing and answer this'
 agentctl interrupt coordinator              # end the running turn
+agentctl approvals coordinator              # permission prompts waiting for the owner
+agentctl approve coordinator a4182          # at a terminal: let the held call run
+agentctl deny coordinator a4182 --reason 'use the fork'
 agentctl compact coordinator                # queue /compact for the turn boundary
 agentctl status coordinator                 # agent_status from the wrapper, queue counts
 agentctl stop coordinator                   # clean stop, archive record, queue and log
@@ -2172,9 +2175,12 @@ the wrapper as a detached process logging to `REGISTRY/agents/NAME/headless.log`
 `claude` found on that PATH) and nothing else. `--model` becomes `--model`, and every
 `--harness-arg` is passed to Claude Code after the protocol arguments; the
 wrapper owns `-p`, the formats, `--session-id`, `--resume`, `--continue` and
-`--bare` and refuses them. It adds `--permission-prompts none` unless given, so a
-tool call that would ask a human is denied and logged as `permission.denied`
-instead of waiting.
+`--bare` and refuses them. It also owns `--permission-prompt-tool`: unless the
+record's arguments give `--permission-prompts none`, it runs Claude Code with
+`--permission-prompts host --permission-prompt-tool stdio`, so a tool call that
+would ask a human waits for the owner's answer (**Approvals** below) instead of
+being denied. `run-headless --no-approvals`, or `--permission-prompts none` among
+the harness arguments, denies such calls at once, logged as `permission.denied`.
 
 **The wrapper** (`agentctl run-headless NAME`) holds `REGISTRY/agents/NAME/headless.lock`,
 so one agent never has two harness processes. It starts Claude Code with
@@ -2235,9 +2241,13 @@ send`, so re-reading a log repeats nothing.
 | `input.started`, `input.completed`, `input.cancelled` | `queue_id`, `mid_turn`, `before_start`, `recovered` |
 | `turn.started`, `turn.completed` | `cause` (`input`, or `self` for a turn the harness began); `outcome` (`completed`, `interrupted`, `error`), usage, `cost_usd`, `duration_ms` |
 | `assistant.text` | the agent's prose, verbatim |
-| `tool.started`, `tool.completed` | tool, a 200-byte summary with credential-looking values masked, `ok`, output size and line count, and `preview`: the result's first 8 lines (200 bytes each, credential-shaped words masked; none for `Read`, and nothing after a private-key header; `run-headless --tool-preview-lines N` keeps fewer, 0 none) |
+| `tool.started`, `tool.completed` | tool, a 200-byte summary with credential-looking values masked, `ok`, output size and line count, and `preview`: the result's first 8 lines (200 bytes each, credential-shaped words masked; none for `Read`, and nothing after a private-key header; `run-headless --tool-preview-lines N` keeps fewer, 0 none). A call that never ran because it was refused also has `summary` and `denied`: `source` (`hook`, `approval` for the owner's or the timeout's no, `no-approval-surface`, or the harness's own) and `reason`, the whole refusal text the model read (lines kept, masked, up to 4000 bytes) |
 | `reply.sent` | after a successful `agentctl chat reply`, `agentctl send`, or `agent-teams reply`/`send` run by the shell tool: `channel` (`chat`, `agent`, `team`), `to`, and the `text` sent (inline, from a here-document, or read back from the named file, up to 32 KiB), or `file` when it could not be read |
-| `permission.denied` | tool and summary |
+| `permission.denied` | at the turn's end, each refused call: tool, summary, `tool_use_id`, and the `source` and `reason` of its `tool.completed` |
+| `approval.requested` | a permission prompt held for the owner: `id` (`a` and the event's `seq`), tool, summary, `detail` and `complete` (the whole call, see **Approvals**), `reason` (the hook's or classifier's text, or the harness's description of the call), `reason_type` (`rule` when the harness gave none), `blocked_path`, `tool_use_id`, `timeout_s` |
+| `approval.decided` | `id`, `decision` (`approved`, `denied`, `cancelled`), `by` (`chat:SENDER`, `console:USER`, `timeout`, `harness`, `turn-end`, `harness-exit`), the approver's `reason`, tool, summary, `waited_ms` |
+| `approval.refused` | an answer the wrapper did not take: `id`, `decision`, `by`, `peer_pid`, `class` (`invalid`, `refused` for the agent's own process, `not_pending`, `ambiguous`, `incomplete`), `message` |
+| `input.consumed` | a queued chat message taken as the answer to `approval_id` instead of being typed |
 | `compact.started`, `compact.completed` | trigger, tokens before and after |
 | `interrupt.requested`, `error` | request ID; error class and message |
 
@@ -2266,9 +2276,54 @@ last 200 events; `--since 0` prints the whole log), `--types tool.,turn.complete
 filters, `--json` prints events verbatim, and `--at SEQ` prints one event's whole
 turn (exit 1 when it is gone). Only the segments a selection needs are read.
 A hole in `seq` prints a gap line. It is unrelated to `read --output tail`.
+A refused call prints as `⛔ denied TOOL  COMMAND`, then who refused it and its
+reason, wrapped to the width and cut at 600 bytes (the event keeps all of it); a
+held permission prompt prints its ID, command, why it was asked and how to
+answer it, and its decision prints when it comes.
 
-**Permissions.** A headless agent cannot ask anyone, so its settings file decides
-everything: allow rules for the coordinator's tools and, because host settings or
+**Approvals.** A tool call that needs a person's approval (a PreToolUse hook's
+`ask`, the auto-mode classifier's, a path outside the allowed directories) is
+not denied outright: the wrapper answers Claude Code's permission prompt itself.
+Claude Code first lets the host's own permission hooks settle the prompt, as in an
+interactive session, and withdraws it from the wrapper when one does (the event
+log then shows it `cancelled` by the harness). Otherwise the wrapper logs
+`approval.requested` with an ID such as `a4182`, the whole call as the owner should
+judge it (`detail`: the shell command, or the input as JSON, credential-shaped words
+masked, up to 3000 bytes; `complete` is false when it had to be cut or masked), and
+holds the call until the owner answers or `run-headless --approval-timeout SECONDS`
+(default 600) passes, which denies it. A `chat run` bridge serving the agent follows
+the event log and, once a prompt has waited 5 s, posts `AGENT wants to run: TOOL
+(reason: ...) - reply approve ID or deny ID` with the call in a code block to its
+channel, then the outcome. A reason the harness made up from the model's own
+description of the call is labelled `the agent says`; Slack markup and mentions in
+it are neutralised. The owner answers in the channel with `approve ID` (`allow
+ID`), or `deny ID` (`reject ID`) optionally followed by a reason the model reads;
+the ID is required in chat, and a bare `approve` is delivered to the agent as an
+ordinary message. Only a message the bridge admitted from its verified owners can
+answer, and the bridge passes it to the wrapper (`by: chat:SENDER`) before queuing
+it; the wrapper then takes that queued message as consumed instead of typing it,
+and the request still earns its receipt. An answer the wrapper does not take (the
+prompt is no longer waiting, the call was not shown whole, the sender is the agent)
+is logged as `approval.refused` and posted back to the channel. A call whose detail
+is not complete can be denied in chat but approved only at a terminal:
+`agentctl approvals NAME` lists the waiting prompts with their detail and
+`agentctl approve|deny NAME [ID]` answers (`by: console:$USER`; without ID, the only
+prompt waiting; refused unless standard input and output are a terminal and
+`AGENTCTL_AGENT` is unset). The wrapper never approves anything by itself. A hook's
+outright refusal (exit 2 or `permissionDecision: deny`) never prompts and stays a
+refusal; its full text is in `tool.completed`. The wrapper refuses an answer from the
+agent's own processes: one whose control-socket peer descends from the harness,
+shares the harness's control group (so run the bridge and the wrapper as separate
+units, as `install-units` does, or pass `run-headless --approval-shared-cgroup`), or runs, itself or through an ancestor, with
+`AGENTCTL_AGENT` naming the agent. This stops the agent approving its own call by
+accident or by following posted instructions; it is not a boundary against a
+hostile process of the same user, which can write any file the wrapper reads or
+post to the chat with the owner's own credentials. A prompt still waiting when its
+turn ends or the harness exits ends `cancelled`. `watch-agents` reports a held
+prompt as an `approval-prompt` episode after `--approval-minutes`.
+
+**Permissions.** A headless agent's settings file decides nearly everything (the
+owner sees only what still asks; see **Approvals**): allow rules for the coordinator's tools and, because host settings or
 a launcher sandbox may approve more than the file names, explicit deny rules for
 what must never run. This example is a starting point; review it against your
 Claude Code version (file rules use `Edit(...)`, which covers every editing

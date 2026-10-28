@@ -39,6 +39,9 @@ pub struct View {
     pub restarting: bool,
     /// The newest lifecycle event (`lifecycle.takeover`, `lifecycle.stopped`, ...).
     pub lifecycle: Option<String>,
+    /// The oldest permission prompt waiting for the owner (`#671 headless-approval-surface`):
+    /// its ID, tool, summary, and when it was asked (Unix seconds).
+    pub pending_approval: Option<(String, String, String, f64)>,
 }
 
 fn seconds(ts: u64) -> f64 {
@@ -50,6 +53,7 @@ fn seconds(ts: u64) -> f64 {
 pub fn view(events: &[Event]) -> View {
     let mut view = View::default();
     let mut text: Vec<String> = Vec::new();
+    let mut pending: Vec<(String, String, String, f64)> = Vec::new();
     for event in events {
         view.last_seq = event.seq;
         view.last_event_at = Some(seconds(event.ts));
@@ -58,11 +62,26 @@ pub fn view(events: &[Event]) -> View {
             "turn.started" => {
                 view.busy_since = Some(seconds(event.ts));
                 view.open_tool = None;
+                pending.clear();
                 text.clear();
+            }
+            "approval.requested" => {
+                let field = |key: &str| event.data[key].as_str().unwrap_or("").to_owned();
+                pending.push((
+                    field("id"),
+                    field("tool"),
+                    field("summary"),
+                    seconds(event.ts),
+                ));
+            }
+            "approval.decided" => {
+                let id = event.data["id"].as_str().unwrap_or("");
+                pending.retain(|(pending, ..)| pending != id);
             }
             "turn.completed" => {
                 view.busy_since = None;
                 view.open_tool = None;
+                pending.clear();
                 view.turn_completed_at = Some(seconds(event.ts));
                 view.last_outcome = event.data["outcome"].as_str().map(str::to_owned);
                 view.last_text = std::mem::take(&mut text);
@@ -92,11 +111,13 @@ pub fn view(events: &[Event]) -> View {
                 ) {
                     view.busy_since = None;
                     view.open_tool = None;
+                    pending.clear();
                 }
             }
             _ => {}
         }
     }
+    view.pending_approval = pending.into_iter().next();
     view
 }
 
@@ -199,10 +220,54 @@ mod tests {
             .append("lifecycle.harness_exited", None, json!({"code": 1}))
             .unwrap();
         assert_eq!(read(&log).unwrap().busy_since, None);
+        // A permission prompt waits until it is decided, and only that decision clears it; the
+        // next one waiting then shows.
+        writer.begin_turn();
+        writer.append("turn.started", None, json!({})).unwrap();
+        writer
+            .append(
+                "approval.requested",
+                None,
+                json!({"id": "a13", "tool": "Bash", "summary": "rm x"}),
+            )
+            .unwrap();
+        let asked = read(&log).unwrap();
+        let pending = asked
+            .pending_approval
+            .as_ref()
+            .map(|(id, tool, summary, _)| (id.as_str(), tool.as_str(), summary.as_str()));
+        assert_eq!(pending, Some(("a13", "Bash", "rm x")));
+        let append = |writer: &mut EventWriter, kind: &str, data: serde_json::Value| {
+            writer.append(kind, None, data).unwrap();
+        };
+        append(
+            &mut writer,
+            "approval.requested",
+            json!({"id": "a14", "tool": "Bash", "summary": "rm y"}),
+        );
+        append(
+            &mut writer,
+            "approval.decided",
+            json!({"id": "a9", "decision": "denied"}),
+        );
+        let oldest = |view: View| view.pending_approval.map(|(id, ..)| id);
+        assert_eq!(oldest(read(&log).unwrap()).as_deref(), Some("a13"));
+        append(
+            &mut writer,
+            "approval.decided",
+            json!({"id": "a13", "decision": "approved"}),
+        );
+        assert_eq!(oldest(read(&log).unwrap()).as_deref(), Some("a14"));
+        append(
+            &mut writer,
+            "approval.decided",
+            json!({"id": "a14", "decision": "approved"}),
+        );
+        assert_eq!(oldest(read(&log).unwrap()), None);
         // The recent window skips a line it cuts and still sees the newest events.
         let recent = events::read_recent(&log, 300).unwrap();
         assert!(
-            !recent.is_empty() && recent.last().unwrap().seq == 10,
+            !recent.is_empty() && recent.last().unwrap().seq == 16,
             "{recent:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();

@@ -43,6 +43,7 @@ fn a_taken_over_agent_refuses_a_wrapper_a_stop_and_a_second_takeover() {
             "lead",
             Some(Path::new("/nonexistent/claude")),
             None,
+            None,
             terminate,
         )
         .unwrap();

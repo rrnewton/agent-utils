@@ -7,7 +7,9 @@
 //! - [`render`]: how `tail` draws events: colors, turn headers, Markdown, folded tool output.
 //! - [`reply`]: reply and send commands recognised in tool calls, logged as `reply.sent`.
 //! - [`watch`]: what `agentctl watch-agents` reads from the log of a headless agent.
-//! - [`control`]: the wrapper's control socket (wake, status, interrupt, stop).
+//! - [`control`]: the wrapper's control socket (wake, status, interrupt, stop, approval).
+//! - [`approval`]: permission prompts held for the owner's answer (`#671
+//!   headless-approval-surface`).
 //! - [`claude`]: Claude Code's stream-json protocol, translated.
 //! - [`wrapper`]: the Claude Code wrapper, the queue's only drainer (M2).
 //!
@@ -22,6 +24,7 @@
 //! <registry>/agents/<agent>/headless.lock   held by the running wrapper
 //! ```
 
+pub mod approval;
 pub mod claude;
 pub mod control;
 pub mod events;
@@ -46,7 +49,10 @@ pub fn capabilities() -> serde_json::Value {
         "harnesses": HARNESSES,
         "event_log": format!("v{}", events::VERSION),
         "commands": ["start --mode headless", "run-headless", "tail", "interrupt", "compact",
-                     "send", "drain", "status", "stop", "install-units --headless", "takeover", "handback"],
+                     "send", "drain", "status", "stop", "install-units --headless", "takeover", "handback",
+                     "approvals", "approve", "deny"],
+        "approvals": {"default_timeout_s": approval::DEFAULT_TIMEOUT.as_secs(),
+                      "answers": ["chat: approve|deny ID", "console: agentctl approve|deny NAME ID"]},
         "claude": claude::capabilities(),
     })
 }
