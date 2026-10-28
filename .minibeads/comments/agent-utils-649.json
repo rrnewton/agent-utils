@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-649-c4b76d608a9",
+    "issue_id": "agent-utils-649",
+    "author": "coordinator",
+    "body": "[opus 5.5] Coordinator 2026-10-28 14:30 ET: this issue's voice.js work landed (95642f0e); its remaining items (unread_only, mark_read, channel selection, server-side reconnect) are server-side, so it no longer blocks #624 voice-page-modularity. Page-side follow-ups wait until after #624.",
+    "created_at": "2026-10-28T18:30:09.349109868Z",
+    "updated_at": "2026-10-28T18:30:09.349109868Z"
+  }
+]
