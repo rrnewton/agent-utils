@@ -2905,11 +2905,14 @@ fn reply_answer_timed(
             })
             .into_response())
         }
-        // 207, not 200 and not 502. A machine caller reading only the status must not conclude
+        // 207 with timing attached below. A machine caller reading only the status must not conclude
         // "sent" — nor "nothing happened", which would have them send the whole thing again and
         // post the first half twice. Multi-Status says exactly what is true: look inside.
         Err(error) => match PartialReplyResponse::from_error(error) {
-            Ok(partial) => Ok((StatusCode::MULTI_STATUS, Json(partial)).into_response()),
+            Ok(mut partial) => {
+                partial.timing = timing;
+                Ok((StatusCode::MULTI_STATUS, Json(partial)).into_response())
+            }
             Err(other) => Err(other.into()),
         },
     }

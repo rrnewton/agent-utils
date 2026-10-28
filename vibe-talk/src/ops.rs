@@ -4427,8 +4427,11 @@ pub async fn reply_accepted(
         Ok(Ready::Known(outcome)) => {
             let server_ms = started.elapsed().as_millis() as u64;
             state.post_keys.note_accepted(idempotency_key, server_ms);
-            let _ = remembered_answer(&outcome);
-            return Ok((server_ms, 0));
+            let parts = match outcome.as_ref() {
+                crate::post_keys::Outcome::Posted { parts, .. } => parts.len(),
+                crate::post_keys::Outcome::Partial(partial) => partial.posted,
+            };
+            return Ok((server_ms, parts));
         }
         Err(refused) => return Err(refused),
     };
@@ -4782,7 +4785,7 @@ fn to_remember(
             uncertain,
             refusal,
             first,
-        }) if *posted > 0 => Some(crate::post_keys::Outcome::Partial(
+        }) if *posted > 0 || !*uncertain => Some(crate::post_keys::Outcome::Partial(
             crate::post_keys::Partial {
                 posted: *posted,
                 unsent: unsent.clone(),

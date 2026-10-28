@@ -443,21 +443,28 @@ impl PostKeys {
     /// Record the server-accept phase for `key`. `#621 send-double-check`.
     pub fn note_accepted(&self, key: &str, server_ms: u64) {
         let mut timings = self.timings.lock().unwrap_or_else(PoisonError::into_inner);
+        timings.retain(|_, (at, _)| at.elapsed() < KEEP);
+        if timings.len() >= MAX_KEPT {
+            timings.clear();
+        }
         let entry = timings
             .entry(key.to_owned())
             .or_insert_with(|| (Instant::now(), SendTiming::default()));
         entry.1.server_ms = Some(server_ms);
+        entry.1.upstream_ms = None;
         entry.0 = Instant::now();
     }
 
     /// Record the upstream phase for `key`; returns the full timing. `#621 send-double-check`.
     pub fn note_settled(&self, key: &str) -> SendTiming {
         let mut timings = self.timings.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = timings
-            .entry(key.to_owned())
-            .or_insert_with(|| (Instant::now(), SendTiming::default()));
-        entry.1.upstream_ms = Some(entry.0.elapsed().as_millis() as u64);
-        entry.1
+        match timings.get_mut(key) {
+            Some(entry) => {
+                entry.1.upstream_ms = Some(entry.0.elapsed().as_millis() as u64);
+                entry.1
+            }
+            None => SendTiming::default(),
+        }
     }
 
     /// The recorded timing for `key`, if any. `#621 send-double-check`.

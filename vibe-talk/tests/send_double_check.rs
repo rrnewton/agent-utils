@@ -121,14 +121,20 @@ async fn accepted_failed_post_settles_as_unknown_or_error_not_green() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    // Failed with nothing posted is forgotten: outcome is 404, never a 200.
-    let (status, _) = call(
+    // A definite refusal (uncertain=false) is remembered as a 207, never a 200.
+    let (status, settled) = call(
         &state,
         &format!("/api/v1/channels/{TEAM}/reply/outcome?wait=20"),
         body,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{settled}");
+    assert_eq!(settled["error"], "partially_posted");
+    assert_eq!(settled["uncertain"], false);
+    assert!(
+        settled["timing"]["server_ms"].as_u64().is_some(),
+        "{settled}"
+    );
 }
 
 #[tokio::test]

@@ -30507,8 +30507,8 @@ function outgoingFromSaved(held) {
     sentAt: Number(held.sentAt) || 0,
     // `#621 send-double-check`.
     sendStartedAt: Number(held.sendStartedAt) || Number(held.createdAt) || Date.now(),
-    serverMs: Number.isFinite(Number(held.serverMs)) ? Number(held.serverMs) : null,
-    upstreamMs: Number.isFinite(Number(held.upstreamMs)) ? Number(held.upstreamMs) : null,
+    serverMs: held.serverMs != null && Number.isFinite(Number(held.serverMs)) ? Number(held.serverMs) : null,
+    upstreamMs: held.upstreamMs != null && Number.isFinite(Number(held.upstreamMs)) ? Number(held.upstreamMs) : null,
     serverTick: held.serverTick === true,
     upstreamTick: held.upstreamTick === true,
     tickFailed: held.tickFailed === true,
@@ -31876,6 +31876,14 @@ function retryOutgoingMessage(id, automatic = false) {
   entry.state = "sending";
   entry.phase = "queued";
   entry.detail = "";
+  // `#621 send-double-check`: a new attempt starts its ticks and clock again.
+  entry.sendStartedAt = Date.now();
+  entry.serverMs = null;
+  entry.upstreamMs = null;
+  entry.serverTick = false;
+  entry.upstreamTick = false;
+  entry.tickFailed = false;
+  entry.showTimes = false;
   outgoingObservations.delete(entry.id);
   return scheduleOutgoingMessage(entry);
 }
@@ -32167,6 +32175,7 @@ async function postOutgoing(entry, job, body, controller, armed) {
   armed(timer);
   const sendTapAt = Date.now();
   entry.sendStartedAt = entry.sendStartedAt || sendTapAt;
+  let askedOutcome = false;
   try {
     const payload = await Promise.race([
       api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply?ack=accepted`, {
@@ -32183,6 +32192,7 @@ async function postOutgoing(entry, job, body, controller, armed) {
       persistOutgoingMessages();
       renderOutgoingEverywhere();
       const acceptedAt = Date.now();
+      askedOutcome = true;
       const found = await askOutgoingOutcome(entry, job, body);
       if (job.stopped) return null;
       if (!found) {
@@ -32196,11 +32206,11 @@ async function postOutgoing(entry, job, body, controller, armed) {
       if (found.timing && Number.isFinite(Number(found.timing.server_ms))) entry.serverMs = Number(found.timing.server_ms);
       return found;
     }
-    // Older server: one answer carried both phases.
+    // Older server: one answer carried both phases; its split is unknown, so the
+    // whole elapsed time is upstream-side and the server phase stays unknown.
     if (payload) {
-      entry.serverMs = Date.now() - sendTapAt;
       entry.serverTick = true;
-      entry.upstreamMs = 0;
+      entry.upstreamMs = Date.now() - sendTapAt;
       entry.upstreamTick = payload.error !== "partially_posted";
     }
     return payload;
@@ -32212,7 +32222,7 @@ async function postOutgoing(entry, job, body, controller, armed) {
     // or something in front of the server answered for it — while the post may still be landing.
     // The owner saw a long message "fail", pressed Retry, and it arrived twice. So the server is
     // asked what became of it before anything is decided, posting nothing.
-    const found = body.idempotency_key && answerLost(error) ? await askOutgoingOutcome(entry, job, body) : null;
+    const found = !askedOutcome && body.idempotency_key && answerLost(error) ? await askOutgoingOutcome(entry, job, body) : null;
     if (job.stopped) return null;
     if (!found) throw error;
     return found;
@@ -32436,7 +32446,7 @@ function sendTimingText(entry) {
   const service = (typeof chatServiceOf === "function" && chatServiceOf(entry.channel)) || "upstream";
   const server = entry.serverMs;
   const upstream = entry.upstreamMs;
-  const total = server !== null && upstream !== null ? server + upstream
+  const total = server !== null && server !== undefined && upstream !== null && upstream !== undefined ? server + upstream
     : Math.max(0, Date.now() - (entry.sendStartedAt || entry.createdAt || Date.now()));
   const up = upstream === null ? "…" : `+${fmtDuration(upstream)}`;
   return `server ${fmtDuration(server)} · ${service} ${up} · total ${fmtDuration(total)}`;
