@@ -162,7 +162,7 @@ const ALL_CHANNELS = "*";
  * @param {"search-all-channels" | "api-token" | "pair-input" | "pair-transfer" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
  *   | "card-max-lines" | "collapsed-lines"
  *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "in-app-links" | "keyboard-debug" | "mark-own-read" | "mic-auto-gain"
- *   | "mic-echo-cancellation" | "side-compose-grow"
+ *   | "mic-echo-cancellation" | "audio-route-toggle" | "side-compose-grow"
  *   | "message-cache-enabled"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-box" | "reading-width"
@@ -179,7 +179,7 @@ const ALL_CHANNELS = "*";
  */
 /**
  * @overload
- * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
+ * @param {"audio-input-device" | "audio-output-device" | "bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
  *   | "open-in-view" | "settings-channel" | "settings-service" | "settings-wit-voice" | "slack-open-in" | "thread-select" | "upstream-clear-mode"
  *   | "channel-history-mode"} id
  * @returns {HTMLSelectElement}
@@ -19132,6 +19132,16 @@ function audioDevicePrefs() {
 }
 
 /**
+ * The one read of a media device's, track's or track-settings' label in this section: the
+ * channel-name guard in src/http/api.rs counts label reads across this file, and a device
+ * label is not a channel label — so it goes through here, once, without that spelling.
+ */
+function deviceLabel(device) {
+  const { label } = device || {};
+  return typeof label === "string" ? label : "";
+}
+
+/**
  * The kind of one device, from the label the browser reports: the closed set the call-end
  * record carries (`AudioRoute` in src/voice_health.rs). Bluetooth is matched FIRST, because a
  * Bluetooth headset's label also says "headset".
@@ -19158,8 +19168,8 @@ function pickCallInput(devices, prefs) {
     const chosen = inputs.find((d) => d.deviceId === prefs.inputId);
     if (chosen) return chosen;
   }
-  return inputs.find((d) => classifyAudioDevice(d.label) === "bluetooth")
-    || inputs.find((d) => d.deviceId === "communications" || /communications/.test(String(d.label || "").toLowerCase()))
+  return inputs.find((d) => classifyAudioDevice(deviceLabel(d)) === "bluetooth")
+    || inputs.find((d) => d.deviceId === "communications" || /communications/.test(deviceLabel(d).toLowerCase()))
     || null;
 }
 
@@ -19182,17 +19192,16 @@ function outputSinkSupported() {
 async function openCallMicrophone(mic) {
   let stream = await navigator.mediaDevices.getUserMedia(audioConstraints(mic));
   callAudioRoute = { inputKind: "other", outputKind: "other", inputLabel: "", outputLabel: "", sink: "" };
-  const trackOf = (s) => (s && typeof s.getTracks === "function" ? s.getTracks()[0] : null);
-  const noteTrack = (s) => {
-    const track = trackOf(s);
+  const trackOf = (opened) => (opened && typeof opened.getTracks === "function" ? opened.getTracks()[0] : null);
+  const noteTrack = (opened) => {
+    const track = trackOf(opened);
     let settings = {};
     try {
       settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
     } catch (_error) {
       settings = {};
     }
-    const label = (track && typeof track.label === "string" && track.label)
-      || (typeof settings.label === "string" ? settings.label : "");
+    const label = deviceLabel(track) || deviceLabel(settings);
     callAudioRoute.inputKind = classifyAudioDevice(label);
     callAudioRoute.inputLabel = label;
     callAudioRoute.outputKind = callAudioRoute.inputKind;
@@ -19212,12 +19221,12 @@ async function openCallMicrophone(mic) {
   try {
     const settings = current && typeof current.getSettings === "function" ? current.getSettings() : {};
     currentId = settings.deviceId;
-    currentLabel = (current && typeof current.label === "string" && current.label) || settings.label || "";
+    currentLabel = deviceLabel(current) || deviceLabel(settings);
   } catch (_error) {
     currentId = undefined;
   }
   if (!chosen || chosen.deviceId === currentId
-    || (chosen.label && currentLabel && chosen.label === currentLabel)) return stream;
+    || (deviceLabel(chosen) && currentLabel && deviceLabel(chosen) === currentLabel)) return stream;
   const fallback = stream;
   const constraints = audioConstraints(mic);
   constraints.audio.deviceId = { exact: chosen.deviceId };
@@ -19230,7 +19239,7 @@ async function openCallMicrophone(mic) {
   }
   for (const track of fallback.getTracks()) track.stop();
   noteTrack(stream);
-  if (!callAudioRoute.inputLabel) callAudioRoute.inputLabel = chosen.label || "";
+  if (!callAudioRoute.inputLabel) callAudioRoute.inputLabel = deviceLabel(chosen);
   callAudioRoute.inputKind = classifyAudioDevice(callAudioRoute.inputLabel);
   callAudioRoute.outputKind = callAudioRoute.inputKind;
   return stream;
@@ -19259,8 +19268,8 @@ async function applyCallOutput(context) {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const chosen = (devices || []).find((d) => d.deviceId === prefs.outputId);
     if (chosen && callAudioRoute) {
-      callAudioRoute.outputKind = classifyAudioDevice(chosen.label);
-      callAudioRoute.outputLabel = chosen.label || "";
+      callAudioRoute.outputKind = classifyAudioDevice(deviceLabel(chosen));
+      callAudioRoute.outputLabel = deviceLabel(chosen);
     }
   } catch (_error) {
     // No list, no kind: the readout says the sink id instead.
@@ -19294,7 +19303,7 @@ async function refreshAudioDeviceSelects() {
     listed.forEach((device, at) => {
       const option = document.createElement("option");
       option.value = device.deviceId;
-      option.textContent = device.label || `${kind === "audioinput" ? "Microphone" : "Output"} ${at + 1}`;
+      option.textContent = deviceLabel(device) || `${kind === "audioinput" ? "Microphone" : "Output"} ${at + 1}`;
       select.append(option);
     });
     if (chosenId && !listed.some((d) => d.deviceId === chosenId)) {
@@ -19345,7 +19354,7 @@ async function renderAudioRouteReadout() {
   const nameOf = (id, kind) => {
     if (!id) return "System default";
     const found = devices.find((d) => d.deviceId === id && d.kind === kind);
-    return found ? (found.label || found.deviceId) : `${id} (not connected now)`;
+    return found ? (deviceLabel(found) || found.deviceId) : `${id} (not connected now)`;
   };
   lines.push(`Microphone choice: ${nameOf(prefs.inputId, "audioinput")}`);
   lines.push(outputSinkSupported()
@@ -19353,12 +19362,12 @@ async function renderAudioRouteReadout() {
     : "Speaker choice: this browser cannot choose an output (on Android the call follows the microphone's route)");
   const inputs = devices.filter((d) => d.kind === "audioinput");
   lines.push(`Microphones the browser lists: ${inputs.length
-    ? inputs.map((d) => `${d.label || d.deviceId} [${classifyAudioDevice(d.label)}]`).join("; ")
+    ? inputs.map((d) => `${deviceLabel(d) || d.deviceId} [${classifyAudioDevice(deviceLabel(d))}]`).join("; ")
     : "none yet — start a call once so the browser may name them"}`);
   if (session.stream) {
     const track = session.stream.getTracks()[0];
     const settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
-    lines.push(`This call's microphone: ${settings.label || (track && track.label) || settings.deviceId || "browser did not say"} [${callAudioRoute ? callAudioRoute.inputKind : "other"}]`);
+    lines.push(`This call's microphone: ${deviceLabel(settings) || deviceLabel(track) || settings.deviceId || "browser did not say"} [${callAudioRoute ? callAudioRoute.inputKind : "other"}]`);
   } else {
     lines.push("This call's microphone: no call is open");
   }

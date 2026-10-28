@@ -2890,6 +2890,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       // `#619 voice-bluetooth-output`. The devices `enumerateDevices` names; empty unless a
       // test stocks it, so every older test sees the browser this fixture has always modelled.
       enumerateDevices: async () => (page.audioDevices || []).map((d) => ({ ...d })),
+      addEventListener: (type, fn) => {
+        (page.mediaDeviceListeners ||= []).push([type, fn]);
+      },
       getUserMedia: async (constraints) => {
         // Rebuilt in THIS realm, key for key. The page's object is made inside the vm context, so
         // its prototype is that context's `Object` and `deepStrictEqual` rejects it against an
@@ -22982,6 +22985,24 @@ test("`#619 voice-bluetooth-output`: with a Bluetooth microphone listed, the cal
   assert.deepStrictEqual(page.micRequests[1].audio.deviceId, { exact: "airpods" });
   assert.equal(page.micRequests[1].audio.echoCancellation, true, "echo cancellation was dropped");
   assert.equal(page.tracks[0].stops, 1, "the default stream was left open");
+});
+
+test("`#619 voice-bluetooth-output`: a device change re-lists the devices, so a headset connected later can be chosen", async () => {
+  const page = newPage();
+  page.audioDevices = [{ kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" }];
+  await page.pure("refreshAudioDeviceSelects")();
+  assert.equal(page.el("audio-input-device").children.length, 2);
+  page.audioDevices = [
+    { kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" },
+    { kind: "audioinput", deviceId: "car", label: "Car Bluetooth" },
+    { kind: "audioinput", deviceId: "airpods", label: "AirPods Pro Bluetooth" },
+  ];
+  for (const [type, fn] of page.mediaDeviceListeners || []) {
+    if (type === "devicechange") await fn();
+  }
+  const labels = page.el("audio-input-device").children.map((o) => o.textContent);
+  assert.ok(labels.some((l) => l.includes("AirPods")), `headphones not offered after devicechange: ${labels}`);
+  assert.ok(labels.some((l) => l.includes("Car")), `car not offered after devicechange: ${labels}`);
 });
 
 test("`#619 voice-bluetooth-output`: a headset that vanishes before the reopen leaves the call on the default microphone", async () => {
