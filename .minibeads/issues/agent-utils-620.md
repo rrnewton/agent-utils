@@ -1,11 +1,12 @@
 ---
 title: 'link-url-chip: a URL chip under Links shows raw addresses, and a README link names its folder'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: cl-urlchip
 created_at: 2026-10-28T12:27:58.748593218+00:00
-updated_at: 2026-10-28T12:27:58.748593218+00:00
+updated_at: 2026-10-28T12:57:51.794853687+00:00
+closed_at: 2026-10-28T12:57:51.794853566+00:00
 ---
 
 # Description

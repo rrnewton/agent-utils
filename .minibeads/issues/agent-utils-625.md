@@ -1,11 +1,12 @@
 ---
 title: 'signin-flash: a reload with a saved token shows the sign-in form for a moment'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-urlchip
 created_at: 2026-10-28T12:47:57.554468066+00:00
-updated_at: 2026-10-28T12:47:57.554468066+00:00
+updated_at: 2026-10-28T12:57:51.798040055+00:00
+closed_at: 2026-10-28T12:57:51.798039945+00:00
 ---
 
 # Description
