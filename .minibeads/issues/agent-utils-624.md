@@ -6,15 +6,16 @@ issue_type: epic
 labels:
 - vibe-talk
 depends_on:
-  agent-utils-623: blocks
-  agent-utils-652: blocks
-  agent-utils-620: blocks
-  agent-utils-619: blocks
   agent-utils-653: blocks
-  agent-utils-622: blocks
+  agent-utils-652: blocks
+  agent-utils-623: blocks
+  agent-utils-620: blocks
+  agent-utils-649: blocks
   agent-utils-621: blocks
+  agent-utils-619: blocks
+  agent-utils-622: blocks
 created_at: 2026-10-28T12:47:41.393557128+00:00
-updated_at: 2026-10-28T15:13:15.884811481+00:00
+updated_at: 2026-10-28T15:35:17.777195329+00:00
 ---
 
 # Description
