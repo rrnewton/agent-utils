@@ -18687,7 +18687,34 @@ def _process_state(identity: ProcessIdentity | None) -> tuple[str, str]:
     return "dead", f"PID {identity.pid} was reused; the recorded generation exited"
 
 
-def _link_target(path: Path, slot_device: int | None = None) -> Path | None:
+def _too_long_link_within(path: Path, exc: OSError, slot_root: Path | None) -> bool | None:
+    """Decide a link readlink(2) failed on with ENAMETOOLONG by its parents.
+
+    Returns None when this cannot apply (another error, or no slot root given);
+    otherwise whether the directory is the slot root or below it.  A same-device
+    very long path stays undecided without this walk (#618); with it, a
+    directory outside the slot is proven so, and one inside counts as use.
+    A failed walk raises Refusal, so it never fails open.
+    """
+
+    if exc.errno != errno.ENAMETOOLONG or slot_root is None:
+        return None
+    try:
+        root = os.stat(slot_root)
+        holder = _directory_link_holder(
+            path, {(root.st_dev, root.st_ino): (slot_root, "")}
+        )
+    except OSError as walk_error:
+        raise Refusal(
+            f"process use is indeterminate because {path} failed: {exc}; "
+            f"cannot place that directory by its parents: {walk_error}"
+        ) from walk_error
+    return holder is not None
+
+
+def _link_target(
+    path: Path, slot_device: int | None = None, slot_root: Path | None = None
+) -> Path | None:
     try:
         raw = os.readlink(path)
     except FileNotFoundError:
@@ -18709,6 +18736,9 @@ def _link_target(path: Path, slot_device: int | None = None) -> Path | None:
                 observed = None
             if observed is not None and observed.st_dev != slot_device:
                 return None
+        within = _too_long_link_within(path, exc, slot_root)
+        if within is not None:
+            return slot_root if within else None
         raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
     if raw.endswith(" (deleted)"):
         raw = raw[: -len(" (deleted)")]
@@ -18740,7 +18770,7 @@ def _process_uses_slot(
 
     def link_target(path: Path) -> Path | None:
         try:
-            return _link_target(path, slot_device)
+            return _link_target(path, slot_device, slot_path)
         except Refusal as exc:
             if unreadable_is_no_evidence and isinstance(exc.__cause__, PermissionError):
                 return None
@@ -39453,7 +39483,9 @@ def _capture_agent_remove_batch_census(
     )
 
 
-def _readable_link_target(path: Path, slot_device: int | None = None) -> str | None:
+def _readable_link_target(
+    path: Path, slot_device: int | None = None, slot_root: Path | None = None
+) -> str | None:
     """Return an absolute link target, or None when absent or unreadable.
 
     A link the invoking user may not read is also invisible to lsof run as
@@ -39482,6 +39514,9 @@ def _readable_link_target(path: Path, slot_device: int | None = None) -> str | N
                 observed = None
             if observed is not None and observed.st_dev != slot_device:
                 return None
+        within = _too_long_link_within(path, exc, slot_root)
+        if within is not None:
+            return str(slot_root) if within else None
         raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
     raw = raw.removesuffix(" (deleted)")
     if not raw.startswith("/"):
@@ -39564,7 +39599,7 @@ def _agent_batch_fresh_use(
         uses.extend(mount_verdicts.uses(pid_dir))
         if not uses:
             for name in ("cwd", "root", "exe"):
-                target = _readable_link_target(pid_dir / name, slot_device)
+                target = _readable_link_target(pid_dir / name, slot_device, slot_path)
                 if within(target):
                     uses.append(f"{name}={target}")
                     break
@@ -39581,7 +39616,7 @@ def _agent_batch_fresh_use(
                     ) from exc
                 descriptors = []
             for descriptor in descriptors:
-                target = _readable_link_target(fd_dir / descriptor, slot_device)
+                target = _readable_link_target(fd_dir / descriptor, slot_device, slot_path)
                 if within(target):
                     uses.append(f"fd/{descriptor}={target}")
                     break
@@ -54712,6 +54747,59 @@ def _long_path_diagnostic_is_foreign(
     return observed.st_dev not in target_devices
 
 
+_DIRECTORY_LINK_PARENT_WALK_LIMIT = 100_000
+_TargetIdentities = Mapping[tuple[int, int], tuple[Path, str]]
+
+
+def _target_directory_identities(targets: Mapping[Path, str]) -> dict[tuple[int, int], tuple[Path, str]]:
+    """Map each existing target directory's (st_dev, st_ino) to it and its slot."""
+
+    identities: dict[tuple[int, int], tuple[Path, str]] = {}
+    for target, slot in targets.items():
+        try:
+            metadata = os.stat(target)
+        except FileNotFoundError:
+            continue  # an absent target holds nothing a live directory can be below
+        identities[(metadata.st_dev, metadata.st_ino)] = (target, slot)
+    return identities
+
+
+def _directory_link_holder(link: Path, identities: _TargetIdentities) -> tuple[Path, str] | None:
+    """Return the target a directory named by a /proc link is at or below.
+
+    For a link readlink(2) cannot read (ENAMETOOLONG).  Opening the link still
+    reaches the directory, so this walks `..` from it and compares each
+    directory's (st_dev, st_ino) with the targets'; bind-mount aliases of a
+    target show the same pair.  Reaching the top of the walk (`..` is the
+    directory itself) means it is below no target.  Any failure raises
+    OSError -- a non-directory (ENOTDIR), a link this user cannot open, or a
+    walk deeper than _DIRECTORY_LINK_PARENT_WALK_LIMIT -- so the caller still
+    refuses rather than reading the failure as absence.
+    """
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    current = os.open(link, flags)
+    try:
+        for _ in range(_DIRECTORY_LINK_PARENT_WALK_LIMIT):
+            here = os.fstat(current)
+            holder = identities.get((here.st_dev, here.st_ino))
+            if holder is not None:
+                return holder
+            parent = os.open("..", flags, dir_fd=current)
+            above = os.fstat(parent)
+            os.close(current)
+            current = parent
+            if (above.st_dev, above.st_ino) == (here.st_dev, here.st_ino):
+                return None
+        raise OSError(
+            errno.ELOOP,
+            f"more than {_DIRECTORY_LINK_PARENT_WALK_LIMIT} parent directories",
+            str(link),
+        )
+    finally:
+        os.close(current)
+
+
 def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
     return _process_start_ticks(Path("/proc") / str(process.pid)) == process.start_ticks
 
@@ -55702,6 +55790,7 @@ def _direct_process_identity_matches(
     sockets: dict[int, set[int]] = {}
     fallback: list[_AbsentProcessObservation] = []
     match_cache: dict[Path, tuple[Path, str] | None] = {}
+    target_identities = _target_directory_identities(targets)
 
     for process in processes:
         budget.consume_observation()
@@ -55734,8 +55823,18 @@ def _direct_process_identity_matches(
             budget.consume_observation()
             budget.remaining_seconds()
             try:
-                raw_target = os.readlink(path)
+                try:
+                    raw_target: str | None = os.readlink(path)
+                except OSError as exc:
+                    if exc.errno != errno.ENAMETOOLONG:
+                        raise
+                    raw_target = None  # placed by its parents below
                 metadata = path.stat()
+                holder = (
+                    _directory_link_holder(path, target_identities)
+                    if raw_target is None
+                    else None
+                )
             except FileNotFoundError:
                 if transient:
                     return False
@@ -55766,12 +55865,16 @@ def _direct_process_identity_matches(
                     )
                 vanished = True
                 return False
-            observed_path = Path(
-                os.path.normpath(raw_target.removesuffix(" (deleted)"))
-            )
-            matched = _matching_absent_validate_target(
-                observed_path, targets, match_cache
-            )
+            if raw_target is None:
+                matched = holder
+                raw_target = f"{path} (a directory whose path exceeds PATH_MAX)"
+            else:
+                observed_path = Path(
+                    os.path.normpath(raw_target.removesuffix(" (deleted)"))
+                )
+                matched = _matching_absent_validate_target(
+                    observed_path, targets, match_cache
+                )
             if matched is not None:
                 _target, slot = matched
                 process_link_matches.append(
