@@ -307,3 +307,19 @@ finding. Gate 41 failures were load flakes only
 (repository-infrastructure 149, thread-card-header browser,
 wrkslots shards 516 + 515 passed alone). Upstream commits shared
 no files; rebased and pushed without a second gate.
+
+[muse watermelon] Slice 31 landed (b5239e0e): `wrkslotsd release`,
+the sixth writer slice, reproduces the owner release mutation
+(owner authorization, agent-slot and hold guards, validated
+handoff publication, the `owner-released` event, and the
+already-released outcome) behind the fixture-only writer guard.
+Adversarial review found dropped publication authentication,
+the hand-parsed sidecar, missing legacy HANDOFF.md branches,
+wrong unpublished-sidecar refusal branches, and weak
+already-released detection; all fixed (the strict sidecar loader
+and publication validator are now shared). Differential: 6 passed
+in this slice's file (50 across the writer files). Gate 42
+failures were load flakes only (repository-infrastructure 149,
+scroll-stability browser, wrkslots shards 519 + 518 passed
+alone). Upstream commits shared no files; rebased and pushed
+without a second gate.
