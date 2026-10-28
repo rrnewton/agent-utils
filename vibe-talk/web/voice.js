@@ -19124,8 +19124,10 @@ function audioDevicePrefs() {
   const prefs = storedAudioDevicePrefs();
   const input = document.getElementById("audio-input-device");
   const output = document.getElementById("audio-output-device");
-  if (input) prefs.inputId = input.value || "";
-  if (output) prefs.outputId = output.value || "";
+  // A select still showing System default may only not have been filled yet (its refresh is
+  // asynchronous): storage, which the change handler keeps current, is the safer word then.
+  if (input && input.value) prefs.inputId = input.value;
+  if (output && output.value) prefs.outputId = output.value;
   return prefs;
 }
 
@@ -19140,7 +19142,7 @@ function classifyAudioDevice(label) {
   if (/usb/.test(words)) return "usb";
   if (/speaker/.test(words)) return "speakerphone";
   if (/earpiece|receiver/.test(words)) return "earpiece";
-  if (/headset|headphone|earbud|earphone|microphone|\bmic\b/.test(words)) return "wired_headset";
+  if (/headset|headphone|earbud|earphone/.test(words)) return "wired_headset";
   return "other";
 }
 
@@ -19161,10 +19163,12 @@ function pickCallInput(devices, prefs) {
     || null;
 }
 
-/** Whether this browser lets a page choose an output at all, in either form. */
+/**
+ * Whether this browser lets the CALL choose an output: call playback is Web Audio, so the
+ * form that matters is `AudioContext.setSinkId` (desktop Chromium). A media-element-only
+ * `setSinkId` could not aim the call, so it does not earn the picker.
+ */
 function outputSinkSupported() {
-  if (typeof HTMLMediaElement !== "undefined" && HTMLMediaElement.prototype
-    && "setSinkId" in HTMLMediaElement.prototype) return true;
   const Context = window.AudioContext || window.webkitAudioContext;
   return Boolean(Context && Context.prototype && "setSinkId" in Context.prototype);
 }
@@ -19181,7 +19185,12 @@ async function openCallMicrophone(mic) {
   const trackOf = (s) => (s && typeof s.getTracks === "function" ? s.getTracks()[0] : null);
   const noteTrack = (s) => {
     const track = trackOf(s);
-    const settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
+    let settings = {};
+    try {
+      settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
+    } catch (_error) {
+      settings = {};
+    }
     const label = (track && typeof track.label === "string" && track.label)
       || (typeof settings.label === "string" ? settings.label : "");
     callAudioRoute.inputKind = classifyAudioDevice(label);
@@ -19198,13 +19207,28 @@ async function openCallMicrophone(mic) {
   }
   const chosen = pickCallInput(devices, audioDevicePrefs());
   const current = trackOf(stream);
-  const currentId = current && typeof current.getSettings === "function"
-    ? current.getSettings().deviceId : undefined;
-  if (!chosen || chosen.deviceId === currentId) return stream;
-  for (const track of stream.getTracks()) track.stop();
+  let currentId;
+  let currentLabel = "";
+  try {
+    const settings = current && typeof current.getSettings === "function" ? current.getSettings() : {};
+    currentId = settings.deviceId;
+    currentLabel = (current && typeof current.label === "string" && current.label) || settings.label || "";
+  } catch (_error) {
+    currentId = undefined;
+  }
+  if (!chosen || chosen.deviceId === currentId
+    || (chosen.label && currentLabel && chosen.label === currentLabel)) return stream;
+  const fallback = stream;
   const constraints = audioConstraints(mic);
   constraints.audio.deviceId = { exact: chosen.deviceId };
-  stream = await navigator.mediaDevices.getUserMedia(constraints);
+  try {
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (_error) {
+    // The chosen device went away between listing and opening: the stream already open
+    // carries the call rather than the call dying on a device race.
+    return fallback;
+  }
+  for (const track of fallback.getTracks()) track.stop();
   noteTrack(stream);
   if (!callAudioRoute.inputLabel) callAudioRoute.inputLabel = chosen.label || "";
   callAudioRoute.inputKind = classifyAudioDevice(callAudioRoute.inputLabel);
@@ -19227,7 +19251,9 @@ async function applyCallOutput(context) {
       callAudioRoute.sink = String(context.sinkId || prefs.outputId);
     }
   } catch (_error) {
-    // The chosen output went away between Settings and the call: the default carries it.
+    // The chosen output went away between Settings and the call: the default carries it,
+    // and the record keeps the route actually in use rather than the choice that failed.
+    return;
   }
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();

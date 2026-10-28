@@ -2908,6 +2908,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // `#619 voice-bluetooth-output`: and which device it opened, from the constraint.
         const wanted = constraints && constraints.audio && constraints.audio.deviceId;
         const wantedId = typeof wanted === "string" ? wanted : wanted && wanted.exact;
+        if (wantedId && page.failDeviceId === wantedId) throw new Error("OverconstrainedError");
         const opened = (page.audioDevices || []).find((d) => d.deviceId === wantedId);
         track.getSettings = () => ({
           ...(typeof page.appliedEchoCancellation === "boolean"
@@ -22981,6 +22982,17 @@ test("`#619 voice-bluetooth-output`: with a Bluetooth microphone listed, the cal
   assert.deepStrictEqual(page.micRequests[1].audio.deviceId, { exact: "airpods" });
   assert.equal(page.micRequests[1].audio.echoCancellation, true, "echo cancellation was dropped");
   assert.equal(page.tracks[0].stops, 1, "the default stream was left open");
+});
+
+test("`#619 voice-bluetooth-output`: a headset that vanishes before the reopen leaves the call on the default microphone", async () => {
+  const page = newPage();
+  page.audioDevices = [
+    { kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" },
+    { kind: "audioinput", deviceId: "airpods", label: "AirPods Pro Bluetooth" },
+  ];
+  page.failDeviceId = "airpods";
+  await startTalking(page);
+  assert.equal(page.tracks[0].stops, 0, "the working default stream was stopped for a failed reopen");
 });
 
 test("`#619 voice-bluetooth-output`: a stored microphone choice wins, and survives a reload", async () => {
