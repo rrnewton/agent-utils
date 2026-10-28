@@ -1005,7 +1005,7 @@
 
           <!--
             `#376 read-aloud-blocks`. Where a read of several blocks is, and the way through it:
-            Previous, "2 of 5", Next. Shown only while such a read plays, floating as the status
+            Previous, "2 of 5", Next (since `#627`, arrows: see below). Shown only while such a read plays, floating as the status
             line does and for the same reason (nothing under the reader's thumb moves when it
             comes and goes). The media keys a steering wheel or a headset sends do the same as
             its buttons.
@@ -1029,6 +1029,17 @@
             full-width row standing on the dock's bottom row, the list ending at its top edge and
             the bar's second row and (while it plays) the chips hidden. See `renderReadLayout` in
             web/voice.js and `data-read-strip` in web/voice.css.
+
+            `#627 scrubber-thumb-arrows`. FOUR ARROWS, ALL ON THE RIGHT: the owner, 2026-10-28, of
+            Previous and Next: "They should both be on the right side because that's where my thumb
+            is", with section skips added, "the little jumps among chunks could be fine thin arrows.
+            And the big jumps between chapters could be big fat arrows. The fine arrows would be to
+            the right of the reading in the middle on where we are. And the fat arrows would be to
+            the left", all pointing left and right as the timeline under them runs. So: the fat
+            Previous and Next section, "k of n", the thin Previous and Next block. A section is a
+            message of the row, or a heading and what follows it; in a message with neither, a
+            paragraph, a list or a quote whole (`readSectionStarts` in web/voice.js). The media keys
+            still step a block.
           -->
           <div id="read-steer" role="group" aria-label="Reading position" hidden>
             <button id="read-steer-grip" type="button" aria-label="Move the reading controls"
@@ -1039,9 +1050,25 @@
                 <circle cx="2" cy="13" r="1.2" /><circle cx="6" cy="13" r="1.2" />
               </svg>
             </button>
-            <button id="read-prev" class="read-steer-button" type="button" aria-label="Previous block">Previous</button>
+            <button id="read-section-prev" class="read-steer-button read-steer-arrow" type="button" data-weight="fat"
+              aria-label="Previous section" title="Previous section">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M1.5 12 12.5 2v6H22v8h-9.5v6Z" /></svg>
+            </button>
+            <button id="read-section-next" class="read-steer-button read-steer-arrow" type="button" data-weight="fat"
+              aria-label="Next section" title="Next section">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M22.5 12 11.5 2v6H2v8h9.5v6Z" /></svg>
+            </button>
             <span id="read-steer-count" aria-live="polite"></span>
-            <button id="read-next" class="read-steer-button" type="button" aria-label="Next block">Next</button>
+            <button id="read-prev" class="read-steer-button read-steer-arrow" type="button" data-weight="thin"
+              aria-label="Previous block" title="Previous block">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.25"
+                stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H4M11 5l-7 7 7 7" /></svg>
+            </button>
+            <button id="read-next" class="read-steer-button read-steer-arrow" type="button" data-weight="thin"
+              aria-label="Next block" title="Next block">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.25"
+                stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16M13 5l7 7-7 7" /></svg>
+            </button>
             <!-- `#537 scrub-bar-no-play-pause`. No Pause or Stop here: the bar under the list has both
                  (Read is the Pause of a read playing, and Stop beside it), so the strip steers. -->
             <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it

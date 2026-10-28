@@ -12178,6 +12178,97 @@ test("Previous and Next move the read a block at a time; Previous on the first b
   assert.equal(blockOf(page.audioStreams.at(-1).url), "0", "Previous on the first block did not start it again");
 });
 
+// --- `#627 scrubber-thumb-arrows`: the fat arrows step a section, the thin ones a block -------------
+
+/** A message of two sections under headings: h2, p, p, h2, p. Sections begin at blocks 0 and 3. */
+const SECTIONED_HTML = "<h2>Done</h2>\n<p>The run finished.</p>\n<p>The budget landed.</p>\n<h2>Open</h2>\n<p>The rewrite is a draft.</p>\n";
+const SECTIONED_KINDS = ["heading", "paragraph", "paragraph", "heading", "paragraph"].map((kind) => ({ kind, spoken: true }));
+const SECTIONED_CONTENT = "## Done\n\nThe run finished.\n\nThe budget landed.\n\n## Open\n\nThe rewrite is a draft.";
+
+test("`#627 scrubber-thumb-arrows`: four arrows, each a 44px target with its own name, the thin pair stepping blocks as Previous and Next did", () => {
+  for (const [id, label, weight] of [["read-section-prev", "Previous section", "fat"], ["read-section-next", "Next section", "fat"],
+    ["read-prev", "Previous block", "thin"], ["read-next", "Next block", "thin"]]) {
+    const tag = HTML_CODE.match(new RegExp(`<button id="${id}"[^>]*>`))[0];
+    assert.match(tag, new RegExp(`aria-label="${label}"`), `${id} is not named ${label}`);
+    assert.match(tag, new RegExp(`data-weight="${weight}"`), `${id} is not a ${weight} arrow`);
+    assert.match(tag, /class="read-steer-button read-steer-arrow"/, `${id} is not drawn as an arrow`);
+  }
+  assert.match(cssBlock(".read-steer-arrow"), /min-width:\s*2\.75rem/, "an arrow's target is narrower than 44px");
+  assert.match(cssBlock(".read-steer-button"), /min-height:\s*2\.75rem/, "an arrow's target is shorter than 44px");
+  // On a phone the group stands at the right edge, under the right thumb, not spread to both edges.
+  const phone = cssRules(CSS_CODE, ":root[data-read-strip] #read-steer").join("\n");
+  assert.match(phone, /justify-content:\s*flex-end/, "on a phone the arrows do not stand at the right edge");
+  assert.doesNotMatch(phone, /space-between/, "on a phone the arrows are still spread to the two edges");
+});
+
+test("`#627 scrubber-thumb-arrows`: the fat arrows jump between the sections a message's headings begin", async () => {
+  const { page, rows } = await blockedRead({ html: SECTIONED_HTML, kinds: SECTIONED_KINDS, content: SECTIONED_CONTENT });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 5");
+  assert.equal(page.el("read-section-next").disabled, false, "Next section is not offered before the second heading");
+  await page.el("read-section-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "4 of 5", "Next section did not land on the second heading");
+  assert.equal(blockOf(page.audioStreams.at(-1).url), "3");
+  assert.equal(page.el("read-section-next").disabled, true, "Next section is offered in the last section");
+  const before = page.audioStreams.length;
+  await page.el("read-section-next").click();
+  await page.settle();
+  assert.equal(page.audioStreams.length, before, "Next section in the last section asked for something");
+  // Previous section from a section's first block: the one before. From inside one: its own start.
+  await page.el("read-section-prev").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 5", "Previous section from the second heading did not go to the first");
+  await page.el("read-next").click();
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "3 of 5", "the thin Next did not step one block");
+  await page.el("read-section-prev").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 5", "Previous section inside a section did not go to its start");
+  // On the first section it starts it again, as Previous on the first block does.
+  await page.el("read-section-prev").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 5");
+  assert.equal(blockOf(page.audioStreams.at(-1).url), "0", "Previous section on the first section did not start it again");
+});
+
+test("`#627 scrubber-thumb-arrows`: with no headings a section is a block whole, a list of items one section", async () => {
+  // The three-block fixture: a paragraph, then a list of two items. Its sections: the paragraph, the list.
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-section-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "Next section did not go to the list");
+  assert.equal(page.el("read-section-next").disabled, true, "the list's second item was taken for a section of its own");
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  await page.el("read-section-prev").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "Previous section inside the list did not go to the list's start");
+});
+
+test("`#627 scrubber-thumb-arrows`: a paragraph's pieces are one section, and the media keys still step one block", async () => {
+  // A long paragraph read in two pieces, then a paragraph: sections at 0 and 2.
+  const kinds = [{ kind: "paragraph", spoken: true, element: 0, piece: 0, pieces: 2 },
+    { kind: "paragraph", spoken: true, element: 0, piece: 1, pieces: 2 }, { kind: "paragraph", spoken: true, element: 1 }];
+  const { page, rows } = await blockedRead({ mediaSession: true, kinds,
+    html: "<p>The run finished. The budget landed.</p>\n<p>The rewrite is a draft.</p>\n",
+    content: "The run finished. The budget landed.\n\nThe rewrite is a draft." });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-section-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "3 of 3", "Next section stopped at a paragraph's second piece");
+  page.mediaSession.handlers.previoustrack();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the media key's previous did not step one block");
+});
+
 test("THE MEDIA KEYS move the read: previoustrack, nexttrack, pause and play, kept by a silent element", async () => {
   // A steering wheel's or a headset's buttons reach a page only while it plays a media element,
   // and Web Audio is not one: the page plays silence alongside the read to hold them.
@@ -12441,19 +12532,21 @@ test("`#433 read-strip-low`: the strip hugs the chips' measured height and the p
     "nothing measures the strip for the room kept over it");
 });
 
-test("`#442 read-strip-order`: the strip reads Previous, k of n, Next, in the markup as on screen, and holds no Pause or Stop (`#537`)", () => {
+test("`#442 read-strip-order`: the strip reads its arrows and k of n in the markup as on screen, and holds no Pause or Stop (`#537`)", () => {
   // In the markup, not by `order`, so Tab and a screen reader meet the controls as they are seen. The
   // desk's grip comes first, at the strip's left. `#537 scrub-bar-no-play-pause`, the owner: "let's
   // remove the pause/play from the floating scrub bar. I like how we currently have stop and pause on
   // the lower bar. We don't need to redundantly have it. We can just have the next and previous".
   const strip = HTML_CODE.slice(HTML_CODE.indexOf('id="read-steer"'), HTML_CODE.indexOf('id="read-timeline"'));
   const ids = [...strip.matchAll(/\bid="(read-[\w-]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(ids, ["read-steer", "read-steer-grip", "read-prev", "read-steer-count", "read-next"],
-    "the strip's controls are not the grip, Previous, the count and Next alone");
+  // `#627 scrubber-thumb-arrows`: the fat Previous and Next section, the count, the thin Previous and Next block.
+  assert.deepEqual(ids, ["read-steer", "read-steer-grip", "read-section-prev", "read-section-next", "read-steer-count",
+    "read-prev", "read-next"], "the strip's controls are not the grip, the section arrows, the count and the block arrows alone");
   assert.ok(!PAGE_ELEMENTS.has("read-pause") && !PAGE_ELEMENTS.has("read-stop"), "the strip still has a Pause or a Stop of its own");
   // The bar under the list keeps both: Read (the Pause of a read playing) and Stop beside it.
   assert.ok(PAGE_ELEMENTS.has("read-aloud") && PAGE_ELEMENTS.has("read-aloud-stop"), "the bar lost its Pause or its Stop");
-  for (const selector of ["#read-steer", ".read-steer-button", "#read-steer-grip", "#read-prev", "#read-steer-count", "#read-next"]) {
+  for (const selector of ["#read-steer", ".read-steer-button", ".read-steer-arrow", "#read-steer-grip", "#read-section-prev",
+    "#read-section-next", "#read-prev", "#read-steer-count", "#read-next"]) {
     for (const rule of cssRules(CSS_CODE, selector)) {
       assert.doesNotMatch(rule, /(^|[\s;])order:|row-reverse|direction:\s*rtl/,
         `${selector} moves the strip's controls on screen away from their order in the markup`);
