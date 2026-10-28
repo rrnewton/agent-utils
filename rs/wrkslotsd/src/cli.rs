@@ -385,8 +385,8 @@ pub(crate) enum Command {
         #[arg(long, value_name = "SHA256")]
         record_sha256: String,
         /// Apply instead of planning the plan
-        #[arg(long)]
-        apply: bool,
+        #[arg(long = "apply")]
+        apply_mode: bool,
         /// The caller asserts it is the recorded coordinator
         #[arg(long)]
         coordinator_authorized: bool,
@@ -409,8 +409,8 @@ pub(crate) enum Command {
         #[arg(long, value_name = "FILE")]
         input: Option<PathBuf>,
         /// Apply instead of planning each plan
-        #[arg(long)]
-        apply: bool,
+        #[arg(long = "apply")]
+        apply_mode: bool,
         /// The caller asserts it is the recorded coordinator
         #[arg(long)]
         coordinator_authorized: bool,
@@ -1097,7 +1097,7 @@ pub fn run() -> u8 {
             slot,
             expected_generation,
             record_sha256,
-            apply,
+            apply_mode,
             coordinator_authorized,
             coordinator_pid,
             root,
@@ -1109,7 +1109,7 @@ pub fn run() -> u8 {
                 &slot,
                 expected_generation,
                 &record_sha256,
-                apply,
+                apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
             ) {
@@ -1129,7 +1129,7 @@ pub fn run() -> u8 {
         Command::RecoverAbsentAgentRows {
             row,
             input,
-            apply,
+            apply_mode,
             coordinator_authorized,
             coordinator_pid,
             root,
@@ -1140,7 +1140,7 @@ pub fn run() -> u8 {
                 machine.as_deref(),
                 &row,
                 input.as_deref(),
-                apply,
+                apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
             ) {
