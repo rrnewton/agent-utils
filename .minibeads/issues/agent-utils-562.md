@@ -422,3 +422,14 @@ process-scan tests, the standalone wrkslots lifecycle, and the
 full agentctl Rust suite, which fails on base with varying
 counts under load while its subsets pass). Upstream commits
 shared no files; rebased and pushed without a second gate.
+
+[muse watermelon] Decision recorded (coordinator, 2026-10-28, M2):
+Rust `chat launch` launches the current Rust bridge generation
+(chat init/run state; Slack, fake and plugin providers), not the
+Python Google Chat polling bridge. The owner retired Google Chat
+on 2026-10-26 and every live bridge on both hosts already runs
+Rust `chat run`, so porting the Python polling loop has no users.
+Rust launch refuses a Python-format chat.json or polling state
+with a clear `chat init` pointer: no silent conversion, no reading
+of the old state. Landed as 9086ca74 under #545; recorded here as
+instructed.
