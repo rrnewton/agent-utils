@@ -115,56 +115,84 @@ fn file_references(page: &str) -> Vec<String> {
 #[tokio::test]
 async fn every_file_a_shell_names_is_immutable_under_a_url_carrying_the_hash_of_its_bytes() {
     let app = app();
-    for (shell, expected) in [(
-        "/",
-        &[
-            "/style.css",
-            "/voice.css",
-            "/contract.js",
-            "/voice.js",
-            "/icons/icon-192.png",
-            "/icons/icon.svg",
-        ][..],
-    )] {
-        let (status, _, page) = fetch(&app, shell, &[]).await;
-        assert_eq!(status, StatusCode::OK, "{shell}");
-        let page = String::from_utf8(page).expect("utf-8");
-        let references = file_references(&page);
-        let mut named: Vec<&str> = Vec::new();
-        for reference in &references {
-            // A reference the shell was not rewritten to hash would still load, by its plain URL,
-            // revalidated on every launch — the cost this change exists to remove.
-            let (file, version) = reference
-                .split_once("?v=")
-                .unwrap_or_else(|| panic!("{shell} names {reference} without its hash"));
-            named.push(file);
-            let (status, headers, body) =
-                fetch(&app, reference, &[("accept-encoding", "identity")]).await;
-            assert_eq!(status, StatusCode::OK, "{reference}");
-            assert_eq!(header(&headers, "cache-control"), IMMUTABLE, "{reference}");
+    let (status, _, page) = fetch(&app, "/", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8(page).expect("utf-8");
+    let references = file_references(&page);
+    let mut named: Vec<String> = Vec::new();
+    for reference in &references {
+        // The page build's script and stylesheet carry their hash in their names (`#624
+        // voice-page-modularity`); every other file carries it in its `?v=`. A reference with
+        // neither would still load, by its plain URL, revalidated on every launch: the cost this
+        // change exists to remove.
+        let (file, version, plain) = match reference.strip_prefix("/assets/voice.") {
+            Some(name) => {
+                let (hash, kind) = name.split_once('.').expect("voice.<hash>.<kind>");
+                // The script is also at the plain /voice.js an older shell names; the one
+                // stylesheet, made of two, has no plain twin.
+                let plain = (kind == "js").then(|| "/voice.js".to_owned());
+                (format!("/assets/voice.{kind}"), hash.to_owned(), plain)
+            }
+            None => {
+                let (file, version) = reference
+                    .split_once("?v=")
+                    .unwrap_or_else(|| panic!("/ names {reference} without its hash"));
+                (file.to_owned(), version.to_owned(), Some(file.to_owned()))
+            }
+        };
+        named.push(file);
+        let (status, headers, body) =
+            fetch(&app, reference, &[("accept-encoding", "identity")]).await;
+        assert_eq!(status, StatusCode::OK, "{reference}");
+        assert_eq!(header(&headers, "cache-control"), IMMUTABLE, "{reference}");
+        assert_eq!(
+            content_hash(&body),
+            version,
+            "{reference} is not named by the hash of the bytes it serves"
+        );
+        assert_eq!(
+            header(&headers, "etag"),
+            format!("W/\"{version}\""),
+            "{reference}"
+        );
+        // The plain URL an older shell names: the same bytes, the same validator, revalidated.
+        if let Some(plain) = plain {
+            let (status, headers_of_plain, same) =
+                fetch(&app, &plain, &[("accept-encoding", "identity")]).await;
+            assert_eq!(status, StatusCode::OK, "{plain}");
             assert_eq!(
-                content_hash(&body),
-                version,
-                "{reference} is not named by the hash of the bytes it serves"
+                header(&headers_of_plain, "cache-control"),
+                REVALIDATE,
+                "{plain}"
             );
             assert_eq!(
+                header(&headers_of_plain, "etag"),
                 header(&headers, "etag"),
-                format!("W/\"{version}\""),
-                "{reference}"
+                "{plain}"
             );
-            // The plain URL an older shell names: the same bytes, the same validator, revalidated.
-            let (status, plain, same) = fetch(&app, file, &[("accept-encoding", "identity")]).await;
-            assert_eq!(status, StatusCode::OK, "{file}");
-            assert_eq!(header(&plain, "cache-control"), REVALIDATE, "{file}");
-            assert_eq!(header(&plain, "etag"), header(&headers, "etag"), "{file}");
-            assert!(same == body, "{file} and {reference} serve different bytes");
-        }
-        for file in expected {
             assert!(
-                named.contains(file),
-                "{shell} no longer names {file}: {references:?}"
+                same == body,
+                "{plain} and {reference} serve different bytes"
             );
         }
+    }
+    for file in [
+        "/assets/voice.js",
+        "/assets/voice.css",
+        "/icons/icon-192.png",
+        "/icons/icon.svg",
+    ] {
+        assert!(
+            named.iter().any(|name| name == file),
+            "/ no longer names {file}: {references:?}"
+        );
+    }
+    // The shell loads the page build, not the plain files a shell from before it named.
+    for old in ["/style.css", "/voice.css", "/contract.js", "/voice.js"] {
+        assert!(
+            !named.iter().any(|name| name == old),
+            "/ still names {old}: {references:?}"
+        );
     }
 }
 

@@ -126,6 +126,14 @@
 //! the CURRENT file of that kind, revalidated, under the current file's ETag, the same rule as an
 //! old `?v=`. A map is different: an old map's name is a 404, because the current map would point
 //! an old script's positions at the wrong lines. Anything else below `/assets/` is a 404.
+//!
+//! The shell at `/` is the page build's shell: `web/voice.html` with its script tags made one tag
+//! naming the hashed script and its stylesheet links one link naming the hashed sheet, and nothing
+//! else changed. A shell cached before the page build names the plain files, and they still answer:
+//! `/voice.js` is the page build's whole script (its validators then run twice, which sets one
+//! global twice), `/contract.js` the standalone validators an older cached `/voice.js` needs, and
+//! the two stylesheets as written. The page reads its build from its script's hashed name, or from
+//! an older shell's `?v=`, and `page_build` is the page build's script hash.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -140,10 +148,12 @@ use super::api;
 use crate::config::DEFAULT_APP_NAME;
 use crate::state::AppState;
 
-/// The app's page, served at `/`. Its files keep the `voice` names they had when it lived at
-/// `/voice`, so a shell cached before the move still names files that exist.
-const VOICE_HTML: &str = include_str!("../../web/voice.html");
-/// The app's script.
+/// The app's page, served at `/`: the page build's shell, naming its hashed script and stylesheet.
+/// See "The page build's hashed files" above. The plain files keep the `voice` names they had when
+/// the app lived at `/voice`, so a shell cached before either move still names files that exist.
+const SHELL: &str = built::SHELL;
+/// The page script's SOURCE, for the tests that assert its shape. What is served is the page build.
+#[cfg(test)]
 pub(crate) const VOICE_JS: &str = include_str!("../../web/voice.js");
 const CONTRACT_JS: &str = include_str!("../../web/contract.js");
 const VOICE_CSS: &str = include_str!("../../web/voice.css");
@@ -204,14 +214,15 @@ const fn source(
 /// Everything static the router serves. A path here needs a route in [`super::router`] too; a
 /// route without an entry here answers 404.
 const SOURCES: &[Source] = &[
-    source("/", HTML, VOICE_HTML.as_bytes(), Role::Shell),
+    source("/", HTML, SHELL.as_bytes(), Role::Shell),
     source(
         "/manifest.webmanifest",
         "application/manifest+json; charset=utf-8",
         MANIFEST.as_bytes(),
         Role::Manifest,
     ),
-    source("/voice.js", JAVASCRIPT, VOICE_JS.as_bytes(), Role::File),
+    // The page build's whole script, for a shell cached before the page build.
+    source("/voice.js", JAVASCRIPT, built::SCRIPT, Role::File),
     // The generated wire-contract validators the page loads before its script.
     source(
         "/contract.js",
@@ -606,12 +617,12 @@ fn opaque(tag: &str) -> &str {
     tag.strip_prefix("W/").unwrap_or(tag)
 }
 
-/// The page script's content hash, the `v=` its URL carries in the shell this server generates.
-/// `#529 page-build-stale-notice`: a page loaded from an older deploy carries an older one, and
-/// says so when a read tells it this one ([`crate::contract::TimelineResponse::page_build`]).
+/// The page script's content hash: the hash in the name of the script the shell this server serves
+/// names (`/assets/voice.<hash>.js`, `#624 voice-page-modularity`), and the `v=` of `/voice.js`'s
+/// hashed URL. `#529 page-build-stale-notice`: a page loaded from an older deploy carries an older
+/// one, and says so when a read tells it this one ([`crate::contract::TimelineResponse::page_build`]).
 pub fn page_build() -> &'static str {
-    static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    BUILD.get_or_init(|| digest(VOICE_JS.as_bytes()))
+    built::PAGE_BUILD
 }
 
 /// The first 128 bits of the SHA-256 of `bytes`, in lowercase hex.
@@ -679,7 +690,7 @@ mod tests {
         // word; two would rename the first and leave the second.
         let custom = names("Work", "W");
         for (written, _) in shell_spellings(&custom) {
-            assert_eq!(VOICE_HTML.matches(written.as_str()).count(), 1, "{written}");
+            assert_eq!(SHELL.matches(written.as_str()).count(), 1, "{written}");
         }
         for (written, _) in manifest_spellings(&custom) {
             assert_eq!(MANIFEST.matches(written.as_str()).count(), 1, "{written}");
@@ -688,21 +699,34 @@ mod tests {
 
     #[test]
     fn the_page_build_is_the_hash_the_shell_names_the_script_by() {
-        // `#529 page-build-stale-notice`: what a read reports is exactly the `v=` a page loaded
-        // from this server's shell finds on its own script's address.
+        // `#529 page-build-stale-notice`: what a read reports is exactly the hash a page loaded
+        // from this server's shell finds in its own script's name (`#624 voice-page-modularity`),
+        // and the `v=` a shell cached before the page build gets for the plain /voice.js.
         let site = Site::new(SOURCES, built::HASHED, Names::default());
         let shell = String::from_utf8(site.entries["/"].body.to_vec()).expect("a text shell");
         assert!(
-            shell.contains(&format!("src=\"/voice.js?v={}\"", page_build())),
+            shell.contains(&format!("src=\"/assets/voice.{}.js\"", page_build())),
             "the shell names the script by another hash than the page build"
         );
         assert_eq!(page_build().len(), 32);
+        assert_eq!(digest(built::SCRIPT), page_build());
+        assert_eq!(
+            site.entries["/voice.js"].version.as_deref(),
+            Some(page_build())
+        );
+        // The shell loads the page build's two files and none of the plain ones.
+        for plain in ["/voice.js", "/contract.js", "/voice.css", "/style.css"] {
+            assert!(
+                !shell.contains(&format!("=\"{plain}")),
+                "the shell still names {plain}"
+            );
+        }
     }
 
     #[test]
     fn with_the_default_names_the_documents_are_the_files_as_written() {
         assert_eq!(name_manifest(MANIFEST, &Names::default()), MANIFEST);
-        assert_eq!(name_shell(VOICE_HTML, &Names::default()), VOICE_HTML);
+        assert_eq!(name_shell(SHELL, &Names::default()), SHELL);
     }
 
     #[test]
@@ -723,7 +747,7 @@ mod tests {
 
     #[test]
     fn a_configured_name_is_escaped_into_the_shell() {
-        let page = name_shell(VOICE_HTML, &names("<b>Work</b> & 'co'", "W\"k"));
+        let page = name_shell(SHELL, &names("<b>Work</b> & 'co'", "W\"k"));
         assert!(
             page.contains("<title>&lt;b&gt;Work&lt;/b&gt; &amp; &#39;co&#39;</title>"),
             "the title"

@@ -123,7 +123,9 @@ fn file_urls(page: &str) -> Vec<&str> {
             let start = at + attribute.len() - 1;
             let end = start + page[start..].find('"').expect("a closed attribute");
             let url = &page[start..end];
-            if url.contains("?v=") {
+            // Content-addressed: by `?v=`, or, for the page build's script and stylesheet, by the
+            // hash in the name (`#624 voice-page-modularity`).
+            if url.contains("?v=") || url.starts_with("/assets/") {
                 urls.push(url);
             }
         }

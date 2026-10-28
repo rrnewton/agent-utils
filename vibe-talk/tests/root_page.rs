@@ -73,10 +73,10 @@ async fn the_root_is_the_app() {
         "id=\"discord-log\"",
         "viewport-fit=cover",
         "<link rel=\"manifest\" href=\"/manifest.webmanifest\" />",
-        "src=\"/contract.js?v=",
-        "src=\"/voice.js?v=",
-        "href=\"/voice.css?v=",
-        "href=\"/style.css?v=",
+        // The page build's script and stylesheet, each named by its hash (`#624
+        // voice-page-modularity`).
+        "<script src=\"/assets/voice.",
+        "<link rel=\"stylesheet\" href=\"/assets/voice.",
     ] {
         assert!(page.contains(marker), "/ does not carry {marker:?}");
     }
