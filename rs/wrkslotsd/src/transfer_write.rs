@@ -249,47 +249,34 @@ pub(crate) fn transfer_owner(
 mod tests {
     use super::cgroup_in_slot_box;
 
+    // Mirrors the Python `_cgroup_in_slot_box` cases in
+    // test_owner_transfer.py, including systemd-escaped hyphens.
     #[test]
     fn slot_box_matches_own_slice_only() {
+        let boxed = "/user.slice/user-1.slice/user@1.service/app.slice/app-wrkslots.slice/app-wrkslots-kvm\\x2d20261012.slice/wrkslots-run-kvm\\x2d20261012-1073417.scope";
+        assert!(cgroup_in_slot_box(boxed, "agent", "kvm-20261012"));
         assert!(cgroup_in_slot_box(
-            "/user.slice/user-1000.slice/user@1000.service/wrkslots-slot-a.slice/run.scope",
+            "/wrkslots.slice/wrkslots-slot01.slice/x.scope",
             "agent",
-            "slot-a"
+            "slot01"
         ));
-        assert!(cgroup_in_slot_box(
-            "/user.slice/prefix-wrkslots-slot-a.slice/run.scope",
+        for slot in ["kvm", "20261012", "kvm-2026101"] {
+            assert!(!cgroup_in_slot_box(boxed, "agent", slot), "{slot}");
+        }
+        assert!(!cgroup_in_slot_box(
+            "/app.slice/app-wrkslots-box-kvm\\x2d20261012.slice/a.scope",
             "agent",
-            "slot-a"
+            "kvm-20261012"
+        ));
+        assert!(!cgroup_in_slot_box(
+            "/app.slice/herdr-server.service",
+            "agent",
+            "kvm-20261012"
         ));
         assert!(!cgroup_in_slot_box(
             "/user.slice/wrkslots-slot-b.slice/run.scope",
             "agent",
             "slot-a"
-        ));
-        assert!(!cgroup_in_slot_box(
-            "/user.slice/wrkslots-slot-a.slice/run.scope",
-            "agent",
-            "slot-b"
-        ));
-        assert!(!cgroup_in_slot_box(
-            "/user.slice/wrkslots-slot-a-extra.slice/run.scope",
-            "agent",
-            "slot-a"
-        ));
-    }
-
-    #[test]
-    fn slot_box_uses_systemd_escaped_label() {
-        // systemd-escape renders "kvm-foo" as "kvm\x2dfoo".
-        assert!(cgroup_in_slot_box(
-            "/user.slice/wrkslots-kvm\\x2dfoo.slice/run.scope",
-            "agent",
-            "kvm-foo"
-        ));
-        assert!(!cgroup_in_slot_box(
-            "/user.slice/wrkslots-kvm-foo.slice/run.scope",
-            "agent",
-            "kvm-foo"
         ));
     }
 }
