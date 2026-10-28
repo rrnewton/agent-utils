@@ -328,6 +328,26 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Hand a slot with a provably dead owner to its live successor (writer; fixture registries only until cutover)
+    TransferOwner {
+        /// Active slot whose owner died
+        slot: String,
+        /// Agent name already recorded on the slot
+        #[arg(long, value_name = "NAME")]
+        agent: String,
+        /// Live successor PID to bind
+        #[arg(long, value_name = "PID")]
+        owner_pid: i64,
+        /// Current slot generation; refuses stale callers
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
     Create {
         /// New slot name
@@ -921,6 +941,35 @@ pub fn run() -> u8 {
                 expected_generation,
                 task_scope_unit.as_deref(),
                 task_scope_invocation_id.as_deref(),
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::TransferOwner {
+            slot,
+            agent,
+            owner_pid,
+            expected_generation,
+            root,
+            machine,
+        } => {
+            match crate::transfer_write::transfer_owner(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                &agent,
+                owner_pid,
+                expected_generation,
             ) {
                 Ok(value) => {
                     println!(
