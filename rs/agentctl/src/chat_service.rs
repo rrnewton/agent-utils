@@ -336,6 +336,16 @@ impl CycleReport {
     }
 }
 
+/// Validate launch authority (configuration, plugin, outbound) without
+/// creating any state, so a launcher can refuse before spawning anything.
+pub fn validate_configuration(configuration: &BridgeConfiguration) -> Result<(), ChatServiceError> {
+    let inventory = crate::plugins::discover();
+    let _pinned = chat_runtime::select_plugin(&inventory, configuration)?;
+    validate_service_outbound(configuration)?;
+    let _outbound = configuration.outbound_transport()?;
+    Ok(())
+}
+
 /// Validate all launch authority before creating a bridge state directory.
 pub fn initialize<A: ManagedApi + ?Sized>(
     state_root: &Path,
@@ -343,14 +353,21 @@ pub fn initialize<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
 ) -> Result<Value, ChatServiceError> {
     let configuration = BridgeConfiguration::load_private(configuration_path)?;
-    let inventory = crate::plugins::discover();
-    let _pinned = chat_runtime::select_plugin(&inventory, &configuration)?;
+    initialize_configuration(state_root, configuration, manager)
+}
+
+/// Create bridge state from an already-loaded configuration (for example
+/// one carrying a launcher's reply-label override).
+pub fn initialize_configuration<A: ManagedApi + ?Sized>(
+    state_root: &Path,
+    configuration: BridgeConfiguration,
+    manager: &ManagedAgents<'_, A>,
+) -> Result<Value, ChatServiceError> {
+    validate_configuration(&configuration)?;
     // A headless coordinator has no pane; `chat run` delivers to its queue instead.
     if !manager.is_headless(&configuration.agent_name)? {
         let _target = manager.pane_info(&configuration.agent_name)?;
     }
-    validate_service_outbound(&configuration)?;
-    let _outbound = configuration.outbound_transport()?;
     let state = BridgeState::initialize(state_root, configuration)?;
     Ok(state.status()?)
 }

@@ -43,6 +43,7 @@
         "py/tests/test_agentctl_chat_history_rust.py",
         "py/tests/test_agentctl_chat_input.py",
         "py/tests/test_agentctl_chat_launch.py",
+        "py/tests/test_agentctl_chat_launch_rust.py",
         "py/tests/test_agentctl_chat_lifecycle.py",
         "py/tests/test_agentctl_chat_multi.py",
         "py/tests/test_agentctl_chat_output.py",

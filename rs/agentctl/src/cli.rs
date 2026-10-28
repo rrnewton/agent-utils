@@ -1197,6 +1197,11 @@ enum ChatCommand {
         after_help = "Example: agentctl chat context --bridge-state ~/.local/state/agentctl/chat --request <KEY-OR-PREFIX> --limit 10"
     )]
     Context(ChatContext),
+    /// Launch a coordinator in this Herdr pane and bridge it to Chat for its lifetime
+    #[command(
+        after_help = "Example:\n  agentctl chat launch --config chat.json --model gpt-6-astra\n\nRun from a Herdr shell pane: launch pins the current pane, starts the native harness there, registers it under the config's agent_name, creates (or reopens) the bridge state, and runs the bridge for the coordinator's lifetime. A Python-format chat config or Python polling bridge state is refused, never converted: create fresh Rust state with 'agentctl chat init' instead."
+    )]
+    Launch(ChatLaunch),
     /// Internal systemd ExecStop helper for one inode-bound main-process pidfd
     #[command(hide = true)]
     GracefulStopMain(ChatGracefulStopMain),
@@ -1535,6 +1540,36 @@ struct ChatHistory {
 }
 
 #[derive(Args)]
+struct ChatLaunch {
+    #[command(flatten)]
+    state: ChatState,
+    /// Private Rust bridge configuration (maximum 1 MiB), as for `chat init`
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+    /// Native coordinator harness to run in this pane
+    #[arg(long, value_name = "KIND", default_value = "codex", value_parser = ["codex", "claude"])]
+    harness: String,
+    /// Native model name (default: harness configuration)
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+    /// Resume an explicit native conversation instead of starting a new one
+    #[arg(long, value_name = "SESSION")]
+    resume: Option<String>,
+    /// Literal harness argument; repeat and use = for flags
+    #[arg(long = "harness-arg", value_name = "ARG")]
+    harness_arg: Vec<String>,
+    /// Chat reply prefix label (default: the config's agent_label)
+    #[arg(long, value_name = "LABEL")]
+    agent_label: Option<String>,
+    /// Bridge subscription ready timeout in seconds (1..=3600; default: run default)
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(f64))]
+    ready_timeout: Option<f64>,
+    /// Bridge reconcile interval in seconds (1..=86400; default: run default)
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(f64))]
+    reconcile_interval: Option<f64>,
+}
+
+#[derive(Args)]
 struct ChatGracefulStopMain {
     /// Exact systemd MAINPID value
     #[arg(long)]
@@ -1654,8 +1689,16 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
     arguments: I,
     environment: &dyn Fn(&str) -> Option<String>,
 ) -> i32 {
+    let raw_arguments: Vec<OsString> = arguments.into_iter().collect();
+    if raw_arguments.first().and_then(|value| value.to_str()) == Some("--chat-launch-gate") {
+        let gate_arguments: Vec<String> = raw_arguments[1..]
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        return crate::chat_launch::gate_main(&gate_arguments);
+    }
     let arguments: Vec<OsString> = std::iter::once(OsString::from("agentctl"))
-        .chain(arguments)
+        .chain(raw_arguments)
         .collect();
     if let Some(command) = python_only_command(&arguments) {
         eprintln!(
@@ -1727,11 +1770,11 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
     }
 }
 
-// Commands only the Python edition implements: the MCP server, the headless-worker operations,
-// and the polling Chat launcher and its history/context readers. This edition refuses them with
-// exit status 2 and names the Python opt-in, instead of Clap's unrecognised-subcommand error.
+// Commands only the Python edition implements: the headless-worker operations.
+// This edition refuses them with exit status 2 and names the Python opt-in,
+// instead of Clap's unrecognised-subcommand error.
 const PYTHON_ONLY_COMMANDS: [&str; 2] = ["migrate", "repair"];
-const PYTHON_ONLY_CHAT_COMMANDS: [&str; 1] = ["launch"];
+const PYTHON_ONLY_CHAT_COMMANDS: [&str; 0] = [];
 // Global options whose value is the following argument.
 const GLOBAL_VALUE_OPTIONS: [&str; 7] = [
     "--registry",
@@ -3331,6 +3374,25 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::Launch(value) => {
+            let code = crate::chat_launch::launch(
+                &registry,
+                &herdr_bin,
+                &crate::chat_launch::LaunchOptions {
+                    state: value.state.bridge_state.clone(),
+                    config: value.config.clone(),
+                    harness: value.harness.clone(),
+                    model: value.model.clone(),
+                    resume: value.resume.clone(),
+                    harness_args: value.harness_arg.clone(),
+                    agent_label: value.agent_label.clone(),
+                    ready_timeout: value.ready_timeout,
+                    reconcile_interval: value.reconcile_interval,
+                },
+            )
+            .map_err(Failure::Chat)?;
+            Ok(code)
+        }
         ChatCommand::GracefulStopMain(value) => {
             crate::chat_service::graceful_stop_main(value.main_pid, value.main_pidfd_id)
                 .map_err(Failure::Chat)?;
@@ -3713,17 +3775,14 @@ mod tests {
                 Some("migrate"),
             ),
             (&["agentctl", "--herdr-bin=/bin/herdr", "reset"], None),
-            (
-                &["agentctl", "chat", "launch", "--config", "c.json"],
-                Some("chat launch"),
-            ),
+            (&["agentctl", "chat", "launch", "--config", "c.json"], None),
             (&["agentctl", "--state=/tmp/r", "chat", "history"], None),
             (&["agentctl", "chat", "context"], None),
             (&["agentctl", "--", "mcp"], None),
-            (&["agentctl", "chat", "--", "launch"], Some("chat launch")),
+            (&["agentctl", "chat", "--", "launch"], None),
             (&["agentctl", "help", "mcp"], None),
-            (&["agentctl", "help", "chat", "launch"], Some("chat launch")),
-            (&["agentctl", "chat", "help", "launch"], Some("chat launch")),
+            (&["agentctl", "help", "chat", "launch"], None),
+            (&["agentctl", "chat", "help", "launch"], None),
             (&["agentctl", "chat", "status"], None),
             (&["agentctl", "chat", "--help"], None),
             (&["agentctl", "chat", "--help", "launch"], None),
