@@ -831,6 +831,7 @@ fn measure_layout_and_compression_options() {
         let keys: Vec<ChanKey> = (0..4).map(|c| ChanKey::new("p", format!("C{c}"))).collect();
         cache.retain_only(routes(&keys));
         let words = corpus();
+        let filling = Instant::now();
         let now = vibe_talk::cache::wall_ms();
         for (c, chan) in keys.iter().enumerate() {
             let mut i = 0;
@@ -874,6 +875,12 @@ fn measure_layout_and_compression_options() {
         }
         assert!(cache.barrier_blocking(Duration::from_secs(600)));
         assert!(cache.quiesce_blocking(Duration::from_secs(600)));
+        eprintln!(
+            "[load {}] fill through the writer, merging included: {:.2} s in {}",
+            load(),
+            filling.elapsed().as_secs_f64(),
+            out.display()
+        );
     }
     let connection = Connection::open(&base).expect("reopen");
     connection
