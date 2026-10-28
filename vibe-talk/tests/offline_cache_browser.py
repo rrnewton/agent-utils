@@ -1721,8 +1721,8 @@ LINK_VIEW_JS = """() => {""" + FLOAT_HELPERS_JS + """
 # scroll it, wholly inside the row and the screen, a target at least 44px each way every point of which
 # presses it, meeting neither the field, the glass, the filters nor the bar; the pill not drawn, and the
 # first row of the list, scrolled to its top, clear below them. `pinned` says whether Pinned is on the
-# bar. Answers how the row was placed, whether it scrolls, its buttons' whole width and, for each kind,
-# [its name, its aria-pressed, the number on it].
+# bar. Answers how the row was placed, whether it scrolls, its buttons' whole width (URL's too) and, for
+# each kind, [its name, its aria-pressed, the number on it].
 KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
     const problems = [];
     const row = document.getElementById('link-kinds');
@@ -1745,9 +1745,10 @@ KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
     const scrolls = row.scrollWidth > row.clientWidth + 1;
     if (scrolls && !['auto', 'scroll'].includes(getComputedStyle(row).overflowX)) problems.push('the kinds overflow their row with no way to scroll to them');
     const others = ['search-field', 'search-toggle', 'links-filter', 'pinned-filter'].map((id) => document.getElementById(id)).filter(shown);
+    // `#620 link-url-chip`: URL first, which is no kind; placed and pressed as they are, never counted.
     const chips = [...row.querySelectorAll('button')];
     const said = chips.map((chip) => (chip.firstChild ? chip.firstChild.textContent.trim() : ''));
-    if (said.join(' ') !== 'PRs Commits Actions Issues Files Other') problems.push(`the kinds read ${said.join(', ')}`);
+    if (said.join(' ') !== 'URL PRs Commits Actions Issues Files Other') problems.push(`the kinds read ${said.join(', ')}`);
     const span = chips.reduce((sum, chip) => sum + box(chip).width, 0);
     const kept = row.scrollLeft;
     chips.forEach((chip, i) => {
@@ -1773,7 +1774,8 @@ KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
     const first = [...document.querySelectorAll('#discord-log > li[data-id], #transcript > li')].find(shown);
     if (first && box(first).top < r.bottom - 0.5) problems.push(`the kinds cover ${(r.bottom - box(first).top).toFixed(1)}px of the first row`);
     return {problems, placement: centred ? 'centred' : 'right-aligned', scrolls, span,
-            chips: chips.map((chip, i) => [said[i], chip.getAttribute('aria-pressed'), chip.querySelector('.link-kind-count').textContent])};
+            chips: chips.map((chip, i) => [said[i], chip.getAttribute('aria-pressed'), chip.querySelector('.link-kind-count')])
+                .filter(([, , count]) => count).map(([name, pressed, count]) => [name, pressed, count.textContent])};
 }"""
 
 # `#266 link-filter-kinds`. Where one kind's button is, against the row it scrolls in and the screen:

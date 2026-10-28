@@ -7362,8 +7362,10 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    one (`#227 github-link-abbrev`): `widgets#123` for a pull request, an issue or a discussion,
    `widgets#123 (comment)` for a comment in one, `widgets@4f21ab0` for a commit,
    `widgets@v1.0...v1.1` for a comparison, `widgets@v1.2.0` for a release, `widgets run 123456`
-   for a run of Actions and `widgets:render.rs#L10` for lines of a file. The repository's owner is
-   left out. The link still goes to the same address, and a pointer resting on the label shows it.
+   for a run of Actions and `widgets:render.rs#L10` for lines of a file. A `README.md`, in any
+   case, is named by its folder instead (`#620 link-url-chip`): `vibe-talk/README.md`, or
+   `widgets/README.md` at the repository's root, since every README's own name is the same. The
+   repository's owner is left out. The link still goes to the same address, and a pointer resting on the label shows it.
    A link its writer named keeps its name, code is never relabelled, and any other address — other
    hosts, and GitHub pages with no short form — is drawn as written. So is any address a browser
    would open somewhere other than its label says: one whose path holds a `.` or `..` segment
@@ -7958,6 +7960,14 @@ a search it says the same of the pins or the matches. The choice is kept on the 
 other view preferences are, so a reader who always turns them off does it once; with nothing kept,
 every kind is on, and a choice kept before Issues, Files and Other existed still holds with those
 three on.
+
+**URL** (`#620 link-url-chip`). First in the same row, apart from the kinds: pressed, every link in
+the view is written as its whole address rather than its name or short label, wrapped after its
+slashes so a phone shows all of it, and still a link to the same place; pressed again, the names come
+back. It changes how the links are written, never which are shown — the kinds still choose those, and
+the search text still finds a message by the words and addresses it holds. Off is not struck through,
+because it hides nothing. The choice is kept with the owner's other settings on the server, so every
+device writes the links the same way; with nothing kept it is off.
 
 ### Choosing a view sits beside choosing the channel
 

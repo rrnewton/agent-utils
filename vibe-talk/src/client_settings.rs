@@ -86,6 +86,8 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.open-in-view",
     "vibe-talk.voice.collapsed-lines",
     "vibe-talk.voice.hidden-link-kinds",
+    // Whether the search bar's Links view writes each link as its address (`#620 link-url-chip`).
+    "vibe-talk.voice.link-raw-urls",
     // Summarize collapsed messages (`#564 message-summary-toggle`). The server reads it too
     // ([`summarize_collapsed`]): with it off, no message summary is generated.
     "vibe-talk.voice.summarize-collapsed",

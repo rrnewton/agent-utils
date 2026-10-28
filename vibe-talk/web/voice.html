@@ -354,8 +354,14 @@
                 Last in the bar rather than beside Links, so it stands between none of the filters on
                 the bar's line: it is out of that line altogether, and web/voice.css hangs it under
                 Links from here.
+
+                `#620 link-url-chip`. URL, first: "it switches back to raw URLs instead of the render
+                hyperlink and that would at least let me see where these files live." It changes how
+                the links are written, not which are shown, so it stands apart from the kinds, at the
+                end a phone never cuts off.
               -->
               <div id="link-kinds" role="group" aria-label="Kinds of link to show" hidden>
+                <button id="link-raw" class="link-kind" type="button" aria-pressed="false" title="Write each link as its full address">URL</button>
                 <button id="link-kind-pr" class="link-kind" type="button" aria-pressed="true" title="Show links to pull requests">PRs<span id="link-kind-pr-count" class="link-kind-count"></span></button>
                 <button id="link-kind-commit" class="link-kind" type="button" aria-pressed="true" title="Show links to commits and comparisons">Commits<span id="link-kind-commit-count" class="link-kind-count"></span></button>
                 <button id="link-kind-action" class="link-kind" type="button" aria-pressed="true" title="Show links to Actions runs and checks">Actions<span id="link-kind-action-count" class="link-kind-count"></span></button>

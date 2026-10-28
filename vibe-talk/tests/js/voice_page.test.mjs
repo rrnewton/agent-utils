@@ -50208,7 +50208,9 @@ test("PRs, Commits, Actions, Issues, Files and Other come up under Links, all on
   // Other is of every host, so the group is not only GitHub's. `#266 link-filter-kinds`.
   assert.match(group, /aria-label="Kinds of link to show"/);
   assert.match(group, /hidden>/, "the kinds are served on screen");
-  const buttons = [...group.matchAll(/<button ([^>]*)>([^<]*)</g)];
+  // `#620 link-url-chip`: URL before them, which is no kind (its own test, below).
+  const [url, ...buttons] = [...group.matchAll(/<button ([^>]*)>([^<]*)</g)];
+  assert.equal(url[2], "URL");
   assert.deepStrictEqual(buttons.map((b) => b[2]), ["PRs", "Commits", "Actions", "Issues", "Files", "Other"],
     "the kinds are not named as the owner named them, in his order");
   assert.deepStrictEqual(buttons.map((b) => /id="([^"]+)"/.exec(b[1])[1]), KIND_CHIPS);
@@ -50245,10 +50247,16 @@ test("PRs, Commits, Actions, Issues, Files and Other come up under Links, all on
     "the bar's right padding is not the 2px --links-mid counts from");
   assert.match(cssBlock('.link-kind[aria-pressed="true"]::before'), /border-color: var\(--accent\)/);
   assert.match(cssBlock('.link-kind[aria-pressed="false"]'), /text-decoration: line-through/, "off is told apart by colour alone");
-  // ...and the list makes room for them, as it does for the bar.
-  assert.match(cssBlock("#screen-main[data-searching][data-link-kinds] #scroll-area"),
-    /padding-top: calc\(var\(--float-line\) \+ var\(--search-bar\) \/ 2 \+ var\(--kinds-gap\) \+ var\(--toggle-hit\) \+ 0\.35rem\)/,
-    "the first row is left under the kinds");
+  // ...and the list STARTS below them, its top edge at their foot and the room at its head given back,
+  // so that no row, scrolled, is drawn under them: `#620 link-url-chip`, where the owner saw a line's
+  // letters between the pills when the list only made room at its head.
+  const below = cssBlock("#screen-main[data-searching][data-link-kinds] #scroll-area");
+  assert.match(below, /--hang-foot: calc\(var\(--float-line\) \+ var\(--search-bar\) \/ 2 \+ var\(--kinds-gap\) \+ var\(--toggle-hit\)\)/,
+    "the list's top is not the kinds' foot");
+  assert.match(below, /margin-top: var\(--hang-foot\)/, "the list does not start below the kinds, so rows scroll under them");
+  assert.match(below, /padding-top: 0\.35rem/, "the room at the list's head is not given back, so every row moves");
+  assert.match(below, /mask-image: linear-gradient\(to bottom, transparent 0, #000 0\.35rem\)/,
+    "the fade under the header reaches into the first row");
 
   const page = newPage();
   await signIn(page);
@@ -50637,6 +50645,137 @@ test("the kinds turned off are kept on this device, and with nothing kept every 
   await showLinks(forgetful);
   await tapKind(forgetful, "pr");
   assert.equal(forgetful.storage.has(HIDDEN_KINDS_KEY), false, "the test cannot tell a kept choice from none");
+});
+
+// `#620 link-url-chip`. The owner, under Links with Files on and every link reading "REPO:README.md":
+// "When we're in URL search mode I would like to have a little chip named URL alongside the other
+// filters for files and so on. When I click that it switches back to raw URLs instead of the render
+// hyperlink and that would at least let me see where these files live." And: "the URL button is a
+// proper filter composed with a type search term in the search bar" — the text still finds a message
+// by the address in it, whichever way its links are written.
+
+const LINK_RAW_KEY_NAME = "vibe-talk.voice.link-raw-urls";
+/** The README the server labels by its folder, as src/link_labels.rs does. */
+const README = `${REPO}/blob/main/vibe-talk/README.md`;
+
+/**
+ * What a link says. Under URL its text is the address in parts with a place to break between them,
+ * which this fake DOM keeps as children; otherwise its own text.
+ */
+const linkSays = (a) => (a.children.length > 0
+  ? a.children.filter((node) => node.tagName === "#text").map((node) => node.textContent).join("")
+  : a.textContent);
+const linkWords = (page) => unfiltered(page, "discord-log").flatMap((li) => linksOf(li).map(linkSays));
+
+/** A channel with a labelled README, a named document, a bare address and a message with none. */
+const urlChannel = () => [
+  message({ id: "8910000000000000001", content: `The notes: ${README}`,
+    content_html: `<p>The notes: <a href="${README}" title="${README}" target="_blank" rel="noopener noreferrer nofollow">vibe-talk/README.md</a></p>\n` }),
+  message({ id: "8910000000000000002", content: "Background: [the guide](https://docs.example.com/guide)" }),
+  message({ id: "8910000000000000003", content: `The fix: ${REPO}/pull/41` }),
+  message({ id: "8910000000000000004", content: "No link here." }),
+];
+const LABELS = ["vibe-talk/README.md", "the guide", `${REPO}/pull/41`];
+const ADDRESSES = [README, "https://docs.example.com/guide", `${REPO}/pull/41`];
+
+test("URL writes each link under Links as its whole address and back as its name, and is no kind", async () => {
+  // First in the row, before the kinds; off, and never struck through, because off hides nothing.
+  const group = HTML_CODE.slice(HTML_CODE.indexOf('id="link-kinds"'));
+  const first = /<button ([^>]*)>([^<]*)</.exec(group);
+  assert.equal(first[2], "URL", "URL is not the first chip under Links");
+  assert.match(first[1], /id="link-raw"/);
+  assert.match(first[1], /type="button"/);
+  assert.match(first[1], /aria-pressed="false"/, "URL is served on");
+  assert.match(first[1], /title="Write each link as its full address"/);
+  assert.match(cssBlock('#link-raw[aria-pressed="false"]'), /text-decoration: none/, "URL off is struck through, as a hidden kind is");
+  // An address is wrapped, never cut short: the reader pressed URL to see all of it.
+  const raw = cssBlock(".row-links[data-raw] .row-link");
+  assert.match(raw, /white-space: normal/, "an address under URL is kept on one line and cut short");
+  assert.match(raw, /overflow-wrap: anywhere/, "a part of an address too long for a line runs off the side");
+
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, urlChannel());
+  await showLinks(page);
+  const chip = page.el("link-raw");
+  assert.equal(chip.getAttribute("aria-pressed"), "false");
+  assert.deepStrictEqual(linkWords(page), LABELS, "off, the links are not written as their names");
+  assert.equal(page.storage.has(LINK_RAW_KEY_NAME), false, "a choice was kept that nobody made");
+
+  await chip.click();
+  await page.settle();
+  assert.equal(chip.getAttribute("aria-pressed"), "true");
+  assert.deepStrictEqual(linkWords(page), ADDRESSES, "on, the links are not written as their addresses");
+  // Still links, to the same places, the address in the title; the same rows, nothing filtered.
+  assert.deepStrictEqual(unfiltered(page, "discord-log").flatMap((li) => linksOf(li).map((a) => [a.getAttribute("href"), a.getAttribute("title")])),
+    ADDRESSES.map((href) => [href, href]));
+  // Broken after its slashes, and only between parts of the address, so it wraps where a reader looks.
+  const readme = unfiltered(page, "discord-log").flatMap(linksOf)[0];
+  const parts = readme.children.filter((node) => node.tagName === "#text").map((node) => node.textContent);
+  assert.deepStrictEqual(parts, ["https:/", "/", "github.com/", "example/", "project/", "blob/", "main/", "vibe-talk/", "README.md"]);
+  assert.ok(readme.children.every((node, i) => (i % 2 === 0 ? node.tagName === "#text" : node.tagName === "wbr")),
+    "the address is not its parts with a break between each");
+  assert.equal(page.storage.get(LINK_RAW_KEY_NAME), "on", "the choice was not kept");
+
+  // The kinds still choose which: Files off takes the README away, written either way.
+  await tapKind(page, "file");
+  assert.deepStrictEqual(linkWords(page), ADDRESSES.slice(1));
+  await tapKind(page, "file");
+
+  // The text finds a message by an address it holds, and URL only says how its link is written.
+  await search(page, "vibe-talk");
+  await page.settle();
+  assert.deepStrictEqual(linkWords(page), [README], "the text did not find the README by its address under URL");
+  await chip.click();
+  await page.settle();
+  assert.deepStrictEqual(linkWords(page), ["vibe-talk/README.md"], "URL off under the text changed which links are shown");
+  assert.equal(page.storage.has(LINK_RAW_KEY_NAME), false, "URL off was not forgotten");
+  await chip.click();
+  await page.settle();
+
+  // A reload: Links on again finds URL still on.
+  const again = reloadWith(page.storage, urlChannel());
+  await signIn(again);
+  await reopenedChannel(again);
+  await showLinks(again);
+  assert.equal(again.el("link-raw").getAttribute("aria-pressed"), "true", "URL did not outlast a reload");
+  assert.deepStrictEqual(linkWords(again), ADDRESSES);
+  // Only the word the page writes turns it on: anything else a device holds reads as off.
+  for (const held of ["true", "1", "ON", ""]) {
+    const store = new Map(page.storage);
+    store.set(LINK_RAW_KEY_NAME, held);
+    const kept = reloadWith(store, urlChannel());
+    await signIn(kept);
+    await reopenedChannel(kept);
+    await showLinks(kept);
+    assert.deepStrictEqual(linkWords(kept), LABELS, `a device holding ${JSON.stringify(held)} writes addresses`);
+  }
+  // Kept with the owner's other settings, so every device writes them the same way.
+  assert.ok(page.pure("SYNCED_SETTING_KEYS.includes(LINK_RAW_KEY)"), "URL is not one of the synced settings");
+  assert.equal(page.pure("LINK_RAW_KEY"), LINK_RAW_KEY_NAME);
+
+  // THE CONTROL: with the address never written, this sees the names stay.
+  const blind = newPage(new Map(), brokenScript("    if (raw) rawAddressInto(anchor, link.href);\n    else anchor.textContent = link.name;",
+    "    anchor.textContent = link.name;"));
+  await signIn(blind);
+  await showDiscord(blind, urlChannel());
+  await showLinks(blind);
+  await blind.el("link-raw").click();
+  await blind.settle();
+  assert.deepStrictEqual(linkWords(blind), LABELS, "the test cannot tell an address from a name");
+});
+
+test("URL turned on by another device rewrites the links under Links here", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, urlChannel());
+  await showLinks(page);
+  assert.deepStrictEqual(linkWords(page), LABELS);
+  page.storage.set(LINK_RAW_KEY_NAME, "on");
+  page.pure("applySyncedSetting")(LINK_RAW_KEY_NAME);
+  await page.settle();
+  assert.equal(page.el("link-raw").getAttribute("aria-pressed"), "true", "the chip does not say what another device chose");
+  assert.deepStrictEqual(linkWords(page), ADDRESSES, "the links were not rewritten for another device's choice");
 });
 
 test("a kind turned off or on keeps a reader at the newest line there, and asks the server for nothing", async () => {

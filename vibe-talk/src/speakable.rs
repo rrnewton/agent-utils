@@ -1346,7 +1346,7 @@ mod tests {
             ),
             (
                 format!("{WIDGETS}/blob/main/README.md"),
-                "widgets file README.md",
+                "the README of widgets",
             ),
             // Either scheme, `www.`, the host's case and a trailing slash change nothing, and the
             // host may be written with no scheme at all.

@@ -1493,6 +1493,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#620 link-url-chip` in the browser engine, at 393x852 and 412x915 with a finger and 1280x800 with
+  # a mouse: URL first among the chips under Links, links written as their labels and then as their whole
+  # addresses wrapped at their slashes, the choice kept over a reload, a search by a word only an address
+  # holds, and the list starting below the chip row so no row shows through it. Measured on 2026-10-28:
+  # about 9s wall.
+  - group: check
+    job: link-url-chip-browser
+    desc: the URL chip under Links writes the links as their addresses and back, and nothing shows through the chip row, in current Chromium at 393x852, 412x915 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/link_url_chip_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 9
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#520 search-whose-toggle-hint` in the browser engine: each press of the author filter leaves a
   # chip under it naming the state landed on, and hover/focus raises its tooltip, at 393x852 and
   # 1280x800. Measured on 2026-10-25: about 8s wall (the chip's real 1.5s wait at each size).

@@ -487,6 +487,14 @@ a.search-hit-link {
   border-top: 1px solid var(--edge);
 }
 
+/* `#620 link-url-chip`. Under URL each link is its whole address, which is what the reader pressed it
+   to see: wrapped, never cut short. web/voice.js offers a break after each slash; a part too long for
+   a line breaks anywhere rather than run off the side. */
+.row-links[data-raw] .row-link {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
 /* The view switch: ONE control with two positions, carrying the word for the position it is in.
    Two differently-styled text labels read as one item being disabled, which is what the previous
    header did. */
@@ -5344,6 +5352,16 @@ a.search-hit-link {
   text-decoration: line-through;
 }
 
+/* `#620 link-url-chip`. URL is no kind: off hides nothing, so it is never struck through, and a little
+   room after it sets it apart from the kinds it stands before. */
+#link-raw[aria-pressed="false"] {
+  text-decoration: none;
+}
+
+#link-raw {
+  margin-right: 6px;
+}
+
 /* `#266 link-filter-kinds`. The row clips what spills past it, now that it scrolls, and a focus ring
    drawn outside the button would be cut off top and bottom; so it is drawn inside, as the rows' own
    buttons draw theirs. */
@@ -5364,10 +5382,20 @@ a.search-hit-link {
   display: none;
 }
 
-/* ...and the list makes room for the row as it does for the bar, so the first row starts below the
-   kinds of link rather than underneath them. */
+/* ...and the list STARTS at the row's foot, so the first row is below the kinds of link rather than
+   underneath them. `#620 link-url-chip`: it used to make room at its head instead, as it does for the
+   bar, but room at the head scrolls away, and a scrolled list ran under the row, its words showing in
+   the clear space between and around the pills — the owner's screenshot had an unmatched line's
+   letters between Commits, Actions and Issues. So, as under the narrow phone's hung author filter
+   below, the list's top edge moves down to the row's foot and the room at its head is given back:
+   nothing is drawn under the row at any scroll position. The fade under the header shortens to the
+   room left at the head. */
 #screen-main[data-searching][data-link-kinds] #scroll-area {
-  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--kinds-gap) + var(--toggle-hit) + 0.35rem);
+  --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--kinds-gap) + var(--toggle-hit));
+  margin-top: var(--hang-foot);
+  padding-top: 0.35rem;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
 }
 
 /* `#251 author-filter`, on a NARROW phone. A third 44px square on the bar's line would take the field

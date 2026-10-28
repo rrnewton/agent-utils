@@ -207,7 +207,7 @@ const ALL_CHANNELS = "*";
  *   | "help-link-speech-prep"
  *   | "help-link-message-cache" | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-file" | "link-kind-issue" | "link-kind-other"
- *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
+ *   | "link-kind-pr" | "link-raw" | "links-filter" | "load-older" | "load-older-turns"
  *   | "message-cache-confirm-no" | "message-cache-confirm-yes" | "message-cache-erase"
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "own-read-apply" | "own-read-undo" | "page-update"
@@ -8420,13 +8420,15 @@ function rowLinks(row) {
  * address. The only sink that is not plain text is the href, and nothing reaches it that
  * `HTTP_ADDRESS` has not passed.
  */
-function linkList(links) {
+function linkList(links, raw) {
   const list = document.createElement("div");
   list.className = "row-links";
+  if (raw) list.setAttribute("data-raw", "");
   for (const link of links) {
     const anchor = document.createElement("a");
     anchor.className = "row-link";
-    anchor.textContent = link.name;
+    if (raw) rawAddressInto(anchor, link.href);
+    else anchor.textContent = link.name;
     anchor.setAttribute("href", link.href);
     anchor.setAttribute("target", "_blank");
     anchor.setAttribute("rel", "noopener noreferrer");
@@ -8434,6 +8436,20 @@ function linkList(links) {
     list.append(anchor);
   }
   return list;
+}
+
+/**
+ * `#620 link-url-chip`. An address written out whole, as its own text, with a place to break after
+ * every `/`, `?`, `&`, `#` and `=`: on a phone it wraps between the parts of its path, where a reader
+ * looks for them. Chromium offers no break after a slash followed by a letter, and without these a
+ * path broke mid-word, "vib" on one line and "e-talk" on the next; web/voice.css still breaks a part
+ * too long for a line anywhere. The breaks are empty elements, so the text is the address exactly.
+ */
+function rawAddressInto(anchor, href) {
+  for (const part of href.split(/(?<=[/?&#=])/)) {
+    if (anchor.firstChild) anchor.append(document.createElement("wbr"));
+    anchor.append(document.createTextNode(part));
+  }
 }
 
 /**
@@ -8466,16 +8482,18 @@ function showRowLinks(row) {
   let drawn = row.linkView;
   if (!drawn || drawn.key !== key) {
     if (drawn && drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
-    drawn = { key, links: rowLinks(row), hidden: null, count: 0, node: null };
+    drawn = { key, links: rowLinks(row), hidden: null, raw: null, count: 0, node: null };
     row.linkView = drawn;
   }
-  // The set itself, not its contents: `setLinkKindShown` replaces it whole on every change.
-  if (drawn.hidden !== hiddenLinkKinds) {
+  // The set itself, not its contents: `setLinkKindShown` replaces it whole on every change. And
+  // `#620 link-url-chip`, drawn again when URL turns the addresses on or off.
+  if (drawn.hidden !== hiddenLinkKinds || drawn.raw !== linksRaw) {
     if (drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
     const shown = drawn.links.filter((link) => !hiddenLinkKinds.has(link.kind));
     drawn.hidden = hiddenLinkKinds;
+    drawn.raw = linksRaw;
     drawn.count = shown.length;
-    drawn.node = shown.length > 0 ? linkList(shown) : null;
+    drawn.node = shown.length > 0 ? linkList(shown, linksRaw) : null;
   }
   if (drawn.node && drawn.node.parentNode !== row) placeAfterBody(row, drawn.node);
   if (drawn.count > 0) row.setAttribute("data-links-view", "true");
@@ -8877,6 +8895,48 @@ function setLinkKindShown(kind, shown) {
   });
 }
 
+// `#620 link-url-chip`. The owner, with Files on and every link reading "agent-utils:README.md":
+// "When we're in URL search mode I would like to have a little chip named URL alongside the other
+// filters for files and so on. When I click that it switches back to raw URLs instead of the render
+// hyperlink and that would at least let me see where these files live."
+//
+// URL changes how the links are WRITTEN, never which: on, each shows its address in full, wrapped at
+// its slashes (`rawAddressInto`); off, the name it was given or the label the server made for it.
+// It filters nothing, so it is first in the row, apart from the kinds, and never struck through. The
+// search text still matches what the messages say, addresses included, either way. KEPT with the
+// owner's other settings on the server (LINK_RAW_KEY in `SYNCED_SETTING_KEYS`), as the kinds are, so
+// every device shows the links the same way; with nothing kept it is off.
+
+const LINK_RAW_KEY = "vibe-talk.voice.link-raw-urls";
+
+/** Whether the Links view writes each link as its address. */
+let linksRaw = storedLinksRaw();
+
+/** What this device kept: on only for the word this page writes, so anything else is off. */
+function storedLinksRaw() {
+  try {
+    return localStorage.getItem(LINK_RAW_KEY) === "on";
+  } catch (_error) {
+    return false;
+  }
+}
+
+/** Write the links as their addresses, or as their names, keep the choice, and redraw them. */
+function setLinksRaw(on) {
+  keepingFilterPlace(() => {
+    linksRaw = on;
+    try {
+      if (on) localStorage.setItem(LINK_RAW_KEY, "on");
+      else localStorage.removeItem(LINK_RAW_KEY);
+    } catch (_error) {
+      // A browser that refuses storage still honours the choice for this page.
+    }
+    renderLinkKinds();
+    renderScrollTools();
+    inOtherColumn(renderScrollTools);
+  });
+}
+
 /**
  * The kinds' buttons: under Links while Links is on, and at no other time — so they go when Links
  * goes and when the bar closes — each pressed while its kind is shown. #screen-main says when they
@@ -8891,6 +8951,7 @@ function renderLinkKinds() {
   for (const { kind, chip } of LINK_KINDS) {
     el(chip).setAttribute("aria-pressed", hiddenLinkKinds.has(kind) ? "false" : "true");
   }
+  el("link-raw").setAttribute("aria-pressed", linksRaw ? "true" : "false");
 }
 
 /**
@@ -59193,6 +59254,8 @@ const SYNCED_SETTING_KEYS = [
   "vibe-talk.voice.open-in-view",
   "vibe-talk.voice.collapsed-lines",
   "vibe-talk.voice.hidden-link-kinds",
+  // `#620 link-url-chip`. Whether the Links view writes each link as its address.
+  "vibe-talk.voice.link-raw-urls",
   // `#564 message-summary-toggle`. Summarize collapsed messages; the server reads it too, and
   // generates no message summary while it is off.
   "vibe-talk.voice.summarize-collapsed",
@@ -59341,6 +59404,11 @@ function applySyncedSetting(key) {
       case LINK_KINDS_KEY:
         hiddenLinkKinds = storedHiddenLinkKinds();
         renderLinkKinds();
+        break;
+      case LINK_RAW_KEY:
+        linksRaw = storedLinksRaw();
+        renderLinkKinds();
+        if (searchOpen && linksOnly) eachColumn(renderScrollTools);
         break;
       case THREADS_UNPACKED_KEY:
         // Not `setUnpackMode`: that is the reader's press, which also gives every thread of the
@@ -61009,6 +61077,8 @@ el("author-filter").addEventListener("click", cycleAuthorFilter);
 for (const { kind, chip } of LINK_KINDS) {
   el(chip).addEventListener("click", () => setLinkKindShown(kind, hiddenLinkKinds.has(kind)));
 }
+// `#620 link-url-chip`. URL, first in that row: addresses or names.
+el("link-raw").addEventListener("click", () => setLinksRaw(!linksRaw));
 // `#266 link-filter-kinds`. The row of six scrolls sideways on a phone, and a browser scrolls it to a
 // button taking the focus only when none of that button shows: one cut off at the row's end stayed cut
 // off under Tab. So the button the focus reaches is brought wholly into the row, by Tab or by a tap.
