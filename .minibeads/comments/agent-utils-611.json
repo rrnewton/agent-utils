@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-611-c295ee37c19",
+    "issue_id": "agent-utils-611",
+    "author": "cl-vtread",
+    "body": "[opus 5.5] Delivered in two landings.\n\nLanding 1, ebf80213:\n- every 5xx logs one WARN \"server error\" line with its cause (error code and detail, read_reason, the upstream operation that failed with its outcome, ms and calls);\n- with serve = true, a timeline read that Slack fails, or holds past [message_cache] timeline_fallback_ms (10 s), is answered from the message cache, marked refresh_failed and as_of;\n- the page lands those rows without removing any or moving its cursors, and says \"Refresh failed · showing messages from HH:MM\";\n- reads of a view are single-flight;\n- access answers, other 4xx and reads the cache holds nothing for still fail.\n\nLanding 2, cde88ed5:\n- Slack All reads at most 10 threads that cost a call per read, and the rest arrive on later reads;\n- a failed thread is left out with a notice instead of failing the read, and a rate limit stops the fan-out;\n- the thread-list scan answers steps back for 60 s;\n- one Slack budget per method by priority (person > live > naming/summaries > backfill and shadow): a Retry-After Slack gave anyone holds every later request, and crawl work yields once everyone else has sent 25 of a method in the last minute.\n\nBackfill: backfill = \"full\" is safe to turn back on with the default backfill_requests_per_minute (20). It takes only spare capacity and may stall while the page is busy.\n\nUnverified:\n- no measurement on the live instance yet;\n- the 25/min threshold assumes Slack's published tier 3 (about 50/min), and the real limit behind the deployment's Slack bridge is unknown.\n\nPossible follow-ups, not filed:\n- serve Slack All and counts reads from the cache when fresh, instead of only standing in for them;\n- a small backfill trickle while the page is busy;\n- count claim-shared serves separately in the shadow figures.",
+    "created_at": "2026-10-28T06:54:37.242332212Z",
+    "updated_at": "2026-10-28T06:54:37.242332212Z"
+  }
+]

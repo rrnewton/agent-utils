@@ -1,13 +1,14 @@
 ---
 title: 'timeline-read-failures: timeline reads answer 502 for a large share of reads once full backfill shares Slack''s rate budget, and the page sits on Loading messages'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 - cache
 created_at: 2026-10-28T04:14:34.774119473+00:00
-updated_at: 2026-10-28T04:14:34.774119473+00:00
+updated_at: 2026-10-28T06:54:37.245385481+00:00
+closed_at: 2026-10-28T06:54:37.245385350+00:00
 ---
 
 # Description
