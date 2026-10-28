@@ -35,10 +35,11 @@ use rusqlite::{Connection, OptionalExtension as _};
 
 use super::{
     now_ms, Bookmark, BookmarkAnchor, BookmarkChange, BookmarkPlace, CachedSummary, ChannelAlias,
-    ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins, ReadMark, RecordedTurn,
-    Retention, Speaker, StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
-    UpstreamClearAttempt, UpstreamClearMode, UpstreamClearResult, UpstreamClearSetting,
-    MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
+    ConversationId, ConversationSummary, HistoryMode, HistoryModeSetting, Pin, PinChange,
+    PinSnapshot, Pins, ReadMark, RecordedTurn, Retention, Speaker, StateStore, StoreError,
+    SummaryKey, TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
+    UpstreamClearResult, UpstreamClearSetting, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE,
+    MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId, UserId};
 use crate::voice_agent::{EditedPrompt, OwnerPrompt};
@@ -479,6 +480,15 @@ pub const MIGRATIONS: &[&str] = &[
     ) STRICT;
 
     CREATE INDEX own_decided_by_position ON own_decided (numeric);
+    ",
+    // v23 — each channel's own history mode. `#602 history-settings-and-limits`. One row per
+    // channel the owner chose for in Settings; no row follows `[message_cache] backfill`.
+    "
+    CREATE TABLE history_modes (
+        channel_id TEXT    PRIMARY KEY NOT NULL,
+        mode       TEXT    NOT NULL CHECK (mode IN ('recent', 'full')),
+        updated_ms INTEGER NOT NULL
+    ) STRICT;
     ",
 ];
 
@@ -2923,6 +2933,65 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn history_modes(&self) -> Result<Vec<HistoryModeSetting>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT channel_id, mode, updated_ms FROM history_modes ORDER BY channel_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(backend)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (channel, mode, updated_ms) = row.map_err(backend)?;
+                // The CHECK keeps any other spelling out; a row a newer server wrote with a mode
+                // this one does not know follows the server's setting rather than failing the read.
+                if let Some(mode) = HistoryMode::parse(&mode) {
+                    out.push(HistoryModeSetting {
+                        channel: ChannelId(channel),
+                        mode,
+                        updated_ms,
+                    });
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn set_history_mode(
+        &self,
+        channel: &ChannelId,
+        mode: Option<HistoryMode>,
+        at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            match mode {
+                Some(mode) => connection.execute(
+                    "INSERT OR REPLACE INTO history_modes (channel_id, mode, updated_ms)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![channel.as_str(), mode.as_str(), at_ms],
+                ),
+                None => connection.execute(
+                    "DELETE FROM history_modes WHERE channel_id = ?1",
+                    rusqlite::params![channel.as_str()],
+                ),
+            }
+            .map(|_| ())
+            .map_err(backend)
+        })
+        .await
+    }
+
     async fn thread_hues(
         &self,
         channel: &ChannelId,
@@ -3090,6 +3159,10 @@ impl StateStore for SqliteStore {
             // Every channel back to off, which is the shipped default and what no row means.
             transaction
                 .execute("DELETE FROM upstream_clear", [])
+                .map_err(backend)?;
+            // Every channel back to the server's history mode.
+            transaction
+                .execute("DELETE FROM history_modes", [])
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM conversations", [])
@@ -5169,6 +5242,54 @@ mod tests {
         drop(store);
         let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
         assert_eq!(reopened.pins(&channel).await.expect("read").pins.len(), 1);
+    }
+
+    /// `#602 history-settings-and-limits`: a channel's own history mode is kept across a restart,
+    /// a channel set back to the default has no row, and the purge returns every channel to the
+    /// server's setting.
+    #[tokio::test]
+    async fn history_modes_outlast_a_restart_and_a_purge_clears_them() {
+        use crate::store::{HistoryMode, HistoryModeSetting};
+        let dir = TempDir::new("sqlite-history-modes");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        let a = ChannelId("C0000000A".to_owned());
+        let b = ChannelId("C0000000B".to_owned());
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            assert!(store.history_modes().await.expect("read").is_empty());
+            store
+                .set_history_mode(&a, Some(HistoryMode::Recent), 10)
+                .await
+                .expect("set");
+            store
+                .set_history_mode(&b, Some(HistoryMode::Recent), 11)
+                .await
+                .expect("set");
+            store
+                .set_history_mode(&b, Some(HistoryMode::Full), 12)
+                .await
+                .expect("change");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        assert_eq!(
+            store.history_modes().await.expect("read"),
+            vec![
+                HistoryModeSetting {
+                    channel: a.clone(),
+                    mode: HistoryMode::Recent,
+                    updated_ms: 10
+                },
+                HistoryModeSetting {
+                    channel: b.clone(),
+                    mode: HistoryMode::Full,
+                    updated_ms: 12
+                },
+            ]
+        );
+        store.set_history_mode(&a, None, 13).await.expect("default");
+        assert_eq!(store.history_modes().await.expect("read").len(), 1);
+        store.purge_everything().await.expect("purge");
+        assert!(store.history_modes().await.expect("read").is_empty());
     }
 
     fn clear_attempt(
@@ -7304,7 +7425,8 @@ mod tests {
         // there are add tables, dropped here as their notes say.
         connection
             .execute_batch(
-                "DROP TABLE IF EXISTS own_decided; ALTER TABLE dismissals DROP COLUMN own;
+                "DROP TABLE IF EXISTS history_modes;
+                 DROP TABLE IF EXISTS own_decided; ALTER TABLE dismissals DROP COLUMN own;
                  DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
                  DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;
                  DROP TABLE IF EXISTS thread_hues;",

@@ -59,6 +59,47 @@ impl RateLimitExhausted {
     }
 }
 
+/// How long background crawling stays off a provider's read routes after the provider last
+/// rate-limited one of them, whoever's request it was, and however short the wait it asked for.
+/// `#602 history-settings-and-limits`: on the live Slack instance the route answered
+/// `Retry-After: 1` again and again until the page's own reads gave up after five attempts, so a
+/// crawler that resumed as soon as the one second passed kept the bucket full; five quiet minutes
+/// leave the bucket to the reads a person is waiting on.
+pub const CRAWL_QUIET_AFTER_LIMIT: Duration = Duration::from_secs(5 * 60);
+
+/// The window [`RateLimitPressure`] counts rate limits over.
+pub const PRESSURE_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// How hard a provider's rate limits are pressing. `#602 history-settings-and-limits`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RateLimitPressure {
+    /// Rate limits answered in the last [`PRESSURE_WINDOW`], every route together.
+    pub limited_last_10_min: u32,
+    /// Per route (a Slack method, or a Discord method and path), where any was answered lately
+    /// or its remaining quota is low.
+    pub routes: std::collections::BTreeMap<String, RoutePressure>,
+    /// Seconds background crawling still holds off for them, when it does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crawl_hold_s: Option<u64>,
+    /// Discord only: 401, 403 and counted 429 answers in the last ten minutes, against its ban at
+    /// 10,000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_last_10_min: Option<u32>,
+}
+
+/// One route's share of [`RateLimitPressure`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RoutePressure {
+    /// Rate limits answered on it in the last [`PRESSURE_WINDOW`].
+    pub limited_last_10_min: u32,
+    /// Seconds since the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_limited_s_ago: Option<u64>,
+    /// The remaining quota the provider last reported for it, when it reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<u64>,
+}
+
 /// A chat-provider read or post failure.
 ///
 /// `Clone` so one failed read can be reported to every caller waiting on it: a channel's refresh
@@ -1432,6 +1473,24 @@ pub trait ChatClient: Send + Sync {
     /// cursor would clear messages this server never received. False by default.
     fn supports_upstream_clear(&self) -> bool {
         false
+    }
+
+    /// How long background crawling of this provider (the message cache's backfill) should hold
+    /// off before its next request, by what the provider itself has signalled: a rate limit it
+    /// answered recently, wherever the request came from, or a count of rejected requests nearing
+    /// a ban. `None` when nothing says to. `#602 history-settings-and-limits`.
+    ///
+    /// Advice for a crawler that can wait, never a refusal: a request the owner is waiting on
+    /// goes ahead, within the client's own bounded waits.
+    fn crawl_hold(&self) -> Option<Duration> {
+        None
+    }
+
+    /// How hard this provider's rate limits are pressing, for the diagnostics: rate limits it
+    /// answered lately, by route, and how long background crawling holds off for them. `None`
+    /// from a client that keeps no such record. `#602 history-settings-and-limits`.
+    fn rate_limit_pressure(&self) -> Option<RateLimitPressure> {
+        None
     }
 
     /// Move the provider's read cursor through `through`, or in a dry run report where it would

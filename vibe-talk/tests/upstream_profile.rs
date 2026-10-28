@@ -654,6 +654,17 @@ impl ChatClient for Recorder {
         self.note("supports_upstream_clear");
         true
     }
+    fn crawl_hold(&self) -> Option<std::time::Duration> {
+        self.note("crawl_hold");
+        Some(std::time::Duration::from_secs(7))
+    }
+    fn rate_limit_pressure(&self) -> Option<vibe_talk::chat::RateLimitPressure> {
+        self.note("rate_limit_pressure");
+        Some(vibe_talk::chat::RateLimitPressure {
+            limited_last_10_min: 3,
+            ..Default::default()
+        })
+    }
     async fn clear_upstream_through(
         &self,
         _channel: &ChannelId,
@@ -953,6 +964,13 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
             .dry_run
     );
     ran("clear_upstream_through");
+    assert_eq!(client.crawl_hold(), Some(std::time::Duration::from_secs(7)));
+    ran("crawl_hold");
+    assert_eq!(
+        client.rate_limit_pressure().map(|p| p.limited_last_10_min),
+        Some(3)
+    );
+    ran("rate_limit_pressure");
 
     let (methods, upstream) = trait_methods();
     assert_eq!(

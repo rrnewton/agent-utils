@@ -1071,6 +1071,14 @@ impl ChatClient for FakeDiscord {
         self.lock().upstream_clear_enabled
     }
 
+    fn crawl_hold(&self) -> Option<Duration> {
+        self.limiter.crawl_hold()
+    }
+
+    fn rate_limit_pressure(&self) -> Option<crate::chat::RateLimitPressure> {
+        Some(self.limiter.pressure())
+    }
+
     /// The bridge's contract, kept: a cursor that only moves forward, a dry run that writes
     /// nothing, 404 for a message it does not hold. `#232 upstream-mark-read`.
     async fn clear_upstream_through(

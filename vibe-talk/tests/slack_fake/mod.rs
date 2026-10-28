@@ -73,6 +73,9 @@ pub struct FakeState {
     pub http_fail: HashMap<String, (u16, String)>,
     /// One 429 for this method, with this `Retry-After` in seconds.
     pub rate_limit_once: Option<(String, u64)>,
+    /// The next N requests for this method answered 429 with this `Retry-After` in seconds,
+    /// as (seconds, N). `#602 history-settings-and-limits`.
+    pub rate_limit_many: HashMap<String, (u64, usize)>,
     /// Answer every request with HTTP 500 and a body that echoes the token.
     pub echo_token_500: bool,
     /// Include the thread root on EVERY `conversations.replies` page, as some servers do.
@@ -538,6 +541,18 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
     if let Some((limited, seconds)) = state.rate_limit_once.clone() {
         if limited == method {
             state.rate_limit_once = None;
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", seconds.to_string())],
+                axum::Json(json!({"ok": false, "error": "ratelimited"})),
+            )
+                .into_response();
+        }
+    }
+    if let Some((seconds, left)) = state.rate_limit_many.get_mut(&method) {
+        if *left > 0 {
+            *left -= 1;
+            let seconds = *seconds;
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [("retry-after", seconds.to_string())],

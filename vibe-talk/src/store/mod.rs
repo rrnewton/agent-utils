@@ -825,6 +825,53 @@ impl UpstreamClearMode {
     }
 }
 
+/// How far back the server's backfill reads one channel, when the owner chose for it in Settings
+/// rather than leaving it to `[message_cache] backfill`. `#602 history-settings-and-limits`.
+///
+/// No row means the channel follows the server's setting. `off` is not a choice here: it is the
+/// operator's switch for every read the backfill makes, and a channel's own choice never turns
+/// those reads on where the operator turned them off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryMode {
+    /// Keep the recent stretch read and re-read, as `backfill = "recent"` does.
+    Recent,
+    /// Also walk back to the channel's beginning, as `backfill = "full"` does.
+    Full,
+}
+
+impl HistoryMode {
+    /// The stored spelling, the same as the wire's and the configuration's.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Full => "full",
+        }
+    }
+
+    /// The mode with this stored spelling.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "recent" => Some(Self::Recent),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+/// One channel's own history mode, as stored. `#602 history-settings-and-limits`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryModeSetting {
+    /// The channel.
+    pub channel: ChannelId,
+    /// What the owner chose for it.
+    pub mode: HistoryMode,
+    /// When, on the server's clock, in milliseconds since the Unix epoch.
+    pub updated_ms: i64,
+}
+
 /// What one automatic upstream clear came to. `#232 upstream-mark-read`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -2633,6 +2680,31 @@ pub trait StateStore: Send + Sync {
         &self,
         channel: &ChannelId,
         attempt: &UpstreamClearAttempt,
+    ) -> Result<(), StoreError>;
+
+    /// Every channel's own history mode, in channel order. A channel with none follows
+    /// `[message_cache] backfill`. `#602 history-settings-and-limits`.
+    ///
+    /// **Not covered by [`Retention`]**: one row per channel at most, which the owner sets.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn history_modes(&self) -> Result<Vec<HistoryModeSetting>, StoreError>;
+
+    /// Set one channel's own history mode, or with `None` go back to the server's setting.
+    /// `#602 history-settings-and-limits`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn set_history_mode(
+        &self,
+        channel: &ChannelId,
+        mode: Option<HistoryMode>,
+        at_ms: i64,
     ) -> Result<(), StoreError>;
 
     /// Every thread hue kept for one channel, in assignment order. `#427 server-thread-hues`.

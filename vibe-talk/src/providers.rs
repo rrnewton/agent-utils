@@ -1268,6 +1268,40 @@ impl ChatClient for ChatRouter {
             .any(|entry| entry.client.supports_upstream_clear())
     }
 
+    /// The longest any provider asks: a caller of the router as a whole cannot tell which
+    /// provider it will read. The backfill asks each provider's own client
+    /// ([`ChatRouter::client_for`]). `#602 history-settings-and-limits`.
+    fn crawl_hold(&self) -> Option<std::time::Duration> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.client.crawl_hold())
+            .max()
+    }
+
+    /// Every provider's together, each route named `key:route`.
+    fn rate_limit_pressure(&self) -> Option<crate::chat::RateLimitPressure> {
+        let mut merged: Option<crate::chat::RateLimitPressure> = None;
+        for entry in &self.entries {
+            let Some(pressure) = entry.client.rate_limit_pressure() else {
+                continue;
+            };
+            let total = merged.get_or_insert_with(Default::default);
+            total.limited_last_10_min = total
+                .limited_last_10_min
+                .saturating_add(pressure.limited_last_10_min);
+            total.crawl_hold_s = total.crawl_hold_s.max(pressure.crawl_hold_s);
+            total.invalid_last_10_min =
+                match (total.invalid_last_10_min, pressure.invalid_last_10_min) {
+                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                    (a, b) => a.or(b),
+                };
+            for (route, value) in pressure.routes {
+                total.routes.insert(format!("{}:{route}", entry.key), value);
+            }
+        }
+        merged
+    }
+
     async fn clear_upstream_through(
         &self,
         channel: &ChannelId,

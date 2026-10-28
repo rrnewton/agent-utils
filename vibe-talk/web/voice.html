@@ -2023,6 +2023,35 @@
                     </div>
 
                     <!--
+                      `#602 history-settings-and-limits`. How much of this channel's history the
+                      server keeps in its message cache, and how its walk into older messages is
+                      going. The owner, 2026-10-27: "I assume it is a per channel setting? I think we
+                      should expose it under the channel pane in settings ... It would be nice to
+                      show progress and ETA in that same channel settings pane." The choice is the
+                      server's, read and written through /history and never kept on this device;
+                      "Read older messages next" puts the channel at the front of the server's queue
+                      (what search's "Search further back" also asks for). Shown while the server's
+                      cache is on and open, for one channel at a time; the choice and the button only
+                      to a token that may change them. Built by `renderChannelHistory` in
+                      web/voice.js.
+                    -->
+                    <div id="channel-history" hidden>
+                      <hr class="settings-rule" />
+                      <label for="channel-history-mode">History saved on the server</label>
+                      <select id="channel-history-mode" aria-describedby="channel-history-progress channel-history-state">
+                        <option id="channel-history-default" value="default">Server default</option>
+                        <option value="recent">Recent days only</option>
+                        <option value="full">Whole history</option>
+                      </select>
+                      <p id="channel-history-progress" class="hint" aria-live="polite"></p>
+                      <div class="channel-actions">
+                        <button id="channel-history-save" class="secondary" type="button" disabled>Save</button>
+                        <button id="channel-history-prioritize" class="secondary" type="button" hidden>Read older messages next</button>
+                      </div>
+                      <p id="channel-history-state" class="hint" aria-live="polite"></p>
+                    </div>
+
+                    <!--
                       WHO IS WHO: which account in the channel chosen above is you, which is the coding
                       agent, and which are other people and bots, as the channel view draws them.
 

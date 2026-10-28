@@ -29,9 +29,13 @@
 //!
 //! # What a reason is not
 //!
-//! Attribution, never a decision. NOTHING reads it to decide what a caller may see or do, which
-//! read is made, whether one is shared or kept, or how fresh an answer must be: it is written to
-//! the access log and counted in the upstream profile, and that is all. So a client that lies about
+//! Attribution, never a decision, with two exceptions for the server's own `backfill` reason
+//! alone, which no client can claim (see below): the upstream profile does not count a backfill
+//! read as the provider being in use (`#453 cache-backfill`), and a backfill read gives up at the
+//! first rate limit instead of waiting it out (`#602 history-settings-and-limits`). Otherwise
+//! NOTHING reads it to decide what a caller may see or do, which read is made, whether one is
+//! shared or kept, or how fresh an answer must be: it is written to the access log and counted in
+//! the upstream profile, and that is all. So a client that lies about
 //! it can mislabel only its own reads. A word the page does not send — including every server-side
 //! reason — is [`ReadReason::Other`] when it arrives from outside, so a request cannot pass itself
 //! off as the server's own background work, and nothing a client sends is copied into the log.

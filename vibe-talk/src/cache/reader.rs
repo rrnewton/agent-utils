@@ -592,6 +592,32 @@ pub(crate) fn frontier(
         .optional()
 }
 
+/// What the file holds of one channel: its messages and their oldest and newest, through the
+/// time index alone (no row is read, so `content_bytes` is 0). What Settings' history line polls.
+/// `#602 history-settings-and-limits`.
+pub(crate) fn channel_stats_of(
+    connection: &Connection,
+    chan: &ChanKey,
+) -> rusqlite::Result<Option<super::ChannelStats>> {
+    connection
+        .query_row(
+            "SELECT COUNT(m.created_ms), MIN(m.created_ms), MAX(m.created_ms)
+             FROM channel ch LEFT JOIN message m INDEXED BY message_by_time ON m.chan = ch.chan
+             WHERE ch.provider_key = ?1 AND ch.channel_id = ?2",
+            [chan.provider_key.as_str(), chan.channel_id.as_str()],
+            |row| {
+                Ok(super::ChannelStats {
+                    chan: chan.clone(),
+                    messages: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                    content_bytes: 0,
+                    oldest_ms: row.get(1)?,
+                    newest_ms: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+}
+
 /// What the file holds of each channel it names, erased ones aside: the history diagnostics and
 /// the storage projection. `#595 cache-full-history`.
 pub(crate) fn channel_stats(connection: &Connection) -> rusqlite::Result<Vec<super::ChannelStats>> {

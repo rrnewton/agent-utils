@@ -541,6 +541,101 @@ pub struct MessageCacheRequest {
     pub enabled: bool,
 }
 
+/// One channel's history in the message cache, and the owner's say over it: `GET`, `PUT
+/// /api/v1/channels/{id}/history`, and `POST` or `DELETE .../history/prioritize`. `#602
+/// history-settings-and-limits`.
+///
+/// What Settings › Channels shows under History, and what search's "Search further back" reads
+/// while it waits. Times are milliseconds since the Unix epoch on the server's clock; `now_ms`
+/// is that clock as of the answer, so a page can say "in 3 minutes" without trusting its own.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct ChannelHistoryState {
+    /// The channel it is about.
+    pub channel_id: String,
+    /// `[message_cache] backfill`: `recent`, `full` or `off`.
+    pub server_mode: &'static str,
+    /// The owner's own choice for this channel, `recent` or `full`; absent while it follows the
+    /// server's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_override: Option<crate::store::HistoryMode>,
+    /// How far back the backfill reads it now: `off` whatever the channel says when the server's
+    /// backfill is off, otherwise its own choice, otherwise the server's.
+    pub mode: &'static str,
+    /// Whether this server can keep a choice of the channel's own (it has a durable store).
+    pub settable: bool,
+    /// Messages the cache holds of it.
+    pub messages: u64,
+    /// The oldest and newest message held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_ms: Option<i64>,
+    /// See `oldest_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_ms: Option<i64>,
+    /// Whether a walk into older history is under way, and the oldest message it has reached.
+    pub walking: bool,
+    /// See `walking`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached_ms: Option<i64>,
+    /// Whether the cache holds every message back to the channel's beginning: a walk reached it,
+    /// and the latest to reach it began less than a week ago.
+    pub complete: bool,
+    /// When the latest walk to reach the beginning ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete_ms: Option<i64>,
+    /// Pages the walk under way has read.
+    pub cycle_pages: i64,
+    /// Its pace so far, in pages an hour, and in days of history an hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages_per_hour: Option<f64>,
+    /// See `pages_per_hour`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days_per_hour: Option<f64>,
+    /// Seconds until the walk under way reaches the beginning, from the latest walk's length and
+    /// this one's pace; absent before any walk has reached it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_s: Option<u64>,
+    /// Its place among the channels asked to be read next, 0 at the front; absent when not asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<u32>,
+    /// Until when the backfill's reads of its provider hold off, and why: `rate_limited`,
+    /// `upstream_error`, `provider_signal` or `storage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until_ms: Option<i64>,
+    /// See `held_until_ms`. `storage` has no end time: it lasts while the file is above the share
+    /// of `max_megabytes` at which the walk into older history waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_reason: Option<crate::history_control::HoldReason>,
+    /// `[[providers]] backfill_requests_per_minute` of its provider, and its backfill reads in the
+    /// last minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_minute: Option<u32>,
+    /// See `requests_per_minute`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_last_minute: Option<u32>,
+    /// The server's clock as of this answer.
+    pub now_ms: i64,
+}
+
+/// `PUT /api/v1/channels/{id}/history`: the channel's own history mode. `#602
+/// history-settings-and-limits`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HistoryModeRequest {
+    /// `recent`, `full`, or `default` to follow the server's `[message_cache] backfill` again.
+    pub mode: HistoryModeChoice,
+}
+
+/// See [`HistoryModeRequest`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryModeChoice {
+    /// Keep the recent stretch read and re-read.
+    Recent,
+    /// Also walk back to the channel's beginning.
+    Full,
+    /// Follow the server's setting.
+    Default,
+}
+
 /// The owner's noise rules, as the Settings editor shows them. `#196 auto-read-noise`.
 ///
 /// Also the body `PUT /api/v1/noise-rules` answers with, so the editor redraws from what the
@@ -1306,6 +1401,9 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<MessageCacheRequest>(),
         // `#457 settings-server-side`. Appended, for the same reason.
         generator.subschema_for::<ClientSettings>(),
+        // `#602 history-settings-and-limits`. Appended, for the same reason.
+        generator.subschema_for::<ChannelHistoryState>(),
+        generator.subschema_for::<HistoryModeRequest>(),
     ]
 }
 

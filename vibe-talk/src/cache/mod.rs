@@ -2476,6 +2476,15 @@ impl MessageCache {
         self.read(None, reader::channel_stats)
     }
 
+    /// What the file holds of one channel, through its time index alone. `#602
+    /// history-settings-and-limits`.
+    #[must_use]
+    pub fn channel_stats_of(&self, chan: &ChanKey) -> Read<Option<ChannelStats>> {
+        self.read(Some(chan), |connection| {
+            reader::channel_stats_of(connection, chan)
+        })
+    }
+
     /// What a shadow evaluation reads of `chan` ([`shadow::Query`]), all of it in one snapshot of
     /// the file, so that a batch committed while it runs is either wholly in it or not at all.
     /// Checked as every read is, and [`Read::Blocked`] while the scope it reads, or the scope the

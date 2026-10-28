@@ -342,6 +342,97 @@ fn a_file_of_schema_one_takes_the_record_of_what_was_left_out_and_keeps_its_rows
     assert_eq!((dropped, checked, checked_from), (None, None, None));
 }
 
+/// `#602 history-settings-and-limits`. A file of schema 4, its index holding positions, opens at
+/// schema 5 with every row kept and the index rebuilt without them: searchable by trigrams, sound,
+/// still erasing what it deletes (`secure-delete`), and kept in step by its triggers.
+#[test]
+fn a_file_of_schema_four_rebuilds_its_index_without_positions_and_keeps_its_rows() {
+    let dir = crate::testing::TempDir::new("cache-migrate-v5");
+    let clock = Arc::new(ManualClock(AtomicI64::new(T0)));
+    let cache_dir = dir.path().join("cache");
+    file::ensure_private_dir(&cache_dir).expect("dir");
+    let path = cache_dir.join("c.sqlite3");
+    file::create_if_absent(&path).expect("create");
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open");
+        schema::prepare_writer(&connection, schema::Header::Empty, &schema::STEPS[..4])
+            .expect("schema 4");
+        connection
+            .execute_batch(
+                "INSERT INTO channel (chan, provider_key, channel_id) VALUES (1, 'p', 'C1');",
+            )
+            .expect("channel");
+        for i in 0..50 {
+            connection
+                .execute(
+                    "INSERT INTO message (chan, message_id, created_ms, observed_ms, home_scope,
+                        author_id, author, author_is_bot, content, content_hash, search_text)
+                     VALUES (1, ?1, ?2, ?2, 'main', 'U1', 'ada', 0, ?3, 'h', ?3)",
+                    rusqlite::params![format!("m{i}"), T0 + i, format!("ada said wombatfig {i}")],
+                )
+                .expect("row");
+        }
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'message_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("schema");
+        assert!(sql.contains("detail = full"), "{sql}");
+    }
+    let cache = fixtures::open(&dir, &clock, Limits::default());
+    let read = |sql: &'static str| {
+        cache
+            .read(None, move |c| {
+                c.query_row(sql, [], |r| r.get::<_, String>(0))
+            })
+            .served()
+            .expect("served")
+    };
+    assert!(
+        read("SELECT sql FROM sqlite_schema WHERE name = 'message_fts'").contains("detail = none")
+    );
+    let count = |term: &str| -> i64 {
+        let query = search::fts_query(&[term.to_owned()]);
+        cache
+            .read(None, move |c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH ?1",
+                    [query.as_str()],
+                    |r| r.get(0),
+                )
+            })
+            .served()
+            .expect("served")
+    };
+    assert_eq!(count("wombatfig"), 50, "every row is in the rebuilt index");
+    assert_eq!(count("platypus"), 0);
+    let secure: i64 = cache
+        .read(None, |c| {
+            c.query_row(
+                "SELECT v FROM message_fts_config WHERE k = 'secure-delete'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .served()
+        .expect("served");
+    assert_eq!(secure, 1, "the rebuilt index still erases what it deletes");
+    drop(cache);
+    let connection = rusqlite::Connection::open(&path).expect("reopen");
+    connection
+        .execute(
+            "INSERT INTO message_fts (message_fts, rank) VALUES ('integrity-check', 1)",
+            [],
+        )
+        .expect("the rebuilt index is sound");
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("version");
+    assert_eq!(version, 5);
+}
+
 /// A head written before cache schema 3 does not say where the read that set it began listing, and
 /// a membership does not say which read vouched for it: the band of such a head is vouched for by
 /// nothing until the next read of the newest end, which records both.
@@ -1852,7 +1943,10 @@ fn search_text_is_rebuilt_when_the_rendering_rules_change() {
     assert!(cache.search_text_current());
     let labelled = sql_count(
         &cache,
-        "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '\"widgets#123\"'",
+        &format!(
+            "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '{}'",
+            search::fts_query(&["widgets#123".to_owned()])
+        ),
     );
     assert_eq!(labelled, 1_200);
     drop(dir);
@@ -1904,7 +1998,10 @@ fn a_rebuild_that_fails_is_retried_rather_than_taken_as_done() {
     assert_eq!(
         sql_count(
             &cache,
-            "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '\"relabelled\"'",
+            &format!(
+                "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '{}'",
+                search::fts_query(&["relabelled".to_owned()])
+            ),
         ),
         50
     );

@@ -1477,6 +1477,14 @@ impl crate::chat::ChatClient for CountingChat {
         self.inner.supports_upstream_clear()
     }
 
+    fn crawl_hold(&self) -> Option<std::time::Duration> {
+        self.inner.crawl_hold()
+    }
+
+    fn rate_limit_pressure(&self) -> Option<crate::chat::RateLimitPressure> {
+        self.inner.rate_limit_pressure()
+    }
+
     async fn clear_upstream_through(
         &self,
         channel: &crate::model::ChannelId,

@@ -3974,6 +3974,8 @@ pub const PURGED: &[&str] = &[
     // `#549 own-read-stored`.
     "own_decided",
     "upstream_clear",
+    // `#602 history-settings-and-limits`.
+    "history_modes",
     "aliases",
     "noise_rules",
     "noise_exemptions",
@@ -4049,6 +4051,9 @@ pub async fn purge_storage(
     state.store.purge_everything().await?;
     let forgotten = clearing.forget_all();
     drop(changing);
+    // `#602 history-settings-and-limits`. Every channel back to the server's history mode, and
+    // nothing queued to be read next.
+    state.live.history().clear();
     // Not durable, so not in the list below, but channel text all the same.
     state.read_ahead.clear();
     state.live.recent().clear();
@@ -4301,6 +4306,154 @@ pub async fn mark_read_upstream(
 pub struct UpstreamClearRequest {
     /// Off, a dry run, or on.
     pub mode: crate::store::UpstreamClearMode,
+}
+
+/// One channel's history state, with its own mode as the store holds it. `#602
+/// history-settings-and-limits`.
+async fn history_view(
+    state: &AppState,
+    channel: &ChannelId,
+) -> Result<crate::contract::ChannelHistoryState, ApiError> {
+    // The store is the record of the owner's choice; with none configured there is no choice to
+    // keep, and the page offers none.
+    let (own, settable) = match state.store.history_modes().await {
+        Ok(settings) => (
+            settings
+                .into_iter()
+                .find(|setting| &setting.channel == channel)
+                .map(|setting| setting.mode),
+            true,
+        ),
+        Err(StoreError::Unavailable(_)) => (None, false),
+        Err(error) => return Err(error.into()),
+    };
+    let state = state.clone();
+    let channel = channel.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::backfill::channel_state(&state, &channel, own, settable)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::from(ChatError::Transport(format!(
+            "the history read did not finish: {error}"
+        )))
+    })
+}
+
+/// `GET /api/v1/channels/{channel_id}/history` — how much of the channel's history the message
+/// cache holds, how far back the backfill reads it and why, and how its walk into older history
+/// is going. `#602 history-settings-and-limits`.
+pub async fn channel_history(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    Ok(no_store(Json(history_view(&state, &channel.id).await?)))
+}
+
+/// `PUT /api/v1/channels/{channel_id}/history` — the channel's own history mode: `recent`,
+/// `full`, or `default` to follow `[message_cache] backfill`. `#602 history-settings-and-limits`.
+///
+/// WRITE scope, and NO MCP TOOL: how much of the owner's history this server gathers, and how
+/// hard it reads the provider to do so, is his to decide.
+pub async fn set_channel_history(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(request): Json<crate::contract::HistoryModeRequest>,
+) -> Result<Response, ApiError> {
+    use crate::contract::HistoryModeChoice;
+    use crate::store::HistoryMode;
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    let mode = match request.mode {
+        HistoryModeChoice::Recent => Some(HistoryMode::Recent),
+        HistoryModeChoice::Full => Some(HistoryMode::Full),
+        HistoryModeChoice::Default => None,
+    };
+    let at_ms = jiff::Timestamp::now().as_millisecond();
+    state
+        .store
+        .set_history_mode(&channel.id, mode, at_ms)
+        .await?;
+    state.live.history().set(&channel.id, mode);
+    tracing::info!(
+        channel = %channel.id,
+        mode = mode.map_or("default", HistoryMode::as_str),
+        "history: channel {} ({}) set to {} in Settings",
+        channel.id,
+        channel.alias.as_deref().unwrap_or(&channel.label),
+        mode.map_or("the server's setting", HistoryMode::as_str),
+    );
+    Ok(no_store(Json(history_view(&state, &channel.id).await?)))
+}
+
+/// `POST /api/v1/channels/{channel_id}/history/prioritize` — read this channel's older history
+/// next: it goes to the front of the backfill's queue, its walk into older history runs before
+/// any other channel of its provider, at the provider's backfill ceiling, and it leaves the queue
+/// when that walk reaches the channel's beginning (at once when the cache already holds it all).
+/// Answers 202 with the channel's history state; poll `GET .../history` for progress. `#602
+/// history-settings-and-limits`; what search's "Search further back" calls.
+///
+/// WRITE scope and no MCP tool, like the mode. Refused when the server's backfill is off or no
+/// cache is open: nothing would read it.
+pub async fn prioritize_channel_history(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    let backfill_on = state
+        .config
+        .message_cache
+        .as_ref()
+        .is_some_and(|config| config.backfill != crate::config::CacheBackfill::Off);
+    let open = state
+        .message_cache
+        .cache()
+        .is_some_and(|cache| cache.is_open());
+    if !backfill_on || !open {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "history_backfill_off",
+            "this server's message cache does not gather history: the backfill is off or no \
+             cache is open",
+        ));
+    }
+    // A channel the cache does not hold would be dropped from the queue at the backfill's next
+    // step, unread.
+    if state.message_cache.chan_key(&channel.id).is_none() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "history_not_cached",
+            "this channel is not in this server's message cache",
+        ));
+    }
+    // A channel the cache already holds whole has nothing further back: it is not queued, and
+    // the answer says so (`complete`, no `queue_position`).
+    let before = history_view(&state, &channel.id).await?;
+    if before.complete {
+        return Ok((StatusCode::ACCEPTED, no_store(Json(before))).into_response());
+    }
+    state
+        .live
+        .history()
+        .prioritize(&channel.id, jiff::Timestamp::now().as_millisecond());
+    tracing::info!(channel = %channel.id, "history: channel {} asked to be read next", channel.id);
+    let body = history_view(&state, &channel.id).await?;
+    Ok((StatusCode::ACCEPTED, no_store(Json(body))).into_response())
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/history/prioritize` — take the channel off the queue;
+/// its walk goes on in the backfill's usual order. `#602 history-settings-and-limits`.
+pub async fn cancel_channel_history_priority(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    state.live.history().cancel(&channel.id);
+    Ok(no_store(Json(history_view(&state, &channel.id).await?)))
 }
 
 /// The longest `POST .../upstream-clear/now` holds the request, reading the channel's newest

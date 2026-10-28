@@ -2530,6 +2530,7 @@ model provider or a real gateway.
 | Voice-only token | `auth.voice_token` | `VIBE_TALK_VOICE_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; opens `GET /api/v1/voice-socket` and no other route — see "Relaying the voice socket" |
 | Channels | `[[channels]]` | `VIBE_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated; a fourth field, or `provider` in the file, names the channel's provider |
 | More providers | `[[providers]]` | — | see [Several chat providers in one server](#several-chat-providers-in-one-server) |
+| Backfill pace | `[[providers]] backfill_requests_per_minute` | — | the most requests the message cache's backfill sends this provider in any minute, all its walks together (one read may send several: a page of system events, a long thread): default `20` for `kind = "slack"`, `30` for `kind = "discord"` (and the `[discord]` section), 1 to 50. A ceiling of our own under the provider's published limits; the provider's rate limits slow the backfill further. See "Rate limits" under [The backfill](#the-backfill). `#602 history-settings-and-limits` |
 | A provider's token | `providers.<key>.token` | `VIBE_TALK_PROVIDER_<KEY>_TOKEN` | **secret**; the key upper-cased with `-` as `_`, so `google-chat` reads `VIBE_TALK_PROVIDER_GOOGLE_CHAT_TOKEN` |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `VIBE_TALK_ELEVENLABS_AGENT_ID` | public |
 | Read-aloud backend | `read_aloud.backend` | `VIBE_TALK_READ_ALOUD_BACKEND` | `elevenlabs` (default), `browser` for the device speech engine, or `conversation` to use the configured `vibe-talk-v1` agent |
@@ -3976,6 +3977,16 @@ taking the file back too. **Take a copy of `storage.path` before an upgrade.** R
 is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
 the server stopped, newest first; each step's note below says how.
 
+**Step 23 (`#602 history-settings-and-limits`)** only adds the `history_modes` table, each
+channel's own history mode chosen in Settings › Channels, so with the server stopped it can be
+undone in place, every channel then following `[message_cache] backfill` again:
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE history_modes; PRAGMA user_version = 22;'
+```
+
+Run that only on a file at version 23, and only when the build being returned to predates the step.
+
 **Step 22 (`#549 own-read-stored`)** adds the `own_decided` table, which of the owner's own
 messages have had their first read state decided, and the `dismissals.own` column, which says a
 Done mark was written by "Mark my own messages as read" rather than by the reader, so the two are
@@ -4204,9 +4215,14 @@ are in this section below and in detail in the design note for `#384 cache-serve
    [message_cache]
    enabled = true
    backfill = "full"          # no max_days: every day is kept
-   max_megabytes = 2048       # about 8.4 KB a message, with room to spare
+   max_megabytes = 2048       # about 4.1 KB a message (cache schema 5), with room to spare
    path = "/srv/vibe-talk-cache/vibe-talk.message-cache-web1.sqlite3"
    ```
+
+   A channel can differ from that in Settings › Channels (`#602 history-settings-and-limits`). On
+   btrfs, set compression on the cache's directory before the first start; the mount option alone
+   does not compress a SQLite file (see "Filesystem compression" under [The
+   backfill](#the-backfill)).
 
    `vibe-talk cache-stats PATH` measures what a cache file holds, read-only and beside a running
    server: its bytes on disk, per table and index and per message, and for each channel its
@@ -4697,11 +4713,153 @@ is complete once the walk is past its limit. `max_megabytes` (up to 16384 under 
 file, and the full walk waits while the file is above 85 % of it, so the cache's own eviction, which
 starts at the bound, does not take back what the walk just read.
 
-**What a full history costs.** Each message costs about 8.4 KB of file in the live store measured
-on 2026-10-27 (2,300 messages of a Slack workspace: 19.3 MB, of which the trigram full-text index is
-52 % and the message rows 44 %; the messages average 913 bytes of text, long agent reports). The
-`vibe-talk cache-stats` command (see [The message cache](#the-message-cache)) measures a file in
-place. Set `max_megabytes` to about 8.4 KB times the messages the channels hold, with room to spare.
+**Each channel's own mode** (`#602 history-settings-and-limits`). The owner, 2026-10-27: "I
+assume it is a per channel setting? I think we should expose it under the channel pane in
+settings." `backfill` is the server's default; a channel may have its own, `recent` or `full`,
+chosen in Settings › Channels under **History saved on the server** and kept in the store (step 23,
+`history_modes`), so `recent` takes a busy channel out of the full walk on a server set to `full`,
+and `full` gathers one channel's whole history on a server set to `recent` (within `max_days`,
+which still bounds what is kept: under `recent` it defaults to 90). `off` stays the operator's:
+with `backfill = "off"` no channel's choice makes a read. The same box shows the channel's
+progress, read from `GET /api/v1/channels/{id}/history` every 30 seconds while Settings is open:
+how many messages are saved and back to when, whether it is complete, the oldest message the walk
+under way has reached, its pages an hour, how long until it reaches the beginning (from the length
+of the last walk that did, so a first walk has none), its place in the queue, and why it is paused.
+
+**Read older messages next.** `POST /api/v1/channels/{id}/history/prioritize`, the box's **Read
+older messages next**, and later search's "Search further back", put a channel at the front of the
+backfill's queue: its walk into older history runs before any other channel's of the same provider,
+whatever its mode, at the provider's `backfill_requests_per_minute` rather than the gentler
+`full_reads_per_minute`, and still only while nothing else is reading the provider and while no
+rate limit says otherwise. It leaves the queue when its walk reaches the beginning; a channel whose
+last walk reached it less than a week ago has nothing further back and leaves at once. The queue
+is in memory: a restart forgets it, and the walk goes on in its usual order. A channel of `recent`
+mode walked this way is not walked again, so its older rows are erased a week later by the
+revalidation rule, as any row not read again is.
+
+**Rate limits.** The owner, 2026-10-27: "We need to have some rate limiting on our crawling because
+we don't want to get rejected by the upstream Slack or Discord service." What each service
+publishes, read 2026-10-27:
+
+| Service | What it allows | What it does past that | Source |
+|---|---|---|---|
+| Slack | `conversations.history` and `conversations.replies` are tier 3: 50+ requests a minute per method, per workspace, per app, with sporadic bursts; Slack suggests designing for about one request a second per method | HTTP 429 with `Retry-After` in seconds, for that method in that workspace only | <https://docs.slack.dev/apis/web-api/rate-limits/>, <https://docs.slack.dev/reference/methods/conversations.history>, <https://docs.slack.dev/reference/methods/conversations.replies> |
+| Slack, since 2025-05-29 | Commercially distributed apps not in the Slack Marketplace, created after that date or newly installed: both methods 1 request a minute and at most 15 messages a request. **Internal customer-built (custom) apps are not affected** (50+ a minute, up to 1,000 messages a request); Marketplace apps and existing installations neither | as above | <https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps>, clarified <https://docs.slack.dev/changelog/2025/06/03/rate-limits-clarity/> |
+| Discord | 50 requests a second per bot, all routes together; per-route buckets (per channel for a channel's messages) given by `X-RateLimit-Limit`, `-Remaining`, `-Reset`, `-Reset-After` and `-Bucket` | HTTP 429 with `retry_after` (seconds, fractional) in the body, `Retry-After`, and `X-RateLimit-Scope` (`user`, `global` or `shared`). An address that makes **10,000 invalid requests (401, 403, or 429 not of the `shared` scope) in 10 minutes is banned from the API for a while** | <https://discord.com/developers/docs/topics/rate-limits> |
+| Google Chat (through a bridge speaking Discord's protocol) | Per project, 3,000 message reads a minute; per space, 15 reads a second shared by every app in it | HTTP 429; truncated exponential backoff (1, 2, 4 … seconds plus up to a second of jitter, up to 32 or 64 seconds) | <https://developers.google.com/workspace/chat/limits> |
+
+A custom Slack app made for its own workspace, as this server's is, keeps tier 3. What the
+backfill does, all of it, for every provider:
+
+* **A ceiling of its own.** Every request a backfill read sends a provider, its walks together, counts against
+  `[[providers]] backfill_requests_per_minute` over a sliding minute, counted in the requests each
+  read actually sent (one read can send several: a page of system events, a long thread): 20 for
+  Slack (two fifths of tier 3's per-method minute, history and replies together, leaving the rest
+  to the page's own reads, the relist and the poller), 30 for a Discord-protocol provider. A read
+  is not cut off part way, so one long read can carry a minute past the ceiling; the next waits. The full walk keeps to its own
+  `full_reads_per_minute` inside that, and every read waits until the provider has been idle for
+  two seconds.
+* **No waiting inside a read.** A read a person is waiting on waits out a rate limit as the
+  provider asks, within a bounded budget: Slack's `Retry-After`, Discord's fractional `retry_after`
+  before its rounded header, a known-empty Discord bucket waited out rather than spent, and a
+  whole-token limit stopping every route (`src/discord/ratelimit.rs`, `src/slack/client.rs`). A
+  backfill read does not: at its first 429, or a Discord bucket known to be empty, it ends without
+  sending again, and the backfill holds off the provider as below.
+* **Backoff after a failure.** A backfill read that fails anyway in a way that may pass (a rate
+  limit the client could not wait out, a 5xx, a timeout) holds every backfill read of that provider
+  for the longer of what the provider asked and an exponential backoff from 30 seconds, doubling to
+  30 minutes, plus up to a tenth of jitter; the next read that succeeds resets it. A refusal of one
+  channel (a 403) holds only that channel.
+* **The route under pressure is yielded entirely.** Any rate limit on a read route the backfill uses
+  (`conversations.history`, `conversations.replies`, or any Discord route), whoever's request it
+  answered, keeps the backfill off the provider for five quiet minutes after the latest one, however
+  short the `Retry-After`; so does a reported quota at its last request or two
+  (`X-RateLimit-Remaining`), until it resets. This is what the live instance needed: after it
+  switched to `full` on 2026-10-27, Slack answered the route with `Retry-After: 1` again and again
+  until the page's own reads gave up after five attempts (the hourly profile's failed operations
+  went 55, 96, 176 an hour, with 142 rate-limited timeline reads), and a crawler that resumed after
+  each one-second wait kept the bucket full. The page's reads, the relist and the poller always
+  come first.
+* **Never near Discord's ban.** The Discord client counts every 401, 403 and counted 429 over a
+  sliding ten minutes; the backfill holds off from 250 of them, and from 5,000, half Discord's
+  limit, the client sends nothing at all, answering every request as rate-limited until the count
+  has fallen.
+
+The diagnostics' `cache_history` says how it stands: `providers` (each provider's ceiling, its
+backfill requests in the last minute, and any hold with its reason and end) and `pressure` (the rate
+limits each provider answered in the last ten minutes, by route, whoever asked, how long the
+backfill still holds off, and Discord's invalid-request count). Settings' history line says
+"Paused for 4 minutes: the chat service is limiting requests."
+
+**How the file is laid out, and what a full history costs.** SQLite stores the text as written:
+nothing in the file is compressed. Measured read-only with `vibe-talk cache-stats` on the live
+store, 2026-10-27 (2,437 messages of a Slack workspace, 20.4 MB plus a 4.2 MB `-wal`, 8,366 bytes a
+message):
+
+| Object | Bytes | A message | What it is |
+|---|---|---|---|
+| `message_fts_data` | 10.6 MB (52 %) | 4,363 | the trigram full-text index, with positions (`detail = full`), more than twice the 1,686 bytes of search text it indexes |
+| `message` | 8.9 MB (44 %) | 3,662 | the rows: 907 bytes of text, 1,686 of search text (author, text, the drawn text where it differs, link addresses), a little JSON, and SQLite's row overhead |
+| everything else | 0.5 MB | ~200 | the scope, time and thread indexes, coverage, threads, the walk's record |
+
+**Cache schema 5 drops the index's positions** (`detail = none`). Measured on 20,000 messages
+shaped like the live store's (`tests/cache_bench.rs`, `measure_layout_and_compression_options`:
+931 bytes of text and 1,830 of search text a message; 7,860 bytes a message before), the index goes
+from 4,386 to 601 bytes a message and the file from 150 MB to 78 MB (4,071 bytes a message), and a
+search through it is as fast (a rare word 0.14 to 0.23 ms, a common one 1.4 ms, by every shape). A
+search asks the index for the rows holding every trigram of each term (FTS5 refuses a phrase
+without positions) and matches each candidate again in Rust, as every search already does, so its
+answer is the same: for "release", 219 candidates and 201 true matches. The step rebuilds the index
+from the rows in place, with no refetch: about 3.5 s for those 20,000 messages, once, when the new
+build first opens the file. Older builds still use the file. The pages the old index held are
+returned to the filesystem by the writer's hourly incremental vacuum.
+
+The other cheap ways, measured on the same corpus:
+
+| Way | Saves | Taken |
+|---|---|---|
+| `detail = none` (cache schema 5) | the index 86 %, the file 48 % | **yes** |
+| `detail = column` | the index 61 % | no: `none` is smaller, and a search needs neither |
+| `columnsize = 0` | 0.2 % of the file | no: not worth a rebuild |
+| `optimize` (the index in one segment) | 0.6 % | no; the writer merges as it goes |
+| zstd of each row's text, in the server | text 898 → 503 bytes a row (56 %), 372 with a trained dictionary (the corpus is this README cut up, which flatters a dictionary): about 10 % of the file. The search text must stay plain for the index to be rebuilt and scanned | no: a dependency and a decode on every read for a tenth |
+| `VACUUM`, `auto_vacuum` | nothing: the file is `auto_vacuum = INCREMENTAL` and the writer returns free pages hourly (the live file had 15 free pages of 4,993) | already |
+| **zstd in the filesystem** (btrfs) | 74 %: the 78 MB file takes 20 MB on disk | **recommended for deployment**, below |
+
+At the live store's rate (about 308 messages a day), a year is about 112,000 messages: about
+460 MB of file at 4.1 KB a message, and about 120 MB on disk with the filesystem's compression. Set
+`max_megabytes` (which counts the file, not its blocks on disk) to about 4.1 KB times the messages
+the channels hold, with room to spare.
+
+**Filesystem compression.** The owner, 2026-10-27: "if SQL doesn't support it out of the box,
+maybe compression in the file system is the easiest way". On btrfs it is, with one catch that
+matters: **the mount option `compress=zstd` does not compress a SQLite file.** It is a heuristic,
+and SQLite writes a page or two at a time; a small write that does not shrink makes btrfs mark the
+whole file "do not compress" (`lsattr` shows `m`), for good. The live store's file was stored
+uncompressed that way on a filesystem mounted `compress=zstd:3`. Setting compression on the
+directory instead makes it stick:
+
+```sh
+# With the server stopped. DIR holds [message_cache] path; FILE is the cache file in it.
+btrfs property set DIR compression zstd      # new files there inherit it: a -wal, a re-created cache
+btrfs property set FILE compression zstd     # the file itself; this clears btrfs's own "m" mark
+btrfs filesystem defragment -czstd FILE      # rewrite what it holds, compressed
+compsize FILE                                # "Disk Usage" against "Uncompressed"
+lsattr FILE                                  # "c": compression set; "m" would mean none
+```
+
+Measured on the 20,000-message corpus in a directory set that way: the file the cache's own writer
+built took 20 MB on disk of 78 MB (26 %), with no VACUUM to help it; the same fill in an ordinary
+directory of the same `compress=zstd:3` filesystem was marked `m` and took all 78 MB. Filling it
+took 8.06 s compressed and 8.27 s not, and searches the same, on a host at load 78 to 100: no cost
+that could be measured. It is safe: btrfs compresses beneath SQLite, copy-on-write and checksums
+stay on, and `fsync` means what it meant; the `-wal` and `-shm` files are compressed too, and gain
+little. Do not set `nodatacow` (`chattr +C`) on that directory, which turns compression and
+checksums off. Two costs to know: a page written alone may be stored uncompressed (a small write
+that does not shrink), so the ratio slips as the file is rewritten; run the `defragment` line again
+now and then (weekly is plenty) to restore it. And `defragment` unshares the file's blocks from any
+snapshot that holds them, so a snapshotted file takes its full size once more. Elsewhere: ZFS
+compresses with `compression=zstd` on the dataset, and ext4 and xfs not at all.
 
 What it does and does not buy for serving, measured on the loopback Slack fake
 (`tests/slack_live_ingest.rs`, module `measure`, ten rounds of "a message arrives through the
@@ -4772,9 +4930,18 @@ as the channel checks name it, what the cache holds and how far its history goes
 "cache_history": {
   "mode": "full", "recent_days": 14, "rewalk_hot_hours": 24, "rewalk_hot_minutes": 60,
   "rewalk_recent_hours": 24, "full_reads_per_minute": 6, "full_cycle_hours": 72,
-  "bytes_per_message": 8378,          // the whole file, over the messages it holds
+  "bytes_per_message": 4100,          // the whole file, over the messages it holds
+  "providers": {                      // each provider's backfill pace (#602)
+    "slack": { "requests_per_minute": 20, "requests_last_minute": 4, "failures": 0,
+               "held_until_ms": 1793151000000, "held_because": "provider_signal" } },
+  "pressure": {                       // rate limits answered lately, whoever asked (#602)
+    "slack": { "limited_last_10_min": 9, "crawl_hold_s": 241,
+               "routes": { "conversations.history": { "limited_last_10_min": 7, "last_limited_s_ago": 59 },
+                           "conversations.replies": { "limited_last_10_min": 2, "last_limited_s_ago": 300 } } } },
   "channels": [
-    { "channel": "C0123456789", "label": "team", "messages": 9120, "content_bytes": 8330000,
+    { "channel": "C0123456789", "label": "team", "mode": "full",   // its own mode, else the server's
+      "mode_override": "full", "queue_position": 0,                 // when set, and when asked for
+      "messages": 9120, "content_bytes": 8330000,
       "oldest": "2025-01-14T09:30:00Z", "newest": "2026-10-27T20:18:41Z",
       "complete": false,              // every message back to the beginning is held
       "walking": true, "reached": "2025-06-02T11:04:00Z",   // the full walk under way, and how far
@@ -4976,6 +5143,10 @@ link or existing strong pairing code is accepted; links for a different server a
 | POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…", thread_id?, after_reply?}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined. `thread_id` is checked to hold the message. `after_reply: true` is the page asking because a reply it sent answered the message (`#300 reply-marks-read`), or because Shift+E read and collapsed it (`#295 shift-e-read-collapse`): the provider is not asked for a message this server has already marked through, nor one before it, and the answer's `outcome` says `marked`, `already_marked` or `behind`; or `thread_channel` or `scope_unknown`, asking nothing, where the provider's cursor covers more than the channel (one thread of a larger space) or the provider cannot say whether it does. Without it the provider is always asked |
 | GET | `/api/v1/channels/{id}/upstream-clear` | read | whether this server clears the channel's unread state in the provider's own client as it ingests messages, and what it last did; see "Clearing unread automatically" |
 | PUT | `/api/v1/channels/{id}/upstream-clear` | **write** | `{mode:"off"\|"dry_run"\|"on"}` — set it. Turning it on pushes nothing by itself; the next message that arrives is pushed. Refused for a channel whose provider cannot do it |
+| GET | `/api/v1/channels/{id}/history` | read | how much of the channel's history the message cache holds and how its walk into older history goes: `{channel_id, server_mode, mode_override?, mode, settable, messages, oldest_ms?, newest_ms?, walking, reached_ms?, complete, complete_ms?, cycle_pages, pages_per_hour?, days_per_hour?, eta_s?, queue_position?, held_until_ms?, held_reason?, requests_per_minute?, requests_last_minute?, now_ms}` (`ChannelHistoryState`; times in milliseconds on the server's clock). `held_reason` is `rate_limited`, `upstream_error`, `provider_signal` or `storage`; see "Each channel's own mode" and "Rate limits" under [The backfill](#the-backfill). `#602 history-settings-and-limits` |
+| PUT | `/api/v1/channels/{id}/history` | **write** | `{mode:"recent"\|"full"\|"default"}` — the channel's own history mode, kept in the store; `default` follows `[message_cache] backfill` again. Answers the state as above. No MCP tool |
+| POST | `/api/v1/channels/{id}/history/prioritize` | **write** | no body — read this channel's older history next: it goes to the front of the backfill's queue, and leaves it when its walk reaches the beginning (at once when the cache already holds it all). Answers **202** with the state; poll the `GET` for progress. **409** `history_backfill_off` when the backfill is off or no cache is open, and `history_not_cached` for a channel the cache does not hold. What search's "Search further back" calls. No MCP tool |
+| DELETE | `/api/v1/channels/{id}/history/prioritize` | **write** | no body — take the channel off the queue; answers the state |
 | POST | `/api/v1/channels/{id}/upstream-clear/now` | **write** | no body — Settings' **Mark read now**: push the channel's newest message at once through the running loop and answer `{outcome, message_id?, message_at_ms?, attempt?, state}`: `outcome` is `pushed` (the provider took the push that covers the pressed message; `attempt` is it), `failed` or `skipped` (that push failed, or named a message the bridge no longer holds; `attempt` says so), `covered`, `no_message`, `retry_waiting`, `changed` (the setting changed meanwhile), `unavailable`, or `waiting` (nothing recorded within 45 s, the whole request included; the server carries on). Changes no setting; refused while the channel is off |
 | PUT | `/api/v1/channels/{id}/alias` | **write** | `{alias:"…"}` — what THIS app calls the channel; see "What to call a channel" |
 | DELETE | `/api/v1/channels/{id}/alias` | **write** | drop it, putting the configured label back |

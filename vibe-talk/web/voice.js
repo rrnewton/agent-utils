@@ -180,7 +180,8 @@ const ALL_CHANNELS = "*";
 /**
  * @overload
  * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
- *   | "open-in-view" | "settings-channel" | "settings-service" | "settings-wit-voice" | "slack-open-in" | "thread-select" | "upstream-clear-mode"} id
+ *   | "open-in-view" | "settings-channel" | "settings-service" | "settings-wit-voice" | "slack-open-in" | "thread-select" | "upstream-clear-mode"
+ *   | "channel-history-mode"} id
  * @returns {HTMLSelectElement}
  */
 /**
@@ -222,7 +223,8 @@ const ALL_CHANNELS = "*";
  *   | "summarise" | "talk"
  *   | "thread-back" | "thread-card-text"
  *   | "todo-filter" | "undo-bookmark" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
- *   | "upstream-clear-save" | "view-switch"} id
+ *   | "upstream-clear-save" | "view-switch"
+ *   | "channel-history-prioritize" | "channel-history-save"} id
  * @returns {HTMLButtonElement}
  */
 /**
@@ -2527,6 +2529,8 @@ function showScreen(name) {
   if (name === "settings" && previous !== "settings" && previous !== "help") pointSettingsAtReading();
   // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
   if (name === "settings" && previous !== "settings") refreshUpstreamClear();
+  // `#602 history-settings-and-limits`. The walk has gone on since the box was last drawn.
+  if (name === "settings" && previous !== "settings") refreshChannelHistory();
   // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
   if (name === "settings" && previous !== "settings") refreshVoicePostPrefix();
   // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
@@ -46648,6 +46652,8 @@ function applyServerCache(status) {
   serverCache = status && typeof status.enabled === "boolean" ? status : null;
   serverCacheAsking = null;
   renderServerCache();
+  // `#602 history-settings-and-limits`. The channel box's history follows whether a file is open.
+  renderChannelHistory();
 }
 
 /**
@@ -56138,6 +56144,7 @@ async function removeChannel() {
 function renderChannelBox() {
   renderAliasEditor();
   renderUpstreamClear();
+  renderChannelHistory();
   renderIdentityRows();
 }
 
@@ -56710,6 +56717,280 @@ async function pushUpstreamClearNow() {
   el("upstream-clear-state").textContent = upstreamClearNowSentence(answer, service);
   // The server stopped waiting before the push landed; ask again until something answers it.
   if (answer.outcome === "waiting") followUpstreamClear(channel, answer, service);
+}
+
+// --- how much of the channel's history the server keeps --------------------------------------------
+//
+// `#602 history-settings-and-limits`. The owner, 2026-10-27: "I assume it is a per channel setting? I
+// think we should expose it under the channel pane in settings ... It would be nice to show progress
+// and ETA in that same channel settings pane." So the channel box says how much of the channel the
+// server's message cache holds, whether its walk into older messages is under way and how fast, when it
+// should reach the beginning, and why it is paused when it is; and it offers the channel's own mode
+// (the server's default, recent days only, or the whole history) and "Read older messages next", which
+// puts the channel at the front of the server's queue. Like Clear unread, the choice is the server's:
+// read and written through /history, nothing kept on this device. The box reads it again every
+// CHANNEL_HISTORY_RECHECK_MS while Settings shows it, more often while the channel is queued.
+
+/** How often the box reads the channel's history again while Settings shows it. */
+const CHANNEL_HISTORY_RECHECK_MS = 30000;
+/** How often while the channel is at the front of the server's queue, when it moves fastest. */
+const CHANNEL_HISTORY_QUEUED_RECHECK_MS = 5000;
+
+/**
+ * What the server last said about the box's channel: its id, its answer or null, and the failure to
+ * show instead when there is no answer.
+ *
+ * @type {{channel: string, view: VibeTalk.ChannelHistoryState | null, failure: string} | null}
+ */
+let channelHistory = null;
+/** Counts reads, so an answer for a channel the box has since left is dropped rather than drawn. */
+let channelHistoryReads = 0;
+/** The next read of the box's channel, while Settings shows it. @type {ReturnType<typeof setTimeout> | null} */
+let channelHistoryTimer = null;
+
+/** Whether the box shows the channel's history: one channel chosen, on a server whose cache is open. */
+function channelHistoryOffered(id) {
+  return !allChannelsChosen() && Boolean(knownChannel(id)) && Boolean(serverCache && serverCache.available);
+}
+
+/** The server's modes, as the default choice names them. */
+const CHANNEL_HISTORY_MODE_WORDS = { recent: "recent days", full: "whole history", off: "none" };
+
+/** Why the server's reads of a chat service are paused, in words. */
+const CHANNEL_HISTORY_HOLD_WORDS = {
+  rate_limited: "the chat service asked for fewer requests",
+  upstream_error: "the chat service failed a read",
+  provider_signal: "the chat service is limiting requests",
+  storage: "the saved copy is near its size limit",
+};
+
+/** A span of seconds as a reader says it: "a minute", "12 minutes", "about 3 hours", "about 2 days". */
+function channelHistoryDuration(seconds) {
+  if (!(seconds >= 90)) return "a minute";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return nounCount(minutes, "minute");
+  const hours = Math.round(seconds / 3600);
+  if (hours < 48) return `about ${nounCount(hours, "hour")}`;
+  return `about ${nounCount(Math.round(hours / 24), "day")}`;
+}
+
+/** A server instant as a day, or "" when absent. */
+function channelHistoryDay(ms) {
+  return typeof ms === "number" && Number.isFinite(ms) ? dayLabel(new Date(ms)) : "";
+}
+
+/**
+ * What the line under the choice says: what is saved, how complete it is, how the walk into older
+ * messages is going and when it should end, the queue, and why it is paused.
+ *
+ * @param {VibeTalk.ChannelHistoryState} view
+ */
+function channelHistorySentence(view) {
+  if (view.mode === "off") return "This server gathers no history in the background.";
+  const parts = [];
+  if (view.messages === 0) {
+    parts.push("Nothing of this channel is saved yet.");
+  } else {
+    const oldest = channelHistoryDay(view.oldest_ms);
+    parts.push(`${nounCount(view.messages, "message")} saved${oldest ? `, back to ${oldest}` : ""}.`);
+  }
+  if (view.complete) parts.push("Complete: every message back to the channel's beginning.");
+  if (view.walking) {
+    const reached = channelHistoryDay(view.reached_ms);
+    const pace = typeof view.pages_per_hour === "number" ? ` at ${view.pages_per_hour} pages an hour` : "";
+    const left = typeof view.eta_s === "number" ? channelHistoryDuration(view.eta_s) : "";
+    const eta = left
+      ? ` ${left.charAt(0).toUpperCase()}${left.slice(1)} to go.`
+      : view.complete ? "" : " How long it takes is known once a walk has reached the beginning.";
+    parts.push(`Reading older messages${reached ? `, back to ${reached} so far` : ""}${pace}.${eta}`);
+  } else if (view.mode === "full" && !view.complete) {
+    parts.push("Older messages are read a page at a time while nothing else is reading.");
+  }
+  if (view.queue_position === 0) parts.push("Asked for: it is read next.");
+  else if (typeof view.queue_position === "number") {
+    parts.push(`Asked for: ${nounCount(view.queue_position, "channel")} ahead of it.`);
+  }
+  if (view.held_reason) {
+    const why = CHANNEL_HISTORY_HOLD_WORDS[view.held_reason] || "it is holding off";
+    const left = typeof view.held_until_ms === "number"
+      ? ` for ${channelHistoryDuration(Math.max(0, (view.held_until_ms - view.now_ms) / 1000))}`
+      : "";
+    parts.push(`Paused${left}: ${why}.`);
+  }
+  return parts.join(" ");
+}
+
+/** Whether Save would change anything: a choice other than the server's. */
+function channelHistoryChanged() {
+  const view = channelHistory ? channelHistory.view : null;
+  return Boolean(view) && el("channel-history-mode").value !== (view.mode_override || "default");
+}
+
+/** Enable Save, and offer "Read older messages next", to match what is chosen and saved. */
+function renderChannelHistoryChoice() {
+  const view = channelHistory ? channelHistory.view : null;
+  const writable = tokenScope === "write" && Boolean(view && view.settable);
+  el("channel-history-mode").disabled = !writable;
+  el("channel-history-save").hidden = !writable;
+  el("channel-history-save").disabled = !writable || !channelHistoryChanged();
+  const next = el("channel-history-prioritize");
+  next.hidden = tokenScope !== "write" || !view || view.mode === "off" || view.complete || view.queue_position === 0;
+}
+
+/** Stop reading the box's channel again. */
+function stopChannelHistoryRecheck() {
+  if (channelHistoryTimer !== null) clearTimeout(channelHistoryTimer);
+  channelHistoryTimer = null;
+}
+
+/** Read the box's channel again in a while, while Settings shows it. */
+function scheduleChannelHistoryRecheck() {
+  stopChannelHistoryRecheck();
+  const view = channelHistory ? channelHistory.view : null;
+  if (!channelHistory || el("screen-settings").hidden) return;
+  const wait = view && view.queue_position === 0 ? CHANNEL_HISTORY_QUEUED_RECHECK_MS : CHANNEL_HISTORY_RECHECK_MS;
+  const channel = channelHistory.channel;
+  channelHistoryTimer = setTimeout(() => {
+    channelHistoryTimer = null;
+    if (el("screen-settings").hidden || !channelHistory || channelHistory.channel !== channel) return;
+    // What a Save or a press said is about then; the progress line says what holds now.
+    el("channel-history-state").textContent = "";
+    loadChannelHistory(channel);
+  }, wait);
+}
+
+/** Draw what the server last said, or why there is nothing to draw. */
+function drawChannelHistory() {
+  if (!channelHistory) return;
+  const view = channelHistory.view;
+  if (!view) {
+    el("channel-history-progress").textContent = channelHistory.failure || "Checking with the server…";
+    renderChannelHistoryChoice();
+    return;
+  }
+  el("channel-history-default").textContent =
+    `Server default (${CHANNEL_HISTORY_MODE_WORDS[view.server_mode] || view.server_mode})`;
+  el("channel-history-progress").textContent = channelHistorySentence(view);
+  renderChannelHistoryChoice();
+}
+
+/**
+ * Take the server's answer for `channel` as the truth, unless the box has moved on. A choice the
+ * owner has made and not saved stays under his hand, as in Clear unread: the select follows the
+ * server only while it still shows what was saved before.
+ *
+ * @param {string} channel
+ * @param {VibeTalk.ChannelHistoryState} view
+ */
+function adoptChannelHistory(channel, view) {
+  if (!channelHistory || channelHistory.channel !== channel) return;
+  const before = channelHistory.view ? channelHistory.view.mode_override || "default" : null;
+  const select = el("channel-history-mode");
+  if (before === null || select.value === before) select.value = view.mode_override || "default";
+  channelHistory = { channel, view, failure: "" };
+  drawChannelHistory();
+  scheduleChannelHistoryRecheck();
+}
+
+/** Ask the server how `channel`'s history stands. */
+async function loadChannelHistory(channel) {
+  const read = ++channelHistoryReads;
+  try {
+    const view = await apiDecoded("ChannelHistoryState", `/api/v1/channels/${encodeURIComponent(channel)}/history`);
+    if (read === channelHistoryReads) adoptChannelHistory(channel, view);
+  } catch (error) {
+    if (read !== channelHistoryReads || !channelHistory || channelHistory.channel !== channel) return;
+    channelHistory = { channel, view: null, failure: `Could not read this channel's history: ${error.detail || error.message}` };
+    drawChannelHistory();
+  }
+}
+
+/** Redraw the history part of the box for the channel its picker is on. */
+function renderChannelHistory() {
+  const id = String(el("settings-channel").value);
+  const offered = channelHistoryOffered(id);
+  el("channel-history").hidden = !offered;
+  if (!offered) {
+    channelHistory = null;
+    stopChannelHistoryRecheck();
+    return;
+  }
+  if (!channelHistory || channelHistory.channel !== id) {
+    channelHistory = { channel: id, view: null, failure: "" };
+    stopChannelHistoryRecheck();
+    el("channel-history-mode").value = "default";
+    el("channel-history-state").textContent = "";
+    drawChannelHistory();
+    // Asked only while Settings is showing, as Clear unread is.
+    if (!el("screen-settings").hidden) loadChannelHistory(id);
+    return;
+  }
+  drawChannelHistory();
+}
+
+/** Read the box's channel again, as when Settings opens. */
+function refreshChannelHistory() {
+  const id = String(el("settings-channel").value);
+  if (!channelHistoryOffered(id)) return;
+  if (channelHistory && channelHistory.channel === id) loadChannelHistory(id);
+  else renderChannelHistory();
+}
+
+/** Save the chosen mode for the box's channel. */
+async function saveChannelHistory() {
+  const channel = String(el("settings-channel").value);
+  if (!channelHistoryOffered(channel) || !channelHistoryChanged()) return;
+  const mode = /** @type {VibeTalk.HistoryModeChoice} */ (el("channel-history-mode").value);
+  el("channel-history-save").disabled = true;
+  el("channel-history-state").textContent = "Saving…";
+  /** @type {VibeTalk.ChannelHistoryState} */
+  let view;
+  try {
+    view = await apiDecoded("ChannelHistoryState", `/api/v1/channels/${encodeURIComponent(channel)}/history`, {
+      method: "PUT",
+      body: { mode },
+    });
+  } catch (error) {
+    el("channel-history-state").textContent = `Not saved: ${error.detail || error.message}`;
+    renderChannelHistoryChoice();
+    return;
+  }
+  channelHistoryReads += 1;
+  if (channelHistory && channelHistory.channel === channel) {
+    // What was saved is now what the select shows: adopt the answer as the saved choice.
+    channelHistory = { channel, view: null, failure: "" };
+    adoptChannelHistory(channel, view);
+    el("channel-history-state").textContent = "Saved.";
+  }
+}
+
+/** "Read older messages next": the server reads this channel's older history before any other's. */
+async function prioritizeChannelHistory() {
+  const channel = String(el("settings-channel").value);
+  if (!channelHistoryOffered(channel)) return;
+  el("channel-history-prioritize").disabled = true;
+  el("channel-history-state").textContent = "Asking the server…";
+  /** @type {VibeTalk.ChannelHistoryState | null} */
+  let view = null;
+  try {
+    view = await apiDecoded(
+      "ChannelHistoryState",
+      `/api/v1/channels/${encodeURIComponent(channel)}/history/prioritize`,
+      { method: "POST" }
+    );
+  } catch (error) {
+    el("channel-history-state").textContent = `Not asked: ${error.detail || error.message}`;
+  }
+  el("channel-history-prioritize").disabled = false;
+  if (!view) {
+    renderChannelHistoryChoice();
+    return;
+  }
+  channelHistoryReads += 1;
+  adoptChannelHistory(channel, view);
+  el("channel-history-state").textContent = view.complete
+    ? "Nothing older to read: every message is saved."
+    : "Its older messages are read next, within the chat service's limits.";
 }
 
 // --- clearing unread in every channel at once ----------------------------------------------------
@@ -59003,6 +59284,9 @@ el("settings-channel").addEventListener("change", () => {
 // `#232 upstream-mark-read`. Choosing a mode only shows what Save would do; Save is the decision.
 el("upstream-clear-mode").addEventListener("change", renderUpstreamClearChoice);
 el("upstream-clear-save").addEventListener("click", saveUpstreamClear);
+el("channel-history-mode").addEventListener("change", renderChannelHistoryChoice);
+el("channel-history-save").addEventListener("click", saveChannelHistory);
+el("channel-history-prioritize").addEventListener("click", prioritizeChannelHistory);
 el("upstream-clear-push").addEventListener("click", pushUpstreamClearNow);
 el("rename-channel").addEventListener("click", () => {
   showChannelPanel("rename-fields");

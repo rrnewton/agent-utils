@@ -2046,6 +2046,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     upstreamClearCalls: [],
     /** Set to `{status, error, detail}` to make the clear-unread route fail that way. */
     upstreamClearFailure: null,
+    /** `#602 history-settings-and-limits`. The server's history state per channel id. */
+    history: new Map(),
+    /** Every history request, as `METHOD channel[ prioritize] body`. */
+    historyCalls: [],
     /**
      * `#253 upstream-clear-polish`. What `POST .../upstream-clear/now` answers: a function of the
      * channel's held state returning `{outcome, state, attempt?, message_id?, message_at_ms?}`, the
@@ -3765,6 +3769,28 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           read_state_notice: INBOX_NOTICE,
         });
       }
+      const historyPath = /^\/api\/v1\/channels\/([^/]+)\/history(\/prioritize)?$/.exec(String(path));
+      if (historyPath) {
+        const method = (options && options.method) || "GET";
+        const id = decodeURIComponent(historyPath[1]);
+        const bump = historyPath[2] === "/prioritize";
+        page.historyCalls.push(`${method} ${id}${bump ? " prioritize" : ""} ${(options && options.body) || ""}`.trim());
+        const held = page.history.get(id) || {
+          channel_id: id, server_mode: "full", mode: "full", settable: true, messages: 0,
+          walking: false, complete: false, cycle_pages: 0, now_ms: Date.UTC(2026, 9, 27, 22, 0),
+        };
+        let next = held;
+        if (method === "PUT") {
+          const body = JSON.parse(options.body);
+          next = { ...held, mode: body.mode === "default" ? held.server_mode : body.mode };
+          if (body.mode === "default") delete next.mode_override;
+          else next.mode_override = body.mode;
+        } else if (bump && method === "POST") {
+          next = { ...held, queue_position: 0 };
+        }
+        page.history.set(id, next);
+        return json(bump && method === "POST" ? 202 : 200, next);
+      }
       const clearing = /^\/api\/v1\/channels\/([^/]+)\/upstream-clear(\/now)?$/.exec(String(path));
       if (clearing) {
         const method = (options && options.method) || "GET";
@@ -4818,6 +4844,14 @@ const TUNING_BANDS = {
     "how often, after a Mark read now the server stopped waiting on, Settings asks what it came to: " +
     "sooner asks a server with nothing new to say, later leaves the line saying \"still waiting\" " +
     "long after the push landed (#253 upstream-clear-polish)"],
+  CHANNEL_HISTORY_RECHECK_MS: [10000, 120000,
+    "how often Settings reads the channel's history again while it is open: sooner asks a server whose " +
+    "walk reads a few pages a minute for nothing new, later leaves the progress line minutes stale " +
+    "(#602 history-settings-and-limits)"],
+  CHANNEL_HISTORY_QUEUED_RECHECK_MS: [2000, 15000,
+    "how often while the channel is at the front of the server's queue, when its walk moves fastest: " +
+    "sooner asks faster than the walk's ceiling of reads, later lags what Read older messages next " +
+    "started (#602 history-settings-and-limits)"],
   UPSTREAM_CLEAR_RECHECK_LIMIT_MS: [15000, 120000,
     "how long Settings keeps asking what such a press came to: shorter gives up before a bridge " +
     "slower than the server's own 45 s wait could answer, longer keeps asking about a push the " +
@@ -58519,6 +58553,72 @@ test("`#298 thread-card-header`: from the thread list, the card moves up across 
 const CLEAR_PATH = `/api/v1/channels/${CHANNEL.id}/upstream-clear`;
 
 /** A signed-in page on Settings, whose server can clear unread in Google Chat. */
+test("`#602 history-settings-and-limits`: the channel box says how the channel's history stands, saves its own mode, and asks for it next", async () => {
+  const walking = {
+    channel_id: CHANNEL.id, server_mode: "full", mode: "full", settable: true, messages: 12400,
+    oldest_ms: Date.UTC(2026, 3, 1, 12), walking: true, reached_ms: Date.UTC(2026, 3, 1, 12),
+    complete: false, cycle_pages: 140, pages_per_hour: 240.5, eta_s: 5400,
+    now_ms: Date.UTC(2026, 9, 27, 22, 0), requests_per_minute: 20, requests_last_minute: 7,
+  };
+  const historyPage = async (script = SCRIPT, view = walking) => {
+    const page = newPage(new Map(), script);
+    page.messageCache = messageCacheStatus();
+    page.history.set(CHANNEL.id, view);
+    await signIn(page);
+    await page.el("open-settings").click();
+    await page.settle();
+    return page;
+  };
+  const page = await historyPage();
+  assert.equal(page.el("channel-history").hidden, false, "the box hides the channel's history");
+  assert.deepEqual(page.historyCalls, [`GET ${CHANNEL.id}`]);
+  assert.ok(markupHolds("channel-settings", "channel-history"), "the history is not in the channel box");
+  const line = page.el("channel-history-progress").textContent;
+  assert.match(line, /^12,?400 messages saved, back to /);
+  assert.match(line, /Reading older messages, back to .+ so far at 240\.5 pages an hour\. About 2 hours to go\.$/);
+  assert.equal(page.el("channel-history-default").textContent, "Server default (whole history)");
+  assert.equal(page.el("channel-history-mode").value, "default");
+  assert.equal(page.el("channel-history-save").disabled, true, "Save offered with nothing to save");
+  assert.equal(page.el("channel-history-prioritize").hidden, false);
+  // Its own mode: a deliberate Save, of the mode alone.
+  page.el("channel-history-mode").value = "recent";
+  await page.el("channel-history-mode").dispatch("change");
+  assert.equal(page.historyCalls.length, 1, "choosing a mode saved it by itself");
+  assert.equal(page.el("channel-history-save").disabled, false);
+  await page.el("channel-history-save").click();
+  await page.settle();
+  assert.equal(page.historyCalls.at(-1), `PUT ${CHANNEL.id} {"mode":"recent"}`);
+  assert.equal(page.el("channel-history-mode").value, "recent");
+  assert.equal(page.el("channel-history-save").disabled, true);
+  assert.equal(page.el("channel-history-state").textContent, "Saved.");
+  // Read older messages next: the queue, and the button steps aside while it is at the front.
+  await page.el("channel-history-prioritize").click();
+  await page.settle();
+  assert.equal(page.historyCalls.at(-1), `POST ${CHANNEL.id} prioritize`);
+  assert.match(page.el("channel-history-progress").textContent, /Asked for: it is read next\./);
+  assert.equal(page.el("channel-history-prioritize").hidden, true);
+  // While it is at the front the box reads it again soon, and less often otherwise.
+  assert.equal(page.expireTimers(5000) > 0, true, "the queued channel is not read again");
+  await page.settle();
+  assert.equal(page.historyCalls.at(-1), `GET ${CHANNEL.id}`);
+  // Nothing about it is kept on this device: it is the server's.
+  assert.deepEqual([...page.storage.keys()].filter((key) => /history/i.test(key)), []);
+  // A complete channel offers nothing further back, and a pause says why and for how long.
+  const whole = await historyPage(SCRIPT, {
+    ...walking, walking: false, complete: true, complete_ms: Date.UTC(2026, 9, 27, 20), eta_s: undefined,
+    held_reason: "rate_limited", held_until_ms: Date.UTC(2026, 9, 27, 22, 3),
+  });
+  assert.equal(whole.el("channel-history-prioritize").hidden, true);
+  assert.match(whole.el("channel-history-progress").textContent,
+    /Complete: every message back to the channel's beginning\. Paused for 3 minutes: the chat service asked for fewer requests\.$/);
+  // The negative control: a box never offered shows and reads nothing, so the checks above saw the box.
+  const blind = await historyPage(brokenScript(
+    "  return !allChannelsChosen() && Boolean(knownChannel(id)) && Boolean(serverCache && serverCache.available);\n",
+    "  return false;\n"));
+  assert.equal(blind.el("channel-history").hidden, true, "the negative control showed the box anyway");
+  assert.deepEqual(blind.historyCalls, [], "the negative control read the server anyway, so the check above proves nothing");
+});
+
 async function clearingPage(arrange = null) {
   const page = newPage();
   page.chatProviderName = "Google Chat";

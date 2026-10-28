@@ -983,6 +983,7 @@ mod measure {
     use serde_json::{json, Value};
     use tower::ServiceExt as _;
     use vibe_talk::backfill::{Backfill, BackfillStep};
+    use vibe_talk::chat::ChatClient as _;
     use vibe_talk::model::ChannelId;
     use vibe_talk::providers::ChatRouter;
     use vibe_talk::relist::RelistOptions;
@@ -1765,7 +1766,8 @@ mod measure {
                             reads += 1;
                         }
                     }
-                    BackfillStep::Idle => break,
+                    // The provider's ceiling of requests a minute: the rest waits for the next.
+                    BackfillStep::Idle | BackfillStep::Waiting => break,
                     other => panic!("unexpected step {other:?}"),
                 }
             }
@@ -2183,6 +2185,515 @@ mod measure {
             ms[ms.len() / 2],
             ms[ms.len() - 1]
         )
+    }
+
+    // ---- `#602 history-settings-and-limits` --------------------------------------------------
+
+    const OTHER: &str = "C0000OTHR2";
+    const THIRD: &str = "C0000THRD3";
+
+    /// `[[channels]]` entries for more channels, ahead of a `[message_cache]` table.
+    fn with_channels(ids: &[&str], table: &str) -> String {
+        let mut text = String::new();
+        for id in ids {
+            text.push_str(&format!(
+                "\n[[channels]]\nid = \"{id}\"\nlabel = \"{id}\"\n"
+            ));
+        }
+        text.push_str(table);
+        text
+    }
+
+    /// `count` messages `spacing` seconds apart in each of `ids`, the newest a minute ago.
+    fn histories(ids: &[&str], count: i64, spacing: i64) -> FakeState {
+        let mut state = FakeState::default();
+        let base = wall_secs() - 60 - (count - 1) * spacing;
+        for id in ids {
+            let list: Vec<Value> = (0..count)
+                .map(|i| {
+                    profiled(
+                        &format!("{}.000000", base + i * spacing),
+                        "UADA00001",
+                        "Ada",
+                        &format!("{id} message {i}"),
+                    )
+                })
+                .collect();
+            state.history.insert((*id).to_owned(), list);
+        }
+        state
+    }
+
+    fn frontier_of(state: &AppState, id: &str) -> Option<vibe_talk::cache::Frontier> {
+        let cache = state.message_cache.cache().expect("a cache");
+        assert!(cache.quiesce_blocking(WAIT), "the writer caught up");
+        let chan = state
+            .message_cache
+            .chan_key(&ChannelId(id.to_owned()))
+            .expect("routed");
+        cache.frontier(&chan).served().expect("served")
+    }
+
+    /// Step until nothing is due, moving the clock past every wait of the pace; the reads made.
+    async fn drain(backfill: &mut Backfill, state: &AppState, clock: &ManualClock) -> usize {
+        let mut reads = 0;
+        for _ in 0..10_000 {
+            match backfill.step(state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Read => reads += 1,
+                BackfillStep::Waiting => clock.advance(1_200),
+                BackfillStep::Idle => return reads,
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        panic!("the backfill never settled");
+    }
+
+    /// A JSON request through the router: its status and its body.
+    async fn call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<&Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        let body = match body {
+            Some(body) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = vibe_talk::http::router(state.clone())
+            .oneshot(builder.body(body).expect("request"))
+            .await
+            .expect("the router answers");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    /// A channel's own mode decides whether it is walked whole, whatever the server's backfill
+    /// says: `full` on a server set to `recent` walks it to its beginning, `recent` on a server set
+    /// to `full` keeps it out of the full walk. Set through the route, kept in the store, and shown
+    /// by `GET .../history` and the diagnostics' report.
+    #[tokio::test]
+    async fn a_channel_of_its_own_mode_is_walked_whole_or_not_whatever_the_server_says() {
+        // 300 messages three hours apart: 37 days, three pages of 100.
+        let fake = Fake::start(histories(&[CH], 300, 3 * 3600), 100).await;
+        let table = "\n[message_cache]\nbackfill = \"recent\"\nmax_days = 365\nfull_reads_per_minute = 50\n";
+        let (state, clock, _dir) = cached(&fake, "own-mode-full", table).await;
+        let uri = format!("/api/v1/channels/{CH}/history");
+        let (status, body) = call(&state, "GET", &uri, READ_TOKEN, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["server_mode"], "recent");
+        assert_eq!(body["mode"], "recent");
+        assert!(body.get("mode_override").is_none(), "{body}");
+        assert_eq!(body["settable"], true);
+        let (status, _) = call(
+            &state,
+            "PUT",
+            &uri,
+            READ_TOKEN,
+            Some(&json!({"mode": "full"})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the read token may not change it"
+        );
+        let (status, body) = call(
+            &state,
+            "PUT",
+            &uri,
+            WRITE_TOKEN,
+            Some(&json!({"mode": "full"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["mode"], "full");
+        assert_eq!(body["mode_override"], "full");
+        assert_eq!(
+            state.store.history_modes().await.expect("read")[0].mode,
+            vibe_talk::store::HistoryMode::Full
+        );
+        drain(&mut Backfill::new(), &state, &clock).await;
+        let done = frontier_of(&state, CH).expect("walked whole");
+        assert_eq!(done.cursor, None);
+        assert!(done.complete_ms.is_some());
+        let (_, body) = call(&state, "GET", &uri, READ_TOKEN, None).await;
+        assert_eq!(body["complete"], true, "{body}");
+        assert_eq!(body["messages"], 300);
+        assert!(body["oldest_ms"].as_i64().is_some());
+        let report = vibe_talk::backfill::history(&state).expect("a report");
+        assert_eq!(report.mode, "recent");
+        assert_eq!(report.channels[0].mode, "full");
+        assert_eq!(report.channels[0].mode_override, Some("full"));
+
+        // And the other way round.
+        let fake = Fake::start(histories(&[CH], 300, 3 * 3600), 100).await;
+        let (state, clock, _dir) = cached(&fake, "own-mode-recent", FULL).await;
+        let (status, _) = call(
+            &state,
+            "PUT",
+            &uri,
+            WRITE_TOKEN,
+            Some(&json!({"mode": "recent"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        drain(&mut Backfill::new(), &state, &clock).await;
+        assert_eq!(
+            frontier_of(&state, CH),
+            None,
+            "never walked into older history"
+        );
+        let (_, body) = call(
+            &state,
+            "PUT",
+            &uri,
+            WRITE_TOKEN,
+            Some(&json!({"mode": "default"})),
+        )
+        .await;
+        assert_eq!(body["mode"], "full");
+        assert!(body.get("mode_override").is_none(), "{body}");
+        assert!(state.store.history_modes().await.expect("read").is_empty());
+    }
+
+    /// "Read this one next": a prioritized channel's walk into older history goes before every
+    /// other channel's, at the provider's ceiling (20 reads a minute for Slack) rather than
+    /// `full_reads_per_minute`, which keeps to the ceiling too; it leaves the queue on reaching the
+    /// beginning, and a channel already whole leaves it at once without a read.
+    #[tokio::test]
+    async fn a_prioritized_channel_is_walked_first_within_the_providers_ceiling() {
+        // 2,000 messages an hour apart in each: twenty pages of 100 to the beginning.
+        let fake = Fake::start(histories(&[CH, OTHER], 2_000, 3600), 100).await;
+        let table = with_channels(
+            &[OTHER],
+            "\n[message_cache]\nbackfill = \"full\"\nrecent_days = 1\nfull_reads_per_minute = 1\n",
+        );
+        let (state, clock, _dir) = cached(&fake, "prioritize", &table).await;
+        let mut backfill = Backfill::new();
+        // Each channel's recent walk first: one page each, the last day.
+        let mut reads = 0;
+        while reads < 2 {
+            assert_eq!(
+                backfill.step(&state, LIMIT, Duration::ZERO).await,
+                BackfillStep::Read
+            );
+            reads += 1;
+        }
+        let uri = format!("/api/v1/channels/{OTHER}/history/prioritize");
+        let (status, body) = call(&state, "POST", &uri, WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["queue_position"], 0);
+        // Its walk runs on the ceiling, without the full walk's one read a minute: on, in this same
+        // minute, until the provider's 20 requests are spent (each read of the fake is one or two).
+        let mut other_pages = 0;
+        loop {
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Read => other_pages += 1,
+                BackfillStep::Waiting => break,
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert!(
+            other_pages >= 5,
+            "the walk asked for kept to the ceiling alone: {other_pages}"
+        );
+        assert_eq!(
+            frontier_of(&state, CH),
+            None,
+            "the other channel waited its turn"
+        );
+        assert_eq!(
+            frontier_of(&state, OTHER).expect("walking").cycle_pages,
+            i64::from(other_pages)
+        );
+        let history_uri = format!("/api/v1/channels/{OTHER}/history");
+        let (_, body) = call(&state, "GET", &history_uri, READ_TOKEN, None).await;
+        assert_eq!(body["walking"], true, "{body}");
+        assert_eq!(body["requests_per_minute"], 20);
+        assert!(
+            body["requests_last_minute"]
+                .as_u64()
+                .is_some_and(|n| n >= 20),
+            "{body}"
+        );
+        assert!(body["reached_ms"].as_i64().is_some(), "{body}");
+        // A minute on, a stream gap asks for the other channel's hot walk: re-reads go before any
+        // walk into older history, the one asked for included.
+        clock.advance(60_000);
+        state.live.request_rewalk(&channel());
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Read
+        );
+        let last = fake.requests("conversations.history");
+        assert_eq!(
+            last.last()
+                .and_then(|request| request.get("channel"))
+                .map(String::as_str),
+            Some(CH),
+            "the hot walk went first"
+        );
+        // Then the rest of the walk asked for; the queue empties at the beginning.
+        loop {
+            match backfill.step(&state, LIMIT, Duration::ZERO).await {
+                BackfillStep::Read => {}
+                BackfillStep::Waiting => clock.advance(60_000),
+                other => panic!("unexpected step {other:?}"),
+            }
+            if frontier_of(&state, OTHER).is_some_and(|f| f.cursor.is_none()) {
+                break;
+            }
+        }
+        assert!(
+            state.live.history().queue().is_empty(),
+            "it left the queue at the beginning"
+        );
+        let (_, body) = call(&state, "GET", &history_uri, READ_TOKEN, None).await;
+        assert_eq!(body["complete"], true, "{body}");
+        assert!(body.get("queue_position").is_none(), "{body}");
+        // Already whole: asked again, it leaves the queue without a walk of its own, even past
+        // `full_cycle_hours` when its next walk is due anyway, since the last to reach the
+        // beginning began less than a week ago.
+        clock.advance(80 * 3600 * 1000);
+        let (status, body) = call(&state, "POST", &uri, WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["complete"], true, "{body}");
+        assert!(body.get("queue_position").is_none(), "not queued: {body}");
+        assert!(
+            state.live.history().queue().is_empty(),
+            "nothing further back to read"
+        );
+        // Cancelling and the refusal with the backfill off.
+        let (status, _) = call(&state, "DELETE", &uri, WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let fake = Fake::start(histories(&[CH], 10, 60), 100).await;
+        let off_table = "\n[message_cache]\nbackfill = \"off\"\n";
+        let (off, _clock, _dir) = cached(&fake, "prioritize-off", off_table).await;
+        let off_uri = format!("/api/v1/channels/{CH}/history/prioritize");
+        let (status, body) = call(&off, "POST", &off_uri, WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "nothing would read it");
+        assert_eq!(body["error"], "history_backfill_off", "{body}");
+    }
+
+    /// Rate limits. A read that fails in a way that may pass holds every backfill read of the
+    /// provider, doubling from 30 seconds, and a success resets it. Slack's `Retry-After` is waited
+    /// out inside a read, and ANY rate limit on a read route, the backfill's or the page's own,
+    /// keeps the backfill off the provider for five quiet minutes however short the wait Slack
+    /// asked for (the live instance's route answered `Retry-After: 1` until the page's reads gave
+    /// up); a longer `Retry-After` holds it for as long as Slack asked. The diagnostics say how
+    /// hard the limits press. The fake returns the 429s with their headers.
+    #[tokio::test]
+    async fn the_backfill_backs_off_and_yields_the_route_while_slack_rate_limits_it() {
+        let pace = |state: &AppState| state.live.history().pace("slack").expect("a pace");
+        use vibe_talk::history_control::HoldReason;
+
+        // Exponential backoff on a 5xx. Two hundred messages a minute apart: each channel's walk
+        // takes four reads of 50, so some channel always has a read due.
+        let fake = Fake::start(histories(&[CH, OTHER, THIRD], 200, 60), 100).await;
+        let table = with_channels(
+            &[OTHER, THIRD],
+            "\n[message_cache]\nbackfill = \"recent\"\n",
+        );
+        let (state, clock, _dir) = cached(&fake, "backoff", &table).await;
+        let mut backfill = Backfill::new();
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Read
+        );
+        fake.with(|fake| {
+            fake.http_fail
+                .insert("conversations.history".to_owned(), (503, "busy".to_owned()));
+        });
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Failed
+        );
+        let first = pace(&state);
+        assert_eq!(first.failures, 1);
+        assert_eq!(first.held_because, Some(HoldReason::UpstreamError));
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Held
+        );
+        clock.advance(29_000);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Held
+        );
+        // Past 30 seconds and its jitter of up to a tenth: the next channel is read, and fails.
+        clock.advance(5_000);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Failed
+        );
+        assert_eq!(pace(&state).failures, 2);
+        clock.advance(34_000);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Held,
+            "the second wait is twice the first"
+        );
+        clock.advance(33_000);
+        fake.with(|fake| {
+            fake.http_fail.clear();
+        });
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Read
+        );
+        assert_eq!(pace(&state).failures, 0, "a success resets the backoff");
+
+        // Two 429s with Retry-After 1. A backfill read gives up at its first, sending nothing more;
+        // the page's own read waits them out and succeeds; and then the backfill stays off the
+        // route for five quiet minutes, although Slack asked for one second.
+        let fake = Fake::start(histories(&[CH, OTHER], 200, 60), 100).await;
+        let table = with_channels(&[OTHER], "\n[message_cache]\nbackfill = \"recent\"\n");
+        let (state, clock, _dir) = cached(&fake, "rate-limit-short", &table).await;
+        let mut backfill = Backfill::new();
+        fake.with(|fake| {
+            fake.rate_limit_many
+                .insert("conversations.history".to_owned(), (1, 1));
+        });
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Failed
+        );
+        assert_eq!(
+            fake.calls("conversations.history"),
+            1,
+            "not sent again inside the read"
+        );
+        assert_eq!(pace(&state).held_because, Some(HoldReason::RateLimited));
+        fake.with(|fake| {
+            fake.rate_limit_many
+                .insert("conversations.history".to_owned(), (1, 2));
+        });
+        let started = std::time::Instant::now();
+        let read = state
+            .providers
+            .fetch_timeline(&channel(), &vibe_talk::threads::TimelineRequest::default())
+            .await;
+        assert!(read.is_ok(), "the page's read waited the limits out");
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "both waits were taken"
+        );
+        let calls = fake.calls("conversations.history");
+        clock.advance(40_000);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Held
+        );
+        let held = pace(&state);
+        assert_eq!(held.held_because, Some(HoldReason::ProviderSignal));
+        let wall = jiff::Timestamp::now().as_millisecond();
+        let left = held.held_until_ms.expect("held") - wall;
+        assert!(
+            left > 280_000 && left <= 300_000,
+            "five quiet minutes, not one second: {left}"
+        );
+        assert_eq!(
+            fake.calls("conversations.history"),
+            calls,
+            "the backfill sent nothing"
+        );
+        let report = vibe_talk::backfill::history(&state).expect("a report");
+        let pressure = &report.pressure["slack"];
+        assert_eq!(pressure.limited_last_10_min, 3);
+        assert_eq!(
+            pressure.routes["conversations.history"].limited_last_10_min,
+            3
+        );
+        assert!(
+            pressure.crawl_hold_s.is_some_and(|s| s > 280),
+            "{pressure:?}"
+        );
+
+        // A 429 asking for longer than the client's budget is not waited inside the read: the
+        // provider's backfill holds for as long as Slack asked, past the first backoff.
+        let fake = Fake::start(histories(&[CH, OTHER], 200, 60), 100).await;
+        let table = with_channels(&[OTHER], "\n[message_cache]\nbackfill = \"recent\"\n");
+        let (state, clock, _dir) = cached(&fake, "rate-limit-long", &table).await;
+        let mut backfill = Backfill::new();
+        fake.with(|fake| {
+            fake.rate_limit_many
+                .insert("conversations.history".to_owned(), (90, 1));
+        });
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Failed
+        );
+        assert_eq!(
+            fake.calls("conversations.history"),
+            1,
+            "not sent again inside the read"
+        );
+        let held = pace(&state);
+        assert_eq!(held.held_because, Some(HoldReason::RateLimited));
+        let wall = jiff::Timestamp::now().as_millisecond();
+        let until = held.held_until_ms.expect("held");
+        assert!(
+            (until - wall) > 85_000 && (until - wall) <= 91_000,
+            "{}",
+            until - wall
+        );
+        clock.advance(60_000);
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Held
+        );
+
+        // A 429 answered to the page's own read holds the backfill as well.
+        let fake = Fake::start(histories(&[CH], 40, 60), 100).await;
+        let (state, _clock, _dir) = cached(
+            &fake,
+            "rate-limit-signal",
+            "\n[message_cache]\nbackfill = \"recent\"\n",
+        )
+        .await;
+        fake.with(|fake| {
+            fake.rate_limit_once = Some(("conversations.history".to_owned(), 90));
+        });
+        let read = state
+            .providers
+            .fetch_timeline(&channel(), &vibe_talk::threads::TimelineRequest::default())
+            .await;
+        assert!(read.is_err(), "the page's read was refused");
+        let mut backfill = Backfill::new();
+        assert_eq!(
+            backfill.step(&state, LIMIT, Duration::ZERO).await,
+            BackfillStep::Held
+        );
+        assert_eq!(pace(&state).held_because, Some(HoldReason::ProviderSignal));
+        assert_eq!(
+            fake.calls("conversations.history"),
+            1,
+            "the backfill sent nothing"
+        );
+        let (_, body) = call(
+            &state,
+            "GET",
+            &format!("/api/v1/channels/{CH}/history"),
+            READ_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(body["held_reason"], "provider_signal", "{body}");
     }
 
     #[tokio::test]

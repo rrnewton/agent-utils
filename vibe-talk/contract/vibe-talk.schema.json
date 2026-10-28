@@ -117,6 +117,177 @@
       ],
       "type": "object"
     },
+    "ChannelHistoryState": {
+      "description": "One channel's history in the message cache, and the owner's say over it: `GET`, `PUT\n/api/v1/channels/{id}/history`, and `POST` or `DELETE .../history/prioritize`. `#602\nhistory-settings-and-limits`.\n\nWhat Settings › Channels shows under History, and what search's \"Search further back\" reads\nwhile it waits. Times are milliseconds since the Unix epoch on the server's clock; `now_ms`\nis that clock as of the answer, so a page can say \"in 3 minutes\" without trusting its own.",
+      "properties": {
+        "channel_id": {
+          "description": "The channel it is about.",
+          "type": "string"
+        },
+        "complete": {
+          "description": "Whether the cache holds every message back to the channel's beginning: a walk reached it,\nand the latest to reach it began less than a week ago.",
+          "type": "boolean"
+        },
+        "complete_ms": {
+          "description": "When the latest walk to reach the beginning ended.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cycle_pages": {
+          "description": "Pages the walk under way has read.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "days_per_hour": {
+          "description": "See `pages_per_hour`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "eta_s": {
+          "description": "Seconds until the walk under way reaches the beginning, from the latest walk's length and\nthis one's pace; absent before any walk has reached it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "held_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HoldReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "See `held_until_ms`. `storage` has no end time: it lasts while the file is above the share\nof `max_megabytes` at which the walk into older history waits."
+        },
+        "held_until_ms": {
+          "description": "Until when the backfill's reads of its provider hold off, and why: `rate_limited`,\n`upstream_error`, `provider_signal` or `storage`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "messages": {
+          "description": "Messages the cache holds of it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "description": "How far back the backfill reads it now: `off` whatever the channel says when the server's\nbackfill is off, otherwise its own choice, otherwise the server's.",
+          "type": "string"
+        },
+        "mode_override": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's own choice for this channel, `recent` or `full`; absent while it follows the\nserver's."
+        },
+        "newest_ms": {
+          "description": "See `oldest_ms`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "now_ms": {
+          "description": "The server's clock as of this answer.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "oldest_ms": {
+          "description": "The oldest and newest message held.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pages_per_hour": {
+          "description": "Its pace so far, in pages an hour, and in days of history an hour.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "queue_position": {
+          "description": "Its place among the channels asked to be read next, 0 at the front; absent when not asked.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reached_ms": {
+          "description": "See `walking`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "requests_last_minute": {
+          "description": "See `requests_per_minute`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "requests_per_minute": {
+          "description": "`[[providers]] backfill_requests_per_minute` of its provider, and its backfill reads in the\nlast minute.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "server_mode": {
+          "description": "`[message_cache] backfill`: `recent`, `full` or `off`.",
+          "type": "string"
+        },
+        "settable": {
+          "description": "Whether this server can keep a choice of the channel's own (it has a durable store).",
+          "type": "boolean"
+        },
+        "walking": {
+          "description": "Whether a walk into older history is under way, and the oldest message it has reached.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "channel_id",
+        "server_mode",
+        "mode",
+        "settable",
+        "messages",
+        "walking",
+        "complete",
+        "cycle_pages",
+        "now_ms"
+      ],
+      "type": "object"
+    },
     "ChannelId": {
       "description": "A Discord channel snowflake, as a string, exactly as Discord renders it.",
       "type": "string"
@@ -550,6 +721,79 @@
         "cut"
       ],
       "type": "object"
+    },
+    "HistoryMode": {
+      "description": "How far back the server's backfill reads one channel, when the owner chose for it in Settings\nrather than leaving it to `[message_cache] backfill`. `#602 history-settings-and-limits`.\n\nNo row means the channel follows the server's setting. `off` is not a choice here: it is the\noperator's switch for every read the backfill makes, and a channel's own choice never turns\nthose reads on where the operator turned them off.",
+      "oneOf": [
+        {
+          "const": "recent",
+          "description": "Keep the recent stretch read and re-read, as `backfill = \"recent\"` does.",
+          "type": "string"
+        },
+        {
+          "const": "full",
+          "description": "Also walk back to the channel's beginning, as `backfill = \"full\"` does.",
+          "type": "string"
+        }
+      ]
+    },
+    "HistoryModeChoice": {
+      "description": "See [`HistoryModeRequest`].",
+      "oneOf": [
+        {
+          "const": "recent",
+          "description": "Keep the recent stretch read and re-read.",
+          "type": "string"
+        },
+        {
+          "const": "full",
+          "description": "Also walk back to the channel's beginning.",
+          "type": "string"
+        },
+        {
+          "const": "default",
+          "description": "Follow the server's setting.",
+          "type": "string"
+        }
+      ]
+    },
+    "HistoryModeRequest": {
+      "description": "`PUT /api/v1/channels/{id}/history`: the channel's own history mode. `#602\nhistory-settings-and-limits`.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/HistoryModeChoice",
+          "description": "`recent`, `full`, or `default` to follow the server's `[message_cache] backfill` again."
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "HoldReason": {
+      "description": "Why the backfill's reads of one provider are holding off.",
+      "oneOf": [
+        {
+          "const": "rate_limited",
+          "description": "The provider answered a backfill read with a rate limit the client could not wait out.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_error",
+          "description": "A backfill read failed in a way that may pass (a 5xx, a timeout, a lost connection).",
+          "type": "string"
+        },
+        {
+          "const": "provider_signal",
+          "description": "The provider signalled it to every request: a rate limit answered to some other read, or\na count of rejected requests nearing its ban ([`crate::chat::ChatClient::crawl_hold`]).",
+          "type": "string"
+        },
+        {
+          "const": "storage",
+          "description": "The cache file is above the share of `max_megabytes` at which the full walk waits.",
+          "type": "string"
+        }
+      ]
     },
     "LiveDeleteEvent": {
       "description": "The data of a live stream `message_delete` event: only the ids, never the removed text.",
@@ -3199,6 +3443,12 @@
     },
     {
       "$ref": "#/$defs/ClientSettings"
+    },
+    {
+      "$ref": "#/$defs/ChannelHistoryState"
+    },
+    {
+      "$ref": "#/$defs/HistoryModeRequest"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

@@ -1926,6 +1926,14 @@ impl ChatClient for HttpDiscordClient {
         self.upstream_read_marks && !crate::config::is_official_discord_api_base(&self.api_base)
     }
 
+    fn crawl_hold(&self) -> Option<std::time::Duration> {
+        self.limiter.crawl_hold()
+    }
+
+    fn rate_limit_pressure(&self) -> Option<crate::chat::RateLimitPressure> {
+        Some(self.limiter.pressure())
+    }
+
     async fn clear_upstream_through(
         &self,
         channel: &ChannelId,

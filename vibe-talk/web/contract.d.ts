@@ -98,6 +98,113 @@ declare namespace VibeTalk {
   }
 
   /**
+   * One channel's history in the message cache, and the owner's say over it: `GET`, `PUT
+   * /api/v1/channels/{id}/history`, and `POST` or `DELETE .../history/prioritize`. `#602
+   * history-settings-and-limits`.
+   *
+   * What Settings › Channels shows under History, and what search's "Search further back" reads
+   * while it waits. Times are milliseconds since the Unix epoch on the server's clock; `now_ms`
+   * is that clock as of the answer, so a page can say "in 3 minutes" without trusting its own.
+   */
+  interface ChannelHistoryState {
+    /**
+     * The channel it is about.
+     */
+    channel_id: string;
+    /**
+     * Whether the cache holds every message back to the channel's beginning: a walk reached it,
+     * and the latest to reach it began less than a week ago.
+     */
+    complete: boolean;
+    /**
+     * When the latest walk to reach the beginning ended.
+     */
+    complete_ms?: number | null;
+    /**
+     * Pages the walk under way has read.
+     */
+    cycle_pages: number;
+    /**
+     * See `pages_per_hour`.
+     */
+    days_per_hour?: number | null;
+    /**
+     * Seconds until the walk under way reaches the beginning, from the latest walk's length and
+     * this one's pace; absent before any walk has reached it.
+     */
+    eta_s?: number | null;
+    /**
+     * See `held_until_ms`. `storage` has no end time: it lasts while the file is above the share
+     * of `max_megabytes` at which the walk into older history waits.
+     */
+    held_reason?: HoldReason | null;
+    /**
+     * Until when the backfill's reads of its provider hold off, and why: `rate_limited`,
+     * `upstream_error`, `provider_signal` or `storage`.
+     */
+    held_until_ms?: number | null;
+    /**
+     * Messages the cache holds of it.
+     */
+    messages: number;
+    /**
+     * How far back the backfill reads it now: `off` whatever the channel says when the server's
+     * backfill is off, otherwise its own choice, otherwise the server's.
+     */
+    mode: string;
+    /**
+     * The owner's own choice for this channel, `recent` or `full`; absent while it follows the
+     * server's.
+     */
+    mode_override?: HistoryMode | null;
+    /**
+     * See `oldest_ms`.
+     */
+    newest_ms?: number | null;
+    /**
+     * The server's clock as of this answer.
+     */
+    now_ms: number;
+    /**
+     * The oldest and newest message held.
+     */
+    oldest_ms?: number | null;
+    /**
+     * Its pace so far, in pages an hour, and in days of history an hour.
+     */
+    pages_per_hour?: number | null;
+    /**
+     * Its place among the channels asked to be read next, 0 at the front; absent when not asked.
+     */
+    queue_position?: number | null;
+    /**
+     * See `walking`.
+     */
+    reached_ms?: number | null;
+    /**
+     * See `requests_per_minute`.
+     */
+    requests_last_minute?: number | null;
+    /**
+     * `[[providers]] backfill_requests_per_minute` of its provider, and its backfill reads in the
+     * last minute.
+     */
+    requests_per_minute?: number | null;
+    /**
+     * `[message_cache] backfill`: `recent`, `full` or `off`.
+     */
+    server_mode: string;
+    /**
+     * Whether this server can keep a choice of the channel's own (it has a durable store).
+     */
+    settable: boolean;
+    /**
+     * Whether a walk into older history is under way, and the oldest message it has reached.
+     */
+    walking: boolean;
+  }
+
+  /**
    * A Discord channel snowflake, as a string, exactly as Discord renders it.
    */
   type ChannelId = string;
@@ -561,6 +668,37 @@ declare namespace VibeTalk {
      */
     title?: string | null;
   }
+
+  /**
+   * How far back the server's backfill reads one channel, when the owner chose for it in Settings
+   * rather than leaving it to `[message_cache] backfill`. `#602 history-settings-and-limits`.
+   *
+   * No row means the channel follows the server's setting. `off` is not a choice here: it is the
+   * operator's switch for every read the backfill makes, and a channel's own choice never turns
+   * those reads on where the operator turned them off.
+   */
+  type HistoryMode = "recent" | "full";
+
+  /**
+   * See [`HistoryModeRequest`].
+   */
+  type HistoryModeChoice = "recent" | "full" | "default";
+
+  /**
+   * `PUT /api/v1/channels/{id}/history`: the channel's own history mode. `#602
+   * history-settings-and-limits`.
+   */
+  interface HistoryModeRequest {
+    /**
+     * `recent`, `full`, or `default` to follow the server's `[message_cache] backfill` again.
+     */
+    mode: HistoryModeChoice;
+  }
+
+  /**
+   * Why the backfill's reads of one provider are holding off.
+   */
+  type HoldReason = "rate_limited" | "upstream_error" | "provider_signal" | "storage";
 
   /**
    * The data of a live stream `message_delete` event: only the ids, never the removed text.
@@ -2450,6 +2588,8 @@ declare namespace VibeTalk {
     MessageCacheStatus: MessageCacheStatus;
     MessageCacheRequest: MessageCacheRequest;
     ClientSettings: ClientSettings;
+    ChannelHistoryState: ChannelHistoryState;
+    HistoryModeRequest: HistoryModeRequest;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

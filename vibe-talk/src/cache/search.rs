@@ -78,15 +78,29 @@ ORDER BY m.created_ms DESC, m.numeric_id DESC LIMIT :limit",
     sql
 }
 
-/// The FTS5 query for terms: each one quoted, `"` doubled, so nothing in a term is FTS syntax.
-/// Terms are lowercased, as `search_text` is.
+/// The FTS5 query for terms: every distinct trigram of every term, each quoted with `"` doubled so
+/// nothing in a term is FTS syntax, joined by AND. Terms are lowercased, as `search_text` is.
+///
+/// Trigrams rather than a phrase per term because the index keeps no positions (`detail = none`,
+/// cache schema 5, `#602 history-settings-and-limits`: 86 % smaller), and FTS5 refuses a phrase
+/// without them. The rows holding every trigram of a term are a superset of the rows holding the
+/// term, and every candidate is matched again in Rust ([`rematch`]), so the answer is the same. A
+/// term shorter than three characters has no trigram and adds nothing: [`choose`] sends such a
+/// search to the scan.
 #[must_use]
 pub fn fts_query(terms: &[String]) -> String {
-    terms
-        .iter()
-        .map(|term| format!("\"{}\"", term.to_lowercase().replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut grams: Vec<String> = Vec::new();
+    for term in terms {
+        let chars: Vec<char> = term.to_lowercase().chars().collect();
+        for window in chars.windows(3) {
+            let gram: String = window.iter().collect();
+            let quoted = format!("\"{}\"", gram.replace('"', "\"\""));
+            if !grams.contains(&quoted) {
+                grams.push(quoted);
+            }
+        }
+    }
+    grams.join(" AND ")
 }
 
 /// Which query shape a search takes.
@@ -308,7 +322,17 @@ mod tests {
     fn terms_are_quoted_so_nothing_in_one_is_syntax() {
         assert_eq!(
             fts_query(&["Ab\"c".to_owned(), "x OR y".to_owned()]),
-            "\"ab\"\"c\" \"x or y\""
+            "\"ab\"\"\" AND \"b\"\"c\" AND \"x o\" AND \" or\" AND \"or \" AND \"r y\""
+        );
+        assert_eq!(
+            fts_query(&["abab".to_owned()]),
+            "\"aba\" AND \"bab\"",
+            "each trigram once"
+        );
+        assert_eq!(
+            fts_query(&["go".to_owned()]),
+            "",
+            "too short for any trigram"
         );
     }
 

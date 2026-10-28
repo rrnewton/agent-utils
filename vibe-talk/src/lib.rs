@@ -66,6 +66,7 @@ pub mod egress;
 pub mod elevenlabs;
 pub mod heading;
 pub mod held_replies;
+pub mod history_control;
 pub mod http;
 pub mod link_labels;
 pub mod live;
