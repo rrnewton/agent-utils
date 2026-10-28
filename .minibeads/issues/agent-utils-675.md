@@ -1,13 +1,14 @@
 ---
 title: 'watch-blocked-fast-alerts: report a lane blocked at an approval prompt or guardrail refusal on the next pass, with a fast prompt-only check'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 - watch-agents
 created_at: 2026-10-28T20:16:45.653757837+00:00
-updated_at: 2026-10-28T20:16:45.653757837+00:00
+updated_at: 2026-10-28T22:20:03.335373154+00:00
+closed_at: 2026-10-28T22:20:03.335372964+00:00
 ---
 
 # Description
