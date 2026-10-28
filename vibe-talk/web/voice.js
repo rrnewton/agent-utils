@@ -32301,7 +32301,9 @@ async function dispatchOutgoingMessage(entry, job) {
       entry.detail = redact(payload.detail
         ? readableCause(payload.detail, chatServiceOf(entry.channel))
         : "The remaining delivery could not be confirmed.");
-      transient = true;
+      // Only an attempt this page made retries on its own; an outcome found for an
+      // earlier attempt (`resolveOnly`) leaves the send to the reader.
+      transient = !payloadFound;
       return;
     }
     if (payload && payload.error === "partially_posted") {
