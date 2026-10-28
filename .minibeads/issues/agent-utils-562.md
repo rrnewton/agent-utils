@@ -362,3 +362,31 @@ timeouts only (repository-infrastructure 149, wrkslots shards
 under load did not reproduce across two logged reruns). Upstream
 commits shared no files; rebased and pushed without a second
 gate.
+
+[muse watermelon] Slice 34 landed (101ebece): `wrkslotsd create`,
+the ninth writer slice, reproduces worktree slot creation
+(coordinator/owner authorization, cross-machine and archive
+free checks, remote/start-ref validation against the configured
+default remote, representation resolution from config with the
+image representation refused, CREATE journal lifecycle with
+hook running/failed records, post-provision hooks, generation
+and checkout identity re-verification before publication, and
+the active-state-recorded publication) behind the fixture-only
+writer guard. Task scope flags embed the verified scope in the
+journal and record. Disk floors apply only when all three
+thresholds are configured, measured on the managed root, and
+fail closed. Adversarial review findings (destination
+validation, stale fetch refs, single operation id, target-clear
+overlap, hook failure journaling, post-hooks re-verification)
+were all fixed with differential cases. Known divergences:
+fetch is an in-repo fetch with stale tracking-ref deletion
+rather than Python's isolated authority-checked fetch;
+setup-hook installers do not run; image-representation and
+validate-batch-sealed creates stay Python. Differential:
+6 passed in this slice's file (68 across the writer files).
+Gates 45-46 failures were load timeouts passed alone (wrkslots
+shards 530 + 529, repository-infrastructure 113) plus three
+host-environment failures proven identical on an untouched
+origin/main export (two lifecycle process-scan tests and the
+standalone wrkslots lifecycle, all refused by unrelated host
+process state). Upstream commits shared no files.
