@@ -5749,6 +5749,10 @@ const TUNING_BANDS = {
     "how many upstream queries one search's alternatives may become (#521 server-side-search). It is " +
     "MAX_UPSTREAM_QUERIES in src/search_query.rs, and the shared corpus's too-many-alternatives cases " +
     "pin it: any other value here and the page plans upstream differently from the server"],
+  HANGUP_TEXT_WAIT_MS: [2000, 8000,
+    "how long a Hang up keeps the voice socket open for the text of an answer still on its way " +
+    "(#649 voice-agent-tools). Under two seconds a bridge that sends the text when it hears quit " +
+    "is cut off; past eight a call the owner ended holds the bridge's session that much longer"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -87456,4 +87460,70 @@ test("`#617 cold-load-first-paint`: after a page from the server's own copy the 
   await page.settle();
   assert.ok(page.timelineCalls.length > reads, "the soon read was not sent");
   assert.equal(freshness(page).getAttribute("data-state"), "fresh", freshness(page).textContent);
+});
+
+test("`#649 voice-agent-tools`: an answer's text that arrives after its turn_complete takes the place of 'no text received' and is filed as the agent's words", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 1, "summarize overnight", true);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  turnDone(socket, 1);
+  await page.settle();
+  const noted = () => session_lines(page).filter((li) => li.getAttribute("data-no-text") === "");
+  assert.equal(noted().length, 1);
+  const rows = session_lines(page).length;
+  // Seen live: the bridge's text for a turn came after that turn's turn_complete.
+  speech(socket, "assistant", 1, "The runner came back at nine.", true);
+  await page.settle();
+  assert.equal(noted().length, 0, "the note stayed beside the words it said were missing");
+  assert.equal(session_lines(page).length, rows, "the late text took a row of its own");
+  assert.match(session_lines(page).at(-1).text(), /The runner came back at nine\.$/);
+  // Filed once the next turn is under way, as the agent's.
+  socket.onmessage({ data: secondOfSpeech(page) });
+  speech(socket, "assistant", 2, "Anything else?", true);
+  turnDone(socket, 2);
+  await page.settle();
+  assert.ok(storedTexts(page).includes("agent: The runner came back at nine."), storedTexts(page).join(" | "));
+  assert.deepEqual(page.healthPosts.map((r) => r.cause), ["audio_without_text", "late_text"]);
+});
+
+test("`#649 voice-agent-tools`: Hang up while an answer is arriving listens a moment for its text, shows it in its row and files it", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 1, "what happened overnight", true);
+  speech(socket, "assistant", 2, "Reading the messages.", true);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(state(page), "ended");
+  assert.notEqual(socket.readyState, 3, "closed before the answer's text could arrive");
+  assert.ok(socket.sent.some((frame) => typeof frame === "string" && frame.includes('"quit"')), "no quit was sent");
+  socket.onmessage({ data: JSON.stringify({ type: "transcript", role: "assistant", turn: 2, text: "Reading the messages. The build is green." }) });
+  socket.onclose({ code: 1000, reason: "" });
+  await page.settle();
+  assert.equal(socket.readyState, 3);
+  const shown = session_lines(page).filter((li) => li.text().includes("The build is green."));
+  assert.equal(shown.length, 1, "the late text was not shown, or shown twice");
+  assert.match(shown[0].text(), /Reading the messages\. The build is green\. \(text arrived after you hung up\)$/);
+  assert.equal(
+    session_lines(page).filter((li) => /Reading the messages\.( \(cut off\))?$/.test(li.text())).length,
+    0,
+    "the cut row stayed beside the whole answer"
+  );
+  await page.settle();
+  assert.ok(
+    storedTexts(page).includes("agent: Reading the messages. The build is green. (text arrived after you hung up)"),
+    storedTexts(page).join(" | ")
+  );
+});
+
+test("`#649 voice-agent-tools`: Hang up with no answer owed still closes the call's socket at once", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 1, "thanks", true);
+  speech(socket, "assistant", 1, "You're welcome.", true);
+  turnDone(socket, 1);
+  await page.settle();
+  await page.el("hang-up").click();
+  assert.equal(socket.readyState, 3);
 });

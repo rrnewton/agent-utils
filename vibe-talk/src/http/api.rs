@@ -1838,6 +1838,9 @@ pub async fn voice_health(
     }
     if report.is_recovery() {
         tracing::info!("voice_recovered {}", report.log_fields());
+    } else if report.is_late_text() {
+        // `#649 voice-agent-tools`. Its words did arrive, after the turn they belong to ended.
+        tracing::info!("voice_text_late {}", report.log_fields());
     } else if report.is_missing_text() {
         // `#330 voice-long-turn-drop`. Heard, so not unresponsive: its words never arrived as text.
         tracing::warn!("voice_text_missing {}", report.log_fields());

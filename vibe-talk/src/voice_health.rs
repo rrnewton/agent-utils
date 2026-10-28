@@ -97,6 +97,9 @@ pub enum Cause {
     /// A turn completed having carried audible audio and no assistant text: the service answered,
     /// and its words never arrived. Not an unresponsive state. `#330 voice-long-turn-drop`.
     AudioWithoutText,
+    /// A turn's assistant text arrived after its `turn_complete`, where the page had already said
+    /// none came; the page put it in place. `#649 voice-agent-tools`.
+    LateText,
 }
 
 impl Cause {
@@ -108,6 +111,7 @@ impl Cause {
             Self::ErrorFrame => "error_frame",
             Self::Recovered => "recovered",
             Self::AudioWithoutText => "audio_without_text",
+            Self::LateText => "late_text",
         }
     }
 }
@@ -169,6 +173,13 @@ impl HealthReport {
     #[must_use]
     pub fn is_missing_text(&self) -> bool {
         self.cause == Cause::AudioWithoutText
+    }
+
+    /// Whether this report says a turn's text arrived after its turn ended. `#649
+    /// voice-agent-tools`.
+    #[must_use]
+    pub fn is_late_text(&self) -> bool {
+        self.cause == Cause::LateText
     }
 
     /// The single log line: enum names and integers, and nothing anybody said.
@@ -603,6 +614,7 @@ mod tests {
             Cause::ErrorFrame,
             Cause::Recovered,
             Cause::AudioWithoutText,
+            Cause::LateText,
         ] {
             let wire = serde_json::to_value(cause).expect("serializes");
             assert_eq!(wire, cause.as_str());

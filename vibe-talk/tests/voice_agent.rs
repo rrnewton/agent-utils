@@ -337,6 +337,8 @@ async fn a_health_report_is_accepted_from_the_write_token_only() {
         "recovered",
         // `#330 voice-long-turn-drop`.
         "audio_without_text",
+        // `#649 voice-agent-tools`.
+        "late_text",
     ] {
         let mut report = silent_report();
         report["cause"] = cause.into();

@@ -701,6 +701,8 @@ const session = {
   lastInterruptAt: 0,
   // `#15 transcript-dedup`. One row per (turn, role) for the life of the call; see `upsertSpoken`.
   liveTurns: new Map(),
+  // `#649 voice-agent-tools`. Each turn's "no text received" row, by turn number, for its late text.
+  noTextRows: new Map(),
   anonTurn: 0,
   // `#11 voice-connect-latency`. Content-free startup marks; see `markStartup`.
   timing: null,
@@ -21119,6 +21121,7 @@ async function openConversation(options) {
   voicePromptForCall = minted.agent_prompt || null; // `#272 voice-agent-instructions`
   session.lastTranscriptKey = null;
   session.liveTurns = new Map();
+  session.noTextRows = new Map();
   session.anonTurn = 0;
   resetVibeTalkTurnState();
   session.pendingPrompts = [];
@@ -21856,6 +21859,14 @@ function upsertSpoken(who, turn, said, final, pageEcho = false) {
     entry.nearAgent = who === "you" && nearAgentSpeech(entry.atMs, ECHO_PARTIAL_GRACE_MS);
     entry.audibleAtStart = entry.nearAgent && agentAudible(entry.atMs);
     entry.undecided = false;
+    // `#649 voice-agent-tools`. The text of a turn already completed as heard without text: its words
+    // go where the note said they were missing, and the record gets them when the turn is stored.
+    const missing = who === "assistant" && !anonymous ? session.noTextRows.get(turn) : undefined;
+    if (missing) {
+      session.noTextRows.delete(turn);
+      entry.li = missing;
+      noteLateText();
+    }
     session.liveTurns.set(key, entry);
   }
   if (final) {
@@ -22500,13 +22511,20 @@ const SPOKEN_WITHOUT_TEXT = "spoken reply — no text received";
  * report it — once a call, as `audio_without_text`. The service is answering, so this is not the
  * unresponsive state.
  *
+ * `#649 voice-agent-tools`. Seen live 2026-10-28: a `vibe-talk-v1` bridge sent an answer's text
+ * AFTER its `turn_complete`, so its words landed in a row of their own further down while this note
+ * stood where they belonged. The row is kept by turn number, and the turn's late text takes its place
+ * (`upsertSpoken`), reported once a call as `late_text`.
+ *
  * @param {{audioMs: number, peak: number}} turn
  * @param {boolean} cut whether the turn was cut short
+ * @param {number | null} [number] the turn's number, when the frame said
  */
-function noteSpokenWithoutText(turn, cut) {
+function noteSpokenWithoutText(turn, cut, number = null) {
   const said = cut ? `${SPOKEN_WITHOUT_TEXT} ${CUT_OFF_MARK}` : SPOKEN_WITHOUT_TEXT;
   const li = line("assistant", said);
   li.setAttribute("data-no-text", "");
+  if (number !== null) session.noTextRows.set(number, li);
   if (cut) li.setAttribute("data-cut", "");
   recordTurn("note", said);
   addDetail("a spoken turn played audio and no text of it arrived");
@@ -22514,6 +22532,94 @@ function noteSpokenWithoutText(turn, cut) {
   if (!health || health.reported.has("audio_without_text")) return;
   health.reported.add("audio_without_text");
   postHealth("audio_without_text", turn);
+}
+
+/** `#649 voice-agent-tools`. A turn's text arrived after its `turn_complete`: reported once a call. */
+function noteLateText() {
+  const health = session.health;
+  if (!health || health.reported.has("late_text")) return;
+  health.reported.add("late_text");
+  postHealth("late_text");
+}
+
+/**
+ * `#649 voice-agent-tools`. How long a Hang up keeps listening for the text of an answer still on its
+ * way: the owner, 2026-10-28, "usually the last message I hear from it before I hang up, I don't
+ * receive it". The microphone, the sound and the call end at the tap as before; only the socket stays
+ * open this long after `quit`, for transcript frames, and closes at once when the service closes it.
+ */
+const HANGUP_TEXT_WAIT_MS = 4000;
+
+/** What marks an answer's words that arrived after the reader hung up. */
+const AFTER_HANG_UP_MARK = "(text arrived after you hung up)";
+
+/**
+ * Keep `socket`, which the call has let go, for HANGUP_TEXT_WAIT_MS: the assistant's text that still
+ * arrives on it is shown — in the row of its turn when one is on screen — and filed in the
+ * conversation it was said in. Nothing else on it is acted on.
+ *
+ * @param {WebSocket} socket
+ * @param {string | null} conversationId
+ * @param {Map<number, {li?: any, entry?: any}>} rows each turn's row on screen: a note's, or a live turn's entry
+ */
+function listenForTextAfterHangUp(socket, conversationId, rows) {
+  /** @type {Map<number | null, string>} */
+  const said = new Map();
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    try {
+      socket.close();
+    } catch (_error) {
+      // Already closing.
+    }
+    for (const [turn, text] of said) {
+      const row = turn === null ? undefined : rows.get(turn);
+      // A live row is read now: the teardown redrew it, marked cut off, after it was noted.
+      const li = row ? (row.entry ? row.entry.li : row.li) : null;
+      const words = row && row.entry ? mergeHypothesis(spokenText(row.entry), text) : text;
+      const shown = `${words} ${AFTER_HANG_UP_MARK}`;
+      if (li && li.parentNode) {
+        li.replaceWith(turnNode("assistant", shown, Date.now()));
+      } else {
+        line("assistant", shown);
+      }
+      fileTurnIn(conversationId, "agent", shown);
+    }
+  };
+  socket.onmessage = (event) => {
+    if (typeof event.data !== "string") return;
+    let frame = null;
+    try {
+      frame = JSON.parse(event.data);
+    } catch (_error) {
+      return;
+    }
+    if (!frame || frame.type !== "transcript" || frame.role === "user" || frame.final === false) return;
+    const text = typeof frame.text === "string" ? frame.text.trim() : "";
+    if (!text) return;
+    const turn = typeof frame.turn === "number" ? frame.turn : null;
+    said.set(turn, mergeHypothesis(said.get(turn) || "", text));
+  };
+  socket.onclose = (event) => {
+    addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
+    finish();
+  };
+  const timer = setTimeout(finish, HANGUP_TEXT_WAIT_MS);
+}
+
+/** File one turn in `conversationId`, as `recordTurn` does for the call in progress. */
+function fileTurnIn(conversationId, speaker, text) {
+  if (recordingBroken || !conversationId || !text) return;
+  recordQueue = recordQueue.then(() => {
+    if (recordingBroken) return undefined;
+    return api(`/api/v1/conversations/${conversationId}/turns`, {
+      method: "POST",
+      body: { speaker, text },
+    }).catch(() => {});
+  });
 }
 
 // --- a voice session lost in the middle of a call ------------------------------------------------
@@ -22685,6 +22791,7 @@ function reconnectCall(said, now) {
   saveUnsettledTurns();
   // The new session numbers its turns from the start.
   session.liveTurns = new Map();
+  session.noTextRows = new Map();
   session.anonTurn = 0;
   session.lastTranscriptKey = null;
   /** @type {ReconnectAttempt} */
@@ -23228,7 +23335,7 @@ function handleVibeTalk(message) {
       if (unwritten) {
         // The owner's words of the turn are filed first, as they were said first.
         settleSpoken();
-        noteSpokenWithoutText(unwritten, cut);
+        noteSpokenWithoutText(unwritten, cut, number);
       }
       noteTurnCompleteForSpokenYes(message.interrupted === true, number);
       vibeTalkTurnComplete();
@@ -23606,6 +23713,7 @@ function teardown() {
   session.outputRate = 16000;
   session.lastTranscriptKey = null;
   session.liveTurns = new Map();
+  session.noTextRows = new Map();
   session.anonTurn = 0;
   session.timing = null;
   clearNoReply();
@@ -23756,10 +23864,27 @@ function endCall(endedBy, reason = "", why = "") {
   // let it go, and its close — whenever it comes, which can be seconds after a `quit` — touches
   // nothing but the connection details. Replaced BEFORE `close()`, which may report the close at once.
   const socket = session.socket;
-  socket.onclose = (event) => {
-    addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
-  };
-  socket.close();
+  // `#649 voice-agent-tools`. A Hang up while an answer's text may still be on its way — its audio
+  // arriving, or a turn heard without text — listens a moment longer for it (`listenForTextAfterHangUp`).
+  const textOwed = endedBy === "hang_up" && session.protocol === "vibe-talk-v1" && !session.chat &&
+    (session.replyArriving || session.noTextRows.size > 0);
+  if (textOwed) {
+    /** @type {Map<number, {li?: any, entry?: any}>} */
+    const rows = new Map();
+    for (const [turn, li] of session.noTextRows) rows.set(turn, { li });
+    for (const entry of session.liveTurns.values()) {
+      const turn = Number(String(entry.key).split(":")[0]);
+      if (entry.who === "assistant" && !entry.echo && Number.isInteger(turn) && entry.li) {
+        rows.set(turn, { entry });
+      }
+    }
+    listenForTextAfterHangUp(socket, session.conversationId, rows);
+  } else {
+    socket.onclose = (event) => {
+      addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
+    };
+    socket.close();
+  }
   setStatus("Call ended.");
   setState("ended");
   dismissBanner();
