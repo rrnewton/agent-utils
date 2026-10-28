@@ -419,7 +419,7 @@ fn remove_control_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn storage_absent(cfg: &Cfg, record: &Value) -> bool {
+pub(crate) fn storage_absent(cfg: &Cfg, record: &Value) -> bool {
     let slot = record
         .get("slot")
         .and_then(Value::as_str)

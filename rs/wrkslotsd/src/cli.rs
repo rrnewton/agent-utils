@@ -261,6 +261,29 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Record one coordinator read of a slot's handoff (writer; fixture registries only until cutover)
+    ReadHandoff {
+        /// Active agent slot name
+        slot: String,
+        /// Live current coordinator PID recorded with the read event
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// Record coordinator authorization as optional read provenance
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Deprecated compatibility flag that always refuses
+        #[arg(long)]
+        adopt_legacy_change: bool,
+        /// Exact current generation; accepted only with the deprecated adoption flag
+        #[arg(long, value_name = "N")]
+        expected_generation: Option<i64>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Bootstrap the selected machine's shard pair and event log (writer; fixture registries only until cutover)
     EnsureStates {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -677,6 +700,37 @@ pub fn run() -> u8 {
                 &slot,
                 &agent,
                 owner_pid,
+                expected_generation,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::ReadHandoff {
+            slot,
+            coordinator_pid,
+            coordinator_authorized,
+            adopt_legacy_change,
+            expected_generation,
+            root,
+            machine,
+        } => {
+            match crate::read_handoff_write::read_handoff(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                coordinator_pid,
+                coordinator_authorized,
+                adopt_legacy_change,
                 expected_generation,
             ) {
                 Ok(value) => {

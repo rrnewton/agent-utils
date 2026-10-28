@@ -310,7 +310,7 @@ pub(crate) fn publication(
     latest.map(|(sequence, artifact)| (sequence, artifact, completed.contains(&sequence)))
 }
 
-fn write_noreplace(path: &Path, payload: &Value) -> Result<()> {
+pub(crate) fn write_noreplace(path: &Path, payload: &Value) -> Result<()> {
     if path.symlink_metadata().is_ok() {
         return Err(format!(
             "handoff sidecar already exists and is immutable: {}",

@@ -337,6 +337,7 @@
         "py/wrkslots/tests/test_ownerless_clone.py",
         "py/wrkslots/tests/test_pair_state_rust.py",
         "py/wrkslots/tests/test_proc_status.py",
+        "py/wrkslots/tests/test_read_handoff_write_rust.py",
         "py/wrkslots/tests/test_record_holds_rust.py",
         "py/wrkslots/tests/test_release_write_rust.py",
         "py/wrkslots/tests/test_scoped_journal_episodes.py",
