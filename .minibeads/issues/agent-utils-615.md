@@ -1,13 +1,14 @@
 ---
 title: 'chat-file-messages: owner messages with screenshots never reach the agent again'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - agentctl
 - chat
 created_at: 2026-10-28T07:41:23.390896728+00:00
-updated_at: 2026-10-28T07:41:23.390896728+00:00
+updated_at: 2026-10-28T08:51:01.477808884+00:00
+closed_at: 2026-10-28T08:51:01.477808764+00:00
 ---
 
 # Description
