@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::active_state::{load_cfg, slot_directory};
 use crate::config_validate::validate_name;
 use crate::ensure_states::{refuse_partial_state, require_fixture};
-use crate::finish_write::stored_repository_path;
+use crate::finish_write::remote_authority;
 use crate::hold_write::{acquire_mutation_locks, active_document, validate_global};
 use crate::status_state::read_process_identity;
 
@@ -49,6 +49,77 @@ fn git(path: &Path, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn repository_path(cfg: &crate::active_state::Cfg, raw: &str) -> Result<PathBuf> {
+    // Mirrors _repository_path(..., allow_managed=True): relative
+    // spellings inside the project root or one direct sibling
+    // (../NAME[/PATH]); managed-worktree repositories are allowed.
+    if Path::new(raw).is_absolute() {
+        return Err(format!(
+            "repository path must be relative to {}: {raw:?}; use a path inside the project root or ../NAME[/PATH] components inside one direct sibling",
+            cfg.root.display()
+        ));
+    }
+    let parts: Vec<String> = Path::new(raw)
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let sibling = parts.len() >= 2
+        && parts[0] == ".."
+        && parts[1..].iter().all(|part| part != "." && part != "..");
+    if parts.iter().any(|part| part == "..") && !sibling {
+        return Err(format!(
+            "repository path must stay inside {} or one direct sibling, with path components '../NAME' or '../NAME/PATH'; other parent traversal is refused: {raw:?}",
+            cfg.root.display()
+        ));
+    }
+    let unresolved = if sibling {
+        let mut base = cfg.root.clone();
+        base.pop();
+        parts[1..].iter().fold(base, |mut path, part| {
+            path.push(part);
+            path
+        })
+    } else {
+        parts.iter().fold(cfg.root.clone(), |mut path, part| {
+            if part != "." {
+                path.push(part);
+            }
+            path
+        })
+    };
+    // No symlink components below the allowed root.
+    let allowed = if sibling {
+        cfg.root.parent().map(Path::to_path_buf).unwrap_or_default()
+    } else {
+        cfg.root.clone()
+    };
+    {
+        let relative = unresolved
+            .strip_prefix(&allowed)
+            .map_err(|_| "repository path escapes its allowed root".to_string())?;
+        let mut current = allowed.clone();
+        for part in relative.components() {
+            current.push(part.as_os_str());
+            if current.is_symlink() {
+                return Err(format!(
+                    "repository crosses a symlink: {}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    let resolved = unresolved
+        .canonicalize()
+        .map_err(|_| format!("source repository {raw:?} does not exist or cannot be resolved"))?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "repository does not exist or is unsafe: {}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
 }
 
 fn is_sha(value: &str) -> bool {
@@ -99,16 +170,45 @@ pub(crate) fn recover_ownerless_agent_worktree(
         read_process_identity(pid)?;
     }
     // Resolve the target: one direct child of the agent root.
+    // Mirrors _relative_inside: relative spelling only, no parent
+    // components, normalized, and no symlink components.
     let agent_root = slot_directory(&cfg, "slot", "agent")?
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    let candidate = if Path::new(raw_path).is_absolute() {
-        PathBuf::from(raw_path)
-    } else {
-        cfg.root.join(raw_path)
-    };
-    let target = candidate;
+    if Path::new(raw_path).is_absolute()
+        || raw_path.is_empty()
+        || Path::new(raw_path)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "ownerless agent worktree must be a relative path inside {}: {raw_path:?}",
+            cfg.root.display()
+        ));
+    }
+    let mut lexical = PathBuf::new();
+    for part in Path::new(raw_path).components() {
+        if let std::path::Component::Normal(name) = part {
+            lexical.push(name);
+        }
+    }
+    if lexical.as_os_str().is_empty() {
+        return Err("ownerless agent worktree must not be the project root".to_string());
+    }
+    let target = cfg.root.join(&lexical);
+    {
+        let mut current = cfg.root.clone();
+        for part in lexical.components() {
+            current.push(part.as_os_str());
+            if current.is_symlink() {
+                return Err(format!(
+                    "ownerless agent worktree crosses a symlink: {}",
+                    current.display()
+                ));
+            }
+        }
+    }
     let name = target
         .file_name()
         .map(|value| value.to_string_lossy().into_owned())
@@ -120,10 +220,7 @@ pub(crate) fn recover_ownerless_agent_worktree(
         ));
     }
     validate_name(&name, "slot")?;
-    let relative = target
-        .strip_prefix(&cfg.root)
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|_| "ownerless agent worktree must be inside the project root".to_string())?;
+    let relative = lexical.to_string_lossy().into_owned();
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     // Interrupted-journal outcomes.
@@ -137,8 +234,18 @@ pub(crate) fn recover_ownerless_agent_worktree(
         if let Some(first) = names.first().and_then(Value::as_str) {
             let path = cfg.control.join(first);
             if names.len() == 1 && first == format!("ACTIVE.{selected}.journal") {
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|error| format!("cannot read recovery journal: {error}"))?;
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(format!(
+                            "another interrupted mutation is recorded in {}",
+                            path.display()
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(format!("cannot read recovery journal: {error}"));
+                    }
+                };
                 let raw: Value = serde_json::from_str(&text)
                     .map_err(|error| format!("cannot read recovery journal: {error}"))?;
                 if raw.get("kind").and_then(Value::as_str) != Some("ownerless-agent-remove") {
@@ -147,9 +254,9 @@ pub(crate) fn recover_ownerless_agent_worktree(
                         path.display()
                     ));
                 }
-                let journal_path = raw
-                    .get("authorization")
-                    .and_then(|auth| auth.get("path"))
+                let authorization = raw.get("authorization").cloned().unwrap_or(Value::Null);
+                let journal_path = authorization
+                    .get("path")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if journal_path != relative {
@@ -157,6 +264,38 @@ pub(crate) fn recover_ownerless_agent_worktree(
                         "requested ownerless path differs from the interrupted recovery"
                             .to_string(),
                     );
+                }
+                let auth_keys: Vec<&String> = authorization
+                    .as_object()
+                    .map(|object| object.keys().collect())
+                    .unwrap_or_default();
+                let identity_ok = authorization
+                    .get("identity")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| items.len() == 3 && items.iter().all(Value::is_i64));
+                let fenced = raw
+                    .get("fenced")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let fenced_ok = Path::new(fenced).parent() == Path::new(&relative).parent()
+                    && Path::new(fenced)
+                        .file_name()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .is_some_and(|value| {
+                            value.starts_with(&format!(".{name}.ownerless-agent."))
+                        });
+                let journal_valid = raw.get("schema").and_then(Value::as_i64) == Some(2)
+                    && raw.get("machine").and_then(Value::as_str) == Some(selected.as_str())
+                    && raw.get("slot").and_then(Value::as_str) == Some(name.as_str())
+                    && matches!(
+                        raw.get("phase").and_then(Value::as_str),
+                        Some("prepared" | "preserved" | "fenced" | "removed")
+                    )
+                    && auth_keys.len() == 10
+                    && identity_ok
+                    && fenced_ok;
+                if !journal_valid {
+                    return Err("ownerless-agent journal is invalid".to_string());
                 }
                 if !apply {
                     return Ok(json!({
@@ -228,7 +367,7 @@ pub(crate) fn recover_ownerless_agent_worktree(
             }
         }
     }
-    let (_stored, repository) = stored_repository_path(&cfg, repository_arg)?;
+    let repository = repository_path(&cfg, repository_arg)?;
     if repository == target || repository.starts_with(&target) {
         return Err("ownerless agent source repository is inside the removal target".to_string());
     }
@@ -338,18 +477,62 @@ pub(crate) fn recover_ownerless_agent_worktree(
             ));
         }
     }
-    let url_out = git(&target, &["remote", "get-url", "--all", remote])?;
-    let urls: Vec<&str> = url_out.lines().collect();
-    if urls.len() != 1 {
-        return Err(format!(
-            "remote {remote:?} must have exactly one non-empty fetch URL"
-        ));
+    // Ordinary history and index, as in Python's facts proof.
+    let common_out = git(&target, &["rev-parse", "--git-common-dir"])?;
+    let common = {
+        let raw = common_out.trim();
+        if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            target.join(raw)
+        }
+    };
+    for marker in ["info/grafts", "shallow"] {
+        let candidate = common.join(marker);
+        if candidate.exists() || candidate.is_symlink() {
+            return Err(format!(
+                "ownerless agent worktree uses graft or shallow history: {}",
+                candidate.display()
+            ));
+        }
     }
-    let digest = format!("{:x}", Sha256::digest(urls[0].as_bytes()));
-    if digest != remote_url_sha256 {
+    let replacements = git(
+        &target,
+        &["for-each-ref", "--format=%(refname)", "refs/replace/"],
+    )?;
+    if !replacements.trim().is_empty() {
+        return Err("ownerless agent worktree contains replacement refs".to_string());
+    }
+    let assume = git(&target, &["ls-files", "-v"])?;
+    if assume.lines().any(|line| {
+        line.chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase())
+    }) {
+        return Err("ownerless agent worktree has assume-unchanged index state".to_string());
+    }
+    let skip = git(&target, &["ls-files", "-t"])?;
+    if skip.lines().any(|line| line.starts_with("S ")) {
+        return Err("ownerless agent worktree has skip-worktree index state".to_string());
+    }
+    let (authority_sha, _url) = remote_authority(&target, remote)?;
+    if authority_sha != remote_url_sha256 {
         return Err("ownerless agent worktree remote changed".to_string());
     }
     if detached {
+        git(
+            &target,
+            &[
+                "fetch",
+                "--quiet",
+                remote,
+                &format!("+refs/heads/*:refs/remotes/{remote}/*"),
+            ],
+        )?;
+        let (after_sha, _after_url) = remote_authority(&target, remote)?;
+        if after_sha != authority_sha {
+            return Err("ownerless agent worktree remote changed".to_string());
+        }
         let containing = git(
             &target,
             &[

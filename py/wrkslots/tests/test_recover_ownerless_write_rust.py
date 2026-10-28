@@ -168,3 +168,61 @@ def test_ownerless_worktree_refuses_without_fixture_attestation(
     result = _rust(rust_root, rust_orphan, head, digest, fixture=False)
     assert result.returncode == 1
     assert "fixture-only" in result.stderr
+
+
+def test_ownerless_worktree_grafts_refuse_plan(tmp_path: Path) -> None:
+    rust_root, rust_orphan, head, digest = _fixture(tmp_path / "rust")
+    oracle_root, oracle_orphan, oracle_head, oracle_digest = _fixture(tmp_path / "oracle")
+    for base, orphan in ((tmp_path / "rust", rust_orphan), (tmp_path / "oracle", oracle_orphan)):
+        common = Path(_git(orphan, "rev-parse", "--git-common-dir"))
+        if not common.is_absolute():
+            common = orphan / common
+        grafts = common / "info" / "grafts"
+        grafts.parent.mkdir(parents=True, exist_ok=True)
+        grafts.write_text(f"{oracle_head if base.name == 'oracle' else head}\n")
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, oracle_orphan, oracle_head, oracle_digest)
+    assert "graft" in str(caught.value) or "ordinary" in str(caught.value)
+    result = _rust(rust_root, rust_orphan, head, digest)
+    assert result.returncode == 1
+    assert "graft" in result.stderr
+
+
+def test_ownerless_worktree_pushurl_refuses_plan(tmp_path: Path) -> None:
+    rust_root, rust_orphan, head, digest = _fixture(tmp_path / "rust")
+    _git(rust_orphan, "remote", "set-url", "--push", "origin", "https://example.invalid/x")
+    result = _rust(rust_root, rust_orphan, head, digest)
+    assert result.returncode == 1
+    assert "push URL" in result.stderr
+
+
+def test_ownerless_worktree_absolute_path_refuses(tmp_path: Path) -> None:
+    rust_root, rust_orphan, head, digest = _fixture(tmp_path / "rust")
+    env = dict(os.environ)
+    env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
+    result = subprocess.run(
+        [
+            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
+            "-p", "wrkslotsd", "--", "recover-ownerless-agent-worktree",
+            str(rust_orphan), "--repository", "../upstream-repo", "--head", head,
+            "--branch", "suite/orphan", "--remote", "origin",
+            "--remote-url-sha256", digest, "--root", str(rust_root),
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
+    )
+    assert result.returncode == 1
+    assert "must be a relative path" in result.stderr
+
+
+def test_ownerless_worktree_minimal_journal_refuses(tmp_path: Path) -> None:
+    rust_root, rust_orphan, head, digest = _fixture(tmp_path / "rust")
+    journal = {
+        "kind": "ownerless-agent-remove",
+        "authorization": {"path": "worktrees/orphan"},
+    }
+    (rust_root / "worktrees" / f"ACTIVE.{MACHINE}.journal").write_text(
+        json.dumps(journal)
+    )
+    result = _rust(rust_root, rust_orphan, head, digest)
+    assert result.returncode == 1
+    assert "journal is invalid" in result.stderr
