@@ -2717,3 +2717,25 @@ async fn all_s_counts_read_never_waits_on_slack_and_the_next_one_takes_the_read_
     assert_eq!(fake.calls("conversations.history"), calls);
     assert_eq!(served_from(&capture, SLACK_CH), ["landed"]);
 }
+
+#[tokio::test]
+async fn a_step_back_over_a_drop_the_writer_has_not_recorded_reads_the_provider() {
+    // Something seen of the channel was not offered after the copy's claims were listed: it may
+    // have been an edit or a deletion in the stretch, so the copy does not answer for it, even
+    // before the writer has written the drop down.
+    let d = deployment("older-dropped").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let body = d.served_reload(5).await;
+    let cursor = served_cursor(&body);
+    d.state
+        .message_cache
+        .cache()
+        .expect("a cache")
+        .mark_suspect(&ChanKey::new(LEGACY.to_owned(), READ_CHANNEL));
+    let capture = vibe_talk::testing::LogCapture::start();
+    let older = d.step_back(5, &cursor).await;
+    assert_eq!(texts(&older).len(), 5, "{older}");
+    assert_eq!(served_from(&capture, READ_CHANNEL), ["upstream"]);
+}

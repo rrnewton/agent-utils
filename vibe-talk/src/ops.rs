@@ -2547,6 +2547,16 @@ async fn older_from_cache(
     else {
         return Ok(None);
     };
+    // A step with more below needs a dated message to step on from: without one its cursor would
+    // keep everything, and the next step would hand back the newest page as older.
+    if held.has_more
+        && !held
+            .messages
+            .iter()
+            .any(|message| crate::clock::instant_ms(&message.timestamp).is_some())
+    {
+        return Ok(None);
+    }
     let now_ms = state
         .message_cache
         .cache()
