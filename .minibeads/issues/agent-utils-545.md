@@ -7,6 +7,8 @@ created_at: 2026-10-26T19:56:33.565034111+00:00
 updated_at: 2026-10-26T19:56:33.565034111+00:00
 ---
 
+# Description
+
 [muse watermelon] rust-primary campaign milestone 2, first slice (plan of
 record step 2: flesh out the python-only corners of Rust agentctl, Google
 Chat path first).

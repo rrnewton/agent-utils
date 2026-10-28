@@ -7,6 +7,8 @@ created_at: 2026-10-27T00:49:51.191658938+00:00
 updated_at: 2026-10-27T00:49:51.191658938+00:00
 ---
 
+# Description
+
 [muse watermelon] rust-primary campaign milestone 4: port wrkslots to Rust
 incrementally behind the same CLI, growing rs/wrkslotsd subcommand by
 subcommand, with the existing Python tests driving a differential harness.
