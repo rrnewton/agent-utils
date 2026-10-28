@@ -1,12 +1,13 @@
 ---
 title: 'headless-second-reaction: the second reaction marks when a headless agent admits a chat request'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 depends_on:
   agent-utils-565: parent-child
 created_at: 2026-10-28T01:13:15.677767441+00:00
-updated_at: 2026-10-28T01:13:15.677767441+00:00
+updated_at: 2026-10-28T02:17:59.703812106+00:00
+closed_at: 2026-10-28T02:17:59.703811946+00:00
 ---
 
 # Description
