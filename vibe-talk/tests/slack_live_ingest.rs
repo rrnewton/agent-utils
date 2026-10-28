@@ -2584,9 +2584,14 @@ mod measure {
                 .insert("conversations.history".to_owned(), (1, 2));
         });
         let started = std::time::Instant::now();
-        let read = state
-            .providers
-            .fetch_timeline(&channel(), &vibe_talk::threads::TimelineRequest::default())
+        // The page's read says it is one (`reason=`): `#611 timeline-read-failures` lets only a
+        // person's read wait out a `Retry-After` Slack gave someone else.
+        let read = vibe_talk::read_reason::ReadReason::Enter
+            .scope(
+                state
+                    .providers
+                    .fetch_timeline(&channel(), &vibe_talk::threads::TimelineRequest::default()),
+            )
             .await;
         assert!(read.is_ok(), "the page's read waited the limits out");
         assert!(

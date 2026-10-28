@@ -1023,10 +1023,11 @@ async fn a_bounded_slack_flat_page_never_tombstones_a_reply_nor_claims_a_thread(
     );
 }
 
-/// `#603 server-side-search`: All reads the replies of every thread rooted on the page, and takes
+/// `#603 server-side-search`: All brings the replies of every thread rooted on the page, and takes
 /// a thread the cache holds whole from there, for a write-scope caller with serving on, at no
 /// call. The page never offers what it took back to the cache as seen: those rows keep the
-/// observation the thread read gave them.
+/// observation the thread read gave them. `#611 timeline-read-failures`: at most ten threads that
+/// cost a call are read upstream per All read, so the eleventh comes with the next.
 #[tokio::test]
 async fn all_takes_a_thread_the_cache_holds_whole_from_there_and_never_offers_it_back() {
     let mut fixture = slack_fake::FakeState::default();
@@ -1073,25 +1074,34 @@ async fn all_takes_a_thread_the_cache_holds_whole_from_there_and_never_offers_it
     let seen_by_thread_read = observed(&cache);
 
     clock.advance(5 * MINUTE);
+    let all_uri = format!("/api/v1/channels/{SLACK_CH}/timeline?view=flat&limit=50");
+    let all = || get(&state, &all_uri);
+    let asked_since = |before: usize| -> Vec<String> {
+        fake.requests("conversations.replies")[before..]
+            .iter()
+            .filter_map(|params| params.get("ts").cloned())
+            .collect()
+    };
     let before = fake.requests("conversations.replies").len();
-    let flat = get(
-        &state,
-        &format!("/api/v1/channels/{SLACK_CH}/timeline?view=flat&limit=50"),
-    )
-    .await;
-    let asked: Vec<String> = fake.requests("conversations.replies")[before..]
-        .iter()
-        .filter_map(|params| params.get("ts").cloned())
-        .collect();
+    let first = all().await;
+    let asked = asked_since(before);
     assert!(
         !asked.contains(held_root),
         "the thread the cache holds whole was read upstream: {asked:?}"
     );
-    assert_eq!(
-        asked.len(),
-        11,
-        "every other thread is read, not ten: {asked:?}"
+    assert_eq!(asked.len(), 10, "ten threads that cost a call: {asked:?}");
+    assert!(
+        first["notice"]
+            .as_str()
+            .is_some_and(|notice| notice.contains("1 thread here was not read just now")),
+        "{first}"
     );
+    // The next All read reads the eleventh: the ten cost nothing now, and the held one never did.
+    let before = fake.requests("conversations.replies").len();
+    let flat = all().await;
+    let asked = asked_since(before);
+    assert_eq!(asked.len(), 1, "the one left: {asked:?}");
+    assert!(!asked.contains(held_root), "{asked:?}");
     let ids: Vec<String> = flat["messages"]
         .as_array()
         .expect("messages")

@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use futures_util::{stream, StreamExt as _, TryStreamExt as _};
+use futures_util::{stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -372,6 +372,37 @@ enum Replies {
     Held(Vec<Message>),
     /// Read upstream: what the root counts, and the newest replies read.
     Upstream(u64, Vec<Raw>),
+    /// Not read: past [`FLAT_UPSTREAM_THREADS`], or after a rate limit stopped this read's reads.
+    Skipped,
+    /// The read failed; the thread is left out of the page rather than failing it.
+    Failed(ChatError),
+}
+
+/// How many threads one All read may read upstream that cost a call — a thread its memory cannot
+/// answer from ([`HttpSlackClient::flat_free`]) and the server's copy does not hold whole — the most
+/// recently active first. `#611 timeline-read-failures`: `#603 server-side-search` lifted the old
+/// bound of ten threads, and every thread the copy did not hold became a read of its own on every
+/// All read, its counts read and its catch-ups. A thread past the bound is read by a later All read,
+/// once the ones before it cost nothing; until then the page is told its replies are not all in All.
+pub const FLAT_UPSTREAM_THREADS: usize = 10;
+
+/// How long the thread list's scan of a conversation's newest history answers its steps back
+/// ("Older threads…"): a minute. `#611 timeline-read-failures`: the scan is up to
+/// [`THREAD_SCAN_PAGES`] requests, and every step back made it again. Only steps back: a newest
+/// list always scans, because the page replaces the summaries it holds with a list's, and a kept
+/// scan would put back counts and an order that a reply since has changed. Forgotten when this
+/// client posts into the conversation, and never kept from a scan such a post overtook.
+pub const THREAD_SCAN_KEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One scan of a conversation's newest history for thread roots, kept for [`THREAD_SCAN_KEEP`].
+#[derive(Clone, Debug)]
+pub(super) struct ThreadScan {
+    at: Instant,
+    /// [`HttpSlackClient::thread_scan_epoch`] when the scan began.
+    epoch: u64,
+    roots: Vec<Raw>,
+    scanned: usize,
+    complete: bool,
 }
 
 /// What a root just read from history says of its thread, for the server's own copy to be
@@ -761,10 +792,16 @@ impl HttpSlackClient {
             .collect();
         roots.sort_by_key(|root| std::cmp::Reverse(root.activity_micros()));
         let source = crate::held_replies::current();
+        // `#611 timeline-read-failures`. A thread whose replies cannot be read is left out, not the
+        // whole page failed; after a rate limit no further thread of this read is asked for; and at
+        // most `FLAT_UPSTREAM_THREADS` threads that cost a call are read.
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let costly = std::sync::atomic::AtomicUsize::new(0);
         let reads: Vec<_> = roots
             .iter()
             .map(|root| {
                 let source = source.clone();
+                let (stopped, costly) = (&stopped, &costly);
                 async move {
                     // A thread longer than an upstream read brings is read upstream too, so that
                     // All holds the same newest replies of it whichever way they come.
@@ -773,18 +810,33 @@ impl HttpSlackClient {
                         .flatten();
                     if let (Some(source), Some(says)) = (source, says) {
                         if let Some(held) = source.whole(channel, &says).await {
-                            return Ok(Replies::Held(held));
+                            return Replies::Held(held);
                         }
                     }
-                    let read = self.flat_replies(conversation, root).await?;
-                    Ok::<_, ChatError>(Replies::Upstream(root.reply_count(), read))
+                    let ordering = std::sync::atomic::Ordering::SeqCst;
+                    if !self.flat_free(conversation, root)
+                        && (stopped.load(ordering)
+                            || costly.fetch_add(1, ordering) >= FLAT_UPSTREAM_THREADS)
+                    {
+                        return Replies::Skipped;
+                    }
+                    match self.flat_replies(conversation, root).await {
+                        Ok(read) => Replies::Upstream(root.reply_count(), read),
+                        Err(error) => {
+                            if matches!(error.cause(), ChatError::RateLimited(_)) {
+                                stopped.store(true, ordering);
+                            }
+                            Replies::Failed(error)
+                        }
+                    }
                 }
             })
             .collect();
-        let replies: Vec<Replies> = stream::iter(reads).buffered(4).try_collect().await?;
+        let replies: Vec<Replies> = stream::iter(reads).buffered(4).collect().await;
         let mut raws = page.raws;
         let mut held = Vec::new();
-        let mut cut = 0_usize;
+        let (mut cut, mut skipped, mut failed) = (0_usize, 0_usize, 0_usize);
+        let mut failure = None;
         for read in replies {
             match read {
                 Replies::Held(messages) => held.extend(messages),
@@ -792,7 +844,22 @@ impl HttpSlackClient {
                     cut += usize::from(count > FLAT_MAX_REPLIES as u64);
                     raws.extend(read);
                 }
+                Replies::Skipped => skipped += 1,
+                Replies::Failed(error) => {
+                    failed += 1;
+                    failure.get_or_insert(error);
+                }
             }
+        }
+        if let Some(error) = &failure {
+            // Counts only: which threads, never what they say.
+            tracing::warn!(
+                conversation,
+                failed,
+                skipped,
+                %error,
+                "a Slack All read left some threads' replies out: they could not be read"
+            );
         }
         raws.sort_by_key(|raw| raw.micros);
         raws.dedup_by_key(|raw| raw.micros);
@@ -811,23 +878,21 @@ impl HttpSlackClient {
             has_threads: self.is_threaded(conversation),
             has_more: page.has_more,
             next_before: page.next_before,
-            notice: (cut > 0).then(|| {
-                // In threads and messages, not pages: `#578 search-status-clarity`. The opening
-                // words are the ones the page recognises (`BOUNDED_ALL_NOTICE`).
-                let threads = if cut == 1 {
-                    "1 thread here has".to_owned()
-                } else {
-                    format!("{cut} threads here have")
-                };
-                format!(
-                    "Some threads' replies are not in All: {threads} more than \
-                     {FLAT_MAX_REPLIES} replies, and All brings the newest {FLAT_MAX_REPLIES} \
-                     of each; open a thread to read all of it."
-                )
-            }),
+            notice: flat_notice(cut, skipped + failed),
             held: held_ids,
             ..TimelinePage::default()
         })
+    }
+
+    /// Whether one All read can answer `root`'s thread from what it remembers, at no call: its
+    /// root says what it said when its replies were last read in full, within the reconcile period
+    /// (`flat_replies`). `#611 timeline-read-failures`.
+    fn flat_free(&self, conversation: &str, root: &Raw) -> bool {
+        self.remembered_flat(&(conversation.to_owned(), root.ts.clone()))
+            .is_some_and(|held| {
+                held.latest_reply == root.activity_micros()
+                    && held.reply_count == root.reply_count()
+            })
     }
 
     /// [`crate::chat::ChatClient::fetch_recent`], without the provider label: the newest `limit`
@@ -1129,6 +1194,102 @@ impl HttpSlackClient {
         limit: usize,
     ) -> Result<TimelinePage, ChatError> {
         let boundary = cursor.map(Cursor::activity).transpose()?;
+        let ThreadScan {
+            mut roots,
+            scanned,
+            complete,
+            ..
+        } = match cursor
+            .is_some()
+            .then(|| self.kept_thread_scan(conversation))
+            .flatten()
+        {
+            Some(scan) => scan,
+            None => {
+                let scan = self.scan_threads(conversation).await?;
+                self.keep_thread_scan(conversation, &scan);
+                scan
+            }
+        };
+        if !roots.is_empty() {
+            self.mark_threaded(conversation);
+        }
+        let has_threads = !roots.is_empty();
+        let key = |raw: &Raw| (raw.activity_micros(), raw.micros);
+        roots.retain(|raw| boundary.is_none_or(|boundary| key(raw) < boundary));
+        let has_more = roots.len() > limit;
+        if has_more {
+            roots.drain(..roots.len() - limit);
+        }
+        let next_before = if has_more {
+            let (activity, root) = key(&roots[0]);
+            Some(self.cursor(channel, request, format!("{activity}:{root}"))?)
+        } else {
+            None
+        };
+        let mut threads = Vec::with_capacity(roots.len());
+        for root in &roots {
+            threads.push(self.summary(channel, root).await);
+        }
+        Ok(TimelinePage {
+            threads,
+            has_threads,
+            has_more,
+            next_before,
+            notice: (!complete).then(|| {
+                format!(
+                    "Threads are found among the newest {scanned} messages of this conversation; \
+                     older threads are not listed."
+                )
+            }),
+            ..TimelinePage::default()
+        })
+    }
+
+    /// The thread list's scan of `conversation`, when one was made within [`THREAD_SCAN_KEEP`].
+    fn kept_thread_scan(&self, conversation: &str) -> Option<ThreadScan> {
+        self.thread_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(conversation)
+            .filter(|scan| scan.at.elapsed() < THREAD_SCAN_KEEP)
+            .cloned()
+    }
+
+    fn keep_thread_scan(&self, conversation: &str, scan: &ThreadScan) {
+        let mut scans = self
+            .thread_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scans.retain(|_, kept| kept.at.elapsed() < THREAD_SCAN_KEEP);
+        // A post since the scan began may be missing from it.
+        if self
+            .thread_scan_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == scan.epoch
+        {
+            scans.insert(conversation.to_owned(), scan.clone());
+        }
+    }
+
+    /// Forget the thread list's scan of `conversation`: this client has just posted into it.
+    pub(super) fn forget_thread_scan(&self, conversation: &str) {
+        let mut scans = self
+            .thread_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.thread_scan_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        scans.remove(conversation);
+    }
+
+    /// Thread roots with replies among a conversation's newest history, oldest activity first,
+    /// each once, from at most [`THREAD_SCAN_PAGES`] pages.
+    async fn scan_threads(&self, conversation: &str) -> Result<ThreadScan, ChatError> {
+        let at = Instant::now();
+        let epoch = self
+            .thread_scan_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let mut roots: Vec<Raw> = Vec::new();
         let mut scanned = 0_usize;
         let mut complete = false;
@@ -1159,40 +1320,14 @@ impl HttpSlackClient {
             }
             page_cursor = page.next_cursor;
         }
-        if !roots.is_empty() {
-            self.mark_threaded(conversation);
-        }
-        let has_threads = !roots.is_empty();
-        let key = |raw: &Raw| (raw.activity_micros(), raw.micros);
-        roots.sort_by_key(key);
+        roots.sort_by_key(|raw| (raw.activity_micros(), raw.micros));
         roots.dedup_by_key(|raw| raw.micros);
-        roots.retain(|raw| boundary.is_none_or(|boundary| key(raw) < boundary));
-        let has_more = roots.len() > limit;
-        if has_more {
-            roots.drain(..roots.len() - limit);
-        }
-        let next_before = if has_more {
-            let (activity, root) = key(&roots[0]);
-            Some(self.cursor(channel, request, format!("{activity}:{root}"))?)
-        } else {
-            None
-        };
-        let mut threads = Vec::with_capacity(roots.len());
-        for root in &roots {
-            threads.push(self.summary(channel, root).await);
-        }
-        Ok(TimelinePage {
-            threads,
-            has_threads,
-            has_more,
-            next_before,
-            notice: (!complete).then(|| {
-                format!(
-                    "Threads are found among the newest {scanned} messages of this conversation; \
-                     older threads are not listed."
-                )
-            }),
-            ..TimelinePage::default()
+        Ok(ThreadScan {
+            at,
+            epoch,
+            roots,
+            scanned,
+            complete,
         })
     }
 
@@ -1329,6 +1464,8 @@ impl HttpSlackClient {
             params.push(("metadata", super::client::op_key_metadata(key)));
         }
         let value = self.call("chat.postMessage", &params).await?;
+        // What the thread list scanned of the conversation no longer holds this post.
+        self.forget_thread_scan(conversation);
         if value.get("channel").and_then(Value::as_str) != Some(conversation) {
             return Err(shape("chat.postMessage answered for a different channel"));
         }
@@ -1645,6 +1782,40 @@ impl HttpSlackClient {
             registered_channel_id: None,
         })
     }
+}
+
+/// The notice of an All page some of whose threads' replies it does not carry: `long` threads with
+/// more replies than it brings, and `unread` threads not read this time (`#611
+/// timeline-read-failures`). In threads, not pages (`#578 search-status-clarity`); its opening words
+/// are the ones the page recognises (`BOUNDED_ALL_NOTICE`), which tell it not to take a reply All
+/// lacks for deleted.
+fn flat_notice(long: usize, unread: usize) -> Option<String> {
+    let threads = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 thread here {one}")
+        } else {
+            format!("{n} threads here {many}")
+        }
+    };
+    let mut parts = Vec::new();
+    if long > 0 {
+        parts.push(format!(
+            "{} more than {FLAT_MAX_REPLIES} replies, and All brings the newest {FLAT_MAX_REPLIES} of each",
+            threads(long, "has", "have")
+        ));
+    }
+    if unread > 0 {
+        parts.push(format!(
+            "{} not read just now",
+            threads(unread, "was", "were")
+        ));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "Some threads' replies are not in All: {}; open a thread to read all of it.",
+            parts.join("; ")
+        )
+    })
 }
 
 fn encode_directory(cursor: &DirectoryCursor) -> Result<String, ChatError> {

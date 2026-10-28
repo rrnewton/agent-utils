@@ -76,6 +76,7 @@
 //! a thread read, because Slack offers no way to with this kind of token. Replies inside threads
 //! therefore stay unread in Slack, and a channel narrowed to one thread is refused.
 
+pub mod budget;
 mod clear;
 mod client;
 mod emoji;
@@ -96,6 +97,7 @@ mod timeline;
 pub use client::{HttpSlackClient, SLACK_MAX_TEXT_CHARS};
 pub use ids::{message_id_from_ts, parse_source, ts_from_message_id};
 pub use live::{LIVE_FAILED_READS, LIVE_LAG_READS, LIVE_THREAD_READS, LIVE_TRANSIENT_FAILED_READS};
+pub use timeline::{FLAT_UPSTREAM_THREADS, THREAD_SCAN_KEEP};
 
 /// The Slack Web API base used when a deployment does not name a bridge.
 pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";

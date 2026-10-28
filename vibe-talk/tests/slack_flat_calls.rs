@@ -1458,8 +1458,10 @@ async fn a_flat_read_that_cannot_hold_its_copy_still_drops_an_older_one() {
     assert_eq!(next.threads(), [root.clone(), root.clone()]);
 }
 
-/// `#603 server-side-search`: All reads the replies of every thread rooted on its page, not the
-/// ten most active, and says how many threads it brought only the newest replies of.
+/// `#603 server-side-search`: All brings the replies of every thread rooted on its page, not only the
+/// ten most active, and says how many threads it brought only the newest replies of. `#611
+/// timeline-read-failures`: each read reads at most `FLAT_UPSTREAM_THREADS` threads that cost a
+/// call, so twenty-five are read over three reads; a thread read once costs nothing after.
 #[tokio::test]
 async fn a_flat_read_reads_every_thread_on_its_page_and_counts_the_long_ones() {
     let mut state = FakeState::default();
@@ -1478,19 +1480,26 @@ async fn a_flat_read_reads_every_thread_on_its_page_and_counts_the_long_ones() {
     state.history.insert(CH.to_owned(), list);
     let fake = Fake::start(state, 100).await;
     let client = fake.client();
-    let page = client
-        .fetch_timeline(
-            &channel(),
-            &TimelineRequest {
-                view: TimelineView::Flat,
-                thread_id: None,
-                before: None,
-                after: None,
-                limit: 50,
-            },
-        )
-        .await
-        .expect("flat");
+    let all = TimelineRequest {
+        view: TimelineView::Flat,
+        thread_id: None,
+        before: None,
+        after: None,
+        limit: 50,
+    };
+    let here = channel();
+    let read = || client.fetch_timeline(&here, &all);
+    let mut page = read().await.expect("flat");
+    for _ in 0..2 {
+        assert!(
+            page.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("not read just now")),
+            "{:?}",
+            page.notice
+        );
+        page = read().await.expect("flat");
+    }
     assert_eq!(
         page.messages.len(),
         25 + 24 * 2 + 50,
@@ -1514,5 +1523,175 @@ async fn a_flat_read_reads_every_thread_on_its_page_and_counts_the_long_ones() {
     assert!(
         page.held.is_empty(),
         "nothing is taken from a cache this client has none of"
+    );
+}
+
+// --- `#611 timeline-read-failures` -----------------------------------------------------------------
+
+/// Forty-five messages, every third the root of a thread of three replies: fifteen threads on one
+/// All page of fifty, each one replies call to read.
+fn fifteen_threads() -> (FakeState, Vec<String>) {
+    let mut state = FakeState::default();
+    let mut list = Vec::new();
+    let mut roots = Vec::new();
+    for i in 0..45 {
+        let at = ts(i * 10, 0);
+        let mut message = profiled(&at, "UADA00001", "Ada", &format!("message {i}"));
+        if i % 3 == 0 {
+            let replies: Vec<(String, String)> = (0..3)
+                .map(|r| (reply_ts(i, r), format!("reply {r} to {i}")))
+                .collect();
+            thread(&mut state, CH, &mut message, &replies);
+            roots.push(at);
+        }
+        list.push(message);
+    }
+    state.history.insert(CH.to_owned(), list);
+    (state, roots)
+}
+
+/// One All read's page, and the threads whose replies it asked for.
+async fn all_page(
+    fake: &Fake,
+    client: &HttpSlackClient,
+) -> (vibe_talk::threads::TimelinePage, Vec<String>) {
+    let replies = fake.requests("conversations.replies").len();
+    let page = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                view: TimelineView::Flat,
+                thread_id: None,
+                before: None,
+                after: None,
+                limit: 50,
+            },
+        )
+        .await
+        .expect("All answers, whatever its threads' reads do");
+    let mut threads: Vec<String> = fake.requests("conversations.replies")[replies..]
+        .iter()
+        .map(|params| params["ts"].clone())
+        .collect();
+    threads.sort();
+    threads.dedup();
+    (page, threads)
+}
+
+#[tokio::test]
+async fn an_all_read_reads_at_most_ten_threads_that_cost_a_call_and_the_next_reads_the_rest() {
+    let (state, roots) = fifteen_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+
+    let (first, read) = all_page(&fake, &client).await;
+    assert_eq!(
+        read.len(),
+        vibe_talk::slack::FLAT_UPSTREAM_THREADS,
+        "the most recently active ten: {read:?}"
+    );
+    let mut newest: Vec<String> = roots.iter().rev().take(10).cloned().collect();
+    let mut read = read;
+    newest.sort();
+    read.sort();
+    assert_eq!(read, newest);
+    assert!(
+        first
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.starts_with(
+                "Some threads' replies are not in All: 5 threads here were not read just now"
+            )),
+        "{:?}",
+        first.notice
+    );
+
+    // The ten read cost nothing now, so the next read reads the other five, and the page has all.
+    let (second, mut read) = all_page(&fake, &client).await;
+    let mut rest: Vec<String> = roots.iter().rev().skip(10).cloned().collect();
+    read.sort();
+    rest.sort();
+    assert_eq!(read, rest);
+    assert_eq!(second.notice, None);
+    assert_eq!(second.messages.len(), 45 + 15 * 3);
+}
+
+#[tokio::test]
+async fn an_all_read_whose_threads_are_rate_limited_answers_and_leaves_them_out() {
+    let (state, roots) = fifteen_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    fake.with(|state| {
+        state
+            .rate_limit_many
+            .insert("conversations.replies".to_owned(), (0, 1_000));
+    });
+    let (page, read) = all_page(&fake, &client).await;
+    // Every root is on the page, and no reply.
+    assert_eq!(page.messages.len(), 45, "{:?}", page.notice);
+    assert!(
+        page.notice
+            .as_deref()
+            .is_some_and(|notice| notice.starts_with("Some threads' replies are not in All")),
+        "{:?}",
+        page.notice
+    );
+    // The first rate limit stopped the fan-out: the reads already under way, no more.
+    assert!(read.len() <= 4, "{read:?} of {}", roots.len());
+}
+
+#[tokio::test]
+async fn a_step_back_in_the_thread_list_uses_its_scan_and_a_newest_list_or_a_post_scans_again() {
+    let (state, _roots) = fifteen_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let threads = |before: Option<String>| TimelineRequest {
+        view: TimelineView::Threads,
+        thread_id: None,
+        before,
+        after: None,
+        limit: 5,
+    };
+    let history = || fake.calls("conversations.history");
+    let start = history();
+    let newest = client
+        .fetch_timeline(&channel(), &threads(None))
+        .await
+        .expect("threads");
+    let scan = history() - start;
+    assert!(scan >= 1);
+    assert_eq!(newest.threads.len(), 5);
+    let cursor = newest.next_before.clone().expect("older threads");
+
+    // "Older threads…" within the minute: from the scan, at no call.
+    let before = history();
+    let older = client
+        .fetch_timeline(&channel(), &threads(Some(cursor.clone())))
+        .await
+        .expect("older threads");
+    assert_eq!(history(), before, "a step back scanned again");
+    assert_eq!(older.threads.len(), 5);
+
+    // A newest list always scans: the page replaces its summaries with it.
+    let before = history();
+    client
+        .fetch_timeline(&channel(), &threads(None))
+        .await
+        .expect("threads");
+    assert_eq!(history() - before, scan);
+
+    // After a post here, a step back scans again.
+    client
+        .post_message(&channel(), "a new message", None)
+        .await
+        .expect("posted");
+    let before = history();
+    client
+        .fetch_timeline(&channel(), &threads(Some(cursor)))
+        .await
+        .expect("older threads");
+    assert!(
+        history() > before,
+        "a post here makes the next step back scan"
     );
 }

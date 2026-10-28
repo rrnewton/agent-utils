@@ -364,7 +364,16 @@ ending on the latest reply the root names, listed by reads in the last two hours
 cache at no call, for a write-scope caller with serving on, and every other thread is read upstream:
 its newest 50 replies. A notice counts the threads longer than that. (Until `#603` All read the
 replies of at most ten threads per page, the ten most recently active, and a server from before it
-still does.) A thread whose replies a page leaves out is on the page with its count but not all of
+still does.) `#611 timeline-read-failures`: one All read reads at most ten threads that cost a call
+(`FLAT_UPSTREAM_THREADS`), the most recently active first; a thread whose root says what it said at
+its last full read costs none, so the threads past the ten are read by the next All reads, and a
+page of twenty-five threads has every thread's replies after three. A thread whose replies cannot
+be read is left out of the page instead of failing it, and after a rate limit the read asks for no
+further thread. Either way the notice counts the threads not read just now, in the words the page
+reads as "not every reply is here", so nothing it holds is taken for deleted. The thread list's scan
+of a conversation's newest history (up to ten requests) answers the list's steps back ("Older
+threads…") for a minute (`THREAD_SCAN_KEEP`); a newest list always scans again, since the page takes
+its summaries as they come, and a post from this server forgets the scan. A thread whose replies a page leaves out is on the page with its count but not all of
 its replies, which says nothing about them: the replies the page already holds for it
 stay held, counted and drawn, and its count says **N new** for any it has never held — on a device
 that never read it, such as a fresh one, that is every reply it has. Nothing brings those replies
@@ -4630,6 +4639,19 @@ of this server's own, or an expired cursor is never hidden this way, and a read 
 nothing for fails as upstream failed. Each stand-in logs one WARN line (`timeline_stand_in`).
 A newest page whose refresh is already running for an earlier serve is served too, without a
 second read upstream: that refresh corrects it.
+
+**One Slack budget, shared by priority** (`#611 timeline-read-failures`, `vibe_talk::slack::budget`).
+Slack limits each Web API method per workspace (`conversations.history` and `conversations.replies`
+are tier 3, about fifty a minute), and every reader spends the same allowance. Every request is
+counted against its method over the last minute, with its priority, from its read reason: a
+person's request (the page's reads, a send, speech, a voice agent's tools, and anything untagged)
+first, then live work (relist, the probe), then thread naming and summaries, then backfill and the
+shadow's check. Once Slack has answered a method with a `Retry-After`, nobody sends it again before
+that runs out: every request waits within its own budget, except crawl work, which fails at once and
+is tried again later. Backfill holds off a method while everyone else has sent 25 of it in the last
+minute (`ChatClient::crawl_hold`), so `backfill = "full"` takes only what is left over, within its
+own `backfill_requests_per_minute`; while the page is busy it may make no progress at all. Nothing
+but crawl work is refused by a count.
 
 Every request that answers a 5xx logs one WARN line beside its access line (`server error`): the
 error code and detail it answered with, its `read_reason`, and the upstream operation that last

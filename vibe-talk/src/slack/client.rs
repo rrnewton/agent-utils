@@ -196,6 +196,14 @@ pub struct HttpSlackClient {
     /// read of each thread, Flat or the thread view, last finished. `#282 slack-flat-skip`; see
     /// `super::timeline`.
     pub(super) flat_memory: Mutex<super::timeline::FlatMemory>,
+    /// The thread list's latest scan of each conversation, by its id, for
+    /// [`super::timeline::THREAD_SCAN_KEEP`]. `#611 timeline-read-failures`.
+    pub(super) thread_scans: Mutex<HashMap<String, super::timeline::ThreadScan>>,
+    /// Moved on by every post this client makes, so a scan a post overtook is not kept.
+    pub(super) thread_scan_epoch: std::sync::atomic::AtomicU64,
+    /// Every request sent in the last minute, by method and priority: the shared budget.
+    /// `#611 timeline-read-failures`; see [`super::budget`].
+    sent: Mutex<super::budget::Sent>,
     /// How long those replies are trusted before a Flat read reads their thread in full again.
     pub(super) flat_reconcile: Duration,
     /// Where the live poller stands in each thread of each conversation it polls, so each of its
@@ -284,6 +292,9 @@ impl HttpSlackClient {
             threaded: Mutex::new(HashSet::new()),
             proven: Mutex::new(HashMap::new()),
             flat_memory: Mutex::default(),
+            thread_scans: Mutex::default(),
+            thread_scan_epoch: std::sync::atomic::AtomicU64::new(0),
+            sent: Mutex::default(),
             flat_reconcile: super::timeline::FLAT_RECONCILE,
             live_threads: Mutex::new(HashMap::new()),
             post_limit: config.post_limit(),
@@ -361,9 +372,16 @@ impl HttpSlackClient {
         patience: Patience,
     ) -> Result<Value, ChatError> {
         let url = format!("{}/{method}", self.api_base);
+        let priority = super::budget::Priority::of(crate::read_reason::ReadReason::current());
         let mut waited = Duration::ZERO;
         let mut attempts = 0;
         loop {
+            if let Some(refused) = self
+                .admit(method, priority, patience, attempts, &mut waited)
+                .await
+            {
+                return Err(refused);
+            }
             attempts += 1;
             let timer = self
                 .shim_profile
@@ -406,6 +424,67 @@ impl HttpSlackClient {
                 }
             }
         }
+    }
+
+    /// Whether a request of `method` for `priority` may be sent now, by the shared budget
+    /// ([`super::budget`]): `None` when it may, having been counted, else the rate limit it fails
+    /// with, at once and without being sent. `attempts` is how many times this request has been
+    /// sent already. `#611 timeline-read-failures`.
+    ///
+    /// A request waits out a `Retry-After` Slack gave anyone for the method, within its own budget,
+    /// before every attempt; crawl work, and a request that gives up at the first rate limit, fail
+    /// instead of sending into it. Then crawl work yields to everyone else ([`super::budget`]).
+    async fn admit(
+        &self,
+        method: &'static str,
+        priority: super::budget::Priority,
+        patience: Patience,
+        attempts: u32,
+        waited: &mut Duration,
+    ) -> Option<ChatError> {
+        let refusal = |waited: Duration, retry_after: Duration| {
+            ChatError::RateLimited(RateLimitExhausted {
+                provider: "slack",
+                route: method.to_owned(),
+                attempts,
+                waited,
+                budget: RATE_LIMIT_BUDGET,
+                retry_after,
+                global: false,
+            })
+        };
+        // Looked at again after each wait: another request may have been told to wait longer
+        // meanwhile.
+        loop {
+            let now = tokio::time::Instant::now();
+            let until = self
+                .pressure()
+                .get(method)
+                .and_then(|entry| entry.retry_until)
+                .filter(|until| *until > now);
+            let Some(until) = until else {
+                break;
+            };
+            let wait = until.saturating_duration_since(now);
+            if priority == super::budget::Priority::Crawl
+                || patience == Patience::BestEffort
+                || *waited + wait > RATE_LIMIT_BUDGET
+            {
+                return Some(refusal(*waited, wait));
+            }
+            tokio::time::sleep(wait).await;
+            *waited += wait;
+        }
+        let now = tokio::time::Instant::now();
+        let mut sent = self
+            .sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sent.admits(method, priority, now) {
+            return Some(refusal(*waited, Duration::ZERO));
+        }
+        sent.record(method, priority, now);
+        None
     }
 
     fn pressure(&self) -> std::sync::MutexGuard<'_, HashMap<String, MethodPressure>> {
@@ -1242,6 +1321,19 @@ impl ChatClient for HttpSlackClient {
                 .get_mut(method)
                 .and_then(|entry| entry.hold_until(now))
             {
+                latest = Some(latest.map_or(until, |at| at.max(until)));
+            }
+        }
+        drop(pressure);
+        // `#611 timeline-read-failures`: and while everyone else is using the methods it reads,
+        // before Slack has had to refuse anyone.
+        let mut sent = self
+            .sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for method in CRAWL_METHODS {
+            if let Some(wait) = sent.crawl_wait(method, now) {
+                let until = now + wait;
                 latest = Some(latest.map_or(until, |at| at.max(until)));
             }
         }
