@@ -2304,8 +2304,9 @@ impl Sink {
                 view.rows.remove(0);
             }
             let thread = matches!(query.scope(), Some(Scope::Thread(_)));
-            let reaches_start =
-                super::below::reaches_start(&view.coverage, &view.rows, more_held, thread);
+            // Not with a row left out below (a text no read proved whole): it may be the oldest.
+            let reaches_start = !view.rows.iter().any(|row| row.content_partial)
+                && super::below::reaches_start(&view.coverage, &view.rows, more_held, thread);
             if slack_flat {
                 let roots: Vec<String> = view
                     .rows
@@ -2485,6 +2486,16 @@ impl Sink {
             if more_held {
                 view.rows.remove(0);
             }
+            // A text a push brought that no read has proven whole is not handed out, and the step
+            // may not leave it out either: the provider's step reads it whole. And a step whose
+            // oldest row is no older than the page's (more than a step of messages in one
+            // millisecond) would hand back the same rows for ever: the provider's cursors get past
+            // them.
+            if view.rows.iter().any(|row| row.content_partial)
+                || (more_held && view.rows.first().is_some_and(|row| row.created_ms >= at_ms))
+            {
+                return None;
+            }
             let thread = matches!(scope, Scope::Thread(_));
             let proven = super::below::proven(
                 &view.coverage,
@@ -2493,10 +2504,9 @@ impl Sink {
                 (limit, more_held),
                 thread,
             )?;
-            if view
-                .dropped_ms
-                .is_some_and(|dropped| proven.cover.listed_ms <= dropped)
-            {
+            // A drop the writer has not recorded yet counts as one it has, as for a serve.
+            let dropped_ms = view.dropped_ms.max(cache.last_drop_ms(&chan));
+            if dropped_ms.is_some_and(|dropped| proven.cover.listed_ms <= dropped) {
                 return None;
             }
             let newer = match cache.newest(&chan, &scope, newer_cap) {
