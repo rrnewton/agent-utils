@@ -56365,8 +56365,212 @@ test("`#261 two-column-connectors`: the cards have the newest thread at the foot
   assert.equal(moved, 0, `the card the reader was on moved ${moved}px when a thread above it went to the foot`);
   assert.equal(foot, false, "a reader up the list was taken to the foot");
   // The control: with the place not kept, the card moves up by the card that left above it.
-  const loose = await run(brokenScript("  change();\n  placeCardAnchor(anchor);\n", "  change();\n"));
+  const loose = await run(brokenScript("  change();\n  placeCardAnchor(anchor, follow);\n", "  change();\n"));
   assert.ok(loose.moved < 0, "the negative control kept the card in place, so the check above proves nothing");
+});
+
+// --- the card the reader was held by, moved (#612 view-stability) ----------------------------------
+//
+// The owner, 2026-10-27: "I just experienced a screen jump. I was in threaded view reading a message and it
+// jumped off the screen. It was probably bc of some new message causing a thread to jump to the bottom. But
+// we should ALWAYS prioritize view stability. Whatever I'm looking at should not jump away." The cards held
+// their reader by one card, the first on screen, half off the top; a reply in that card's thread took it to
+// the foot, and the reader after it. Each check below reads every row on screen before the change and asks
+// that every one still drawn where it was, but the card that moved, is within a pixel of where it stood.
+
+/** Every row of `list` that shows in `area`, by id, with the top of its box. */
+const rowsOnScreen = (page, list, area, idOf = (li) => li.getAttribute("data-id")) => {
+  const frame = page.el(area);
+  const top = frame.getBoundingClientRect().top;
+  return new Map(page.el(list).children.filter((li) => {
+    const box = li.getBoundingClientRect();
+    return !li.hidden && !li.hasClass("search-hidden") && box.bottom > top && box.top < top + frame.clientHeight;
+  }).map((li) => [idOf(li), li.getBoundingClientRect().top]));
+};
+
+/** How far each row of `before` (`rowsOnScreen`) but `moved` has gone since, by id: the rows that moved. */
+const rowsMoved = (page, list, before, moved, idOf = (li) => li.getAttribute("data-id")) => {
+  const now = new Map(page.el(list).children.map((li) => [idOf(li), li.getBoundingClientRect().top]));
+  return [...before].filter(([id]) => id !== moved)
+    .map(([id, top]) => [id, now.has(id) ? now.get(id) - top : NaN])
+    .filter(([, by]) => !(Math.abs(by) <= 1));
+};
+
+test("`#612 view-stability`: a reply moving the card the reader is held by to the foot — the first on screen, half off the top; one in the middle of the screen; the highlighted one — moves nothing else on screen; a reply below the screen moves nothing; and the card half off the top, grown by an edit, grows over the top", async () => {
+  // `upto`: how many of the steps below to take, for a negative control that goes wrong at one of them.
+  const run = async (script, upto = Infinity) => {
+    const { page, server, data } = await manyThreadColumns(16, null, script);
+    const area = page.el("side-scroll");
+    const threadOf = (id) => data.threads.findIndex((thread) => thread.id === id);
+    const replyTo = (id, n) => liveReply(page, server, data.messages[2 * threadOf(id)], String(n));
+    const found = [];
+    // Up the list, the first card on screen half scrolled off the top.
+    area.scrollTop = 160;
+    const first = firstCardInView(page);
+    const box = first.getBoundingClientRect();
+    area.scrollTop += Math.round((area.getBoundingClientRect().top - box.top) + box.height / 2);
+    await area.dispatch("scroll");
+    const half = firstCardInView(page);
+    assert.ok(half.getBoundingClientRect().top < area.getBoundingClientRect().top, "the first card is not half off the top, so this proves nothing");
+    let before = rowsOnScreen(page, "side-cards", "side-scroll");
+    assert.ok(before.size >= 3, "too few cards on screen to prove anything");
+    await replyTo(half.getAttribute("data-id"), 400);
+    assert.equal(cardIds(page)[cardIds(page).length - 1], half.getAttribute("data-id"), "the card answered did not go to the foot");
+    found.push(["the first card on screen moved to the foot", rowsMoved(page, "side-cards", before, half.getAttribute("data-id"))]);
+    if (found.length >= upto) return found;
+    assert.equal(sideAtFoot(page), false, "a reader up the list was taken to the foot");
+    // A card in the middle of the screen: the cards above it stay where they are, and the rest close up under them.
+    before = rowsOnScreen(page, "side-cards", "side-scroll");
+    const middle = [...before.keys()][2];
+    await replyTo(middle, 401);
+    const above = new Map([...before].slice(0, 2));
+    found.push(["a card in the middle of the screen moved to the foot", rowsMoved(page, "side-cards", above, middle)]);
+    if (found.length >= upto) return found;
+    // The highlighted card, which the reader is held by while it shows (`#277 thread-card-focus`), moves alone:
+    // the first card fully shown that stayed, the one under it, holds the rest.
+    const lit = [...rowsOnScreen(page, "side-cards", "side-scroll").keys()][1];
+    await page.el("side-cards").children.find((li) => li.getAttribute("data-id") === lit).children[0].click();
+    await page.settle();
+    assert.deepStrictEqual(litCards(page), [lit], "the click did not highlight the card");
+    before = rowsOnScreen(page, "side-cards", "side-scroll");
+    await replyTo(lit, 402);
+    found.push(["the highlighted card moved to the foot", rowsMoved(page, "side-cards", new Map([...before].slice(2)), lit)]);
+    if (found.length >= upto) return found;
+    assert.equal(sideAtFoot(page), false, "the reader went with the highlighted card to the foot");
+    // A reply into a thread whose card is below the screen, and an edit of a root above it: nothing on screen moves.
+    before = rowsOnScreen(page, "side-cards", "side-scroll");
+    const shown = new Set(before.keys());
+    const below = cardIds(page).slice(cardIds(page).indexOf([...before.keys()].pop()) + 1).find((id) => !shown.has(id));
+    await replyTo(below, 403);
+    found.push(["a reply below the screen", rowsMoved(page, "side-cards", before, null)]);
+    // The card half off the top, its root edited longer: it grows over the top of the column, not over the
+    // cards under it.
+    before = rowsOnScreen(page, "side-cards", "side-scroll");
+    const over = [...before.keys()][0];
+    assert.ok(before.get(over) < area.getBoundingClientRect().top, "the first card is not half off the top, so this proves nothing");
+    const root = data.messages[2 * threadOf(over)];
+    server.edit(String(root.id), { content: `${root.content}, edited and longer. ${"More words. ".repeat(30)}` });
+    await deliver(page, page.stream(), sseUpdate("edit-1", page.messages.find((m) => String(m.id) === String(root.id))));
+    await page.settle();
+    const grew = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === over).getBoundingClientRect();
+    assert.ok(grew.bottom - grew.top > 150, "the edit did not grow the card, so this proves nothing");
+    found.push(["the card half off the top grown by an edit", rowsMoved(page, "side-cards", before, over)]);
+    return found;
+  };
+  for (const [what, moved] of await run(SCRIPT)) {
+    assert.deepStrictEqual(moved, [], `${what}, and the rows on screen moved by (id, px): ${JSON.stringify(moved)}`);
+  }
+  // The controls. Held by the first card showing alone, as before, the cards on screen go with it to the foot;
+  // held by the first card shown whole, but followed wherever it goes, they go with the highlighted card.
+  const FOLLOWED = ["  const stayed = follow ? null : stayedCardRow(anchor);\n", "  const stayed = null;\n"];
+  const first = await run(brokenScriptEach(FOLLOWED,
+    ["    rows.find((one) => seen(one) && whole(one)) || rows.find(seen);\n", "    rows.find(seen);\n"]), 1);
+  assert.ok(first[0][1].length > 0, "the first negative control left the cards where they were, so the check above proves nothing");
+  const lit = await run(brokenScriptEach(FOLLOWED), 3);
+  assert.ok(lit[2][1].length > 0, "the second negative control left the cards where they were, so the check above proves nothing");
+});
+
+test("`#612 view-stability`: a thread unpacked and being read, its replies filling the screen, is followed to the foot when a reply comes, every line on screen where it was", async () => {
+  const run = async (script) => {
+    // Ten threads, the fourth with thirteen answers, all older than the fifth's root: its block is mid-list.
+    const messages = [];
+    const threads = [];
+    for (let i = 0; i < 10; i += 1) {
+      const id = `spaces/A/threads/t${i}`;
+      const rootId = String(300 + 2 * i);
+      const count = i === 3 ? 13 : 1;
+      const record = { id, root_message_id: rootId, is_root: true, reply_count: count, reply_count_exact: true };
+      const root = message({ id: rootId, content: `thread ${i} root`, thread: record });
+      messages.push(root);
+      let answer = null;
+      for (let n = 0; n < count; n += 1) {
+        answer = message({ id: n === 0 ? String(301 + 2 * i) : String(500 + n), content: `thread ${i} answer ${n}`,
+          thread: { ...record, is_root: false } });
+        messages.push(answer);
+      }
+      threads.push({ id, root, title: `Thread ${i}`, reply_count: count, reply_count_exact: true, updated_at: answer.timestamp });
+    }
+    const page = newPage(new Map(), script);
+    page.threadingSupported = true;
+    page.threads = threads;
+    page.messages = messages;
+    const server = forwardTimeline(page);
+    await signIn(page);
+    await showDiscord(page, messages);
+    await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+    assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "the premise is the Threads view");
+    // Unpack all (`#440`: Pack all, Unpack unread, Unpack all).
+    await page.el("side-unpack").click();
+    await page.el("side-unpack").click();
+    await page.settle();
+    const block = page.el("side-cards").children.filter((li) => li.getAttribute("data-unpack-thread") === "spaces/A/threads/t3");
+    assert.ok(block.length >= 13, `the fourth thread did not unpack its answers (${block.length} rows)`);
+    const area = page.el("side-scroll");
+    area.scrollTop += Math.round(block[3].getBoundingClientRect().top - area.getBoundingClientRect().top);
+    await area.dispatch("scroll");
+    const before = rowsOnScreen(page, "side-cards", "side-scroll");
+    const own = new Set(block.map((li) => li.getAttribute("data-id")));
+    assert.ok(before.size >= 3 && [...before.keys()].every((id) => own.has(id)),
+      `the fourth thread's replies do not fill the screen, so this proves nothing: ${[...before.keys()]}`);
+    await liveReply(page, server, threads[3].root, "600");
+    assert.equal(cardIds(page).filter((id) => id && id.startsWith("spaces/"))
+      .pop(), "spaces/A/threads/t3", "the thread answered did not go to the foot");
+    return rowsMoved(page, "side-cards", before, null);
+  };
+  const moved = await run(SCRIPT);
+  assert.deepStrictEqual(moved, [], `the lines being read moved by (id, px): ${JSON.stringify(moved)}`);
+  // The control: held by the cards that stayed, the thread being read goes to the foot from under the reader.
+  const loose = await run(brokenScript("  if (heaviest !== null && px > still) {\n", "  if (false) {\n"));
+  assert.ok(loose.length > 0, "the negative control left the lines where they were, so the check above proves nothing");
+});
+
+test("`#612 view-stability`: in the Threads list in one column, a reply moving the first card on screen to the foot moves no other card on screen; a reply below the screen moves none", async () => {
+  const run = async (script) => {
+    const data = manyThreads(16);
+    const page = newPage(new Map(), script);
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    page.messages = data.messages;
+    const server = forwardTimeline(page);
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    await page.el("channel-view-threads").click();
+    await page.settle();
+    const list = page.el("thread-list");
+    assert.equal(list.hidden, false, "the Threads list is not on screen");
+    const idOf = (li) => li.getAttribute("data-context-id");
+    const ids = () => list.children.map(idOf);
+    const area = page.el("scroll-area");
+    assert.ok(area.scrollHeight > area.clientHeight + 200, "the cards do not run past the foot, so this proves nothing");
+    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.4);
+    await area.dispatch("scroll");
+    const top = area.getBoundingClientRect().top;
+    const first = list.children.find((li) => li.getBoundingClientRect().bottom > top);
+    area.scrollTop += Math.round(first.getBoundingClientRect().top - top + first.getBoundingClientRect().height / 2);
+    await area.dispatch("scroll");
+    let before = rowsOnScreen(page, "thread-list", "scroll-area", idOf);
+    const held = [...before.keys()][0];
+    assert.ok(before.size >= 3 && list.children.find((li) => idOf(li) === held).getBoundingClientRect().top < top,
+      "the first card is not half off the top among others, so this proves nothing");
+    const index = data.threads.findIndex((thread) => thread.id === held);
+    await liveReply(page, server, data.messages[2 * index], "400");
+    assert.equal(ids()[ids().length - 1], held, "the card answered did not go to the foot");
+    const found = [["the first card on screen moved to the foot", rowsMoved(page, "thread-list", before, held, idOf)]];
+    // The control follows the card to the foot, where nothing is below the screen.
+    if (script !== SCRIPT) return found;
+    before = rowsOnScreen(page, "thread-list", "scroll-area", idOf);
+    const shown = new Set(before.keys());
+    const below = ids().slice(ids().indexOf([...before.keys()].pop()) + 1).find((id) => !shown.has(id) && id !== held);
+    await liveReply(page, server, data.messages[2 * data.threads.findIndex((thread) => thread.id === below)], "401");
+    found.push(["a reply below the screen", rowsMoved(page, "thread-list", before, null, idOf)]);
+    return found;
+  };
+  for (const [what, moved] of await run(SCRIPT)) {
+    assert.deepStrictEqual(moved, [], `${what}, and the cards on screen moved by (id, px): ${JSON.stringify(moved)}`);
+  }
+  const loose = await run(brokenScript("    if (!neighbourStayed(position.anchorId, now, around.near)) {",
+    "    if (false) {"));
+  assert.ok(loose[0][1].length > 0, "the negative control left the cards where they were, so the check above proves nothing");
 });
 
 test("`#261 two-column-connectors`: closing a thread comes back to the card it was chosen from; the way to older threads is above the oldest card", async () => {
@@ -70351,7 +70555,7 @@ test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each vie
   // behind the list first, which draws the picker before the cards are placed.)
   const placedEarly = await run(brokenScript(
     "  } else {\n    // Where the card the list's place was on has gone since, the place two columns had.\n" +
-    "    placeCardAnchor(place);\n  }\n",
+    "    placeCardAnchor(place, true);\n  }\n",
     "  }\n"));
   assert.deepStrictEqual(placedEarly, { ...real, listFoot: false });
   // The right column's reader kept on its foot in two columns only: a card growing under a reader at the

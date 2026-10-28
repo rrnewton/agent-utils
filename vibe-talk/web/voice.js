@@ -19628,7 +19628,7 @@ function stepCardMaxLines(direction) {
 }
 
 /**
- * One line of a card's words wrapped as src/threads.rs `card_lines` wraps it, word by word at
+ * One line of a card's words wrapped as src/threads.rs `underCardlines` wraps it, word by word at
  * `CARD_LINE_CHARS` characters: a word that does not fit begins the next line, and one longer than a
  * whole line is broken across lines. The lines it fills, each with `cut` where it ends inside a word
  * broken so. Word by word because a browser breaks only between words, and a count that ignored that
@@ -19662,7 +19662,7 @@ function cardProxyLines(lines, width = CARD_LINE_CHARS) {
   return lines.reduce((sum, line) => sum + wrapCardLine(line, width).length, 0);
 }
 
-/** `text`'s lines as src/threads.rs `card_lines` counts them: blank ones dropped, white space closed up. */
+/** `text`'s lines as src/threads.rs `underCardlines` counts them: blank ones dropped, white space closed up. */
 const proxyLinesOf = (text) =>
   String(text).split(/\r?\n/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
 
@@ -29495,11 +29495,8 @@ function holdingMessage(mutate) {
     restoreScroll(mark);
     return;
   }
-  const row = position.anchorId
-    ? shownRowFor([...visibleList().children].find((candidate) =>
-      candidate.getAttribute("data-context-id") === position.anchorId || idsOf(candidate).includes(position.anchorId)))
-    : null;
-  if (row && currentView === "discord") area.scrollTop += row.getBoundingClientRect().top - position.anchorTop;
+  const held = heldRowAfter(position);
+  if (held && currentView === "discord") area.scrollTop += held.row.getBoundingClientRect().top - held.top;
   renderJumpNewest();
 }
 
@@ -43663,7 +43660,8 @@ let discordNewestId = null;
  *
  * @param {Array<{id: string}>} messages the list as it was just read, oldest first
  * @param {{keepPosition: boolean, wasAtNewest: boolean, area: object, previousTop: number,
- *          anchorId?: string|null, anchorTop?: number, ownAct?: boolean, heldPlaceAt?: number}} how
+ *          anchorId?: string|null, anchorTop?: number, around?: ListAround | null, ownAct?: boolean,
+ *          heldPlaceAt?: number}} how
  */
 function settleAfterRead(messages, how) {
   const previous = discordNewestId;
@@ -43688,13 +43686,11 @@ function settleAfterRead(messages, how) {
     // message occupies that pixel. Prefer the same rendered message at the same viewport offset.
     // A deleted anchor has no semantic destination, so only that case falls back to the old offset.
     // ...or the line of the collapsed run it has joined since. `#221 read-modes`.
-    const anchor = how.anchorId
-      ? shownRowFor([...visibleList().children].find((row) =>
-        row.getAttribute("data-context-id") === how.anchorId || idsOf(row).includes(how.anchorId)))
-      : null;
-    if (anchor && Number.isFinite(how.anchorTop)) {
+    // `#612 view-stability`: in the Threads list, not after a card a reply moved to the foot (`heldRowAfter`).
+    const held = heldRowAfter(how);
+    if (held && Number.isFinite(how.anchorTop)) {
       how.area.scrollTop = how.previousTop;
-      how.area.scrollTop += anchor.getBoundingClientRect().top - how.anchorTop;
+      how.area.scrollTop += held.row.getBoundingClientRect().top - held.top;
     } else if (how.heldPlaceAt !== undefined) {
       // As near as the read reaches: the top, when everything it brought is newer than the reader's
       // message — the walk back goes on from there — and otherwise the newest line.
@@ -43751,7 +43747,13 @@ function landedReadPosition(area, keepPosition, sentAtNewest) {
   return { ...at, keepPosition: keepPosition || (sentAtNewest && !at.wasAtNewest) };
 }
 
-/** Capture the channel row the reader is looking at before an authoritative replacement. */
+/**
+ * Capture the channel row the reader is looking at before an authoritative replacement.
+ *
+ * `#612 view-stability`: in the Threads list, whose cards re-sort as replies come, `around` too — the cards on
+ * screen, fully shown first, and each card's neighbours — for when the card held is the one that moved
+ * (`heldRowAfter`). The lists of messages are in the order sent, and hold their reader by the row alone.
+ */
 function channelReadPosition(area) {
   // A message a filter change holds in place is the one kept, and the newest line is not followed.
   // `#243 filter-keeps-selection`.
@@ -43762,7 +43764,67 @@ function channelReadPosition(area) {
     previousTop: area.scrollTop,
     anchorId: anchor ? anchor.getAttribute("data-context-id") || anchorIds[0] || null : null,
     anchorTop: anchor ? anchor.getBoundingClientRect().top : 0,
+    around: anchor && visibleList() === el("thread-list") ? threadListAround(area) : null,
   };
+}
+
+/** A thread card's id in the Threads list. */
+const threadCardId = (/** @type {Element} */ row) => String(row.getAttribute("data-context-id"));
+
+/**
+ * The Threads list's cards on screen in `area`, fully shown first, with where each stands, and every card's
+ * neighbours (`rowNeighbours`). `#612 view-stability`.
+ *
+ * @param {HTMLElement} area
+ * @returns {ListAround}
+ */
+function threadListAround(area) {
+  const top = area.getBoundingClientRect().top;
+  const foot = top + (area.clientHeight || 0);
+  const cards = /** @type {HTMLElement[]} */ ([...el("thread-list").children]).filter((row) => row.hasAttribute("data-context-id"));
+  const shown = cards.filter((row) => rowShown(row)).map((row) => ({ row, box: row.getBoundingClientRect() }))
+    .filter(({ box }) => box.bottom > top && box.top < foot);
+  const whole = ({ box }) => box.top >= top - 1 && box.bottom <= foot + 1;
+  const marks = [...shown.filter(whole), ...shown.filter((one) => !whole(one))]
+    .map(({ row, box }) => ({ id: threadCardId(row), top: box.top }));
+  return { marks, near: rowNeighbours(cards, threadCardId) };
+}
+
+/**
+ * The cards of the Threads list on screen as a place was read: each card's id and the top of its box, fully
+ * shown first, and every card's neighbours. `#612 view-stability`.
+ *
+ * @typedef {{marks: {id: string, top: number}[], near: Map<string, {prev: string | null, next: string | null}>}} ListAround
+ */
+
+/**
+ * The row a list holds its reader by once it is drawn again, as `channelReadPosition` read the place, and the
+ * top it stood at then: the same message, found by id, or the line of the collapsed run it has joined since
+ * (`#221 read-modes`). Null when it is not drawn.
+ *
+ * `#612 view-stability`. In the Threads list, not a card that has moved, re-sorted to the foot by a reply: the first
+ * card on screen then that still stands beside a card it stood beside, and where it stood. The owner: "Whatever
+ * I'm looking at should not jump away."
+ *
+ * @param {{anchorId?: string | null, anchorTop?: number, around?: ListAround | null}} position
+ * @returns {{row: Element, top: number} | null}
+ */
+function heldRowAfter(position) {
+  if (!position.anchorId) return null;
+  const rows = [...visibleList().children];
+  const around = position.around;
+  if (around && visibleList() === el("thread-list")) {
+    const now = rowNeighbours(rows.filter((row) => row.hasAttribute("data-context-id")), threadCardId);
+    if (!neighbourStayed(position.anchorId, now, around.near)) {
+      for (const mark of around.marks) {
+        const row = rows.find((one) => one.getAttribute("data-context-id") === mark.id);
+        if (row && rowShown(row) && neighbourStayed(mark.id, now, around.near)) return { row, top: mark.top };
+      }
+    }
+  }
+  const row = shownRowFor(rows.find((candidate) =>
+    candidate.getAttribute("data-context-id") === position.anchorId || idsOf(candidate).includes(position.anchorId)));
+  return row ? { row, top: Number(position.anchorTop) } : null;
 }
 
 /**
@@ -49251,13 +49313,13 @@ function moveLayout(now, next, cards = null, left = null) {
     ? held.place : null;
   renderThreadSelect();
   if (left && next !== "list") keepLeftColumnPlace(left, leftBack);
-  if (back && placeCardAnchor(back)) {
+  if (back && placeCardAnchor(back, true)) {
     // The card docked again under the list is not the dock growing under a reader two columns had at the
     // foot of their cards (`cardsPlacedUnderLists`).
     cardsPlacedUnderLists();
   } else {
     // Where the card the list's place was on has gone since, the place two columns had.
-    placeCardAnchor(place);
+    placeCardAnchor(place, true);
   }
   if (place && kept && now === "list" && next === "two") listCardsHeld = { place: kept, placed: cardAnchor(), channel };
   if (left && now !== "list" && next !== "list") {
@@ -50224,16 +50286,75 @@ function renderSideCards() {
   else if (pendingReply) reopenPendingReply();
 }
 
+// --- the card the reader was held by, moved -----------------------------------------------------------
+//
+// `#612 view-stability`. The owner, 2026-10-27: "I just experienced a screen jump. I was in threaded view reading a
+// message and it jumped off the screen. It was probably bc of some new message causing a thread to jump to the
+// bottom. But we should ALWAYS prioritize view stability. Whatever I'm looking at should not jump away."
+//
+// The cards hold their reader by ONE card, found again by id once they are drawn again (`cardAnchor`): the
+// highlighted one, the selected one, else the first showing, which is most often a card half scrolled off the
+// top. A reply in that card's thread moves it to the foot, and the reader was taken after it: every card they
+// were reading went, 755px at 393x852 and 245px at 1280x800 in Chromium, with the card they were looking at
+// gone off the screen. So a place in the cards also notes every row on screen, cards and the replies unpacked
+// under them, fully shown first, and the cards either side of each one's card. A card standing between neither
+// of the cards it stood between has MOVED — re-sorted to the foot, or gone — and is not followed: the reader is
+// held by the first row on screen whose card did not move, so what stayed on screen stays where it was, and
+// the moved card is where the list now puts it. Only a reader on the foot follows the list (`followFoot`).
+//
+// UNLESS MOST OF THE SCREEN MOVED WITH IT. The rule is to keep as much of what is on screen still as can be: a
+// thread unpacked and being read, its replies filling the screen, goes to the foot whole when a reply comes,
+// and following it leaves every line the reader sees where it was, the reply arriving under them. So the rows
+// on screen are weighed by how much of each shows: a moved card whose rows show more than those that stayed is
+// followed. Main's messages among the cards (`#419 threads-view-main-messages`) belong to no card, do not
+// re-sort, and are found again by id.
+//
+// FOR CHANGES NOBODY ASKED FOR. A place the reader chose to come back to — the card a thread was opened from,
+// the place a layout had, the selected card through a sort the reader pressed — is found again by its card
+// wherever it now is, as before (`placeCardAnchor`'s `follow`).
+
+/**
+ * Each of `rows`, by its id (`idOf`), with the ids of the rows before and after it, null at the ends: the cards
+ * of a list, for whether one has moved since (`neighbourStayed`).
+ *
+ * @param {Element[]} rows
+ * @param {(row: Element) => string} [idOf]
+ * @returns {Map<string, {prev: string | null, next: string | null}>}
+ */
+function rowNeighbours(rows, idOf = (row) => String(row.getAttribute("data-id"))) {
+  const id = (/** @type {Element | undefined} */ row) => (row ? idOf(row) : null);
+  return new Map(rows.map((row, at) => [idOf(row), { prev: id(rows[at - 1]), next: id(rows[at + 1]) }]));
+}
+
+/**
+ * Whether the row `id` still stands beside a row it stood beside: in `now`, the rows' neighbours as drawn, and
+ * `was`, as they were when the place was read (`rowNeighbours`). A row in neither place has moved, re-sorted
+ * to the foot by a reply, and a row not drawn has gone; one whose neighbours were not noted is taken to stay.
+ *
+ * @param {string} id
+ * @param {Map<string, {prev: string | null, next: string | null}>} now
+ * @param {Map<string, {prev: string | null, next: string | null} | undefined>} was
+ */
+function neighbourStayed(id, now, was) {
+  const is = now.get(id);
+  const then = was.get(id);
+  return Boolean(is) && (!then || is.prev === then.prev || is.next === then.next);
+}
+
 /**
  * Where the reader is in the cards, to put them back after the cards change under them: a thread that
  * moved going to the foot, the cards filtered, the line over them coming or going. `#261
  * two-column-connectors`. As a list of messages keeps its reader (`keepingFilterPlace`, whose rules
  * these are): the reader on the foot follows it; else the highlighted card while it shows (`#277
- * thread-card-focus`), else the selected one, else the first card showing, stays at its height. With
+ * thread-card-focus`), else the selected one, else the first card shown whole (`#612 view-stability`), else the
+ * first card showing, stays at its height. With
  * every card off screen inside unpacked replies, keep the scroll offset. Null with the cards not on screen, and while they are being opened, which places the reader itself
  * (`placeOpenedCards`).
  *
- * @returns {{newest: boolean, id: string | null, offset: number} | null}
+ * `#612 view-stability`: and `rows`, every row on screen with its offset and its card, fully shown first, with
+ * `cards`, the neighbours of each of those cards, for when the card held is the one that moved.
+ *
+ * @returns {CardPlace | null}
  */
 function cardAnchor() {
   if (!sideColumnUp() || columns.side.mode !== "list" || cardsOpening) return null;
@@ -50241,20 +50362,112 @@ function cardAnchor() {
   if (atBottom(area)) return { newest: true, id: null, offset: 0 };
   const top = area.getBoundingClientRect().top;
   const foot = top + (area.clientHeight || 0);
-  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
-    .filter((row) => row.hasAttribute("data-card") && rowShown(row));
+  const list = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
+  const rows = list.filter((row) => row.hasAttribute("data-card") && rowShown(row));
   const seen = (/** @type {HTMLElement} */ row) => {
     const box = row.getBoundingClientRect();
     return box.bottom > top && box.top < foot;
   };
+  // `#612 view-stability`. Shown whole: a card half off the top that grows — its summary come, its root edited —
+  // grows over the cards under it, and they are what the reader is reading.
+  const whole = (/** @type {HTMLElement} */ row) => {
+    const box = row.getBoundingClientRect();
+    return box.top >= top - 1 && box.bottom <= foot + 1;
+  };
   const mark = markOf(sidePane);
   const card = (/** @type {string | null} */ id) => (id === null ? undefined : rows.find((one) => one.getAttribute("data-id") === id));
   const row = [card(litCard()), card(mark && mark.card !== false ? mark.id : null)].find((one) => one && seen(one)) ||
-    rows.find(seen);
+    rows.find((one) => seen(one) && whole(one)) || rows.find(seen);
+  // The rows on screen, in the list's order, read until the first below the foot: their boxes, and how much of
+  // each shows.
+  const around = [];
+  // The card each row is under: itself, or the card whose replies are unpacked after it.
+  let underCard = null;
+  for (const one of list) {
+    if (one.hasAttribute("data-card")) underCard = one;
+    if (!one.hasAttribute("data-id") || !rowShown(one)) continue;
+    const box = one.getBoundingClientRect();
+    if (box.height > 0 && box.top >= foot) break;
+    if (box.bottom <= top || box.top >= foot) continue;
+    const main = one.hasAttribute("data-main-row");
+    const owner = main ? null : underCard;
+    if (!main && !owner) continue;
+    around.push({ row: one, main, owner, offset: box.top - top, px: Math.min(box.bottom, foot) - Math.max(box.top, top),
+      whole: box.top >= top - 1 && box.bottom <= foot + 1 });
+  }
+  const near = rowNeighbours(list.filter((one) => one.hasAttribute("data-card")));
+  const cards = new Map();
+  const marks = [...around.filter((one) => one.whole), ...around.filter((one) => !one.whole)].map((one) => {
+    const owner = one.owner ? String(one.owner.getAttribute("data-id")) : null;
+    if (owner !== null) cards.set(owner, near.get(owner));
+    return { id: String(one.row.getAttribute("data-id")), card: owner, own: one.row.hasAttribute("data-card"),
+      offset: one.offset, px: one.px };
+  });
+  if (row) cards.set(String(row.getAttribute("data-id")), near.get(String(row.getAttribute("data-id"))));
   // Deep inside an unpacked thread, every card can be above the viewport. Keep the scroll
   // offset then: rebuilding those rows must still restore the reader after their nodes go.
-  if (!row) return { newest: false, id: null, offset: area.scrollTop };
-  return { newest: false, id: String(row.getAttribute("data-id")), offset: row.getBoundingClientRect().top - top };
+  if (!row) return { newest: false, id: null, offset: area.scrollTop, rows: marks, cards };
+  return { newest: false, id: String(row.getAttribute("data-id")), offset: row.getBoundingClientRect().top - top, rows: marks, cards };
+}
+
+/**
+ * A place in the cards, as `cardAnchor` reads it: the foot, or a card and how far below the top of the list's
+ * window it stood, or with `id` null the scroll offset; and since `#612 view-stability` the rows on screen with
+ * their cards' neighbours, which `placeCardAnchor` holds the reader by when that card has moved.
+ *
+ * @typedef {{newest: boolean, id: string | null, offset: number,
+ *   rows?: {id: string, card: string | null, own: boolean, offset: number, px: number}[],
+ *   cards?: Map<string, {prev: string | null, next: string | null} | undefined>}} CardPlace
+ */
+
+/**
+ * The row of `place` to hold the reader by now that the cards are drawn again (`#612 view-stability`): when a card
+ * whose rows showed more of the screen than every row that stayed has moved, its first row, wherever it now is;
+ * else, when the card held has moved or gone, the first row on screen that stayed — Main's messages, or a row
+ * whose card still stands beside a card it stood beside — and where that row stood. Null when the card held is
+ * the one to hold, or when no row is drawn.
+ *
+ * @param {CardPlace} place
+ * @returns {{row: HTMLElement, offset: number} | null}
+ */
+function stayedCardRow(place) {
+  if (!place.rows || !place.cards) return null;
+  const list = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
+  const cards = list.filter((row) => row.hasAttribute("data-card"));
+  const byId = new Map(cards.map((card) => [card.getAttribute("data-id"), card]));
+  const now = rowNeighbours(cards);
+  const was = place.cards;
+  const stayed = (/** @type {{card: string | null}} */ mark) => mark.card === null || neighbourStayed(mark.card, now, was);
+  const found = (/** @type {{id: string, card: string | null, own: boolean}} */ mark) => {
+    if (mark.card === null) return list.find((one) => one.hasAttribute("data-main-row") && one.getAttribute("data-id") === mark.id);
+    const owner = byId.get(mark.card);
+    if (!owner || mark.own) return owner;
+    for (let at = list.indexOf(owner) + 1; at < list.length && !list[at].hasAttribute("data-card"); at += 1) {
+      if (list[at].getAttribute("data-id") === mark.id) return list[at];
+    }
+    return undefined;
+  };
+  const firstDrawn = (/** @type {typeof place.rows} */ marks) => {
+    for (const mark of marks) {
+      const row = /** @type {HTMLElement | undefined} */ (found(mark));
+      if (row && rowShown(row)) return { row, offset: mark.offset };
+    }
+    return null;
+  };
+  // Most of the screen moved together: follow it, and nothing the reader sees moves.
+  let still = 0;
+  const moved = new Map();
+  for (const mark of place.rows) {
+    if (stayed(mark)) still += mark.px;
+    else moved.set(mark.card, (moved.get(mark.card) || 0) + mark.px);
+  }
+  const [heaviest, px] = [...moved].reduce((best, entry) => (entry[1] > best[1] ? entry : best), [null, 0]);
+  if (heaviest !== null && px > still) {
+    const followed = firstDrawn(place.rows.filter((mark) => mark.card === heaviest));
+    if (followed) return followed;
+  }
+  if (place.id !== null && neighbourStayed(place.id, now, was)) return null;
+  return firstDrawn(place.rows.filter(stayed));
 }
 
 /**
@@ -50262,13 +50475,23 @@ function cardAnchor() {
  * filters now hide it, the nearest card shown, in the list's order. Whether the reader was placed:
  * not for a card that has gone, nor where no card is shown.
  *
- * @param {{newest: boolean, id: string | null, offset: number} | null} anchor
+ * `#612 view-stability`: not after a card that has moved, re-sorted to the foot by a reply or gone, through a
+ * change nobody asked for. The reader is held by what kept most of the screen still (`stayedCardRow`), and is
+ * placed while one did. With `follow`, a place the reader chose to come back to, the card wherever it now is.
+ *
+ * @param {CardPlace | null} anchor
+ * @param {boolean} [follow]
  */
-function placeCardAnchor(anchor) {
+function placeCardAnchor(anchor, follow = false) {
   if (!anchor) return false;
   const area = leftEl("side-scroll");
   if (anchor.newest) {
     followFoot(area);
+    return true;
+  }
+  const stayed = follow ? null : stayedCardRow(anchor);
+  if (stayed) {
+    area.scrollTop += stayed.row.getBoundingClientRect().top - area.getBoundingClientRect().top - stayed.offset;
     return true;
   }
   if (anchor.id === null) {
@@ -50301,16 +50524,19 @@ function sameCardPlace(one, other) {
 }
 
 /**
- * Run `change` to the cards, keeping the reader's place in them. `#261 two-column-connectors`.
+ * Run `change` to the cards, keeping the reader's place in them. `#261 two-column-connectors`. With `follow`,
+ * a change the reader asked for that re-sorts the cards: the card they are on is kept wherever it goes
+ * (`#612 view-stability`).
  *
  * @param {() => void} change
+ * @param {boolean} [follow]
  */
-function keepingCardPlace(change) {
+function keepingCardPlace(change, follow = false) {
   // `#460 pack-gap-slide`. A slide is ended first, so the place is read where the cards are laid out.
   finishPackSlide();
   const anchor = cardAnchor();
   change();
-  placeCardAnchor(anchor);
+  placeCardAnchor(anchor, follow);
 }
 
 /** True while the cards are being opened, which places the reader once they are drawn. */
@@ -50354,7 +50580,7 @@ function placeOpenedCards() {
   const anchor = sideCardPlaces.get(String(el("discord-channel").value));
   sideCardPlaces.delete(String(el("discord-channel").value));
   // The foot, too, when the card the reader was on has gone.
-  if (!(anchor && !anchor.newest && placeCardAnchor(anchor))) placeCardAnchor({ newest: true, id: null, offset: 0 });
+  if (!(anchor && !anchor.newest && placeCardAnchor(anchor, true))) placeCardAnchor({ newest: true, id: null, offset: 0 });
 }
 
 /**
@@ -51546,7 +51772,7 @@ function setThreadOrder(order) {
   if (!sideColumnUp()) return;
   const mark = markOf(sidePane);
   const selected = mark && mark.card !== false ? mark.id : null;
-  keepingCardPlace(renderSideColumn);
+  keepingCardPlace(renderSideColumn, true);
   const row = selected === null ? null : paneRowFor(sidePane, selected, true);
   if (!row || !rowShown(row)) return;
   const area = leftEl("side-scroll").getBoundingClientRect();

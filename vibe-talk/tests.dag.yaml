@@ -1379,10 +1379,13 @@ steps:
   # reload in it opening it at its foot with the desk's dock on two rows; and, last, a card highlighted by
   # a click with the mouse going on over another card to the dock moves nothing, while the mouse resting
   # on it glides its root on screen (`#277 thread-card-focus`). Measured on 2026-10-13: about 110s wall,
-  # most of it the 2.5 s holds, and about 10s CPU.
+  # most of it the 2.5 s holds, and about 10s CPU. `#612 view-stability`: then, on fresh pages at 393x852 and
+  # 1280x800, the thread list halfway up holds the card being read, at every frame, while replies move the
+  # card above the screen, the card half off its top, one mid-screen and one below it to the foot. Measured
+  # on 2026-10-27 on a loaded host: 128s wall for the whole file.
   - group: check
     job: scroll-stability-browser
-    desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves, the view keys and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads and the thread list at their foot, in current Chromium at 1280x800 and 412x915
+    desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves, the view keys and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads and the thread list at their foot, in current Chromium at 1280x800 and 412x915; and the thread list holds the card being read while replies move other cards to its foot, at 393x852 and 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
     jobs_flag: ""
@@ -1390,7 +1393,7 @@ steps:
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
-      est_duration_s: 110
+      est_duration_s: 140
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
