@@ -69,6 +69,7 @@ mod policy;
 mod read_handoff_write;
 mod record_holds;
 mod recover_absent_write;
+mod recover_clone_write;
 mod recover_ownerless_write;
 mod recover_unbound_write;
 mod recover_validate_write;

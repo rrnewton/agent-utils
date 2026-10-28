@@ -489,6 +489,35 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Retire one exact unregistered standalone clone (writer; fixture registries only until cutover)
+    RecoverOwnerlessAgentClone {
+        /// Direct child of the managed agent directory
+        path: String,
+        /// Remote for one Git directory inside the clone, as KEY=URL (repeatable)
+        #[arg(long = "remote-url", value_name = "KEY=URL")]
+        remote_urls: Vec<String>,
+        /// Exact HANDOFF digest after the coordinator has read it (repeatable)
+        #[arg(long = "handoff-sha256", value_name = "SHA256")]
+        handoff_sha256s: Vec<String>,
+        /// Delete the gitignored files the plan lists
+        #[arg(long)]
+        discard_ignored: bool,
+        /// Apply instead of planning
+        #[arg(long = "apply")]
+        apply_mode: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID (required with --apply)
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
     Create {
         /// New slot name
@@ -1337,6 +1366,48 @@ pub fn run() -> u8 {
                 &remote,
                 &remote_url_sha256,
                 handoff_sha256.as_deref(),
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverOwnerlessAgentClone {
+            path,
+            remote_urls,
+            handoff_sha256s,
+            discard_ignored,
+            apply_mode,
+            coordinator_authorized,
+            coordinator_pid,
+            root,
+            machine,
+        } => {
+            let parsed_urls: Vec<(String, String)> = remote_urls
+                .iter()
+                .map(|raw| {
+                    let (key, url) = raw.split_once('=').unwrap_or((raw.as_str(), ""));
+                    (key.to_string(), url.to_string())
+                })
+                .collect();
+            match crate::recover_clone_write::recover_ownerless_agent_clone(
+                root.as_deref(),
+                machine.as_deref(),
+                &path,
+                &parsed_urls,
+                &handoff_sha256s,
+                discard_ignored,
                 apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
