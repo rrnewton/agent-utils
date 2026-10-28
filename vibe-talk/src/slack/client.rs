@@ -204,6 +204,9 @@ pub struct HttpSlackClient {
     /// Every request sent in the last minute, by method and priority: the shared budget.
     /// `#611 timeline-read-failures`; see [`super::budget`].
     sent: Mutex<super::budget::Sent>,
+    /// Calls since the last minute's report, by method and read reason. `#614
+    /// timeline-read-failures`; see [`super::budget::Tally`].
+    tally: Mutex<super::budget::Tally>,
     /// How long those replies are trusted before a Flat read reads their thread in full again.
     pub(super) flat_reconcile: Duration,
     /// Where the live poller stands in each thread of each conversation it polls, so each of its
@@ -295,6 +298,7 @@ impl HttpSlackClient {
             thread_scans: Mutex::default(),
             thread_scan_epoch: std::sync::atomic::AtomicU64::new(0),
             sent: Mutex::default(),
+            tally: Mutex::default(),
             flat_reconcile: super::timeline::FLAT_RECONCILE,
             live_threads: Mutex::new(HashMap::new()),
             post_limit: config.post_limit(),
@@ -350,14 +354,21 @@ impl HttpSlackClient {
     /// message cache's backfill, giving up at the first one: a crawler that waits a `Retry-After`
     /// and sends again keeps a route full that a person's read is waiting on, and the backfill
     /// holds off the provider itself once told (`#602 history-settings-and-limits`).
+    ///
+    /// `#614 timeline-read-failures`: so do the right column's reads (`side`) and All's counts read
+    /// (`counts`). The page makes them again by itself and the message cache answers them in the
+    /// provider's place; waiting out the budget held each for 16-47 s before a 502, spent the
+    /// route for everyone else meanwhile, and answered nothing the cache could not.
     pub(super) async fn call(
         &self,
         method: &'static str,
         params: &[(&str, String)],
     ) -> Result<Value, ChatError> {
-        let patience = if crate::read_reason::ReadReason::current()
-            == crate::read_reason::ReadReason::Backfill
-        {
+        use crate::read_reason::ReadReason;
+        let patience = if matches!(
+            ReadReason::current(),
+            ReadReason::Backfill | ReadReason::Side | ReadReason::Counts
+        ) {
             Patience::BestEffort
         } else {
             Patience::Budgeted
@@ -372,7 +383,8 @@ impl HttpSlackClient {
         patience: Patience,
     ) -> Result<Value, ChatError> {
         let url = format!("{}/{method}", self.api_base);
-        let priority = super::budget::Priority::of(crate::read_reason::ReadReason::current());
+        let reason = crate::read_reason::ReadReason::current();
+        let priority = super::budget::Priority::of(reason);
         let mut waited = Duration::ZERO;
         let mut attempts = 0;
         loop {
@@ -380,8 +392,10 @@ impl HttpSlackClient {
                 .admit(method, priority, patience, attempts, &mut waited)
                 .await
             {
+                self.count(|tally, now| tally.refused(method, now));
                 return Err(refused);
             }
+            self.count(|tally, now| tally.sent(method, reason, now));
             attempts += 1;
             let timer = self
                 .shim_profile
@@ -401,6 +415,7 @@ impl HttpSlackClient {
             match answer? {
                 Outcome::Done(value) => return Ok(value),
                 Outcome::Limited(retry_after) => {
+                    self.count(|tally, now| tally.limited(method, now));
                     self.note_limited(method, retry_after);
                     let wait = retry_after.max(MIN_RETRY_WAIT);
                     // A wait longer than what is left is refused BEFORE it is taken: parking a
@@ -485,6 +500,23 @@ impl HttpSlackClient {
         }
         sent.record(method, priority, now);
         None
+    }
+
+    /// Count one call in the minute's tally, and write the minute's report when it is due.
+    fn count(&self, what: impl FnOnce(&mut super::budget::Tally, tokio::time::Instant)) {
+        let now = tokio::time::Instant::now();
+        let report = {
+            let mut tally = self
+                .tally
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let report = tally.due(now);
+            what(&mut tally, now);
+            report
+        };
+        if let Some(report) = report {
+            report.log();
+        }
     }
 
     fn pressure(&self) -> std::sync::MutexGuard<'_, HashMap<String, MethodPressure>> {

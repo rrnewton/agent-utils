@@ -430,6 +430,16 @@ pub struct ThreadRecord {
     pub last_activity_ms: i64,
 }
 
+/// A channel's thread list as the file holds it ([`MessageCache::thread_list`]). `#614
+/// timeline-read-failures`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadList {
+    /// The threads with the latest activity, newest first, each with its root.
+    pub threads: Vec<(ThreadRecord, CachedMessage)>,
+    /// When the latest read of Main's newest end the file records began, local time.
+    pub main_checked_ms: Option<i64>,
+}
+
 /// Where the full-history walk of one channel stands: the `backfill` table's row
 /// (`#595 cache-full-history`, schema 4). Times are local unless they say provider time.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -2459,6 +2469,23 @@ impl MessageCache {
         let scope_key = Scope::Thread(thread_id.to_owned()).key();
         self.read_scope(chan, &scope_key, |connection| {
             reader::thread(connection, chan, thread_id)
+        })
+    }
+
+    /// The `limit` threads of a channel with the latest activity, each with its held root, newest
+    /// first: what a thread list put together from the file lists. Blocked while Main is (the
+    /// roots are Main's); a thread whose own scope is blocked is left out. `#614
+    /// timeline-read-failures`.
+    #[must_use]
+    pub fn thread_list(&self, chan: &ChanKey, limit: usize) -> Read<ThreadList> {
+        let read = self.read_scope(chan, &Scope::Main.key(), |connection| {
+            reader::thread_list(connection, chan, limit)
+        });
+        read.map(|mut list| {
+            list.threads.retain(|(record, _)| {
+                !self.scope_blocked(chan, &Scope::Thread(record.thread_id.clone()).key())
+            });
+            list
         })
     }
 

@@ -1527,6 +1527,11 @@ pub async fn timeline(
             });
         }
     }
+    // `#614 timeline-read-failures`: the thread list and All's counts read of a live-fed channel,
+    // from the cache, while an upstream read of the view answered lately or is running.
+    if let Some(held) = live_fed_answer(state, caller, &channel.id, request).await {
+        return stood_in(state, channel, request, held).await;
+    }
     // A step back from a served page offers each provider page it reads as it reads it.
     let fill = served_below
         .is_none()
@@ -1544,11 +1549,7 @@ pub async fn timeline(
     // upstream fail it or keep it waiting: the newest page of the view, for a caller that may be
     // answered from the cache at all. Never for a step back, whose rows lie below anything the
     // cache's newest page holds.
-    let stand_in = (request.before.is_none() && may_serve(state, caller)).then(|| Ask::Timeline {
-        view: request.view,
-        thread: request.thread_id.clone(),
-        limit: usize::from(request.limit.max(1)),
-    });
+    let stand_in = request.before.is_none() && may_serve(state, caller);
     let (mut page, position) = match (served_below.as_ref(), stand_in) {
         (Some(below), _) => (
             crate::held_replies::scope(
@@ -1569,17 +1570,17 @@ pub async fn timeline(
                 fill,
                 timeline_read,
             };
-            match stand_in {
+            if stand_in {
                 // Off the request's task, so that it runs on, and still fills the cache, after the
                 // request has been answered from the cache.
-                Some(ask) => match read_or_stand_in(state, &channel.id, request, read, &ask).await?
-                {
+                match read_or_stand_in(state, &channel.id, request, read).await? {
                     Answered::Upstream(answer) => *answer,
                     Answered::StandIn(page) => {
                         return stood_in(state, channel, request, page).await;
                     }
-                },
-                None => read.run().await?,
+                }
+            } else {
+                read.run().await?
             }
         }
     };
@@ -1726,22 +1727,182 @@ enum Answered {
 /// What the cache answered a read with in upstream's place.
 struct StoodIn {
     held: crate::cache::sink::StaleTimeline,
-    why: &'static str,
+    /// Why upstream did not answer, for the page; `None` for a live-fed channel's read answered
+    /// from the cache while upstream was read lately ([`live_fed_answer`]), which is no failure.
+    why: Option<&'static str>,
+}
+
+/// How long a live-fed channel's thread list, and All's counts read, are answered from the cache
+/// after an upstream read of the view answered ([`live_fed_answer`]). `#614 timeline-read-failures`.
+pub const LIVE_FED_UPSTREAM_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The cache's answer to a newest read or catch-up of a live-fed channel's thread list, or of its
+/// All for the page's counts (`reason=counts`), while an upstream read of that view answered within
+/// [`LIVE_FED_UPSTREAM_EVERY`] or one is running: `None` when the read should go upstream. `#614
+/// timeline-read-failures`.
+///
+/// The thread list scanned up to ten pages of Slack's history on every read, once a minute per tab
+/// and channel, and All's counts read made a history request and up to ten replies requests behind
+/// every poll of Main: together most of what kept Slack's `conversations.history` limit spent, for
+/// what live ingestion had already put in the cache. A thread's activity, its replies and its root
+/// reach the cache as they happen; so in between upstream reads the list is the latest upstream
+/// list brought up to date from the cache ([`merge_thread_lists`]), and All is Main and each
+/// root's newest held replies, as a stand-in's is. Never a failure (`refresh_failed` is absent),
+/// and, as a stand-in, no `settled_below_ms`: nothing the page holds is taken for deleted by
+/// being absent from it.
+async fn live_fed_answer(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+) -> Option<StoodIn> {
+    use crate::read_reason::ReadReason;
+    use crate::threads::TimelineView;
+    let applies = match request.view {
+        TimelineView::Threads => true,
+        TimelineView::Flat => ReadReason::current() == ReadReason::Counts,
+        TimelineView::Main | TimelineView::Thread => false,
+    };
+    if !applies
+        || request.before.is_some()
+        || !may_serve(state, caller)
+        || !crate::recent::live_fed(state, channel)
+    {
+        return None;
+    }
+    let key = RefreshKey::view(channel.clone(), request.view, request.thread_id.as_deref());
+    if state
+        .message_cache
+        .upstream_read_within(&key, LIVE_FED_UPSTREAM_EVERY)
+        .is_none()
+        && !state
+            .message_cache
+            .refresh_running(&flight_key(channel, request))
+    {
+        return None;
+    }
+    let held = held_for(state, channel, request).await?;
+    Some(StoodIn { held, why: None })
+}
+
+/// What the cache would answer `request` with in upstream's place ([`crate::cache::sink::Sink::stale_timeline`]):
+/// for the thread list, the latest upstream list brought up to date from the cache's own
+/// ([`merge_thread_lists`]). `#614 timeline-read-failures`.
+async fn held_for(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+) -> Option<crate::cache::sink::StaleTimeline> {
+    let limit = usize::from(request.limit.max(1));
+    let ask = Ask::Timeline {
+        view: request.view,
+        thread: request.thread_id.clone(),
+        limit,
+    };
+    // Every gate of the cache's holds for the list as a whole: with none passed (serving off, the
+    // channel unrouted or its account unchecked, Main blocked), not even the upstream list is used.
+    let mut held = state.message_cache.stale_timeline(channel, &ask).await?;
+    if request.view == crate::threads::TimelineView::Threads {
+        let upstream = state
+            .message_cache
+            .upstream_read_within(
+                &RefreshKey::view(channel.clone(), request.view, None),
+                UPSTREAM_LIST_KEPT,
+            )
+            .unwrap_or_default();
+        held.threads = merge_thread_lists(upstream, std::mem::take(&mut held.threads), limit);
+    }
+    Some(held)
+}
+
+/// How old an upstream thread list may be and still be merged into the cache's ([`held_for`]):
+/// past it, a thread that has since left the list would be put back.
+const UPSTREAM_LIST_KEPT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The latest upstream thread list brought up to date with the cache's own: each thread once, the
+/// copy with the later activity (the larger reply count of the two), the threads only the cache
+/// lists added, oldest activity first, the newest `limit`. A thread the cache does not list stays
+/// as upstream listed it: the cache may not hold its root. `#614 timeline-read-failures`.
+fn merge_thread_lists(
+    upstream: Vec<crate::threads::ThreadSummary>,
+    held: Vec<crate::threads::ThreadSummary>,
+    limit: usize,
+) -> Vec<crate::threads::ThreadSummary> {
+    let activity = |summary: &crate::threads::ThreadSummary| {
+        summary
+            .updated_at
+            .parse::<jiff::Timestamp>()
+            .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+    };
+    let mut merged: Vec<crate::threads::ThreadSummary> = upstream;
+    for summary in held {
+        match merged.iter_mut().find(|known| known.id == summary.id) {
+            Some(known) => {
+                let count = known.reply_count.max(summary.reply_count);
+                if activity(&summary) > activity(known) {
+                    *known = summary;
+                }
+                if known.reply_count != count {
+                    known.reply_count = count;
+                    known.reply_count_exact = false;
+                }
+            }
+            None => merged.push(summary),
+        }
+    }
+    merged.sort_by_key(|summary| (activity(summary), summary.id.clone()));
+    if merged.len() > limit {
+        merged.drain(..merged.len() - limit);
+    }
+    merged
+}
+
+/// Remember an upstream read of `request`'s view that answered with `page`, for
+/// [`live_fed_answer`]: the thread list's summaries, the whole list from a newest read, or the
+/// remembered list with a catch-up's changes applied. The thread list and All only; nothing else
+/// asks. `#614 timeline-read-failures`.
+fn note_upstream_read(
+    sink: &crate::cache::sink::Sink,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    page: &crate::threads::TimelinePage,
+) {
+    use crate::threads::TimelineView;
+    if !matches!(request.view, TimelineView::Threads | TimelineView::Flat) || !sink.serve_enabled()
+    {
+        return;
+    }
+    let key = RefreshKey::view(channel.clone(), request.view, None);
+    let threads = match &page.delta {
+        None => page.threads.clone(),
+        Some(delta) => {
+            // Changes to a list this server does not hold would be taken for the whole list.
+            let Some(mut known) = sink.upstream_read_within(&key, UPSTREAM_LIST_KEPT) else {
+                return;
+            };
+            known.retain(|summary| {
+                !delta.removed_threads.contains(&summary.id)
+                    && !page.threads.iter().any(|changed| changed.id == summary.id)
+            });
+            known.extend(page.threads.iter().cloned());
+            known
+        }
+    };
+    sink.note_upstream_read(key, threads);
 }
 
 /// Read `read` upstream on a task of its own, and answer from the cache instead — what it holds of
-/// `ask`, however old ([`crate::cache::sink::Sink::stale_timeline`]) — when upstream fails the way
-/// a provider fails (not a refusal, an access answer or an expired cursor), or has not answered
-/// within [`stand_in_after`]. A read the cache cannot stand in for waits for upstream, and fails as
-/// upstream failed. The read upstream is never abandoned: answered from the cache, the request
-/// leaves it running, and what it brings fills the cache for the next read. `#611
-/// timeline-read-failures`.
+/// the request's newest page, however old ([`held_for`]) — when upstream fails the way a provider
+/// fails (not a refusal, an access answer or an expired cursor), or has not answered within
+/// [`stand_in_after`]. A read the cache cannot stand in for waits for upstream, and fails as
+/// upstream failed; one that [`fails_fast`] fails once that wait has passed. The read upstream is
+/// never abandoned: answered from the cache, the request leaves it running, and what it brings
+/// fills the cache for the next read. `#611 timeline-read-failures`, `#614`.
 async fn read_or_stand_in(
     state: &AppState,
     channel: &ChannelId,
     request: &crate::threads::TimelineRequest,
     read: UpstreamTimeline,
-    ask: &Ask,
 ) -> Result<Answered, OpError> {
     let deadline = tokio::time::Instant::now() + stand_in_after(&state.config);
     // One read upstream of a view at a time, whoever asks (single-flight): a read that finds one
@@ -1755,12 +1916,15 @@ async fn read_or_stand_in(
             break Some(claim);
         }
         if tokio::time::Instant::now() >= deadline {
-            if let Some(held) = state.message_cache.stale_timeline(channel, ask).await {
+            if let Some(held) = held_for(state, channel, request).await {
                 log_stand_in(request, "busy", None);
                 return Ok(Answered::StandIn(StoodIn {
                     held,
-                    why: "The chat service is still answering an earlier read.",
+                    why: Some("The chat service is still answering an earlier read."),
                 }));
+            }
+            if fails_fast() {
+                return Err(too_slow(state));
             }
             // Nothing to stand in with: go upstream beside it, as every read used to.
             break None;
@@ -1768,19 +1932,29 @@ async fn read_or_stand_in(
         tokio::time::sleep(FLIGHT_POLL).await;
     };
     let reason = crate::read_reason::ReadReason::current();
+    let sink = std::sync::Arc::clone(&state.message_cache);
+    let (noted_channel, noted_request) = (channel.clone(), request.clone());
     let mut running = tokio::spawn(reason.scope(async move {
         let _claim = claim;
-        crate::upstream_profile::noting_failures(read.run()).await
+        let (result, failed) = crate::upstream_profile::noting_failures(read.run()).await;
+        if let Ok((page, _)) = &result {
+            note_upstream_read(&sink, &noted_channel, &noted_request, page);
+        }
+        (result, failed)
     }));
     let joined = match tokio::time::timeout_at(deadline, &mut running).await {
         Ok(joined) => joined,
         Err(_) => {
-            if let Some(held) = state.message_cache.stale_timeline(channel, ask).await {
+            if let Some(held) = held_for(state, channel, request).await {
                 log_stand_in(request, "slow", None);
                 return Ok(Answered::StandIn(StoodIn {
                     held,
-                    why: "The chat service did not answer in time.",
+                    why: Some("The chat service did not answer in time."),
                 }));
+            }
+            if fails_fast() {
+                // The read runs on, and fills the cache for the next one.
+                return Err(too_slow(state));
             }
             running.await
         }
@@ -1799,15 +1973,36 @@ async fn read_or_stand_in(
             let Some(why) = stand_in_for(&error) else {
                 return Err(error);
             };
-            match state.message_cache.stale_timeline(channel, ask).await {
+            match held_for(state, channel, request).await {
                 Some(held) => {
                     log_stand_in(request, "failed", Some(&error));
-                    Ok(Answered::StandIn(StoodIn { held, why }))
+                    Ok(Answered::StandIn(StoodIn {
+                        held,
+                        why: Some(why),
+                    }))
                 }
                 None => Err(error),
             }
         }
     }
+}
+
+/// Whether this read fails once [`stand_in_after`] has passed with nothing to stand in with,
+/// rather than waiting for upstream: the right column's reads and All's counts read, which the
+/// page makes again by itself and which nobody is waiting on. `#614 timeline-read-failures`: they
+/// waited out the provider's whole rate-limit budget and then answered 502 after 16-47 s.
+fn fails_fast() -> bool {
+    use crate::read_reason::ReadReason;
+    matches!(ReadReason::current(), ReadReason::Side | ReadReason::Counts)
+}
+
+/// The error a read that [`fails_fast`] answers with once [`stand_in_after`] has passed.
+fn too_slow(state: &AppState) -> OpError {
+    OpError::Chat(ChatError::Transport(format!(
+        "the chat service did not answer within {} ms and this server holds nothing to answer \
+         with; the read runs on and fills the cache for the next one",
+        stand_in_after(&state.config).as_millis()
+    )))
 }
 
 /// How often a read waiting for another read of its view to end looks again.
@@ -1889,25 +2084,37 @@ async fn stood_in(
     use crate::timeline_forward as forward;
     let StoodIn { held, why } = stood;
     let thread = request.thread_id.as_deref();
-    let next_before =
-        crate::timeline_served::encode(&channel.id, request.view, thread, &held.messages)?;
+    // `#614 timeline-read-failures`: a thread list has no messages to step back from; its next
+    // page back is read upstream, from the newest, as a page with no cursor reads it.
+    let list = request.view == crate::threads::TimelineView::Threads;
+    let next_before = (!list)
+        .then(|| crate::timeline_served::encode(&channel.id, request.view, thread, &held.messages))
+        .transpose()?;
     let oldest_seen = held
         .messages
         .iter()
+        .chain(
+            held.threads
+                .iter()
+                .filter_map(|summary| summary.root.as_ref()),
+        )
         .filter_map(|message| message.observed_ms)
         .min();
     let mut page = crate::threads::TimelinePage {
         messages: held.messages,
+        threads: held.threads,
         has_threads: held.has_threads,
         observed_ms: held.checked_ms.or(oldest_seen),
         settled_below_ms: None,
-        has_more: true,
-        next_before: Some(next_before),
-        as_of: held
-            .checked_ms
-            .or(oldest_seen)
-            .map(crate::clock::iso_from_ms),
-        refresh_failed: Some(why.to_owned()),
+        has_more: next_before.is_some(),
+        next_before,
+        // A failure says how old the copy is. An answer beside a live feed is as new as the feed.
+        as_of: why.and_then(|_| {
+            held.checked_ms
+                .or(oldest_seen)
+                .map(crate::clock::iso_from_ms)
+        }),
+        refresh_failed: why.map(str::to_owned),
         ..crate::threads::TimelinePage::default()
     };
     page.next_after = Some(forward::encode(
@@ -1919,6 +2126,12 @@ async fn stood_in(
     let noise = crate::noise::filter_for(state, &channel.id).await;
     stamp(state, &mut page.messages);
     noise.mark(&mut page.messages);
+    for summary in &mut page.threads {
+        if let Some(root) = &mut summary.root {
+            stamp(state, std::slice::from_mut(root));
+            noise.mark(std::slice::from_mut(root));
+        }
+    }
     Ok((channel, page))
 }
 

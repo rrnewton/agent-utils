@@ -57,8 +57,6 @@ const FLAT_REMEMBERED_MAX: usize = 256;
 /// without reading it first: long enough for the rest of that post, parts and a retry of the rest,
 /// short enough that a thread removed meanwhile is soon read again. `#448 send-dedupe`.
 pub const ROOTS_KEEP: std::time::Duration = std::time::Duration::from_secs(2 * 60);
-/// Characters of a root's first line used as its thread title.
-pub const THREAD_TITLE_CHARS: usize = 80;
 /// Pages of `users.conversations` one discovery request may read while filtering.
 pub const DISCOVERY_PAGES: usize = 10;
 /// The page size asked of `users.conversations`.
@@ -209,10 +207,10 @@ pub(super) fn cursor_micros(id: &MessageId) -> Result<i64, ChatError> {
     })
 }
 
-/// The first line of a root, trimmed to [`THREAD_TITLE_CHARS`]; for a root that is only files, its
-/// first file's name and kind as text (`#313 slack-file-posts`), since a file line's Markdown would
-/// show its address. A mention in it is written as the person's name, `@Ada Lovelace`, where the
-/// read could name it (`#318 slack-mention-names`).
+/// The first line of a root, trimmed to [`crate::threads::THREAD_TITLE_CHARS`]; for a root that is
+/// only files, its first file's name and kind as text (`#313 slack-file-posts`), since a file
+/// line's Markdown would show its address. A mention in it is written as the person's name, `@Ada
+/// Lovelace`, where the read could name it (`#318 slack-mention-names`).
 fn title(raw: &Raw, root: Option<&Message>) -> String {
     let files = super::files::plain_title(&raw.value);
     let named = root.map(|root| MentionName::write_names(&root.content, &root.mentions, "@"));
@@ -224,14 +222,7 @@ fn title(raw: &Raw, root: Option<&Message>) -> String {
                 .and_then(|text| text.lines().map(str::trim).find(|l| !l.is_empty()))
         })
         .unwrap_or("");
-    if line.is_empty() {
-        return "Thread".to_owned();
-    }
-    if line.chars().count() <= THREAD_TITLE_CHARS {
-        return line.to_owned();
-    }
-    let cut: String = line.chars().take(THREAD_TITLE_CHARS - 1).collect();
-    format!("{}…", cut.trim_end())
+    crate::threads::title_from_line(line)
 }
 
 /// A display name the directory contract accepts: no control characters, bounded length.

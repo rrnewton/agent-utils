@@ -16,12 +16,12 @@
 //!   handler inside it ([`ReadReason::scope`]).
 //! * **The server says so for its own reads**: thread naming, the voice catch-up's windows, the
 //!   reachability probe, a summary's context window, speech preparation, the recent-view shadow
-//!   check, and an MCP tool call. Each runs its read inside its own reason, which overrides any
-//!   reason of the request it was made for.
+//!   check, an MCP tool call, and the live poller (`#614 timeline-read-failures`). Each runs its
+//!   read inside its own reason, which overrides any reason of the request it was made for.
 //!
-//! A read made with no reason around it counts as [`ReadReason::Untagged`] (the live poller's, for
-//! one), so a path nobody tagged shows up in the figures as exactly that rather than hiding under
-//! another's name.
+//! A read made with no reason around it counts as [`ReadReason::Untagged`] (a send, for one), so a
+//! path nobody tagged shows up in the figures as exactly that rather than hiding under another's
+//! name.
 //!
 //! The reason is carried in a task-local, not threaded through every signature: the chat trait
 //! stays as it is, and [`crate::upstream_profile::ProfiledClient`] reads it where it times the
@@ -32,11 +32,16 @@
 //! Attribution, never a decision, with two exceptions for the server's own `backfill` reason
 //! alone, which no client can claim (see below): the upstream profile does not count a backfill
 //! read as the provider being in use (`#453 cache-backfill`), and a backfill read gives up at the
-//! first rate limit instead of waiting it out (`#602 history-settings-and-limits`). Otherwise
+//! first rate limit instead of waiting it out (`#602 history-settings-and-limits`). And for the
+//! page's own words, decisions about the caller's own read only, never what it may see: Slack's
+//! shared budget places a read by its reason (`#611 timeline-read-failures`,
+//! [`crate::slack::budget`]), and a `side` or `counts` read gives up at the first rate limit, fails
+//! once the stand-in wait has passed with nothing to answer from, and is answered from the message
+//! cache in between upstream reads of a live-fed channel's All (`#614`, `crate::ops`). Otherwise
 //! NOTHING reads it to decide what a caller may see or do, which read is made, whether one is
 //! shared or kept, or how fresh an answer must be: it is written to the access log and counted in
 //! the upstream profile, and that is all. So a client that lies about
-//! it can mislabel only its own reads. A word the page does not send — including every server-side
+//! it can mislabel only its own reads, and hurry or slow only its own answers. A word the page does not send — including every server-side
 //! reason — is [`ReadReason::Other`] when it arrives from outside, so a request cannot pass itself
 //! off as the server's own background work, and nothing a client sends is copied into the log.
 
@@ -111,6 +116,9 @@ pub enum ReadReason {
     /// The server: walking a channel's older history to fill the message cache. `#453
     /// cache-backfill`.
     Backfill,
+    /// The server: the live poller reading each polled channel's newest messages (and the threads
+    /// that moved) to publish them. `#614 timeline-read-failures`; it used to be untagged.
+    LivePoll,
     /// A reason was given, but it is not one the page sends.
     Other,
     /// No reason was given at all.
@@ -118,7 +126,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 28] = [
+pub const ALL: [ReadReason; 29] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -145,6 +153,7 @@ pub const ALL: [ReadReason; 28] = [
     ReadReason::ReplyMark,
     ReadReason::Relist,
     ReadReason::Backfill,
+    ReadReason::LivePoll,
     ReadReason::Other,
     ReadReason::Untagged,
 ];
@@ -180,6 +189,7 @@ impl ReadReason {
             Self::ReplyMark => "reply-mark",
             Self::Relist => "relist",
             Self::Backfill => "backfill",
+            Self::LivePoll => "live-poll",
             Self::Other => "other",
             Self::Untagged => "untagged",
         }

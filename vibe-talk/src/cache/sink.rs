@@ -229,6 +229,11 @@ struct State {
     /// The background refreshes of served answers now running, one per read: a second serve of
     /// the same read starts no second upstream read. `#384 cache-serve`.
     refreshing: Mutex<HashSet<RefreshKey>>,
+    /// When the thread list and All of each channel were last read upstream and answered, and the
+    /// summaries the thread list's read brought ([`Sink::note_upstream_read`]): what a live-fed
+    /// channel's side and counts reads are answered from in between. Memory only, one entry per
+    /// channel and view. `#614 timeline-read-failures`.
+    upstream_reads: Mutex<HashMap<RefreshKey, UpstreamRead>>,
     /// How each recent message reached the cache, by whom it was offered: what the shadow's
     /// diagnostics name beside a message its comparison found different. Memory only. `#497
     /// cache-shadow-missing-row`.
@@ -462,6 +467,16 @@ impl RefreshKey {
         }
     }
 
+    /// One channel's `view` (and `thread`), however it is read: what [`Sink::note_upstream_read`]
+    /// remembers a read of. `#614 timeline-read-failures`.
+    #[must_use]
+    pub fn view(channel: ChannelId, view: TimelineView, thread: Option<&str>) -> Self {
+        Self {
+            channel,
+            read: format!("view:{view:?}:{}", thread.unwrap_or_default()),
+        }
+    }
+
     /// Every catch-up read (`after=`) of one channel's `view` (and `thread`), whatever cursor it
     /// continues from: one at a time upstream. `#611 timeline-read-failures`.
     #[must_use]
@@ -471,6 +486,14 @@ impl RefreshKey {
             read: format!("timeline-forward:{view:?}:{}", thread.unwrap_or_default()),
         }
     }
+}
+
+/// One view's latest upstream read that answered ([`Sink::note_upstream_read`]). `#614
+/// timeline-read-failures`.
+#[derive(Clone, Debug)]
+struct UpstreamRead {
+    at: Instant,
+    threads: Vec<crate::threads::ThreadSummary>,
 }
 
 /// A running background refresh's claim ([`Sink::claim_refresh`]): dropped, the read may be
@@ -978,6 +1001,9 @@ pub struct StaleTimeline {
     /// When the latest read of the scope's newest end the file records began, local time: what
     /// the answer is as of. `None` when no read of the newest end has landed.
     pub checked_ms: Option<i64>,
+    /// The thread list's summaries, oldest activity first, for the Threads view (and no
+    /// messages); empty for every other view. `#614 timeline-read-failures`.
+    pub threads: Vec<crate::threads::ThreadSummary>,
 }
 
 /// An answer to hand back from the cache. `#384 cache-serve`.
@@ -1543,6 +1569,39 @@ impl Sink {
             })
     }
 
+    /// Whether a read under `key` is running now ([`Self::claim_refresh`]).
+    #[must_use]
+    pub fn refresh_running(&self, key: &RefreshKey) -> bool {
+        lock(&self.state.refreshing).contains(key)
+    }
+
+    /// Remember that the view `key` names ([`RefreshKey::view`]) was read upstream just now and
+    /// answered, with the thread list's summaries when it is the thread list. `#614
+    /// timeline-read-failures`.
+    pub fn note_upstream_read(&self, key: RefreshKey, threads: Vec<crate::threads::ThreadSummary>) {
+        lock(&self.state.upstream_reads).insert(
+            key,
+            UpstreamRead {
+                at: Instant::now(),
+                threads,
+            },
+        );
+    }
+
+    /// The summaries the latest upstream read of the view `key` names brought, when that read
+    /// answered within `within`: `None` when none did. `#614 timeline-read-failures`.
+    #[must_use]
+    pub fn upstream_read_within(
+        &self,
+        key: &RefreshKey,
+        within: Duration,
+    ) -> Option<Vec<crate::threads::ThreadSummary>> {
+        lock(&self.state.upstream_reads)
+            .get(key)
+            .filter(|read| read.at.elapsed() < within)
+            .map(|read| read.threads.clone())
+    }
+
     /// What opens, switches and erases the cache file, once the server has started it.
     #[must_use]
     pub fn lifecycle(&self) -> Option<&Arc<Lifecycle>> {
@@ -2063,8 +2122,8 @@ impl Sink {
     /// Main and one thread on every shape but a channel narrowed to one thread, whose pages carry
     /// a thread record the cache does not keep; a bridge's All, which the cache keeps as a scope;
     /// and Slack's All, put together as Slack's own read puts it together: Main, and the newest
-    /// replies the cache holds of each thread rooted on it. Never the thread list, which the cache
-    /// does not keep.
+    /// replies the cache holds of each thread rooted on it. `#614 timeline-read-failures`: and
+    /// Slack's thread list, put together from the file's thread records ([`Self::stale_thread_list`]).
     pub async fn stale_timeline(&self, channel: &ChannelId, ask: &Ask) -> Option<StaleTimeline> {
         if !self.serve_enabled() {
             return None;
@@ -2081,7 +2140,17 @@ impl Sink {
                 .map(|route| (route.key.clone(), route.shape, route.recent_via_flat))
         };
         let (key, shape, recent_via_flat) = route_of(self)?;
-        if shape == Shape::SlackThread || *view == TimelineView::Threads {
+        if *view == TimelineView::Threads {
+            if shape != Shape::Slack {
+                return None;
+            }
+            let Ask::Timeline { limit, .. } = ask else {
+                return None;
+            };
+            let list = self.stale_thread_list(&key, channel, *limit).await?;
+            return (route_of(self).is_some_and(|(again, ..)| again == key)).then_some(list);
+        }
+        if shape == Shape::SlackThread {
             return None;
         }
         let slack_flat = shape == Shape::Slack && *view == TimelineView::Flat;
@@ -2147,6 +2216,66 @@ impl Sink {
                     message
                 })
                 .collect(),
+            threads: Vec::new(),
+        })
+    }
+
+    /// Slack's thread list as the file holds it: the `limit` threads with the latest activity
+    /// whose roots it holds whole, oldest activity first, each summarised as Slack's own list
+    /// summarises it (its root, the root's first line as its title, its reply count, and its latest
+    /// activity). `None` when it holds no thread. `#614 timeline-read-failures`.
+    ///
+    /// Live ingestion keeps it current between reads of the list: every reply it delivers moves its
+    /// thread's activity forward, and every read of Main or of the list sets the counts. A thread
+    /// whose root is older than anything the file holds is not listed, as one older than Slack's
+    /// own scan is not.
+    async fn stale_thread_list(
+        &self,
+        key: &str,
+        channel: &ChannelId,
+        limit: usize,
+    ) -> Option<StaleTimeline> {
+        let cache = self.cache()?;
+        let chan = ChanKey::new(key.to_owned(), channel.as_str());
+        let list = tokio::task::spawn_blocking(move || cache.thread_list(&chan, limit).served())
+            .await
+            .ok()
+            .flatten()?;
+        let mut threads: Vec<crate::threads::ThreadSummary> = list
+            .threads
+            .into_iter()
+            .filter(|(_, root)| !root.content_partial)
+            .map(|(record, root)| {
+                let mut message = root.message;
+                message.observed_ms = Some(root.observed_ms);
+                let counted = message
+                    .thread
+                    .as_ref()
+                    .and_then(|thread| thread.reply_count);
+                crate::threads::ThreadSummary {
+                    id: record.thread_id,
+                    title: crate::threads::root_title(&message),
+                    reply_count: record.reply_count.or(counted),
+                    reply_count_exact: record.reply_count.is_some() && record.reply_count_exact,
+                    updated_at: crate::clock::iso_from_ms(
+                        record.last_activity_ms.max(root.created_ms),
+                    ),
+                    root: Some(message),
+                    display_name: None,
+                    summary: None,
+                    hue: None,
+                }
+            })
+            .collect();
+        if threads.is_empty() {
+            return None;
+        }
+        threads.reverse();
+        Some(StaleTimeline {
+            messages: Vec::new(),
+            has_threads: true,
+            checked_ms: list.main_checked_ms,
+            threads,
         })
     }
 

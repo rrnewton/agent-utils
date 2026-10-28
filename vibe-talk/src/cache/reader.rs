@@ -631,6 +631,56 @@ pub(crate) fn thread(
         .optional()
 }
 
+/// The `limit` threads of `chan` with the latest activity, newest first, each with its root as the
+/// file holds it: a thread whose root the file does not hold, or that says it has no replies, is
+/// not listed. Also when the latest read of Main's newest end began. In ONE read transaction. `#614
+/// timeline-read-failures`; see [`super::MessageCache::thread_list`].
+pub(crate) fn thread_list(
+    connection: &Connection,
+    chan: &ChanKey,
+    limit: usize,
+) -> rusqlite::Result<super::ThreadList> {
+    let snapshot = connection.unchecked_transaction()?;
+    let Some(chan_id) = chan_id(&snapshot, chan)? else {
+        return Ok(super::ThreadList::default());
+    };
+    let main_checked_ms =
+        head_by_id(&snapshot, chan_id, &Scope::Main.key())?.map(|record| record.checked_ms);
+    let mut statement = snapshot.prepare(&format!(
+        "SELECT {MESSAGE_COLUMNS}, t.thread_id, t.reply_count, t.reply_count_exact,
+                t.last_activity_ms
+         FROM thread t JOIN message m ON m.chan = t.chan AND m.message_id = t.root_id
+         WHERE t.chan = ?1 AND m.is_root = 1 AND COALESCE(t.reply_count, 1) > 0
+         ORDER BY t.last_activity_ms DESC, t.thread_id DESC LIMIT ?2"
+    ))?;
+    let threads = statement
+        .query_map(
+            params![chan_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                let root = cached(&chan.channel_id, row)?;
+                Ok((
+                    ThreadRecord {
+                        thread_id: row.get(10)?,
+                        root_id: Some(root.message.id.clone()),
+                        reply_count: row
+                            .get::<_, Option<i64>>(11)?
+                            .and_then(|n| u64::try_from(n).ok()),
+                        reply_count_exact: row.get(12)?,
+                        last_activity_ms: row.get(13)?,
+                    },
+                    root,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    snapshot.finish()?;
+    Ok(super::ThreadList {
+        threads,
+        main_checked_ms,
+    })
+}
+
 pub(crate) fn account(
     connection: &Connection,
     provider_key: &str,

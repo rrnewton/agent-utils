@@ -176,6 +176,39 @@ pub struct ThreadSummary {
     pub hue: Option<u16>,
 }
 
+/// Characters of a root's first line used as its thread title.
+pub const THREAD_TITLE_CHARS: usize = 80;
+
+/// A thread title from one line of its root: the line trimmed and cut to [`THREAD_TITLE_CHARS`],
+/// or a neutral `Thread` for an empty one.
+#[must_use]
+pub fn title_from_line(line: &str) -> String {
+    let line = line.trim();
+    if line.is_empty() {
+        return "Thread".to_owned();
+    }
+    if line.chars().count() <= THREAD_TITLE_CHARS {
+        return line.to_owned();
+    }
+    let cut: String = line.chars().take(THREAD_TITLE_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// A thread's title from its root, as Slack's thread list titles one: the root's first non-empty
+/// line, each mention written as the person's name. For a thread list the message cache puts
+/// together (`#614 timeline-read-failures`).
+#[must_use]
+pub fn root_title(root: &Message) -> String {
+    let named = crate::model::MentionName::write_names(&root.content, &root.mentions, "@");
+    title_from_line(
+        named
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or(""),
+    )
+}
+
 /// The fewest messages a thread holds before it is named or summarised at all: the root and
 /// two replies. `#484 summary-card-threshold`.
 ///
