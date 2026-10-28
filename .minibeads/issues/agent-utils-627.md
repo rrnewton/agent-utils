@@ -1,12 +1,13 @@
 ---
 title: 'scrubber-thumb-arrows: section and chunk arrows on the right of the read-aloud strip'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-28T13:17:04.273297697+00:00
-updated_at: 2026-10-28T13:17:04.273297697+00:00
+updated_at: 2026-10-28T15:52:43.928299202+00:00
+closed_at: 2026-10-28T15:52:43.928299031+00:00
 ---
 
 # Description
