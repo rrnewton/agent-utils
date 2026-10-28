@@ -1,13 +1,14 @@
 ---
 title: 'cache-first-reads: every page read and read-aloud answered from the server''s message cache, Slack behind the answer'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - cache
 created_at: 2026-10-28T12:39:00.591856816+00:00
-updated_at: 2026-10-28T12:39:00.591856816+00:00
+updated_at: 2026-10-28T13:34:10.204021567+00:00
+closed_at: 2026-10-28T13:34:10.204021417+00:00
 ---
 
 # Description
