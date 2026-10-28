@@ -2584,6 +2584,8 @@ pub async fn activity(
             per_channel_limit: query.per_channel_limit,
             channel: query.channel_id.as_deref(),
             now_ms: ops::now_ms(),
+            unread_only: false,
+            channels: &[],
         },
     )
     .await?;

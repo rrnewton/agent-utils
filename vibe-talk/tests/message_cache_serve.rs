@@ -2498,6 +2498,8 @@ async fn slack_catch_up(state: &AppState, hours: u64) -> vibe_talk::ops::Activit
             per_channel_limit: None,
             channel: None,
             now_ms: slack_ms(3_600),
+            unread_only: false,
+            channels: &[],
         },
     )
     .await

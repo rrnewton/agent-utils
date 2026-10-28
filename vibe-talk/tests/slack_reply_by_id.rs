@@ -334,7 +334,7 @@ async fn the_voice_agent_reads_a_reply_it_was_told_about() {
 
     let (catch_up, failed) = tool(&server, "recent_activity", json!({})).await;
     assert!(!failed, "{catch_up}");
-    let thread = format!(" | thread {}]", ids.root);
+    let thread = format!(" | thread {} | ", ids.root);
     assert!(
         line_of(&catch_up, "build is green").contains(&thread),
         "{catch_up}"

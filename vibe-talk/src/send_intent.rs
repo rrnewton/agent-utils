@@ -362,6 +362,70 @@ impl SendIntent {
         Ok(license)
     }
 
+    /// Whether `request` names the user's own explicit ask, made lately, to mark messages read:
+    /// "mark that read", "mark those as done", "archive it", "dismiss them", "clear those". The
+    /// quote must itself be such an ask and must be among what the user said in the last
+    /// [`HEARD_WINDOW`]. Nothing is spent: marking twice changes nothing the second time. `#649
+    /// voice-agent-tools` item 7. Waits up to [`REPORT_GRACE`] for the page's report, as
+    /// [`Self::check`] does.
+    ///
+    /// # Errors
+    ///
+    /// The [`Refusal`] that says why not ([`Refusal::Spent`] is never one).
+    pub async fn check_read(&self, request: Option<&str>) -> Result<(), Refusal> {
+        let request = request.map(str::trim).unwrap_or_default();
+        if request.is_empty() {
+            return Err(Refusal::Missing);
+        }
+        let wanted = tokens(request);
+        if !read_directive(&wanted) || content(&wanted).is_empty() {
+            return Err(Refusal::NoDirective);
+        }
+        let deadline = tokio::time::Instant::now() + REPORT_GRACE;
+        loop {
+            let changed = self.heard_changed.notified();
+            let verdict = self.judge_read(&wanted, Instant::now());
+            match verdict {
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                        return self.judge_read(&wanted, Instant::now());
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// [`Self::check_read`]'s verdict as of `now`, without waiting.
+    fn judge_read(&self, wanted: &[Token], now: Instant) -> Result<(), Refusal> {
+        let mut inner = self.lock();
+        inner.prune(now);
+        let recent: Vec<&Heard> = inner.heard.iter().collect();
+        let mut candidates: Vec<Vec<&Heard>> = recent.iter().rev().map(|h| vec![*h]).collect();
+        for pair in recent.windows(2).rev() {
+            if pair[1].at.saturating_duration_since(pair[0].at) <= ADJACENT {
+                candidates.push(vec![pair[0], pair[1]]);
+            }
+        }
+        let mut refusal = Refusal::NotHeard;
+        for candidate in candidates {
+            let text = candidate
+                .iter()
+                .map(|h| h.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let said = tokens(&text);
+            if !quotes(wanted, &said) {
+                continue;
+            }
+            if read_directive(&said) {
+                return Ok(());
+            }
+            refusal = Refusal::NoDirective;
+        }
+        Err(refusal)
+    }
+
     /// The send `license` was spent on certainly posted nothing: its ask is good again.
     pub fn release(&self, license: &License) {
         self.lock().spent.retain(|s| !license.keys.contains(&s.key));
@@ -604,6 +668,34 @@ const NEGATION_REACH: usize = 4;
 /// are channel names, as word lists, that count as addressees.
 fn directive(said: &[Token], targets: &[Vec<String>]) -> bool {
     (0..said.len()).any(|at| directive_at(said, at, targets))
+}
+
+/// Whether `said` asks for messages to be marked read here, in imperative or request position and
+/// not negated: "mark" followed within a few words by "read", "done" or "seen"; or "archive",
+/// "dismiss" or "clear". "Did you mark it read?" and "don't mark it read" are not asks. `#649
+/// voice-agent-tools` item 7.
+fn read_directive(said: &[Token]) -> bool {
+    (0..said.len()).any(|at| {
+        let verb = match word(said, at) {
+            Some(verb) => verb,
+            None => return false,
+        };
+        let asks = imperative(said, at) && !in_question(said, at);
+        match verb {
+            "mark" => {
+                asks && said[at + 1..]
+                    .iter()
+                    .take(6)
+                    .map_while(|t| match t {
+                        Token::Word(w) => Some(w.as_str()),
+                        Token::Stop { .. } => None,
+                    })
+                    .any(|w| matches!(w, "read" | "done" | "seen"))
+            }
+            "archive" | "dismiss" | "clear" => asks,
+            _ => false,
+        }
+    })
 }
 
 fn word(said: &[Token], at: usize) -> Option<&str> {

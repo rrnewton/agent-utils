@@ -259,6 +259,8 @@ async fn catch_up(state: &AppState) -> Value {
                 per_channel_limit: None,
                 channel: None,
                 now_ms: vibe_talk::ops::now_ms(),
+                unread_only: false,
+                channels: &[],
             },
         )
     };

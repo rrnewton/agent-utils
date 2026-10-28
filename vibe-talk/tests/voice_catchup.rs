@@ -99,6 +99,8 @@ async fn catch_up(state: &AppState) -> ops::Activity {
             per_channel_limit: None,
             channel: None,
             now_ms: ops::now_ms(),
+            unread_only: false,
+            channels: &[],
         },
     )
     .await

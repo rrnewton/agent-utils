@@ -9931,13 +9931,14 @@ endpoint should have.
 
 | Tool | Scope | Approval intent | What it does |
 |---|---|---|---|
-| `recent_activity` | read | automatic | Catches up in one call, with no required argument: the newest message's channel and time first, then each channel's most recent messages inside the window (`hours`, default 24, at most 168), **in full**, with an honest count. `channel_id` reads one channel. Listed first. |
+| `recent_activity` | read | automatic | Catches up in one call, with no required argument: the newest message's channel and time first, then each channel's most recent messages inside the window (`hours`, default 24, at most 168), **in full**, with an honest count. `channel_id` reads one channel; `channel_ids` reads several in one call, each by id, name or a part of a name (`"build"` reads every channel whose name holds it). `unread_only` counts and shows only what the user has not marked read on this server (`#649 voice-agent-tools`). Listed first. |
 | `list_channels` | read | automatic | Names the configured channels and which are postable. |
 | `digest_channel` | read | automatic | One speakable line per recent message. **Not listed** since `#437 voice-full-text-catchup`; answered by name only, for an agent configured with it. |
 | `read_page` | read | automatic | One step of a walk: a page that says it is a page, plus the cursor for the next one. `hours` reads from that many hours ago to now. |
 | `count_messages` | read | automatic | How many, up to a cost ceiling — "at least N" when the ceiling stops it. `hours` counts from that many hours ago. |
 | `find_message` | read | automatic | Describe a message in your own words, get it back in full. |
 | `read_message` | read | automatic | One known message by id; `thread_id` for a reply in a thread, which the reply's line gives as `\| thread <thread id>`. |
+| `mark_read` | **write** | automatic, held to the user's words | Marks messages read on this server, exactly as Done on the voice page, and nothing in the chat service; only with `user_request` quoting the user's own ask ("mark that read"), which the server checks against what the voice page heard, as for `post_reply`. Answers exactly which it marked and which were already read (`#649 voice-agent-tools`). |
 | `post_reply` | **write** | **requires approval**, unless the owner turned it off | *Proposes* a post as the bot, and nothing is sent until the owner confirms it outside the model's tools — or, with "Ask me before the voice agent sends" off, posts it at once and says `SENT`. |
 
 They are deliberately thin, with one exception. With a real model in the loop the model should
@@ -10627,6 +10628,7 @@ Then set per-tool approval. This table is the whole policy:
 | `count_messages` | **auto** — no approval | How many, honest about a floor. |
 | `find_message` | **auto** — no approval | A description in your own words → that message, in full. |
 | `read_message` | **auto** — no approval | One known message by id. |
+| `mark_read` | **auto** — no approval | Marks messages Done on this server only, and only on the user's own quoted ask, which the server checks. |
 | **`post_reply`** | **REQUIRE APPROVAL** | **Speaks in your name, in your channel.** While the agent asks first, the voice page approves the vendor's request itself — see below. |
 
 That is what implements "reading is automatic while driving, posting asks first". If the agent
@@ -11205,6 +11207,17 @@ else), `[owner] user_ids` and every provider's `owner_user_id` (the page is told
 `owner_author_ids`, and draws them as yours), and the account this server posts as or any message it
 posted, unless `coding_agent_user_ids` names that account. A message is decided the first time it is
 seen as yours, so one from an account you later call "me" is decided at its next sight.
+
+### Read state, to the voice agent
+
+`#649 voice-agent-tools` item 7. Every message line the read tools give a model (`recent_activity`,
+`read_page`, `read_message`, `find_message`, `digest_channel`) says after the author whether the user
+has marked it read on THIS SERVER, `| read` or `| unread`: Done on the voice page, or their own
+message, the same record the page shows. Nothing about the chat service's own read state is
+claimed. `recent_activity` and `read_page` take `unread_only=true`, which counts and shows only the
+unread ones; the tool descriptions make it the choice for "update me with any unread messages from
+the last few hours". `mark_read` marks messages Done on the user's own quoted ask (see the tool
+table), and the page's next read shows them Done.
 
 ### Your own messages, to the voice agent
 

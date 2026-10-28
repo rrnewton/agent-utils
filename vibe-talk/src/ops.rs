@@ -2695,9 +2695,18 @@ pub struct ActivityRequest<'a> {
     /// "catch me up on that channel" is the same catch-up, with the same deadline and held copy, as
     /// "catch me up". A channel that is not listed is [`OpError::UnknownChannel`].
     pub channel: Option<&'a str>,
+    /// Read only these listed channels, each named by its id, its name, or a part of its name
+    /// ("build" for every channel whose name holds it), beside `channel`. `#649 voice-agent-tools`:
+    /// asked for "the two build channels", the agent read three channels one by one, one of them
+    /// not one of them at all; this makes that one call, chosen by name here.
+    pub channels: &'a [String],
     /// The clock the window is resolved against: [`now_ms`] in production, a fixed instant in a
     /// test.
     pub now_ms: i64,
+    /// Only messages the user has not marked read on this server (Done, or their own), counted and
+    /// shown. `#649 voice-agent-tools` item 7: the owner's common request is "update me with any
+    /// unread messages from the last k hours", without what they already know.
+    pub unread_only: bool,
 }
 
 /// Every listed channel's recent activity, read in one call. `#190 voice-agent-tools`.
@@ -2716,6 +2725,8 @@ pub struct Activity {
     pub per_channel_limit: u16,
     /// One entry per listed channel, in list order, each read or not on its own.
     pub channels: Vec<ChannelActivity>,
+    /// [`ActivityRequest::unread_only`]: every count and line is of unread messages only.
+    pub unread_only: bool,
 }
 
 /// One channel's part of an [`Activity`].
@@ -2788,6 +2799,9 @@ pub struct WindowActivity {
     /// The newest message this read saw that is not a placeholder, inside the window or not, so
     /// "what was the last thing said, and where?" has an answer even after a quiet day.
     pub newest: Option<Newest>,
+    /// Which of `messages` the user has marked read on this server: Done, or their own. `#649
+    /// voice-agent-tools` item 7; the same source of truth as the page ([`dismissed_within`]).
+    pub read: std::collections::HashSet<MessageId>,
 }
 
 /// A channel's newest message and the instant it was created.
@@ -2931,16 +2945,25 @@ pub async fn activity(
     let since_ms = hours_before(hours, request.now_ms)?;
     let lines = request
         .per_channel_limit
-        .unwrap_or(if request.channel.is_some() {
-            DEFAULT_CHANNEL_ACTIVITY_LINES
-        } else {
-            DEFAULT_ACTIVITY_LINES
-        })
+        .unwrap_or(
+            if request.channel.is_some() || request.channels.len() == 1 {
+                DEFAULT_CHANNEL_ACTIVITY_LINES
+            } else {
+                DEFAULT_ACTIVITY_LINES
+            },
+        )
         .clamp(1, MAX_ACTIVITY_LINES);
     let scan = activity_scan(state, lines);
     let mut channels = channels(state).await;
-    if let Some(only) = request.channel {
-        channels.retain(|channel| channel.id.as_str() == only);
+    let wanted: Vec<&str> = request
+        .channel
+        .into_iter()
+        .chain(request.channels.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|wanted| !wanted.is_empty())
+        .collect();
+    if !wanted.is_empty() {
+        channels.retain(|channel| wanted.iter().any(|w| channel_answers_to(channel, w)));
         if channels.is_empty() {
             return Err(OpError::UnknownChannel);
         }
@@ -3005,7 +3028,17 @@ pub async fn activity(
         let reuse = crate::recent::reuse_for(state, &channel.id);
         let copy = cached.remove(&channel.id);
         reads.push(
-            channel_activity(state, channel, began, reuse, lines, since_ms, &owner, copy).await,
+            channel_activity(
+                state,
+                caller,
+                channel,
+                began,
+                reuse,
+                (lines, since_ms, request.unread_only),
+                &owner,
+                copy,
+            )
+            .await,
         );
     }
     if !reads.is_empty()
@@ -3023,7 +3056,19 @@ pub async fn activity(
         since_ms,
         per_channel_limit: lines,
         channels: reads,
+        unread_only: request.unread_only,
     })
+}
+
+/// Whether `channel` is the one `wanted` names: by its id exactly, or by a part of its name or its
+/// configured label, ignoring case. `#649 voice-agent-tools`.
+fn channel_answers_to(channel: &ChannelInfo, wanted: &str) -> bool {
+    if channel.id.as_str() == wanted {
+        return true;
+    }
+    let wanted = wanted.to_lowercase();
+    channel.display_name().to_lowercase().contains(&wanted)
+        || channel.label.to_lowercase().contains(&wanted)
 }
 
 /// What the message cache holds of `channel`'s newest `scan` messages, replies included where the
@@ -3141,11 +3186,11 @@ fn spoken_ms(state: &AppState, ms: i64) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn channel_activity(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel: ChannelInfo,
     began: tokio::time::Instant,
     reuse: std::time::Duration,
-    lines: u16,
-    since_ms: i64,
+    (lines, since_ms, unread_only): (u16, i64, bool),
     owner: &crate::owner::Owner,
     cached: Option<(crate::cache::sink::StaleTimeline, bool)>,
 ) -> ChannelActivity {
@@ -3216,7 +3261,23 @@ async fn channel_activity(
     crate::noise::filter_for(state, &channel.id)
         .await
         .mark(&mut messages);
-    let mut read = window_activity(messages, whole, lines, since_ms, owner);
+    // `#649 voice-agent-tools` item 7: which are read here, as the page shows them. A store that
+    // cannot say leaves every message unread, as the page would.
+    let read_ids: std::collections::HashSet<MessageId> =
+        dismissed_within(state, caller, &channel.id, &messages)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let mut read = window_activity(
+        messages,
+        whole,
+        lines,
+        since_ms,
+        owner,
+        &read_ids,
+        unread_only,
+    );
     read.complete &= exact;
     ChannelActivity {
         channel,
@@ -3236,6 +3297,8 @@ fn window_activity(
     lines: u16,
     since_ms: i64,
     owner: &crate::owner::Owner,
+    read_ids: &std::collections::HashSet<MessageId>,
+    unread_only: bool,
 ) -> WindowActivity {
     // The count is exact only when the read reached past the start of the window: either the
     // channel ran out, or its oldest fetched message is already older than the window. Otherwise
@@ -3253,10 +3316,13 @@ fn window_activity(
     });
     // A message whose time cannot be read is kept, as a time-range page keeps it: dropping it
     // would make the channel sound quieter than it is.
-    let (noise, kept): (Vec<Message>, Vec<Message>) = messages
+    let (noise, mut kept): (Vec<Message>, Vec<Message>) = messages
         .into_iter()
         .filter(|m| message_ms(m).is_none_or(|ms| ms >= since_ms))
         .partition(|m| m.noise);
+    if unread_only {
+        kept.retain(|m| !read_ids.contains(&m.id));
+    }
     let skip = kept.len().saturating_sub(usize::from(lines));
     let owners = kept
         .iter()
@@ -3269,6 +3335,11 @@ fn window_activity(
         complete,
         noise: noise.len(),
         newest,
+        read: kept[skip..]
+            .iter()
+            .filter(|m| read_ids.contains(&m.id))
+            .map(|m| m.id.clone())
+            .collect(),
         messages: kept.into_iter().skip(skip).collect(),
     }
 }
@@ -8171,6 +8242,8 @@ mod tests {
             hours,
             per_channel_limit: None,
             now_ms: NOW,
+            unread_only: false,
+            channels: &[],
             channel: None,
         }
     }

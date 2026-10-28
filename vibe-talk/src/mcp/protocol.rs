@@ -645,6 +645,7 @@ async fn run_named(
         "find_message" => run_find(state, scope, args).await,
         "read_message" => run_read(state, scope, args).await,
         "post_reply" => run_post(state, args).await,
+        "mark_read" => run_mark_read(state, args).await,
         _ => return None,
     })
 }
@@ -835,7 +836,26 @@ async fn run_page(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
     // placeholder is as good a place to step back from as any other message.
     let noise = page.messages.iter().filter(|m| m.noise).count();
     page.messages.retain(|m| !m.noise);
-    let header = if page.messages.is_empty() && noise > 0 {
+    // `#649 voice-agent-tools` item 7: each message says whether the user marked it read here, and
+    // with unread_only the read ones are left out (the cursors still step through all of them).
+    let read = read_set(state, caller, &page.channel.id, &page.messages).await;
+    let unread_only = arg_bool(args, "unread_only");
+    let hidden = if unread_only {
+        let before = page.messages.len();
+        page.messages.retain(|m| !read.contains(&m.id));
+        before - page.messages.len()
+    } else {
+        0
+    };
+    let header = if unread_only && page.messages.is_empty() && hidden > 0 {
+        format!(
+            "Page of {} (id {}): nothing unread — all {hidden} messages in this page are marked \
+             read on this server.{}\n",
+            page.channel.display_name(),
+            page.channel.id,
+            page_onward(&page)
+        )
+    } else if page.messages.is_empty() && noise > 0 {
         // Not "no messages in that part of the channel", which would be false, and not a count
         // the model would read out as news either. The way onward is still said: a run of
         // placeholders is not the end of the channel, and a walk that is not told where to step
@@ -867,10 +887,158 @@ async fn run_page(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
         ),
         _ => header,
     };
+    let header = match header.strip_suffix('\n') {
+        Some(line) if hidden > 0 && !page.messages.is_empty() => format!(
+            "{line} Only unread messages are shown: {hidden} on this page marked read on this \
+             server were left out.\n"
+        ),
+        _ => header,
+    };
     Ok(format!(
         "{header}{}",
-        untrusted::render_for_model_as(&page.messages, &crate::owner::Owner::of(state))
+        untrusted::render_for_model_read(&page.messages, &crate::owner::Owner::of(state), &read)
     ))
+}
+
+/// Which of `messages` the user has marked read on this server: Done on the voice page, or their
+/// own, as the page shows them ([`ops::dismissed_within`]). A store that cannot say marks none.
+/// `#649 voice-agent-tools` item 7.
+async fn read_set(
+    state: &AppState,
+    caller: Scope,
+    channel: &crate::model::ChannelId,
+    messages: &[crate::model::Message],
+) -> std::collections::HashSet<crate::model::MessageId> {
+    ops::dismissed_within(state, caller, channel, messages)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// A boolean argument: `true` (or the text "true"), else false.
+fn arg_bool(args: &Value, name: &str) -> bool {
+    match args.get(name) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(text)) => text.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// The most ids one `mark_read` may name, as the page's own Done.
+const MAX_MARK_READ: usize = ops::MAX_DISMISS_BATCH;
+
+/// `mark_read`: mark messages read on this server, exactly as the page's Done does, and only on the
+/// user's own explicit ask in their own words (`user_request`, checked against what the voice page
+/// heard them say: [`crate::send_intent::SendIntent::check_read`]). `#649 voice-agent-tools` item 7.
+async fn run_mark_read(state: &AppState, args: &Value) -> Result<String, OpError> {
+    let channel_id = arg_id(args, "channel_id").unwrap_or_default();
+    let info = ops::allowed_channel(state, &channel_id).await?;
+    let mut ids: Vec<crate::model::MessageId> = Vec::new();
+    let mut strange: Vec<String> = Vec::new();
+    for value in args
+        .get("message_ids")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let raw = match value {
+            Value::String(text) => text.trim().to_owned(),
+            Value::Number(number) => number.to_string(),
+            _ => continue,
+        };
+        let id = crate::model::MessageId(raw.clone());
+        if id.numeric().is_none() {
+            strange.push(raw);
+        } else if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Ok(
+            "NOT MARKED. Nothing changed: message_ids named no message id. Pass the ids \
+                   exactly as the read tools gave them."
+                .to_owned(),
+        );
+    }
+    if ids.len() > MAX_MARK_READ {
+        return Ok(format!(
+            "NOT MARKED. Nothing changed: at most {MAX_MARK_READ} messages can be marked at once."
+        ));
+    }
+    let request = arg_str(args, "user_request");
+    if let Err(refusal) = state.send_intent.check_read(request.as_deref()).await {
+        tracing::info!(
+            target: "vibe_talk::access",
+            reason = refusal.code(),
+            "mark_read refused"
+        );
+        return Ok(mark_read_refusal(refusal).to_owned());
+    }
+    let already: std::collections::HashSet<crate::model::MessageId> = state
+        .store
+        .dismissals(&info.id)
+        .await
+        .map_err(OpError::from)?
+        .into_iter()
+        .collect();
+    let (was, fresh): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| already.contains(id));
+    if !fresh.is_empty() {
+        ops::dismiss(state, &channel_id, &fresh).await?;
+    }
+    tracing::info!(
+        target: "vibe_talk::access",
+        marked = fresh.len(),
+        already = was.len(),
+        "mark_read"
+    );
+    let list = |ids: &[crate::model::MessageId]| {
+        if ids.is_empty() {
+            "none".to_owned()
+        } else {
+            ids.iter()
+                .map(crate::model::MessageId::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut out = format!(
+        "MARKED READ in {} (id {}) on this server, as Done on the voice page: {}. Already read: {}.",
+        info.display_name(),
+        info.id,
+        list(&fresh),
+        list(&was)
+    );
+    if !strange.is_empty() {
+        out.push_str(&format!(
+            " Not message ids, so not marked: {}.",
+            strange.join(", ")
+        ));
+    }
+    out.push_str(" Nothing changed in the chat service itself.");
+    Ok(out)
+}
+
+/// What a model is told when `mark_read` was not asked for in the user's own words.
+fn mark_read_refusal(refusal: crate::send_intent::Refusal) -> &'static str {
+    use crate::send_intent::Refusal;
+    match refusal {
+        Refusal::Missing => {
+            "NOT MARKED. Nothing changed: mark_read needs user_request, the user's own words \
+             asking you to mark these messages read. Mark messages read only when the user \
+             explicitly asks, in words such as \"mark that read\"."
+        }
+        Refusal::NoDirective | Refusal::Spent => {
+            "NOT MARKED. Nothing changed: the words you quoted do not ask to mark anything read. \
+             Mark messages read only when the user explicitly asks, in words such as \"mark that \
+             read\", \"mark those as done\" or \"archive it\"; never on your own."
+        }
+        Refusal::NotHeard => {
+            "NOT MARKED. Nothing changed: the user did not say the words you quoted in the last \
+             few minutes, as far as the voice page heard them. Ask them to say it again if they \
+             want these marked read."
+        }
+    }
 }
 
 async fn run_count(state: &AppState, caller: Scope, args: &Value) -> Result<String, OpError> {
@@ -995,9 +1163,21 @@ async fn run_digest(state: &AppState, caller: Scope, args: &Value) -> Result<Str
         _ => header,
     };
     let owner = crate::owner::Owner::of(state);
+    // `#649 voice-agent-tools` item 7: read here or not, from the same record the page shows.
+    let read: std::collections::HashSet<crate::model::MessageId> = state
+        .store
+        .dismissals(&info.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let mut body = String::new();
     for entry in &entries {
-        body.push_str(&digest_line(entry, &owner));
+        body.push_str(&digest_line(
+            entry,
+            &owner,
+            Some(read.iter().any(|id| id.as_str() == entry.id)),
+        ));
     }
     Ok(format!("{header}{}", untrusted::fenced(&body)))
 }
@@ -1009,15 +1189,20 @@ async fn run_digest(state: &AppState, caller: Scope, args: &Value) -> Result<Str
 /// why the id travels with the message at all. The spoken time first, the exact instant after it
 /// and labelled as such. Printed, never computed: `ops::stamp` did the conversion, and doing it
 /// again here is how four render sites end up disagreeing. See `crate::clock`.
-fn digest_line(entry: &crate::summary::DigestEntry, owner: &crate::owner::Owner) -> String {
+fn digest_line(
+    entry: &crate::summary::DigestEntry,
+    owner: &crate::owner::Owner,
+    read: Option<bool>,
+) -> String {
     format!(
-        "[{} | {} | exact {} | {} {}{}] {}\n",
+        "[{} | {} | exact {} | {} {}{}{}] {}\n",
         entry.id,
         entry.spoken_time,
         entry.timestamp,
         owner.speaker(&entry.author, entry.author_id.as_str()),
         entry.author_id.mention(),
         untrusted::thread_field(entry.thread_id.as_deref()),
+        untrusted::read_field(read),
         entry.summary
     )
 }
@@ -1052,6 +1237,24 @@ async fn run_activity(state: &AppState, caller: Scope, args: &Value) -> Result<S
     // `#437 voice-full-text-catchup`: one channel, by the id `call_tool` already resolved a label
     // or alias to. A channel id that is not listed is refused as every channel tool refuses it.
     let channel = arg_id(args, "channel_id").filter(|id| !id.trim().is_empty());
+    // `#649 voice-agent-tools`: several channels in one call, by id, name or a part of a name.
+    let wanted: Vec<String> = match args.get("channel_ids") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(text) => Some(text.trim().to_owned()),
+                Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            })
+            .filter(|text| !text.is_empty())
+            .collect(),
+        Some(Value::String(text)) => text
+            .split(',')
+            .map(|part| part.trim().to_owned())
+            .filter(|part| !part.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
     let activity = ops::activity(
         state,
         caller,
@@ -1060,6 +1263,8 @@ async fn run_activity(state: &AppState, caller: Scope, args: &Value) -> Result<S
             per_channel_limit: arg_u16(args, "per_channel_limit"),
             channel: channel.as_deref(),
             now_ms: ops::now_ms(),
+            unread_only: arg_bool(args, "unread_only"),
+            channels: &wanted,
         },
     )
     .await?;
@@ -1146,6 +1351,9 @@ struct ActivityBlock<'a> {
     size: usize,
     /// [`as_of_note`] for the read, worked out once against the activity's clock.
     as_of: String,
+    /// Whether only unread messages were asked for, so every count says "unread". `#649
+    /// voice-agent-tools` item 7.
+    unread_only: bool,
 }
 
 /// One channel's block: a header in this server's words, then its lines inside the fence.
@@ -1205,8 +1413,13 @@ fn activity_block_around(block: &ActivityBlock<'_>, span: &str, body: &str) -> S
     };
     let held = format!("{held}{}", block.as_of);
     if read.counted == 0 {
+        let none = if block.unread_only {
+            "no unread messages"
+        } else {
+            "no messages"
+        };
         return if read.noise == 0 {
-            format!("{label} (id {id}):{held} no messages in the last {span}.\n")
+            format!("{label} (id {id}):{held} {none} in the last {span}.\n")
         } else {
             format!(
                 "{label} (id {id}):{held} nothing to report in the last {span} — only placeholder \
@@ -1214,10 +1427,11 @@ fn activity_block_around(block: &ActivityBlock<'_>, span: &str, body: &str) -> S
             )
         };
     }
-    let plural = if read.counted == 1 {
-        "message"
-    } else {
-        "messages"
+    let plural = match (read.counted == 1, block.unread_only) {
+        (true, false) => "message",
+        (false, false) => "messages",
+        (true, true) => "unread message",
+        (false, true) => "unread messages",
     };
     let count = if read.complete {
         format!("{} {plural} in the last {span}", read.counted)
@@ -1393,12 +1607,22 @@ fn activity_text(
         ),
         None => format!("No messages in the last {span} in {}.\n", read_channels_phrase(activity)),
     };
+    if activity.unread_only {
+        // `#649 voice-agent-tools` item 7.
+        head.push_str(
+            "ONLY UNREAD messages are counted and shown: those the user has not marked read on this \
+             server (Done on the voice page, or their own). A channel with none says \"no unread \
+             messages\", which is not the same as no messages. The newest message overall named \
+             above may be one already read.\n",
+        );
+    }
     let channels = activity.channels.len();
     head.push_str(&format!(
         "Read {channels} {} for the last {span}, counted back from now on this server's clock; \
          the channels with the newest messages come first. Each message is given IN FULL: \
-         [message id | local time | exact instant | author <@author id>] and then its text. \
-         Answer from that text, precisely. Say the local time and the author when they help; \
+         [message id | local time | exact instant | author <@author id> | read or unread] and \
+         then its text; read means the user has marked it read on this server (Done on the voice \
+         page, or their own), unread that they have not. Answer from that text, precisely. Say the local time and the author when they help; \
          never read an id, a <@...> token or an exact instant aloud. The local time is already \
          in the listener's own zone. A message whose author begins \"the user\" is the user's \
          own: never read it aloud or summarise it back to them unless they ask; use it only as \
@@ -1446,16 +1670,18 @@ fn activity_text(
                     read.messages
                         .iter()
                         .map(|m| {
-                            untrusted::neutralize(&untrusted::model_line(
+                            untrusted::neutralize(&untrusted::model_line_read(
                                 m,
                                 owner,
                                 Some(MAX_ACTIVITY_MESSAGE_CHARS),
+                                Some(read.read.contains(&m.id)),
                             ))
                         })
                         .collect()
                 })
                 .unwrap_or_default();
             let mut block = ActivityBlock {
+                unread_only: activity.unread_only,
                 part,
                 shown: lines.len(),
                 lines,
@@ -1544,19 +1770,24 @@ async fn run_find(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
         }
     );
     let owner = crate::owner::Owner::of(state);
+    let found: Vec<crate::model::Message> = std::iter::once(best.message.clone())
+        .chain(resolution.alternatives.iter().map(|a| a.message.clone()))
+        .collect();
+    let read = read_set(state, caller, &info.id, &found).await;
     let mut body = format!(
-        "[BEST | {} | {} | exact {} | {} {}{}] {}\n",
+        "[BEST | {} | {} | exact {} | {} {}{}{}] {}\n",
         best.message.id.as_str(),
         best.message.spoken(),
         best.message.timestamp,
         untrusted::one_line(&owner.speaker(&best.message.author, best.message.author_id.as_str())),
         best.message.author_id.mention(),
         untrusted::thread_field(best.message.reply_thread()),
+        untrusted::read_field(Some(read.contains(&best.message.id))),
         untrusted::continued(&best.message.content)
     );
     for alternative in &resolution.alternatives {
         body.push_str(&format!(
-            "[ALTERNATIVE | {} | {} | exact {} | {} {}{}] {}\n",
+            "[ALTERNATIVE | {} | {} | exact {} | {} {}{}{}] {}\n",
             alternative.message.id.as_str(),
             alternative.message.spoken(),
             alternative.message.timestamp,
@@ -1566,6 +1797,7 @@ async fn run_find(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
             )),
             alternative.message.author_id.mention(),
             untrusted::thread_field(alternative.message.reply_thread()),
+            untrusted::read_field(Some(read.contains(&alternative.message.id))),
             untrusted::continued(&alternative.message.content)
         ));
     }
@@ -1592,11 +1824,12 @@ async fn run_read(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
         let info = ops::allowed_channel(state, &channel_id).await?;
         crate::cache_first::note(crate::cache_first::Source::CacheFirst);
         let id = message.id.clone();
+        let read = read_set(state, caller, &info.id, std::slice::from_ref(&message)).await;
         return Ok(format!(
             "Message {} from {}:\n{}",
             id.as_str(),
             info.display_name(),
-            untrusted::render_for_model_as(&[message], &crate::owner::Owner::of(state))
+            untrusted::render_for_model_read(&[message], &crate::owner::Owner::of(state), &read)
         ));
     }
     let (info, message) = ops::message_by_id_scoped(
@@ -1609,11 +1842,12 @@ async fn run_read(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
     )
     .await?;
     let id = message.id.clone();
+    let read = read_set(state, caller, &info.id, std::slice::from_ref(&message)).await;
     Ok(format!(
         "Message {} from {}:\n{}",
         id.as_str(),
         info.display_name(),
-        untrusted::render_for_model_as(&[message], &crate::owner::Owner::of(state))
+        untrusted::render_for_model_read(&[message], &crate::owner::Owner::of(state), &read)
     ))
 }
 
@@ -2363,6 +2597,8 @@ mod tests {
                 hours,
                 per_channel_limit: None,
                 now_ms: NOW,
+                unread_only: false,
+                channels: &[],
                 channel: None,
             },
         )
@@ -2570,7 +2806,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "| the user (Ada Lovelace) <@2000000000000000001>] how is the drift going?"
+                "| the user (Ada Lovelace) <@2000000000000000001> | read] how is the drift going?"
             ),
             "{text}"
         );
@@ -2625,7 +2861,7 @@ mod tests {
             .await,
         );
         assert!(
-            found.contains("| the user (Ada) <@2000000000000000001>]"),
+            found.contains("| the user (Ada) <@2000000000000000001> | read]"),
             "{found}"
         );
         let read = result_text(
@@ -2640,7 +2876,7 @@ mod tests {
             .await,
         );
         assert!(
-            read.contains("| the user (Ada) <@2000000000000000001>]"),
+            read.contains("| the user (Ada) <@2000000000000000001> | read]"),
             "{read}"
         );
         for (tool, args) in [
@@ -2772,7 +3008,7 @@ mod tests {
             "{line}"
         );
         let entry = crate::summary::digest_entry(&mine, 160);
-        assert!(digest_line(&entry, &owner).contains("| the user (Ada) <@U1>]"));
+        assert!(digest_line(&entry, &owner, None).contains("| the user (Ada) <@U1>]"));
     }
 
     #[tokio::test]
@@ -2789,6 +3025,8 @@ mod tests {
                         hours,
                         per_channel_limit: None,
                         now_ms: NOW,
+                        unread_only: false,
+                        channels: &[],
                         channel: None,
                     },
                 )

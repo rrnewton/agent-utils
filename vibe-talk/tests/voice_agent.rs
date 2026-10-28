@@ -127,7 +127,11 @@ async fn a_read_caller_is_told_writing_exists_but_is_not_theirs() {
     assert!(!writes.is_empty(), "no write tool is described at all");
     for tool in writes {
         assert_eq!(tool["available"], json!(false), "{tool}");
-        assert_eq!(tool["requires_confirmation"], json!(true), "{tool}");
+        // `#649 voice-agent-tools`: `mark_read` asks no confirmation of its own (the server holds
+        // it to the user's quoted ask instead); every tool that speaks for the owner does.
+        if tool["name"] != "mark_read" {
+            assert_eq!(tool["requires_confirmation"], json!(true), "{tool}");
+        }
     }
 }
 

@@ -79,6 +79,36 @@ pub fn thread_field(thread: Option<&str>) -> String {
     thread.map_or_else(String::new, |thread| format!(" | thread {thread}"))
 }
 
+/// ` | read` or ` | unread`, or nothing when the read state is not given.
+#[must_use]
+pub fn read_field(read: Option<bool>) -> &'static str {
+    match read {
+        Some(true) => " | read",
+        Some(false) => " | unread",
+        None => "",
+    }
+}
+
+/// [`render_for_model_as`], each line saying whether the user has marked it read: those in `read`
+/// are read, every other is unread. `#649 voice-agent-tools` item 7.
+#[must_use]
+pub fn render_for_model_read(
+    messages: &[Message],
+    owner: &Owner,
+    read: &std::collections::HashSet<crate::model::MessageId>,
+) -> String {
+    let mut body = String::new();
+    for message in messages {
+        body.push_str(&model_line_read(
+            message,
+            owner,
+            None,
+            Some(read.contains(&message.id)),
+        ));
+    }
+    fenced(&body)
+}
+
 /// Render a batch of messages as a fenced, labelled block for a model prompt.
 ///
 /// This function PRINTS [`Message::spoken_time`]; it must never compute one. The zone conversion
@@ -116,12 +146,24 @@ pub fn render_for_model_as(messages: &[Message], owner: &Owner) -> String {
 /// voice-full-text-catchup`.
 #[must_use]
 pub fn model_line(message: &Message, owner: &Owner, max_body: Option<usize>) -> String {
+    model_line_read(message, owner, max_body, None)
+}
+
+/// [`model_line`], saying after the author whether the user has marked the message read on this
+/// server (`| read`) or not (`| unread`), when `read` says. `#649 voice-agent-tools` item 7.
+#[must_use]
+pub fn model_line_read(
+    message: &Message,
+    owner: &Owner,
+    max_body: Option<usize>,
+    read: Option<bool>,
+) -> String {
     // The author's mention token rides along with the message it belongs to. That is the
     // whole reason a caller can ping the right person without a user-lookup tool: the id is
     // attached to the thing being replied to, so there is nothing to search for and nothing
     // to guess. See `crate::model::Message::author_id`.
     format!(
-        "[{} | {} | exact {}{} | {} {}{}] {}{}\n",
+        "[{} | {} | exact {}{} | {} {}{}{}] {}{}\n",
         message.id.as_str(),
         message.spoken(),
         message.timestamp,
@@ -135,6 +177,7 @@ pub fn model_line(message: &Message, owner: &Owner, max_body: Option<usize>) -> 
         )),
         neutralize(&message.author_id.mention()),
         neutralize(&thread_field(message.reply_thread())),
+        read_field(read),
         continued(&neutralize(&cut_body(&message.content, max_body))),
         mentioned(message)
     )

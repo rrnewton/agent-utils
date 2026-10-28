@@ -299,13 +299,19 @@ async fn no_tool_description_claims_a_read_state_the_bot_cannot_have() {
             .as_str()
             .expect("every tool has a description")
             .to_lowercase();
-        for claim in [
-            "unread",
-            "read state",
-            "marked read",
-            "since you last",
-            "since i last",
-        ] {
+        // `#649 voice-agent-tools`: read state is now offered, but only this server's own record
+        // of it (Done on the voice page), never the chat service's: a description that speaks of
+        // read or unread messages says whose record it is.
+        for claim in ["unread", "read state", "marked read"] {
+            if description.contains(claim) {
+                assert!(
+                    description.contains("on this server"),
+                    "{name} speaks of {claim:?} without saying it is this server's record: \
+                     {description}"
+                );
+            }
+        }
+        for claim in ["since you last", "since i last"] {
             assert!(
                 !description.contains(claim),
                 "{name} promises {claim:?}, which Discord does not give a bot: {description}"
@@ -335,7 +341,11 @@ async fn the_owners_stored_transcript_is_not_reachable_by_a_model() {
     //
     // The read marks are held to the same line, for a different reason: they are vibe-talk's own
     // record and are never synchronised with Discord, so a tool that offered "unread" would be
-    // making a promise about a word that already means something else to a Discord user.
+    // making a promise about a word that already means something else to a Discord user. `#649
+    // voice-agent-tools` item 7 (the owner, 2026-10-28) changed that for the page's Done alone:
+    // `mark_read` marks messages Done on the user's own quoted ask, and every description that
+    // speaks of read state says it is this server's (see the test above). The read mark itself,
+    // the inbox and the transcript stay out of reach.
     let harness = harness();
     let (status, body) = rpc(
         &harness,
@@ -351,7 +361,6 @@ async fn the_owners_stored_transcript_is_not_reachable_by_a_model() {
         "conversation",
         "transcript",
         "inbox",
-        "mark_read",
         "read_mark",
         // `#270 voice-transcript-markers`: the send memory and the records filed from it are the
         // page's, through application routes, and no tool may name them.
@@ -877,9 +886,10 @@ async fn a_full_handshake_then_list_then_call_works_over_the_endpoint() {
             "count_messages",
             "find_message",
             "read_message",
+            "mark_read",
             "post_reply"
         ],
-        "the write credential is offered exactly the seven listed tools"
+        "the write credential is offered exactly the eight listed tools"
     );
 
     let (_status, found) = rpc(
@@ -1428,4 +1438,230 @@ async fn no_model_facing_text_calls_this_server_a_bridge() {
             "{source} calls something a bridge: {text}"
         );
     }
+}
+
+/// One tool call made with the write token, straight through the dispatcher, and its text.
+async fn agent_says(state: &vibe_talk::state::AppState, tool: &str, arguments: Value) -> String {
+    let outcome = vibe_talk::mcp::protocol::dispatch(
+        state,
+        vibe_talk::auth::Scope::Write,
+        &call(tool, arguments),
+    )
+    .await;
+    let vibe_talk::mcp::protocol::Outcome::Reply(response) = outcome else {
+        panic!("{tool}: no reply");
+    };
+    let result = response.result.as_ref().expect("a result");
+    result["content"][0]["text"]
+        .as_str()
+        .expect("text")
+        .to_owned()
+}
+
+/// A write-token request on the router, and its JSON.
+async fn api(
+    state: &vibe_talk::state::AppState,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Value {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"));
+    let request = match body {
+        Some(json) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_string()))
+            .expect("request"),
+        None => builder.body(Body::empty()).expect("request"),
+    };
+    let response = router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    assert!(
+        response.status().is_success(),
+        "{method} {uri}: {}",
+        response.status()
+    );
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
+/// `#649 voice-agent-tools` item 7. The owner: "update me with any unread messages from the last k
+/// hours", without what they already know. Every message a read tool returns says whether the user
+/// has marked it read on this server (the page's Done); unread_only leaves the read ones out; and
+/// mark_read marks only on the user's own words, as the voice page heard them, saying exactly what
+/// it marked, and the page then shows them Done.
+#[tokio::test]
+async fn read_state_rides_every_message_unread_only_filters_and_mark_read_needs_the_users_words() {
+    let (state, discord) = vibe_talk::testing::state();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let now = vibe_talk::ops::now_ms();
+    let old = discord.seed_at(&channel, "agent", "build is green", now - 2 * 3_600_000);
+    let new = discord.seed_at(&channel, "agent", "deploy finished", now - 3_600_000);
+    // The owner taps Done on the older one on the page.
+    api(
+        &state,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+        Some(json!({ "messages": [old.as_str()] })),
+    )
+    .await;
+
+    let all = agent_says(
+        &state,
+        "recent_activity",
+        json!({ "channel_id": WRITE_CHANNEL, "hours": 12 }),
+    )
+    .await;
+    assert!(all.contains("| read] build is green"), "{all}");
+    assert!(all.contains("| unread] deploy finished"), "{all}");
+    let unread = agent_says(
+        &state,
+        "recent_activity",
+        json!({ "channel_id": WRITE_CHANNEL, "hours": 12, "unread_only": true }),
+    )
+    .await;
+    assert!(unread.contains("ONLY UNREAD"), "{unread}");
+    assert!(
+        unread.contains("1 unread message in the last 12 hours"),
+        "{unread}"
+    );
+    assert!(unread.contains("deploy finished"), "{unread}");
+    assert!(
+        !unread.contains("build is green"),
+        "a read message was read out again: {unread}"
+    );
+    let page = agent_says(
+        &state,
+        "read_page",
+        json!({ "channel_id": WRITE_CHANNEL, "hours": 12, "unread_only": true }),
+    )
+    .await;
+    assert!(
+        page.contains("deploy finished") && !page.contains("build is green"),
+        "{page}"
+    );
+    let one = agent_says(
+        &state,
+        "read_message",
+        json!({ "channel_id": WRITE_CHANNEL, "message_id": old.as_str() }),
+    )
+    .await;
+    assert!(one.contains("| read] build is green"), "{one}");
+
+    // Not on the agent's own say-so, nor on words the user never said.
+    let mark = |request: Option<&str>| {
+        let mut arguments = json!({ "channel_id": WRITE_CHANNEL, "message_ids": [new.as_str()] });
+        if let Some(request) = request {
+            arguments["user_request"] = json!(request);
+        }
+        arguments
+    };
+    let refused = agent_says(&state, "mark_read", mark(None)).await;
+    assert!(refused.starts_with("NOT MARKED"), "{refused}");
+    let refused = agent_says(&state, "mark_read", mark(Some("mark that read"))).await;
+    assert!(refused.starts_with("NOT MARKED"), "not heard: {refused}");
+    state.send_intent.hear("turn-1", "what did the agent say");
+    let refused = agent_says(&state, "mark_read", mark(Some("what did the agent say"))).await;
+    assert!(
+        refused.starts_with("NOT MARKED"),
+        "no ask to mark: {refused}"
+    );
+    let timeline = format!("/api/v1/channels/{WRITE_CHANNEL}/messages?limit=50");
+    let before = api(&state, "GET", &timeline, None).await;
+    assert!(
+        !before["dismissed"].to_string().contains(new.as_str()),
+        "marked without the user's ask: {before}"
+    );
+
+    // The user's own words, as the voice page heard them.
+    state
+        .send_intent
+        .hear("turn-2", "okay, mark that read please");
+    let marked = agent_says(&state, "mark_read", mark(Some("mark that read"))).await;
+    assert!(marked.starts_with("MARKED READ"), "{marked}");
+    assert!(marked.contains(new.as_str()), "{marked}");
+    assert!(marked.contains("Already read: none"), "{marked}");
+    let after = api(&state, "GET", &timeline, None).await;
+    assert!(
+        after["dismissed"].to_string().contains(new.as_str()),
+        "the page does not show it Done: {after}"
+    );
+    let again = agent_says(&state, "mark_read", mark(Some("mark that read"))).await;
+    assert!(
+        again.contains(&format!("Already read: {}", new.as_str())),
+        "{again}"
+    );
+    let unread = agent_says(
+        &state,
+        "recent_activity",
+        json!({ "channel_id": WRITE_CHANNEL, "hours": 12, "unread_only": true }),
+    )
+    .await;
+    assert!(
+        unread.contains("no unread messages in the last 12 hours"),
+        "{unread}"
+    );
+}
+
+/// `#649 voice-agent-tools` (e). Asked for "the two build channels", the agent read three channels
+/// one at a time, one of them not one of them. channel_ids takes several channels in one call,
+/// by id, name or a part of a name, and each block is labelled with the channel's name.
+#[tokio::test]
+async fn recent_activity_reads_the_channels_named_together_in_one_call() {
+    let (state, discord) = vibe_talk::testing::state();
+    let now = vibe_talk::ops::now_ms();
+    discord.seed_at(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "ci",
+        "build is green",
+        now - 60_000,
+    );
+    discord.seed_at(
+        &ChannelId(WRITE_CHANNEL.to_owned()),
+        "lead",
+        "ship it",
+        now - 60_000,
+    );
+    let one = agent_says(
+        &state,
+        "recent_activity",
+        json!({ "channel_ids": ["team"] }),
+    )
+    .await;
+    assert!(one.contains("lead team (id"), "{one}");
+    assert!(
+        !one.contains("build noise (id"),
+        "a channel not named was read: {one}"
+    );
+    let both = agent_says(
+        &state,
+        "recent_activity",
+        json!({ "channel_ids": ["NOISE", WRITE_CHANNEL] }),
+    )
+    .await;
+    assert!(
+        both.contains("lead team (id") && both.contains("build noise (id"),
+        "{both}"
+    );
+    assert!(both.contains("Read 2 channels"), "{both}");
+    let none = agent_says(
+        &state,
+        "recent_activity",
+        json!({ "channel_ids": ["nonesuch"] }),
+    )
+    .await;
+    assert!(none.starts_with("unknown_channel"), "{none}");
+    assert!(
+        none.contains("lead team (id"),
+        "the choices are given: {none}"
+    );
 }
