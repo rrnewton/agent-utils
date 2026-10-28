@@ -4836,13 +4836,21 @@ pub async fn post_outcome(
         crate::post_keys::Lookup::Known(outcome) => {
             return Ok(PostOutcome::Settled(Box::new(remembered_answer(&outcome))))
         }
-        crate::post_keys::Lookup::Unknown => return Ok(PostOutcome::Unknown),
+        crate::post_keys::Lookup::Unknown => {
+            return Ok(match state.post_keys.failure(idempotency_key) {
+                Some(detail) => PostOutcome::Failed(detail),
+                None => PostOutcome::Unknown,
+            })
+        }
         crate::post_keys::Lookup::InFlight(waiting) => waiting,
     };
     match tokio::time::timeout(wait, waiting.settled()).await {
         Ok(Some(outcome)) => Ok(PostOutcome::Settled(Box::new(remembered_answer(&outcome)))),
         // Forgotten as it settled: it posted nothing anyone can confirm.
-        Ok(None) => Ok(PostOutcome::Unknown),
+        Ok(None) => Ok(match state.post_keys.failure(idempotency_key) {
+            Some(detail) => PostOutcome::Failed(detail),
+            None => PostOutcome::Unknown,
+        }),
         Err(_) => {
             // Read again: it may have moved on while this waited.
             let (posted, parts) = match state.post_keys.lookup(&fingerprint) {
@@ -4865,6 +4873,8 @@ pub type PostResult = Result<(ChannelInfo, Message, Vec<Message>), OpError>;
 pub enum PostOutcome {
     /// The post's own answer, as [`reply_scoped`] gave it.
     Settled(Box<PostResult>),
+    /// It failed and was forgotten; this is why. `#621 send-double-check`.
+    Failed(String),
     /// Still posting: `posted` parts of `parts` have landed (`parts` is 0 before it is cut).
     Posting {
         /// Parts landed so far.
@@ -4958,6 +4968,12 @@ async fn post_parts(
     }
     if let Some(claim) = claim {
         let remembered = to_remember(&result);
+        // `#621 send-double-check`: a forgotten failure still tells the outcome route why.
+        if remembered.is_none() {
+            if let (Some(key), Err(error)) = (&key_for_timing, &result) {
+                state.post_keys.note_failure(key, error.to_string());
+            }
+        }
         // `#471 replication-c5-post-keys`: what it landed as is filed in the store too, so a
         // repeat after a restart is answered with it rather than posted again.
         // Not after a purge emptied the send log while this post was in flight.

@@ -2979,6 +2979,10 @@ pub async fn reply_outcome(
     .await?;
     let timing = state.post_keys.timing(key).map(SendTimingBody::from);
     match outcome {
+        ops::PostOutcome::Failed(detail) => Ok(Json(serde_json::json!({
+            "state": "failed", "detail": detail, "timing": timing,
+        }))
+        .into_response()),
         ops::PostOutcome::Settled(result) => reply_answer_timed(&state, *result, timing),
         ops::PostOutcome::Posting { posted, parts } => Ok((
             StatusCode::ACCEPTED,

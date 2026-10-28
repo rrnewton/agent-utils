@@ -271,6 +271,7 @@ pub struct SendTiming {
 pub struct PostKeys {
     slots: Mutex<HashMap<String, Slot>>,
     timings: Mutex<HashMap<String, (Instant, SendTiming)>>,
+    failures: Mutex<HashMap<String, String>>,
     keep: Duration,
     /// Moved by every [`PostKeys::forget_settled`]: a claim made before it settles into memory,
     /// but is not filed in the store. `#471 replication-c5-post-keys`.
@@ -435,6 +436,7 @@ impl PostKeys {
         Self {
             slots: Mutex::new(HashMap::new()),
             timings: Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
             keep,
             generation: std::sync::atomic::AtomicU64::new(0),
         }
@@ -465,6 +467,25 @@ impl PostKeys {
             }
             None => SendTiming::default(),
         }
+    }
+
+    /// Remember why a forgotten post failed, for the outcome route. `#621 send-double-check`.
+    pub fn note_failure(&self, key: &str, detail: String) {
+        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        if failures.len() >= MAX_KEPT {
+            failures.clear();
+        }
+        failures.insert(key.to_owned(), detail);
+    }
+
+    /// Why the post under `key` failed, if recorded. `#621 send-double-check`.
+    #[must_use]
+    pub fn failure(&self, key: &str) -> Option<String> {
+        self.failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned()
     }
 
     /// The recorded timing for `key`, if any. `#621 send-double-check`.

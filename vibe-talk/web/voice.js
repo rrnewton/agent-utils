@@ -32202,7 +32202,7 @@ async function postOutgoing(entry, job, body, controller, armed) {
       }
       entry.upstreamMs = found.timing && Number.isFinite(Number(found.timing.upstream_ms))
         ? Number(found.timing.upstream_ms) : Date.now() - acceptedAt;
-      entry.upstreamTick = found.error !== "partially_posted";
+      entry.upstreamTick = !found.error;
       if (found.timing && Number.isFinite(Number(found.timing.server_ms))) entry.serverMs = Number(found.timing.server_ms);
       return found;
     }
@@ -32291,6 +32291,19 @@ async function dispatchOutgoingMessage(entry, job) {
     let payload = payloadFound;
     if (!payload) payload = await postOutgoing(entry, job, body, controller, (handle) => { timer = handle; });
     if (job.stopped) return;
+    // `#621 send-double-check`: the outcome route says the post failed upstream, with why.
+    if (payload && payload.error === "post_failed") {
+      entry.state = "unconfirmed";
+      entry.mayHavePosted = true;
+      entry.tickFailed = true;
+      entry.upstreamTick = false;
+      outgoingObservations.delete(entry.id);
+      entry.detail = redact(payload.detail
+        ? readableCause(payload.detail, chatServiceOf(entry.channel))
+        : "The remaining delivery could not be confirmed.");
+      transient = true;
+      return;
+    }
     if (payload && payload.error === "partially_posted") {
       entry.postedCount += Math.max(0, Number(payload.posted) || 0);
       // Where the unsent text belongs, when the server says: the thread the parts already posted
@@ -32501,6 +32514,9 @@ async function askOutgoingOutcome(entry, job, body) {
         clearTimeout(timer);
       }
       if (job.stopped) return null;
+      if (answer && answer.state === "failed") {
+        return { error: "post_failed", detail: String(answer.detail || ""), timing: answer.timing || null, uncertain: true };
+      }
       if (!answer || answer.state !== "posting") return answer;
       noteOutgoingProgress(entry, answer);
     }

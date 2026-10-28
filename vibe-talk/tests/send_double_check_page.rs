@@ -19,5 +19,8 @@ fn the_send_double_check_page_suite_passes() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.status.success(), "the send-double-check page suite failed:\n{text}");
+    assert!(
+        output.status.success(),
+        "the send-double-check page suite failed:\n{text}"
+    );
 }
