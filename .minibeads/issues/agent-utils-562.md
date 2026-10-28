@@ -390,3 +390,35 @@ host-environment failures proven identical on an untouched
 origin/main export (two lifecycle process-scan tests and the
 standalone wrkslots lifecycle, all refused by unrelated host
 process state). Upstream commits shared no files.
+
+[muse watermelon] Slice 35 landed (521244af): `wrkslotsd finish`,
+the tenth writer slice, reproduces the finish mutation (owner
+authorization, seal and cleanup-journal guards, handoff
+preconditions over record paths and slot contents, per-checkout
+Git safety: worktree identity, branch, unfinished operations,
+ordinary history/index, cache policy with a component fnmatch
+port, clean status, remote authority, containment and landed
+ancestry, and the single `handoff-recorded` event) behind the
+fixture-only writer guard. The fetch lands tracking refs in one
+verified update-ref transaction after a scratch-namespace fetch,
+not in place. Adversarial review found no Critical/High; the
+fnmatch `[^...]` inversion, fetch mutation on refusal paths,
+registry-global slot-image refusal, diagnostic quoting, and the
+missing pre-write revision recheck were all fixed, with new
+differential cases for tracked cache paths, detached HEAD, extra
+slot entries, and stale generations. Known divergences: the
+fetch does not use Python's isolated network repository or its
+proxy/credential plumbing; seal-side journal classification is
+approximated by journal names (as in release); slot-image
+records stay Python; the Rust storage reader names extra slot
+entries with its own text. Differential: 10 passed in this
+slice's file (74 across the writer files). Gates 47-48: gate 47
+caught a missing `py/` prefix in the components manifest
+(fixed); gate 48 failures were load timeouts passed alone
+(wrkslots shards 535 + 534, repository-infrastructure 113,
+herdr-agent differential 104) plus host-environment failures
+proven identical on untouched origin/main exports (two lifecycle
+process-scan tests, the standalone wrkslots lifecycle, and the
+full agentctl Rust suite, which fails on base with varying
+counts under load while its subsets pass). Upstream commits
+shared no files; rebased and pushed without a second gate.
