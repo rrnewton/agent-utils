@@ -282,7 +282,7 @@ pub(crate) fn recover_ownerless_agent_worktree(
         _ => {}
     }
     let top = git(&target, &["rev-parse", "--show-toplevel"])?;
-    if PathBuf::from(top.trim()) != target {
+    if Path::new(top.trim()) != target {
         return Err(format!(
             "ownerless agent worktree is not its Git worktree root: {}",
             target.display()
