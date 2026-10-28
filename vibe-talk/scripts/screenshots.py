@@ -3248,7 +3248,7 @@ def _act_failed_send_and_draft(driver: Driver) -> None:
     by its Back, as a reader leaves one.
     """
     _act_open_channel(driver)
-    driver.page.route("**/api/v1/channels/*/reply", _refuse_send)
+    driver.page.route("**/api/v1/channels/*/reply*", _refuse_send)
     try:
         driver.page.fill("#channel-compose-text", REFUSED_SEND_TEXT)
         driver.click("channel-send")
@@ -3257,7 +3257,7 @@ def _act_failed_send_and_draft(driver: Driver) -> None:
             timeout=10_000,
         )
     finally:
-        driver.page.unroute("**/api/v1/channels/*/reply", _refuse_send)
+        driver.page.unroute("**/api/v1/channels/*/reply*", _refuse_send)
     driver.js(
         "(() => { const rows = document.querySelectorAll('#discord-log > li'); "
         "rows[rows.length - 1].id = 'draft-probe'; return true; })()"
@@ -3314,7 +3314,7 @@ DISMISSED_LIST_TEXTS = (
 
 def _dismiss_sends(driver: Driver, texts: Iterable[str]) -> None:
     """Send each of `texts` in the channel, have the chat service refuse it, and dismiss it unsent."""
-    driver.page.route("**/api/v1/channels/*/reply", _refuse_send)
+    driver.page.route("**/api/v1/channels/*/reply*", _refuse_send)
     try:
         for text in texts:
             driver.page.fill("#channel-compose-text", text)
@@ -3329,7 +3329,7 @@ def _dismiss_sends(driver: Driver, texts: Iterable[str]) -> None:
                 timeout=5_000,
             )
     finally:
-        driver.page.unroute("**/api/v1/channels/*/reply", _refuse_send)
+        driver.page.unroute("**/api/v1/channels/*/reply*", _refuse_send)
 
 
 def _act_settings_dismissed_list(driver: Driver) -> None:
