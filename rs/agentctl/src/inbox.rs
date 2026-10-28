@@ -1152,7 +1152,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-fn utc_clock(ms: u64) -> String {
+pub(crate) fn utc_clock(ms: u64) -> String {
     let seconds = ms / 1000;
     let rest = seconds % 86_400;
     format!(
@@ -1163,7 +1163,7 @@ fn utc_clock(ms: u64) -> String {
     )
 }
 
-fn utc_date(ms: u64) -> String {
+pub(crate) fn utc_date(ms: u64) -> String {
     let (year, month, day) = civil_from_days(i64::try_from(ms / 86_400_000).unwrap_or(0));
     format!("{year:04}-{month:02}-{day:02}")
 }

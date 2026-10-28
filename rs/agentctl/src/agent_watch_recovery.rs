@@ -95,12 +95,12 @@ pub(super) fn recover_due(
             );
             let target = options.coordinator.as_str();
             if let Err(error) = notifier.notify(target, &notice, &notice_id) {
-                eprintln!("agentctl watch-agents: recovery notice failed: {error}");
+                super::log(format_args!("recovery notice failed: {error}"));
             }
-            eprintln!(
-                "agentctl watch-agents: {agent} recovery attempt {}: {outcome}",
+            super::log(format_args!(
+                "{agent} recovery attempt {}: {outcome}",
                 receipt.attempts
-            );
+            ));
             outcome
         };
         results.push(json!({"agent": agent, "cause": cause, "attempts": receipt.attempts, "outcome": outcome}));

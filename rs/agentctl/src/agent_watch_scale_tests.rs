@@ -458,6 +458,7 @@ fn agents_the_pass_has_no_time_for_are_reported_unchecked_and_keep_their_memory(
                 kind: EpisodeKind::Stalled,
                 since: 100.0,
                 notified: false,
+                notified_at: None,
                 turn: None,
                 window: None,
             }),

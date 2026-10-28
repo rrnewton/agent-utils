@@ -1029,9 +1029,34 @@ A notice about an agent goes to the nearest agent up its `managed_by` chain that
 can take one (registered here, running, not paused, and reachable), so a
 lieutenant hears about its own workers and the coordinator about the
 lieutenants and every agent with no reachable manager; "the coordinator" below
-means that recipient. Each recipient gets its own batches and its own
-`--min-notice-interval`, and a manager that cannot take a batch has its notices
-redirected to the coordinator.
+means that recipient. A manager must also be able to read the notice: one the
+watcher is itself reporting, past its threshold, at an approval prompt,
+unreachable, stopped by a harness failure, or inside a turn its input waits
+behind cannot, so the notice goes on up the chain (#669
+watch-notice-delivery). An idle manager, with or without a verdict, still
+hears: a queued message starts its next turn, and it may be waiting on those
+very agents. Each
+recipient gets its own batches and its own `--min-notice-interval`, and a
+manager that cannot take a batch has its notices redirected to the
+coordinator.
+
+An episode counts as reported only once its notice is durably queued for its
+recipient. Until then the pass report shows it with `"reported": false` and
+`"owed": true`, and the log line names it as owed, not delivered. A failed
+send is tried again after `--interval`, then after twice that, doubling up to
+30 minutes, and the report's `notice` row gives `failures` and
+`retry_in_seconds`. Each batch keeps its own schedule, so one that cannot be
+delivered (a queue entry stuck crossing the injection barrier, say) holds up
+no other notice, not even a later one for the same recipient; it goes out in
+a batch of its own. A recipient has at most two batches unconfirmed at once,
+so a recipient that is down collects later notices into one batch rather than
+one per pass. After every fourth failure a batch moves to a fresh queue ID,
+so an ID that can never deliver does not keep its notices from the
+recipient; if the old entry does arrive after all, they are read twice.
+Every line the watcher writes to standard error opens
+with the UTC time (`2026-10-28T17:26:00Z agentctl watch-agents: ...`), and a
+send that failed is logged with its reason and when it is next tried, so a
+redirected log shows how long notices went undelivered.
 
 #### Large registries
 
