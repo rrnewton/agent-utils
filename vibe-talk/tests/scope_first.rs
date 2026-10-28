@@ -200,6 +200,18 @@ fn inventory() -> Vec<Route> {
         route("GET", "/api/v1/channels/{channel_id}/timeline", Read, limit),
         route(
             "GET",
+            "/api/v1/channels/{channel_id}/search",
+            Read,
+            Query("?q=lunch", "?q=lunch&below=soon"),
+        ),
+        route(
+            "GET",
+            "/api/v1/search",
+            Read,
+            Query("?q=lunch", "?q=lunch&below=soon"),
+        ),
+        route(
+            "GET",
             "/api/v1/channels/{channel_id}/count",
             Read,
             Query("?cap=5", "?cap=soon"),

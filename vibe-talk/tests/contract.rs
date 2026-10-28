@@ -18,8 +18,8 @@ use vibe_talk::contract::{
     LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheHistory,
     MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules, PendingPost,
     PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled, ProviderDescription,
-    ReplayUnavailable, ReplyDismissals, TimelineResponse, TokenScope, TranscriptRole,
-    UpstreamClearAttemptView, UpstreamClearNowOutcome, UpstreamClearNowResponse,
+    ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope, TimelineResponse, TokenScope,
+    TranscriptRole, UpstreamClearAttemptView, UpstreamClearNowOutcome, UpstreamClearNowResponse,
     UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame, VoicePostPrefix,
     VoicePromptSettings, VoiceSend, VoiceSettings,
 };
@@ -1187,6 +1187,55 @@ fn samples() -> Value {
             to(&HistoryModeRequest { mode: HistoryModeChoice::Recent }),
             to(&HistoryModeRequest { mode: HistoryModeChoice::Full }),
             to(&HistoryModeRequest { mode: HistoryModeChoice::Default }),
+        ],
+        // `#605 server-side-search`: a search that stopped on its budget, with a hit, beside a
+        // channel the read token did not search; and one that searched a whole channel, finding
+        // nothing. So every optional field is seen present and omitted.
+        "SearchResponse": [
+            to(&SearchResponse {
+                hits: vec![Message {
+                    observed_ms: Some(1_790_000_000_000),
+                    ..threaded.clone()
+                }],
+                scopes: vec![
+                    SearchScope {
+                        state: "searched",
+                        examined: 20_000,
+                        searched_back_to_ms: Some(1_758_801_600_000),
+                        held_from_ms: Some(1_755_000_000_000),
+                        as_of_ms: Some(1_790_000_000_000),
+                        top_level_only: true,
+                        expanding: true,
+                        partial: 1,
+                        resume_below_ms: Some(1_758_801_600_000),
+                        ..SearchScope::empty(channel())
+                    },
+                    SearchScope {
+                        reason: Some("read_scope"),
+                        ..SearchScope::empty(channel())
+                    },
+                ],
+                resume_below_ms: Some(1_758_801_600_000),
+                upstream: "none",
+                untrusted_content_notice: "third-party text",
+            }),
+            to(&SearchResponse {
+                hits: Vec::new(),
+                scopes: vec![SearchScope {
+                    state: "searched",
+                    examined: 412,
+                    searched_back_to_ms: Some(1_700_000_000_000),
+                    held_from_ms: Some(1_700_000_000_000),
+                    top_level_only: true,
+                    whole: true,
+                    capped: 1,
+                    withheld: 1,
+                    ..SearchScope::empty(channel())
+                }],
+                resume_below_ms: None,
+                upstream: "none",
+                untrusted_content_notice: "third-party text",
+            }),
         ],
         "VibeTalkV1ClientFrame": [
             to(&VibeTalkV1ClientFrame::AudioStart),

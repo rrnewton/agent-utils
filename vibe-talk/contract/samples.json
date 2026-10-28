@@ -1066,6 +1066,128 @@
       "untrusted_content_notice": "third-party text"
     }
   ],
+  "SearchResponse": [
+    {
+      "hits": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "[build-bot] Status, 15:05Z. hello",
+          "content_html": "<p><em>hello</em></p>\n",
+          "edited_timestamp": "2026-09-25T12:04:30.000100Z",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
+          "id": "301",
+          "noise": true,
+          "observed_ms": 1790000000000,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀",
+              "owner_reacted": true
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "upstream_url": "https://chat.google.com/room/AAAa1/BBBb2/CCCc3"
+        }
+      ],
+      "resume_below_ms": 1758801600000,
+      "scopes": [
+        {
+          "as_of_ms": 1790000000000,
+          "capped": 0,
+          "channel": {
+            "added": false,
+            "alias": null,
+            "id": "100",
+            "label": "general",
+            "provider": "discord",
+            "writable": true
+          },
+          "examined": 20000,
+          "expanding": true,
+          "held_from_ms": 1755000000000,
+          "partial": 1,
+          "resume_below_ms": 1758801600000,
+          "searched_back_to_ms": 1758801600000,
+          "state": "searched",
+          "top_level_only": true,
+          "whole": false,
+          "withheld": 0
+        },
+        {
+          "capped": 0,
+          "channel": {
+            "added": false,
+            "alias": null,
+            "id": "100",
+            "label": "general",
+            "provider": "discord",
+            "writable": true
+          },
+          "examined": 0,
+          "expanding": false,
+          "partial": 0,
+          "reason": "read_scope",
+          "state": "not_searched",
+          "top_level_only": false,
+          "whole": false,
+          "withheld": 0
+        }
+      ],
+      "untrusted_content_notice": "third-party text",
+      "upstream": "none"
+    },
+    {
+      "hits": [],
+      "scopes": [
+        {
+          "capped": 1,
+          "channel": {
+            "added": false,
+            "alias": null,
+            "id": "100",
+            "label": "general",
+            "provider": "discord",
+            "writable": true
+          },
+          "examined": 412,
+          "expanding": false,
+          "held_from_ms": 1700000000000,
+          "partial": 0,
+          "searched_back_to_ms": 1700000000000,
+          "state": "searched",
+          "top_level_only": true,
+          "whole": true,
+          "withheld": 1
+        }
+      ],
+      "untrusted_content_notice": "third-party text",
+      "upstream": "none"
+    }
+  ],
   "ThreadSummary": [
     {
       "id": "t1",

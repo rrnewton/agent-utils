@@ -2305,6 +2305,7 @@ impl MessageCache {
             .limits
             .cutoff_ms(&chan.channel_id, self.now_ms());
         let scope_key = request.view.horizon_scope().key();
+        let memory_dropped_ms = self.last_drop_ms(chan);
         self.read_scope(chan, &scope_key, |connection| {
             let snapshot = connection.unchecked_transaction()?;
             let (rows, more) = reader::search_rows(
@@ -2316,10 +2317,33 @@ impl MessageCache {
             )?;
             let intervals = reader::coverage(&snapshot, chan, &scope_key)?;
             let head = reader::head(&snapshot, chan, &scope_key)?;
+            let dropped_ms = reader::dropped_ms(&snapshot, chan)?.max(memory_dropped_ms);
             snapshot.finish()?;
             let mut outcome = search::test_rows(rows, more, request);
             outcome.horizon = coverage::horizon(&intervals, head.as_ref(), cutoff_ms);
-            Ok(outcome)
+            Ok((outcome, dropped_ms))
+        })
+        .map(|(mut outcome, dropped_ms)| {
+            // What a serve would not hand out is not handed out here either (`#605
+            // server-side-search`): a reply whose own thread is in doubt or being erased (the
+            // scope read above is the view's, and a thread's block is its own), a row not seen
+            // since the latest offer dropped for the channel (the dropped one may have been its
+            // edit or deletion), and a text only a push brought, which may be a snippet.
+            let before = outcome.hits.len();
+            outcome.hits.retain(|hit| {
+                let thread_clear = hit
+                    .message
+                    .thread
+                    .as_ref()
+                    .filter(|thread| !thread.is_root)
+                    .is_none_or(|thread| {
+                        !self.scope_blocked(chan, &Scope::Thread(thread.id.clone()).key())
+                    });
+                let seen_since_drop = dropped_ms.is_none_or(|dropped| hit.observed_ms > dropped);
+                thread_clear && seen_since_drop && !hit.content_partial
+            });
+            outcome.withheld = before - outcome.hits.len();
+            outcome
         })
     }
 

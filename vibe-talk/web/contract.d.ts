@@ -1683,6 +1683,115 @@ declare namespace VibeTalk {
   }
 
   /**
+   * `GET /api/v1/channels/{id}/search` and `GET /api/v1/search`: what the server's own copy of
+   * each channel holds that matches a query, and how far back that search reached. `#605
+   * server-side-search`; see [`crate::server_search`].
+   */
+  interface SearchResponse {
+    /**
+     * Matching messages, newest first, across every channel searched: those created from
+     * `resume_below_ms` (or the oldest held) up to the search's start. Rendered as a timeline
+     * page's messages are, each carrying the observation that put it in the server's copy.
+     */
+    hits: Message[];
+    /**
+     * Where the next answer continues, as `below`: every message the server holds of every
+     * channel searched, created from here up, was tested. Absent when every channel's search
+     * reached the oldest message held.
+     */
+    resume_below_ms?: number | null;
+    /**
+     * One per channel asked about, saying whether it was searched and how far back.
+     */
+    scopes: SearchScope[];
+    /**
+     * Standing reminder that the content is third-party text.
+     */
+    untrusted_content_notice: string;
+    /**
+     * How the chat services' own search was used: `none`. Searching upstream is deferred; only
+     * the server's own copy is searched.
+     */
+    upstream: string;
+  }
+
+  /**
+   * One channel's part of a [`SearchResponse`]. Times are milliseconds since the Unix epoch on the
+   * provider's clock, as messages' are; `as_of_ms` is the server's.
+   */
+  interface SearchScope {
+    /**
+     * When the oldest read that vouching rests on began, server time.
+     */
+    as_of_ms?: number | null;
+    /**
+     * Messages tested whose index text was cut at its cap: a term only past it is not found.
+     */
+    capped: number;
+    /**
+     * The channel.
+     */
+    channel: ChannelInfo;
+    /**
+     * Messages tested.
+     */
+    examined: number;
+    /**
+     * Whether the server's walk of the channel's history is under way, so `held_from_ms` is
+     * still moving back.
+     */
+    expanding: boolean;
+    /**
+     * From here up the server's coverage vouches it holds every message of the view (of
+     * top-level messages only when `top_level_only`), as of `as_of_ms`.
+     */
+    held_from_ms?: number | null;
+    /**
+     * Messages held only as a live event brought them, matched on that text and never handed
+     * out as hits.
+     */
+    partial: number;
+    /**
+     * Why the server's copy was not searched: `no_cache`, `serve_off` (the operator has not let
+     * the server answer from its copy), `not_kept`, `unverified` (the provider's account is not
+     * checked yet), `suspended`, `in_doubt` (access to the channel is in doubt, or an erase of
+     * it is waiting) or `read_scope` (the read token is never answered from the server's copy).
+     * A string rather than a closed set, so a reason added later does not make an older page
+     * refuse the answer.
+     */
+    reason?: string | null;
+    /**
+     * Where this channel's search stopped on its budget, when it did.
+     */
+    resume_below_ms?: number | null;
+    /**
+     * How far back every message the server holds of the view was both held and tested: the
+     * oldest creation time from which that is true, up to the search's start. Absent where the
+     * server's coverage vouches for nothing, or the search stopped above it.
+     */
+    searched_back_to_ms?: number | null;
+    /**
+     * `searched`, or `not_searched`, when `reason` says why.
+     */
+    state: string;
+    /**
+     * Whether `held_from_ms` speaks for top-level messages only: in a channel with threads, no
+     * claim says every reply of every thread is held.
+     */
+    top_level_only: boolean;
+    /**
+     * Whether the server holds the channel's whole history: its walk of the channel reached the
+     * beginning recently, every read on the way proving its stretch, and its coverage is not cut
+     * at an age limit. `#595 cache-full-history`.
+     */
+    whole: boolean;
+    /**
+     * Matching replies left out because their thread is in doubt.
+     */
+    withheld: number;
+  }
+
+  /**
    * How the owner approved a send. `#270 voice-transcript-markers`.
    */
   type SendHow = "tap" | "voice" | "direct";
@@ -2590,6 +2699,7 @@ declare namespace VibeTalk {
     ClientSettings: ClientSettings;
     ChannelHistoryState: ChannelHistoryState;
     HistoryModeRequest: HistoryModeRequest;
+    SearchResponse: SearchResponse;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

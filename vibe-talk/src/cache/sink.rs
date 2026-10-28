@@ -1950,6 +1950,75 @@ impl Sink {
         }))
     }
 
+    /// Search what the cache holds of `channel` (`#605 server-side-search`), under the rules a serve
+    /// keeps ([`Sink::try_serve`]): a cache open, serving on, the channel on the server's list,
+    /// its provider's account checked against the file and not suspended, and the view's scope not
+    /// blocked (in doubt, or being erased). A reply whose own thread is blocked is left out
+    /// ([`super::search::SearchOutcome::withheld`]). The gates are checked again after the read,
+    /// as a serve's are. The view is the channel's whole list: a bridge's Flat, and anywhere else
+    /// Main with every thread's replies. Blocking: it reads the file. The caller decides who may
+    /// ask: a serve answers the write scope alone.
+    ///
+    /// # Errors
+    ///
+    /// The first gate that refused, as [`super::search::SearchRefusal`].
+    pub fn search(
+        &self,
+        channel: &ChannelId,
+        ask: &super::search::SearchAsk<'_>,
+    ) -> Result<super::search::ChannelSearch, super::search::SearchRefusal> {
+        use super::search::{ChannelSearch, SearchRefusal, SearchRequest, SearchView};
+        let gate = |sink: &Self| -> Result<(Arc<MessageCache>, Route), SearchRefusal> {
+            let cache = sink
+                .cache()
+                .filter(|cache| cache.is_open())
+                .ok_or(SearchRefusal::NoCache)?;
+            if !sink.serve_enabled() {
+                return Err(SearchRefusal::ServeOff);
+            }
+            let route = sink
+                .state
+                .routes()
+                .fills
+                .get(channel)
+                .cloned()
+                .ok_or(SearchRefusal::NotRouted)?;
+            match sink.verification(&route.key) {
+                Verification::Verified => Ok((cache, route)),
+                Verification::Suspended => Err(SearchRefusal::Suspended),
+                Verification::Unverified => Err(SearchRefusal::Unverified),
+            }
+        };
+        let (cache, route) = gate(self)?;
+        let view = if route.shape == Shape::Bridge {
+            SearchView::Flat
+        } else {
+            SearchView::All
+        };
+        let chan = ChanKey::new(route.key.clone(), channel.as_str());
+        let request = SearchRequest {
+            query: ask.query,
+            view,
+            below_ms: ask.below_ms,
+            limit: ask.limit,
+            budget: ask.budget,
+            day_start_ms: ask.day_start_ms,
+        };
+        let outcome = cache
+            .search(&chan, &request)
+            .served()
+            .ok_or(SearchRefusal::Blocked)?;
+        let frontier = cache.frontier(&chan).served().flatten();
+        if gate(self)?.1.key != route.key {
+            return Err(SearchRefusal::NotRouted);
+        }
+        Ok(ChannelSearch {
+            outcome,
+            view,
+            frontier,
+        })
+    }
+
     /// `channel` as the cache names it, under the provider the latest routes give it: for a
     /// caller reading the cache back beside the sink (a served answer's corrections).
     #[must_use]

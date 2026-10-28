@@ -1168,3 +1168,246 @@ async fn a_slack_window_is_never_served_and_a_slack_main_page_is() {
         "Slack's own cursor for the next step: {older}"
     );
 }
+
+// --- `#605 server-side-search`: the server's own copy, searched ---------------------------------
+
+fn search_path(channel: &str, query: &str) -> String {
+    path(channel, &format!("/search?q={}&tz=UTC", url_encode(query)))
+}
+
+fn hit_texts(body: &Value) -> Vec<String> {
+    body["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|m| m["content"].as_str().expect("content").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_search_of_the_servers_copy_finds_what_it_holds_newest_first_and_pages_on() {
+    let d = deployment("cache-search-hits").await;
+    d.fill_timeline().await;
+    d.state.message_cache.set_serve(true);
+
+    let body = ok(
+        &d.state,
+        &search_path(READ_CHANNEL, "MESSAGE 1"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(
+        hit_texts(&body),
+        ["message 11", "message 10", "message 1"],
+        "case-insensitive substrings, newest first: {body}"
+    );
+    assert_eq!(body["upstream"], "none");
+    let scope = &body["scopes"][0];
+    assert_eq!(scope["state"], "searched", "{scope}");
+    assert_eq!(scope["channel"]["id"], READ_CHANNEL);
+    assert_eq!(scope["examined"], 12, "{scope}");
+    assert!(
+        scope["resume_below_ms"].is_null(),
+        "the whole copy was searched"
+    );
+    assert!(body["resume_below_ms"].is_null());
+    let timeline = ok(
+        &d.state,
+        &path(READ_CHANNEL, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    let read = timeline["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == body["hits"][0]["id"])
+        .expect("the timeline holds the hit");
+    for field in ["content_html", "spoken_time", "spoken_content", "noise"] {
+        assert_eq!(
+            body["hits"][0][field], read[field],
+            "{field}: rendered as a timeline's messages are"
+        );
+    }
+    assert!(
+        body["hits"][0]["observed_ms"].is_i64(),
+        "a copy says when it was read"
+    );
+
+    // The language: OR, a phrase, and a negation.
+    let body = ok(
+        &d.state,
+        &search_path(READ_CHANNEL, "\"message 2\" OR \"message 3\" -ada"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(
+        hit_texts(&body),
+        Vec::<String>::new(),
+        "every author is Ada"
+    );
+    let body = ok(
+        &d.state,
+        &search_path(READ_CHANNEL, "\"message 2\" OR \"message 3\""),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(hit_texts(&body), ["message 3", "message 2"]);
+
+    // A limit cuts on a whole millisecond and says where to resume; the next answer, below it,
+    // goes on with nothing skipped and nothing repeated.
+    let first = ok(
+        &d.state,
+        &format!("{}&limit=2", search_path(READ_CHANNEL, "message")),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(hit_texts(&first), ["message 11", "message 10"]);
+    let resume = first["resume_below_ms"].as_i64().expect("more to search");
+    let next = ok(
+        &d.state,
+        &format!(
+            "{}&limit=2&below={resume}",
+            search_path(READ_CHANNEL, "message")
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(hit_texts(&next), ["message 9", "message 8"]);
+}
+
+#[tokio::test]
+async fn a_search_of_the_servers_copy_keeps_the_serving_rules_and_says_which_refused() {
+    let d = deployment("cache-search-gates").await;
+    d.fill_timeline().await;
+    let reason = |body: &Value| body["scopes"][0]["reason"].as_str().map(str::to_owned);
+
+    // Serving off: the operator has not let the server answer from its copy.
+    let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;
+    assert_eq!(reason(&body).as_deref(), Some("serve_off"), "{body}");
+    assert_eq!(body["scopes"][0]["state"], "not_searched");
+    assert!(hit_texts(&body).is_empty());
+
+    d.state.message_cache.set_serve(true);
+    // The read token is never answered from the copy.
+    let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), READ_TOKEN).await;
+    assert_eq!(reason(&body).as_deref(), Some("read_scope"), "{body}");
+    assert!(hit_texts(&body).is_empty());
+
+    // A channel in doubt is not searched.
+    let cache = d.state.message_cache.cache().expect("installed");
+    let chan = ChanKey::new(LEGACY, READ_CHANNEL);
+    cache.block_channel(&chan);
+    let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;
+    assert_eq!(reason(&body).as_deref(), Some("in_doubt"), "{body}");
+    assert!(hit_texts(&body).is_empty());
+    cache.unblock(&chan, None);
+    let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;
+    assert_eq!(
+        hit_texts(&body).len(),
+        12,
+        "searched again once the doubt is gone"
+    );
+
+    // An offer for the channel dropped: what was seen before it may be an edit or a deletion
+    // behind, so it is withheld until a read sees it again.
+    d.clock.advance(SECOND);
+    cache.mark_suspect(&chan);
+    let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;
+    assert!(hit_texts(&body).is_empty(), "{body}");
+    assert_eq!(body["scopes"][0]["withheld"], 12, "{body}");
+    d.clock.advance(SECOND);
+    d.fill_timeline().await;
+    let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;
+    assert_eq!(
+        hit_texts(&body).len(),
+        12,
+        "a read since the drop vouches for them again: {body}"
+    );
+
+    // An account not checked against the file: nothing of it is handed out.
+    d.state.message_cache.reverify();
+    if d.state.message_cache.verification(LEGACY) != Verification::Verified {
+        let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;
+        assert_eq!(reason(&body).as_deref(), Some("unverified"), "{body}");
+    }
+
+    // What is not a search, and what is not a channel here.
+    let (status, _) = call(&d.state, &search_path(READ_CHANNEL, "  "), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a query with no term");
+    let (status, _) = call(&d.state, &search_path("9999999999", "message"), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // No cache at all.
+    let (bare, _fake, _voice) = testing::state_from_toml(&testing::config_toml());
+    let body = ok(&bare, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;
+    assert_eq!(reason(&body).as_deref(), Some("no_cache"), "{body}");
+}
+
+#[tokio::test]
+async fn all_channels_searches_every_channel_the_server_answers_for() {
+    let d = deployment("cache-search-all").await;
+    d.fill_timeline().await;
+    d.state.message_cache.set_serve(true);
+    let body = ok(&d.state, "/api/v1/search?q=message%205&tz=UTC", WRITE_TOKEN).await;
+    assert_eq!(hit_texts(&body), ["message 5"], "{body}");
+    assert_eq!(body["hits"][0]["channel_id"], READ_CHANNEL);
+    let scopes = body["scopes"].as_array().expect("scopes");
+    assert!(
+        scopes.len() >= 2,
+        "every configured channel has a scope: {body}"
+    );
+    assert!(scopes
+        .iter()
+        .any(|scope| scope["channel"]["id"] == READ_CHANNEL && scope["state"] == "searched"));
+}
+
+#[tokio::test]
+async fn a_slack_search_finds_replies_in_their_threads_and_withholds_a_thread_in_doubt() {
+    let (state, fake, clock, _dir) = slack_deployment("cache-search-slack").await;
+    // Message 2 becomes the root of a thread with two replies, read in the thread view.
+    let root = slack_fake::ts(120, 0);
+    {
+        let mut fixture = fake.state.lock().expect("the fake's state");
+        let mut message = fixture.history[SLACK_CH][2].clone();
+        let replies = [
+            (slack_fake::ts(130, 0), "a heron by the river".to_owned()),
+            (slack_fake::ts(140, 0), "and a kingfisher".to_owned()),
+        ];
+        slack_fake::thread(&mut fixture, SLACK_CH, &mut message, &replies);
+        fixture.history.get_mut(SLACK_CH).expect("the channel")[2] = message;
+    }
+    clock.advance(SECOND);
+    ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!("/timeline?view=thread&thread_id={root}&limit=50"),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    state.message_cache.set_serve(true);
+
+    let body = ok(&state, &search_path(SLACK_CH, "HERON"), WRITE_TOKEN).await;
+    assert_eq!(hit_texts(&body), ["a heron by the river"], "{body}");
+    assert_eq!(body["hits"][0]["thread"]["id"], root.as_str());
+    let scope = &body["scopes"][0];
+    assert_eq!(
+        scope["top_level_only"], true,
+        "replies are not covered by Main's claims"
+    );
+    assert_eq!(scope["withheld"], 0);
+
+    // The thread in doubt: its replies are not handed out, and the scope says how many.
+    let cache = state.message_cache.cache().expect("installed");
+    let chan = ChanKey::new(SLACK, SLACK_CH);
+    let thread = vibe_talk::cache::Scope::Thread(root.clone());
+    cache.block_scope(&chan, &thread);
+    let body = ok(&state, &search_path(SLACK_CH, "heron"), WRITE_TOKEN).await;
+    assert!(hit_texts(&body).is_empty(), "{body}");
+    assert_eq!(body["scopes"][0]["withheld"], 1, "{body}");
+    assert_eq!(body["scopes"][0]["state"], "searched");
+    cache.unblock(&chan, Some(&thread));
+}

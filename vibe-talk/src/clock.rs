@@ -54,6 +54,22 @@ impl Zone {
     pub fn at(&self, instant: jiff::Timestamp) -> jiff::Zoned {
         instant.to_zoned(self.tz.clone())
     }
+
+    /// The first instant of a calendar day in this zone, in milliseconds since the epoch: what a
+    /// search's `before:` and `after:` name (`#605 server-side-search`). A day a gap skips the
+    /// start of begins at the gap's end. `None` for a date that does not exist.
+    #[must_use]
+    pub fn day_start_ms(&self, year: i32, month: u32, day: u32) -> Option<i64> {
+        let date = jiff::civil::Date::new(
+            i16::try_from(year).ok()?,
+            i8::try_from(month).ok()?,
+            i8::try_from(day).ok()?,
+        )
+        .ok()?;
+        date.to_zoned(self.tz.clone())
+            .ok()
+            .map(|start| start.timestamp().as_millisecond())
+    }
 }
 
 /// Resolve an IANA zone name such as `America/New_York` or `UTC`.

@@ -225,8 +225,7 @@ pub struct SearchRequest<'a> {
 /// What a search of the cache found, and how far it can vouch for its absence of hits.
 #[derive(Clone, Debug)]
 pub struct SearchOutcome {
-    /// Matching rows, newest first. A row held only as a pushed snippet (`content_partial`) is
-    /// matched on the snippet and is never served as the message: a route fetches it whole first.
+    /// Matching rows, newest first, that may be handed out: see `withheld` for the rest.
     pub hits: Vec<CachedMessage>,
     /// Rows tested.
     pub examined: usize,
@@ -241,6 +240,10 @@ pub struct SearchOutcome {
     pub partial: usize,
     /// The view's horizon, when its claims reach the head.
     pub horizon: Option<Horizon>,
+    /// Matching rows left out of `hits` because a serve would not hand them out (`#605
+    /// server-side-search`): a reply whose thread is in doubt or being erased, a row not seen since
+    /// the latest offer dropped for the channel, or a text only a push brought.
+    pub withheld: usize,
 }
 
 impl SearchOutcome {
@@ -259,6 +262,69 @@ impl SearchOutcome {
     }
 }
 
+/// What a route asks of one channel's copy (`#605 server-side-search`): [`SearchRequest`] less the
+/// view, which [`super::Sink::search`] chooses from the channel's provider.
+pub struct SearchAsk<'a> {
+    /// The parsed query.
+    pub query: &'a Query,
+    /// Only rows created before this provider time (exclusive).
+    pub below_ms: i64,
+    /// Stop after this many hits, on a whole millisecond.
+    pub limit: usize,
+    /// Stop after testing about this many rows.
+    pub budget: usize,
+    /// The start of a calendar day in the reader's time zone.
+    pub day_start_ms: &'a dyn Fn(Day) -> i64,
+}
+
+/// One channel's copy searched: what was found, over which view, and how far the server's walk
+/// of the channel's history stands.
+#[derive(Clone, Debug)]
+pub struct ChannelSearch {
+    /// What the search found.
+    pub outcome: SearchOutcome,
+    /// The view searched: the channel's whole list.
+    pub view: SearchView,
+    /// The full-history walk's record for the channel, when one exists (`#595
+    /// cache-full-history`): whether it reached the channel's beginning, or is still under way.
+    pub frontier: Option<super::Frontier>,
+}
+
+/// Why the server's copy of a channel was not searched. Each is said to the reader, by its code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchRefusal {
+    /// No cache file is open.
+    NoCache,
+    /// The operator has not let the server answer reads from its copy (`[message_cache] serve`).
+    ServeOff,
+    /// The channel is not on the list the cache is kept for.
+    NotRouted,
+    /// The provider's account has not been checked against the file yet.
+    Unverified,
+    /// The provider refused the server's credential.
+    Suspended,
+    /// Access to the channel is in doubt, or an erase of it is waiting.
+    Blocked,
+    /// The caller holds the read token, which is never answered from the server's copy.
+    ReadScope,
+}
+
+impl SearchRefusal {
+    /// The code the wire carries.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NoCache => "no_cache",
+            Self::ServeOff => "serve_off",
+            Self::NotRouted => "not_kept",
+            Self::Unverified => "unverified",
+            Self::Suspended => "suspended",
+            Self::Blocked => "in_doubt",
+            Self::ReadScope => "read_scope",
+        }
+    }
+}
+
 /// Test `rows` (newest first, as [`super::reader::search_rows`] lists them: ending on a whole
 /// millisecond) against the request, stopping at its limit on a whole millisecond; `more` says
 /// whether older rows remained past the budget.
@@ -274,6 +340,7 @@ pub(crate) fn test_rows(
         capped: 0,
         partial: 0,
         horizon: None,
+        withheld: 0,
     };
     if request.query.is_empty() || request.limit == 0 || request.budget == 0 {
         // Nothing tested, so nothing below `below_ms` is vouched for.

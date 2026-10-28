@@ -265,6 +265,12 @@ fn routes(state: AppState) -> Router {
         )
         .route("/api/v1/channels/{channel_id}/page", get(api::page))
         .route("/api/v1/channels/{channel_id}/timeline", get(api::timeline))
+        // `#605 server-side-search`: what the server's own copy holds, one channel or all.
+        .route(
+            "/api/v1/channels/{channel_id}/search",
+            get(api::search_channel),
+        )
+        .route("/api/v1/search", get(api::search_all))
         .route("/api/v1/channels/{channel_id}/count", get(api::count))
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))

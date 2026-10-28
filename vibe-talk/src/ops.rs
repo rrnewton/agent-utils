@@ -164,6 +164,16 @@ impl OpError {
 ///
 /// This is the single gate every channel-scoped operation goes through. A snowflake that is not
 /// configured does not exist here, however many channels the bot is actually in.
+/// The allowlist gate, with the alias overlay, for a route outside this module. `#605
+/// server-side-search`.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`].
+pub async fn allowed_channel(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
+    allowed(state, channel_id).await
+}
+
 async fn allowed(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
     let mut channel = configured(state, channel_id)?;
     channel.alias = aliases(state).await.remove(channel.id.as_str());
@@ -338,7 +348,7 @@ pub async fn clear_channel_alias(
 /// relative to two different "now"s.
 ///
 /// Everything downstream PRINTS these fields and must never compute them.
-fn stamp(state: &AppState, messages: &mut [Message]) {
+pub(crate) fn stamp(state: &AppState, messages: &mut [Message]) {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     for message in messages {
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);

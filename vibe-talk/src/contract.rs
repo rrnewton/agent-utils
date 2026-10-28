@@ -530,6 +530,104 @@ pub struct MessageCacheHistory {
     pub paused: Option<&'static str>,
 }
 
+/// `GET /api/v1/channels/{id}/search` and `GET /api/v1/search`: what the server's own copy of
+/// each channel holds that matches a query, and how far back that search reached. `#605
+/// server-side-search`; see [`crate::server_search`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SearchResponse {
+    /// Matching messages, newest first, across every channel searched: those created from
+    /// `resume_below_ms` (or the oldest held) up to the search's start. Rendered as a timeline
+    /// page's messages are, each carrying the observation that put it in the server's copy.
+    pub hits: Vec<Message>,
+    /// One per channel asked about, saying whether it was searched and how far back.
+    pub scopes: Vec<SearchScope>,
+    /// Where the next answer continues, as `below`: every message the server holds of every
+    /// channel searched, created from here up, was tested. Absent when every channel's search
+    /// reached the oldest message held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_below_ms: Option<i64>,
+    /// How the chat services' own search was used: `none`. Searching upstream is deferred; only
+    /// the server's own copy is searched.
+    pub upstream: &'static str,
+    /// Standing reminder that the content is third-party text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// One channel's part of a [`SearchResponse`]. Times are milliseconds since the Unix epoch on the
+/// provider's clock, as messages' are; `as_of_ms` is the server's.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SearchScope {
+    /// The channel.
+    pub channel: ChannelInfo,
+    /// `searched`, or `not_searched`, when `reason` says why.
+    pub state: &'static str,
+    /// Why the server's copy was not searched: `no_cache`, `serve_off` (the operator has not let
+    /// the server answer from its copy), `not_kept`, `unverified` (the provider's account is not
+    /// checked yet), `suspended`, `in_doubt` (access to the channel is in doubt, or an erase of
+    /// it is waiting) or `read_scope` (the read token is never answered from the server's copy).
+    /// A string rather than a closed set, so a reason added later does not make an older page
+    /// refuse the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// Messages tested.
+    pub examined: u64,
+    /// How far back every message the server holds of the view was both held and tested: the
+    /// oldest creation time from which that is true, up to the search's start. Absent where the
+    /// server's coverage vouches for nothing, or the search stopped above it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched_back_to_ms: Option<i64>,
+    /// From here up the server's coverage vouches it holds every message of the view (of
+    /// top-level messages only when `top_level_only`), as of `as_of_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_from_ms: Option<i64>,
+    /// When the oldest read that vouching rests on began, server time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of_ms: Option<i64>,
+    /// Whether `held_from_ms` speaks for top-level messages only: in a channel with threads, no
+    /// claim says every reply of every thread is held.
+    pub top_level_only: bool,
+    /// Whether the server holds the channel's whole history: its walk of the channel reached the
+    /// beginning recently, every read on the way proving its stretch, and its coverage is not cut
+    /// at an age limit. `#595 cache-full-history`.
+    pub whole: bool,
+    /// Whether the server's walk of the channel's history is under way, so `held_from_ms` is
+    /// still moving back.
+    pub expanding: bool,
+    /// Messages tested whose index text was cut at its cap: a term only past it is not found.
+    pub capped: u64,
+    /// Messages held only as a live event brought them, matched on that text and never handed
+    /// out as hits.
+    pub partial: u64,
+    /// Matching replies left out because their thread is in doubt.
+    pub withheld: u64,
+    /// Where this channel's search stopped on its budget, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_below_ms: Option<i64>,
+}
+
+impl SearchScope {
+    /// A scope that searched nothing, for `channel`.
+    #[must_use]
+    pub fn empty(channel: ChannelInfo) -> Self {
+        Self {
+            channel,
+            state: "not_searched",
+            reason: None,
+            examined: 0,
+            searched_back_to_ms: None,
+            held_from_ms: None,
+            as_of_ms: None,
+            top_level_only: false,
+            whole: false,
+            expanding: false,
+            capped: 0,
+            partial: 0,
+            withheld: 0,
+            resume_below_ms: None,
+        }
+    }
+}
+
 /// `PUT /api/v1/message-cache`: the owner's switch. `#208 persistent-cache`.
 ///
 /// An unknown field is ignored, as everywhere in the contract: a page may send one a later server
@@ -1404,6 +1502,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         // `#602 history-settings-and-limits`. Appended, for the same reason.
         generator.subschema_for::<ChannelHistoryState>(),
         generator.subschema_for::<HistoryModeRequest>(),
+        // `#605 server-side-search`. Appended, for the same reason.
+        generator.subschema_for::<SearchResponse>(),
     ]
 }
 

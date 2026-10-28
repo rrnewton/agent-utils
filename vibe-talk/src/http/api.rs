@@ -2175,6 +2175,58 @@ pub struct TimelineQuery {
     pub limit: Option<u16>,
 }
 
+/// `GET /api/v1/channels/{channel_id}/search` and `GET /api/v1/search`. `#605 server-side-search`.
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    /// The query, in the search language (`crate::search_query`).
+    pub q: String,
+    /// The reader's IANA time zone, for `before:` and `after:`; the server's own when absent.
+    pub tz: Option<String>,
+    /// Only messages created before this instant, in milliseconds since the epoch (exclusive).
+    pub below: Option<i64>,
+    /// Hits wanted: default 50, at most 200.
+    pub limit: Option<usize>,
+}
+
+impl SearchQuery {
+    fn ask(self) -> crate::server_search::Ask {
+        crate::server_search::Ask {
+            q: self.q,
+            tz: self.tz,
+            below_ms: self.below,
+            limit: self.limit,
+        }
+    }
+}
+
+/// `GET /api/v1/channels/{channel_id}/search` — search what the server's own copy of one channel
+/// holds. Read scope; the read token's answer says the copy was not searched (`read_scope`), as
+/// it is never answered from the copy. `#605 server-side-search`.
+pub async fn search_channel(
+    State(state): State<AppState>,
+    ReadScope(caller): ReadScope,
+    Path(channel_id): Path<String>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<crate::contract::SearchResponse>, ApiError> {
+    let channel = ops::allowed_channel(&state, &channel_id).await?;
+    Ok(Json(
+        crate::server_search::search(&state, caller, vec![channel], &query.ask()).await?,
+    ))
+}
+
+/// `GET /api/v1/search` — the same, over every channel this server answers for. `#605
+/// server-side-search`: the owner's "All channels".
+pub async fn search_all(
+    State(state): State<AppState>,
+    ReadScope(caller): ReadScope,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<crate::contract::SearchResponse>, ApiError> {
+    let channels = ops::channels(&state).await;
+    Ok(Json(
+        crate::server_search::search(&state, caller, channels, &query.ask()).await?,
+    ))
+}
+
 /// `GET /api/v1/channels/{channel_id}/timeline` — all views share one allowlist boundary.
 pub async fn timeline(
     State(state): State<AppState>,
