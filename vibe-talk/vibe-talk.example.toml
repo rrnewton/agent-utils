@@ -545,7 +545,9 @@ enabled = true
 # full_cycle_hours = 72             # 24 to 144: how soon after a walk of the whole history began
 #                                   # the next begins. A held row not read again within a week is
 #                                   # erased, so the whole history is walked again, not once
-# timeline_fallback_ms = 10000      # 1000 to 60000. No effect in this build
+# timeline_fallback_ms = 10000      # 1000 to 60000. With serve = true: how long a page's
+#                                   # timeline read waits on the provider before what the
+#                                   # cache holds answers it, marked refresh_failed (#611)
 #
 # A conversation the provider keeps for less time can have its own age limit:
 # [[message_cache.channel]]

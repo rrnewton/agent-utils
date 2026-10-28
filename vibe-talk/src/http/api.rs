@@ -55,16 +55,35 @@ impl ApiError {
     }
 }
 
+/// Why a request answered a 5xx, carried on the response for the access middleware's one
+/// server-error line (`crate::http::access_layer`). `#611 timeline-read-failures`: the status
+/// alone said nothing of which failure it was.
+#[derive(Clone, Debug)]
+pub struct ServerErrorCause {
+    /// The error code the body carries.
+    pub code: &'static str,
+    /// The detail the body carries: already redacted, as it goes to the caller.
+    pub detail: String,
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let cause = self.status.is_server_error().then(|| ServerErrorCause {
+            code: self.code,
+            detail: self.detail.clone(),
+        });
+        let mut response = (
             self.status,
             Json(ApiErrorBody {
                 error: self.code,
                 detail: self.detail,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(cause) = cause {
+            response.extensions_mut().insert(cause);
+        }
+        response
     }
 }
 

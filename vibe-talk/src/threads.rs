@@ -394,6 +394,13 @@ pub struct TimelinePage {
     /// nothing. The replication model's rule 4. `#473 replication-c7-server-versions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_below_ms: Option<i64>,
+    /// Present when the provider could not be read for this page just now — it failed, or it did
+    /// not answer in time — and the page is what this server's own copy holds instead: a short
+    /// sentence saying which, for the reader. `as_of` then says how old the copy is, and the page
+    /// carries no `settled_below_ms`: absence from it proves nothing. `#611
+    /// timeline-read-failures`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_failed: Option<String>,
     /// Messages of this page taken from the server's own copy rather than read upstream: the
     /// replies of threads the message cache held whole ([`crate::held_replies`], `#603
     /// server-side-search`). Never sent: it keeps the read from being offered back to the cache

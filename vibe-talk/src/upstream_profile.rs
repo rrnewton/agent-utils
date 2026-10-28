@@ -124,6 +124,44 @@ async fn within<F: Future>(calls: &Arc<AtomicU64>, work: F) -> F::Output {
     output
 }
 
+tokio::task_local! {
+    /// Where the timed operations of the request being served now note how they failed. See
+    /// [`noting_failures`].
+    static FAILURES: Arc<Mutex<Option<FailedOperation>>>;
+}
+
+/// The latest upstream operation that failed while a request was being served: what the request's
+/// one server-error line names as the call that failed. `#611 timeline-read-failures`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedOperation {
+    /// The operation, as the upstream profile names it: `fetch_timeline`, `fetch_page`, ...
+    pub operation: &'static str,
+    /// How it ended.
+    pub outcome: Outcome,
+    /// How long it ran before it failed.
+    pub elapsed: Duration,
+    /// The upstream requests it sent, retries after a rate limit included.
+    pub calls: u64,
+}
+
+/// Run `work`, and say which timed upstream operation last failed inside it, if any did. A task it
+/// spawns notes nothing here unless it runs inside its own [`noting_failures`] and hands the
+/// answer back with [`note_failure_of`]. `#611 timeline-read-failures`.
+pub async fn noting_failures<F: Future>(work: F) -> (F::Output, Option<FailedOperation>) {
+    let slot = Arc::new(Mutex::new(None));
+    let output = FAILURES.scope(Arc::clone(&slot), work).await;
+    let failed = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    (output, failed)
+}
+
+/// Note `failed` for the request being served, as if it had failed on this task: for work that ran
+/// on a task of its own and handed back what [`noting_failures`] found there.
+pub fn note_failure_of(failed: FailedOperation) {
+    let _ = FAILURES.try_with(|slot| {
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(failed);
+    });
+}
+
 /// How one upstream operation or call ended, in the words the report and the log use.
 ///
 /// A provider label ([`ChatError::Provider`]) is looked through, so it does not change the class.
@@ -664,6 +702,12 @@ impl Timer<'_> {
     /// against it, and against an enclosing count as well ([`counting_calls`]).
     pub async fn run<F: Future>(&self, work: F) -> F::Output {
         within(&self.calls, work).await
+    }
+
+    /// The upstream requests the work it ran has sent so far.
+    #[must_use]
+    pub fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
     }
 
     /// Record how this one ended, and return how long it took.
@@ -1422,7 +1466,15 @@ impl ProfiledClient {
                 }
             }
             Err(error) => {
-                timer.finish(Outcome::of(error), 0);
+                let calls = timer.calls();
+                let outcome = Outcome::of(error);
+                let elapsed = timer.finish(outcome, 0);
+                note_failure_of(FailedOperation {
+                    operation,
+                    outcome,
+                    elapsed,
+                    calls,
+                });
             }
         }
         if let Some(access) = &self.access {

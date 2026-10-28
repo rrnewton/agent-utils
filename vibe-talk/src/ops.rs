@@ -1420,7 +1420,6 @@ pub async fn timeline(
         .transpose()
         .map_err(|_| OpError::CursorMismatch)?
         .flatten();
-    let mut backend = request.clone();
     // Before the fetch, not after: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
     let timeline_read = if request.before.is_some() {
@@ -1445,11 +1444,16 @@ pub async fn timeline(
     // background.
     let mut shadow = None;
     if let Some(ask) = newest_ask {
-        // Every page served has a refresh of its own, which compares it and corrects it: so
-        // its claim is taken first, and a page whose read is already being refreshed for an
-        // earlier serve goes upstream as before (`#510 cache-serve-every-read`). Dropped
-        // unused when the page is not served.
-        let claim = may_serve(state, caller)
+        // A page served is refreshed, which compares it and corrects it: so the refresh's
+        // claim is taken first (`#510 cache-serve-every-read`). Dropped unused when the page is
+        // not served.
+        //
+        // `#611 timeline-read-failures`: a page whose read is already being refreshed is served
+        // all the same when the rule serves it, and starts no second refresh: that one corrects
+        // it. It used to go upstream beside the refresh, two reads of one page at once, and a
+        // provider slow enough to keep the first refresh waiting failed the second as a 502.
+        let serving = may_serve(state, caller);
+        let claim = serving
             .then(|| {
                 state.message_cache.claim_refresh(RefreshKey::timeline(
                     channel.id.clone(),
@@ -1459,7 +1463,7 @@ pub async fn timeline(
                 ))
             })
             .flatten();
-        if let Some(claim) = claim {
+        if serving {
             match state
                 .message_cache
                 .try_serve(&channel.id, ask, || {
@@ -1472,15 +1476,17 @@ pub async fn timeline(
                     let (raw, as_of) = served_messages(&view);
                     let next_before =
                         crate::timeline_served::encode(&channel.id, request.view, thread, &raw)?;
-                    spawn_timeline_refresh(
-                        state.clone(),
-                        caller,
-                        channel.id.clone(),
-                        request.clone(),
-                        claim,
-                        raw.clone(),
-                        pending,
-                    );
+                    if let Some(claim) = claim {
+                        spawn_timeline_refresh(
+                            state.clone(),
+                            caller,
+                            channel.id.clone(),
+                            request.clone(),
+                            claim,
+                            raw.clone(),
+                            pending,
+                        );
+                    }
                     let mut page = crate::threads::TimelinePage {
                         messages: raw,
                         has_threads: view.has_threads,
@@ -1534,37 +1540,49 @@ pub async fn timeline(
     let held: Option<std::sync::Arc<dyn crate::held_replies::HeldReplies>> =
         (request.view == crate::threads::TimelineView::Flat && may_serve(state, caller))
             .then(|| std::sync::Arc::clone(&state.message_cache) as _);
-    let (mut page, position) = crate::held_replies::scope(held, async {
-        Ok::<_, OpError>(match (served_below.as_ref(), resumed) {
-            (Some(below), _) => (
-                step_back_from_served(state, caller, &channel.id, request, below).await?,
-                None,
-            ),
-            (None, Some(Forward::Native(own))) => {
-                backend.after = Some(own);
-                (
-                    state.chat.fetch_timeline(&channel.id, &backend).await?,
-                    None,
-                )
+    // `#611 timeline-read-failures`. What the cache would stand in with for this read, should
+    // upstream fail it or keep it waiting: the newest page of the view, for a caller that may be
+    // answered from the cache at all. Never for a step back, whose rows lie below anything the
+    // cache's newest page holds.
+    let stand_in = (request.before.is_none() && may_serve(state, caller)).then(|| Ask::Timeline {
+        view: request.view,
+        thread: request.thread_id.clone(),
+        limit: usize::from(request.limit.max(1)),
+    });
+    let (mut page, position) = match (served_below.as_ref(), stand_in) {
+        (Some(below), _) => (
+            crate::held_replies::scope(
+                held,
+                step_back_from_served(state, caller, &channel.id, request, below),
+            )
+            .await?,
+            None,
+        ),
+        (None, stand_in) => {
+            let read = UpstreamTimeline {
+                state: state.clone(),
+                channel: channel.id.clone(),
+                request: request.clone(),
+                resumed,
+                held,
+                shadow: shadow.take(),
+                fill,
+                timeline_read,
+            };
+            match stand_in {
+                // Off the request's task, so that it runs on, and still fills the cache, after the
+                // request has been answered from the cache.
+                Some(ask) => match read_or_stand_in(state, &channel.id, request, read, &ask).await?
+                {
+                    Answered::Upstream(answer) => *answer,
+                    Answered::StandIn(page) => {
+                        return stood_in(state, channel, request, page).await;
+                    }
+                },
+                None => read.run().await?,
             }
-            (None, Some(Forward::Generic(since))) => {
-                backend.after = None;
-                let read = state
-                    .chat
-                    .fetch_timeline_since(&channel.id, &backend, &since)
-                    .await?;
-                (read.page, Some(read.position))
-            }
-            (None, None) => (state.chat.fetch_timeline(&channel.id, request).await?, None),
-        })
-    })
-    .await?;
-    if let Some(shadow) = shadow {
-        shadow.compare(Upstream::of(&page.messages, page.has_more));
-    }
-    if let Some(fill) = fill {
-        fill.offer_timeline(request, timeline_read, &page);
-    }
+        }
+    };
     page.next_after = if request.before.is_some() {
         None
     } else {
@@ -1620,6 +1638,287 @@ pub async fn timeline(
     for gone in page.delta.iter().flat_map(|delta| &delta.deleted) {
         state.read_ahead.forget(&channel.id, gone);
     }
+    Ok((channel, page))
+}
+
+/// How long a timeline read the cache can stand in for waits on upstream before the cache answers
+/// it: `[message_cache] timeline_fallback_ms`, ten seconds unless set, inside the page's own twenty.
+/// `#611 timeline-read-failures`: on a loaded host a read took 9-25 s and then failed, and the page
+/// sat on its loading line all that while.
+#[must_use]
+pub fn stand_in_after(config: &crate::config::Config) -> std::time::Duration {
+    std::time::Duration::from_millis(config.message_cache.as_ref().map_or(
+        crate::config::DEFAULT_MESSAGE_CACHE_TIMELINE_FALLBACK_MS,
+        |cache| cache.timeline_fallback_ms,
+    ))
+}
+
+/// One upstream timeline read, with what it offers the cache and compares when it lands: owned,
+/// so that it can run on a task of its own and outlive the request that began it.
+struct UpstreamTimeline {
+    state: AppState,
+    channel: ChannelId,
+    request: crate::threads::TimelineRequest,
+    resumed: Option<crate::timeline_forward::Forward>,
+    held: Option<std::sync::Arc<dyn crate::held_replies::HeldReplies>>,
+    shadow: Option<crate::cache::Shadowed>,
+    fill: Option<crate::cache::sink::Fill>,
+    timeline_read: crate::cache::observe::TimelineRead,
+}
+
+/// A timeline read's page, and the generic position a catch-up read reached.
+type UpstreamAnswer = (
+    crate::threads::TimelinePage,
+    Option<crate::timeline_forward::GenericPosition>,
+);
+
+impl UpstreamTimeline {
+    /// Read upstream, then compare the shadow and offer the page, as [`timeline`] always has.
+    async fn run(self) -> Result<UpstreamAnswer, OpError> {
+        use crate::timeline_forward::Forward;
+        let Self {
+            state,
+            channel,
+            request,
+            resumed,
+            held,
+            shadow,
+            fill,
+            timeline_read,
+        } = self;
+        let mut backend = request.clone();
+        let (page, position) = crate::held_replies::scope(held, async {
+            Ok::<_, OpError>(match resumed {
+                Some(Forward::Native(own)) => {
+                    backend.after = Some(own);
+                    (state.chat.fetch_timeline(&channel, &backend).await?, None)
+                }
+                Some(Forward::Generic(since)) => {
+                    backend.after = None;
+                    let read = state
+                        .chat
+                        .fetch_timeline_since(&channel, &backend, &since)
+                        .await?;
+                    (read.page, Some(read.position))
+                }
+                None => (state.chat.fetch_timeline(&channel, &request).await?, None),
+            })
+        })
+        .await?;
+        if let Some(shadow) = shadow {
+            shadow.compare(Upstream::of(&page.messages, page.has_more));
+        }
+        if let Some(fill) = fill {
+            fill.offer_timeline(&request, timeline_read, &page);
+        }
+        Ok((page, position))
+    }
+}
+
+/// How a read the cache could stand in for was answered.
+enum Answered {
+    /// By upstream, as ever.
+    Upstream(Box<UpstreamAnswer>),
+    /// By the cache, upstream having failed or kept it waiting: what it held, and why.
+    StandIn(StoodIn),
+}
+
+/// What the cache answered a read with in upstream's place.
+struct StoodIn {
+    held: crate::cache::sink::StaleTimeline,
+    why: &'static str,
+}
+
+/// Read `read` upstream on a task of its own, and answer from the cache instead — what it holds of
+/// `ask`, however old ([`crate::cache::sink::Sink::stale_timeline`]) — when upstream fails the way
+/// a provider fails (not a refusal, an access answer or an expired cursor), or has not answered
+/// within [`stand_in_after`]. A read the cache cannot stand in for waits for upstream, and fails as
+/// upstream failed. The read upstream is never abandoned: answered from the cache, the request
+/// leaves it running, and what it brings fills the cache for the next read. `#611
+/// timeline-read-failures`.
+async fn read_or_stand_in(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    read: UpstreamTimeline,
+    ask: &Ask,
+) -> Result<Answered, OpError> {
+    let deadline = tokio::time::Instant::now() + stand_in_after(&state.config);
+    // One read upstream of a view at a time, whoever asks (single-flight): a read that finds one
+    // already under way waits for it to end, within the same wait, and is answered from the cache
+    // if it has not. Under a provider that is rate-limiting or slow, the page's polls, other tabs
+    // and the counts reads of All used to add a read each beside the one still waiting, on the
+    // budget that was already spent.
+    let key = flight_key(channel, request);
+    let claim = loop {
+        if let Some(claim) = state.message_cache.claim_refresh(key.clone()) {
+            break Some(claim);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if let Some(held) = state.message_cache.stale_timeline(channel, ask).await {
+                log_stand_in(request, "busy", None);
+                return Ok(Answered::StandIn(StoodIn {
+                    held,
+                    why: "The chat service is still answering an earlier read.",
+                }));
+            }
+            // Nothing to stand in with: go upstream beside it, as every read used to.
+            break None;
+        }
+        tokio::time::sleep(FLIGHT_POLL).await;
+    };
+    let reason = crate::read_reason::ReadReason::current();
+    let mut running = tokio::spawn(reason.scope(async move {
+        let _claim = claim;
+        crate::upstream_profile::noting_failures(read.run()).await
+    }));
+    let joined = match tokio::time::timeout_at(deadline, &mut running).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            if let Some(held) = state.message_cache.stale_timeline(channel, ask).await {
+                log_stand_in(request, "slow", None);
+                return Ok(Answered::StandIn(StoodIn {
+                    held,
+                    why: "The chat service did not answer in time.",
+                }));
+            }
+            running.await
+        }
+    };
+    let (result, failed) = joined.map_err(|_| {
+        OpError::Chat(ChatError::Transport(
+            "the timeline read stopped before it answered".to_owned(),
+        ))
+    })?;
+    if let Some(failed) = failed.clone() {
+        crate::upstream_profile::note_failure_of(failed);
+    }
+    match result {
+        Ok(answer) => Ok(Answered::Upstream(Box::new(answer))),
+        Err(error) => {
+            let Some(why) = stand_in_for(&error) else {
+                return Err(error);
+            };
+            match state.message_cache.stale_timeline(channel, ask).await {
+                Some(held) => {
+                    log_stand_in(request, "failed", Some(&error));
+                    Ok(Answered::StandIn(StoodIn { held, why }))
+                }
+                None => Err(error),
+            }
+        }
+    }
+}
+
+/// How often a read waiting for another read of its view to end looks again.
+const FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The single-flight key of an upstream timeline read: a newest page's is the one its serve's
+/// refresh claims ([`RefreshKey::timeline`]), so a stand-in read and a refresh never run together
+/// either; every catch-up of one view shares another, whatever cursor it continues from.
+fn flight_key(channel: &ChannelId, request: &crate::threads::TimelineRequest) -> RefreshKey {
+    if request.after.is_some() {
+        RefreshKey::timeline_forward(channel.clone(), request.view, request.thread_id.as_deref())
+    } else {
+        RefreshKey::timeline(
+            channel.clone(),
+            request.view,
+            request.thread_id.as_deref(),
+            request.limit,
+        )
+    }
+}
+
+/// Why the cache may answer for a read `error` failed, in a sentence for the reader; `None` when
+/// it may not. Only a provider failing as a provider fails: unreachable, slow, rate-limited, or
+/// answering with a server error or an answer it cannot parse. Never a refusal of this server's own, an expired cursor
+/// (the page reads the newest page instead), or an access answer — refused, forbidden, not found —
+/// which says the channel may no longer be readable at all. `#611 timeline-read-failures`.
+fn stand_in_for(error: &OpError) -> Option<&'static str> {
+    use crate::upstream_profile::Outcome;
+    let OpError::Chat(error) = error else {
+        return None;
+    };
+    match Outcome::of(error) {
+        Outcome::RateLimited => Some("The chat service is limiting how fast it can be read."),
+        Outcome::Transport => Some("The chat service could not be reached."),
+        Outcome::ServerError | Outcome::UnexpectedStatus | Outcome::Shape => {
+            Some("The chat service answered with an error.")
+        }
+        // Any other 4xx may be a provider saying the channel is gone (a 410, a bridge's 400):
+        // never hidden behind the cache.
+        Outcome::ClientError
+        | Outcome::Ok
+        | Outcome::Unauthorized
+        | Outcome::Forbidden
+        | Outcome::NotFound
+        | Outcome::Refused
+        | Outcome::CursorExpired
+        | Outcome::Abandoned => None,
+    }
+}
+
+/// One line for a read the cache answered in upstream's place: which view, and why. Counts and
+/// words only, as every cache line: never a channel's content.
+fn log_stand_in(
+    request: &crate::threads::TimelineRequest,
+    upstream: &str,
+    error: Option<&OpError>,
+) {
+    tracing::warn!(
+        consumer = "timeline_stand_in",
+        view = ?request.view,
+        forward = request.after.is_some(),
+        upstream,
+        error = error.map(|error| error.code()).unwrap_or("-"),
+        "a timeline read was answered from the message cache because upstream {upstream}; the \
+         page says so, and the read upstream runs on to refresh the cache"
+    );
+}
+
+/// The page a read the cache stood in for answers with: what the cache held, as of when the scope's
+/// newest end was last read, saying why, and proving nothing by what it lacks. Its backward cursor
+/// is this server's own, as a served page's is (`#510 cache-serve-every-read`), and so is its
+/// forward one. `#611 timeline-read-failures`.
+async fn stood_in(
+    state: &AppState,
+    channel: ChannelInfo,
+    request: &crate::threads::TimelineRequest,
+    stood: StoodIn,
+) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
+    use crate::timeline_forward as forward;
+    let StoodIn { held, why } = stood;
+    let thread = request.thread_id.as_deref();
+    let next_before =
+        crate::timeline_served::encode(&channel.id, request.view, thread, &held.messages)?;
+    let oldest_seen = held
+        .messages
+        .iter()
+        .filter_map(|message| message.observed_ms)
+        .min();
+    let mut page = crate::threads::TimelinePage {
+        messages: held.messages,
+        has_threads: held.has_threads,
+        observed_ms: held.checked_ms.or(oldest_seen),
+        settled_below_ms: None,
+        has_more: true,
+        next_before: Some(next_before),
+        as_of: held
+            .checked_ms
+            .or(oldest_seen)
+            .map(crate::clock::iso_from_ms),
+        refresh_failed: Some(why.to_owned()),
+        ..crate::threads::TimelinePage::default()
+    };
+    page.next_after = Some(forward::encode(
+        &channel.id,
+        request.view,
+        thread,
+        &forward::Forward::Generic(forward::position_of(&page, request.view)),
+    )?);
+    let noise = crate::noise::filter_for(state, &channel.id).await;
+    stamp(state, &mut page.messages);
+    noise.mark(&mut page.messages);
     Ok((channel, page))
 }
 

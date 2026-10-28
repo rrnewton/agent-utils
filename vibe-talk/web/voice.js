@@ -24205,26 +24205,36 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   if (channelCanon.scope !== scopeWas) Promise.resolve().then(renderColumns);
   const before = view === "threads" ? new Map() : heldCopies(payload.messages || []);
   const fold = pageFold(channelCanon, payload, held);
+  // `#611 timeline-read-failures`. A page the server answered from its own copy, the chat service
+  // having failed or kept it waiting, adds and updates rows and answers for nothing it lacks: the
+  // copy may have gaps and may lag. Nor does it move a view already covered, its forward cursor or
+  // its last full read, so the next read reads as if this one had failed.
+  const failed = refreshFailed(payload);
+  const covered = channelCanon.views.has(viewKey(view, thread));
   const taken = view === "threads" ? [] : (payload.messages || []).filter(fold.takes);
   if (view === "threads") {
     mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => true);
   } else {
     const inPage = view === "flat" ? allPageAnswersFor(payload.messages || [], Boolean(payload.notice))
       : (message) => inView(message, view, thread);
-    mergeIntoCanon("messages", taken, older, hasMore, (message) => fold.answers(message) && inPage(message),
-      payload.messages || []);
+    mergeIntoCanon("messages", taken, older, hasMore,
+      (message) => !failed && fold.answers(message) && inPage(message), payload.messages || []);
     // What it took stands where it was sent (`copyOrder`).
     orderCopiesRead(taken, sentNumberOf(payload));
   }
   if (payload.thread) upsertThreadSummary(payload.thread);
   if (view !== "thread") channelCanon.hasThreads = payload.has_threads === true;
-  coverView(view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore, payload.notice || "",
-    view, thread);
+  if (!failed || !covered) {
+    coverView(view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore, payload.notice || "",
+      view, thread);
+  }
   if (!older) {
     const cover = channelCanon.views.get(viewKey(view, thread));
-    cover.newest = payload.next_after || null;
-    cover.fullAt = Date.now();
-    cover.fullSent = sentNumberOf(payload);
+    if (!failed) {
+      cover.newest = payload.next_after || null;
+      cover.fullAt = Date.now();
+      cover.fullSent = sentNumberOf(payload);
+    }
     const asOf = staleAsOf(payload);
     if (asOf !== null) cover.at = asOf;
   }
@@ -24479,7 +24489,22 @@ function heldCopies(messages) {
  */
 function staleAsOf(payload) {
   const asOf = payload && typeof payload.as_of === "string" ? Date.parse(payload.as_of) : NaN;
+  // `#611 timeline-read-failures`. A page the server answered from its own copy, the chat service
+  // having failed or kept it waiting, is as old as that copy, however recent.
+  if (refreshFailed(payload)) return Number.isFinite(asOf) ? Math.min(asOf, Date.now()) : Date.now();
   return Number.isFinite(asOf) && Date.now() - asOf > STALE_AS_OF_MS ? asOf : null;
+}
+
+/**
+ * Whether the server says it could not read the chat service for this page and answered from its own
+ * copy instead (`refresh_failed`, `#611 timeline-read-failures`). Its rows are added and updated as any
+ * page's are, but it answers for nothing it lacks and moves no cover, cursor or full read
+ * (`foldTimelinePage`); the pill says "Refresh failed · showing messages from …", quietly, over them.
+ *
+ * @param {any} payload
+ */
+function refreshFailed(payload) {
+  return Boolean(payload) && typeof payload.refresh_failed === "string";
 }
 
 /**
@@ -29600,7 +29625,7 @@ function isCursorRefusal(error) {
 function noteFreshRead(payload) {
   const asOf = staleAsOf(payload);
   channelFreshAt = asOf === null ? Date.now() : asOf;
-  setChannelFreshness(asOf === null ? "fresh" : "slow");
+  setChannelFreshness(refreshFailed(payload) ? "failed" : asOf === null ? "fresh" : "slow");
   // `#206 pin-message`. Every landed read, delta included, says what revision the pins are at.
   notePinsRevision(payload.pins_revision);
   // `#240 reading-bookmark`. ...and where the bookmark is, which another device may have moved.
@@ -29805,7 +29830,8 @@ async function loadTimeline(options) {
       landed.push(payload);
       // `#308 live-reply-in-main`. All's newest page has said where every message it carries is, and
       // that one it does not carry is not there to be placed.
-      if (view === "flat" && sameStore()) answerUnplaced(canon, seenArrivals);
+      // Not a page the server answered from its own copy (`#611`), which may lag what arrived.
+      if (view === "flat" && sameStore() && !refreshFailed(payload)) answerUnplaced(canon, seenArrivals);
       // Under rows drawn from the store, a reader off the newest line keeps their message: the view
       // is walked back to it before anything is drawn, so the list changes once, under them. The
       // message they are on NOW, which the wait for this page gave them time to change. `#277`.
@@ -29831,7 +29857,9 @@ async function loadTimeline(options) {
       const at = behindHeld ? { ...landedAt, heldPlaceAt: placeAt } : landedAt;
       // ...unless what is on screen came from the device or a read that failed: those rows are what
       // the reader has, and the refresh MERGES into them rather than replacing them with one page.
-      if (!keepPosition && channelFreshness === "fresh") {
+      // Not for a page the server answered from its own copy (`#611 timeline-read-failures`): what is
+      // on screen stands, as it does when a read fails.
+      if (!keepPosition && channelFreshness === "fresh" && !refreshFailed(payload)) {
         // An explicit refresh starts a fresh provider snapshot. Retaining old pages here would
         // retain their expiring cursor forever, even though the newest request made a new one.
         timelineMessages = [];

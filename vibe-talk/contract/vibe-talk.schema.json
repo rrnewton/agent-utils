@@ -2563,6 +2563,13 @@
             "null"
           ]
         },
+        "refresh_failed": {
+          "description": "Present when the provider could not be read for this page just now — it failed, or it did\nnot answer in time — and the page is what this server's own copy holds instead: a short\nsentence saying which, for the reader. `as_of` then says how old the copy is, and the page\ncarries no `settled_below_ms`: absence from it proves nothing. `#611\ntimeline-read-failures`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "reply_dismissals": {
           "anyOf": [
             {

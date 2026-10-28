@@ -16,7 +16,8 @@ use crate::access::{self, Credential};
 use crate::read_reason::ReadReason;
 use crate::state::AppState;
 
-/// Log one line per request, after the status is known.
+/// Log one line per request, after the status is known, and for a 5xx a second, at WARN, saying
+/// why ([`access::server_error`]).
 ///
 /// A request that says why it was made (`reason=`, `remote-ops-audit`) has the reason in its line
 /// as `read_reason`, and its handler runs inside it, so every provider read the request makes is
@@ -37,10 +38,13 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
     );
     let started = Instant::now();
     let private_response = path == "/mcp" || path.starts_with("/api/");
-    let mut response = match read_reason {
-        Some(reason) => reason.scope(next.run(request)).await,
-        None => next.run(request).await,
-    };
+    let (mut response, failed) = crate::upstream_profile::noting_failures(async {
+        match read_reason {
+            Some(reason) => reason.scope(next.run(request)).await,
+            None => next.run(request).await,
+        }
+    })
+    .await;
     // One policy at the edge covers successful bodies, authentication failures, and future API
     // routes alike. This matters especially for an installed app: adding an installable manifest
     // must never grow into browser-managed offline storage of chat text or bearer credentials.
@@ -57,5 +61,19 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
         response.status().as_u16(),
         started.elapsed().as_millis(),
     );
+    // `#611 timeline-read-failures`. Once per request, beside its access line: why it failed.
+    if response.status().is_server_error() {
+        access::server_error(
+            &method,
+            &path,
+            read_reason,
+            response.status().as_u16(),
+            started.elapsed().as_millis(),
+            response
+                .extensions()
+                .get::<crate::http::api::ServerErrorCause>(),
+            failed.as_ref(),
+        );
+    }
     response
 }

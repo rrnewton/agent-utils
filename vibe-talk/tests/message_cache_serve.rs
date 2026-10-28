@@ -805,9 +805,12 @@ async fn a_walk_that_spends_its_pages_resumes_and_never_hands_back_a_newer_messa
 }
 
 #[tokio::test]
-async fn a_reload_while_the_last_serves_refresh_runs_goes_upstream() {
-    // Every served page has a refresh of its own to compare and correct it. While one is still
-    // reading the provider, a reload of the same page is not served: it would have none.
+async fn a_reload_while_the_last_serves_refresh_runs_is_served_and_shares_that_refresh() {
+    // Every served page is refreshed, to compare and correct it. While one refresh is still
+    // reading the provider, a reload of the same page is served too, and starts no second read:
+    // the running refresh corrects the page by live event, which reaches every reader of the
+    // channel. `#611 timeline-read-failures`: it used to go upstream beside the refresh, and a
+    // provider slow enough to hold the refresh failed it.
     let d = deployment("cache-serve-overlap").await;
     d.fill_timeline().await;
     d.clock.advance(2 * HOUR);
@@ -822,6 +825,7 @@ async fn a_reload_while_the_last_serves_refresh_runs_goes_upstream() {
     held.entered
         .await
         .expect("the refresh reached the provider");
+    let reads = d.chat.timeline_reads();
 
     d.clock.advance(SECOND);
     let again = ok(
@@ -830,21 +834,17 @@ async fn a_reload_while_the_last_serves_refresh_runs_goes_upstream() {
         WRITE_TOKEN,
     )
     .await;
-    assert!(
-        again["next_before"]
-            .as_str()
-            .is_some_and(|next| !next.starts_with(vibe_talk::timeline_served::PREFIX)),
-        "the provider's own page: {again}"
-    );
+    served_cursor(&again);
+    assert_eq!(d.chat.timeline_reads(), reads, "no second read upstream");
     held.release.send(()).expect("the refresh is waiting");
     d.refreshed(5).await;
     let timeline = counts(&d.state, "timeline_fallback");
-    assert_eq!(timeline.served, 1, "{timeline:?}");
+    assert_eq!(timeline.served, 2, "{timeline:?}");
 
-    // With that refresh done, the next reload is served again.
+    // With that refresh done, the next reload is served again, with a refresh of its own.
     d.clock.advance(SECOND);
     served_cursor(&d.served_reload(5).await);
-    assert_eq!(counts(&d.state, "timeline_fallback").served, 2);
+    assert_eq!(counts(&d.state, "timeline_fallback").served, 3);
 }
 
 #[tokio::test]
@@ -1410,4 +1410,211 @@ async fn a_slack_search_finds_replies_in_their_threads_and_withholds_a_thread_in
     assert_eq!(body["scopes"][0]["withheld"], 1, "{body}");
     assert_eq!(body["scopes"][0]["state"], "searched");
     cache.unblock(&chan, Some(&thread));
+}
+
+// --- `#611 timeline-read-failures`: the cache stands in for a provider that fails or is slow ----
+
+/// A rate limit that did not clear in its budget, as the Slack client reports one.
+fn rate_limited() -> ChatError {
+    ChatError::RateLimited(vibe_talk::chat::RateLimitExhausted {
+        provider: "slack",
+        route: "conversations.history".to_owned(),
+        attempts: 5,
+        waited: Duration::from_secs(5),
+        budget: Duration::from_secs(30),
+        retry_after: Duration::from_secs(1),
+        global: false,
+    })
+}
+
+/// The forward cursor a newest read of the read channel's Main hands back.
+async fn forward_cursor(d: &Deployment) -> String {
+    let body = ok(
+        &d.state,
+        &path(READ_CHANNEL, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&d.state).await;
+    body["next_after"]
+        .as_str()
+        .expect("a newest page hands back a forward cursor")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_read_the_provider_fails_is_answered_from_the_cache_and_says_it_could_not_refresh() {
+    let d = deployment("stand-in-failed").await;
+    let after = forward_cursor(&d).await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    d.chat.fail_timelines(Some(rate_limited()));
+    let reads = d.chat.timeline_reads();
+
+    // A poll's catch-up read, which the cache never serves: it used to be a 502.
+    let capture = vibe_talk::testing::LogCapture::start();
+    let body = ok(
+        &d.state,
+        &path(
+            READ_CHANNEL,
+            &format!("/timeline?view=main&limit=50&after={after}&reason=poll"),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(d.chat.timeline_reads(), reads + 1, "one read went upstream");
+    assert_eq!(
+        texts(&body).len(),
+        12,
+        "every message the cache holds of Main: {body}"
+    );
+    assert!(
+        body.get("delta").is_none(),
+        "a newest page, not a delta: {body}"
+    );
+    assert!(
+        body["refresh_failed"]
+            .as_str()
+            .is_some_and(|why| why.contains("limiting")),
+        "the page is told the provider could not be read, and why: {body}"
+    );
+    assert!(body["as_of"].is_string(), "and how old the copy is: {body}");
+    assert!(
+        body.get("settled_below_ms").is_none(),
+        "a stand-in proves nothing by what it lacks: {body}"
+    );
+    assert!(
+        body["next_after"].is_string() && body["next_before"].is_string(),
+        "it can be continued either way: {body}"
+    );
+    let text = capture.text();
+    assert!(
+        text.contains("timeline_stand_in") && text.contains("upstream=\"failed\""),
+        "the stand-in is logged: {text}"
+    );
+    assert!(
+        !text.contains("server error"),
+        "no 5xx was answered: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_the_cache_cannot_answer_fails_and_the_log_says_why() {
+    let d = deployment("stand-in-off").await;
+    let after = forward_cursor(&d).await;
+    // Serving off: the cache answers nothing, so the failure is the answer, said at WARN.
+    d.chat.fail_timelines(Some(rate_limited()));
+    let capture = vibe_talk::testing::LogCapture::start();
+    let (status, body) = call(
+        &d.state,
+        &path(
+            READ_CHANNEL,
+            &format!("/timeline?view=main&limit=50&after={after}&reason=side"),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "chat_error", "{body}");
+    let text = capture.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("server error"))
+        .unwrap_or_else(|| panic!("one server-error line: {text}"));
+    assert_eq!(
+        text.matches("server error").count(),
+        1,
+        "once per request: {text}"
+    );
+    for wanted in [
+        "WARN",
+        "status=502",
+        "read_reason=\"side\"",
+        "error=\"chat_error\"",
+        "conversations.history",
+        "upstream_operation=\"fetch_timeline\"",
+        "upstream_outcome=\"rate_limited\"",
+    ] {
+        assert!(line.contains(wanted), "{wanted} in: {line}");
+    }
+}
+
+#[tokio::test]
+async fn an_access_answer_is_never_hidden_behind_the_cache() {
+    let d = deployment("stand-in-forbidden").await;
+    let after = forward_cursor(&d).await;
+    d.state.message_cache.set_serve(true);
+    d.chat.fail_timelines(Some(ChatError::Status {
+        status: 403,
+        body: "conversations.history answered not_in_channel".to_owned(),
+    }));
+    let (status, body) = call(
+        &d.state,
+        &path(
+            READ_CHANNEL,
+            &format!("/timeline?view=main&limit=50&after={after}"),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(body.get("refresh_failed").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn a_slow_provider_is_answered_from_the_cache_one_read_at_a_time_and_its_read_runs_on() {
+    let d = deployment("stand-in-slow").await;
+    let after = forward_cursor(&d).await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let reads = d.chat.timeline_reads();
+
+    // Two catch-up reads of one view at once, a poll and another tab's, behind a provider that
+    // does not answer: one goes upstream, the other waits for it, and both are answered from the
+    // cache when the wait runs out.
+    let held = d.chat.hold_next_timeline();
+    let read = |reason: &'static str| {
+        let state = d.state.clone();
+        let after = after.clone();
+        tokio::spawn(async move {
+            ok(
+                &state,
+                &path(
+                    READ_CHANNEL,
+                    &format!("/timeline?view=main&limit=50&after={after}&reason={reason}"),
+                ),
+                WRITE_TOKEN,
+            )
+            .await
+        })
+    };
+    let began = std::time::Instant::now();
+    let (first, second) = (read("poll"), read("live"));
+    let wait = vibe_talk::ops::stand_in_after(&d.state.config);
+    for request in [first, second] {
+        let body = tokio::time::timeout(wait + Duration::from_secs(5), request)
+            .await
+            .expect("answered once the stand-in wait ran out, not when the provider did")
+            .expect("the request ran");
+        assert!(
+            body["refresh_failed"].is_string(),
+            "answered from the cache: {body}"
+        );
+        assert_eq!(texts(&body).len(), 12, "{body}");
+    }
+    assert!(
+        began.elapsed() >= wait,
+        "the provider was given its time first"
+    );
+    assert_eq!(
+        d.chat.timeline_reads(),
+        reads + 1,
+        "one read upstream, not one per reader"
+    );
+
+    // The read upstream was not abandoned: released, it lands.
+    held.entered.await.expect("the read reached the provider");
+    held.release.send(()).expect("the read is still waiting");
+    settled(&d.state).await;
+    assert_eq!(d.chat.timeline_reads(), reads + 1);
 }

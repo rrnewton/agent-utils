@@ -86784,3 +86784,47 @@ test("`#521 server-side-search`: the corpus catches a page that lost one fold en
     "    while (tokens[at] === \"OR\") {\n      at += 1;\n      const node = and(false);");
   assert.ok(searchCorpusDisagreements(newPage(new Map(), looseOr)).some((line) => line.startsWith("parse \"a OR b c\"")));
 });
+
+// --- `#611 timeline-read-failures` -----------------------------------------------------------------
+
+test("`#611 timeline-read-failures`: a channel read the server fails ends its loading line and says so", async () => {
+  // The owner, 2026-10-27: "My vibe talk app is stuck. It is stuck loading messages." A view no read
+  // has covered shows the loading line while its read is out; when the server fails that read, the
+  // line goes and the failure is on screen, rather than "Loading threads…" standing.
+  const page = await threadPage("main");
+  page.timeline = errorResponse(502, "chat_error", "the chat service is limiting how fast it can be read");
+  const pending = page.el("channel-view-threads").click();
+  await page.settle();
+  await pending;
+  await page.settle();
+  assert.equal(page.el("channel-loading").hidden, true, "the loading line outlived the failed read");
+  const said = `${freshness(page).hidden ? "" : freshness(page).textContent} ${page.el("error").textContent}`;
+  assert.match(said, /Refresh failed|could not|failed/i, `nothing on screen said the read failed: ${said}`);
+});
+
+test("`#611 timeline-read-failures`: a page the server answered from its own copy lands, and the pill says it could not refresh", async () => {
+  const page = await threadPage("main");
+  const standard = page.timeline;
+  const asOf = new Date(Date.now() - 5 * 60_000).toISOString();
+  page.timeline = async (path, options) => {
+    const response = await standard(path, options);
+    const { delta: _delta, ...newest } = JSON.parse(await response.text());
+    // The server's copy lags: it lacks the oldest message on screen.
+    const messages = (newest.messages || []).slice(1);
+    return json(200, { ...newest, messages, as_of: asOf,
+      refresh_failed: "The chat service is limiting how fast it can be read." });
+  };
+  const before = shownIds(page);
+  assert.ok(before.length > 1, "the premise is a list of rows");
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), before, "a row the server's copy lacks was taken off the screen");
+  assert.equal(page.el("channel-loading").hidden, true);
+  assert.equal(freshness(page).hidden, false);
+  assert.equal(freshness(page).getAttribute("data-state"), "failed");
+  assert.match(freshness(page).textContent, /^Refresh failed · showing messages from \d{2}:\d{2}$/);
+
+  // The next read the service answers says the rows are current again.
+  page.timeline = standard;
+  await reReadChannel(page);
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh");
+});

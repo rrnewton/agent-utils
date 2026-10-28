@@ -461,6 +461,16 @@ impl RefreshKey {
             read: format!("timeline:{view:?}:{}:{limit}", thread.unwrap_or_default()),
         }
     }
+
+    /// Every catch-up read (`after=`) of one channel's `view` (and `thread`), whatever cursor it
+    /// continues from: one at a time upstream. `#611 timeline-read-failures`.
+    #[must_use]
+    pub fn timeline_forward(channel: ChannelId, view: TimelineView, thread: Option<&str>) -> Self {
+        Self {
+            channel,
+            read: format!("timeline-forward:{view:?}:{}", thread.unwrap_or_default()),
+        }
+    }
 }
 
 /// A running background refresh's claim ([`Sink::claim_refresh`]): dropped, the read may be
@@ -950,6 +960,24 @@ pub enum ServeOutcome {
     /// Go upstream as without serving, with this ask's shadow (when there is one) to hand the
     /// answer to, exactly as [`Sink::shadow`] returned it.
     NotServed(Option<Shadowed>),
+}
+
+/// The most replies of one thread a stale answer of Slack's All carries: the newest, as Slack's
+/// own All read brings a bounded number. `#611 timeline-read-failures`.
+const STALE_FLAT_REPLIES: usize = 20;
+
+/// What the cache holds of a newest timeline page, handed back because upstream could not answer
+/// it in time ([`Sink::stale_timeline`]). `#611 timeline-read-failures`.
+#[derive(Clone, Debug)]
+pub struct StaleTimeline {
+    /// The messages, oldest first, each carrying the observation that set it (`observed_ms`),
+    /// unstamped and unmarked as the cache holds them.
+    pub messages: Vec<Message>,
+    /// Whether the file holds any thread of the channel.
+    pub has_threads: bool,
+    /// When the latest read of the scope's newest end the file records began, local time: what
+    /// the answer is as of. `None` when no read of the newest end has landed.
+    pub checked_ms: Option<i64>,
 }
 
 /// An answer to hand back from the cache. `#384 cache-serve`.
@@ -2016,6 +2044,109 @@ impl Sink {
             outcome,
             view,
             frontier,
+        })
+    }
+
+    /// What the cache holds of the newest page `ask` names, for a read whose upstream read failed or
+    /// is too slow to wait for: `None` when it holds nothing it may hand back. `#611
+    /// timeline-read-failures`.
+    ///
+    /// NOT A SERVE. [`Sink::try_serve`] answers only when its rule proves the answer is what
+    /// upstream would say now; this answers with whatever the cache holds of the scope, however
+    /// old, and the caller says so on the page it builds (`refresh_failed`, `as_of`, and no
+    /// `settled_below_ms`, so nothing a page holds is taken for deleted by being absent from it).
+    /// Every gate that is not about freshness still holds: serving is on, the channel is routed,
+    /// its provider's account has been checked against the file in this process (again after the
+    /// read), the scope is not blocked (access in doubt or lost, an erase pending), and a text a
+    /// push brought that no read has proven whole is left out.
+    ///
+    /// Main and one thread on every shape but a channel narrowed to one thread, whose pages carry
+    /// a thread record the cache does not keep; a bridge's All, which the cache keeps as a scope;
+    /// and Slack's All, put together as Slack's own read puts it together: Main, and the newest
+    /// replies the cache holds of each thread rooted on it. Never the thread list, which the cache
+    /// does not keep.
+    pub async fn stale_timeline(&self, channel: &ChannelId, ask: &Ask) -> Option<StaleTimeline> {
+        if !self.serve_enabled() {
+            return None;
+        }
+        let Ask::Timeline { view, .. } = ask else {
+            return None;
+        };
+        let route_of = |sink: &Self| {
+            let routes = sink.state.routes();
+            routes
+                .fills
+                .get(channel)
+                .filter(|route| sink.verification(&route.key) == Verification::Verified)
+                .map(|route| (route.key.clone(), route.shape, route.recent_via_flat))
+        };
+        let (key, shape, recent_via_flat) = route_of(self)?;
+        if shape == Shape::SlackThread || *view == TimelineView::Threads {
+            return None;
+        }
+        let slack_flat = shape == Shape::Slack && *view == TimelineView::Flat;
+        let query = if slack_flat {
+            let Ask::Timeline { limit, .. } = ask else {
+                return None;
+            };
+            shadow::Query::Newest {
+                scope: Scope::Main,
+                limit: *limit,
+            }
+        } else {
+            shadow::query(ask, shape, recent_via_flat)?
+        };
+        let cache = self.cache()?;
+        let chan = ChanKey::new(key.clone(), channel.as_str());
+        let view = tokio::task::spawn_blocking(move || {
+            let Read::Served(mut view) = cache.shadow_view(&chan, &query) else {
+                return None;
+            };
+            if slack_flat {
+                let roots: Vec<String> = view
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.message.thread.as_ref())
+                    .filter(|thread| thread.is_root)
+                    .map(|thread| thread.id.clone())
+                    .collect();
+                for thread in roots {
+                    match cache.newest(&chan, &Scope::Thread(thread), STALE_FLAT_REPLIES) {
+                        Read::Served(replies) => view.rows.extend(replies),
+                        // A thread in doubt is in doubt for All too.
+                        Read::Blocked => return None,
+                        _ => {}
+                    }
+                }
+                view.rows
+                    .sort_by_key(|row| (row.created_ms, row.message.id.clone()));
+                view.rows.dedup_by(|a, b| a.message.id == b.message.id);
+            }
+            view.rows.retain(|row| !row.content_partial);
+            Some(view)
+        })
+        .await
+        .ok()
+        .flatten()?;
+        // Checked again after the read, as a serve is: an account or a route that changed under it
+        // must not let rows read as one account out as another's.
+        if view.rows.is_empty() || route_of(self).is_none_or(|(again, ..)| again != key) {
+            return None;
+        }
+        Some(StaleTimeline {
+            checked_ms: view
+                .head_checked_ms
+                .or(view.head.map(|head| head.head_listed_ms)),
+            has_threads: view.has_threads,
+            messages: view
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let mut message = row.message;
+                    message.observed_ms = Some(row.observed_ms);
+                    message
+                })
+                .collect(),
         })
     }
 

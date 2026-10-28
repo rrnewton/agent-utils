@@ -546,6 +546,7 @@ pub async fn generic_since<C: ChatClient + ?Sized>(
             // The newest page this delta was cut from: as new as it. A delta proves no absence.
             observed_ms: newest.observed_ms,
             settled_below_ms: None,
+            refresh_failed: newest.refresh_failed,
             // What the newest page took from the cache, still not read. `#603 server-side-search`.
             held: newest.held,
         },

@@ -2149,6 +2149,14 @@ declare namespace VibeTalk {
      */
     pins_revision?: number | null;
     /**
+     * Present when the provider could not be read for this page just now — it failed, or it did
+     * not answer in time — and the page is what this server's own copy holds instead: a short
+     * sentence saying which, for the reader. `as_of` then says how old the copy is, and the page
+     * carries no `settled_below_ms`: absence from it proves nothing. `#611
+     * timeline-read-failures`.
+     */
+    refresh_failed?: string | null;
+    /**
      * `#222 unread-replies`. On the newest page of Main, or a delta of it, in a channel with
      * threads: every message marked Done from a position on, the replies in Main's threads
      * included. Absent everywhere else.

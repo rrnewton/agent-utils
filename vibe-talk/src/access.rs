@@ -172,6 +172,45 @@ pub fn request(
     );
 }
 
+/// One WARN line for a request that answered a 5xx, saying why: the error code and detail it
+/// answered with, and the upstream operation that last failed while it was served, with how that
+/// ended, how long it ran and how many requests it sent. `-` where there is nothing to say: a 5xx
+/// no handler built (a panic, a timeout layer) has no code, and one that no upstream failure caused
+/// names no operation. `#611 timeline-read-failures`: the access line alone said only "502".
+///
+/// The detail is the one the caller was sent, redacted where it was made; it is cut to 300
+/// characters here, because an intermediary's error page can be long.
+pub fn server_error(
+    method: &str,
+    path: &str,
+    read_reason: Option<crate::read_reason::ReadReason>,
+    status: u16,
+    millis: u128,
+    cause: Option<&crate::http::api::ServerErrorCause>,
+    failed: Option<&crate::upstream_profile::FailedOperation>,
+) {
+    let detail: String = cause
+        .map_or("-", |cause| cause.detail.as_str())
+        .chars()
+        .take(300)
+        .collect();
+    tracing::warn!(
+        target: "vibe_talk::access",
+        method,
+        path,
+        read_reason = read_reason.map_or("-", crate::read_reason::ReadReason::as_str),
+        status,
+        millis,
+        error = cause.map_or("-", |cause| cause.code),
+        detail = %detail,
+        upstream_operation = failed.map_or("-", |failed| failed.operation),
+        upstream_outcome = failed.map_or("-", |failed| failed.outcome.as_str()),
+        upstream_millis = failed.map_or(0, |failed| failed.elapsed.as_millis()),
+        upstream_calls = failed.map_or(0, |failed| failed.calls),
+        "server error"
+    );
+}
+
 /// One line for one JSON-RPC message arriving at `/mcp`.
 ///
 /// Logged separately from [`request`] because the HTTP line cannot see inside the body: every MCP

@@ -583,6 +583,8 @@ pub struct TimelineChat {
     delta: Mutex<crate::threads::TimelineDelta>,
     hold: Mutex<Option<HoldGate>>,
     hold_recent: Mutex<Option<HoldGate>>,
+    fail: Mutex<Option<crate::chat::ChatError>>,
+    timeline_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// The provider's side of a [`HeldRead`].
@@ -611,7 +613,22 @@ impl TimelineChat {
             delta: Mutex::new(crate::threads::TimelineDelta::default()),
             hold: Mutex::new(None),
             hold_recent: Mutex::new(None),
+            fail: Mutex::new(None),
+            timeline_reads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Fail every `/timeline` read with `error` from now on, or stop failing them. `#611
+    /// timeline-read-failures`.
+    pub fn fail_timelines(&self, error: Option<crate::chat::ChatError>) {
+        *lock(&self.fail) = error;
+    }
+
+    /// How many `/timeline` reads have reached this provider, failed ones included.
+    #[must_use]
+    pub fn timeline_reads(&self) -> usize {
+        self.timeline_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Hold the next `/timeline` read once it has taken its answer, until the returned
@@ -719,6 +736,11 @@ impl crate::chat::ChatClient for TimelineChat {
     ) -> Result<crate::threads::TimelinePage, crate::chat::ChatError> {
         use crate::threads::{TimelinePage, TimelineView};
         request.one_direction()?;
+        self.timeline_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(error) = lock(&self.fail).clone() {
+            return Err(error);
+        }
         if request.view == TimelineView::Threads {
             return Ok(TimelinePage::default());
         }
@@ -744,6 +766,7 @@ impl crate::chat::ChatClient for TimelineChat {
                     .await?,
             );
             let newest = messages.last().map_or(after, |m| m.id.clone());
+            Self::held(&self.hold).await;
             return Ok(TimelinePage {
                 messages,
                 next_after: Some(newest.as_str().to_owned()),
