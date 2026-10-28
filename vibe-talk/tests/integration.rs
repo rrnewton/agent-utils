@@ -129,6 +129,9 @@ mod own_read;
 #[path = "page_build.rs"]
 mod page_build;
 
+#[path = "page_prebuilt.rs"]
+mod page_prebuilt;
+
 #[path = "pairing.rs"]
 mod pairing;
 

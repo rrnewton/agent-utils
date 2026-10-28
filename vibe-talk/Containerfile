@@ -43,7 +43,7 @@ COPY web ./web
 COPY prompts ./prompts
 # The highlighter's grammars, compiled into one syntax set by build.rs. Not needed above: without
 # build.rs the placeholder build has no build script, so its build dependencies wait for this one.
-COPY build.rs ./
+COPY build.rs build_page.rs ./
 COPY syntaxes ./syntaxes
 # The page, built above, and the lockfile build.rs checks it against.
 COPY contract/package-lock.json ./contract/

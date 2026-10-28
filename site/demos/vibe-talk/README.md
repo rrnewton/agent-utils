@@ -34,7 +34,8 @@ as it would in a deployment.
 Run these from the repository root.
 
 ```sh
-# 1. Build vibe-talk. web/ is compiled into the binary, so rebuild after any page change.
+# 1. Build vibe-talk. The page is built and compiled into the binary, so rebuild after any page
+#    change. The page build needs its pinned tools once: npm ci --prefix vibe-talk/contract
 cargo build --release --manifest-path vibe-talk/Cargo.toml
 
 # 2. One-time tool setup, if not already present. ffmpeg must also be on PATH (or pass --ffmpeg).

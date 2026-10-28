@@ -451,9 +451,8 @@ choose another port with --port."
     done
 
     command -v cargo >/dev/null 2>&1 || die "--screenshots needs cargo, and it is not on PATH.
-The app is compiled INTO the server binary (web/voice.html and web/voice.js are
-include_str! constants), so a stale binary serves last build's markup. Install Rust, or build
-the binary yourself and re-run."
+The app is compiled INTO the server binary (build.rs builds web/ and embeds the result), so a
+stale binary serves last build's markup. Install Rust, or build the binary yourself and re-run."
 
     SHOTS_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
     if [ -z "$SHOTS_OUT" ]; then
@@ -576,6 +575,9 @@ EOF
     fi
 
     step "Rebuilding the server, because web/ is compiled into it"
+    [ -f "$VIBE_TALK_DIR/contract/node_modules/esbuild/package.json" ] || die "--screenshots rebuilds the
+server, and its build needs the page build's pinned tools, which are not installed. Run
+npm ci --prefix $VIBE_TALK_DIR/contract and re-run."
     cargo build --release --manifest-path "$VIBE_TALK_DIR/Cargo.toml" \
         || die "the build failed, so there is no binary serving today's web/ to photograph."
     SHOTS_BIN="$VIBE_TALK_DIR/target/release/vibe-talk"

@@ -147,3 +147,45 @@ fn build_stage_copies_every_compile_time_input() {
         missing.join(", ")
     );
 }
+
+/// What `build.rs` reads besides the Rust sources: the modules it declares beside itself, and the
+/// page build's inputs (`#624 voice-page-modularity`), which a prebuilt page is checked against.
+fn build_script_inputs(root: &Path) -> BTreeSet<PathBuf> {
+    let script = fs::read_to_string(root.join("build.rs")).expect("build.rs should be readable");
+    let mut inputs: BTreeSet<PathBuf> = ["build.rs", "web", "contract/package-lock.json"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    for line in script.lines().map(str::trim) {
+        if let Some(name) = line
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.strip_suffix(';'))
+        {
+            inputs.insert(PathBuf::from(format!("{name}.rs")));
+        }
+    }
+    inputs
+}
+
+#[test]
+fn build_stage_copies_what_the_build_script_reads() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let inputs = build_script_inputs(root);
+    assert!(
+        inputs.contains(Path::new("build_page.rs")),
+        "build.rs no longer declares build_page, so this inventory reads it wrongly: {inputs:?}"
+    );
+    let containerfile = fs::read_to_string(root.join("Containerfile"))
+        .expect("the image recipe should be readable");
+    let copied = build_stage_copy_sources(&containerfile);
+    let missing = inputs
+        .iter()
+        .filter(|input| !copied.iter().any(|source| input.starts_with(source)))
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "Containerfile's build stage does not copy what build.rs reads: {}",
+        missing.join(", ")
+    );
+}

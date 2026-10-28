@@ -117,31 +117,43 @@ fn load(path: &Path) -> SyntaxDefinition {
 // sources make; or, for a packaging stage with no Node, `VIBE_TALK_WEB_DIST` names a directory that
 // stage built, which is checked against these sources and copied in. Nothing here downloads
 // anything: the build's one tool, esbuild, is installed beforehand from `contract/package-lock.json`.
+// What is refused, and why, is in `build_page.rs`, which `tests/page_prebuilt.rs` tests.
 //
 // Then the asset table: `OUT_DIR/page_assets.rs`, which `src/http/assets.rs` includes. A Rust
 // macro cannot find a file whose name it only learns at run time, so the table is generated with
 // each hashed file's literal `include_bytes!` path.
 
+mod build_page;
+
 /// Where `build.mjs` writes the page, below `OUT_DIR`.
 const PAGE_DIR: &str = "web";
 
-/// The command that installs the page build's tools, for every message that needs it.
-const INSTALL: &str = "npm ci --prefix vibe-talk/contract \
-    (validation's setup step runs scripts/provision-node-packages vibe-talk/contract)";
+/// Stop the build with `message`, set apart from cargo's own output.
+fn refuse(message: &str) -> ! {
+    panic!("\n\n{message}\n")
+}
 
 fn page(manifest: &Path, out: &Path) {
     let web = manifest.join("web");
-    let lockfile = manifest.join("contract").join("package-lock.json");
-    // A directory is scanned whole, so a file added to web/ or taken away reruns this as well.
+    let contract = manifest.join("contract");
+    // A directory is scanned whole, so a file added to web/ or taken away reruns this as well. The
+    // installed esbuild's own package.json too, so an `npm ci` after a refusal is noticed.
     println!("cargo::rerun-if-changed={}", web.display());
-    println!("cargo::rerun-if-changed={}", lockfile.display());
+    println!("cargo::rerun-if-changed=build_page.rs");
+    println!(
+        "cargo::rerun-if-changed={}",
+        contract.join("package-lock.json").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        contract.join("node_modules/esbuild/package.json").display()
+    );
     println!("cargo::rerun-if-env-changed=VIBE_TALK_WEB_DIST");
     let built = out.join(PAGE_DIR);
-    match std::env::var_os("VIBE_TALK_WEB_DIST") {
+    let assets = match std::env::var_os("VIBE_TALK_WEB_DIST") {
         Some(dist) if !dist.is_empty() => take_prebuilt(manifest, Path::new(&dist), &built),
         _ => run_page_build(manifest, &built),
-    }
-    let assets = read_assets(&built);
+    };
     let script = format!("assets/voice.{}.js", assets.page_build);
     assert!(
         assets.files.iter().any(|(path, _)| *path == script),
@@ -151,24 +163,9 @@ fn page(manifest: &Path, out: &Path) {
         .expect("write the asset table");
 }
 
-/// `node web/build.mjs --out built`, failing with what to do when its prerequisites are missing.
-fn run_page_build(manifest: &Path, built: &Path) {
-    let esbuild = manifest
-        .join("contract")
-        .join("node_modules")
-        .join("esbuild")
-        .join("package.json");
-    if !esbuild.is_file() {
-        panic!(
-            "\n\nThe page build needs the pinned esbuild in {}, which is not installed.\n\
-             From the repository root, run:\n\n    {INSTALL}\n\n\
-             (or set VIBE_TALK_WEB_DIST to a page build made from these sources).\n",
-            esbuild
-                .parent()
-                .and_then(Path::parent)
-                .map_or_else(String::new, |p| p.display().to_string())
-        );
-    }
+/// `node web/build.mjs --out built`, once the pinned tools are known to be installed.
+fn run_page_build(manifest: &Path, built: &Path) -> build_page::Assets {
+    build_page::check_installed_tools(manifest).unwrap_or_else(|message| refuse(&message));
     let output = std::process::Command::new("node")
         .current_dir(manifest)
         .arg("web/build.mjs")
@@ -176,157 +173,43 @@ fn run_page_build(manifest: &Path, built: &Path) {
         .arg(built)
         .output()
         .unwrap_or_else(|error| {
-            panic!("\n\nThe page build runs `node web/build.mjs`, and node could not be run: {error}\n")
+            refuse(&format!(
+                "The page build runs `node web/build.mjs`, and node could not be run: {error}"
+            ))
         });
     if !output.status.success() {
-        panic!(
-            "\n\nThe page build failed (`node web/build.mjs`):\n{}{}\n",
+        refuse(&format!(
+            "The page build failed (`node web/build.mjs`):\n{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
+        ));
     }
+    build_page::read_assets(built).unwrap_or_else(|message| refuse(&message))
 }
 
-/// What `build.rs` needs from `assets.json`.
-struct Assets {
-    /// The script's hash: what a read reports as `page_build` once the shell names it.
-    page_build: String,
-    /// Every file the build wrote, by path relative to the build directory, and its digest.
-    files: Vec<(String, String)>,
-    /// Every input the build read, by repository-relative path, and its digest.
-    inputs: Vec<(String, String)>,
-}
-
-fn read_assets(built: &Path) -> Assets {
-    let path = built.join("assets.json");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
-    let pairs = |key: &str| -> Vec<(String, String)> {
-        json[key]
-            .as_object()
-            .unwrap_or_else(|| panic!("{} has no {key}", path.display()))
-            .iter()
-            .map(|(name, digest)| {
-                let digest = digest
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{key}.{name} is not a digest"));
-                (name.clone(), digest.to_owned())
-            })
-            .collect()
-    };
-    let page_build = json["page_build"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{} has no page_build", path.display()))
-        .to_owned();
-    Assets {
-        page_build,
-        files: pairs("files"),
-        inputs: pairs("inputs"),
-    }
-}
-
-/// The first 128 bits of the SHA-256 of `bytes`, in lowercase hex: `build.mjs`'s and the server's.
-fn digest(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let hash = ring::digest::digest(&ring::digest::SHA256, bytes);
-    hash.as_ref()[..16]
-        .iter()
-        .fold(String::with_capacity(32), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        })
-}
-
-/// Take a page built elsewhere (`VIBE_TALK_WEB_DIST`), only if these sources would build it:
-/// its inputs are exactly every file below web/ and the lockfile, each with the digest it has here,
-/// and every file it declares is present with the digest it declares. Then copy it to `built`.
-fn take_prebuilt(manifest: &Path, dist: &Path, built: &Path) {
-    let assets = read_assets(dist);
-    let mut here: Vec<(String, String)> = files_below(&manifest.join("web"))
-        .into_iter()
-        .map(|relative| format!("vibe-talk/web/{relative}"))
-        .chain(std::iter::once(
-            "vibe-talk/contract/package-lock.json".to_owned(),
-        ))
-        .map(|name| {
-            // Named from the repository root, read from this crate's directory: a container build
-            // has the crate alone.
-            let local = manifest.join(name.strip_prefix("vibe-talk/").expect("a vibe-talk path"));
-            let bytes = std::fs::read(&local)
-                .unwrap_or_else(|error| panic!("read {}: {error}", local.display()));
-            (name, digest(&bytes))
-        })
-        .collect();
-    here.sort();
-    let mut theirs = assets.inputs.clone();
-    theirs.sort();
-    if here != theirs {
-        let mut stale: Vec<&String> = here
-            .iter()
-            .filter(|pair| !theirs.contains(pair))
-            .chain(theirs.iter().filter(|pair| !here.contains(pair)))
-            .map(|(name, _)| name)
-            .collect();
-        stale.sort();
-        stale.dedup();
-        panic!(
-            "\n\nVIBE_TALK_WEB_DIST={} was not built from these sources (differs in {stale:?}).\n\
-             Rebuild it with `node web/build.mjs --out DIR`, or unset VIBE_TALK_WEB_DIST.\n",
-            dist.display()
-        );
-    }
-    for (path, want) in &assets.files {
-        let bytes = std::fs::read(dist.join(path))
-            .unwrap_or_else(|error| panic!("VIBE_TALK_WEB_DIST lacks {path}: {error}"));
-        assert_eq!(
-            &digest(&bytes),
-            want,
-            "VIBE_TALK_WEB_DIST's {path} is not the file it declares"
-        );
-    }
+/// Take a page built elsewhere (`VIBE_TALK_WEB_DIST`) once `build_page::check_prebuilt` has said
+/// these sources and tools made it, copying it to `built`.
+fn take_prebuilt(manifest: &Path, dist: &Path, built: &Path) -> build_page::Assets {
+    let assets =
+        build_page::check_prebuilt(manifest, dist).unwrap_or_else(|message| refuse(&message));
     if built.exists() {
         std::fs::remove_dir_all(built)
-            .unwrap_or_else(|error| panic!("clear {}: {error}", built.display()));
+            .unwrap_or_else(|error| refuse(&format!("clear {}: {error}", built.display())));
     }
-    for path in files_below(dist) {
+    let files = build_page::files_below(dist).unwrap_or_else(|message| refuse(&message));
+    for path in files {
         let target = built.join(&path);
         std::fs::create_dir_all(target.parent().expect("a file has a directory"))
-            .unwrap_or_else(|error| panic!("create {}: {error}", target.display()));
-        std::fs::copy(dist.join(&path), &target)
-            .unwrap_or_else(|error| panic!("copy {path} from VIBE_TALK_WEB_DIST: {error}"));
+            .unwrap_or_else(|error| refuse(&format!("create {}: {error}", target.display())));
+        std::fs::copy(dist.join(&path), &target).unwrap_or_else(|error| {
+            refuse(&format!("copy {path} from VIBE_TALK_WEB_DIST: {error}"))
+        });
     }
-}
-
-/// Every file below `root`, as a `/`-separated relative path, sorted.
-fn files_below(root: &Path) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut pending = vec![PathBuf::new()];
-    while let Some(relative) = pending.pop() {
-        let directory = root.join(&relative);
-        for entry in std::fs::read_dir(&directory)
-            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
-        {
-            let entry = entry.expect("a directory entry");
-            let path = relative.join(entry.file_name());
-            if root.join(&path).is_dir() {
-                pending.push(path);
-            } else {
-                let parts: Vec<String> = path
-                    .iter()
-                    .map(|part| part.to_string_lossy().into_owned())
-                    .collect();
-                found.push(parts.join("/"));
-            }
-        }
-    }
-    found.sort();
-    found
+    assets
 }
 
 /// `OUT_DIR/page_assets.rs`: the page build's hashed files, each by its literal path.
-fn asset_table(assets: &Assets, built: &Path) -> String {
+fn asset_table(assets: &build_page::Assets, built: &Path) -> String {
     let mut table = String::from(
         "// GENERATED by build.rs from the page build's assets.json (`#624 voice-page-modularity`).\n\n",
     );
@@ -343,7 +226,9 @@ fn asset_table(assets: &Assets, built: &Path) -> String {
         } else if path.ends_with(".map") {
             "application/json; charset=utf-8"
         } else {
-            panic!("the page build wrote {path}, whose type this table does not know")
+            refuse(&format!(
+                "the page build wrote {path}, whose type this table does not know"
+            ))
         };
         let file = built.join(path);
         table.push_str(&format!(

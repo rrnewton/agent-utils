@@ -12,6 +12,7 @@ Everything runs on loopback and nothing contacts a chat or model vendor:
   * ffmpeg turns each clip into an animated GIF (palettegen/paletteuse) and a poster PNG.
 
 Usage, from the repository root:
+    npm ci --prefix vibe-talk/contract        # once: the page build's pinned tools
     cargo build --release --manifest-path vibe-talk/Cargo.toml
     python3 site/demos/vibe-talk/record_demo.py [--only NAME,NAME] [--publish]
 
