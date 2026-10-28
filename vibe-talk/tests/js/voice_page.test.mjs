@@ -23000,6 +23000,7 @@ test("`#619 voice-bluetooth-output`: a device change re-lists the devices, so a 
   for (const [type, fn] of page.mediaDeviceListeners || []) {
     if (type === "devicechange") await fn();
   }
+  await page.settle();
   const labels = page.el("audio-input-device").children.map((o) => o.textContent);
   assert.ok(labels.some((l) => l.includes("AirPods")), `headphones not offered after devicechange: ${labels}`);
   assert.ok(labels.some((l) => l.includes("Car")), `car not offered after devicechange: ${labels}`);
