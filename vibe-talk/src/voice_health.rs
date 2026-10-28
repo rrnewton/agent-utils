@@ -701,7 +701,9 @@ mod tests {
         };
         routed.validate().expect("valid");
         assert!(
-            routed.log_fields().contains(" audio_input=bluetooth audio_output=bluetooth close_reason="),
+            routed
+                .log_fields()
+                .contains(" audio_input=bluetooth audio_output=bluetooth close_reason="),
             "{}",
             routed.log_fields()
         );
@@ -712,11 +714,14 @@ mod tests {
         }))
         .expect("a route kind reads");
         assert_eq!(parsed.audio_input, Some(AudioRoute::Bluetooth));
-        assert!(serde_json::from_value::<EndReport>(serde_json::json!({
-            "protocol": "vibe-talk-v1", "chat": false, "ended_by": "hang_up",
-            "since_open_ms": 1000, "turns": 1, "audio_input": "AirPods Pro",
-        }))
-        .is_err(), "a device LABEL must never be accepted into this record");
+        assert!(
+            serde_json::from_value::<EndReport>(serde_json::json!({
+                "protocol": "vibe-talk-v1", "chat": false, "ended_by": "hang_up",
+                "since_open_ms": 1000, "turns": 1, "audio_input": "AirPods Pro",
+            }))
+            .is_err(),
+            "a device LABEL must never be accepted into this record"
+        );
     }
 
     #[test]

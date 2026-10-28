@@ -19122,8 +19122,8 @@ function persistAudioDevicePrefs(prefs) {
 /** The Settings selects' word, falling back to storage before they exist. */
 function audioDevicePrefs() {
   const prefs = storedAudioDevicePrefs();
-  const input = document.getElementById("audio-input-device");
-  const output = document.getElementById("audio-output-device");
+  const input = /** @type {HTMLSelectElement | null} */ (document.getElementById("audio-input-device"));
+  const output = /** @type {HTMLSelectElement | null} */ (document.getElementById("audio-output-device"));
   // A select still showing System default may only not have been filled yet (its refresh is
   // asynchronous): storage, which the change handler keeps current, is the safer word then.
   if (input && input.value) prefs.inputId = input.value;
@@ -19328,7 +19328,7 @@ function audioDevicesChanged() {
  */
 async function renderAudioRouteReadout() {
   const box = document.getElementById("audio-route-readout");
-  const toggle = document.getElementById("audio-route-toggle");
+  const toggle = /** @type {HTMLInputElement | null} */ (document.getElementById("audio-route-toggle"));
   if (!box || !toggle) return;
   box.hidden = !toggle.checked;
   if (!toggle.checked) return;
@@ -20856,7 +20856,7 @@ function postCallEnd(endedBy, code, reason = "") {
   // Every protocol the server named for the call; its allowlist refuses one it does not know.
   if (session.protocol === "unknown") return;
   const now = Date.now();
-  /** @type {{protocol: string, chat: boolean, ended_by: string, since_open_ms: number, turns: number, close_code?: number, visibility: string, queued_audio_ms: number, last_text_ms?: number, last_audio_end_ms?: number, last_interrupt_ms?: number, reconnects?: number, speech_holds?: number, speech_hold_max_ms?: number, speech_hold_capped?: number, close_reason?: string}} */
+  /** @type {{protocol: string, chat: boolean, ended_by: string, since_open_ms: number, turns: number, close_code?: number, visibility: string, queued_audio_ms: number, last_text_ms?: number, last_audio_end_ms?: number, last_interrupt_ms?: number, reconnects?: number, speech_holds?: number, speech_hold_max_ms?: number, speech_hold_capped?: number, audio_input?: string, audio_output?: string, close_reason?: string}} */
   const body = {
     protocol: session.protocol,
     chat: health.chat,
