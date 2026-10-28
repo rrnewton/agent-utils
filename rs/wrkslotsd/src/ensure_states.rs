@@ -446,14 +446,30 @@ pub(crate) fn ensure_states(root: Option<&Path>, machine_override: Option<&str>)
         &cfg.control.join(format!("ACTIVE.{selected}.json.lock")),
         &cfg.control.join(format!("ACTIVE.{selected}.json")),
     )?;
+    ensure_states_locked(root, &cfg, &selected)
+}
+
+/// Bootstrap the shard pair and event log assuming the registry
+/// locks are already held by the caller.
+pub(crate) fn ensure_states_locked(
+    root: Option<&Path>,
+    cfg: &Cfg,
+    selected: &str,
+) -> Result<Value> {
     let active_path = cfg.control.join(format!("ACTIVE.{selected}.json"));
     let archive_path = cfg.control.join(format!("ARCHIVED.{selected}.json"));
     let directory = cfg.control.join(format!("EVENTS.{selected}"));
     if let EventLogStatus::Invalid(message) = event_log_status(&directory) {
         return Err(message);
     }
+    if active_path.symlink_metadata().is_ok() && archive_path.symlink_metadata().is_ok() {
+        let (active, _) = parse_state_ordered(root, Some(selected))?;
+        let archive = parse_archive(root, Some(selected))?;
+        ensure_event_log(root, cfg, selected)?;
+        return Ok(json!({"machine": selected, "active": active, "archive": archive}));
+    }
     if let EventLogStatus::Derived = event_log_status(&directory) {
-        let events = load_event_chain(&directory, &selected)?;
+        let events = load_event_chain(&directory, selected)?;
         let imports: Vec<&Value> = events
             .iter()
             .filter(|event| event.get("kind").and_then(Value::as_str) == Some("state-imported"))
@@ -477,15 +493,15 @@ pub(crate) fn ensure_states(root: Option<&Path>, machine_override: Option<&str>)
             .cloned()
             .ok_or_else(|| "state-imported event has no archive state".to_string())?;
         let active = crate::active_state::normalize_active_value(
-            &cfg,
+            cfg,
             &raw_active,
-            &selected,
+            selected,
             "state-imported event active",
         )?;
         let archive = crate::archive_state::normalize_archive_value(
-            &cfg,
+            cfg,
             &raw_archive,
-            &selected,
+            selected,
             "state-imported event archive",
         )?;
         atomic_write_json(&active_path, &active)?;
@@ -496,7 +512,7 @@ pub(crate) fn ensure_states(root: Option<&Path>, machine_override: Option<&str>)
     let archive_exists = archive_path.symlink_metadata().is_ok();
     match (active_exists, archive_exists) {
         (true, false) => {
-            let (active, _) = parse_state_ordered(root, Some(&selected))?;
+            let (active, _) = parse_state_ordered(root, Some(selected))?;
             let revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
             let slots = active
                 .get("slots")
@@ -508,10 +524,10 @@ pub(crate) fn ensure_states(root: Option<&Path>, machine_override: Option<&str>)
                     "partial machine state for {selected}: non-empty ACTIVE has no ARCHIVED"
                 ));
             }
-            atomic_write_json(&archive_path, &empty_archive(&selected))?;
+            atomic_write_json(&archive_path, &empty_archive(selected))?;
         }
         (false, true) => {
-            let archive = parse_archive(root, Some(&selected))?;
+            let archive = parse_archive(root, Some(selected))?;
             let revision = archive.get("revision").and_then(Value::as_i64).unwrap_or(0);
             let records = archive
                 .get("records")
@@ -523,19 +539,19 @@ pub(crate) fn ensure_states(root: Option<&Path>, machine_override: Option<&str>)
                     "partial machine state for {selected}: non-empty ARCHIVED has no ACTIVE"
                 ));
             }
-            atomic_write_json(&active_path, &empty_active(&selected))?;
+            atomic_write_json(&active_path, &empty_active(selected))?;
         }
         (true, true) => {
-            let _ = parse_state_ordered(root, Some(&selected))?;
-            let _ = parse_archive(root, Some(&selected))?;
+            let _ = parse_state_ordered(root, Some(selected))?;
+            let _ = parse_archive(root, Some(selected))?;
         }
         (false, false) => {
-            atomic_write_json(&active_path, &empty_active(&selected))?;
-            atomic_write_json(&archive_path, &empty_archive(&selected))?;
+            atomic_write_json(&active_path, &empty_active(selected))?;
+            atomic_write_json(&archive_path, &empty_archive(selected))?;
         }
     }
-    ensure_event_log(root, &cfg, &selected)?;
-    let (active, _) = parse_state_ordered(root, Some(&selected))?;
-    let archive = parse_archive(root, Some(&selected))?;
+    ensure_event_log(root, cfg, selected)?;
+    let (active, _) = parse_state_ordered(root, Some(selected))?;
+    let archive = parse_archive(root, Some(selected))?;
     Ok(json!({"machine": selected, "active": active, "archive": archive}))
 }

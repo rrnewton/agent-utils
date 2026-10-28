@@ -22,6 +22,7 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
     /// Strictly replay an event log and atomically replace the derived index
     Rebuild {
@@ -303,6 +304,65 @@ pub(crate) enum Command {
         /// Lowercase 32-hex systemd InvocationID for --task-scope-unit
         #[arg(long, value_name = "HEX32")]
         task_scope_invocation_id: Option<String>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
+    Create {
+        /// New slot name
+        slot: String,
+        /// Slot type: agent or validate
+        #[arg(long, value_name = "TYPE")]
+        slot_type: String,
+        /// Confirm the coordinator assigned this slot
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Registered agent name
+        #[arg(long, value_name = "NAME")]
+        agent: String,
+        /// Task or work-item identifier
+        #[arg(long, value_name = "TASK")]
+        task: String,
+        /// Short human-readable reason for the slot
+        #[arg(long, value_name = "TEXT")]
+        purpose: String,
+        /// Live owner PID to bind (omit only when the owner will adopt)
+        #[arg(long, value_name = "PID")]
+        owner_pid: Option<i64>,
+        /// Live assigned coordinator PID
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// Source repository as NAME=PATH (repeat once per checkout)
+        #[arg(long, value_name = "NAME=PATH")]
+        repo: Vec<String>,
+        /// Configured Git remote as NAME=REMOTE
+        #[arg(long, value_name = "NAME=REMOTE")]
+        remote: Vec<String>,
+        /// Expected fetch URL as NAME=URL
+        #[arg(long, value_name = "NAME=URL")]
+        remote_url: Vec<String>,
+        /// New local branch as NAME=BRANCH (once per repo)
+        #[arg(long, value_name = "NAME=BRANCH")]
+        branch: Vec<String>,
+        /// Start ref as NAME=REF
+        #[arg(long, value_name = "NAME=REF")]
+        start: Vec<String>,
+        /// Allow create below the provisioning floor, never below emergency
+        #[arg(long)]
+        override_disk_floor: bool,
+        /// Transient systemd scope containing --owner-pid (both scope options together)
+        #[arg(long, value_name = "UNIT.scope")]
+        task_scope_unit: Option<String>,
+        /// Lowercase 32-hex systemd InvocationID for --task-scope-unit
+        #[arg(long, value_name = "HEX32")]
+        task_scope_invocation_id: Option<String>,
+        /// Storage representation: config, worktree, or image
+        #[arg(long, value_name = "KIND", default_value = "config")]
+        representation: String,
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -789,6 +849,61 @@ pub fn run() -> u8 {
                 &agent,
                 owner_pid,
                 expected_generation,
+                task_scope_unit.as_deref(),
+                task_scope_invocation_id.as_deref(),
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::Create {
+            slot,
+            slot_type,
+            coordinator_authorized,
+            agent,
+            task,
+            purpose,
+            owner_pid,
+            coordinator_pid,
+            repo,
+            remote,
+            remote_url,
+            branch,
+            start,
+            override_disk_floor,
+            task_scope_unit,
+            task_scope_invocation_id,
+            representation,
+            root,
+            machine,
+        } => {
+            match crate::create_write::create_slot(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                &slot_type,
+                coordinator_authorized,
+                &agent,
+                &task,
+                &purpose,
+                owner_pid,
+                coordinator_pid,
+                &repo,
+                &remote,
+                &remote_url,
+                &branch,
+                &start,
+                override_disk_floor,
+                &representation,
                 task_scope_unit.as_deref(),
                 task_scope_invocation_id.as_deref(),
             ) {

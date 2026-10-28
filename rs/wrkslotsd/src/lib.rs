@@ -48,6 +48,7 @@ mod canonical;
 pub mod cli;
 mod config;
 mod config_validate;
+mod create_write;
 mod doctor_state;
 mod ensure_states;
 mod evidence;

@@ -26,7 +26,7 @@ use crate::status_state::{process_state, read_process_identity, Identity};
 
 type Result<T> = std::result::Result<T, String>;
 
-fn validate_agent_name(agent: &str) -> Result<()> {
+pub(crate) fn validate_agent_name(agent: &str) -> Result<()> {
     let valid = agent.len() <= 32
         && agent
             .chars()
@@ -120,7 +120,11 @@ fn record_identity(record: &Value) -> Option<Identity> {
     })
 }
 
-fn verify_task_scope(owner: &Identity, unit: &str, invocation_id: &str) -> Result<Value> {
+pub(crate) fn verify_task_scope(
+    owner: &Identity,
+    unit: &str,
+    invocation_id: &str,
+) -> Result<Value> {
     if !unit.ends_with(".scope")
         || unit.contains('/')
         || unit

@@ -319,6 +319,7 @@
         "py/wrkslots/tests/test_census_traversal_deadline.py",
         "py/wrkslots/tests/test_cli.py",
         "py/wrkslots/tests/test_config_validate_rust.py",
+        "py/wrkslots/tests/test_create_write_rust.py",
         "py/wrkslots/tests/test_direct_census_found_evidence.py",
         "py/wrkslots/tests/test_doctor_state_rust.py",
         "py/wrkslots/tests/test_e2e_stress.py",
