@@ -146,6 +146,11 @@
 <p>Several agents share one machine's CPUs and memory, and often one GitHub account.</p>
 <p class="answer"><strong><a href="tools.html#dagrun">dagrun</a></strong> runs validation as a graph under CPU and memory limits. <strong><a href="tools.html#gh-paced">gh-paced</a></strong> paces <code>gh</code> calls, and <strong><a href="tools.html#agent-usage">agent-usage</a></strong> reads plan usage without a model call.</p>
 </article>
+<article class="card problem">
+<h3>Tasks get dropped</h3>
+<p>Work handed to an agent lives in a chat message or a notes file, nobody can see what is in flight, and nothing is closed when it lands.</p>
+<p class="answer"><strong><a href="tools.html#minibeads">minibeads</a></strong> keeps tasks as Markdown files in the repository, with claims and dependencies, so the coordinator dispatches from a queue and each subagent closes its own task. Any other tracker works too; nothing in the suite depends on it.</p>
+</article>
 </div>
 </div>
 </section>
@@ -297,6 +302,11 @@
 <h4 class="card-title"><a href="tools.html#agent-usage"><code>agent-usage</code></a> <span class="badges"><span class="badge">optional</span><span class="badge">build from source</span></span></h4>
 <p>Reads Claude Code and Codex plan usage, reset times and burn rates without making a model call, so agents can see their own budgets.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-usage/QUICKSTART.md">Quickstart<span class="vh"> for agent-usage</span></a></p>
+</article>
+<article class="card">
+<h4 class="card-title"><a href="tools.html#minibeads"><code>minibeads</code></a> <span class="badges"><span class="badge">optional</span><span class="badge">submodule</span></span></h4>
+<p>A dependency-aware issue tracker that keeps each issue as a Markdown file in the repository: the queue a coordinator dispatches from. A separate project; the suite works with other trackers as well.</p>
+<p class="card-links"><a href="https://github.com/rrnewton/minibeads">Upstream project<span class="vh">: minibeads</span></a></p>
 </article>
 <article class="card" id="vibe-talk-card">
 <h4 class="card-title"><a href="vibe-talk.html"><code>vibe-talk</code></a> <span class="badges"><span class="badge">optional</span><span class="badge badge-warn">early</span></span></h4>

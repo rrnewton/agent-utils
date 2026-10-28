@@ -21,6 +21,7 @@ documentation link the page. Claims that could not be confirmed for this review 
 | `agent-usage` | [common/docs/agent-usage/RELATED_WORK.md](common/docs/agent-usage/RELATED_WORK.md) | The harnesses' own `/status` screens, ccusage, Claude Code Usage Monitor, and status-line scripts. |
 | `vibe-talk` | [vibe-talk/RELATED_WORK.md](vibe-talk/RELATED_WORK.md) | Happy Coder, Claude mobile voice mode with a Discord connector, ElevenLabs Agents with a phone number, Discord bots, and voice frameworks. |
 | `dagrun` | [common/docs/dagrun/PLANNER_DESIGN.md, section 3](common/docs/dagrun/PLANNER_DESIGN.md#3-related-work) | Scheduling literature (speedup models, moldable-task allocation) only. There is no comparison with other CI runners or build schedulers yet. |
+| `minibeads` (submodule) | [ai_docs/transient/2026-10-28-task-tracker-adapters/README.md, section 6](ai_docs/transient/2026-10-28-task-tracker-adapters/README.md#6-trackers-surveyed) | A working comparison, not yet a settled document: upstream beads, GitHub Issues through `gh`, and Gas Town's task layer, by storage, states, dependencies, claims and closing. minibeads' own repository describes it as a lighter replacement for upstream beads. |
 
 No comparison exists yet for `tick-hub`, `pr-landing-planner`, `parallel-experiment-runner`, or
 `cpuset-alloc` (a companion command of `dagrun`). The documentation policy in

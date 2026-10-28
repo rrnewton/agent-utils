@@ -49,7 +49,8 @@ the harness ignores it.
 **Core tools**, always set up: `agentctl` (named agents in Herdr tabs), `wrkslots` (one isolated
 worktree slot per agent), and the **chat bridge** (`agentctl chat`, so the owner can reach the
 coordinator from chat; it may be deferred). **Optional tools** are offered, not pushed:
-`herdr-run`, `tick-hub`, `dagrun`, `wrkviz`, `gh-paced`, `vibe-talk`, `pr-landing-planner`.
+`herdr-run`, `tick-hub`, `dagrun`, `wrkviz`, `gh-paced`, `minibeads`, `vibe-talk`,
+`pr-landing-planner`.
 
 ## Phase 0: Orient (detect; ask nothing)
 
@@ -89,7 +90,7 @@ installs; never change host configuration.
 | An authenticated agent harness | the coordinator and subagents | Claude Code, Codex, or Muse, per their own install docs. |
 | A user systemd manager and cgroup v2 | wrkslots per-slot limits and boxes; dagrun | Present on most current Linux distributions. |
 | Passwordless `sudo`, or `/dev/fuse` with `fuse2fs` | disk-image slots (`kernel` or `fuse` backend) | `fuse2fs` is in the e2fsprogs packages of most distributions. |
-| Rust toolchain (`cargo`) | the paired tools' default Rust engine (built through Cargo on first use), `gh-paced`, building `vibe-talk`. Without it, paired tools refuse and name the `DAGRUN_ENGINE=python` opt-in | https://rustup.rs |
+| Rust toolchain (`cargo`) | the paired tools' default Rust engine (built through Cargo on first use), `gh-paced`, `minibeads`, building `vibe-talk`. Without it, paired tools refuse and name the `DAGRUN_ENGINE=python` opt-in | https://rustup.rs |
 | `podman` or another container runtime | optional: the `vibe-talk` container image (a native build works too) | Distribution package. |
 | `gh` | optional: GitHub operations by agents | https://cli.github.com |
 
@@ -160,6 +161,9 @@ none; each can be added later by asking):
 - `wrkviz`: a zoomable timeline of what the coordinator and subagents did, from their transcripts.
 - `gh-paced`: a `gh` wrapper that paces calls so many agents sharing one GitHub account stay inside
   GitHub's limits (Rust build).
+- `minibeads`: a local issue tracker (`mb`, issues as Markdown files in the repository) for the
+  coordinator's dispatch queue, beside GitHub Issues for serious bugs (Rust build). Skip it if the
+  project already has a tracker; nothing else in the suite needs it.
 - `vibe-talk`: a deployable voice and phone front end for chat-bridged sessions (a service with
   its own deployment; see `agent-utils/vibe-talk/README.md`).
 - `pr-landing-planner`: an advisory plan for landing a queue of pull requests (experimental).
@@ -467,6 +471,11 @@ link to `.agents/skills/` if it has one, and commit the harness. For each tool, 
 - **wrkviz**: `wrkviz quickstart`; point it at the harness transcripts it lists.
 - **gh-paced**: needs `cargo`. Build it from `agent-utils/rs` as its quickstart shows
   (`common/docs/gh-paced/QUICKSTART.md`), then put it in front of the real `gh` for agents.
+- **minibeads**: needs `cargo`. `git -C agent-utils submodule update --init --checkout ext/minibeads`, then
+  `cargo install --path agent-utils/ext/minibeads --bin mb` (or `cargo install minibeads --version '^0.29'`), and
+  `mb init` in the primary checkout if it has no `.minibeads/` yet. Record in the harness
+  `AGENTS.md` that dispatched tasks are filed and claimed there and closed by the worker that
+  lands them.
 - **vibe-talk**: a separately deployed web service; `agent-utils/vibe-talk/QUICKSTART.md` and
   its README are the reference. What a first run needs, in order:
   - a native build (`cargo build --release --locked` in `vibe-talk/`), installed to a versioned

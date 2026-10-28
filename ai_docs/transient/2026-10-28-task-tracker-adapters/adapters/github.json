@@ -1,0 +1,108 @@
+{
+  "schema": "agent-utils/task-adapter@0",
+  "name": "github",
+  "summary": "GitHub Issues through the gh CLI (or gh-paced in front of it). The report tier: serious bugs and outside reports, not dispatch churn.",
+  "verified": "gh 2.102.0: flag names from its --help; the list JSON shape (including blockedBy.nodes) from one read-only `gh issue list --json` call on 2026-10-28; no write action has been run",
+  "program": ["gh", "issue"],
+  "json_args": [],
+  "params": {
+    "repo": {"required": true, "description": "OWNER/REPO the issues live in"}
+  },
+  "detect": {
+    "probe": ["gh", "--version"]
+  },
+  "id": {
+    "pattern": "^[0-9]+$",
+    "display": "#{id}"
+  },
+  "states": {
+    "open": ["OPEN"],
+    "closed": ["CLOSED"]
+  },
+  "priority": null,
+  "fields": {
+    "id": "$.number",
+    "title": "$.title",
+    "state": "$.state",
+    "labels": "$.labels[*].name",
+    "assignee": "$.assignees[0].login",
+    "description": "$.body",
+    "blocked_by": "$.blockedBy.nodes[*].number",
+    "parent": "$.parent.number",
+    "url": "$.url",
+    "created_at": "$.createdAt",
+    "updated_at": "$.updatedAt",
+    "closed_at": "$.closedAt",
+    "author": "$.author.login"
+  },
+  "list_fields": "number,title,state,labels,assignees,author,body,blockedBy,parent,url,createdAt,updatedAt,closedAt",
+  "capabilities": {
+    "in_progress": "label:in-progress",
+    "blocked": "derived",
+    "dependencies": "native",
+    "ready_query": "derived",
+    "claim": "assign-then-verify",
+    "labels": "native",
+    "comments": "native",
+    "close_reason": "comment",
+    "explicit_ids": "none",
+    "external_ref": "none",
+    "parent": "native",
+    "priority": "label:P{priority}",
+    "rate_limited": true
+  },
+  "actions": {
+    "list": {
+      "argv": ["list", "-R", "{repo}", "--json", "{list_fields}",
+               ["--state", "{state?}"], ["--label", "{label?}"], ["--limit", "{limit?}"]],
+      "state_values": {"open": "open", "closed": "closed"},
+      "output": {"format": "json", "items": "$[*]"}
+    },
+    "show": {
+      "argv": ["view", "{id}", "-R", "{repo}", "--json", "{list_fields}"],
+      "output": {"format": "json", "item": "$"}
+    },
+    "create": {
+      "argv": ["create", "-R", "{repo}", "--title", "{title}", "--body", "{description}",
+               ["--label", "{labels*}"], ["--blocked-by", "{blocked_by,}"], ["--parent", "{parent?}"]],
+      "output": {"format": "text", "regex": "/issues/(?P<id>[0-9]+)\\s*$"}
+    },
+    "claim": {
+      "argv": ["edit", "{id}", "-R", "{repo}", "--add-assignee", "{assignee}", "--add-label", "in-progress"],
+      "output": {"format": "none"},
+      "verify": "show"
+    },
+    "release": {
+      "argv": ["edit", "{id}", "-R", "{repo}", "--remove-assignee", "{assignee}", "--remove-label", "in-progress"],
+      "output": {"format": "none"}
+    },
+    "close": {
+      "argv": ["close", "{id}", "-R", "{repo}", ["--comment", "{reason?}"], ["--reason", "{close_kind?}"]],
+      "output": {"format": "none"}
+    },
+    "reopen": {
+      "argv": ["reopen", "{id}", "-R", "{repo}", ["--comment", "{reason?}"]],
+      "output": {"format": "none"}
+    },
+    "comment": {
+      "argv": ["comment", "{id}", "-R", "{repo}", "--body", "{body}"],
+      "output": {"format": "none"}
+    },
+    "label_add": {
+      "argv": ["edit", "{id}", "-R", "{repo}", "--add-label", "{label}"],
+      "output": {"format": "none"}
+    },
+    "label_remove": {
+      "argv": ["edit", "{id}", "-R", "{repo}", "--remove-label", "{label}"],
+      "output": {"format": "none"}
+    },
+    "dep_add": {
+      "argv": ["edit", "{id}", "-R", "{repo}", "--add-blocked-by", "{blocker}"],
+      "output": {"format": "none"}
+    },
+    "dep_remove": {
+      "argv": ["edit", "{id}", "-R", "{repo}", "--remove-blocked-by", "{blocker}"],
+      "output": {"format": "none"}
+    }
+  }
+}

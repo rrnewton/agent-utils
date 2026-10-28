@@ -239,6 +239,11 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # repository-wide strict typing, which the root-mypy rule in selection_for adds.
     ("site/", frozenset()),
     ("scripts/check_no_any.py", frozenset({PYTHON, CROSS, VIBE_TALK})),
+    # Submodules: each project under ext/ has its own repository, CI and releases, and nothing in
+    # this repository builds, embeds or tests it, so a pin bump owes only the always-on hygiene
+    # group. Exact rules, not "ext/": a new submodule must be classified on purpose.
+    (".gitmodules", frozenset()),
+    ("ext/minibeads", frozenset()),
     # Prose and agent-facing material. Not embedded anywhere, so nothing can go red for it.
     (".minibeads/", frozenset()),
     ("ai_docs/", frozenset()),
@@ -1126,6 +1131,16 @@ def self_test() -> int:
         "website files are checked by the always-on hygiene group and owe nothing else",
     )
     expect(["site.html"], set(ALL_GROUPS), "the site/ directory rule must stop at its boundary")
+    expect(
+        [".gitmodules", "ext/minibeads"],
+        set(),
+        "a submodule pin is validated in its own repository and owes only the hygiene group",
+    )
+    expect(
+        ["ext/another-project"],
+        set(ALL_GROUPS),
+        "a new submodule is unclassified until it is routed on purpose",
+    )
     expect(
         ["site/demos/vibe-talk/record_demo.py", "site/demos/vibe-talk/gchat_bridge_mock.py"],
         {PYTHON},

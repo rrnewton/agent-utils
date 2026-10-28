@@ -1,0 +1,147 @@
+{
+  "schema": "agent-utils/task-adapter@0",
+  "name": "beads",
+  "summary": "Upstream beads (bd): a Dolt-backed issue store with leases, gates, molecules and configurable status categories.",
+  "verified": "written from the bd CLI reference and internal/types/types.go at upstream commit 9353122 (2026-10-28); bd is not installed on the authoring host, so no action has been run, and the show/list JSON shapes are read from the Go types (types.go IssueDetails, cmd/bd/show.go), not observed",
+  "program": ["bd"],
+  "json_args": ["--json"],
+  "actor_args": ["--actor", "{actor}"],
+  "detect": {
+    "any_file": [".beads/config.yaml"],
+    "probe": ["bd", "version"]
+  },
+  "id": {
+    "pattern": "^[a-z0-9][a-z0-9-]*-[0-9a-z.]+$",
+    "display": "{id}"
+  },
+  "states": {
+    "open": ["open"],
+    "in_progress": ["in_progress", "hooked"],
+    "blocked": ["blocked", "deferred", "pinned"],
+    "closed": ["closed"]
+  },
+  "state_categories": {
+    "comment": "bd lets a project add statuses, each in a category: active, wip, done or frozen. `bd statuses --json` lists them (each entry has name and category; the enclosing shape is unverified); the generic layer maps active->open, wip->in_progress, done->closed, frozen->blocked for any status this file does not name. bd itself files blocked under wip; this adapter keeps it as canonical blocked.",
+    "probe": ["statuses"],
+    "items": "$[*]",
+    "name": "$.name",
+    "category": "$.category",
+    "map": {"active": "open", "wip": "in_progress", "done": "closed", "frozen": "blocked"}
+  },
+  "priority": {
+    "native": "integer",
+    "highest": 0,
+    "lowest": 4,
+    "default": 2
+  },
+  "fields": {
+    "id": "$.id",
+    "title": "$.title",
+    "state": "$.status",
+    "priority": "$.priority",
+    "type": "$.issue_type",
+    "labels": "$.labels[*]",
+    "assignee": "$.assignee",
+    "description": "$.description",
+    "blocked_by": "$.dependencies[?(@.dependency_type=='blocks')].id",
+    "parent": "$.parent",
+    "external_ref": "$.external_ref",
+    "created_at": "$.created_at",
+    "updated_at": "$.updated_at",
+    "closed_at": "$.closed_at"
+  },
+  "fields_note": "Paths follow `bd show --json` (IssueDetails: dependencies are IssueWithDependencyMetadata entries keyed by id and dependency_type, parent is top level). `bd list --json` carries no dependency list, so blocked_by from list is empty; ask show, or blocked.",
+  "capabilities": {
+    "in_progress": "native",
+    "blocked": "native",
+    "dependencies": "native",
+    "ready_query": "native",
+    "claim": "atomic-lease",
+    "labels": "native",
+    "comments": "native",
+    "close_reason": "native",
+    "explicit_ids": "native",
+    "external_ref": "native",
+    "parent": "native",
+    "compare_and_swap": "native"
+  },
+  "actions": {
+    "list": {
+      "argv": ["list", ["--status", "{state?}"], ["--label", "{label?}"], ["--limit", "{limit?}"]],
+      "output": {"format": "json", "items": "$[*]"}
+    },
+    "show": {
+      "argv": ["show", "{id}"],
+      "output": {"format": "json", "item": "$[0]"}
+    },
+    "ready": {
+      "argv": ["ready", ["--limit", "{limit?}"]],
+      "output": {"format": "json", "items": "$[*]"}
+    },
+    "blocked": {
+      "argv": ["blocked"],
+      "output": {"format": "json", "items": "$[*]"}
+    },
+    "stale": {
+      "argv": ["stale", "--days", "{days}"],
+      "output": {"format": "json", "items": "$[*]"}
+    },
+    "create": {
+      "argv": [
+        "create", "{title}", "--silent",
+        ["--id", "{id?}"],
+        ["--description", "{description?}"],
+        ["--priority", "{priority?}"],
+        ["--type", "{type?}"],
+        ["--labels", "{labels,}"],
+        ["--parent", "{parent?}"],
+        ["--external-ref", "{external_ref?}"]
+      ],
+      "json": false,
+      "output": {"format": "text", "regex": "^(?P<id>\\S+)\\s*$"}
+    },
+    "set_state": {
+      "argv": ["update", "{id}", "--status", "{state}", ["--if-status", "{expect_state?}"]],
+      "output": {"format": "json"},
+      "conflict_exit": [13]
+    },
+    "claim": {
+      "argv": ["update", "{id}", "--claim"],
+      "actor_is_assignee": true,
+      "output": {"format": "json"},
+      "conflict_stderr": "already claimed"
+    },
+    "release": {
+      "argv": ["unclaim", "{id}", ["--if-assignee", "{assignee?}"], ["--reason", "{reason?}"]],
+      "output": {"format": "json"}
+    },
+    "close": {
+      "argv": ["close", "{id}", ["--reason", "{reason?}"]],
+      "output": {"format": "json"}
+    },
+    "reopen": {
+      "argv": ["reopen", "{id}"],
+      "output": {"format": "json"}
+    },
+    "comment": {
+      "argv": ["comments", "add", "{id}", "{body}"],
+      "output": {"format": "json"}
+    },
+    "label_add": {
+      "argv": ["label", "add", "{id}", "{label}"],
+      "output": {"format": "json"}
+    },
+    "label_remove": {
+      "argv": ["label", "remove", "{id}", "{label}"],
+      "output": {"format": "json"}
+    },
+    "dep_add": {
+      "argv": ["dep", "add", "{id}", "{blocker}"],
+      "output": {"format": "json"}
+    },
+    "dep_remove": {
+      "argv": ["dep", "remove", "{id}", "{blocker}"],
+      "output": {"format": "json"}
+    }
+  }
+}
