@@ -1,10 +1,11 @@
 ---
 title: 'voice-bluetooth-output: route call audio to the system/Bluetooth device'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-28T11:57:53.766158139+00:00
-updated_at: 2026-10-28T11:57:53.766158139+00:00
+updated_at: 2026-10-28T12:50:44.463207823+00:00
+closed_at: 2026-10-28T12:50:44.463207362+00:00
 ---
 
 # Description
