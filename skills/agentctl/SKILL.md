@@ -25,7 +25,9 @@ Use the installed command as the authority:
 - `agentctl status NAME`
 - `agentctl send NAME --file PROMPT` (a `queued:` warning means the prompt waits behind a running
   turn; `status` shows the turn's age and queue, and `send NAME --urgent --file PROMPT` interrupts
-  the turn and submits the queued input instead of anyone pressing Escape and Enter by hand)
+  the turn and submits the queued input instead of anyone pressing Escape and Enter by hand; every
+  prompt arrives opened with a sender header such as
+  `[from cl-foo via agentctl · reply: agentctl send cl-foo]`, which nothing suppresses)
 - `agentctl progress NAME --file STATUS --matching TEXT --hours H` (declare what progress looks
   like, so `watch-agents` can tell activity from progress)
 - `agentctl read NAME --lines 500`
@@ -36,7 +38,9 @@ Use the installed command as the authority:
 
 **Every agent launch and every agent inspection goes through agentctl.** Do not
 start, split, move, message or read agent panes with raw `herdr agent start`,
-`herdr pane split` or `herdr pane move`. Raw `herdr agent start` without `--tab`
+`herdr pane split` or `herdr pane move`. Message another agent only with
+`agentctl send`, never with `herdr pane send-text` or `herdr pane run`: a line
+typed straight into a pane reaches its reader with no sign of who sent it. Raw `herdr agent start` without `--tab`
 SPLITS the caller's current tab. It also skips the launch profile, so the new
 agent comes up without its owner-configured flags. agentctl creates a labelled
 tab in the configured workspace, and it moves a split agent into its own tab.

@@ -42,6 +42,25 @@ pub fn format_action(skill: &str, fields: &IndexMap<String, String>, title: &str
     parts.join(" ")
 }
 
+/// Format the source header that opens each reminder's records (#609 sender-header-mandatory):
+/// `[tick-hub: NAME · SCHEDULE]`. A record forwarded to an agent then says which reminder sent it
+/// and how often, in the bracketed one-line form agent message headers share.
+pub fn format_tick_header(name: &str, schedule: &str) -> String {
+    format!("[tick-hub: {name} · {schedule}]")
+}
+
+/// A reminder's schedule as its header prints it: `every tick` for a zero cadence, else
+/// `every Ns`, and `every Ns at +Ms` when a cadence offset phases it.
+pub fn format_schedule(cadence_secs: i64, cadence_offset_secs: Option<i64>) -> String {
+    if cadence_secs <= 0 {
+        return "every tick".to_string();
+    }
+    match cadence_offset_secs {
+        Some(offset) => format!("every {cadence_secs}s at +{offset}s"),
+        None => format!("every {cadence_secs}s"),
+    }
+}
+
 /// Format an informational note.
 pub fn format_note(text: &str) -> String {
     format!("NOTE: {text}")
@@ -122,6 +141,16 @@ mod tests {
             format_action("ci-health-red", &fields, "CI on main is \"red\""),
             "ACTION: ci-health-red branch=main runs=\"run 1 failed\" empty=\"\" separator=\"a\u{1c}b\" title=\"CI on main is \\\"red\\\"\""
         );
+    }
+
+    #[test]
+    fn tick_header_names_the_reminder_and_its_schedule() {
+        assert_eq!(
+            format_tick_header("owner_status", &format_schedule(3540, None)),
+            "[tick-hub: owner_status · every 3540s]"
+        );
+        assert_eq!(format_schedule(0, Some(5)), "every tick");
+        assert_eq!(format_schedule(86400, Some(3600)), "every 86400s at +3600s");
     }
 
     #[test]

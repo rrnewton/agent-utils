@@ -1815,8 +1815,10 @@ def test_cli_managed_start_and_message_file(tmp_path: Path, monkeypatch: pytest.
     capsys.readouterr()
     message = tmp_path / "brief.txt"
     message.write_text("line one\nline two")
+    monkeypatch.setenv("AGENTCTL_AGENT", "lead")
     assert cli.main(["send", "--name", "worker", "--file", str(message), *root]) == 0
-    assert fake.submitted == ["line one\nline two"]
+    # Opened with the sender header (#609 sender-header-mandatory).
+    assert fake.submitted == ["[from lead via agentctl · reply: agentctl send lead]\nline one\nline two"]
     assert cli.main(["stop", "worker", *root]) == 0
 
 

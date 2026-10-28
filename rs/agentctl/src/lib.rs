@@ -30,6 +30,7 @@ pub mod progress_metric;
 pub(crate) mod prompt_time;
 pub mod registry_layout;
 pub mod restore;
+pub mod sender_header;
 pub(crate) mod skill_install;
 pub mod stale_composer;
 pub mod stuck;

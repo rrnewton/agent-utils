@@ -7,7 +7,9 @@ description: Run a cooperatively allowlisted command in a terminal pane belongin
 
 Use this command only for operations admitted by the project policy. Its allowlist is a cooperative
 safety rail, not a same-user containment boundary; do not widen policy without reading the trust
-model.
+model. It never types an unlabelled message into another pane: `herdr pane send-text` and
+`herdr pane run` need text that opens with a sender header, and `herdr pane send-keys` is refused.
+Message agents with `agentctl send` instead.
 
 The installed CLI is the source of truth:
 

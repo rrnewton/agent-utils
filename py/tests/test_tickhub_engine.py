@@ -971,3 +971,51 @@ def test_failed_stream_write_kills_outstanding_parallel_gate(tmp_path: Path) -> 
     else:
         os.kill(pid, 9)
         raise AssertionError("failed output left a parallel gate running")
+
+
+def test_each_reminders_records_open_with_its_tick_header() -> None:
+    """#609 sender-header-mandatory: every group of records a reminder writes names its source."""
+    quiet = Reminder("quiet", Emit(EmitKind.NOTE, title="never shown"),
+                     gate=Gate("quiet-gate", when=GateWhen.FAILURE))
+    failing = Reminder("probe", Emit(EmitKind.ACTION, title="probe", skill="probe"), gate=Gate("boom"))
+    cfg = TickConfig(reminders=(_action("owner_status", "owner-status", cadence=3540), failing, quiet))
+    gate = FakeGate({"boom": GateResult(returncode=127, stdout="", ok=False, error="not found")})
+    state = OpsState.default()
+    result = run_tick(cfg, state, now=10, fired={}, gate_runner=gate, age_probe=FakeProbe({}),
+                      current_tick_min=state.tick_frequency_min + 1)
+    headers = [(index, line) for index, line in enumerate(result.lines) if line.startswith("[tick-hub: ")]
+    assert [line for _, line in headers] == [
+        "[tick-hub: ops-state · every tick]",
+        "[tick-hub: owner_status · every 3540s]",
+        "[tick-hub: probe · every tick]",
+    ], result.lines
+    # Each header stands directly above the records it introduces; a quiet reminder writes neither.
+    assert result.lines[headers[0][0] + 1].startswith("ACTION: actualize-tick-frequency")
+    assert result.lines[headers[1][0] + 1].startswith("ACTION: owner-status")
+    assert result.lines[headers[2][0] + 1].startswith("ERROR: reminder probe")
+    assert result.actions_emitted == 3
+
+
+def test_tick_header_names_the_reminder_and_its_schedule() -> None:
+    from tick_hub.emit import format_schedule, format_tick_header
+
+    assert format_tick_header("owner_status", format_schedule(3540, None)) == (
+        "[tick-hub: owner_status · every 3540s]")
+    assert format_schedule(0, 5) == "every tick"
+    assert format_schedule(86400, 3600) == "every 86400s at +3600s"
+
+
+def test_a_pending_reports_suppressed_and_clean_lines_open_with_their_tick_header() -> None:
+    bench = Reminder("bench", Emit(EmitKind.ACTION, title="run", skill="run-benchmark"),
+                     cadence_secs=86400, requires_flags=("benchmark_enabled",))
+    quiet = Reminder("quiet", Emit(EmitKind.NOTE, title="never shown"),
+                     gate=Gate("quiet-gate", when=GateWhen.FAILURE))
+    state = OpsState(enabled=True, tick_frequency_min=30, flags={"benchmark_enabled": False})
+    result = run_tick(TickConfig(reminders=(bench, quiet)), state, now=10, fired={},
+                      gate_runner=FakeGate({}), age_probe=FakeProbe({}), report_pending=True)
+    assert list(result.lines[1:5]) == [
+        "[tick-hub: bench · every 86400s]",
+        "SUPPRESSED: bench did not run; required flag(s) not set: benchmark_enabled",
+        "[tick-hub: quiet · every tick]",
+        "CLEAN: quiet ran and found nothing to report",
+    ], result.lines

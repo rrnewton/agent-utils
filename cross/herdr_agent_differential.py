@@ -1338,6 +1338,20 @@ def _state(root: Path) -> dict[str, object]:
     return {str(key): value for key, value in raw.items()}
 
 
+#: The sender header ``agentctl send`` opens every prompt with (#609 sender-header-mandatory):
+#: ``[from SENDER via ROUTE( · KEY: VALUE)*]`` on a line of its own.
+SENDER_HEADER = re.compile(r"\[from [^\s\]·]+ via [^\]·\n]+(?: · [a-z-]+: [^\]·\n]+)*\]\n")
+
+
+def _submitted(root: Path) -> list[object] | None:
+    """The prompts the fixture saw submitted, each without the sender header it opens with."""
+    values = _state(root).get("submitted")
+    if not isinstance(values, list):
+        return None
+    return [SENDER_HEADER.sub("", value, count=1) if isinstance(value, str) and SENDER_HEADER.match(value)
+            else value for value in values]
+
+
 def _queue_snapshot(root: Path, queue: str) -> dict[str, object]:
     queue_root = root / queue
     snapshot: dict[str, object] = {}
@@ -1791,9 +1805,17 @@ def _successful_send(harness: Harness, report: Report) -> None:
     report.exact("send/success", python, rust, 0)
     report.require(
         "send/literal-atomic-text",
-        _state(case.python_root).get("submitted") == [text]
-        and _state(case.rust_root).get("submitted") == [text],
+        _submitted(case.python_root) == [text]
+        and _submitted(case.rust_root) == [text],
         "one implementation changed or split the submitted text",
+    )
+    typed = [_state(root).get("submitted") for root in (case.python_root, case.rust_root)]
+    report.require(
+        "send/sender-header",
+        all(isinstance(value, list) and len(value) == 1 and isinstance(value[0], str)
+            and SENDER_HEADER.match(value[0]) for value in typed)
+        and typed[0] == typed[1],
+        f"send did not open the prompt with the same sender header: {typed!r}",
     )
     report.require(
         "send/durable-state",
@@ -1828,8 +1850,8 @@ def _pending_and_ambiguous(harness: Harness, report: Report) -> None:
     )
     report.require(
         "send/pending-not-injected",
-        _state(busy.python_root).get("submitted") == []
-        and _state(busy.rust_root).get("submitted") == [],
+        _submitted(busy.python_root) == []
+        and _submitted(busy.rust_root) == [],
         "busy prompt was injected",
     )
 
@@ -1837,8 +1859,8 @@ def _pending_and_ambiguous(harness: Harness, report: Report) -> None:
     python, rust = harness.invoke(working, pending_arguments)
     report.exact("send/working-followup", python, rust, 0)
     report.require("send/working-followup-once",
-        _state(working.python_root).get("submitted") == ["keep pending"]
-        and _state(working.rust_root).get("submitted") == ["keep pending"],
+        _submitted(working.python_root) == ["keep pending"]
+        and _submitted(working.rust_root) == ["keep pending"],
         "recognized working Codex did not accept exactly one follow-up")
 
     ambiguous = harness.case("ambiguous", {"run_mode": "fail"})
@@ -1856,8 +1878,8 @@ def _pending_and_ambiguous(harness: Harness, report: Report) -> None:
     report.exact("send/possibly-submitted", python, rust, 76)
     report.require(
         "send/possibly-submitted-once",
-        _state(ambiguous.python_root).get("submitted") == ["only once"]
-        and _state(ambiguous.rust_root).get("submitted") == ["only once"],
+        _submitted(ambiguous.python_root) == ["only once"]
+        and _submitted(ambiguous.rust_root) == ["only once"],
         "ambiguous prompt was not attempted exactly once",
     )
     report.require(
@@ -2068,7 +2090,7 @@ def _shared_queue_interop(harness: Harness, report: Report) -> None:
             f"interop/{label}",
             pending.returncode == 75
             and drained.returncode == 0
-            and _state(root).get("submitted") == ["shared queue prompt"]
+            and _submitted(root) == ["shared queue prompt"]
             and isinstance(binding, dict)
             and binding.get("pane_id") == "w1:p1",
             f"shared queue was not interoperable: pending={pending!r} drained={drained!r}",
@@ -2145,7 +2167,7 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
             root / "tmp-b",
         )
         time.sleep(0.25)
-        serialized = _state(root).get("submitted") == ["from pane"]
+        serialized = _submitted(root) == ["from pane"]
         (root / "run-release").write_text("release\n", encoding="utf-8")
         first_out, first_err = first.communicate(timeout=10)
         second_out, second_err = second.communicate(timeout=10)
@@ -2364,7 +2386,7 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
         started = harness._invoke_one(producer, root, ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common))
         sent = harness._invoke_one(consumer, root, ("send", "shared registry", "--name", "worker", *common))
         stopped = harness._invoke_one(consumer, root, ("stop", "worker", *common))
-        report.require(f"managed/interop/{label}", started.returncode == sent.returncode == stopped.returncode == 0 and _state(root).get("submitted") == ["shared registry"],
+        report.require(f"managed/interop/{label}", started.returncode == sent.returncode == stopped.returncode == 0 and _submitted(root) == ["shared registry"],
                        f"registry interop failed: {started!r} {sent!r} {stopped!r}")
 
     for label, change in (("offline", {"offline": True}), ("busy", {"status": "working", "screen": "unrecognized terminal layout\n"}), ("extra-pane", {"extra_pane": True})):
@@ -2387,8 +2409,8 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
                            f"prompt was not durably retained: {python!r} {rust!r}")
             report.require(f"managed/{label}-durable-state", _queue_snapshot(case.python_root, "registry/agents/worker/queue") == _queue_snapshot(case.rust_root, "registry/agents/worker/queue"),
                            "pending managed queue artifacts differed")
-        report.require(f"managed/{label}-no-mutation", _state(case.python_root).get("submitted") == []
-                       and _state(case.rust_root).get("submitted") == []
+        report.require(f"managed/{label}-no-mutation", _submitted(case.python_root) == []
+                       and _submitted(case.rust_root) == []
                        and not _state(case.python_root).get("closed") and not _state(case.rust_root).get("closed"),
                        "failure injected a prompt or closed a tab")
 

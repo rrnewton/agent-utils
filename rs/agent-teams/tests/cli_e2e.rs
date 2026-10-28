@@ -139,7 +139,7 @@ fn show_check_send_hook_reply_round_trip() {
     assert!(value["tag"]
         .as_str()
         .unwrap_or("")
-        .starts_with("[sim host-a -> tools host-a tm-"));
+        .starts_with("[from sim@host-a via agent-teams · to: tools@host-a · id: tm-"));
     assert_eq!(world.hook_inbox_count("tools"), 1);
 
     // The same send again is a retry, not a second copy.
@@ -163,7 +163,10 @@ fn show_check_send_hook_reply_round_trip() {
     let (code, out, err) = world.run(&["hook", "--team", "tools"]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("Please hold landing."), "{out}");
-    assert!(out.contains("[sim host-a -> tools host-a"), "{out}");
+    assert!(
+        out.contains("[from sim@host-a via agent-teams · to: tools@host-a"),
+        "{out}"
+    );
     let (_, out, _) = world.run(&["hook", "--team", "tools"]);
     assert!(
         !out.contains("Please hold landing."),

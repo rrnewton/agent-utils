@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
+use crate::sender_header;
 use crate::subagents::{
     environment_entries, stop_reason, AdoptOptions, CloudLaunch, CloudTools, ManageAction,
     ManagedAgents, RecoveryAction, SlotLaunch, StartOptions, StopContext, StopFailure, StopOptions,
@@ -195,7 +196,7 @@ enum Commands {
     Status(Named),
     /// Persist and deliver a prompt when the agent is ready
     #[command(
-        after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1\n\nFor an agentcloud agent the prompt is journaled by `agentcloudctl send --end-of-turn` (a leading\n/goal is sent without --end-of-turn), up to 102400 bytes. When --from-session (default:\n$AGENTCLOUD_SESSION_ID) names a different agentcloud session, agentcloudctl refuses that send,\nso the prompt goes as an attributed `agentcloudctl send-message` from that session instead; it\narrives as an ordinary input and a /goal is not interpreted. An explicit\nhuman send (--from-session '') from inside a different agentcloud session is refused, never\ndisguised. --message-id becomes the idempotency\nkey, so repeating it journals nothing new; without it agentctl generates and prints one. The\ndelivery timeouts and --max-attempts do not apply."
+        after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1\n\nFor an agentcloud agent the prompt is journaled by `agentcloudctl send --end-of-turn` (a leading\n/goal is sent without --end-of-turn), up to 102400 bytes. When --from-session (default:\n$AGENTCLOUD_SESSION_ID) names a different agentcloud session, agentcloudctl refuses that send,\nso the prompt goes as an attributed `agentcloudctl send-message` from that session instead; it\narrives as an ordinary input and a /goal is not interpreted. An explicit\nhuman send (--from-session '') from inside a different agentcloud session is refused, never\ndisguised. --message-id becomes the idempotency\nkey, so repeating it journals nothing new; without it agentctl generates and prints one. The\ndelivery timeouts and --max-attempts do not apply.\n\nEvery prompt opens with a sender header line naming who sent it and how, for example\n`[from cl-foo via agentctl · reply: agentctl send cl-foo]`. The sender is the registered agent\nwhose harness runs this command, else $AGENTCTL_AGENT, else the nearest claude, codex or muse\nancestor (`claude:PID@HOST`), else `human@HOST` at a terminal or `unknown@HOST`. No option\nsuppresses it; a one-line harness slash command such as `/compact` is sent as written."
     )]
     Send(Send),
     /// Deliver queued prompts that are known not to have been submitted
@@ -2792,6 +2793,18 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .read()
                 .map_err(Failure::Usage)?
                 .ok_or_else(|| Failure::Usage("send requires prompt text or --file".to_owned()))?;
+            // Every path below delivers the prompt opened with its sender header (#609
+            // sender-header-mandatory); nothing suppresses it.
+            let route = if value.urgent {
+                sender_header::URGENT_ROUTE
+            } else {
+                sender_header::ROUTE
+            };
+            let sender = sender_header::resolve_current(
+                manager.caller_edge().map(|edge| edge.agent),
+                environment("AGENTCTL_AGENT"),
+            );
+            let text = sender_header::stamp(&text, &sender, route);
             if manager.is_headless(&value.agent.name)? {
                 let not_after = value.ttl.map(|ttl| {
                     crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)

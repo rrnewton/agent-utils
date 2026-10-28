@@ -250,7 +250,15 @@ fn run(args: Args) -> Result<i32, CliError> {
         return run_managed(args);
     }
     let message = if command == "send" {
-        Some(message(&args)?)
+        // Typed straight into a pane, so it carries the sender header too (#609
+        // sender-header-mandatory); without a registry the sender comes from the environment.
+        let sender =
+            crate::sender_header::resolve_current(None, std::env::var("AGENTCTL_AGENT").ok());
+        Some(crate::sender_header::stamp(
+            &message(&args)?,
+            &sender,
+            crate::sender_header::ROUTE,
+        ))
     } else {
         None
     };
@@ -521,7 +529,16 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
             }
             write_json(&manager.list()?)?;
         }
-        "send" => write_json(&manager.send(name, &message(&args)?, delivery)?)?,
+        "send" => {
+            // The same mandatory sender header as `agentctl send` (#609 sender-header-mandatory).
+            let sender = crate::sender_header::resolve_current(
+                manager.caller_edge().map(|edge| edge.agent),
+                std::env::var("AGENTCTL_AGENT").ok(),
+            );
+            let text =
+                crate::sender_header::stamp(&message(&args)?, &sender, crate::sender_header::ROUTE);
+            write_json(&manager.send(name, &text, delivery)?)?;
+        }
         "drain" => {
             let result = manager.drain(name, delivery)?;
             write_json(&result)?;

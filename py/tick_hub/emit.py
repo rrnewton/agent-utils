@@ -73,6 +73,28 @@ def format_unevaluable(name: str, dependencies: Sequence[str]) -> str:
     )
 
 
+def format_tick_header(name: str, schedule: str) -> str:
+    """Format the source header that opens each reminder's records (#609 sender-header-mandatory).
+
+    ``[tick-hub: NAME · SCHEDULE]``. A record forwarded to an agent then says which reminder sent
+    it and how often, in the bracketed one-line form agent message headers share.
+    """
+    return f"[tick-hub: {name} · {schedule}]"
+
+
+def format_schedule(cadence_secs: int, cadence_offset_secs: int | None) -> str:
+    """A reminder's schedule as its header prints it.
+
+    ``every tick`` for a zero cadence, else ``every Ns``, and ``every Ns at +Ms`` when a cadence
+    offset phases it.
+    """
+    if cadence_secs <= 0:
+        return "every tick"
+    if cadence_offset_secs is not None:
+        return f"every {cadence_secs}s at +{cadence_offset_secs}s"
+    return f"every {cadence_secs}s"
+
+
 def format_clean(name: str) -> str:
     """Format a gate that RAN and found nothing wrong.
 

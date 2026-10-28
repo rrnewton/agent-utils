@@ -686,6 +686,7 @@ def test_mcp_routes_into_the_cli_registry_and_honors_its_pause(tmp_path: Path, m
     sessions, fake, _ = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path))
     monkeypatch.setattr(cli, "HerdrClient", lambda **_: fake)
+    monkeypatch.setenv("AGENTCTL_AGENT", "lead")
     registry = str(tmp_path / "registry")
     assert mcp.call_tool("agent_pause", {"name": "worker"}, registry, "unused")["isError"] is False
     assert sessions.get("worker").paused
@@ -694,7 +695,8 @@ def test_mcp_routes_into_the_cli_registry_and_honors_its_pause(tmp_path: Path, m
     assert not fake.submitted
     assert mcp.call_tool("agent_resume", {"name": "worker"}, registry, "unused")["isError"] is False
     assert mcp.call_tool("agent_send", {"name": "worker", "text": "--literal prompt"}, registry, "unused")["isError"] is False
-    assert fake.submitted == ["--literal prompt"]
+    # The CLI opens every prompt with its sender header (#609 sender-header-mandatory).
+    assert fake.submitted == ["[from lead via agentctl · reply: agentctl send lead]\n--literal prompt"]
 
 
 def test_headless_herdr_attach_checks_pane_ownership_and_focuses_its_tab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

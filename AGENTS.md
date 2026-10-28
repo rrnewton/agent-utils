@@ -248,6 +248,17 @@ or a commit body quoted out of context.
 
 Use the model you actually are, not a generic label.
 
+## Message agents through agentctl
+
+An agent sends another agent (a coordinator, a worker, a reviewer) a message
+only with `agentctl send NAME TEXT`, never by typing into its pane with
+`herdr pane send-text` or `herdr pane run`. `agentctl send` opens every prompt
+with a sender header, `[from NAME via agentctl · reply: agentctl send NAME]`,
+and nothing turns it off; a raw line reaches its reader with no sign of who
+wrote it (#609 sender-header-mandatory). Briefs for subagents say the same.
+Messages to a coordinator on another host or in another harness go through
+`agent-teams`, whose tag uses the same grammar.
+
 ## Close what you finish
 
 If work is delivered, **close the issue**. Do not leave it open with a comment

@@ -3317,6 +3317,8 @@ exit 0
             arguments.into_iter().map(std::ffi::OsString::from),
             &move |name| match name {
                 "AGENTCLOUD_SESSION_ID" => session.clone(),
+                // A fixed sender, so the header the CLI adds is the same on every host.
+                "AGENTCTL_AGENT" => Some("lead".to_owned()),
                 _ => None,
             },
         )
@@ -3361,6 +3363,7 @@ exit 0
             0,
             "{command}"
         );
+        // The CLI opens the retried prompt with its sender header (#609 sender-header-mandatory).
         assert_eq!(
             fixture.calls().pop().unwrap(),
             strings(&[
@@ -3372,7 +3375,7 @@ exit 0
                 "--to",
                 SESSION,
                 "--body",
-                "follow-up",
+                "[from lead via agentctl · reply: agentctl send lead]\nfollow-up",
                 "--idempotency-key",
                 "retry-7",
             ])
