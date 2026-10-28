@@ -42,6 +42,7 @@
 #![forbid(unsafe_code)]
 
 mod active_state;
+mod adopt_write;
 mod archive_state;
 mod canonical;
 pub mod cli;

@@ -284,6 +284,32 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Bind an unowned slot to its live owner (writer; fixture registries only until cutover)
+    Adopt {
+        /// Active slot awaiting an owner
+        slot: String,
+        /// Agent name already recorded on the slot
+        #[arg(long, value_name = "NAME")]
+        agent: String,
+        /// Live owner PID to bind
+        #[arg(long, value_name = "PID")]
+        owner_pid: i64,
+        /// Current slot generation; refuses stale callers
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Transient systemd scope containing --owner-pid (both scope options together)
+        #[arg(long, value_name = "UNIT.scope")]
+        task_scope_unit: Option<String>,
+        /// Lowercase 32-hex systemd InvocationID for --task-scope-unit
+        #[arg(long, value_name = "HEX32")]
+        task_scope_invocation_id: Option<String>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Bootstrap the selected machine's shard pair and event log (writer; fixture registries only until cutover)
     EnsureStates {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -732,6 +758,39 @@ pub fn run() -> u8 {
                 coordinator_authorized,
                 adopt_legacy_change,
                 expected_generation,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::Adopt {
+            slot,
+            agent,
+            owner_pid,
+            expected_generation,
+            task_scope_unit,
+            task_scope_invocation_id,
+            root,
+            machine,
+        } => {
+            match crate::adopt_write::adopt_slot(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                &agent,
+                owner_pid,
+                expected_generation,
+                task_scope_unit.as_deref(),
+                task_scope_invocation_id.as_deref(),
             ) {
                 Ok(value) => {
                     println!(
