@@ -37,12 +37,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import unquote, urlsplit
 
+import page_sources
+
 if TYPE_CHECKING:
     from playwright.sync_api import Page, Route, WebSocketRoute
 
 TOKEN = "write-token-browser-voice-expand-check"
 ORIGIN = "https://vibe-talk.test"
-WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
+WEB_ROOT = page_sources.served_root()
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None, "added": False}
 Json = dict[str, object]
 

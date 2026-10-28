@@ -37,6 +37,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import page_sources
+
 TOKEN = "write-token-browser-enter-to-send-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
            "added": False}
@@ -170,7 +172,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument(
         "--web-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "web",
+        default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
     return parser.parse_args()

@@ -49,11 +49,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
+import page_sources
+
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
 
 HERE = Path(__file__).resolve().parent
-WEB_ROOT = HERE.parent / "web"
+WEB_ROOT = page_sources.served_root()
 FIXTURE = HERE / "fixtures" / "rich_headers_messages.json"
 TOKEN = "write-token-browser-rich-headers-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,

@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 
 import keyboard_browser as kb
 from keyboard_browser import TOKEN, Json, check
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Page
@@ -255,7 +256,7 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--browser-executable", default=os.environ.get("VIBE_TALK_CHROMIUM"),
                         help="Chrome/Chromium executable (default: Playwright's bundled Chromium)")
-    parser.add_argument("--web-root", type=Path, default=Path(__file__).resolve().parents[1] / "web",
+    parser.add_argument("--web-root", type=Path, default=page_sources.served_root(),
                         help="the page assets to serve (default: this checkout's vibe-talk/web)")
     parser.add_argument("--baseline-web-root", type=Path, default=None,
                         help="a copy of the page from before the change: the phone's dock must match it to the "

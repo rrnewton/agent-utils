@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from inline_reply_browser import ReplyColumnsApi, sign_in
 from offline_cache_browser import CHANNEL, check, handler_for, said, thread_of
+import page_sources
 from two_column_browser import CANARY, REPLICA, Desk
 
 if TYPE_CHECKING:
@@ -56,7 +57,7 @@ RECEIPTS_JS = """() => [...document.querySelectorAll('.outgoing-message')]
 def receipt_ms(web_root: Path) -> int:
     """The page's SENT_RECEIPT_MS, read from the page served: the walk waits it out for real. A page
     without one (before #500) is given the 15 s this one has, and fails the walk by what it draws."""
-    found = re.search(r"^const SENT_RECEIPT_MS = (\d+);$", (web_root / "voice.js").read_text(), re.MULTILINE)
+    found = re.search(r"^const SENT_RECEIPT_MS = (\d+);$", page_sources.source_text(web_root, "voice.js"), re.MULTILINE)
     return int(found.group(1)) if found else 15000
 
 

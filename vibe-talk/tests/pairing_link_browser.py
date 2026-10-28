@@ -32,6 +32,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import page_sources
+
 TOKEN = "write-token-browser-pairing-link-check"
 CODE = "Pq3x_Zr-7AbCdEfGhIjKlMnOpQrStUvWxYz01234567"
 SECOND_CODE = "Zz9y_Xw-8VuTsRqPoNmLkJiHgFeDcBa98765432100"
@@ -167,7 +169,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument(
         "--web-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "web",
+        default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
     parser.add_argument(

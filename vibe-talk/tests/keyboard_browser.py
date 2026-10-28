@@ -88,6 +88,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import page_sources
+
 if TYPE_CHECKING:
     from playwright.sync_api import CDPSession, Page
 
@@ -463,7 +465,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument(
         "--web-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "web",
+        default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
     parser.add_argument("--screenshots", type=Path, default=None,

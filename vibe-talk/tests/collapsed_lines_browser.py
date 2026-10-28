@@ -49,10 +49,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import page_sources
+
 if TYPE_CHECKING:
     from playwright.sync_api import CDPSession, Page, Route
 
-WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
+WEB_ROOT = page_sources.served_root()
 TOKEN = "write-token-browser-collapsed-lines-check"
 CHANNEL = {"id": "1120000000000000001", "label": "dev lane", "writable": True, "alias": None, "added": False}
 EPOCH = datetime(2026, 10, 22, 9, 0, tzinfo=timezone.utc)

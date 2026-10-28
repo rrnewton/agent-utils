@@ -1,14 +1,12 @@
 // `#621 send-double-check`: tick states and duration readout.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const js = readFileSync(join(here, "../../web/voice.js"), "utf8");
-const css = readFileSync(join(here, "../../web/voice.css"), "utf8");
+import { readWeb } from "../../web/page_sources.mjs";
+
+const js = readWeb("voice.js");
+const css = readWeb("voice.css");
 
 function loadHelpers() {
   const start = js.indexOf("function fmtDuration");

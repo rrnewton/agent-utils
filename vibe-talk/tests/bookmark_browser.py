@@ -50,10 +50,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import page_sources
+
 if TYPE_CHECKING:
     from playwright.sync_api import Page
 
-WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
+WEB_ROOT = page_sources.served_root()
 TOKEN = "write-token-browser-bookmark-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
            "added": False}

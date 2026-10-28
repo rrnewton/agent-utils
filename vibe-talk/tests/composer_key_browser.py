@@ -38,6 +38,7 @@ from pathlib import Path
 
 import keyboard_browser as kb
 from keyboard_browser import TOKEN, Json, Walk, check
+import page_sources
 
 FIRST_ROW = "#discord-log > li[data-id]"
 CARD = "#side-cards > li[data-id] .side-card"
@@ -176,7 +177,7 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--browser-executable", default=os.environ.get("VIBE_TALK_CHROMIUM"),
                         help="Chrome/Chromium executable (default: Playwright's bundled Chromium)")
-    parser.add_argument("--web-root", type=Path, default=Path(__file__).resolve().parents[1] / "web",
+    parser.add_argument("--web-root", type=Path, default=page_sources.served_root(),
                         help="the page assets to serve (default: this checkout's vibe-talk/web)")
     parser.add_argument("--screenshots", type=Path, default=None,
                         help="a directory to keep one PNG per step in (default: none kept)")

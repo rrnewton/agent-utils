@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import unquote, urlsplit
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page
@@ -365,7 +366,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument(
         "--web-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "web",
+        default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
     return parser.parse_args()

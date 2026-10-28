@@ -83,6 +83,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, check, said
 from scroll_stability_browser import SUMMARY, Reader, StabilityApi, handler, thread_record, view_key
 from two_column_browser import UNSPLIT_CARDS_JS
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -297,7 +298,7 @@ CONTROLS: tuple[Control, ...] = (
 
 def page_rest_ms(root: Path) -> float:
     """The wheel's rest as the page at `root` states it (`OVERSCROLL_REST_MS` in voice.js)."""
-    found = re.search(r"^const OVERSCROLL_REST_MS = (\d+);$", (root / "voice.js").read_text(), re.MULTILINE)
+    found = re.search(r"^const OVERSCROLL_REST_MS = (\d+);$", page_sources.source_text(root, "voice.js"), re.MULTILINE)
     check(found is not None, f"{root / 'voice.js'} no longer states OVERSCROLL_REST_MS")
     assert found is not None
     return float(found.group(1))

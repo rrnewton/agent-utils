@@ -202,13 +202,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import page_sources
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from playwright.sync_api import BrowserType, FloatRect, Page, Route
 
 
-WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
+WEB_ROOT = page_sources.served_root()
 TOKEN = "write-token-browser-cache-check"
 READ_TOKEN = "read-token-browser-cache-check"
 SCOPES = {f"Bearer {TOKEN}": "write", f"Bearer {READ_TOKEN}": "read"}
@@ -2078,7 +2080,7 @@ PHONE_DOCK_PX = 1 + 2.85 * 16 + 6.4 * 16
 PHONE_SPAN_PX = 5.2 * 16
 PHONE_NARROW_PX = 3.5 * 16
 # How far from the end of the list a reader may be and still be followed: web/voice.js's own number.
-_BOTTOM_SLACK = re.search(r"const BOTTOM_SLACK_PX = (\d+);", (WEB_ROOT / "voice.js").read_text())
+_BOTTOM_SLACK = re.search(r"const BOTTOM_SLACK_PX = (\d+);", page_sources.source_text(WEB_ROOT, "voice.js"))
 if _BOTTOM_SLACK is None:
     raise SystemExit("web/voice.js no longer declares BOTTOM_SLACK_PX, which the dock walk follows from")
 BOTTOM_SLACK_PX = int(_BOTTOM_SLACK[1])

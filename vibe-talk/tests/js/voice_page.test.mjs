@@ -32,9 +32,10 @@
 import { afterEach, beforeEach, test as nodeTest } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import vm from "node:vm";
+
+import { SHELL, WEB, occurrences, readWeb, shellScripts } from "../../web/page_sources.mjs";
 
 /**
  * One slice of the suite, or all of it. `VOICE_PAGE_SHARD=i/n` runs the tests at positions i, i+n,
@@ -114,12 +115,16 @@ afterEach(() => {
   assert.deepStrictEqual(found, [], "a read of the channel did not say why it was made (remote-ops-audit)");
 });
 
-const WEB = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "web");
-const SCRIPT = readFileSync(join(WEB, "voice.js"), "utf8");
-// The generated wire-contract validators, loaded first exactly as voice.html loads them: every
-// payload this fixture's fake server sends is decoded by them before the page reads it.
-const CONTRACT = readFileSync(join(WEB, "contract.js"), "utf8");
-const HTML = readFileSync(join(WEB, "voice.html"), "utf8");
+const SCRIPT_FILE = "voice.js";
+const SCRIPT = readWeb(SCRIPT_FILE);
+const HTML = readWeb(SHELL);
+/**
+ * The scripts every page here runs, in order: the ones the shell loads, as it loads them
+ * (`#624 voice-page-modularity`). A negative control replaces `SCRIPT_FILE`'s text with its own.
+ * The first is the generated wire-contract validators: every payload this fixture's fake server
+ * sends is decoded by them before the page reads it.
+ */
+const PAGE_SCRIPTS = shellScripts(HTML);
 /**
  * The elements the server's sanitizer may send, from src/render.rs itself rather than restated, so
  * this fixture's parser and the sanitizer cannot drift apart. `#217 markdown-blocks`.
@@ -145,12 +150,12 @@ const storeWords = (type) => {
   return new Set(words);
 };
 const MARKER_WORDS = { transports: storeWords("RecapTransport"), whys: storeWords("RecapNone") };
-const CSS = readFileSync(join(WEB, "voice.css"), "utf8");
+const CSS = readWeb("voice.css");
 // The BASE sheet, web/style.css: the colours and components voice.css is layered on. Read so that
 // a claim about a colour differing from the resting one can be checked against the resting one,
 // rather than against a restatement of it here — `#56 message-hover-highlight`. It was shared with
 // an older page at `/` until `#302 root-is-the-app`.
-const BASE_CSS = readFileSync(join(WEB, "style.css"), "utf8");
+const BASE_CSS = readWeb("style.css");
 
 /**
  * The same files with their comments removed.
@@ -1784,8 +1789,10 @@ function replyDismissals(messages, dealtWith) {
  * cached script in every tab that loads it: compiling web/voice.js afresh for every page was a
  * twentieth of the suite (`test-time-vibe-talk`). A negative control's copy is compiled on its own.
  */
-const CONTRACT_COMPILED = new vm.Script(CONTRACT, { filename: "contract.js" });
-const SCRIPT_COMPILED = new vm.Script(SCRIPT, { filename: "voice.js" });
+const COMPILED = new Map(PAGE_SCRIPTS.map((name) => [
+  name,
+  new vm.Script(name === SCRIPT_FILE ? SCRIPT : readWeb(name), { filename: name }),
+]));
 
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const elements = new Map();
@@ -4668,8 +4675,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   // here, before a line of the page has run.
   if (arrange) arrange(page);
   vm.createContext(context);
-  CONTRACT_COMPILED.runInContext(context);
-  (script === SCRIPT ? SCRIPT_COMPILED : new vm.Script(script, { filename: "voice.js" })).runInContext(context);
+  for (const name of PAGE_SCRIPTS) {
+    const compiled = name === SCRIPT_FILE && script !== SCRIPT ? new vm.Script(script, { filename: name }) : COMPILED.get(name);
+    compiled.runInContext(context);
+  }
   // `#212 link-filter`. One of the page's own functions, by name, for the few that are PURE — an
   // address in, a kind out — and so are pinned down as values, a table of them at a time. Only for
   // those: everything the reader sees is asserted through the page as it draws it.
@@ -4693,16 +4702,32 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
  * scroll position satisfies "the scroll position did not move" on any implementation at all,
  * including one that does nothing. The `includes` check is the other half — a control that no
  * longer matches the source would silently become a second copy of the positive test.
+ *
+ * `count` is how many times `find` occurs in web/voice.js, one unless the caller says otherwise, and
+ * only the first is replaced: a needle that came to match a second place would otherwise go on
+ * patching whichever comes first without a word (`#624 voice-page-modularity`).
  */
-function brokenScript(find, replace) {
+function brokenScript(find, replace, count = 1) {
   assert.ok(
     SCRIPT.includes(find),
     `the negative control patches ${JSON.stringify(find)}, which web/voice.js no longer contains`
   );
+  assert.equal(occurrences(SCRIPT, find), count,
+    `the negative control patches ${JSON.stringify(find)}, which web/voice.js holds a different number of times`);
   const mutated = SCRIPT.replace(find, replace);
   assert.notEqual(mutated, SCRIPT, "the negative control changed nothing");
   return mutated;
 }
+
+test("`#624 voice-page-modularity`: every page here runs the scripts the shell loads, in its order, and a control's needle is counted", () => {
+  assert.deepStrictEqual(PAGE_SCRIPTS, ["contract.js", SCRIPT_FILE]);
+  // The tags, not the prose: a commented-out tag loads nothing, and a version query is not the name.
+  assert.deepStrictEqual(shellScripts('<!-- <script src="/old.js"></script> --><script src="/a.js?v=1"></script>'), ["a.js"]);
+  assert.throws(() => shellScripts("<script>inline();</script>"), /names no local file/);
+  assert.throws(() => shellScripts('<script src="//elsewhere.example/a.js"></script>'), /names no local file/);
+  // A needle that occurs twice is refused unless the control says it means the first of two.
+  assert.throws(() => brokenScript("  if (chosen) rememberChosenView(chosen);", ""), /different number of times/);
+});
 
 /**
  * Drive the whole happy path: sign in, mint, open the microphone, open the socket.
@@ -36790,7 +36815,8 @@ test("ON THE CALL'S VIEW TOO, the chips' room growing under the box keeps a foll
   // THE CONTROL: the re-pin as it was, for the channel only. The reader is left short.
   const control = await run(brokenScript(
     'const pinned = !landed && currentScreen === "main" && followsNewest(area);',
-    'const pinned = !landed && currentScreen === "main" && currentView === "discord" && followsNewest(area);'
+    'const pinned = !landed && currentScreen === "main" && currentView === "discord" && followsNewest(area);',
+    2 // the second is the same re-pin after the dock moves, left as it is
   ));
   assert.equal(control, false, "the model does not grow the room, so this test says nothing");
 });
@@ -47680,7 +47706,7 @@ test("a channel reopens in the view chosen in it, one nobody chose a view in ope
     "a channel nobody chose a view in was recorded as choosing one");
 
   // THE CONTROL: with the choice not kept, coming back opens in All, and this fails.
-  const control = await run(brokenScript("  if (chosen) rememberChosenView(chosen);", "  if (chosen) void chosen;"));
+  const control = await run(brokenScript("  if (chosen) rememberChosenView(chosen);", "  if (chosen) void chosen;", 2));
   assert.equal(control.page.el("thread-select").value, "flat", "the test cannot tell a kept choice from none");
 
   // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
@@ -52931,7 +52957,7 @@ test("...and the dock and the chips changing as the thread opens leave the first
   assert.deepStrictEqual(dockOnly, { ...real, afterDock: false, afterChips: false });
   const chipsOnly = await run(brokenScript(
     "const landed = currentScreen === \"main\" && currentView === \"discord\" && entryLandingHolds();",
-    "const landed = false;"));
+    "const landed = false;", 2));
   assert.deepStrictEqual(chipsOnly, { ...real, afterChips: false });
 });
 

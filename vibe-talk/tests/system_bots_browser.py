@@ -39,10 +39,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
+import page_sources
+
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
 
-WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
+WEB_ROOT = page_sources.served_root()
 TOKEN = "write-token-browser-system-bots-check"
 CHANNEL = {"id": "C0000TEAM1", "label": "new channel", "writable": True, "alias": None,
            "added": False}
