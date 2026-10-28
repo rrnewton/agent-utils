@@ -69,6 +69,53 @@ pub const MAX_RESCUES_PER_PASS: usize = 32;
 pub const PASS_BUDGET: Duration = Duration::from_secs(60);
 /// The longest wait after consecutive failed passes.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
+/// In-pass retries of one rate-limited listing.
+pub const MAX_RATE_LIMIT_RETRIES: usize = 3;
+/// Longest single in-pass wait for a rate-limited listing; a longer `retry_after` is left to
+/// the next pass's scheduling instead.
+pub const MAX_RATE_LIMIT_RETRY_WAIT: Duration = Duration::from_secs(15);
+/// Longest wait before the next pass after a rate-limited pass.
+pub const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// The wait Slack asked for before retrying a rate-limited listing, when `error` is one and
+/// names it (`retry_after_seconds` in the client's error document, or "Retry after N seconds"
+/// in its message). `None` for any other failure, including a rate limit that names no wait.
+#[must_use]
+pub fn rate_limit_delay(error: &crate::transport::TransportError) -> Option<Duration> {
+    let code = error.code.to_ascii_lowercase();
+    let detail = error.detail.to_ascii_lowercase();
+    let limited = (code.contains("rate") && code.contains("limit"))
+        || detail.contains("rate-limited")
+        || detail.contains("rate_limited")
+        || detail.contains("ratelimited");
+    if !limited {
+        return None;
+    }
+    let seconds = [
+        "retry_after_seconds",
+        "retry_after",
+        "retry-after",
+        "retry after",
+    ]
+    .iter()
+    .find_map(|marker| parse_seconds_after(&detail, marker))?;
+    Some(Duration::from_secs(seconds.min(MAX_BACKOFF.as_secs())))
+}
+
+fn parse_seconds_after(text: &str, marker: &str) -> Option<u64> {
+    // The number must follow the marker directly (after JSON punctuation), so digits
+    // elsewhere in the detail can never invent a wait.
+    let rest = text.split(marker).nth(1)?;
+    let digits: String = rest
+        .trim_start_matches(['"', ':', ' ', '='])
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
 /// Most entries in each ledger list.
 pub const MAX_LEDGER_ENTRIES: usize = 4_096;
 /// Where the download commands in a file note save files.
@@ -449,6 +496,26 @@ mod tests {
             rescue_cursor(&cursor, "C0C91RW5FAR/1792000802.000100"),
             "slack1:seq:7;rescued:C0C91RW5FAR/1792000802.000100"
         );
+    }
+
+    #[test]
+    fn rate_limit_waits_come_from_slacks_own_retry_after() {
+        let limited = crate::transport::TransportError::not_applied(
+            "slack_rate_limited",
+            "Slack rate-limited request conversations.history. Retry after 2 seconds. \
+             {\"retry_after_seconds\":2}",
+            true,
+        );
+        assert_eq!(rate_limit_delay(&limited), Some(Duration::from_secs(2)));
+        let generic =
+            crate::transport::TransportError::not_applied("ratelimited", "slow down", true);
+        assert_eq!(rate_limit_delay(&generic), None);
+        let other = crate::transport::TransportError::not_applied(
+            "client_failed",
+            "client exited with exit status: 1",
+            true,
+        );
+        assert_eq!(rate_limit_delay(&other), None);
     }
 
     #[test]

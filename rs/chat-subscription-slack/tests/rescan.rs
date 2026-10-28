@@ -872,6 +872,100 @@ fn an_active_thread_older_than_the_window_is_listed() {
     fs::remove_dir_all(&directory).unwrap();
 }
 
+clock!(ratelimit_clock, RATELIMIT_NOW);
+
+#[test]
+fn rate_limited_listings_retry_and_still_deliver_file_messages() {
+    // Live regression 2026-10-28 (#615 chat-file-messages): Slack rate-limited
+    // conversations.history (429, retry after 1-2 s) for hours. Every pass aborted on the
+    // first failed listing and backed off exponentially to 30 min, so two owner messages
+    // with screenshots were never rescued. A rate-limited listing must be retried after
+    // its retry_after within the same pass.
+    let directory = scratch("ratelimit");
+    let fake = FakeTransport::new();
+    fake.push_script(heartbeats(6));
+    for _ in 0..2 {
+        fake.state()
+            .scan_failures
+            .push_back(TransportError::not_applied(
+                "slack_rate_limited",
+                "Slack rate-limited request conversations.history. Retry after 0 seconds. \
+                 {\"retry_after_seconds\":0}",
+                true,
+            ));
+    }
+    let files_only = ts(T0 + 10_000);
+    let text_and_file = ts(T0 + 20_000);
+    fake.push_history(listed(&files_only, None, OWNER, "", &["F0JJJJJJJJ1"]));
+    fake.push_history(listed(
+        &text_and_file,
+        None,
+        OWNER,
+        "look at this",
+        &["F0JJJJJJJJ2"],
+    ));
+    let mut backend = backend(&fake, ratelimit_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, None, json!({}))).unwrap();
+    commit_next(&mut subscription);
+    RATELIMIT_NOW.store(T0 + 100_000, Ordering::SeqCst);
+    let first = next_batch_within(&mut subscription, 2).expect("files-only rescue");
+    let message = single_message(&first);
+    assert_eq!(
+        message.message_id().as_str(),
+        format!("{CHANNEL}/messages/{files_only}")
+    );
+    assert!(message.text().contains("1 attached file: F0JJJJJJJJ1."));
+    assert!(message.text().contains("--file-id=F0JJJJJJJJ1"));
+    let payload = message.provider_payload().unwrap().data();
+    assert_eq!(payload["file_ids"], json!(["F0JJJJJJJJ1"]));
+    assert_eq!(payload["delivered_by"], "rescan");
+    subscription.commit_durable(&first).unwrap();
+    let second = next_batch_within(&mut subscription, 2).expect("text+file rescue");
+    let message = single_message(&second);
+    assert!(message.text().starts_with("look at this"));
+    assert!(message.text().contains("1 attached file: F0JJJJJJJJ2."));
+    subscription.commit_durable(&second).unwrap();
+    assert!(
+        fake.state().scans.len() >= 3,
+        "two rate-limited attempts then a successful listing: {:?}",
+        fake.state().scans
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(activity_clock, ACTIVITY_NOW);
+
+#[test]
+fn channel_activity_pulls_the_rescan_forward() {
+    // #615: a file message beside ordinary traffic must arrive within seconds, not at
+    // the next 90 s interval. A stream-carried message pulls the next pass to +20 s.
+    let directory = scratch("activity");
+    let fake = FakeTransport::new();
+    let carried = ts(T0 + 5_000);
+    let file_ts = ts(T0 + 10_000);
+    let mut script = vec![stream_message(9, &carried, None, "hello")];
+    script.extend(heartbeats(6));
+    fake.push_script(script);
+    fake.push_history(listed(&file_ts, None, OWNER, "", &["F0KKKKKKKK1"]));
+    let mut backend = backend(&fake, activity_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, None, json!({}))).unwrap();
+    commit_next(&mut subscription);
+    let plain = commit_next(&mut subscription);
+    assert_eq!(single_message(&plain).text(), "hello");
+    ACTIVITY_NOW.store(T0 + 30_000, Ordering::SeqCst);
+    let rescued = next_batch_within(&mut subscription, 2).expect("activity-pulled rescue");
+    assert_eq!(
+        single_message(&rescued).message_id().as_str(),
+        format!("{CHANNEL}/messages/{file_ts}")
+    );
+    subscription.commit_durable(&rescued).unwrap();
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
 clock!(overflow_clock, OVERFLOW_NOW);
 
 #[test]

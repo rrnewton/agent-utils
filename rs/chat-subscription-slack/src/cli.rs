@@ -907,7 +907,16 @@ const PERMANENT_ERRORS: &[&str] = &[
 /// client refused the call, so the write did not happen. A failure with no readable error
 /// document cannot prove that, and is reported with an unknown outcome.
 fn exit_failure(completed: &Completed, write: bool) -> TransportError {
-    let parsed = first_json_value(&completed.stdout);
+    // The client writes its error document to stdout or stderr depending on the command;
+    // the live rate-limit document arrives on stderr (#615 chat-file-messages). Whichever
+    // stream carries an error document wins; a non-error stdout document must not hide it.
+    let parsed = [&completed.stdout, &completed.stderr]
+        .into_iter()
+        .find_map(|bytes| {
+            first_json_value(bytes)
+                .filter(|value| value.get("status").and_then(Value::as_str) == Some("error"))
+        })
+        .or_else(|| first_json_value(&completed.stdout));
     let message = parsed
         .as_ref()
         .filter(|value| value.get("status").and_then(Value::as_str) == Some("error"))
@@ -930,8 +939,13 @@ fn exit_failure(completed: &Completed, write: bool) -> TransportError {
     if let Some(code) = PERMANENT_ERRORS.iter().find(|code| lower.contains(**code)) {
         return TransportError::not_applied(code, message, false);
     }
+    if lower.contains("ratelimited")
+        || lower.contains("rate_limited")
+        || lower.contains("rate-limited")
+    {
+        return TransportError::not_applied("ratelimited", message, true);
+    }
     let code = [
-        "ratelimited",
         "not_in_channel",
         "channel_not_found",
         "is_archived",

@@ -2194,7 +2194,12 @@ for a message the rescan already delivered commits as a checkpoint, and a
 restart offers an unacknowledged rescued batch again, identically, before
 anything else, as the host requires after a rollback; waiting for the tail to
 catch up keeps a rescued batch from overtaking a stream batch the host needs
-again. The rescan never rescues a message created before the ledger began, and
+again. Any message the stream does carry pulls the next pass to within about
+20 seconds, so a file message posted beside ordinary traffic arrives within
+seconds. When Slack rate-limits a listing, the pass retries it after the wait Slack
+named and, if it still cannot list, schedules the next pass from that wait rather
+than backing off exponentially; one thread's failed listing does not discard what
+the channel history already found. The rescan never rescues a message created before the ledger began, and
 when a subscription resumes from a cursor other than the one the ledger last
 recorded (an older plugin moved the bridge on), it rescues nothing created
 before that subscription. The ledger records carried messages even while

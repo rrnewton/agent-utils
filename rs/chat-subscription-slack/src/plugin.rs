@@ -106,8 +106,8 @@ use crate::diag::{unix_millis, Diagnostics};
 use crate::ids;
 use crate::rescan::{self, message_key, Ledger, PendingRescue};
 use crate::transport::{
-    Catchup, EventStream, ScanQuery, SlackMessage, SlackTransport, StreamCancel, StreamRecord,
-    StreamWait, SubscribeSpec, TransportError, WebApiTransport,
+    Catchup, EventStream, ScanPage, ScanQuery, SlackMessage, SlackTransport, StreamCancel,
+    StreamRecord, StreamWait, SubscribeSpec, TransportError, WebApiTransport,
 };
 
 /// Schema of `backend_configuration` for this plugin.
@@ -834,6 +834,9 @@ const MAX_TRACKED_THREADS: usize = 1_024;
 const SETTLE_FALLBACK_MILLIS: u64 = 10 * 60 * 1_000;
 /// A thread the stream carried a reply in is listed for this long after that reply.
 const ACTIVE_THREAD_MILLIS: u64 = 30 * 60 * 1_000;
+/// After any stream-carried message, the next rescan pass is pulled to this far ahead, so a
+/// file message posted beside ordinary traffic is rescued within seconds (#615).
+const ACTIVITY_RESCAN_MILLIS: u64 = 20_000;
 
 fn micros_ts(micros: u128) -> String {
     format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
@@ -1180,6 +1183,15 @@ impl SlackDriver {
                 ));
             }
         }
+        // A file message beside this one is invisible to the stream, so channel activity
+        // pulls the next pass forward: a screenshot the owner sends just before or after a
+        // text message is rescued within seconds, not at the next interval (#615).
+        if rescan.interval.is_some() && !rescan.stopped {
+            let due = now.saturating_add(ACTIVITY_RESCAN_MILLIS);
+            if due < rescan.next_due_millis {
+                rescan.next_due_millis = due;
+            }
+        }
         None
     }
 
@@ -1279,6 +1291,54 @@ impl SlackDriver {
 
     /// One bounded pass over every configured channel's history and the threads in it with
     /// replies not yet listed; see the module documentation.
+    /// One rescan listing. A rate-limited listing is retried in-pass after the wait Slack
+    /// named (#615 chat-file-messages: a 429 aborted every pass for hours, and the
+    /// exponential backoff to 30 min kept file messages from ever being rescued), bounded
+    /// by the pass budget, the cancellation flag and [`rescan::MAX_RATE_LIMIT_RETRIES`].
+    fn scan_listing(
+        &mut self,
+        query: &ScanQuery<'_>,
+        started: &Instant,
+    ) -> Result<ScanPage, TransportError> {
+        let mut retries = 0_usize;
+        let mut pending: Option<(TransportError, Duration)> = None;
+        loop {
+            if let Some((error, delay)) = pending.take() {
+                if retries > rescan::MAX_RATE_LIMIT_RETRIES
+                    || delay > rescan::MAX_RATE_LIMIT_RETRY_WAIT
+                {
+                    return Err(error);
+                }
+                let wait_start = Instant::now();
+                while wait_start.elapsed() < delay {
+                    if self.cancel.cancelled.load(Ordering::SeqCst)
+                        || started.elapsed() >= rescan::PASS_BUDGET
+                    {
+                        return Err(error);
+                    }
+                    std::thread::sleep(
+                        (delay - wait_start.elapsed()).min(Duration::from_millis(50)),
+                    );
+                }
+                if self.cancel.cancelled.load(Ordering::SeqCst)
+                    || started.elapsed() >= rescan::PASS_BUDGET
+                {
+                    return Err(error);
+                }
+            }
+            match self.transport.scan_messages(query) {
+                Ok(page) => return Ok(page),
+                Err(error) => {
+                    let Some(delay) = rescan::rate_limit_delay(&error) else {
+                        return Err(error);
+                    };
+                    retries += 1;
+                    pending = Some((error, delay));
+                }
+            }
+        }
+    }
+
     fn rescan_pass(&mut self, rescan: &mut Rescan, interval: Duration, now: u64) {
         let now_micros = u128::from(now) * 1_000;
         // History is listed over the whole window, so a thread whose root predates the ledger is
@@ -1311,11 +1371,24 @@ impl SlackDriver {
                     oldest: &oldest,
                     page_token: token.as_deref(),
                 };
-                let listed = match self.transport.scan_messages(&query) {
+                let listed = match self.scan_listing(&query, &started) {
                     Ok(listed) => listed,
                     Err(error) => {
-                        failure = Some(error);
-                        break 'pass;
+                        // A rate limit is global: firing more listings only deepens it,
+                        // so it still ends the pass (#615).
+                        let limited = rescan::rate_limit_delay(&error).is_some();
+                        if failure.is_none()
+                            || (limited
+                                && failure
+                                    .as_ref()
+                                    .is_some_and(|f| rescan::rate_limit_delay(f).is_none()))
+                        {
+                            failure = Some(error);
+                        }
+                        if limited {
+                            break 'pass;
+                        }
+                        break;
                     }
                 };
                 listings += 1;
@@ -1375,6 +1448,7 @@ impl SlackDriver {
                 let mut token: Option<String> = None;
                 let mut complete = false;
                 let mut overflowed = false;
+                let mut thread_failed = false;
                 for _ in 0..rescan::MAX_THREAD_PAGES {
                     if stop(self) {
                         break 'pass;
@@ -1385,11 +1459,26 @@ impl SlackDriver {
                         oldest: &oldest,
                         page_token: token.as_deref(),
                     };
-                    let listed = match self.transport.scan_messages(&query) {
+                    let listed = match self.scan_listing(&query, &started) {
                         Ok(listed) => listed,
                         Err(error) => {
-                            failure = Some(error);
-                            break 'pass;
+                            // One thread's listing must not abort the pass: what the
+                            // history listing already found is still delivered (#615).
+                            // A rate limit is global, so it still ends the pass.
+                            let limited = rescan::rate_limit_delay(&error).is_some();
+                            if failure.is_none()
+                                || (limited
+                                    && failure
+                                        .as_ref()
+                                        .is_some_and(|f| rescan::rate_limit_delay(f).is_none()))
+                            {
+                                failure = Some(error);
+                            }
+                            if limited {
+                                break 'pass;
+                            }
+                            thread_failed = true;
+                            break;
                         }
                     };
                     listings += 1;
@@ -1414,7 +1503,7 @@ impl SlackDriver {
                     listed_through = listed_through.max(latest);
                 }
                 // A reply left out because the queue was full must be listed again.
-                if !overflowed {
+                if !overflowed && !thread_failed {
                     rescan.threads.insert(key, listed_through);
                 }
             }
@@ -1443,6 +1532,21 @@ impl SlackDriver {
                 self.diagnostics.log(&format!(
                     "rescan stopped: the transport cannot list history ({}: {})",
                     error.code, error.detail
+                ));
+            }
+            Some(error) if rescan::rate_limit_delay(&error).is_some() => {
+                // Slack named the wait; honour it (plus one interval) instead of backing
+                // off exponentially to 30 min (#615 chat-file-messages).
+                let delay = (interval + rescan::rate_limit_delay(&error).unwrap_or_default())
+                    .min(rescan::MAX_RATE_LIMIT_BACKOFF);
+                rescan.next_due_millis =
+                    now.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+                self.diagnostics.log(&format!(
+                    "rescan: a listing failed after {listings} succeeded ({}: {}); next pass \
+                     in {} s (rate-limited)",
+                    error.code,
+                    error.detail,
+                    delay.as_secs()
                 ));
             }
             Some(error) => {
