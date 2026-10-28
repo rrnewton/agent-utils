@@ -24,6 +24,23 @@ pub(crate) struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
+    /// Remove and archive one slot (writer; fixture registries only until cutover)
+    Remove {
+        /// Active slot to remove
+        slot: String,
+        /// Live coordinator PID authorizing the removal
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// Current slot generation; refuses stale callers
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Strictly replay an event log and atomically replace the derived index
     Rebuild {
         /// Real EVENTS.<machine> directory to validate; it is never modified
@@ -784,6 +801,33 @@ pub fn run() -> u8 {
                 owner_pid,
                 expected_generation,
                 &from_file,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::Remove {
+            slot,
+            coordinator_pid,
+            expected_generation,
+            root,
+            machine,
+        } => {
+            match crate::remove_write::remove_slot(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                coordinator_pid,
+                expected_generation,
             ) {
                 Ok(value) => {
                     println!(

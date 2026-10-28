@@ -69,6 +69,7 @@ mod policy;
 mod read_handoff_write;
 mod record_holds;
 mod release_write;
+mod remove_write;
 mod replay;
 mod schema;
 mod status_state;

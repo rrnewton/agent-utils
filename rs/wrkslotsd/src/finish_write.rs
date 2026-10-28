@@ -193,7 +193,7 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
-fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<(String, PathBuf)> {
+pub(crate) fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<(String, PathBuf)> {
     let candidate = Path::new(raw);
     let parts: Vec<String> = candidate
         .components()
@@ -503,7 +503,7 @@ fn cache_glob_contains_path(pattern: &str, path: &str) -> bool {
     glob_parts_match(&pattern_parts, &path_parts[..pattern_parts.len()])
 }
 
-fn cache_globs_for(config: &Value, checkout_name: &str) -> Vec<String> {
+pub(crate) fn cache_globs_for(config: &Value, checkout_name: &str) -> Vec<String> {
     let mut selected: Vec<String> = Vec::new();
     if let Some(items) = config.get("cache_globs").and_then(Value::as_array) {
         for item in items {
@@ -855,7 +855,7 @@ fn unpushed_refusal(checkout_path: &Path, checkout: &Value, head: &str) -> Resul
     ))
 }
 
-fn assert_checkout_safe(
+pub(crate) fn assert_checkout_safe(
     cfg: &Cfg,
     config: &Value,
     checkout: &Value,
@@ -1124,7 +1124,7 @@ fn assert_checkout_safe(
     Ok(updated)
 }
 
-fn record_layout(cfg: &Cfg, record: &Value) -> Result<String> {
+pub(crate) fn record_layout(cfg: &Cfg, record: &Value) -> Result<String> {
     let layout = record
         .get("layout")
         .and_then(Value::as_str)
@@ -1139,7 +1139,7 @@ fn record_layout(cfg: &Cfg, record: &Value) -> Result<String> {
     Ok(layout)
 }
 
-fn assert_record_paths(cfg: &Cfg, record: &Value) -> Result<()> {
+pub(crate) fn assert_record_paths(cfg: &Cfg, record: &Value) -> Result<()> {
     let slot = record
         .get("slot")
         .and_then(Value::as_str)
@@ -1211,7 +1211,7 @@ fn assert_record_paths(cfg: &Cfg, record: &Value) -> Result<()> {
     Ok(())
 }
 
-fn assert_slot_contents(cfg: &Cfg, record: &Value) -> Result<PathBuf> {
+pub(crate) fn assert_slot_contents(cfg: &Cfg, record: &Value) -> Result<PathBuf> {
     let slot = record
         .get("slot")
         .and_then(Value::as_str)

@@ -5056,6 +5056,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "plan",
             "read-handoff",
             "rebuild",
+            "remove",
             "release",
             "status",
             "validate-config"

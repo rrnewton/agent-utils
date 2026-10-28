@@ -1,0 +1,291 @@
+"""Differential: wrkslotsd remove against the Python remove mutation.
+
+#562 rust-primary-wrkslots slice 36, the eleventh writer slice. The
+Python oracle is `_cmd_remove` on a copy of the fixture registry;
+the Rust writer runs on the original. Resulting ACTIVE/ARCHIVED
+records and event kinds must match apart from wall-clock stamps
+and each fixture's own Git history. Salvage corners needing a
+push, a bundle, owner consent, or attestation stay Python and are
+refused explicitly by the Rust writer. Temporary fixture
+registries only: writers are never pointed at a live registry
+before the edition cutover.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+from typing import cast
+
+import re
+
+import pytest
+from wrkslots import cli as wrkslots_cli
+
+
+AU_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _git(cwd: Path, *args: str) -> str:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        {
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+    )
+    result = subprocess.run(
+        [
+            "git", "-c", "user.email=test@example.invalid", "-c", "user.name=Test",
+            "-c", "commit.gpgsign=false", "-C", str(cwd), *args,
+        ],
+        capture_output=True, text=True, check=True, env=env, timeout=120,
+    )
+    return result.stdout.strip()
+
+
+def _repo(path: Path) -> str:
+    path.mkdir(parents=True)
+    _git(path, "init", "-q", "-b", "main")
+    (path / "file.txt").write_text("one\n")
+    _git(path, "add", "file.txt")
+    _git(path, "commit", "-q", "-m", "one")
+    return _git(path, "rev-parse", "HEAD")
+
+
+def _dead_identity() -> dict[str, object]:
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        identity = wrkslots_cli._read_process_identity(proc.pid)
+        return {
+            "pid": identity.pid,
+            "start_ticks": identity.start_ticks,
+            "boot_id": identity.boot_id,
+            "host_id": identity.host_id,
+            "cgroup_path": identity.cgroup_path,
+        }
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _fixture(base: Path) -> Path:
+    root = base / "project"
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+    )
+    upstream = base / "upstream-repo"
+    head = _repo(upstream)
+    _git(upstream, "remote", "add", "origin", str(upstream))
+    _git(upstream, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    _git(
+        upstream, "worktree", "add", "-q", "-b", "suite/work",
+        str(root / "worktrees" / "slot-a" / "repo"), "HEAD",
+    )
+    dead = _dead_identity()
+    record: dict[str, object] = {
+        "slot": "slot-a",
+        "agent": "agent-slot-a",
+        "task": "do work",
+        "purpose": "testing",
+        "machine": "node-a",
+        "generation": 1,
+        "created_at": "2026-10-26T00:00:00Z",
+        "heartbeat_at": "2026-10-26T01:00:00Z",
+        "heartbeat_ttl_seconds": 60,
+        "owner": dead,
+        "coordinator_lease": dead,
+        "coordinator_recovery_note": None,
+        "handoff": None,
+        "checkouts": [
+            {
+                "name": "repo",
+                "path": "worktrees/slot-a/repo",
+                "repository": "../upstream-repo",
+                "branch": "suite/work",
+                "start_point": head,
+                "remote": "origin",
+                "remote_url_sha256": hashlib.sha256(
+                    str(upstream).encode()
+                ).hexdigest(),
+                "landed_ref": "refs/remotes/origin/main",
+                "head": head,
+                "containing_remote_refs": ["refs/remotes/origin/main"],
+                "vcs": "git",
+            }
+        ],
+    }
+    (root / "worktrees" / "ACTIVE.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 7, "slots": [record]})
+    )
+    (root / "worktrees" / "ARCHIVED.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 3, "records": []})
+    )
+    return root
+
+
+def _pair(tmp_path: Path) -> tuple[Path, Path]:
+    return _fixture(tmp_path / "rust"), _fixture(tmp_path / "oracle")
+
+
+def _rust_remove(root: Path, *, fixture: bool = True) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    if fixture:
+        env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
+    else:
+        env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
+    return subprocess.run(
+        [
+            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
+            "-p", "wrkslotsd", "--", "remove", "slot-a",
+            "--coordinator-pid", str(os.getpid()), "--expected-generation", "1",
+            "--root", str(root),
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env
+    )
+
+
+def _python_remove(root: Path) -> int:
+    args = argparse.Namespace(
+        project_root=str(root), machine=None, slot="slot-a",
+        coordinator_authorized=False, validate_complete=False,
+        coordinator_pid=os.getpid(), expected_generation=1,
+        salvage_archive_root=None, validation_proof_manifest=None,
+        completed_record=None, attest_agent_stopped=None,
+        attest_agent_never_started=None, attest_note=None,
+        archive_drifted_checkouts=False, adopt_legacy_change=False, wait_lock=0.0,
+    )
+    return wrkslots_cli._cmd_remove(args)
+
+
+def _scrub_doc(doc: dict[str, object]) -> dict[str, object]:
+    for record in cast(list[dict[str, object]], doc.get("slots", doc.get("records", []))):
+        handoff = record.get("handoff")
+        if isinstance(handoff, dict):
+            handoff.pop("recorded_at")
+        for checkout in cast(list[dict[str, object]], record.get("checkouts", [])):
+            checkout["head"] = "HEAD"
+            checkout["start_point"] = "HEAD"
+            checkout["remote_url_sha256"] = "URLSHA"
+        record.pop("finished_at", None)
+        record.pop("archive_id", None)
+        if isinstance(record.get("validation"), list):
+            record["validation"] = [
+                re.sub(r"[0-9a-f]{40}", "HEAD", str(entry))
+                for entry in cast(list[object], record["validation"])
+            ]
+        handoff_value = record.get("handoff")
+        if isinstance(handoff_value, dict) and isinstance(
+            handoff_value.get("validation"), list
+        ):
+            handoff_value["validation"] = [
+                re.sub(r"[0-9a-f]{40}", "HEAD", str(entry))
+                for entry in cast(list[object], handoff_value["validation"])
+            ]
+        for item in cast(list[dict[str, object]], record.get("salvage", [])):
+            item["source_head"] = "HEAD"
+            item["salvage_commit"] = "HEAD"
+    return doc
+
+
+def _doc(root: Path, name: str) -> dict[str, object]:
+    doc: dict[str, object] = json.loads((root / "worktrees" / name).read_text())
+    return _scrub_doc(doc)
+
+
+def _kinds_and_actions(root: Path) -> list[tuple[str, str]]:
+    directory = root / "worktrees" / "EVENTS.node-a"
+    found: list[tuple[str, str]] = []
+    if not directory.is_dir():
+        return found
+    for path in sorted(directory.iterdir()):
+        event: dict[str, object] = json.loads(path.read_text())
+        assert event["sha256"] == wrkslots_cli._event_digest(
+            {k: v for k, v in event.items() if k != "sha256"}
+        )
+        payload = cast(dict[str, object], event["payload"])
+        found.append((str(event["kind"]), str(payload.get("action", ""))))
+    return found
+
+
+def test_remove_matches_python(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    assert _python_remove(oracle_root) == 0
+    result = _rust_remove(rust_root)
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert outcome["outcome"] == "removed and archived"
+    assert _doc(rust_root, "ACTIVE.node-a.json") == _doc(oracle_root, "ACTIVE.node-a.json")
+    assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
+        oracle_root, "ARCHIVED.node-a.json"
+    )
+    assert _kinds_and_actions(rust_root) == _kinds_and_actions(oracle_root)
+    for root in (rust_root, oracle_root):
+        assert not (root / "worktrees" / "slot-a").exists()
+        assert not (root / "worktrees" / "ACTIVE.node-a.journal").exists()
+
+
+def test_remove_dirty_checkout_refuses_salvage_scope(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    (rust_root / "worktrees" / "slot-a" / "repo" / "notes.txt").write_text("wip\n")
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "salvage stays with the Python edition" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_unpublished_commit_refuses_salvage_scope(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    checkout = rust_root / "worktrees" / "slot-a" / "repo"
+    (checkout / "file.txt").write_text("two\n")
+    _git(checkout, "add", "file.txt")
+    _git(checkout, "commit", "-q", "-m", "two")
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "salvage stays with the Python edition" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_live_owner_refuses_consent_scope(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    active_path = rust_root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(active_path.read_text())
+    identity = wrkslots_cli._read_process_identity(os.getpid())
+    document["slots"][0]["owner"] = {
+        "pid": identity.pid,
+        "start_ticks": identity.start_ticks,
+        "boot_id": identity.boot_id,
+        "host_id": identity.host_id,
+        "cgroup_path": identity.cgroup_path,
+    }
+    active_path.write_text(json.dumps(document))
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "consent" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_refuses_without_fixture_attestation(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    result = _rust_remove(rust_root, fixture=False)
+    assert result.returncode == 1
+    assert "fixture-only" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+    doc: dict[str, object] = json.loads(
+        (rust_root / "worktrees" / "ACTIVE.node-a.json").read_text()
+    )
+    assert len(cast(list[object], doc["slots"])) == 1
