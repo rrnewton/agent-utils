@@ -227,12 +227,47 @@ CREATE TABLE backfill (
 ) STRICT;
 ";
 
+/// `#602 history-settings-and-limits`. The full-text index keeps no positions: `detail = none`.
+///
+/// Measured on 20,000 messages shaped like the live store's (`tests/cache_bench.rs`,
+/// `measure_layout_and_compression_options`), the trigram index with positions was 4,386 bytes a
+/// message, more than half the file and more than twice the text it indexes; without them it is
+/// 601, and the file 48 % smaller, at the same search speed. Every search matches its candidates
+/// again in Rust, and the index is asked for the rows holding every trigram of a term
+/// ([`super::search::fts_query`]), which needs no positions. Rebuilt from `message.search_text`
+/// with no refetch. Older code still uses the file (it asks the index nothing at run time), so the
+/// compat stays.
+const V5: &str = "
+DROP TRIGGER message_fts_ai;
+DROP TRIGGER message_fts_ad;
+DROP TRIGGER message_fts_au;
+DROP TABLE message_fts_vocab;
+DROP TABLE message_fts;
+CREATE VIRTUAL TABLE message_fts USING fts5(
+    search_text, content = 'message', content_rowid = 'row_id', tokenize = 'trigram', detail = none
+);
+INSERT INTO message_fts (message_fts, rank) VALUES ('secure-delete', 1);
+INSERT INTO message_fts (message_fts) VALUES ('rebuild');
+CREATE VIRTUAL TABLE message_fts_vocab USING fts5vocab(message_fts, row);
+CREATE TRIGGER message_fts_ai AFTER INSERT ON message BEGIN
+    INSERT INTO message_fts (rowid, search_text) VALUES (new.row_id, new.search_text);
+END;
+CREATE TRIGGER message_fts_ad AFTER DELETE ON message BEGIN
+    INSERT INTO message_fts (message_fts, rowid, search_text) VALUES ('delete', old.row_id, old.search_text);
+END;
+CREATE TRIGGER message_fts_au AFTER UPDATE OF search_text ON message BEGIN
+    INSERT INTO message_fts (message_fts, rowid, search_text) VALUES ('delete', old.row_id, old.search_text);
+    INSERT INTO message_fts (rowid, search_text) VALUES (new.row_id, new.search_text);
+END;
+";
+
 /// Every step this code knows, in order. Step `n` (from 1) brings a file to `user_version = n`.
 pub const STEPS: &[Step] = &[
     Step { sql: V1, compat: 1 },
     Step { sql: V2, compat: 2 },
     Step { sql: V3, compat: 3 },
     Step { sql: V4, compat: 3 },
+    Step { sql: V5, compat: 3 },
 ];
 
 /// Why a file cannot be used.

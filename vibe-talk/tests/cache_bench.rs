@@ -687,3 +687,343 @@ fn bench_twelve_channels_of_10k_rows_search_erase_and_rebuild() {
     drop(cache);
     drop(dir);
 }
+
+// ---- `#602 history-settings-and-limits`: the file's layout, and what would make it smaller -----
+
+/// The live store's shape, as `vibe-talk cache-stats` measured it on 2026-10-27: about 900 bytes of
+/// text a message, and a search text about 1.9 times that (author, text, the drawn text where it
+/// differs, link addresses). Markdown and links make the drawn text differ, as Slack's do.
+fn layout_message(
+    id: u64,
+    channel: &str,
+    words: &[String],
+    created_ms: i64,
+    thread: Option<u64>,
+) -> Message {
+    let mut message = message(id, channel, words, created_ms, thread);
+    let start = usize::try_from(id.wrapping_mul(104_729)).unwrap_or(0) % (words.len() - 400);
+    // Lengths spread like chat: mostly short, some long agent reports.
+    let target = match id % 10 {
+        0..=4 => 300,
+        5..=7 => 900,
+        8 => 2_000,
+        _ => 3_000,
+    };
+    let mut content = String::new();
+    for (n, word) in words[start..].iter().enumerate() {
+        if content.len() > target {
+            break;
+        }
+        if !content.is_empty() {
+            content.push(' ');
+        }
+        match n % 23 {
+            5 => content.push_str(&format!("*{word}*")),
+            11 => content.push_str(&format!("`{word}`")),
+            17 => content.push_str(&format!("<https://example.test/{word}/{id}|{word}#{n}>")),
+            _ => content.push_str(word),
+        }
+    }
+    if id % 1_777 == 7 {
+        content.push_str(" a ");
+        content.push_str(RARE);
+    }
+    message.content = content;
+    message
+}
+
+/// The drawn text of [`layout_message`]: markup gone, each link its label, and its address apart.
+struct DrawnText;
+
+impl vibe_talk::cache::SearchTextSource for DrawnText {
+    fn version(&self) -> String {
+        "layout-1".to_owned()
+    }
+
+    fn rendered(&self, _provider_key: &str, message: &Message) -> Rendered {
+        let mut text = String::new();
+        let mut hrefs = Vec::new();
+        for word in message.content.split(' ') {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            if let Some(link) = word.strip_prefix('<').and_then(|w| w.strip_suffix('>')) {
+                let (href, label) = link.split_once('|').unwrap_or((link, link));
+                hrefs.push(href.to_owned());
+                text.push_str(label);
+            } else {
+                text.push_str(word.trim_matches(|c| c == '*' || c == '`'));
+            }
+        }
+        Rendered { text, hrefs }
+    }
+}
+
+/// Bytes of each object in `connection`'s file, and the file's pages in use.
+fn objects(connection: &Connection) -> (Vec<(String, i64)>, i64) {
+    let mut statement = connection
+        .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC")
+        .expect("dbstat");
+    let rows: Vec<(String, i64)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows")
+        .map(|row| row.expect("row"))
+        .collect();
+    let total = rows.iter().map(|(_, bytes)| bytes).sum();
+    (rows, total)
+}
+
+/// Rows whose search text holds `term`, by the index: `query` is the MATCH expression.
+fn candidates(connection: &Connection, query: &str) -> Result<Vec<i64>, rusqlite::Error> {
+    let mut statement = connection
+        .prepare("SELECT rowid FROM message_fts WHERE message_fts MATCH ?1 ORDER BY rowid")?;
+    let rows = statement.query_map([query], |row| row.get(0))?;
+    rows.collect()
+}
+
+/// The terms' trigrams, each quoted, joined by AND: the superset of rows a substring search of
+/// each term needs, which needs no positions in the index.
+fn trigram_and(terms: &[&str]) -> String {
+    let mut grams = Vec::new();
+    for term in terms {
+        let chars: Vec<char> = term.to_lowercase().chars().collect();
+        for window in chars.windows(3) {
+            let gram: String = window.iter().collect();
+            let quoted = format!("\"{}\"", gram.replace('"', "\"\""));
+            if !grams.contains(&quoted) {
+                grams.push(quoted);
+            }
+        }
+    }
+    grams.join(" AND ")
+}
+
+/// `#602 history-settings-and-limits`. Where a message cache file's bytes go, and what each cheap
+/// way of making it smaller saves, on 20,000 messages shaped like the live store's: the full-text
+/// index as it is (`detail=full`), merged into one segment, and rebuilt with `detail=column` or
+/// `detail=none` (positions dropped; a substring search then asks the index for the rows holding
+/// every trigram and re-matches them in Rust, as every search already does), each with and without
+/// `columnsize=0`; the time of a rare and a common search through each; and VACUUM. It leaves the
+/// files in `$VIBE_TALK_LAYOUT_DIR` (default a temporary directory) for the filesystem-compression
+/// step the README describes.
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn measure_layout_and_compression_options() {
+    let rows_per_channel: u64 = 5_000;
+    let keep = std::env::var_os("VIBE_TALK_LAYOUT_DIR").map(std::path::PathBuf::from);
+    let dir = vibe_talk::testing::TempDir::new("layout");
+    let out = keep.clone().unwrap_or_else(|| dir.path().to_owned());
+    std::fs::create_dir_all(&out).expect("out dir");
+    let base = out.join("baseline.sqlite3");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", base.display()));
+    }
+    {
+        let cache = MessageCache::open(CacheOptions {
+            limits: Limits {
+                max_bytes: 8 * 1024 * 1024 * 1024,
+                ..Limits::default()
+            },
+            search_text: Arc::new(DrawnText),
+            ..CacheOptions::new(base.clone())
+        })
+        .expect("open");
+        let keys: Vec<ChanKey> = (0..4).map(|c| ChanKey::new("p", format!("C{c}"))).collect();
+        cache.retain_only(routes(&keys));
+        let words = corpus();
+        let now = vibe_talk::cache::wall_ms();
+        for (c, chan) in keys.iter().enumerate() {
+            let mut i = 0;
+            while i < rows_per_channel {
+                let batch: Vec<Incoming> = (i..(i + 100).min(rows_per_channel))
+                    .map(|n| {
+                        let created =
+                            now - i64::try_from(rows_per_channel - n).unwrap_or(0) * 60_000;
+                        let id = n + u64::try_from(c).unwrap_or(0) * 1_000_000;
+                        // A third replies, as live (1,640 of 2,300).
+                        if n % 3 == 0 {
+                            let thread = n / 15;
+                            Incoming::new(
+                                layout_message(id, &chan.channel_id, &words, created, Some(thread)),
+                                Scope::Thread(format!("t{thread}")),
+                            )
+                        } else {
+                            Incoming::new(
+                                layout_message(id, &chan.channel_id, &words, created, None),
+                                Scope::Main,
+                            )
+                        }
+                    })
+                    .collect();
+                let stamp = cache.stamp(chan);
+                cache.offer(
+                    chan.clone(),
+                    stamp,
+                    Observation::Listing(Listing {
+                        scope: Scope::Main,
+                        rows: batch,
+                        observed_ms: now,
+                        proof: None,
+                    }),
+                );
+                i += 100;
+                if i % 2_000 == 0 {
+                    assert!(cache.barrier_blocking(Duration::from_secs(120)));
+                }
+            }
+        }
+        assert!(cache.barrier_blocking(Duration::from_secs(600)));
+        assert!(cache.quiesce_blocking(Duration::from_secs(600)));
+    }
+    let connection = Connection::open(&base).expect("reopen");
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
+    let (messages, content, search, extra): (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), SUM(LENGTH(CAST(content AS BLOB))), SUM(LENGTH(CAST(search_text AS BLOB))), \
+             SUM(LENGTH(CAST(extra AS BLOB))) FROM message",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("sums");
+    eprintln!(
+        "[load {}] corpus: {messages} messages; per message: content {} B, search_text {} B, extra {} B",
+        load(),
+        content / messages,
+        search / messages,
+        extra / messages
+    );
+    drop(connection);
+    let truth = |connection: &Connection, term: &str| -> Vec<i64> {
+        let mut statement = connection
+            .prepare("SELECT row_id FROM message WHERE instr(search_text, ?1) > 0 ORDER BY row_id")
+            .expect("scan");
+        statement
+            .query_map([term], |row| row.get(0))
+            .expect("rows")
+            .map(|row| row.expect("row"))
+            .collect()
+    };
+    let variants: &[(&str, &str)] = &[
+        ("baseline", ""),
+        (
+            "optimized",
+            "INSERT INTO message_fts (message_fts) VALUES ('optimize');",
+        ),
+        ("full-columnsize0", "full,0"),
+        ("column", "column,1"),
+        ("none", "none,1"),
+        ("none-columnsize0", "none,0"),
+    ];
+    for (name, change) in variants {
+        let path = out.join(format!("{name}.sqlite3"));
+        if *name != "baseline" {
+            let _ = std::fs::remove_file(&path);
+            std::fs::copy(&base, &path).expect("copy");
+        }
+        let connection = Connection::open(&path).expect("open variant");
+        let started = Instant::now();
+        if let Some((detail, columnsize)) = change.split_once(',') {
+            connection
+                .execute_batch(&format!(
+                    "BEGIN;
+                     DROP TRIGGER message_fts_ai; DROP TRIGGER message_fts_ad; DROP TRIGGER message_fts_au;
+                     DROP TABLE message_fts_vocab; DROP TABLE message_fts;
+                     CREATE VIRTUAL TABLE message_fts USING fts5(search_text, content = 'message',
+                         content_rowid = 'row_id', tokenize = 'trigram', detail = {detail},
+                         columnsize = {columnsize});
+                     INSERT INTO message_fts (message_fts) VALUES ('rebuild');
+                     INSERT INTO message_fts (message_fts) VALUES ('optimize');
+                     COMMIT;"
+                ))
+                .expect("rebuild the index");
+        } else if !change.is_empty() {
+            connection.execute_batch(change).expect("change");
+        }
+        let changed = started.elapsed();
+        let started = Instant::now();
+        connection.execute_batch("VACUUM;").expect("vacuum");
+        let vacuumed = started.elapsed();
+        let (rows, total) = objects(&connection);
+        let fts: i64 = rows
+            .iter()
+            .filter(|(object, _)| object.starts_with("message_fts"))
+            .map(|(_, bytes)| bytes)
+            .sum();
+        let table = rows
+            .iter()
+            .find(|(object, _)| object == "message")
+            .map_or(0, |(_, bytes)| *bytes);
+        // Searches: a rare word and a common one, by phrase and by every trigram; each candidate
+        // set must hold every true match, as the Rust re-match needs.
+        let mut timings = Vec::new();
+        for term in [RARE, "release", "the"] {
+            let want = truth(&connection, term);
+            for (shape, query) in [
+                ("phrase", search::fts_query(&[term.to_owned()])),
+                ("trigrams", trigram_and(&[term])),
+            ] {
+                let started = Instant::now();
+                let mut runs = 0;
+                let mut answer = Ok(Vec::new());
+                while runs < 20 {
+                    answer = candidates(&connection, &query);
+                    runs += 1;
+                }
+                let each = started.elapsed() / runs;
+                match answer {
+                    Ok(found) => {
+                        assert!(
+                            want.iter().all(|row| found.binary_search(row).is_ok()),
+                            "{name} {shape} {term}: the index missed a match"
+                        );
+                        timings.push(format!(
+                            "{term}/{shape} {:.2} ms ({} cand, {} true)",
+                            each.as_secs_f64() * 1000.0,
+                            found.len(),
+                            want.len()
+                        ));
+                    }
+                    Err(error) => timings.push(format!("{term}/{shape} refused ({error})")),
+                }
+            }
+        }
+        let file = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+        #[allow(clippy::cast_precision_loss)]
+        let per = |bytes: i64| bytes as f64 / messages as f64;
+        eprintln!(
+            "[{name}] file {:.1} MB ({:.0} B/msg): index {:.1} MB ({:.0} B/msg), message table {:.1} MB; \
+             change {:.2} s, VACUUM {:.2} s; {}",
+            mb(file),
+            per(i64::try_from(file).unwrap_or(0)),
+            mb(u64::try_from(fts).unwrap_or(0)),
+            per(fts),
+            mb(u64::try_from(table).unwrap_or(0)),
+            changed.as_secs_f64(),
+            vacuumed.as_secs_f64(),
+            timings.join("; ")
+        );
+        let _ = total;
+    }
+    // Text for the zstd step: each row's content, extra and search text, NUL-separated.
+    let connection =
+        Connection::open_with_flags(&base, OpenFlags::SQLITE_OPEN_READ_ONLY).expect("ro");
+    let mut statement = connection
+        .prepare("SELECT content, extra, search_text FROM message ORDER BY row_id")
+        .expect("rows");
+    let mut text = Vec::new();
+    let mut rows = statement.query([]).expect("rows");
+    while let Some(row) = rows.next().expect("row") {
+        for column in 0..3 {
+            let value: String = row.get(column).expect("text");
+            text.extend_from_slice(value.as_bytes());
+            text.push(0);
+        }
+        text.push(b'\n');
+    }
+    std::fs::write(out.join("rows.bin"), text).expect("rows");
+    if keep.is_none() {
+        eprintln!("(set VIBE_TALK_LAYOUT_DIR to keep the files for the filesystem step)");
+    }
+}

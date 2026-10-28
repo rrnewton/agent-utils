@@ -224,7 +224,13 @@ mod tests {
         assert_eq!(control.position(&ch("a")), Some(1));
         control.prioritize(&ch("a"), 30);
         let queue = control.queue();
-        assert_eq!(queue[0], Priority { channel: ch("a"), asked_ms: 10 });
+        assert_eq!(
+            queue[0],
+            Priority {
+                channel: ch("a"),
+                asked_ms: 10
+            }
+        );
         assert_eq!(queue[1].channel, ch("b"));
         assert!(control.cancel(&ch("a")));
         assert!(!control.cancel(&ch("a")));

@@ -1851,7 +1851,10 @@ fn search_text_is_rebuilt_when_the_rendering_rules_change() {
     assert!(cache.search_text_current());
     let labelled = sql_count(
         &cache,
-        "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '\"widgets#123\"'",
+        &format!(
+            "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '{}'",
+            search::fts_query(&["widgets#123".to_owned()])
+        ),
     );
     assert_eq!(labelled, 1_200);
     drop(dir);
@@ -1903,7 +1906,10 @@ fn a_rebuild_that_fails_is_retried_rather_than_taken_as_done() {
     assert_eq!(
         sql_count(
             &cache,
-            "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '\"relabelled\"'",
+            &format!(
+                "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH '{}'",
+                search::fts_query(&["relabelled".to_owned()])
+            ),
         ),
         50
     );

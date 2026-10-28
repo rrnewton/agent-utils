@@ -35,11 +35,11 @@ use rusqlite::{Connection, OptionalExtension as _};
 
 use super::{
     now_ms, Bookmark, BookmarkAnchor, BookmarkChange, BookmarkPlace, CachedSummary, ChannelAlias,
-    ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins, ReadMark, RecordedTurn,
-    Retention, Speaker, StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
-    HistoryMode, HistoryModeSetting, UpstreamClearAttempt, UpstreamClearMode, UpstreamClearResult,
-    UpstreamClearSetting,
-    MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
+    ConversationId, ConversationSummary, HistoryMode, HistoryModeSetting, Pin, PinChange,
+    PinSnapshot, Pins, ReadMark, RecordedTurn, Retention, Speaker, StateStore, StoreError,
+    SummaryKey, TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
+    UpstreamClearResult, UpstreamClearSetting, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE,
+    MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId, UserId};
 use crate::voice_agent::{EditedPrompt, OwnerPrompt};

@@ -414,6 +414,32 @@ fn inventory() -> Vec<Route> {
             Write,
             Nothing,
         ),
+        // `#602 history-settings-and-limits`: seen at read scope; the channel's own mode and "read
+        // it next" at write.
+        route(
+            "GET",
+            "/api/v1/channels/{channel_id}/history",
+            Read,
+            Nothing,
+        ),
+        route(
+            "PUT",
+            "/api/v1/channels/{channel_id}/history",
+            Write,
+            Json(r#"{"mode":"default"}"#),
+        ),
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/history/prioritize",
+            Write,
+            Nothing,
+        ),
+        route(
+            "DELETE",
+            "/api/v1/channels/{channel_id}/history/prioritize",
+            Write,
+            Nothing,
+        ),
         route(
             "PUT",
             "/api/v1/channels/{channel_id}/alias",

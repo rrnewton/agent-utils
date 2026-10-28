@@ -467,8 +467,10 @@ fn an_erase_landing_during_a_compaction_is_compacted_too() {
         "segments the compactions did not take in: {structure:?}"
     );
     let stats = fx.cache.stats();
+    // At least one merge step and the step that saw it over, each. (Three while the index kept
+    // positions; without them, `#602 history-settings-and-limits`, it is a seventh the size.)
     assert!(
-        stats.compaction_steps >= stats.compactions * 3,
+        stats.compactions >= 2 && stats.compaction_steps >= stats.compactions * 2,
         "each compaction went on until its merge was over: {stats:?}"
     );
     assert!(on_disk(&fx.path(), secret).is_empty());

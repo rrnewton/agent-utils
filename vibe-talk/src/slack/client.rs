@@ -1228,7 +1228,10 @@ impl ChatClient for HttpSlackClient {
         let mut pressure = self.pressure();
         let mut latest: Option<tokio::time::Instant> = None;
         for method in CRAWL_METHODS {
-            if let Some(until) = pressure.get_mut(method).and_then(|entry| entry.hold_until(now)) {
+            if let Some(until) = pressure
+                .get_mut(method)
+                .and_then(|entry| entry.hold_until(now))
+            {
                 latest = Some(latest.map_or(until, |at| at.max(until)));
             }
         }

@@ -1931,6 +1931,7 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
             "dismissals",
             "own_decided",
             "upstream_clear",
+            "history_modes",
             "aliases",
             "noise_rules",
             "noise_exemptions",

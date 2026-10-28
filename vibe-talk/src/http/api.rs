@@ -3974,6 +3974,8 @@ pub const PURGED: &[&str] = &[
     // `#549 own-read-stored`.
     "own_decided",
     "upstream_clear",
+    // `#602 history-settings-and-limits`.
+    "history_modes",
     "aliases",
     "noise_rules",
     "noise_exemptions",
@@ -4049,6 +4051,12 @@ pub async fn purge_storage(
     state.store.purge_everything().await?;
     let forgotten = clearing.forget_all();
     drop(changing);
+    // `#602 history-settings-and-limits`. Every channel back to the server's history mode, and
+    // nothing queued to be read next.
+    state.live.history().load(Vec::new());
+    for priority in state.live.history().queue() {
+        state.live.history().cancel(&priority.channel);
+    }
     // Not durable, so not in the list below, but channel text all the same.
     state.read_ahead.clear();
     state.live.recent().clear();
@@ -4367,7 +4375,10 @@ pub async fn set_channel_history(
         HistoryModeChoice::Default => None,
     };
     let at_ms = jiff::Timestamp::now().as_millisecond();
-    state.store.set_history_mode(&channel.id, mode, at_ms).await?;
+    state
+        .store
+        .set_history_mode(&channel.id, mode, at_ms)
+        .await?;
     state.live.history().set(&channel.id, mode);
     tracing::info!(
         channel = %channel.id,

@@ -100,10 +100,10 @@ use crate::cache::{ChanKey, Fill, FillGrant, Frontier, ServerFill, Stamp};
 use crate::chat::ChatClient as _;
 use crate::config::{CacheBackfill, MessageCacheConfig};
 use crate::history_control::{HoldReason, PaceReport};
-use crate::store::HistoryMode;
 use crate::model::{ChannelId, Message};
 use crate::read_reason::ReadReason;
 use crate::state::AppState;
+use crate::store::HistoryMode;
 use crate::threads::{TimelinePage, TimelineRequest, TimelineView};
 
 /// The most pages one hot or recent walk reads of one channel.
@@ -512,7 +512,9 @@ impl Backfill {
     fn report(&self, state: &AppState, now_ms: i64) {
         let control = state.live.history();
         // Local (cache) time to the server's wall clock, for the page.
-        let wall_offset = jiff::Timestamp::now().as_millisecond().saturating_sub(now_ms);
+        let wall_offset = jiff::Timestamp::now()
+            .as_millisecond()
+            .saturating_sub(now_ms);
         for (key, pace) in &self.pace {
             let held = now_ms < pace.hold_until_ms;
             let reads = pace
@@ -627,7 +629,9 @@ impl Backfill {
                 continue;
             }
             let full = prioritized
-                || control.mode(id).map_or(server_full, |mode| mode == HistoryMode::Full);
+                || control
+                    .mode(id)
+                    .map_or(server_full, |mode| mode == HistoryMode::Full);
             let job = if entry.walk.is_some() {
                 Some(Job::Walk)
             } else if now_ms >= entry.recent_due_ms {
@@ -1592,10 +1596,7 @@ pub fn channel_state(
     let control = state.live.history();
     let config = state.config.message_cache.as_ref();
     let server = config.map_or(CacheBackfill::Off, |config| config.backfill);
-    let cache = state
-        .message_cache
-        .cache()
-        .filter(|cache| cache.is_open());
+    let cache = state.message_cache.cache().filter(|cache| cache.is_open());
     let wall_ms = jiff::Timestamp::now().as_millisecond();
     let chan = state.message_cache.chan_key(channel);
     let (stats, frontier, cache_now) = match (&cache, &chan) {

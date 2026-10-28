@@ -340,11 +340,9 @@ struct LimiterState {
 
 impl LimiterState {
     fn prune_limited(&mut self, now: Instant) {
-        while self
-            .limited
-            .front()
-            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= crate::chat::PRESSURE_WINDOW)
-        {
+        while self.limited.front().is_some_and(|(at, _)| {
+            now.saturating_duration_since(*at) >= crate::chat::PRESSURE_WINDOW
+        }) {
             self.limited.pop_front();
         }
     }
@@ -622,7 +620,13 @@ impl RateLimiter {
             let answer = match attempt().await {
                 Ok(answer) => answer,
                 Err(error) => {
-                    if matches!(error.cause(), ChatError::Status { status: 401 | 403, .. }) {
+                    if matches!(
+                        error.cause(),
+                        ChatError::Status {
+                            status: 401 | 403,
+                            ..
+                        }
+                    ) {
                         self.note_invalid();
                     }
                     return Err(error);
@@ -1111,7 +1115,11 @@ mod tests {
                 })
                 .await;
         }
-        assert_eq!(limiter.invalid_requests(), 2, "401 and 403 count; 404 does not");
+        assert_eq!(
+            limiter.invalid_requests(),
+            2,
+            "401 and 403 count; 404 does not"
+        );
         let _ = limiter
             .run("GET", OTHER, || async {
                 Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(
@@ -1120,7 +1128,11 @@ mod tests {
                 )))
             })
             .await;
-        assert_eq!(limiter.invalid_requests(), 2, "a shared-scope 429 is not counted");
+        assert_eq!(
+            limiter.invalid_requests(),
+            2,
+            "a shared-scope 429 is not counted"
+        );
         let _ = limiter
             .run("GET", OTHER, || async {
                 Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(
@@ -1145,7 +1157,9 @@ mod tests {
         for _ in 0..INVALID_REQUEST_CRAWL_CEILING {
             limiter.note_invalid();
         }
-        let hold = limiter.crawl_hold().expect("crawling holds off at the ceiling");
+        let hold = limiter
+            .crawl_hold()
+            .expect("crawling holds off at the ceiling");
         assert!(hold <= INVALID_REQUEST_WINDOW && hold > Duration::ZERO);
         tokio::time::advance(Duration::from_secs(60)).await;
         for _ in INVALID_REQUEST_CRAWL_CEILING..INVALID_REQUEST_REFUSE_AT {
@@ -1165,7 +1179,10 @@ mod tests {
         };
         // The count falls below the line once the oldest leaves, nine minutes on: the first 250
         // were noted a minute before the rest.
-        assert_eq!(detail.retry_after, INVALID_REQUEST_WINDOW - Duration::from_secs(60));
+        assert_eq!(
+            detail.retry_after,
+            INVALID_REQUEST_WINDOW - Duration::from_secs(60)
+        );
         assert_eq!(limiter.stats().refused_invalid, 1);
         tokio::time::advance(INVALID_REQUEST_WINDOW).await;
         let value = limiter
@@ -1215,22 +1232,38 @@ mod tests {
         });
         let _ = limiter
             .run("GET", URL, || async {
-                Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(Duration::from_millis(500), "shared")))
+                Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(
+                    Duration::from_millis(500),
+                    "shared",
+                )))
             })
             .await;
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(limiter.crawl_hold(), None, "a resource's own limit does not hold crawling");
+        assert_eq!(
+            limiter.crawl_hold(),
+            None,
+            "a resource's own limit does not hold crawling"
+        );
         let _ = limiter
             .run("GET", URL, || async {
-                Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(Duration::from_millis(500), "user")))
+                Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(
+                    Duration::from_millis(500),
+                    "user",
+                )))
             })
             .await;
         tokio::time::advance(Duration::from_secs(1)).await;
         let hold = limiter.crawl_hold().expect("held after a 429 of our own");
-        assert_eq!(hold, crate::chat::CRAWL_QUIET_AFTER_LIMIT - Duration::from_secs(1));
+        assert_eq!(
+            hold,
+            crate::chat::CRAWL_QUIET_AFTER_LIMIT - Duration::from_secs(1)
+        );
         let pressure = limiter.pressure();
         assert_eq!(pressure.limited_last_10_min, 1);
-        assert_eq!(pressure.routes[&route_key("GET", URL)].limited_last_10_min, 1);
+        assert_eq!(
+            pressure.routes[&route_key("GET", URL)].limited_last_10_min,
+            1
+        );
         assert_eq!(pressure.invalid_last_10_min, Some(1));
         tokio::time::advance(crate::chat::CRAWL_QUIET_AFTER_LIMIT).await;
         assert_eq!(limiter.crawl_hold(), None);
@@ -1246,7 +1279,10 @@ mod tests {
             .await
             .expect("sent");
         assert_eq!(limiter.crawl_hold(), Some(Duration::from_millis(3500)));
-        assert_eq!(limiter.pressure().routes[&route_key("GET", OTHER)].remaining, Some(1));
+        assert_eq!(
+            limiter.pressure().routes[&route_key("GET", OTHER)].remaining,
+            Some(1)
+        );
         tokio::time::advance(Duration::from_secs(4)).await;
         assert_eq!(limiter.crawl_hold(), None);
     }
