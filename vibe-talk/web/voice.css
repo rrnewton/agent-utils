@@ -1361,6 +1361,13 @@ a.search-hit-link {
   color: var(--warn);
 }
 
+/* `#621 send-double-check`: two very small ticks after the Sending ellipsis. */
+.send-ticks { display: inline-flex; gap: 1px; margin-left: 2px; cursor: pointer; }
+.send-tick { font-size: 9px; line-height: 1; color: #9aa0a6; }
+.send-tick.ok { color: #1a9e54; }
+.send-tick.bad { color: #c0392b; }
+.send-times { font-size: 0.72rem; color: var(--muted); }
+
 .outgoing-actions {
   display: flex;
   flex-wrap: wrap;

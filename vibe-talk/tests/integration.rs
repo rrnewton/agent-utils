@@ -183,6 +183,9 @@ mod send_confirm_thread;
 #[path = "send_dedupe.rs"]
 mod send_dedupe;
 
+#[path = "send_double_check.rs"]
+mod send_double_check;
+
 #[path = "send_log.rs"]
 mod send_log;
 

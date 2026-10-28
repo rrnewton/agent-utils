@@ -1625,6 +1625,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#621 send-double-check` in the browser engine at 393x852: the Sending card mid-send
+  # shows tick one green (server accepted) and tick two gray (upstream held); the tap readout
+  # shows durations from the Send tap.
+  - group: check
+    job: send-double-check-browser
+    desc: the Sending card's two ticks mid-send and the duration tap readout, in current Chromium at 393x852
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/send_double_check_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#421 chip-states`, `#422 composer-key-stay`, `#424 threads-main-own-center` and `#423
   # back-key-consistency` in the browser engine, at 1280x800 with a mouse and 393x852 by touch: the
   # Threads view's three chips alike at rest and alike pressed, unlike each other way; Cmd+S with Main

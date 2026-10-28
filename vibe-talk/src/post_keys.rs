@@ -258,9 +258,19 @@ impl Fingerprint {
     }
 }
 
+/// The two phases of one keyed send, in milliseconds. `#621 send-double-check`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SendTiming {
+    /// Server accept: request start to durable claim recorded.
+    pub server_ms: Option<u64>,
+    /// Upstream: accept to provider outcome known.
+    pub upstream_ms: Option<u64>,
+}
+
 /// Every keyed post in flight, and every one that landed within [`KEEP`].
 pub struct PostKeys {
     slots: Mutex<HashMap<String, Slot>>,
+    timings: Mutex<HashMap<String, (Instant, SendTiming)>>,
     keep: Duration,
     /// Moved by every [`PostKeys::forget_settled`]: a claim made before it settles into memory,
     /// but is not filed in the store. `#471 replication-c5-post-keys`.
@@ -424,9 +434,40 @@ impl PostKeys {
     pub fn with_keep(keep: Duration) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
+            timings: Mutex::new(HashMap::new()),
             keep,
             generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Record the server-accept phase for `key`. `#621 send-double-check`.
+    pub fn note_accepted(&self, key: &str, server_ms: u64) {
+        let mut timings = self.timings.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = timings
+            .entry(key.to_owned())
+            .or_insert_with(|| (Instant::now(), SendTiming::default()));
+        entry.1.server_ms = Some(server_ms);
+        entry.0 = Instant::now();
+    }
+
+    /// Record the upstream phase for `key`; returns the full timing. `#621 send-double-check`.
+    pub fn note_settled(&self, key: &str) -> SendTiming {
+        let mut timings = self.timings.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = timings
+            .entry(key.to_owned())
+            .or_insert_with(|| (Instant::now(), SendTiming::default()));
+        entry.1.upstream_ms = Some(entry.0.elapsed().as_millis() as u64);
+        entry.1
+    }
+
+    /// The recorded timing for `key`, if any. `#621 send-double-check`.
+    #[must_use]
+    pub fn timing(&self, key: &str) -> Option<SendTiming> {
+        self.timings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .map(|(_, t)| *t)
     }
 
     /// Claim `fingerprint` to post it, or find it made or being made under its key.

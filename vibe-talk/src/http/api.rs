@@ -2698,6 +2698,9 @@ pub struct ReplyResponse {
     pub posted: Message,
     /// Every part, in order. One element for a reply that fitted.
     pub parts: Vec<Message>,
+    /// Two-phase durations when known. `#621 send-double-check`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<SendTimingBody>,
 }
 
 /// What came back when a split reply got halfway.
@@ -2752,6 +2755,9 @@ pub struct PartialReplyResponse {
     /// page records it. Absent when certainly nothing was posted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub send_seq: Option<u64>,
+    /// Two-phase durations when known. `#621 send-double-check`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<SendTimingBody>,
 }
 
 impl PartialReplyResponse {
@@ -2780,8 +2786,47 @@ impl PartialReplyResponse {
                 refusal: refusal.map(|refusal| *refusal),
                 serial: None,
                 send_seq: None,
+                timing: None,
             }),
             other => Err(other),
+        }
+    }
+}
+
+/// Query of the reply route. `#621 send-double-check`.
+#[derive(Debug, Deserialize)]
+pub struct ReplyQuery {
+    /// `accepted`: answer `202` once the op key is durably claimed; upstream posts in background.
+    pub ack: Option<String>,
+}
+
+/// The `202` answer of a two-phase send. `#621 send-double-check`.
+#[derive(Debug, Serialize)]
+pub struct AcceptedResponse {
+    /// Always `"accepted"`.
+    pub state: &'static str,
+    /// The op (idempotency) key naming this send.
+    pub op_key: String,
+    /// Server accept duration in ms, send-start to durable claim.
+    pub server_ms: u64,
+    /// Parts the post was cut into.
+    pub parts: usize,
+}
+
+/// The two send phases as durations. `#621 send-double-check`.
+#[derive(Debug, Serialize)]
+pub struct SendTimingBody {
+    /// Server accept duration in ms.
+    pub server_ms: Option<u64>,
+    /// Upstream duration in ms (accept to outcome known).
+    pub upstream_ms: Option<u64>,
+}
+
+impl From<crate::post_keys::SendTiming> for SendTimingBody {
+    fn from(t: crate::post_keys::SendTiming) -> Self {
+        Self {
+            server_ms: t.server_ms,
+            upstream_ms: t.upstream_ms,
         }
     }
 }
@@ -2791,8 +2836,32 @@ pub async fn reply(
     State(state): State<AppState>,
     _scope: WriteScope,
     Path(channel_id): Path<String>,
+    Query(query): Query<ReplyQuery>,
     Json(request): Json<ReplyRequest>,
 ) -> Result<Response, ApiError> {
+    if query.ack.as_deref() == Some("accepted") {
+        if let Some(key) = request.idempotency_key.as_deref() {
+            let (server_ms, parts) = ops::reply_accepted(
+                &state,
+                &channel_id,
+                &request.text,
+                request.reply_to.as_deref(),
+                request.thread_id.as_deref(),
+                key,
+            )
+            .await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(AcceptedResponse {
+                    state: "accepted",
+                    op_key: key.to_owned(),
+                    server_ms,
+                    parts,
+                }),
+            )
+                .into_response());
+        }
+    }
     let result = ops::reply_scoped(
         &state,
         &channel_id,
@@ -2811,6 +2880,14 @@ fn reply_answer(
     state: &AppState,
     result: Result<(ChannelInfo, Message, Vec<Message>), ops::OpError>,
 ) -> Result<Response, ApiError> {
+    reply_answer_timed(state, result, None)
+}
+
+fn reply_answer_timed(
+    state: &AppState,
+    result: Result<(ChannelInfo, Message, Vec<Message>), ops::OpError>,
+    timing: Option<SendTimingBody>,
+) -> Result<Response, ApiError> {
     match result {
         Ok((channel, mut posted, mut parts)) => {
             // The page draws the acknowledged parts before any read brings them back.
@@ -2821,7 +2898,12 @@ fn reply_answer(
                 std::slice::from_mut(&mut posted),
             );
             crate::render::fill(&state.config, &state.headings, &channel, &mut parts);
-            Ok(Json(ReplyResponse { posted, parts }).into_response())
+            Ok(Json(ReplyResponse {
+                posted,
+                parts,
+                timing,
+            })
+            .into_response())
         }
         // 207, not 200 and not 502. A machine caller reading only the status must not conclude
         // "sent" — nor "nothing happened", which would have them send the whole thing again and
@@ -2854,6 +2936,9 @@ pub struct PostingResponse {
     pub posted: usize,
     /// Parts in all; 0 before the post is cut.
     pub parts: usize,
+    /// Two-phase durations when known. `#621 send-double-check`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<SendTimingBody>,
 }
 
 /// `POST /api/v1/channels/{channel_id}/reply/outcome` — what became of a keyed post, posting
@@ -2889,14 +2974,16 @@ pub async fn reply_outcome(
         wait,
     )
     .await?;
+    let timing = state.post_keys.timing(key).map(SendTimingBody::from);
     match outcome {
-        ops::PostOutcome::Settled(result) => reply_answer(&state, *result),
+        ops::PostOutcome::Settled(result) => reply_answer_timed(&state, *result, timing),
         ops::PostOutcome::Posting { posted, parts } => Ok((
             StatusCode::ACCEPTED,
             Json(PostingResponse {
                 state: "posting",
                 posted,
                 parts,
+                timing,
             }),
         )
             .into_response()),

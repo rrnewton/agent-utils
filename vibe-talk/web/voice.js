@@ -30505,6 +30505,14 @@ function outgoingFromSaved(held) {
     wire: savedWire(held.wire),
     // `#500 sent-receipts-pile-up`: when the server confirmed it, for a send that is sent.
     sentAt: Number(held.sentAt) || 0,
+    // `#621 send-double-check`.
+    sendStartedAt: Number(held.sendStartedAt) || Number(held.createdAt) || Date.now(),
+    serverMs: Number.isFinite(Number(held.serverMs)) ? Number(held.serverMs) : null,
+    upstreamMs: Number.isFinite(Number(held.upstreamMs)) ? Number(held.upstreamMs) : null,
+    serverTick: held.serverTick === true,
+    upstreamTick: held.upstreamTick === true,
+    tickFailed: held.tickFailed === true,
+    showTimes: false,
     detail: attempted ? "This page closed before delivery was confirmed."
       : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
   };
@@ -30871,6 +30879,32 @@ function renderOutgoingMessages() {
     label.textContent = outgoingStatus(entry) + (outgoingStorageOkay ? "" :
       " This browser could not save this message. Keep this page open; reloading may lose its text or delivery status.");
     status.append(label);
+    // `#621 send-double-check`: two very small ticks right after the ellipsis.
+    if (entry.state === "sending" || entry.state === "sent" || entry.tickFailed) {
+      const ticks = document.createElement("span");
+      ticks.className = "send-ticks";
+      ticks.setAttribute("title", sendTimingText(entry));
+      const first = document.createElement("span");
+      first.className = `send-tick${entry.serverTick ? " ok" : ""}`;
+      first.textContent = "✓";
+      first.setAttribute("data-tick", "server");
+      const second = document.createElement("span");
+      second.className = `send-tick${entry.tickFailed ? " bad" : entry.upstreamTick ? " ok" : ""}`;
+      second.textContent = entry.tickFailed ? "✗" : "✓";
+      second.setAttribute("data-tick", "upstream");
+      ticks.append(first, second);
+      ticks.addEventListener("click", () => {
+        entry.showTimes = !entry.showTimes;
+        renderOutgoingEverywhere();
+      });
+      status.append(ticks);
+      if (entry.showTimes) {
+        const times = document.createElement("span");
+        times.className = "send-times";
+        times.textContent = ` ${sendTimingText(entry)}`;
+        status.append(times);
+      }
+    }
     row.append(meta, body, status);
     // `#277 send-order`. A message waiting its turn behind another has not left the device: it can be
     // taken back, Edit and Dismiss, but there is no Retry to send it out of turn.
@@ -31814,6 +31848,9 @@ function queueOutgoingMessage(request, column = null) {
     remaining: request.text.trim(), state: "sending", phase: "queued",
     parts: [], observedParts: [], postedCount: 0, detail: "", keyedOnly: true, mayHavePosted: false,
     continueIn: null,
+    // `#621 send-double-check`: two-phase durations from the Send tap, and tick states.
+    sendStartedAt: Date.now(), serverMs: null, upstreamMs: null,
+    serverTick: false, upstreamTick: false, tickFailed: false, showTimes: false,
   };
   outgoingMessages.set(id, entry);
   if (column) columnReplies.set(id, column);
@@ -32128,14 +32165,45 @@ async function postOutgoing(entry, job, body, controller, armed) {
     }, OUTGOING_TIMEOUT_MS);
   });
   armed(timer);
+  const sendTapAt = Date.now();
+  entry.sendStartedAt = entry.sendStartedAt || sendTapAt;
   try {
     const payload = await Promise.race([
-      api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply`, {
+      api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply?ack=accepted`, {
         method: "POST", body, ...(controller ? { signal: controller.signal } : {}),
       }),
       interruption,
     ]);
-    return job.stopped ? null : payload;
+    if (job.stopped) return null;
+    // `#621 send-double-check`: phase one answered; phase two via the outcome long-poll.
+    if (payload && payload.state === "accepted") {
+      entry.serverMs = Number.isFinite(Number(payload.server_ms)) ? Number(payload.server_ms) : Date.now() - sendTapAt;
+      entry.serverTick = true;
+      entry.tickFailed = false;
+      persistOutgoingMessages();
+      renderOutgoingEverywhere();
+      const acceptedAt = Date.now();
+      const found = await askOutgoingOutcome(entry, job, body);
+      if (job.stopped) return null;
+      if (!found) {
+        const late = /** @type {any} */ (new Error("The send timed out before delivery was confirmed."));
+        late.timedOut = true;
+        throw late;
+      }
+      entry.upstreamMs = found.timing && Number.isFinite(Number(found.timing.upstream_ms))
+        ? Number(found.timing.upstream_ms) : Date.now() - acceptedAt;
+      entry.upstreamTick = found.error !== "partially_posted";
+      if (found.timing && Number.isFinite(Number(found.timing.server_ms))) entry.serverMs = Number(found.timing.server_ms);
+      return found;
+    }
+    // Older server: one answer carried both phases.
+    if (payload) {
+      entry.serverMs = Date.now() - sendTapAt;
+      entry.serverTick = true;
+      entry.upstreamMs = 0;
+      entry.upstreamTick = payload.error !== "partially_posted";
+    }
+    return payload;
   } catch (error) {
     clearTimeout(timer);
     armed(null);
@@ -32230,6 +32298,8 @@ async function dispatchOutgoingMessage(entry, job) {
       // back to Retry four times over a refusal that the same words meet every time. An older
       // server does not say, and its 207 stays unconfirmed.
       const answered = payload.uncertain === false;
+      entry.tickFailed = true;
+      entry.upstreamTick = false;
       entry.state = answered ? "failed" : "unconfirmed";
       if (!answered || entry.postedCount > 0) entry.mayHavePosted = true;
       outgoingObservations.delete(entry.id);
@@ -32269,6 +32339,9 @@ async function dispatchOutgoingMessage(entry, job) {
     entry.observedParts = entry.parts.filter((part) => observed.has(part.id)).map((part) => part.id);
     outgoingObservations.set(entry.id, new Set(entry.observedParts));
     entry.state = "sent";
+    entry.upstreamTick = true;
+    entry.tickFailed = false;
+    if (entry.upstreamMs === null) entry.upstreamMs = Math.max(0, Date.now() - (entry.sendStartedAt || Date.now()) - (entry.serverMs || 0));
     entry.detail = "";
     // `#500 sent-receipts-pile-up`. From now its receipt is shown for a while, then goes.
     entry.sentAt = Date.now();
@@ -32299,6 +32372,9 @@ async function dispatchOutgoingMessage(entry, job) {
     if (entry.marksRead) guardQuietly(markSentRead)(entry);
   } catch (error) {
     if (job.stopped) return;
+    entry.tickFailed = true;
+    entry.upstreamTick = false;
+    if (entry.upstreamMs === null && entry.serverTick) entry.upstreamMs = Math.max(0, Date.now() - (entry.sendStartedAt || Date.now()) - (entry.serverMs || 0));
     entry.state = error.status >= 400 && error.status < 500 && error.status !== 408
       ? "failed" : "unconfirmed";
     if (entry.state === "unconfirmed") entry.mayHavePosted = true;
@@ -32347,6 +32423,24 @@ async function dispatchOutgoingMessage(entry, job) {
 //     repeat of a post that landed, or is landing, with that post.
 //   * While a send is slow, the row says which part is going ("Posting part 2 of 3…"), asked of the
 //     same route every OUTGOING_PROGRESS_MS, so a send that takes seconds never looks stuck.
+
+/** One duration for the tap readout: `120 ms`, `1.9 s`. `#621 send-double-check`. */
+function fmtDuration(ms) {
+  if (ms === null || ms === undefined || !Number.isFinite(Number(ms))) return "—";
+  const value = Math.max(0, Math.round(Number(ms)));
+  return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(1)} s`;
+}
+
+/** Durations from the Send tap, never absolute times. `#621 send-double-check`. */
+function sendTimingText(entry) {
+  const service = (typeof chatServiceOf === "function" && chatServiceOf(entry.channel)) || "upstream";
+  const server = entry.serverMs;
+  const upstream = entry.upstreamMs;
+  const total = server !== null && upstream !== null ? server + upstream
+    : Math.max(0, Date.now() - (entry.sendStartedAt || entry.createdAt || Date.now()));
+  const up = upstream === null ? "…" : `+${fmtDuration(upstream)}`;
+  return `server ${fmtDuration(server)} · ${service} ${up} · total ${fmtDuration(total)}`;
+}
 
 /** Whether `error` means the server's answer was lost rather than given. */
 function answerLost(error) {

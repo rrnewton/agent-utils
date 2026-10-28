@@ -4403,6 +4403,54 @@ pub async fn reply_scoped(
     post_settled(state, post, None).await.0
 }
 
+/// Two-phase send, phase one. `#621 send-double-check`: validate, claim the
+/// op key durably in [`crate::post_keys`], then post upstream in a detached
+/// task and answer at once. Phase two is read via [`post_outcome`].
+pub async fn reply_accepted(
+    state: &AppState,
+    channel_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    thread_id: Option<&str>,
+    idempotency_key: &str,
+) -> Result<(u64, usize), OpError> {
+    let started = std::time::Instant::now();
+    let post = Post {
+        channel_id,
+        text,
+        reply_to,
+        thread_id,
+        idempotency_key: Some(idempotency_key),
+    };
+    let (posting, turn) = match ready_to_post(state, post).await {
+        Ok(Ready::Post(posting, turn)) => (*posting, turn),
+        Ok(Ready::Known(outcome)) => {
+            let server_ms = started.elapsed().as_millis() as u64;
+            state.post_keys.note_accepted(idempotency_key, server_ms);
+            let _ = remembered_answer(&outcome);
+            return Ok((server_ms, 0));
+        }
+        Err(refused) => return Err(refused),
+    };
+    let parts = posting.parts.len();
+    let server_ms = started.elapsed().as_millis() as u64;
+    state.post_keys.note_accepted(idempotency_key, server_ms);
+    let state2 = state.clone();
+    let key2 = idempotency_key.to_owned();
+    tokio::spawn(async move {
+        let (result, _) = post_parts(state2.clone(), posting, turn, None).await;
+        let timing = state2.post_keys.note_settled(&key2);
+        let outcome = match &result {
+            Ok(_) => "posted",
+            Err(OpError::PartiallyPosted { .. }) => "partial",
+            Err(_) => "failed",
+        };
+        tracing::info!(op_key = %key2, server_ms = timing.server_ms.unwrap_or(server_ms), upstream_ms = timing.upstream_ms.unwrap_or(0), outcome, "send_timing");
+        let _ = result;
+    });
+    Ok((server_ms, parts))
+}
+
 /// [`reply`] for a send the post gate keeps in its send memory (`#270 voice-transcript-markers`):
 /// a confirmed proposal's, or one the voice agent sent at once. `binding` is what to post, and
 /// `ticket` the send's place in the memory. Returns the post's answer, and the `send_seq` the send
@@ -4890,9 +4938,21 @@ async fn post_parts(
     Result<(ChannelInfo, Message, Vec<Message>), OpError>,
     Option<u64>,
 ) {
+    let key_for_timing = posting.key.clone();
     let claim = posting.claim.take();
     let progress = claim.as_ref().map(crate::post_keys::Pending::progress);
     let result = post_each(&state, posting, progress.as_deref()).await;
+    if let Some(key) = &key_for_timing {
+        let timing = state.post_keys.note_settled(key);
+        if timing.server_ms.is_some() {
+            let outcome = match &result {
+                Ok(_) => "posted",
+                Err(OpError::PartiallyPosted { .. }) => "partial",
+                Err(_) => "failed",
+            };
+            tracing::info!(op_key = %key, server_ms = timing.server_ms.unwrap_or(0), upstream_ms = timing.upstream_ms.unwrap_or(0), outcome, "send_timing");
+        }
+    }
     if let Some(claim) = claim {
         let remembered = to_remember(&result);
         // `#471 replication-c5-post-keys`: what it landed as is filed in the store too, so a
