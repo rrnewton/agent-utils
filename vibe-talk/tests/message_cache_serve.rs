@@ -158,6 +158,19 @@ impl Deployment {
         settled(&self.state).await;
     }
 
+    /// Fill the read channel's `main` from a write-token timeline read of its newest `limit`
+    /// only: the file then proves nothing below them, and a step back from a served page walks the
+    /// provider (`#650 cache-first-older-reads`).
+    async fn fill_newest(&self, limit: u16) {
+        ok(
+            &self.state,
+            &path(READ_CHANNEL, &format!("/timeline?view=main&limit={limit}")),
+            WRITE_TOKEN,
+        )
+        .await;
+        settled(&self.state).await;
+    }
+
     /// Fill the read channel's `main` from a write-token window read.
     async fn fill_window(&self) {
         ok(
@@ -617,6 +630,20 @@ fn served_cursor(body: &Value) -> String {
     cursor
 }
 
+/// Wait until no step back of `channel`'s `view` is being read upstream behind an answer from the
+/// cache (`#650 cache-first-older-reads`), and for the cache's writer.
+async fn stepped_behind(state: &AppState, channel: &str, view: TimelineView) {
+    let key = || RefreshKey::timeline_backward(ChannelId(channel.to_owned()), view, None);
+    tokio::time::timeout(WAIT, async {
+        while state.message_cache.claim_refresh(key()).is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the step behind finished");
+    settled(state).await;
+}
+
 #[tokio::test]
 async fn back_to_back_reloads_are_each_served_and_a_step_back_still_reaches_older_history() {
     // `#510 cache-serve-every-read`: a served page used to leave its view owing the provider's
@@ -679,10 +706,19 @@ async fn back_to_back_reloads_are_each_served_and_a_step_back_still_reaches_olde
     assert!(delta["delta"].is_object(), "a delta answer: {delta}");
     settled(&d.state).await;
 
-    // After those serves, the first one's cursor still steps back: the provider's own newest
-    // page holds the served rows and nothing older, so the step goes on by its cursor and
-    // answers the five older messages, with the provider's own cursor for the next.
-    let older = d.step_back(5, &cursor).await;
+    // After those serves, the first one's cursor still steps back. `#650 cache-first-older-reads`:
+    // the file proves the five messages below the served page, so they are the answer, at once,
+    // with the provider held, and this server's cursor again for the next step.
+    let held = d.chat.hold_next_timeline();
+    let older = tokio::time::timeout(AT_ONCE, d.step_back(5, &cursor))
+        .await
+        .expect("the step back answered at once, from the cache");
+    // The provider's step, read behind it: its claims were listed two hours ago.
+    held.entered
+        .await
+        .expect("the step is read behind the answer");
+    held.release.send(()).expect("the read behind is waiting");
+    stepped_behind(&d.state, READ_CHANNEL, TimelineView::Main).await;
     assert_eq!(
         texts(&older),
         [
@@ -699,14 +735,10 @@ async fn back_to_back_reloads_are_each_served_and_a_step_back_still_reaches_olde
         older["next_after"].is_null(),
         "a step back says nothing of the newest end"
     );
-    let next = older["next_before"]
-        .as_str()
-        .expect("the provider's own backward cursor")
-        .to_owned();
-    assert!(
-        !next.starts_with(vibe_talk::timeline_served::PREFIX),
-        "every step after the first is the provider's: {older}"
-    );
+    let next = served_cursor(&older);
+    // Below them the file holds two messages, and its claims stop at the age limit, so older ones
+    // may be missing from it: that step walks the provider back to them, which says nothing is
+    // older.
     let oldest = d.step_back(5, &next).await;
     assert_eq!(texts(&oldest), ["message 0", "message 1"], "{oldest}");
     assert_eq!(oldest["has_more"], false, "{oldest}");
@@ -724,7 +756,7 @@ async fn a_step_back_from_a_served_page_walks_past_what_arrived_since() {
     // longer reaches the served rows, and the step walks back on its cursors until it does,
     // answering only what lies below the oldest message served.
     let d = deployment("cache-serve-walk").await;
-    d.fill_timeline().await;
+    d.fill_newest(5).await;
     d.clock.advance(2 * HOUR);
     d.state.message_cache.set_serve(true);
     let body = d.served_reload(5).await;
@@ -761,7 +793,7 @@ async fn a_walk_that_spends_its_pages_resumes_and_never_hands_back_a_newer_messa
     // on from where it stopped, not the provider's bare one, whose pages would carry the
     // twenty-five newer messages up above the ones on the page.
     let d = deployment("cache-serve-walk-cap").await;
-    d.fill_timeline().await;
+    d.fill_newest(5).await;
     d.clock.advance(2 * HOUR);
     d.state.message_cache.set_serve(true);
     let body = d.served_reload(5).await;
@@ -1148,7 +1180,9 @@ async fn a_slack_window_is_never_served_and_a_slack_main_page_is() {
         "`#510 cache-serve-every-read`: served again, back to back"
     );
 
-    // Its own cursor steps back past the provider's newest page into Slack's history.
+    // Its own cursor steps back past the provider's newest page into Slack's history. (`#650
+    // cache-first-older-reads`: the copy proves nothing between the fill's settled stretch and
+    // this page, so the step is the provider's.)
     let cursor = served_cursor(&body);
     let older = ok(
         &state,
@@ -1630,6 +1664,15 @@ async fn slack_threads_deployment(
     tag: &str,
     live_poll: bool,
 ) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
+    slack_threads_deployment_with(tag, live_poll, "").await
+}
+
+/// [`slack_threads_deployment`] with `table` added to its configuration.
+async fn slack_threads_deployment_with(
+    tag: &str,
+    live_poll: bool,
+    table: &str,
+) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
     let mut fixture = slack_fake::FakeState::default();
     let mut history: Vec<Value> = (0..6)
         .map(|n| {
@@ -1677,6 +1720,7 @@ token = "{token}"
 id = "{SLACK_CH}"
 label = "team"
 writable = true
+{table}
 "#,
         base = fake.base,
         token = slack_fake::TOKEN,
@@ -1976,17 +2020,17 @@ async fn a_live_fed_channel_s_side_thread_list_spends_no_slack_call_between_upst
     .await;
     assert_eq!(thread_ids(&body), [slack_fake::ts(60, 0)], "{body}");
 
-    // All's counts read is not the thread list: it goes upstream, for the replies the counts
-    // say the page lacks (and not first from the cache either, `#622 cache-first-reads`).
+    // All's counts read is not the thread list: it reads All upstream, for the replies the counts
+    // say the page lacks, behind an answer from the cache (`#650 cache-first-older-reads`); the
+    // page's next counts read takes what that read brought.
     let history = fake.calls("conversations.history");
-    let body = ok(
-        &state,
-        &path(SLACK_CH, "/timeline?view=flat&limit=50&reason=counts"),
-        WRITE_TOKEN,
-    )
-    .await;
-    assert!(body.get("refresh_failed").is_none(), "{body}");
+    let counts_read = path(SLACK_CH, "/timeline?view=flat&limit=50&reason=counts");
+    let body = ok(&state, &counts_read, WRITE_TOKEN).await;
+    assert!(body["refresh_failed"].is_string(), "{body}");
+    landed(&state, &newest_key(SLACK_CH, TimelineView::Flat, 50), None).await;
     assert!(fake.calls("conversations.history") > history);
+    let body = ok(&state, &counts_read, WRITE_TOKEN).await;
+    assert!(body.get("refresh_failed").is_none(), "{body}");
 }
 
 #[tokio::test]
@@ -2485,4 +2529,191 @@ async fn an_answer_from_the_cache_is_dated_by_the_last_upstream_read_that_answer
     let body = ok(&d.state, &poll(&url_encode(&next)), WRITE_TOKEN).await;
     assert!(body["refresh_failed"].is_string(), "{body}");
     assert_eq!(as_of(&body), T0 + 3 * HOUR, "{body}");
+}
+
+// --- `#650 cache-first-older-reads` ---------------------------------------------------------------
+
+/// A table that keeps every day (`#595 cache-full-history`): with no age limit the copy's claims
+/// reach a channel's start, and say nothing is older. The walk itself is not started in a test.
+const FULL_HISTORY: &str = "\n[message_cache]\nbackfill = \"full\"\n";
+
+/// Read Slack's Main upstream again past the unsettled band of the deployment's fill, with serving
+/// still off, so the copy's claims reach its newest messages: a page's oldest message then lies in
+/// the claims, as one fifty messages down does in a live channel.
+async fn settle_band(state: &AppState, clock: &ManualClock) {
+    clock.advance(11 * MINUTE);
+    ok(
+        state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(state).await;
+}
+
+/// The `served_from` words of the access lines `capture` holds for `channel`'s timeline, in order.
+fn served_from(capture: &vibe_talk::testing::LogCapture, channel: &str) -> Vec<String> {
+    capture
+        .access_lines()
+        .into_iter()
+        .filter(|line| line.contains(&format!("/channels/{channel}/timeline")))
+        .filter_map(|line| {
+            line.split(" served_from=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn slack_s_all_held_from_its_start_says_there_is_nothing_older_so_the_page_never_steps_back()
+{
+    // The loop the issue found: a page at the top of a view the server's copy holds whole, from
+    // its start, was told there was more, stepped back after every poll, and each step walked
+    // Slack to learn there was nothing. The copy now says so itself.
+    let (state, fake, clock, _dir) =
+        slack_threads_deployment_with("older-all-start", false, FULL_HISTORY).await;
+    settle_band(&state, &clock).await;
+    state.message_cache.set_serve(true);
+    fake.with(|fixture| fixture.delay = Some(Duration::from_secs(3)));
+    for reason in ["poll", "older", "search"] {
+        let began = std::time::Instant::now();
+        let body = ok(
+            &state,
+            &path(
+                SLACK_CH,
+                &format!("/timeline?view=flat&limit=50&reason={reason}"),
+            ),
+            WRITE_TOKEN,
+        )
+        .await;
+        assert!(began.elapsed() < AT_ONCE, "{reason}: {:?}", began.elapsed());
+        assert!(body["refresh_failed"].is_string(), "{reason}: {body}");
+        assert_eq!(body["has_more"], false, "{reason}: {body}");
+        assert!(body["next_before"].is_null(), "{reason}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn slack_s_all_steps_back_from_the_servers_copy_without_waiting_on_slack() {
+    // Every newest page of All comes from the copy, with this server's cursor; every step back
+    // from it walked Slack from its newest page, 2.6 s a step and once 21 s. The copy holds the
+    // whole history, so the steps come from it, to the start.
+    let (state, fake, clock, _dir) =
+        slack_threads_deployment_with("older-all-steps", false, FULL_HISTORY).await;
+    settle_band(&state, &clock).await;
+    state.message_cache.set_serve(true);
+    fake.with(|fixture| fixture.delay = Some(Duration::from_secs(3)));
+    let capture = vibe_talk::testing::LogCapture::start();
+    let newest = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=flat&limit=2&reason=poll"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(texts(&newest), ["message 4", "message 5"], "{newest}");
+    assert_eq!(newest["has_more"], true, "{newest}");
+    let mut cursor = served_cursor(&newest);
+    let mut steps = Vec::new();
+    loop {
+        let began = std::time::Instant::now();
+        let older = ok(
+            &state,
+            &path(
+                SLACK_CH,
+                &format!(
+                    "/timeline?view=flat&limit=2&reason=older&before={}",
+                    url_encode(&cursor)
+                ),
+            ),
+            WRITE_TOKEN,
+        )
+        .await;
+        assert!(began.elapsed() < AT_ONCE, "{:?}", began.elapsed());
+        // Its replies are the newest the copy holds of each thread, as All's stand-in's are: the
+        // page takes nothing out for lacking one.
+        assert!(older["refresh_failed"].is_string(), "{older}");
+        assert!(older["next_after"].is_null(), "{older}");
+        steps.push(texts(&older));
+        if older["has_more"] == false {
+            break;
+        }
+        cursor = served_cursor(&older);
+        assert!(
+            steps.len() < 5,
+            "the steps never reached the start: {steps:?}"
+        );
+    }
+    assert_eq!(
+        steps,
+        [
+            vec!["message 2", "message 3", "only reply"],
+            vec!["message 0", "message 1", "first reply", "second reply"],
+        ],
+    );
+    let words = served_from(&capture, SLACK_CH);
+    assert_eq!(
+        words.first().map(String::as_str),
+        Some("cache-first"),
+        "{words:?}"
+    );
+    assert!(
+        words[1..].iter().all(|word| word == "cache-older"),
+        "{words:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_step_back_the_copy_cannot_prove_still_reads_the_provider() {
+    // The copy holds only the newest five, so nothing below them is proven: the step walks the
+    // provider as before, and its answer carries the provider's own cursor.
+    let d = deployment("older-unproven").await;
+    d.fill_newest(5).await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let body = d.served_reload(5).await;
+    let cursor = served_cursor(&body);
+    let capture = vibe_talk::testing::LogCapture::start();
+    let older = d.step_back(5, &cursor).await;
+    assert_eq!(
+        texts(&older),
+        [
+            "message 2",
+            "message 3",
+            "message 4",
+            "message 5",
+            "message 6"
+        ],
+        "{older}"
+    );
+    assert!(
+        older["next_before"]
+            .as_str()
+            .is_some_and(|next| !next.starts_with(vibe_talk::timeline_served::PREFIX)),
+        "{older}"
+    );
+    assert_eq!(served_from(&capture, READ_CHANNEL), ["upstream"]);
+}
+
+#[tokio::test]
+async fn all_s_counts_read_never_waits_on_slack_and_the_next_one_takes_the_read_behind_it() {
+    // `read_reason=counts` waited 8.6 s on Slack. Answered from the copy, it says so, and the read
+    // made behind it is what the page's next counts read takes: the provider's own page, which
+    // ends the page's asking.
+    let (state, fake, _clock, _dir) = slack_threads_deployment("older-counts", false).await;
+    state.message_cache.set_serve(true);
+    fake.with(|fixture| fixture.delay = Some(Duration::from_secs(3)));
+    let counts_read = path(SLACK_CH, "/timeline?view=flat&limit=50&reason=counts");
+    let began = std::time::Instant::now();
+    let body = ok(&state, &counts_read, WRITE_TOKEN).await;
+    assert!(began.elapsed() < AT_ONCE, "{:?}", began.elapsed());
+    assert!(body["refresh_failed"].is_string(), "{body}");
+    landed(&state, &newest_key(SLACK_CH, TimelineView::Flat, 50), None).await;
+    let calls = fake.calls("conversations.history");
+    let capture = vibe_talk::testing::LogCapture::start();
+    let body = ok(&state, &counts_read, WRITE_TOKEN).await;
+    assert!(body.get("refresh_failed").is_none(), "{body}");
+    assert_eq!(fake.calls("conversations.history"), calls);
+    assert_eq!(served_from(&capture, SLACK_CH), ["landed"]);
 }

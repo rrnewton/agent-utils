@@ -29155,6 +29155,12 @@ function noteReplyGaps(payload, view, older, delta, before) {
 
 /** How long after a read of All, or an attempt at this one, a read of Main asks for none for its counts: five minutes. */
 const COUNTS_ALL_READ_MS = 300000;
+/**
+ * `#650 cache-first-older-reads`. How soon after a counts read the server answered from its own copy the
+ * page asks once more: the server reads All behind such an answer and keeps what it brings for the next
+ * read for fifteen seconds, so this read takes it, and a read the page trusts ends the asking as before.
+ */
+const COUNTS_SOON_MS = 10000;
 /** @type {Map<string, number>} by channel: when this page last read All for Main's counts */
 const countsAllReadAt = new Map();
 /** @type {Map<string, Map<string, number>>} by channel: what outran the store then, thread id to count */
@@ -29193,13 +29199,13 @@ function outrunningThreads() {
  * than it, and never bringing back a message removed upstream since (`pageFold`, `#316
  * late-counts-resurrect`).
  */
-async function readAllForCounts(channel) {
+async function readAllForCounts(channel, soon = false) {
   if (!threadingSupported || !channel || String(el("discord-channel").value) !== channel || channelView !== "main" ||
       channelCanon.channel !== channel || channelCanon.scope || countsAllReadInFlight !== null ||
       document.visibilityState === "hidden") return;
   const all = channelCanon.views.get(viewKey("flat"));
   const now = Date.now();
-  if (now - Math.max(countsAllReadAt.get(channel) || 0, all ? all.at || 0 : 0) < COUNTS_ALL_READ_MS) return;
+  if (!soon && now - Math.max(countsAllReadAt.get(channel) || 0, all ? all.at || 0 : 0) < COUNTS_ALL_READ_MS) return;
   const outrun = outrunningThreads();
   const saw = countsAllReadFor.get(channel);
   if (![...outrun].some(([id, count]) => !(saw && (saw.get(id) || 0) >= count))) return;
@@ -29220,6 +29226,8 @@ async function readAllForCounts(channel) {
     // `#614 timeline-read-failures`: the server's own copy, the chat service having failed or kept
     // it waiting, may lack the very replies the counts outran: the next counts read asks again.
     if (!refreshFailed(payload)) countsAllReadFor.set(channel, outrun);
+    // `#650 cache-first-older-reads`: ...and asks once more soon, for the read the server made behind it.
+    else if (!soon) setTimeout(() => void readAllForCounts(channel, true).catch(() => {}), COUNTS_SOON_MS);
     const current = channelCanon === read.canon && read.canon.channel === channel &&
       String(el("discord-channel").value) === channel;
     const number = sentNumberOf(payload);

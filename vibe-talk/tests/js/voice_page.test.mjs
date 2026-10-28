@@ -5372,6 +5372,12 @@ const TUNING_BANDS = {
     "sitting on Main while agents answer reads All, about eleven of Slack's calls, nearly as often " +
     "as Main itself is polled; past a quarter of an hour, a read that failed on a cold open leaves " +
     "every answered root saying 'N new' for that long"],
+  // `#650 cache-first-older-reads`. How soon a counts read the server answered from its copy is asked again.
+  COUNTS_SOON_MS: [3000, 14000,
+    "how soon after a counts read the server answered from its own copy the page asks once more, for " +
+    "the read the server made behind it. Under three seconds that read, about Slack's ten calls, has " +
+    "seldom landed; past fourteen the server, which keeps it fifteen, has let it go, and the page asks " +
+    "Slack again five minutes on, for good"],
   UI_STATE_CHARS: [20000, 200000,
     "the whole record in UTF-16 units. A remembered thread carries its root message, so under " +
     "twenty thousand a few long roots push every other channel's choice out; past two hundred " +
@@ -87133,4 +87139,122 @@ test("`#617 cold-load-first-paint`: after a page from the server's own copy the 
   await page.settle();
   assert.ok(page.timelineCalls.length > reads, "the soon read was not sent");
   assert.equal(freshness(page).getAttribute("data-state"), "fresh", freshness(page).textContent);
+});
+
+
+// --- `#650 cache-first-older-reads` ----------------------------------------------------------------
+
+const COUNTS_SOON_MS = sourceConstant("COUNTS_SOON_MS");
+
+/**
+ * A channel of ten messages read on the timeline route, whose newest reads the server answers from its own
+ * copy (`refresh_failed`), saying there is more (`stillMore`) as a server before `#650` did, or not, as one
+ * that holds the view from its start does; a step back walks the provider and finds nothing older. The
+ * reader at the top of the short list, where every redraw's scroll event asks for the step back. The reads
+ * each of four polls made, as `reason:cursor`.
+ */
+async function pollsOverAShortCopy(stillMore) {
+  const page = newPage();
+  pagedTimeline(page, { steps: 1, size: 10 });
+  await signIn(page);
+  await showDiscord(page, []);
+  const area = page.el("scroll-area");
+  const standard = page.timeline;
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    if (url.searchParams.get("before")) {
+      return json(200, timelineAnswer({ view: url.searchParams.get("view"), messages: [], limit: 10,
+        has_threads: true, has_more: false, next_before: null }));
+    }
+    const { delta: _delta, ...newest } = JSON.parse(await (await standard(path, options)).text());
+    return json(200, { ...newest, has_more: stillMore, next_before: stillMore ? "vt-served.x" : null,
+      as_of: new Date(page.clock() - 1000).toISOString(),
+      refresh_failed: "Answered from this server's copy while the chat service is read." });
+  };
+  const polls = [];
+  for (let i = 0; i < 4; i += 1) {
+    const before = page.timelineCalls.length;
+    // The poll, and the soon reads after a page from the copy (`#617 cold-load-first-paint`).
+    for (const due of [DISCORD_POLL_MS, 3000, 10000]) {
+      page.expireTimers(due);
+      await page.settle();
+      // A redraw in a real browser scrolls the list, and the reader is at its top.
+      area.scrollTop = 0;
+      await area.dispatch("scroll");
+      await page.settle();
+    }
+    polls.push(page.timelineCalls.slice(before).map((call) => {
+      const url = new URL(call, "http://fixture.test");
+      return `${url.searchParams.get("reason")}:${url.searchParams.get("before") ? "before" : "newest"}`;
+    }));
+  }
+  return polls;
+}
+
+test("`#650 cache-first-older-reads`: a short view the server's copy holds from its start is never stepped back from at the next poll", async () => {
+  // Live after `#622`: one open page read a step back every forty-five seconds, each walking Slack for
+  // 2.6 s to learn there was nothing older. The copy said there was more; the page at the top of its
+  // short list stepped back after every poll's redraw, learned there was nothing, and the next poll's
+  // copy said there was more again. A copy that says there is nothing older is believed.
+  const polls = await pollsOverAShortCopy(false);
+  assert.ok(polls.every((reads) => reads.length > 0 && reads.every((read) => read.endsWith(":newest"))),
+    `a poll stepped back: ${JSON.stringify(polls)}`);
+
+  // THE CONTROL, the server as it was: a step back after every poll.
+  const control = await pollsOverAShortCopy(true);
+  assert.ok(control.every((reads) => reads.includes("older:before")), JSON.stringify(control));
+});
+
+/**
+ * Main with a root whose count outruns the store, so each read of Main past the interval reads All behind
+ * it for its counts; the server answers those from its own copy while `fromCopy()` says so. The counts
+ * reads it made, by the time of each.
+ */
+async function countsFromCopy(script, fromCopy) {
+  const { page, server, held, quietReply } = await heldAllReads(script);
+  const serve = page.timeline;
+  const counted = [];
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    if (url.searchParams.get("reason") !== "counts") return serve(path, options);
+    counted.push(page.clock());
+    const answer = server.answer(path);
+    const body = JSON.parse(await (await answer).text());
+    if (!fromCopy()) return json(200, body);
+    // The copy says nothing of the second discussion: it leaves the counts outrunning what the page holds.
+    const messages = (body.messages || []).filter((m) => !["203", "204", "250"].includes(String(m.id)));
+    return json(200, { ...body, messages,
+      refresh_failed: "Answered from this server's copy while the chat service is read." });
+  };
+  void held;
+  page.setClock(page.clock() + COUNTS_ALL_READ_MS + 1000);
+  quietReply();
+  await pollOnce(page);
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  return { page, counted };
+}
+
+test("`#650 cache-first-older-reads`: a counts read the server answered from its copy that leaves the counts outrunning is asked once more soon, and one it trusts ends the asking", async () => {
+  let copy = true;
+  const { page, counted } = await countsFromCopy(SCRIPT, () => copy);
+  assert.equal(counted.length, 1, "fixture: All was not read for Main's counts");
+  // The read the server made behind that answer has landed by the next one.
+  copy = false;
+  assert.ok(page.expireTimers(COUNTS_SOON_MS) > 0, "no soon counts read was armed");
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(counted.length, 2, "the counts were not asked again soon");
+  page.expireTimers(COUNTS_SOON_MS);
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  page.setClock(page.clock() + DISCORD_POLL_MS);
+  await pollOnce(page);
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(counted.length, 2, "a counts read the page trusts did not end the asking");
+
+  // THE CONTROL, the page as it was: one counts read, then nothing for five minutes.
+  const control = await countsFromCopy(brokenScript(
+    "    else if (!soon) setTimeout(() => void readAllForCounts(channel, true).catch(() => {}), COUNTS_SOON_MS);\n", ""),
+  () => true);
+  control.page.expireTimers(COUNTS_SOON_MS);
+  for (let i = 0; i < 3; i += 1) await control.page.settle();
+  assert.equal(control.counted.length, 1, JSON.stringify(control.counted));
 });

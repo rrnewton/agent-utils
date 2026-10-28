@@ -143,6 +143,58 @@ impl std::fmt::Display for ToolOutcome {
     }
 }
 
+/// What a timeline read asked for, as its access line says it (`read_view`, `read_cursor`): the view
+/// (`flat`, `main`, `thread`, `threads`, `other` for any other word), and where its cursor points
+/// (`newest`, `after`, `before`, or `before-served` for a step back from a page this server
+/// answered from its cache), `-` for a request that names neither. Words from a closed set only,
+/// never a cursor, a thread id or anything else a client sent. `#650 cache-first-older-reads`:
+/// the line said only the path, so a step back could not be told from a newest read labelled
+/// `older`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadShape {
+    /// The view asked for.
+    pub view: &'static str,
+    /// Where the read's cursor points.
+    pub cursor: &'static str,
+}
+
+impl ReadShape {
+    /// The shape of the read a request's query string asks for.
+    #[must_use]
+    pub fn of_query_string(query: Option<&str>) -> Self {
+        let mut view = "-";
+        let mut cursor = "-";
+        for (key, value) in query
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .filter(|(_, value)| !value.is_empty())
+        {
+            match key {
+                "view" => {
+                    view = match value {
+                        "flat" => "flat",
+                        "main" => "main",
+                        "thread" => "thread",
+                        "threads" => "threads",
+                        _ => "other",
+                    };
+                }
+                "before" if value.starts_with(crate::timeline_served::PREFIX) => {
+                    cursor = "before-served";
+                }
+                "before" => cursor = "before",
+                "after" => cursor = "after",
+                _ => {}
+            }
+        }
+        if cursor == "-" && view != "-" {
+            cursor = "newest";
+        }
+        Self { view, cursor }
+    }
+}
+
 /// One line for one HTTP request, emitted after the response status is known.
 ///
 /// `read_reason` is why the caller says it made the request, when it said: the page's `reason=` on
@@ -156,11 +208,15 @@ impl std::fmt::Display for ToolOutcome {
 /// `served_from` is where the request's timeline read or speech preparation was answered from
 /// (`cache`, `cache-first`, `landed`, `upstream`, ...; see [`crate::cache_first::Source`]), `-` for
 /// a request that made neither. `#622 cache-first-reads`.
+///
+/// `shape` is what a timeline read asked for ([`ReadShape`]). `#650 cache-first-older-reads`.
+#[allow(clippy::too_many_arguments)]
 pub fn request(
     method: &str,
     path: &str,
     credential: Credential,
     read_reason: Option<crate::read_reason::ReadReason>,
+    shape: ReadShape,
     served_from: Option<crate::cache_first::Source>,
     status: u16,
     millis: u128,
@@ -171,6 +227,8 @@ pub fn request(
         path,
         credential = credential.as_str(),
         read_reason = read_reason.map_or("-", crate::read_reason::ReadReason::as_str),
+        read_view = shape.view,
+        read_cursor = shape.cursor,
         served_from = served_from.map_or("-", crate::cache_first::Source::as_str),
         status,
         millis,
@@ -380,12 +438,45 @@ mod tests {
         // check that an operator following `RUST_LOG=vibe_talk::access=info` from the README gets
         // the lines this module emits.
         let capture = crate::testing::LogCapture::start();
-        request("GET", "/healthz", Credential::Absent, None, None, 200, 0);
+        request(
+            "GET",
+            "/healthz",
+            Credential::Absent,
+            None,
+            ReadShape::of_query_string(None),
+            None,
+            200,
+            0,
+        );
         assert!(
             capture.text().contains(TARGET),
             "the emitted target does not match TARGET: {}",
             capture.text()
         );
+    }
+
+    #[test]
+    fn a_read_shape_names_the_view_and_the_cursor_and_copies_nothing() {
+        // `#650 cache-first-older-reads`.
+        let shape = |query: Option<&str>| {
+            let ReadShape { view, cursor } = ReadShape::of_query_string(query);
+            (view, cursor)
+        };
+        assert_eq!(shape(None), ("-", "-"));
+        assert_eq!(
+            shape(Some("view=flat&limit=50&reason=poll")),
+            ("flat", "newest")
+        );
+        assert_eq!(shape(Some("view=main&after=abc")), ("main", "after"));
+        assert_eq!(
+            shape(Some("view=thread&thread_id=T1&before=123")),
+            ("thread", "before")
+        );
+        assert_eq!(
+            shape(Some("view=flat&before=vt-served.eyJ2IjoxfQ&reason=older")),
+            ("flat", "before-served")
+        );
+        assert_eq!(shape(Some("view=whatever&before=")), ("other", "newest"));
     }
 
     #[test]

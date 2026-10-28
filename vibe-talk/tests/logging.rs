@@ -1641,6 +1641,13 @@ async fn a_read_says_why_it_was_made_and_a_reason_the_page_does_not_send_is_othe
         lines[2]
     );
     assert!(lines[3].contains(" read_reason=\"-\""), "{}", lines[3]);
+    // `#650 cache-first-older-reads`: and what it asked for, in words of a closed set.
+    for line in &lines {
+        assert!(
+            line.contains(" read_view=\"main\"") && line.contains(" read_cursor=\"newest\""),
+            "{line}"
+        );
+    }
     // Not `reason`, which the tool, mcp and post_gate lines use for a refusal code.
     for line in &lines {
         assert!(!line.contains(" reason="), "{line}");

@@ -4714,12 +4714,31 @@ answer), which that read answers with as it would have read it itself. So a cold
 round trip to this server, and the provider's page lands a few seconds later. Upstream goes first,
 with the waits above, for a view the cache has never listed, "Older threads…" with no way back
 known, the reads that place a live message's thread (`place`, `reply-place`: they ask the provider
-what this server does not know), All's `counts` read (the page counts it done only when it is not
-the server's copy and asks again five minutes later, so answered first it would read All upstream
-every five minutes for good), a step back into older history, a channel narrowed to one Slack
-thread, and the server's own reads. The access line of every request says where its read was
-answered from (`served_from`: `cache` by the serve rule, `cache-first`, `landed`, `live-fed`,
-`upstream`, `stand-in`; for speech preparation `held` or `fetched`) beside its `millis`.
+what this server does not know), a channel narrowed to one Slack thread, and the server's own reads.
+The access line of every request says where its read was answered from (`served_from`: `cache` by
+the serve rule, `cache-first`, `cache-older`, `landed`, `live-fed`, `upstream`, `stand-in`; for
+speech preparation `held` or `fetched`) and what it asked for (`read_view`: `flat`, `main`,
+`thread`, `threads`; `read_cursor`: `newest`, `after`, `before`, or `before-served` for a step back
+from a page this server answered from its cache) beside its `millis`.
+
+**Older pages and counts from the cache** (`#650`). Live after `#622`, every step back walked Slack
+from its newest page (2.6 s, once 21 s), because every newest page came from the cache with this
+server's own backward cursor; and one open page stepped back after every 45 s poll: its view's
+whole history fitted one page, the copy said there was more, the page at the top of its list took
+the step on the poll's redraw, Slack said there was nothing, and the next poll's copy said there
+was more again. Now a step back from a page the cache answered is answered from the cache when its
+coverage claims prove the step whole (from its oldest message up to the page's, or from the
+scope's start when the step is short), with this server's cursor again when more is older
+(`served_from="cache-older"`); Slack's All is put together as its stand-in is, and carries
+`refresh_failed` like it. A page the cache holds from the view's start (claims from the scope's
+start, which only a channel with no age limit has, and nothing more held below) says
+`has_more: false` with no cursor, so the page has nothing to step back to. The provider's step is
+read behind the answer, giving up at the first rate limit and one per view at a time, only when its
+claims were listed more than 15 minutes ago and the step lies within the walk's four pages of the
+newest end. A step the claims do not prove walks the provider as before. All's `counts` read, and
+the newest page an `older` or `search` step reads for its cursor, are answered from the cache first
+like the page's other newest reads; the page asks for counts once more 10 s after a counts answer
+from the copy that left its counts outrunning, which takes the read made behind it.
 
 **Read aloud from the cache** (`#622`). Speech preparation (`POST /speech/prepare`) and a message's
 `/speak` take a message the cache holds whole (no text a push brought that no read proved) before
@@ -5180,7 +5199,7 @@ ambiguity**. The server says so in a banner at startup, because a reader has to 
 have spoken.
 
 ```text
-INFO vibe_talk::access: request method="POST" path="/mcp" credential="write" read_reason="-" status=200 millis=12
+INFO vibe_talk::access: request method="POST" path="/mcp" credential="write" read_reason="-" read_view="-" read_cursor="-" served_from="-" status=200 millis=12
 INFO vibe_talk::access: mcp rpc_method="tools/call" credential="write" is_notification=false
 INFO vibe_talk::access: tool tool="post_reply" channel="123…" credential="write" outcome="ok" reason="-" text_len=48 millis=9
 INFO vibe_talk::access: post_gate event="proposed" proposal=4 channel="123…" text_len=48 reason="-" confirmed_by="-"
@@ -5195,7 +5214,9 @@ recent-window reads send `reason=poll`, `reason=live` and the rest of the words 
 long upstream takes", and every provider read the request makes is counted under it there. A word
 outside that list is written as `other`, so nothing a client sends is copied into the log, and a
 request that gave no reason shows `-` (`remote-ops-audit`). It is a different field from the
-`reason` on `tool`, `mcp` and `post_gate` lines, which is a refusal code.
+`reason` on `tool`, `mcp` and `post_gate` lines, which is a refusal code. A timeline read also says
+what it asked for, in words of a closed set: `read_view` and `read_cursor` (`#650`), so a step back
+is told from a newest read made for a step back's cursor; never the cursor or a thread id itself.
 
 A tool call the caller stopped waiting for — a voice runtime gives a tool fifteen seconds and then
 drops the request — writes `tool tool="…" outcome="abandoned" millis=…` from the moment its handler

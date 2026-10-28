@@ -41,7 +41,8 @@
 //! between upstream reads of it (`#614`, `crate::ops`); and with serving on, the page's reads of a
 //! view's newest end or of what changed since a cursor are answered from the cache first when it
 //! holds anything of the view, the read upstream behind the answer (`#622 cache-first-reads`,
-//! [`crate::cache_first::eligible`]). Otherwise
+//! [`crate::cache_first::eligible`]; All's `counts` read and the newest page an `older` or
+//! `search` step reads for its cursor among them since `#650 cache-first-older-reads`). Otherwise
 //! NOTHING reads it to decide what a caller may see or do, which read is made, whether one is
 //! shared or kept, or how fresh an answer must be: it is written to the access log and counted in
 //! the upstream profile, and that is all. So a client that lies about

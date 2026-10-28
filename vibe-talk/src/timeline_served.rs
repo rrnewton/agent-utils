@@ -82,6 +82,14 @@ impl Below {
             .is_none_or(|written| written < *at || (written == *at && message.id.as_str() != id))
     }
 
+    /// The served page's oldest message, when it had one whose time reads: when it was written,
+    /// in milliseconds, and its id. Where a step back answered from the cache begins (`#650
+    /// cache-first-older-reads`).
+    #[must_use]
+    pub fn oldest(&self) -> Option<(i64, &str)> {
+        self.oldest.as_ref().map(|(at, id)| (*at, id.as_str()))
+    }
+
     /// The provider's own cursor this step reads on from, or `None` for its newest page.
     #[must_use]
     pub fn resume(&self) -> Option<&str> {

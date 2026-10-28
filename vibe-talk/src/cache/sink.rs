@@ -479,6 +479,17 @@ impl RefreshKey {
         }
     }
 
+    /// Every step back (`before=`) of one channel's `view` (and `thread`) read upstream behind an
+    /// answer from the cache, whatever page it steps back from: one at a time. `#650
+    /// cache-first-older-reads`.
+    #[must_use]
+    pub fn timeline_backward(channel: ChannelId, view: TimelineView, thread: Option<&str>) -> Self {
+        Self {
+            channel,
+            read: format!("timeline-backward:{view:?}:{}", thread.unwrap_or_default()),
+        }
+    }
+
     /// Every catch-up read (`after=`) of one channel's `view` (and `thread`), whatever cursor it
     /// continues from: one at a time upstream. `#611 timeline-read-failures`.
     #[must_use]
@@ -1067,6 +1078,31 @@ pub struct StaleTimeline {
     pub next_before: Option<String>,
     /// See `next_before`.
     pub notice: Option<String>,
+    /// Whether the file proves nothing of the view is older than its oldest message
+    /// ([`super::below::reaches_start`]): a page that says so has no way back. Slack's All, by
+    /// Main's claims. `#650 cache-first-older-reads`.
+    pub reaches_start: bool,
+}
+
+/// A step back from a page answered from the cache, answered from the file
+/// ([`Sink::held_below`]). `#650 cache-first-older-reads`.
+#[derive(Clone, Debug)]
+pub struct HeldBelow {
+    /// The messages, oldest first, each carrying the observation that set it (`observed_ms`),
+    /// unstamped and unmarked as the cache holds them.
+    pub messages: Vec<Message>,
+    /// Whether the file holds any thread of the channel.
+    pub has_threads: bool,
+    /// Whether anything of the view is older than the oldest message.
+    pub has_more: bool,
+    /// Whether the claims prove every message of the answer: false for Slack's All, whose replies
+    /// are the newest the file holds of each thread, as its stand-in's are.
+    pub whole: bool,
+    /// When the oldest claim the step rests on was listed, local time: what it is as of.
+    pub listed_ms: i64,
+    /// How many messages of the view's scope are at or above the page's oldest, counted to
+    /// [`Sink::held_below`]'s `newer_cap`: how far below the newest end the step lies.
+    pub newer: usize,
 }
 
 /// An answer to hand back from the cache. `#384 cache-serve`.
@@ -2214,7 +2250,10 @@ impl Sink {
         if !self.serve_enabled() {
             return None;
         }
-        let Ask::Timeline { view, .. } = ask else {
+        let Ask::Timeline {
+            view, limit: asked, ..
+        } = ask
+        else {
             return None;
         };
         let route_of = |sink: &Self| {
@@ -2240,16 +2279,19 @@ impl Sink {
             return None;
         }
         let slack_flat = shape == Shape::Slack && *view == TimelineView::Flat;
-        let query = if slack_flat {
-            let Ask::Timeline { limit, .. } = ask else {
-                return None;
-            };
-            shadow::Query::Newest {
+        let asked = *asked;
+        // One more than the page: the row that says whether the file holds more below it (`#650
+        // cache-first-older-reads`).
+        let query = match shadow::query(ask, shape, recent_via_flat) {
+            Some(shadow::Query::Newest { scope, .. }) => shadow::Query::Newest {
+                scope,
+                limit: asked.saturating_add(1),
+            },
+            None if slack_flat => shadow::Query::Newest {
                 scope: Scope::Main,
-                limit: *limit,
-            }
-        } else {
-            shadow::query(ask, shape, recent_via_flat)?
+                limit: asked.saturating_add(1),
+            },
+            _ => return None,
         };
         let cache = self.cache()?;
         let chan = ChanKey::new(key.clone(), channel.as_str());
@@ -2257,6 +2299,13 @@ impl Sink {
             let Read::Served(mut view) = cache.shadow_view(&chan, &query) else {
                 return None;
             };
+            let more_held = view.rows.len() > asked;
+            if more_held {
+                view.rows.remove(0);
+            }
+            let thread = matches!(query.scope(), Some(Scope::Thread(_)));
+            let reaches_start =
+                super::below::reaches_start(&view.coverage, &view.rows, more_held, thread);
             if slack_flat {
                 let roots: Vec<String> = view
                     .rows
@@ -2278,17 +2327,19 @@ impl Sink {
                 view.rows.dedup_by(|a, b| a.message.id == b.message.id);
             }
             view.rows.retain(|row| !row.content_partial);
-            Some(view)
+            Some((view, reaches_start))
         })
         .await
         .ok()
         .flatten()?;
+        let (view, reaches_start) = view;
         // Checked again after the read, as a serve is: an account or a route that changed under it
         // must not let rows read as one account out as another's.
         if view.rows.is_empty() || route_of(self).is_none_or(|(again, ..)| again != key) {
             return None;
         }
         Some(StaleTimeline {
+            reaches_start,
             checked_ms: view
                 .head_checked_ms
                 .or(view.head.map(|head| head.head_listed_ms)),
@@ -2366,7 +2417,142 @@ impl Sink {
             threads,
             next_before: None,
             notice: None,
+            reaches_start: false,
         })
+    }
+
+    /// A step back of `limit` from a page answered from the cache, whose oldest message was
+    /// written at `at_ms` with the id `id`, answered from the file: `None` when its claims do not
+    /// prove the step whole ([`super::below::proven`]), and then the step reads upstream. `#650
+    /// cache-first-older-reads`.
+    ///
+    /// Under the gates [`Self::stale_timeline`] keeps (serving on, the channel routed, its
+    /// provider's account checked against the file before and after the read, the scope not
+    /// blocked, no text a push brought that no read has proven whole), and one more: the claims it
+    /// rests on were listed after the latest offer dropped for the channel, which may have been an
+    /// edit or a deletion in the stretch. The same views as there: Main and one thread on every
+    /// shape but a channel narrowed to one thread, a bridge's All, and Slack's All, put together
+    /// as its stand-in is, from Main's step and the newest replies the file holds of each thread
+    /// rooted on it that are older than the page, proven by Main's claims alone (`whole` false).
+    /// `newer_cap`: count the scope's messages at or above `at_ms` up to this many.
+    pub async fn held_below(
+        &self,
+        channel: &ChannelId,
+        ask: &Ask,
+        (at_ms, id): (i64, &str),
+        newer_cap: usize,
+    ) -> Option<HeldBelow> {
+        if !self.serve_enabled() {
+            return None;
+        }
+        let Ask::Timeline { view, limit, .. } = ask else {
+            return None;
+        };
+        let limit = *limit;
+        let route_of = |sink: &Self| {
+            let routes = sink.state.routes();
+            routes
+                .fills
+                .get(channel)
+                .filter(|route| sink.verification(&route.key) == Verification::Verified)
+                .map(|route| (route.key.clone(), route.shape, route.recent_via_flat))
+        };
+        let (key, shape, recent_via_flat) = route_of(self)?;
+        if *view == TimelineView::Threads || shape == Shape::SlackThread {
+            return None;
+        }
+        let slack_flat = shape == Shape::Slack && *view == TimelineView::Flat;
+        let scope = if slack_flat {
+            Scope::Main
+        } else {
+            shadow::query(ask, shape, recent_via_flat)?.scope()?.clone()
+        };
+        // One more than the step: the row that says whether the file holds more below it.
+        let query = shadow::Query::Below {
+            scope: scope.clone(),
+            at_ms,
+            id: id.to_owned(),
+            limit: limit.saturating_add(1),
+        };
+        let below_id = id.to_owned();
+        let cache = self.cache()?;
+        let chan = ChanKey::new(key.clone(), channel.as_str());
+        let held = tokio::task::spawn_blocking(move || {
+            let Read::Served(mut view) = cache.shadow_view(&chan, &query) else {
+                return None;
+            };
+            let more_held = view.rows.len() > limit;
+            if more_held {
+                view.rows.remove(0);
+            }
+            let thread = matches!(scope, Scope::Thread(_));
+            let proven = super::below::proven(
+                &view.coverage,
+                &view.rows,
+                at_ms,
+                (limit, more_held),
+                thread,
+            )?;
+            if view
+                .dropped_ms
+                .is_some_and(|dropped| proven.cover.listed_ms <= dropped)
+            {
+                return None;
+            }
+            let newer = match cache.newest(&chan, &scope, newer_cap) {
+                Read::Served(rows) => rows.iter().filter(|row| row.created_ms >= at_ms).count(),
+                _ => newer_cap,
+            };
+            if slack_flat {
+                let roots: Vec<String> = view
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.message.thread.as_ref())
+                    .filter(|thread| thread.is_root)
+                    .map(|thread| thread.id.clone())
+                    .collect();
+                for thread in roots {
+                    match cache.newest(&chan, &Scope::Thread(thread), STALE_FLAT_REPLIES) {
+                        Read::Served(replies) => {
+                            view.rows.extend(replies.into_iter().filter(|row| {
+                                row.created_ms < at_ms
+                                    || (row.created_ms == at_ms && row.message.id.0 != below_id)
+                            }))
+                        }
+                        Read::Blocked => return None,
+                        _ => {}
+                    }
+                }
+                view.rows
+                    .sort_by_key(|row| (row.created_ms, row.message.id.clone()));
+                view.rows.dedup_by(|a, b| a.message.id == b.message.id);
+            }
+            view.rows.retain(|row| !row.content_partial);
+            Some(HeldBelow {
+                has_threads: view.has_threads,
+                has_more: proven.has_more,
+                whole: !slack_flat,
+                listed_ms: proven.cover.listed_ms,
+                newer,
+                messages: view
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        let mut message = row.message;
+                        message.observed_ms = Some(row.observed_ms);
+                        message
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .ok()
+        .flatten()?;
+        // Checked again after the read, as a serve is.
+        if route_of(self).is_none_or(|(again, ..)| again != key) {
+            return None;
+        }
+        Some(held)
     }
 
     /// The messages of `channel` among `ids` that the cache holds whole, by id, for speech
