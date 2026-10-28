@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-652-cd5ba148232",
+    "issue_id": "agent-utils-652",
+    "author": "coordinator",
+    "body": "[opus 5.5] Owner 10:56 ET variant: with the thread UNPACKED the reply joined the thread immediately after the 2nd tick (green never seen); after folding the thread the Sending card was still in the main list with both ticks green: two copies (stale pending card not retired) or a jump back out. Fix: one record per send (op key then Slack id), in exactly one place in every view; test every combination of open/folded thread before/after the 2nd tick. Also (owner 10:54 ET): server_ms=0 is server processing only; the page should report its own measured tap->tick1/tick2 times to the server log.",
+    "created_at": "2026-10-28T15:13:36.437956094Z",
+    "updated_at": "2026-10-28T15:13:36.437956094Z"
+  }
+]
