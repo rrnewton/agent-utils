@@ -1011,13 +1011,15 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     let state = state
         .with_ignored_text_prefixes(settings.ignored_text_prefixes)?
         .with_reply_command_offered(offer_reply_command)
-        .with_command_only_replies(headless);
+        .with_command_only_replies(headless)
+        .with_receipt_when_started(headless);
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
     if headless {
         service_log(format!(
-            "agentctl: {} is headless: requests go to its queue, replies only through \
-             `agentctl chat reply`; reply reminders and the stale composer guard are off",
+            "agentctl: {} is headless: requests go to its queue, each earns its receipt when \
+             the model starts it, replies only through `agentctl chat reply`; reply reminders \
+             and the stale composer guard are off",
             state.config().agent_name
         ));
     }
@@ -3292,6 +3294,12 @@ impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
     fn withdraw(&self, agent_name: &str, message_id: &str) -> std::result::Result<bool, String> {
         self.delivery.withdraw(agent_name, message_id)
     }
+
+    /// A headless agent's model started the prompt: the request earns its ✅ now, as a pane's
+    /// prompt does once a drain verified it (#601 headless-second-reaction).
+    fn prompt_started(&self, message_id: &str) {
+        self.note_printed(message_id);
+    }
 }
 
 /// `chat_runtime::deliver_fence_feedback_covering` through the service's delivery, which notes
@@ -5246,8 +5254,109 @@ struct StaleComposerRun {
 
 /// How long the headless owner loop waits for a provider notice before it looks for reply wakes
 /// and due scans again: a `chat reply` wake reaches no pane event stream, so this bounds how long
-/// a stored reply waits to be sent.
+/// a stored reply waits to be sent. It also spaces the looks at the queue for prompts the model
+/// started, so it bounds how late a request's ✅ receipt is saved.
 const HEADLESS_WAIT: Duration = Duration::from_millis(250);
+
+/// The requests whose prompts a headless coordinator's queue holds and its model has not started
+/// yet, which the headless owner loop looks up at most once each `HEADLESS_WAIT` for the moment
+/// it does, so that the request earns its ✅ receipt then and not up to a rescan later (#601
+/// headless-second-reaction). A request leaves the watch once a pass settles it, either way,
+/// or fails on it; each scan adds the requests it finds waiting again. A look reads at most
+/// `MAX_KEYS_PER_PASS` entries, taking up after the last one the previous look read, so with
+/// more waiting, each is still read within a few looks.
+#[derive(Default)]
+struct StartWatch {
+    keys: BTreeSet<String>,
+    next_look: Option<Instant>,
+    // The last request the previous look read.
+    last_looked: Option<String>,
+}
+
+impl StartWatch {
+    /// Follow what a pass did: each request it handled leaves the watch, and those it left
+    /// waiting for the model join it.
+    fn note(&mut self, report: &CycleReport) {
+        for key in &report.processed_keys {
+            self.keys.remove(key);
+        }
+        self.keys.extend(report.delivery_pending.iter().cloned());
+    }
+
+    /// When the next look is due, if any request is watched.
+    fn next_look(&self) -> Option<Instant> {
+        (!self.keys.is_empty()).then(|| self.next_look.unwrap_or_else(Instant::now))
+    }
+
+    /// The watched requests whose prompts have left the queue's inbox, each settled one way or
+    /// another: started (`processed`), set aside untyped, or possibly submitted. A pass over them
+    /// records which, and saves the ✅ of each one started. Gives none before the next look is
+    /// due. A request whose entry cannot be read, or that the queue does not show at all (as for
+    /// an instant while the wrapper hands an input back), stays for the next look; the scans
+    /// report what stays unreadable.
+    fn settled(
+        &mut self,
+        state: &BridgeState,
+        delivery: &dyn chat_runtime::CoordinatorDelivery,
+    ) -> Vec<String> {
+        let now = Instant::now();
+        if self.keys.is_empty() || self.next_look.is_some_and(|due| now < due) {
+            return Vec::new();
+        }
+        self.next_look = Some(now + HEADLESS_WAIT);
+        let agent_name = &state.config().agent_name;
+        let after = self.last_looked.take().unwrap_or_default();
+        let turn: Vec<String> = self
+            .keys
+            .iter()
+            .filter(|key| **key > after)
+            .chain(self.keys.iter().filter(|key| **key <= after))
+            .take(MAX_KEYS_PER_PASS)
+            .cloned()
+            .collect();
+        self.last_looked = turn.last().cloned();
+        turn.into_iter()
+            .filter(|key| {
+                matches!(
+                    delivery.message_state(agent_name, &format!("chat-{key}")),
+                    Ok(Some(
+                        QueueMessageState::Processed
+                            | QueueMessageState::Failed
+                            | QueueMessageState::Cancelled
+                    ))
+                )
+            })
+            .collect()
+    }
+}
+
+/// Run `watch.scan` through a delivery that saves the ✅ receipt of each request whose prompt
+/// the scan finds started, as a pass does, and log what that could not save.
+fn headless_scan(
+    watch: &mut DeliveryWatch,
+    starts: &mut StartWatch,
+    state: &BridgeState,
+    queue_reader: &dyn chat_runtime::CoordinatorDelivery,
+    receipts: Option<&Arc<AckQueue>>,
+    routes: &mut RouteCache,
+    notes: &mut NoteLog,
+) {
+    let typing = TypingNotes::default();
+    watch.scan(
+        state,
+        &TypingWatch {
+            delivery: queue_reader,
+            notes: &typing,
+            state,
+            receipts,
+        },
+        routes,
+    );
+    starts.keys.extend(watch.retry_keys.iter().cloned());
+    let mut report = CycleReport::default();
+    report_receipt_errors(&typing, &mut report);
+    notes.log(&report);
+}
 
 /// One run of the owner loop for a headless coordinator (#594 headless-slack-trial, the minimal
 /// form of the design note's `HeadlessDelivery`). Its wrapper is the only drainer of its queue,
@@ -5255,8 +5364,11 @@ const HEADLESS_WAIT: Duration = Duration::from_millis(250);
 /// `--deliver-while-working`) and wakes the wrapper; there is no pane to read, no turn to watch
 /// and no reply block to capture, because a headless coordinator replies only through
 /// `agentctl chat reply`, whose wake brings the send forward. Delivery state comes from the
-/// queue alone. Rescans retry the requests still pending, and each reconciliation runs a
-/// recovery pass, as the pane loop does.
+/// queue alone: a request is delivered, and earns its ✅ receipt, when the queue shows that the
+/// model started its prompt, which [`StartWatch`] looks for (#601 headless-second-reaction).
+/// Rescans retry the requests still pending, and each reconciliation runs a recovery pass, as
+/// the pane loop does; the first one, at startup, settles the requests whose prompts the model
+/// started while `chat run` was down.
 #[allow(clippy::too_many_arguments)]
 fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     state: &BridgeState,
@@ -5277,15 +5389,26 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     };
     let mut direct_keys = DirectKeyQueue::default();
     let mut notes = NoteLog::default();
+    let mut starts = StartWatch::default();
+    let receipts = stop.ack_queue.as_ref();
     let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
     enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
+    starts.note(&recovery);
     notes.log(&recovery);
     let queue_reader = CancellableDelivery {
         manager,
         runtime: StopRuntime::new(stop),
     };
     let mut watch = DeliveryWatch::new(options.timing);
-    watch.scan(state, &queue_reader, &mut routes);
+    headless_scan(
+        &mut watch,
+        &mut starts,
+        state,
+        &queue_reader,
+        receipts,
+        &mut routes,
+        &mut notes,
+    );
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
     while !stop.is_stopped() {
         health.tick(state);
@@ -5293,12 +5416,21 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
         take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
         let retry = watch.due() && {
-            watch.scan(state, &queue_reader, &mut routes);
+            headless_scan(
+                &mut watch,
+                &mut starts,
+                state,
+                &queue_reader,
+                receipts,
+                &mut routes,
+                &mut notes,
+            );
             !recover && !watch.retry_keys.is_empty()
         };
         if recover {
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
+            starts.note(&report);
             notes.log(&report);
         }
         if !direct_keys.is_empty() {
@@ -5310,6 +5442,18 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
                 &mut control,
                 overflowed,
             )?;
+            starts.note(&report);
+            notes.log(&report);
+            for key in &report.processed_keys {
+                routes.replace(key, state.next_reply_route(key)?);
+            }
+        }
+        // The prompts the model started since the last look: each earns its ✅ now, before the
+        // pass records it delivered.
+        let settled = starts.settled(state, &queue_reader);
+        if !settled.is_empty() {
+            let report = process_keys(state, manager, options.delivery, &settled, &mut control)?;
+            starts.note(&report);
             notes.log(&report);
             for key in &report.processed_keys {
                 routes.replace(key, state.next_reply_route(key)?);
@@ -5336,22 +5480,34 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
                     break;
                 }
             }
+            starts.note(&report);
             notes.log(&report);
             for key in &report.processed_keys {
                 routes.replace(key, state.next_reply_route(key)?);
             }
-            watch.scan(state, &queue_reader, &mut routes);
+            headless_scan(
+                &mut watch,
+                &mut starts,
+                state,
+                &queue_reader,
+                receipts,
+                &mut routes,
+                &mut notes,
+            );
         }
         if Instant::now() >= next_reconciliation {
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
+            starts.note(&report);
             notes.log(&report);
             next_reconciliation = Instant::now() + options.reconciliation_interval;
         }
         let timeout = if direct_keys.is_empty() {
+            let next_look = starts.next_look().unwrap_or(next_reconciliation);
             watch
                 .next_scan
                 .min(next_reconciliation)
+                .min(next_look)
                 .saturating_duration_since(Instant::now())
                 .min(HEADLESS_WAIT)
         } else {
@@ -13315,6 +13471,551 @@ esac
         assert!(fixture.client.runs.lock().expect("runs").is_empty());
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
+    }
+
+    /// A stand-in for a headless agent's wrapper (#601 headless-second-reaction). It answers
+    /// every request on the agent's control socket as a running wrapper answers a wake, and
+    /// moves a queue item when the test says, as the wrapper moves it when the harness takes the
+    /// input, the model starts it, an interrupt hands it back, or the queue sets it aside. With
+    /// `start_on_wake` set, a wake starts every queued input before it is answered, as an idle
+    /// model can start one before the sender looks.
+    struct FakeWrapper {
+        queue: PathBuf,
+        wakes: Arc<AtomicU64>,
+        start_on_wake: Arc<AtomicBool>,
+    }
+
+    /// Where the queue at `queue` holds request `key`'s prompt, if it does.
+    fn fake_queue_find(queue: &Path, key: &str) -> Option<PathBuf> {
+        [
+            "inbox",
+            "inbox.v2",
+            "inflight",
+            "processed",
+            "failed",
+            "cancelled",
+        ]
+        .into_iter()
+        .map(|phase| queue.join(phase).join(format!("chat-{key}.json")))
+        .find(|path| path.exists())
+    }
+
+    /// Move request `key`'s prompt in the queue at `queue` to `phase` with `fields` set, as the
+    /// wrapper does: the new copy is renamed into place before the old one is removed, so a
+    /// reader never finds a partial item, and finds none missing.
+    fn fake_queue_move(queue: &Path, key: &str, phase: &str, fields: Value) {
+        let from = fake_queue_find(queue, key).expect("queued item");
+        let mut item: Value =
+            serde_json::from_slice(&fs::read(&from).expect("read item")).expect("item JSON");
+        for (name, value) in fields.as_object().expect("fields") {
+            item[name] = value.clone();
+        }
+        let directory = queue.join(phase);
+        if !directory.exists() {
+            fs::create_dir(&directory).expect("create phase directory");
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("private phase directory");
+        }
+        let to = directory.join(format!("chat-{key}.json"));
+        let temporary = directory.join(format!(".chat-{key}.moving"));
+        fs::write(&temporary, serde_json::to_vec(&item).expect("item bytes")).expect("write item");
+        fs::rename(&temporary, &to).expect("place item");
+        if from != to {
+            fs::remove_file(&from).expect("remove the old item");
+        }
+    }
+
+    /// The model started the input, between tool calls when `mid_turn`.
+    fn fake_queue_start(queue: &Path, key: &str, mid_turn: bool) {
+        fake_queue_move(
+            queue,
+            key,
+            "processed",
+            json!({
+                "delivery_state": "processed",
+                "started_at": agent_queue::queue::unix_seconds(),
+                "mid_turn": mid_turn,
+            }),
+        );
+    }
+
+    impl FakeWrapper {
+        fn serve(fixture: &crate::subagents::tests::Fixture, agent: &str) -> Self {
+            let directory = fixture.manager().agent_directory(agent);
+            let queue = directory.join("queue");
+            let (sender, receiver) = crate::headless::control::channel();
+            crate::headless::control::serve(
+                &crate::headless::control::socket_path(&directory),
+                sender,
+                |request| request,
+            )
+            .expect("serve the control socket");
+            let wakes = Arc::new(AtomicU64::new(0));
+            let start_on_wake = Arc::new(AtomicBool::new(false));
+            let (counted, starting) = (Arc::clone(&wakes), Arc::clone(&start_on_wake));
+            let lanes = [queue.join("inbox"), queue.join("inbox.v2")];
+            let started_queue = queue.clone();
+            thread::spawn(move || {
+                for request in receiver {
+                    if request.body["op"] == "wake" {
+                        counted.fetch_add(1, AtomicOrdering::SeqCst);
+                        if starting.load(AtomicOrdering::SeqCst) {
+                            let entries = lanes
+                                .iter()
+                                .flat_map(|lane| fs::read_dir(lane).into_iter().flatten())
+                                .flatten();
+                            for entry in entries {
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                if let Some(key) = name
+                                    .strip_prefix("chat-")
+                                    .and_then(|name| name.strip_suffix(".json"))
+                                {
+                                    fake_queue_start(&started_queue, key, false);
+                                }
+                            }
+                        }
+                    }
+                    let _ = request.reply.send(json!({"ok": true}));
+                }
+            });
+            Self {
+                queue,
+                wakes,
+                start_on_wake,
+            }
+        }
+
+        fn find(&self, key: &str) -> Option<PathBuf> {
+            fake_queue_find(&self.queue, key)
+        }
+
+        /// The queued prompt of request `key`.
+        fn item(&self, key: &str) -> Value {
+            let path = self.find(key).expect("queued item");
+            serde_json::from_slice(&fs::read(path).expect("read item")).expect("item JSON")
+        }
+
+        /// The harness took the input: the item crosses the at-most-once barrier, remembering
+        /// the lane it came from.
+        fn write(&self, key: &str) {
+            let lane = self
+                .find(key)
+                .and_then(|path| path.parent()?.file_name()?.to_str().map(str::to_owned))
+                .expect("queued lane");
+            fake_queue_move(
+                &self.queue,
+                key,
+                "inflight",
+                json!({
+                    "delivery_state": "inflight",
+                    "possibly_submitted": true,
+                    "inflight_from": lane,
+                }),
+            );
+        }
+
+        fn start(&self, key: &str, mid_turn: bool) {
+            fake_queue_start(&self.queue, key, mid_turn);
+        }
+
+        /// An interrupt cancelled the input before the model started it: back to its lane.
+        fn hand_back(&self, key: &str) {
+            let lane = self.item(key)["inflight_from"]
+                .as_str()
+                .expect("written from a lane")
+                .to_owned();
+            fake_queue_move(
+                &self.queue,
+                key,
+                &lane,
+                json!({"delivery_state": "pending", "possibly_submitted": false}),
+            );
+        }
+
+        /// The queue set the input aside untyped, as for a tombstone.
+        fn set_aside(&self, key: &str) {
+            fake_queue_move(
+                &self.queue,
+                key,
+                "cancelled",
+                json!({"delivery_state": "cancelled"}),
+            );
+        }
+    }
+
+    /// A bridge state for the fixture's headless agent `worker`, opened as `chat run` opens it
+    /// for a headless agent, that acknowledges each request with 👀 so that each can earn the ✅
+    /// receipt.
+    fn headless_worker_state(fixture: &crate::subagents::tests::Fixture) -> BridgeState {
+        fixture
+            .manager()
+            .start_headless(
+                "worker",
+                &fixture.root,
+                crate::subagents::HeadlessStart {
+                    harness: "claude".to_owned(),
+                    ..crate::subagents::HeadlessStart::default()
+                },
+            )
+            .expect("register a headless agent");
+        let root = fixture.root.join("chat");
+        fs::create_dir(&root).expect("create state root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private state");
+        BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
+                channel_ids: vec!["spaces/example".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
+                agent_name: "worker".to_owned(),
+                agent_label: "worker".to_owned(),
+                outbound_enabled: true,
+                ack_reaction: ReactionSetting::Emoji("👀".to_owned()),
+                receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
+                backend_configuration: None,
+                outbound_command: None,
+                reply_alias_range: None,
+                slack_format: Some(SlackFormat::Markdown),
+                slack_format_by_channel: std::collections::BTreeMap::new(),
+            },
+        )
+        .expect("initialize state")
+        .with_command_only_replies(true)
+        .with_receipt_when_started(true)
+    }
+
+    /// Whether request `key` has a ✅ receipt waiting to be added.
+    fn receipt_saved(state: &BridgeState, key: &str) -> bool {
+        state
+            .pending_receipt_reactions()
+            .expect("pending receipts")
+            .iter()
+            .any(|saved| saved == key)
+    }
+
+    /// The stage `chat status` gives request `key`.
+    fn status_stage(state: &BridgeState, key: &str) -> String {
+        let status = state.status().expect("status");
+        let request = status["requests"]
+            .as_array()
+            .expect("requests")
+            .iter()
+            .find(|request| request["key"] == key)
+            .cloned()
+            .expect("request in status");
+        request["stage"].as_str().expect("stage").to_owned()
+    }
+
+    /// Add the ✅ saved for request `key` through a stand-in for the chat provider, and give the
+    /// message and emoji it was asked to react with.
+    fn add_saved_receipt(state: &BridgeState, key: &str) -> (String, String) {
+        let (submitted, submissions) = mpsc::channel();
+        state
+            .ensure_receipt_reaction(key, &mut EmojiObservingTransport { submitted })
+            .expect("add the receipt")
+            .expect("a receipt was saved");
+        let (message, emoji, _) = submissions.try_recv().expect("the receipt reaction");
+        (message, emoji)
+    }
+
+    /// The headless owner loop for `state`, with `delivery` as its options, until `done` returns
+    /// true (or 20 seconds pass); see [`run_owner_loop_timed`]. Rescans fall due once an hour,
+    /// so whatever the loop settles meanwhile, it settles by looking at the queue.
+    fn run_headless_loop(
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        delivery: DrainOptions,
+        done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
+    ) {
+        // A stand-in of its own for each run, since each binds its socket under its name.
+        static RUNS: AtomicU64 = AtomicU64::new(0);
+        let name = format!("herdr-{}", RUNS.fetch_add(1, AtomicOrdering::Relaxed));
+        let herdr = owner_loop_herdr(&fixture.root, &name, |_| Vec::new());
+        run_owner_loop_timed(
+            fixture,
+            state,
+            &herdr,
+            Duration::from_secs(3_600),
+            DeliveryTiming {
+                retry_interval: Duration::from_secs(3_600),
+                ..DeliveryTiming::default()
+            },
+            delivery,
+            Duration::from_secs(20),
+            None,
+            None,
+            done,
+        );
+        assert_eq!(herdr.subscriptions.load(AtomicOrdering::SeqCst), 0);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_headless_request_earns_its_receipt_only_when_the_model_starts_it() {
+        // The second reaction marks the agent admitting the request as input (#601
+        // headless-second-reaction). Here a turn is running, so the prompt waits for the turn
+        // boundary: queued, taken by the harness, handed back by an interrupt, and finally
+        // started. Only the start earns the ✅, and it is saved before the request is recorded
+        // delivered.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state(&fixture);
+        let wrapper = FakeWrapper::serve(&fixture, "worker");
+        let mut key: Option<String> = None;
+        let mut step = 0;
+        let mut since = Instant::now();
+        // Long enough for the loop to look at the queue several times.
+        let looks = HEADLESS_WAIT * 3;
+        // A check that fails in the loop's companion thread ends the loop and is reported after.
+        let mut failure = None;
+        run_headless_loop(&fixture, &state, DrainOptions::default(), |notify, _| {
+            let Some(key) = &key else {
+                let admitted = admitted_worker_message(&state, 1, "one");
+                notify(ProviderNotice::Batch(vec![admitted.clone()]));
+                key = Some(admitted);
+                return false;
+            };
+            match step {
+                // Queued: not started, so no receipt, however long it waits.
+                0 if wrapper.find(key).is_some() => {
+                    step = 1;
+                    since = Instant::now();
+                }
+                1 if since.elapsed() >= looks => {
+                    let stage = status_stage(&state, key);
+                    let deliver = wrapper.item(key)["deliver"].clone();
+                    if receipt_saved(&state, key) || stage != "queued" || deliver != "turn-boundary"
+                    {
+                        failure = Some(format!("queued: stage {stage}, deliver {deliver}"));
+                        return true;
+                    }
+                    wrapper.write(key);
+                    step = 2;
+                    since = Instant::now();
+                }
+                2 if since.elapsed() >= looks => {
+                    let stage = status_stage(&state, key);
+                    if receipt_saved(&state, key) || stage != "queued" {
+                        failure = Some(format!("written: stage {stage}"));
+                        return true;
+                    }
+                    wrapper.hand_back(key);
+                    step = 3;
+                    since = Instant::now();
+                }
+                3 if since.elapsed() >= looks => {
+                    if receipt_saved(&state, key) {
+                        failure = Some("a handed-back prompt earned a receipt".to_owned());
+                        return true;
+                    }
+                    wrapper.start(key, false);
+                    step = 4;
+                }
+                4 => return receipt_saved(&state, key),
+                _ => {}
+            }
+            false
+        });
+        assert_eq!(failure, None);
+        let key = key.expect("a request was admitted");
+        assert!(
+            receipt_saved(&state, &key),
+            "the started prompt earned no receipt"
+        );
+        assert!(
+            wrapper.wakes.load(AtomicOrdering::SeqCst) > 0,
+            "the wrapper was never woken"
+        );
+        let inspection = state.inspect_request(&key).expect("inspect request");
+        assert_eq!(inspection["phase"], "delivered", "{inspection:#}");
+        assert_eq!(inspection["stage"], "started", "{inspection:#}");
+        assert_eq!(status_stage(&state, &key), "started");
+        assert_eq!(state.status().expect("status")["stages"]["started"], 1);
+        assert_eq!(
+            add_saved_receipt(&state, &key),
+            (
+                "spaces/example/messages/one".to_owned(),
+                "\u{2705}".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn an_urgent_headless_request_earns_its_receipt_when_started_mid_turn() {
+        // With --deliver-while-working the prompt is urgent and the model starts it between
+        // tool calls of the running turn: the ✅ follows that start, not the queuing.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state(&fixture);
+        let wrapper = FakeWrapper::serve(&fixture, "worker");
+        let mut key: Option<String> = None;
+        let mut started = false;
+        let mut failure = None;
+        let delivery = DrainOptions {
+            deliver_while_working: true,
+            ..DrainOptions::default()
+        };
+        run_headless_loop(&fixture, &state, delivery, |notify, _| {
+            let Some(key) = &key else {
+                let admitted = admitted_worker_message(&state, 1, "one");
+                notify(ProviderNotice::Batch(vec![admitted.clone()]));
+                key = Some(admitted);
+                return false;
+            };
+            if !started {
+                if wrapper.find(key).is_none() {
+                    return false;
+                }
+                let item = wrapper.item(key);
+                if receipt_saved(&state, key)
+                    || item["deliver"] != "now"
+                    || item["priority"] != "urgent"
+                {
+                    failure = Some(format!("queued: {item:#}"));
+                    return true;
+                }
+                wrapper.write(key);
+                wrapper.start(key, true);
+                started = true;
+                return false;
+            }
+            receipt_saved(&state, key)
+        });
+        assert_eq!(failure, None);
+        let key = key.expect("a request was admitted");
+        assert!(
+            receipt_saved(&state, &key),
+            "the started prompt earned no receipt"
+        );
+        assert_eq!(status_stage(&state, &key), "started");
+    }
+
+    #[test]
+    fn a_headless_request_started_while_the_bridge_was_down_earns_its_receipt_at_restart() {
+        // `chat run` stops with the prompt queued; the model starts it meanwhile. The first pass
+        // of the next run settles it from the queue: the ✅ is saved once, then the request is
+        // recorded delivered.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state(&fixture);
+        let wrapper = FakeWrapper::serve(&fixture, "worker");
+        let mut key: Option<String> = None;
+        run_headless_loop(
+            &fixture,
+            &state,
+            DrainOptions::default(),
+            |notify, _| match &key {
+                None => {
+                    let admitted = admitted_worker_message(&state, 1, "one");
+                    notify(ProviderNotice::Batch(vec![admitted.clone()]));
+                    key = Some(admitted);
+                    false
+                }
+                Some(key) => wrapper.find(key).is_some(),
+            },
+        );
+        let key = key.expect("a request was admitted");
+        assert!(
+            !receipt_saved(&state, &key),
+            "a queued prompt earned a receipt"
+        );
+        assert_eq!(status_stage(&state, &key), "queued");
+        wrapper.start(&key, false);
+        // Down, nothing changes: the stage still reads from the request record.
+        assert_eq!(status_stage(&state, &key), "queued");
+        let restarted = state.clone();
+        run_headless_loop(&fixture, &restarted, DrainOptions::default(), |_, _| {
+            receipt_saved(&restarted, &key)
+        });
+        assert!(
+            receipt_saved(&state, &key),
+            "the restart did not save the receipt"
+        );
+        assert_eq!(status_stage(&state, &key), "started");
+        assert_eq!(
+            state.pending_receipt_reactions().expect("receipts").len(),
+            1
+        );
+        assert_eq!(add_saved_receipt(&state, &key).1, "\u{2705}");
+        // Added once: another run finds the request delivered and saves nothing again.
+        run_headless_loop(&fixture, &restarted, DrainOptions::default(), |_, _| true);
+        assert!(!receipt_saved(&state, &key), "the receipt was saved again");
+    }
+
+    #[test]
+    fn a_headless_request_set_aside_untyped_earns_no_receipt() {
+        // A prompt the queue sets aside untyped (a tombstone, or expiry) never reached the
+        // model: the request is `delivery_uncertain`, its stage `cancelled`, and it earns no ✅.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state(&fixture);
+        let wrapper = FakeWrapper::serve(&fixture, "worker");
+        let mut key: Option<String> = None;
+        let mut set_aside = false;
+        run_headless_loop(&fixture, &state, DrainOptions::default(), |notify, _| {
+            let Some(key) = &key else {
+                let admitted = admitted_worker_message(&state, 1, "one");
+                notify(ProviderNotice::Batch(vec![admitted.clone()]));
+                key = Some(admitted);
+                return false;
+            };
+            if !set_aside {
+                if wrapper.find(key).is_some() {
+                    wrapper.set_aside(key);
+                    set_aside = true;
+                }
+                return false;
+            }
+            state.inspect_request(key).expect("inspect request")["phase"] == "delivery_uncertain"
+        });
+        let key = key.expect("a request was admitted");
+        let inspection = state.inspect_request(&key).expect("inspect request");
+        assert_eq!(inspection["phase"], "delivery_uncertain", "{inspection:#}");
+        assert_eq!(inspection["stage"], "cancelled", "{inspection:#}");
+        assert!(
+            !receipt_saved(&state, &key),
+            "a set-aside prompt earned a receipt"
+        );
+        assert_eq!(state.status().expect("status")["stages"]["cancelled"], 1);
+    }
+
+    #[test]
+    fn a_headless_request_the_model_starts_at_once_earns_its_receipt_from_the_send() {
+        // An idle model can start the input before the send looks at the queue: the send then
+        // succeeds, and the ✅ is saved before the request is recorded delivered, with no look
+        // of the watch needed.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state(&fixture);
+        let wrapper = FakeWrapper::serve(&fixture, "worker");
+        wrapper.start_on_wake.store(true, AtomicOrdering::SeqCst);
+        let mut key: Option<String> = None;
+        run_headless_loop(
+            &fixture,
+            &state,
+            DrainOptions::default(),
+            |notify, _| match &key {
+                None => {
+                    let admitted = admitted_worker_message(&state, 1, "one");
+                    notify(ProviderNotice::Batch(vec![admitted.clone()]));
+                    key = Some(admitted);
+                    false
+                }
+                Some(key) => receipt_saved(&state, key),
+            },
+        );
+        let key = key.expect("a request was admitted");
+        assert!(
+            receipt_saved(&state, &key),
+            "the started prompt earned no receipt"
+        );
+        let inspection = state.inspect_request(&key).expect("inspect request");
+        assert_eq!(inspection["phase"], "delivered", "{inspection:#}");
+        assert_eq!(
+            inspection["delivery"]["error"],
+            Value::Null,
+            "{inspection:#}"
+        );
+        assert_eq!(wrapper.item(&key)["delivery_state"], "processed");
     }
 
     #[test]

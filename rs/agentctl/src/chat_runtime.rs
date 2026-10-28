@@ -301,8 +301,9 @@ impl Ord for SentEntry {
 }
 
 /// A bridge configuration's choice for one of its two reactions: the acknowledgement added once a
-/// request is durably admitted (`ack_reaction`), or the receipt added once its prompt is verified
-/// in the agent's pane (`receipt_reaction`).
+/// request is durably admitted (`ack_reaction`), or the receipt added once the agent admits it as
+/// input: its prompt is verified in the agent's pane, or a headless agent's model started it
+/// (`receipt_reaction`).
 ///
 /// A key that is absent inherits the built-in default that the bridge shares with its provider
 /// plugins, and stays absent when the configuration is saved in the state directory, so a later
@@ -672,8 +673,8 @@ pub struct BridgeConfiguration {
     /// [`Self::ack_emoji`].
     #[serde(default, skip_serializing_if = "ReactionSetting::is_inherit")]
     pub ack_reaction: ReactionSetting,
-    /// The receipt, placed once a request's prompt is verified in the agent's pane: see
-    /// [`Self::receipt_emoji`].
+    /// The receipt, placed once the agent admits a request as input (its prompt is verified in
+    /// the agent's pane, or a headless agent's model started it): see [`Self::receipt_emoji`].
     #[serde(default, skip_serializing_if = "ReactionSetting::is_inherit")]
     pub receipt_reaction: ReactionSetting,
     /// The rejection feedback for a human message that cannot create a request: see
@@ -724,8 +725,9 @@ impl BridgeConfiguration {
             .resolve(chat_subscription::reactions::DEFAULT_ACK_REACTION.emoji)
     }
 
-    /// The receipt emoji this bridge adds once a request's prompt is verified in the agent's
-    /// pane, or `None` when `receipt_reaction` disables it. An absent key inherits the built-in
+    /// The receipt emoji this bridge adds once the agent admits a request as input (its prompt is
+    /// verified in the agent's pane, or a headless agent's model started it), or `None` when
+    /// `receipt_reaction` disables it. An absent key inherits the built-in
     /// default receipt. Only a request that was admitted with an acknowledgement earns a
     /// receipt: see [`Self::receipt_emoji_in_use`].
     #[must_use]
@@ -4810,6 +4812,14 @@ pub(crate) trait CoordinatorDelivery {
         let _ = (agent_name, prompt, message_id, options, printed);
         Err("this delivery cannot take a prompt back out of the coordinator's queue".to_owned())
     }
+    /// Note that the coordinator's queue shows that the model started the prompt `message_id`,
+    /// for a state that gives the ✅ receipt then: see [`BridgeState::with_receipt_when_started`].
+    /// Called before the request is recorded as delivered, so a crash between the two notes it
+    /// again at the next pass, which finds the request still waiting. A delivery that keeps no
+    /// receipts ignores it.
+    fn prompt_started(&self, message_id: &str) {
+        let _ = message_id;
+    }
     /// Take the prompt `message_id` back out of the coordinator's queue inbox, untyped; `true`
     /// when it was there. A prompt the queue has begun to type is left alone. See
     /// [`agent::withdraw`].
@@ -5058,6 +5068,10 @@ pub struct BridgeState {
     // Whether the coordinator's screen is never read, as for a headless agent, so request prompts
     // give only the `chat reply` command and no marker lines; also process-local.
     command_only_replies: bool,
+    // Whether a request earns its ✅ receipt when the coordinator's queue shows that the model
+    // started its prompt, as a headless agent's does, rather than when a drain verifies the
+    // prompt in a pane; also process-local.
+    receipt_when_started: bool,
     // The requests this process retired with their prompts recorded as typed, and when each was
     // typed, oldest retirement first, until `take_typed_retirements` takes them. A retired
     // request's record is gone and its tombstone keeps no delivery time.
@@ -5130,15 +5144,14 @@ impl BridgeState {
     /// Create a new private bridge state directory.
     pub fn initialize(root: &Path, config: BridgeConfiguration) -> Result<Self> {
         config.validate()?;
-        // The receipt marks a request whose prompt the queue verified in the agent's pane, so a
+        // The receipt marks a request the agent admitted as input, so a
         // new state does not take it as the acknowledgement as well. A state made before keeps
         // it and adds no separate receipt.
         if let Some(receipt) = config.receipt_emoji() {
             if config.ack_emoji() == Some(receipt) {
                 return Err(ChatRuntimeError::invalid(format!(
                     "ack_reaction cannot be {receipt}, the receipt_reaction, which marks a \
-                     request whose prompt the queue verified in the agent's pane; choose \
-                     another emoji for one of them"
+                     request the agent admitted as input; choose another emoji for one of them"
                 )));
             }
         }
@@ -5185,6 +5198,7 @@ impl BridgeState {
             ignored_text_prefixes: Arc::from([]),
             offer_reply_command: false,
             command_only_replies: false,
+            receipt_when_started: false,
             typed_retirements: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
@@ -5279,6 +5293,7 @@ impl BridgeState {
             ignored_text_prefixes: Arc::from([]),
             offer_reply_command: false,
             command_only_replies: false,
+            receipt_when_started: false,
             typed_retirements: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
@@ -5335,6 +5350,18 @@ impl BridgeState {
     pub fn with_command_only_replies(mut self, command_only: bool) -> Self {
         self.command_only_replies = command_only;
         self.offer_reply_command |= command_only;
+        self
+    }
+
+    /// Set whether a request earns its ✅ receipt reaction when the coordinator's queue shows that
+    /// the model started its prompt (#601 headless-second-reaction). A headless agent's wrapper
+    /// moves a prompt to `processed/` only when the model reports it started that input, between
+    /// tool calls for an urgent prompt or at the next turn for one that waits, so that move is
+    /// the moment the agent admits the request; enqueueing it earns nothing. A pane coordinator
+    /// keeps this off: its ✅ comes from a drain that verified the prompt in the pane.
+    #[must_use]
+    pub fn with_receipt_when_started(mut self, when_started: bool) -> Self {
+        self.receipt_when_started = when_started;
         self
     }
 
@@ -6867,6 +6894,10 @@ impl BridgeState {
         phases.insert("submitting".to_owned(), Value::from(0));
         phases.insert("delivered".to_owned(), Value::from(0));
         phases.insert("delivery_uncertain".to_owned(), Value::from(0));
+        let mut stages: Map<String, Value> = REQUEST_STAGES
+            .iter()
+            .map(|stage| ((*stage).to_owned(), Value::from(0)))
+            .collect();
         let mut acknowledgements = Map::new();
         acknowledgements.insert("disabled".to_owned(), Value::from(0));
         acknowledgements.insert("pending".to_owned(), Value::from(0));
@@ -6923,11 +6954,16 @@ impl BridgeState {
                     "reason": entry.reason,
                 }));
             }
+            let stage = request_stage(record, replies_sent);
+            let count = stages.get(stage).and_then(Value::as_u64).unwrap_or(0);
+            stages.insert(stage.to_owned(), Value::from(count.saturating_add(1)));
             requests.push(serde_json::json!({
                 "key": record.key,
                 "phase": request_phase_name(&record.phase),
+                "stage": stage,
                 "admitted_at_millis": record.admitted_at_millis,
                 "ack_completed_at_millis": record.ack_completed_at_millis,
+                "delivery_started_at_millis": record.delivery_started_at_millis,
                 "delivered_at_millis": record.delivered_at_millis,
                 "first_reply_sent_at_millis": first_reply_sent_at_millis,
                 "replies_captured": record.reply_count,
@@ -7002,7 +7038,7 @@ impl BridgeState {
             (true, Some(_)) => "environment",
             (true, None) => "config",
         };
-        Ok(serde_json::json!({
+        let mut status = serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
             "backend_configuration_schema": self.config.backend_configuration.as_ref().map(|value| &value.schema),
             "agent_name": self.config.agent_name,
@@ -7086,8 +7122,10 @@ impl BridgeState {
             "requests": requests,
             "reply_breaker": self.reply_breaker_status(),
             "reply_alias_problem": self.reply_alias_problem(),
-        }))
-        .map(|mut status| {
+        });
+        // Beside `phases`, outside the literal above, which is at the macro's recursion limit.
+        status["stages"] = Value::Object(stages);
+        Ok(status).map(|mut status| {
             if let Some(object) = status.as_object_mut() {
                 object.insert("slack_format".to_owned(), Value::from(slack_format));
                 object.insert(
@@ -8108,10 +8146,15 @@ impl BridgeState {
                 "sent_at_millis": reply.sent_at_millis,
             }));
         }
+        let replies_sent = replies
+            .iter()
+            .filter(|reply| reply["phase"] == "sent")
+            .count();
         Ok(serde_json::json!({
             "schema": REQUEST_INSPECTION_SCHEMA,
             "request_key": request.key,
             "phase": request_phase_name(&request.phase),
+            "stage": request_stage(&request, u32::try_from(replies_sent).unwrap_or(u32::MAX)),
             "source": {
                 "channel_id": request.message.channel_id,
                 "message_id": request.message.message_id,
@@ -10933,7 +10976,10 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             .message_state(&self.config.agent_name, &record.delivery_message_id)
             .map_err(|error| format!("its queue entry could not be read: {error}"))?
         {
-            Some(QueueMessageState::Processed) => match self.record_typed_if_waiting(key) {
+            Some(QueueMessageState::Processed) => match self
+                .note_started(delivery, &record.delivery_message_id)
+                .record_typed_if_waiting(key)
+            {
                 Ok(recorded) => Ok(recorded),
                 Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                     Ok(false)
@@ -10944,6 +10990,15 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             },
             _ => Ok(false),
         }
+    }
+
+    /// Pass `message_id` to `delivery` as a prompt the model started, when this state gives the
+    /// ✅ receipt then; the caller saw its queue entry processed. Gives this state back.
+    fn note_started(&self, delivery: &dyn CoordinatorDelivery, message_id: &str) -> &Self {
+        if self.receipt_when_started {
+            delivery.prompt_started(message_id);
+        }
+        self
     }
 
     fn retry_eligible_retirement(&self, key: &str) -> Result<()> {
@@ -12484,6 +12539,52 @@ fn bounded_list(items: &[String], max: usize) -> String {
     displayed
 }
 
+/// How a request's delivery error opens when the coordinator's queue set its prompt aside
+/// untyped: cancelled by a tombstone, or expired.
+const SET_ASIDE_UNTYPED: &str =
+    "coordinator queue set the request aside untyped (cancelled or expired)";
+
+/// How far one request has come, as `chat status` and `chat inspect` name it (#601
+/// headless-second-reaction), for a pane coordinator and a headless one alike: `admitted` (the
+/// bridge holds it; its acknowledgement is the first reaction), `queued` (its prompt was handed
+/// to the coordinator and has not arrived), `started` (the coordinator admitted it: a headless
+/// model started its prompt, or a pane showed it typed; it earns the ✅ receipt), `replied` (a
+/// reply was sent), or, for a prompt that never arrived for certain, `cancelled` when the queue
+/// set it aside untyped and `uncertain` otherwise. `replies_sent` counts the replies sent.
+fn request_stage(record: &RequestRecord, replies_sent: u32) -> &'static str {
+    if replies_sent > 0 {
+        return "replied";
+    }
+    match record.phase {
+        RequestPhase::Delivered => "started",
+        RequestPhase::DeliveryUncertain
+            if record
+                .delivery_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with(SET_ASIDE_UNTYPED)) =>
+        {
+            "cancelled"
+        }
+        RequestPhase::DeliveryUncertain => "uncertain",
+        RequestPhase::Pending | RequestPhase::Submitting
+            if record.delivery_started_at_millis.is_some() =>
+        {
+            "queued"
+        }
+        RequestPhase::Pending | RequestPhase::Submitting => "admitted",
+    }
+}
+
+/// Every value [`request_stage`] gives, in order, for the counts `chat status` reports.
+const REQUEST_STAGES: [&str; 6] = [
+    "admitted",
+    "queued",
+    "started",
+    "replied",
+    "cancelled",
+    "uncertain",
+];
+
 pub(crate) fn deliver_request_with(
     state: &BridgeState,
     delivery: &dyn CoordinatorDelivery,
@@ -12540,7 +12641,7 @@ pub(crate) fn deliver_request_with(
         // A request set aside untyped (cancelled or expired) is never queued again by itself;
         // an operator settles it.
         Some(QueueMessageState::Cancelled) => {
-            let detail = "coordinator queue set the request aside untyped (cancelled or expired)";
+            let detail = SET_ASIDE_UNTYPED;
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
             return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
         }
@@ -12573,19 +12674,25 @@ pub(crate) fn deliver_request_with(
     };
 
     if operation_error.is_none() && observed != Some(QueueMessageState::Pending) {
+        // The queue showed the prompt processed, or took it: a headless agent's queue takes a
+        // prompt only once the model started it.
+        state.note_started(delivery, message_id);
         state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
 
     match delivery.message_state(agent_name, message_id) {
         Ok(Some(QueueMessageState::Processed)) => {
+            state.note_started(delivery, message_id);
             state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
             Ok(CoordinatorDeliveryResult::Delivered)
         }
         Ok(Some(QueueMessageState::Cancelled)) => {
-            let detail = operation_error.unwrap_or_else(|| {
-                "coordinator queue set the request aside untyped (cancelled or expired)".to_owned()
-            });
+            // Opened with the same words either way, so `chat status` can tell it was set aside.
+            let detail = operation_error.map_or_else(
+                || SET_ASIDE_UNTYPED.to_owned(),
+                |error| format!("{SET_ASIDE_UNTYPED}: {error}"),
+            );
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(&detail))?;
             Ok(CoordinatorDeliveryResult::Uncertain(detail))
         }
@@ -34464,6 +34571,19 @@ fails twice for a reply, print that reply between the two lines at the end of yo
             status["phases"],
             json!({"pending": 2, "submitting": 0, "delivered": 2, "delivery_uncertain": 2})
         );
+        // A stored reply that is not sent does not make k5 replied (#601
+        // headless-second-reaction).
+        assert_eq!(
+            status["stages"],
+            json!({
+                "admitted": 2,
+                "queued": 0,
+                "started": 1,
+                "replied": 1,
+                "cancelled": 0,
+                "uncertain": 2,
+            })
+        );
         // Ages are whole seconds, and the status is read a little after `now`.
         let age = |value: &Value, at_least: u64| {
             let age = value.as_u64().expect("age in seconds");
@@ -34522,6 +34642,7 @@ fails twice for a reply, print that reply between the two lines at the end of yo
                     "admitted_at_millis",
                     "age_seconds",
                     "delivered_at_millis",
+                    "delivery_started_at_millis",
                     "first_reply_sent_at_millis",
                     "key",
                     "phase",
@@ -34529,6 +34650,7 @@ fails twice for a reply, print that reply between the two lines at the end of yo
                     "replies_captured",
                     "replies_closed",
                     "replies_sent",
+                    "stage",
                 ]
             );
         }

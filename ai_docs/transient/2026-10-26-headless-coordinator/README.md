@@ -102,13 +102,22 @@ delay as a pane queue does), releases the lifecycle lock, and wakes the wrapper 
 a drain is a wake. A request is `delivered` once the queue shows it `processed` (the model
 started it); `inflight` reads as pending. It captures no reply: prompts name only `agentctl chat
 reply` (a request whose command cannot be printed is refused), and the reply's wake brings the
-send forward within 250 ms. **Differences from section 8:** no receipt reaction (the pane path's
-comes from verified typing), and reply reminders and the stale-composer guard are off for a
-headless target rather than becoming queue items.
+send forward within 250 ms. **Differences from section 8:** reply reminders and the
+stale-composer guard are off for a headless target rather than becoming queue items.
+
+Receipts on `started` (`#601 headless-second-reaction`, owner 2026-10-27): the second reaction
+means the agent admitted the request as input to the model, which for a headless agent may be
+mid-turn on other work. The chat send no longer waits for the model (it held the owner loop up to
+10 s); the headless pass looks at the queue every 250 ms for the prompts it holds and, for each
+one `processed`, saves the ✅ and then records the request `delivered`. Enqueueing, `inflight`
+and a hand-back after an interrupt earn nothing; an input set aside untyped earns none and reads
+as stage `cancelled`. A restart's first pass settles prompts started while `chat run` was down.
+`chat status` and `chat inspect` give each request a `stage`: `admitted`, `queued`, `started`,
+`replied` (or `cancelled` / `uncertain`).
 
 Not built yet: the bridge's request journal and `agentctl ledger` (12.1); the Python extension's
 v1 events; `agentctl say`; per-input cancel of a written input; the provenance header of section
-10; the post-compaction records prompt of 9.5; the rest of M3 (`inbox deliver --via queue`, reminders as queue items, receipts on `started`); Codex and Muse wrappers (after the
+10; the post-compaction records prompt of 9.5; the rest of M3 (`inbox deliver --via queue`, reminders as queue items); Codex and Muse wrappers (after the
 Claude cutover, per the owner's answer to question 5).
 
 ## 0. Summary
