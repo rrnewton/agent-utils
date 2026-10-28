@@ -55,34 +55,46 @@ fn archives_document(cfg: &Cfg, selected: &str) -> Result<Value> {
     serde_json::from_str(&text).map_err(|error| format!("cannot read archive state: {error}"))
 }
 
-fn recovery_matches(cfg: &Cfg, selected: &str, slot: &str, generation: i64, sha: &str) -> bool {
+fn recovery_matches(
+    cfg: &Cfg,
+    selected: &str,
+    archived: &Value,
+    archives_revision: i64,
+    slot: &str,
+    generation: i64,
+    sha: &str,
+) -> bool {
+    let Some(archive_id) = archived.get("archive_id").and_then(Value::as_str) else {
+        return false;
+    };
     let Ok(events) = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), selected)
     else {
         return false;
     };
     events.iter().any(|event| {
         let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+        let record = payload.get("record").cloned().unwrap_or(Value::Null);
+        let evidence = payload.get("evidence").cloned().unwrap_or(Value::Null);
+        let evidence_keys: Vec<&String> = evidence
+            .as_object()
+            .map(|object| object.keys().collect())
+            .unwrap_or_default();
         event.get("kind").and_then(Value::as_str) == Some("archive-state-recorded")
             && payload.get("action").and_then(Value::as_str) == Some("absent-agent-row-recovered")
             && payload.get("slot").and_then(Value::as_str) == Some(slot)
-            && payload
-                .get("record")
-                .and_then(|record| record.get("generation"))
-                .and_then(Value::as_i64)
-                == Some(generation)
-            && payload
-                .get("evidence")
-                .and_then(|evidence| evidence.get("source_record_sha256"))
-                .and_then(Value::as_str)
-                == Some(sha)
-            && payload
-                .get("evidence")
-                .and_then(|evidence| evidence.get("archive_id"))
-                .and_then(Value::as_str)
-                == payload
-                    .get("record")
-                    .and_then(|record| record.get("archive_id"))
-                    .and_then(Value::as_str)
+            && payload.get("revision").and_then(Value::as_i64) == Some(archives_revision)
+            && payload.get("previous_revision").and_then(Value::as_i64)
+                == Some(archives_revision - 1)
+            && record.get("archive_id").and_then(Value::as_str) == Some(archive_id)
+            && record.get("slot").and_then(Value::as_str) == Some(slot)
+            && record.get("machine").and_then(Value::as_str) == Some(selected)
+            && record.get("generation").and_then(Value::as_i64) == Some(generation)
+            && record.get("slot_type").and_then(Value::as_str) == Some("agent")
+            && record.get("physical_storage").and_then(Value::as_str) == Some("removed")
+            && evidence_keys.len() == 3
+            && evidence.get("archive_id").and_then(Value::as_str) == Some(archive_id)
+            && evidence.get("source_record_sha256").and_then(Value::as_str) == Some(sha)
+            && evidence.get("physical_storage").and_then(Value::as_str) == Some("externally-absent")
     })
 }
 
@@ -127,6 +139,25 @@ pub(crate) fn recover_absent_agent_row(
     let _ = coordinator;
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
+    // Other outstanding journals refuse before this row is judged.
+    {
+        let enumerated = crate::journals_state::parse_journals(root)?;
+        let names = enumerated
+            .get("journals")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let own = format!("ACTIVE.{selected}.journal");
+        for name in &names {
+            let Some(name) = name.as_str() else { continue };
+            if name != own {
+                return Err(format!(
+                    "another interrupted mutation is recorded in {}",
+                    cfg.control.join(name).display()
+                ));
+            }
+        }
+    }
     // Interrupted-journal outcomes come before any global validation.
     let journal = journal_path(&cfg, &selected);
     if journal.exists() || journal.is_symlink() {
@@ -142,10 +173,59 @@ pub(crate) fn recover_absent_agent_row(
         }
         let input = raw.get("input").cloned().unwrap_or(Value::Null);
         let same = input.get("slot").and_then(Value::as_str) == Some(slot)
+            && input.get("machine").and_then(Value::as_str) == Some(selected.as_str())
             && input.get("generation").and_then(Value::as_i64) == Some(expected_generation)
             && input.get("record_sha256").and_then(Value::as_str) == Some(record_sha256);
         if !same {
             return Err("requested agent row differs from the interrupted recovery".to_string());
+        }
+        // The journal must be the exact durable plan Python wrote:
+        // identity, actor, phase, the recorded row snapshot, and an
+        // archive entry for this row.
+        let actor = raw.get("actor").cloned().unwrap_or(Value::Null);
+        let actor_keys: Vec<&String> = actor
+            .as_object()
+            .map(|object| object.keys().collect())
+            .unwrap_or_default();
+        let mut journal_record = raw.get("record").cloned().unwrap_or(Value::Null);
+        // The record digest is over the normalized record shape
+        // (slot_type defaults to "agent"), as in the active parser.
+        if let Some(object) = journal_record.as_object_mut() {
+            object
+                .entry("slot_type".to_string())
+                .or_insert_with(|| json!("agent"));
+        }
+        let journal_record_digest = canonical_sha256(&journal_record).unwrap_or_default();
+        let archive_entry = raw.get("archive_entry").cloned().unwrap_or(Value::Null);
+        let finished_at = archive_entry
+            .get("finished_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let journal_valid = raw.get("schema").and_then(Value::as_i64) == Some(2)
+            && raw.get("machine").and_then(Value::as_str) == Some(selected.as_str())
+            && raw.get("slot").and_then(Value::as_str) == Some(slot)
+            && raw
+                .get("host_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            && actor_keys.len() == 5
+            && matches!(
+                raw.get("phase").and_then(Value::as_str),
+                Some("prepared" | "preserved" | "registrations-removed")
+            )
+            && journal_record.get("slot").and_then(Value::as_str) == Some(slot)
+            && journal_record.get("generation").and_then(Value::as_i64)
+                == Some(expected_generation)
+            && journal_record_digest == record_sha256
+            && archive_entry.get("slot").and_then(Value::as_str) == Some(slot)
+            && archive_entry.get("generation").and_then(Value::as_i64) == Some(expected_generation)
+            && archive_entry.get("archive_id").and_then(Value::as_str)
+                == Some(&format!(
+                    "{selected}:{slot}:{expected_generation}:{finished_at}"
+                ))
+            && !finished_at.is_empty();
+        if !journal_valid {
+            return Err("absent-agent-row journal is invalid".to_string());
         }
         if !apply {
             return Ok(json!({
@@ -183,6 +263,10 @@ pub(crate) fn recover_absent_agent_row(
             .iter()
             .filter(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
             .collect();
+        let archives_revision = archives
+            .get("revision")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let exact = matching.len() == 1
             && matching[0].get("machine").and_then(Value::as_str) == Some(selected.as_str())
             && matching[0].get("generation").and_then(Value::as_i64) == Some(expected_generation)
@@ -197,7 +281,15 @@ pub(crate) fn recover_absent_agent_row(
                             == Some(&format!("source ACTIVE record SHA-256: {record_sha256}"))
                     })
                 })
-            && recovery_matches(&cfg, &selected, slot, expected_generation, record_sha256);
+            && recovery_matches(
+                &cfg,
+                &selected,
+                matching[0],
+                archives_revision,
+                slot,
+                expected_generation,
+                record_sha256,
+            );
         if exact {
             return Ok(json!({
                 "machine": selected,
@@ -350,6 +442,50 @@ pub(crate) fn recover_absent_agent_rows(
         }
         seen.push(slot.as_str());
     }
+    // A corrupt registry is a batch-level state error in Python:
+    // the first row carries it, recovery is required, and the
+    // remaining rows are refused without being attempted.
+    if let Ok((cfg, _selected)) = load_cfg(root, machine_override) {
+        if let Err(error) = validate_global(root, &cfg) {
+            let mut out_rows: Vec<Value> = Vec::new();
+            for (index, (slot, generation, _sha)) in parsed.iter().enumerate() {
+                let mut row = json!({
+                    "slot": slot,
+                    "generation": generation,
+                    "outcome": "refused",
+                    "seconds": 0.0,
+                    "output": [],
+                    "reason": if index == 0 {
+                        error.clone()
+                    } else {
+                        "batch stopped after a state error; run 'wrkslots recover' and retry the remaining rows".to_string()
+                    },
+                });
+                if index == 0 {
+                    if let Some(object) = row.as_object_mut() {
+                        object.insert("recovery_required".to_string(), json!(true));
+                    }
+                }
+                out_rows.push(row);
+            }
+            return Ok(json!({
+                "schema": 1,
+                "batch_limit": BATCH_LIMIT,
+                "mode": if apply { "apply" } else { "plan" },
+                "requested": parsed.len(),
+                "counts": {
+                    "would-recover": 0,
+                    "would-resume": 0,
+                    "recovered": 0,
+                    "already-recovered": 0,
+                    "refused": parsed.len(),
+                },
+                "rows": out_rows,
+                "recovery_required": true,
+                "seconds": 0.0,
+            }));
+        }
+    }
     let started = std::time::Instant::now();
     let mut out_rows: Vec<Value> = Vec::new();
     for (slot, generation, sha) in &parsed {
@@ -381,6 +517,10 @@ pub(crate) fn recover_absent_agent_rows(
         };
         let output: Vec<String> = if outcome == "refused" {
             Vec::new()
+        } else if outcome == "would-resume" {
+            vec![format!(
+                "ROW machine={machine} slot={slot} outcome=planned detail=resume"
+            )]
         } else {
             vec![format!(
                 "ROW machine={machine} slot={slot} generation={generation} outcome={outcome}"

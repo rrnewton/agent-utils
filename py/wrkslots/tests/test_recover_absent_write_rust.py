@@ -274,17 +274,105 @@ def test_absent_row_neither_active_nor_recovered_refuses(tmp_path: Path) -> None
     assert "is neither active nor an exact prior recovery" in result.stderr
 
 
+def _write_journal(root: Path, record: dict[str, object], sha: str) -> None:
+    record_obj = wrkslots_cli._record_from_obj(record, "fixture record")
+    item = wrkslots_cli.AbsentAgentRow(MACHINE, "slot-a", 1, sha)
+    witnesses = tuple(
+        wrkslots_cli._AbsentAgentBranchWitness(
+            checkout=checkout.name,
+            branch_ref=f"refs/heads/{checkout.branch}",
+            state="present",
+            head=checkout.head,
+        )
+        for checkout in record_obj.checkouts
+    )
+    receipts = wrkslots_cli._absent_agent_planned_receipts(
+        record_obj,
+        witnesses,
+        include_branch_witness=False,
+        rescue_root=wrkslots_cli.ABSENT_AGENT_RESCUE_REF_ROOT,
+        containment=None,
+    )
+    entry = wrkslots_cli._absent_agent_archive_entry(
+        record_obj, item, FINISHED, receipts, ()
+    )
+    journal = {
+        "schema": 2,
+        "kind": "recover-absent-agent-row",
+        "machine": MACHINE,
+        "host_id": "fixture-host",
+        "slot": "slot-a",
+        "phase": "prepared",
+        "actor": _live_identity(),
+        "input": {
+            "machine": MACHINE,
+            "slot": "slot-a",
+            "generation": 1,
+            "record_sha256": sha,
+        },
+        "record": record,
+        "preserved": [],
+        "removed": [],
+        "archive_entry": entry,
+    }
+    (root / "worktrees" / f"ACTIVE.{MACHINE}.journal").write_text(
+        json.dumps(journal)
+    )
+
+
 def test_absent_row_journal_would_resume(tmp_path: Path) -> None:
+    rust_root, record = _fixture(tmp_path / "rust")
+    oracle_root, oracle_record = _fixture(tmp_path / "oracle")
+    sha = _record_sha(rust_root, record)
+    oracle_sha = _record_sha(oracle_root, oracle_record)
+    _write_journal(rust_root, record, sha)
+    _write_journal(oracle_root, oracle_record, oracle_sha)
+    assert _python_row(oracle_root, oracle_sha) == 0
+    result = _rust_row(rust_root, sha)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["outcome"] == "would-resume"
+
+
+def test_absent_row_minimal_journal_refuses(tmp_path: Path) -> None:
     rust_root, record = _fixture(tmp_path / "rust")
     sha = _record_sha(rust_root, record)
     journal = {
         "kind": "recover-absent-agent-row",
-        "input": {"machine": MACHINE, "slot": "slot-a", "generation": 1, "record_sha256": sha},
+        "input": {
+            "machine": MACHINE,
+            "slot": "slot-a",
+            "generation": 1,
+            "record_sha256": sha,
+        },
     }
-    (rust_root / "worktrees" / f"ACTIVE.{MACHINE}.journal").write_text(json.dumps(journal))
+    (rust_root / "worktrees" / f"ACTIVE.{MACHINE}.journal").write_text(
+        json.dumps(journal)
+    )
     result = _rust_row(rust_root, sha)
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["outcome"] == "would-resume"
+    assert result.returncode == 1
+    assert "journal is invalid" in result.stderr
+
+
+def test_absent_row_mismatched_recovery_event_refuses(tmp_path: Path) -> None:
+    rust_root, record = _fixture(tmp_path / "rust")
+    oracle_root, oracle_record = _fixture(tmp_path / "oracle")
+    rust_sha = _record_sha(rust_root, record)
+    oracle_sha = _record_sha(oracle_root, oracle_record)
+    _mark_recovered(rust_root, record, rust_sha)
+    _mark_recovered(oracle_root, oracle_record, oracle_sha)
+    for root in (rust_root, oracle_root):
+        events = root / "worktrees" / f"EVENTS.{MACHINE}"
+        for path in events.iterdir():
+            event = json.loads(path.read_text())
+            if event["kind"] == "archive-state-recorded":
+                event["payload"]["evidence"]["archive_id"] = "bogus:archive"
+                event.pop("sha256")
+                event["sha256"] = wrkslots_cli._event_digest(event)
+                path.write_text(json.dumps(event))
+    with pytest.raises(Exception):
+        _python_row(oracle_root, oracle_sha)
+    result = _rust_row(rust_root, rust_sha)
+    assert result.returncode == 1
 
 
 def test_absent_rows_batch_matches_python(tmp_path: Path) -> None:
