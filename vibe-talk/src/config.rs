@@ -2131,7 +2131,7 @@ fn documents_config(file: FileDocuments) -> Result<DocumentsConfig, ConfigError>
     let ranged = |field: &str, value: Option<i64>, default: usize| -> Result<usize, ConfigError> {
         match value {
             None => Ok(default),
-            Some(v) if v >= 1 && v <= 1_000_000_000 => {
+            Some(v) if (1..=1_000_000_000).contains(&v) => {
                 usize::try_from(v).map_err(|_| invalid(field, "too large".to_owned()))
             }
             Some(v) => Err(invalid(

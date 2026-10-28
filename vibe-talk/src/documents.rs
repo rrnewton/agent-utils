@@ -373,7 +373,7 @@ pub fn recognize(text: &str, paste_prefixes: &[String]) -> Vec<Recognized> {
     for word in text.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '`'))
     {
         let word = word.trim_matches(|c| matches!(c, '(' | '[' | '{'));
-        let word = word.trim_end_matches(|c| matches!(c, ')' | ']' | '}' | '.' | ',' | ';' | ':'));
+        let word = word.trim_end_matches([')', ']', '}', '.', ',', ';', ':']);
         if word.contains("://") {
             if let Some(rec) = recognize_url(word, None, paste_prefixes) {
                 push(rec, &mut found);
