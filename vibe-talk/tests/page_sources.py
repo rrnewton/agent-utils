@@ -13,6 +13,8 @@ checked-out sources, for a walk that reads one of the page's own numbers out of 
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -34,6 +36,17 @@ def source_text(root: Path, name: str) -> str:
 
     A walk that waits out one of the page's own numbers reads it here rather than opening
     `root / name` itself, so that the number keeps coming from source text however the served
-    directory is produced.
+    directory is produced. A directory of sources (web/, or another checkout's) is read as it is.
+    A page build (`web/build.mjs`, which writes `assets.json` beside its minified files) was made
+    from this checkout's sources, and its `inputs` say so by digest: `name` is read from
+    `SOURCE_ROOT`, and a build those sources did not make is refused rather than read wrongly.
     """
-    return (root / name).read_text()
+    manifest_path = root / "assets.json"
+    if not manifest_path.is_file():
+        return (root / name).read_text()
+    inputs = json.loads(manifest_path.read_text()).get("inputs", {})
+    source = SOURCE_ROOT / name
+    built_from = inputs.get(f"vibe-talk/web/{name}") if isinstance(inputs, dict) else None
+    if built_from != hashlib.sha256(source.read_bytes()).hexdigest()[:32]:
+        raise SystemExit(f"{root} was not built from {source}; rebuild it with web/build.mjs")
+    return source.read_text()

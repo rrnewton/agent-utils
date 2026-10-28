@@ -211,6 +211,8 @@ if TYPE_CHECKING:
 
 
 WEB_ROOT = page_sources.served_root()
+# The stylesheet the page's own rules come last in: web/voice.css, or a page build's one hashed sheet.
+VOICE_STYLESHEET = re.compile(r"/(?:voice|assets/voice\.[0-9a-f]{32})\.css(?:[?#]|$)")
 TOKEN = "write-token-browser-cache-check"
 READ_TOKEN = "read-token-browser-cache-check"
 SCOPES = {f"Bearer {TOKEN}": "write", f"Bearer {READ_TOKEN}": "read"}
@@ -2883,7 +2885,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 route.fulfill(response=served,
                               body=served.text() + "\n#discord-log > li[data-id] { min-height: 70vh; }\n")
 
-            page.route("**/voice.css", tall_rows)
+            # The page's last stylesheet, by either name it has: /voice.css as written, or the one
+            # hashed stylesheet a page build's shell links (`#624 voice-page-modularity`).
+            page.route(VOICE_STYLESHEET, tall_rows)
             reading = place("middle")
             check(reading["top"] > 0 and reading["gap"] > 100, f"{label}: could not park the reader mid-list: {reading}")
 

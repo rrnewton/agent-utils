@@ -126,6 +126,9 @@ mod op_key_carrier;
 #[path = "own_read.rs"]
 mod own_read;
 
+#[path = "page_build.rs"]
+mod page_build;
+
 #[path = "pairing.rs"]
 mod pairing;
 

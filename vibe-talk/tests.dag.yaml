@@ -2080,6 +2080,9 @@ steps:
   # one after another, so inside this step it was most of the wall time and a third of the CPU
   # budget, and runs were killed at the budget while it was still going. Run alone, `cargo test`
   # (and `make test`) still runs every suite.
+  #
+  # The page build's suite (tests/page_build.rs) runs the esbuild contract/package-lock.json pins,
+  # so this step depends on the step that installs it (`#624 voice-page-modularity`).
   - group: test
     job: unit
     desc: the Rust suites, and the contract's page suite through its harness
@@ -2087,7 +2090,7 @@ steps:
     cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast -- --skip the_voice_page_suite_passes --exact
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
-    deps: [build.tests]
+    deps: [build.tests, setup.contract-tools]
     # Measured 2026-10-23 on the loaded validation host: a passing run that built the test binaries
     # and ran the page suite as well used 1789 s of CPU, and runs since were killed at the old 1800 s
     # budget while that suite was still running; 2700 s was the stopgap (185b2539). Running the
