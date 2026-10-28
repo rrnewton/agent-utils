@@ -1,13 +1,14 @@
 ---
 title: 'timeline-read-failures: side reads still 502 under Slack rate limits'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 - cache
 created_at: 2026-10-28T07:11:52.122480559+00:00
-updated_at: 2026-10-28T07:11:52.122480559+00:00
+updated_at: 2026-10-28T08:07:45.841200115+00:00
+closed_at: 2026-10-28T08:07:45.841200025+00:00
 ---
 
 # Description
