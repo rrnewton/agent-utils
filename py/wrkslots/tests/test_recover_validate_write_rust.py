@@ -21,6 +21,7 @@ import socket
 import subprocess
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import cast
 
 import pytest
 from wrkslots import cli as wrkslots_cli
@@ -320,8 +321,9 @@ def _archive_another(root: Path, record: dict[str, object], sha: str) -> None:
     record2 = dict(record)
     record2["slot"] = "slot-b"
     record2["agent"] = "validate-slot-b"
+    first = cast(list[dict[str, object]], record["checkouts"])[0]
     record2["checkouts"] = [
-        dict(record["checkouts"][0], path="worktrees/validate/slot-b/repo")
+        dict(first, path="worktrees/validate/slot-b/repo")
     ]
     record_obj = wrkslots_cli._record_from_obj(record2, "fixture record b")
     item = wrkslots_cli.AbsentValidateRow(MACHINE, "slot-b", 1, sha)

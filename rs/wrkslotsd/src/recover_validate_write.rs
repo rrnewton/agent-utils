@@ -67,7 +67,7 @@ fn read_input(cfg: &Cfg, raw_path: &Path) -> Result<(String, Vec<Row>)> {
     };
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
