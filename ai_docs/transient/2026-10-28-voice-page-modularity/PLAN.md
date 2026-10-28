@@ -636,12 +636,16 @@ source-reader migrations, and tests/controls collected. File count or reduced
   result is already applied is owned data. A later fix need not manipulate
   rendered rows or force a view refresh. If the fix is admitted before the
   baseline, preserve and move its tests as part of step 12.
-* The owner's **top-level-view follow-up** uses `core/navigation` for logical
-  destinations and `view/shell` for presentation/keyboard/history. Channel-local
-  Main/Threads/All selection stays separate from top-level Voice/Channel/
-  Documents selection. The final issue title/slug was not present in the
-  reviewed issue snapshot; record it before creating implementation links.
-  The extension boundary does not depend on that administrative detail.
+* **#653 top-level-views-equal** uses `core/navigation` for logical destinations
+  and `view/shell` for presentation/keyboard/history. Main, All, Threads and
+  Two-column are equal channel-view destinations; Two-column is a distinct
+  mode, not a boolean overlay remembering which mode to return to. Thread
+  drill-in is a child place. Escape dismisses search or returns from drill-in;
+  it does not silently switch the Threads list to All. The broader Voice/
+  Channel/Documents destination remains a separate concern. The issue record,
+  fetched after the source review, places this quick fix before the freeze;
+  include its finished behavior and tests in the implementation baseline.
+  This plan supplies its new home without implementing its UI behavior here.
 
 ## 9. Risks and remaining owner questions
 
@@ -666,8 +670,8 @@ Remaining choices to record with the implementation coordinator:
 
 1. Which already-started quick page fixes make the freeze baseline? The default
    is the existing admitted blocker list for #624 voice-page-modularity; any
-   additional feature waits until after the exit gate. Record the final baseline
-   commit and canonical title/slug for the top-level-view follow-up.
+   additional feature waits until after the exit gate. Include the admitted
+   #653 top-level-views-equal fix and record the final baseline commit.
 2. Are source maps to be served like the public source assets? Default: yes,
    same origin, repository-relative sources, with no credentials or deployment
    configuration embedded. Restricting their delivery is an optional policy
