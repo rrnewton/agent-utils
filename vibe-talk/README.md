@@ -1302,7 +1302,10 @@ interface and then fails at the first write, which is why both refusals now name
 did not already hold — and the page uses it only to skip what a read token cannot have: with one,
 Settings says stored conversations need the write-scope token rather than asking for them and
 logging a 403. It is stored per browser **and per hostname**, so a second URL onto the same
-deployment asks again.
+deployment asks again. Once a token is stored, a reload never shows the sign-in screen while it checks
+the token (`#625 signin-flash`): the page opens on the channel it saved, or on an empty frame saying
+"Checking your token…" when it saved none, and the sign-in screen comes back only if the server
+refuses the token.
 
 ### Podman
 

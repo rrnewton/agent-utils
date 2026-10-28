@@ -40948,7 +40948,97 @@ test("a snapshot saved for one token is never drawn for another", async () => {
   });
   assert.deepStrictEqual(shownIds(page), []);
   assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false, "the other identity's snapshot survived");
-  assert.equal(page.screen(), "signin", "the app was shown from a snapshot this token did not make");
+  assert.equal(page.el("screen-main").hidden, true, "the app was shown from a snapshot this token did not make");
+  // `#625 signin-flash`: nor is this token, not yet refused, asked for again while it is checked.
+  assert.equal(page.el("screen-signin").hidden, true, "the sign-in form came up for a token nobody had refused");
+});
+
+// `#625 signin-flash`. The owner: "whenever I refresh the page on desktop I would see the sign in form
+// for just a second even though I was already signed in." The form was served visible, so the browser
+// drew it while /voice.js loaded, and with no saved shell to draw the page left it up until
+// /client-config answered. Now it is served hidden and shown only with no token or after a refusal.
+
+/** Arrange a page to note every time the sign-in screen is shown, before its script runs. */
+const noteSigninShown = (shown) => (p) => {
+  const screen = p.el("screen-signin");
+  let hidden = screen.hidden;
+  Object.defineProperty(screen, "hidden", {
+    configurable: true,
+    get: () => hidden,
+    set: (value) => {
+      if (hidden && !value) shown.push(p.el("status").textContent);
+      hidden = value;
+    },
+  });
+};
+
+test("with a token saved, a reload never shows the sign-in form while the token is checked", async () => {
+  // Served hidden, as every screen is: which one comes up is the script's to say.
+  assert.match(HTML_CODE, /<section id="screen-signin" class="screen"[^>]*\shidden>/, "the sign-in form is served on screen");
+
+  // No saved shell to draw: no screen at all while the token is checked, and a status saying so.
+  const first = newPage();
+  await signIn(first);
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  const shown = [];
+  let config = null;
+  const page = reloadPage(first.storage, (p) => {
+    noteSigninShown(shown)(p);
+    config = gate(p.clientConfig);
+    p.clientConfig = config.respond;
+  });
+  await page.settle();
+  assert.equal(page.el("screen-signin").hidden, true, "the sign-in form is up while a saved token is checked");
+  assert.equal(page.el("screen-main").hidden, true, "the app is up on a token nobody has proved, with nothing saved to show");
+  assert.equal(page.el("status").textContent, "Checking your token…");
+  config.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.screen(), "main", "the proved token did not open the app");
+  assert.deepStrictEqual(shown, [], "the sign-in form came up during the load");
+
+  // A saved shell: the app at once, and the form never.
+  const saved = newPage();
+  await signIn(saved);
+  await showDiscord(saved, [message({ id: "6251", content: "saved for the next load" })]);
+  const quiet = [];
+  const held = { gate: null };
+  const hydrated = reloadPage(saved.storage, (p) => {
+    noteSigninShown(quiet)(p);
+    held.gate = gate(p.clientConfig);
+    p.clientConfig = held.gate.respond;
+  });
+  assert.equal(hydrated.screen(), "main", "a reload with a saved shell waited for the network");
+  held.gate.open();
+  await hydrated.settle();
+  await hydrated.settle();
+  assert.equal(hydrated.screen(), "main");
+  assert.deepStrictEqual(quiet, [], "the sign-in form came up under a saved shell");
+
+  // Refused: the form, once, after the answer and not before it.
+  const refusedShown = [];
+  const refused = reloadPage(new Map([[TOKEN_STORAGE_KEY, "write-token-eeeeeeeeeeeeeeee"]]), (p) => {
+    noteSigninShown(refusedShown)(p);
+    p.clientConfig = errorResponse(401, "unauthorized", "token revoked");
+  });
+  assert.deepStrictEqual(refusedShown, [], "the form came up before the server refused the token");
+  await refused.settle();
+  assert.equal(refused.screen(), "signin", "a refused token did not bring the form back");
+  assert.equal(refusedShown.length, 1);
+
+  // No token at all: the form, straight away.
+  const fresh = newPage();
+  assert.equal(fresh.screen(), "signin", "with no token the sign-in form is not shown");
+
+  // THE CONTROL: with the startup's no-token branch showing the form whatever is saved, this sees it.
+  const control = [];
+  const flashing = newPage(first.storage, brokenScript('} else if (token()) {\n  if (hydrateFromCache()) {',
+    '} else if (token()) {\n  showScreen("signin");\n  if (hydrateFromCache()) {'), (p) => {
+    noteSigninShown(control)(p);
+    p.clientConfig = () => new Promise(() => {});
+  });
+  await flashing.settle();
+  assert.equal(control.length, 1, "the test cannot see the form come up during a load");
 });
 
 test("a token replaced in another tab never inherits the rows this page is showing", async () => {

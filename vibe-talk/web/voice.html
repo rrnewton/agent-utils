@@ -136,7 +136,12 @@
 
       <div id="screens">
         <!-- ------------------------------------------------------------------ sign-in screen -->
-        <section id="screen-signin" class="screen" tabindex="-1" aria-label="Sign in">
+        <!-- `#625 signin-flash`. Served HIDDEN, like every other screen. Which screen comes up depends on a
+             token only the script can read, and the browser draws what it has parsed while /voice.js is
+             still loading: served visible, this form was on a signed-in reader's screen for every reload
+             ("I would see the sign in form for just a second even though I was already signed in"). The
+             script shows it with no token or after a refusal. -->
+        <section id="screen-signin" class="screen" tabindex="-1" aria-label="Sign in" hidden>
           <h1>vibe-talk</h1>
           <p class="hint">Server: <code id="signin-server-url"></code></p>
 

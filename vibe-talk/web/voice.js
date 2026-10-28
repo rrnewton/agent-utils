@@ -61610,6 +61610,10 @@ if (pairingCode !== null) {
     showScreen("main");
     reopenSavedView();
   }
+  // `#625 signin-flash`. ...and with no saved shell to show, NO screen until the proof arrives: the
+  // sign-in form is served hidden and stays so, and "Checking your token…" says what is happening.
+  // A form asking for a token the reader has already given, up for a round trip on every reload, read
+  // as being signed out. `signIn` shows the main screen, or this one after a refusal.
   guardQuietly(signIn)();
 } else {
   showScreen("signin");
