@@ -22,15 +22,19 @@
 //
 // A <hash> is the first 128 bits of the SHA-256 of the file's bytes, in lowercase hex: the digest
 // src/http/assets.rs names every other file by. A map is hashed first, the script then carries a
-// `sourceMappingURL` naming the map, and the script's name is the hash of THOSE bytes, so neither
-// hash covers itself. `page_build` in assets.json is the script's hash.
+// `sourceMappingURL` naming the map by its absolute path (so the copy at the plain /voice.js finds
+// it too), and the script's name is the hash of THOSE bytes, so neither hash covers itself.
+// `page_build` in assets.json is the script's hash.
 //
-// HOW THE SCRIPTS ARE MINIFIED. The page's scripts are still classic scripts sharing one global
-// scope, and one of them (voice.js) is in strict mode. Each is minified on its own, with whitespace
-// and syntax minification only: no identifier is renamed, so every top-level name stays the global
-// it was, every function keeps its `name`, and esbuild adds no helper of its own to the global
-// scope. They are joined in the shell's order under one leading "use strict": a script that is not
-// itself strict throughout is refused rather than made strict by the join.
+// HOW THE FILES ARE MINIFIED: whitespace and comments only. The page's scripts are still classic
+// scripts sharing one global scope, so no identifier may be renamed (every top-level name stays the
+// global it was, every function keeps its `name`, and esbuild adds no helper to the global scope);
+// and syntax minification is not taken either, because it inlines a primitive `const` into its
+// uses, which turns a temporal-dead-zone ReferenceError into a value. Measured at the time: syntax
+// minification would save 1.2% more of the brotli-compressed script and 0.3% of the stylesheet.
+// Each script is minified on its own and they are joined in the shell's order under one leading
+// "use strict": a script that is not itself strict throughout is refused rather than made strict
+// by the join (`requireStrict`). The stylesheets are joined in the shell's order likewise.
 //
 // COMPATIBILITY. A shell already in a browser's cache names the plain /contract.js, /voice.js,
 // /style.css and /voice.css. /voice.js is the new complete script (the validators run twice, which
@@ -38,9 +42,9 @@
 // /voice.js still needs them; the two stylesheets stay as written, in their own order.
 
 import { createHash, randomBytes } from "node:crypto";
-import { cpSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SHELL, WEB, readWeb, shellScripts, shellStyles } from "./page_sources.mjs";
@@ -52,14 +56,15 @@ const REPOSITORY = resolve(WEB, "..", "..");
 /** The first 128 bits of the SHA-256 of `bytes`, in lowercase hex. */
 export const digest = (bytes) => createHash("sha256").update(bytes).digest("hex").slice(0, 32);
 
-function loadEsbuild() {
+/** One of the lockfile-pinned tools (esbuild, typescript), or an error saying how to install it. */
+export function loadTool(name) {
   const require = createRequire(join(TOOLS, "package.json"));
   try {
-    return require("esbuild");
+    return require(name);
   } catch (error) {
     throw new Error(
-      `the page build needs the pinned esbuild in ${relative(process.cwd(), TOOLS) || TOOLS}/node_modules; ` +
-        `install it with: npm ci --prefix ${join(WEB, "..", "contract")}\n(${error.message})`
+      `the page build needs the pinned ${name} in vibe-talk/contract/node_modules; ` +
+        `from the repository root, install it with: npm ci --prefix vibe-talk/contract\n(${error.message})`
     );
   }
 }
@@ -168,17 +173,45 @@ export function joinMaps(parts, leadingLines) {
 
 // ---- The build --------------------------------------------------------------------------------
 
-/** A script is joined under one "use strict" only if it was already strict throughout. */
-export function requireStrict(name, text) {
-  const code = text.replace(/^(?:\s*\/\/[^\n]*\n)*\s*/, "");
-  const strictFile = /^"use strict";/.test(code);
-  const strictWrapper = /^\(function \(\) \{\s*"use strict";[\s\S]*\}\)\(\);\s*$/.test(code);
-  if (!strictFile && !strictWrapper) {
+/** `text` parsed as a classic script, by the pinned TypeScript's parser; a syntax error throws. */
+export function parseScript(name, text, ts = loadTool("typescript")) {
+  const file = ts.createSourceFile(name, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const [problem] = file.parseDiagnostics || [];
+  if (problem) throw new Error(`${name} does not parse: ${ts.flattenDiagnosticMessageText(problem.messageText, " ")}`);
+  return { ts, file };
+}
+
+/** Whether `statements` open with a directive prologue holding "use strict", spelled as a directive. */
+function strictPrologue(ts, file, statements) {
+  for (const statement of statements) {
+    if (!ts.isExpressionStatement(statement) || !ts.isStringLiteral(statement.expression)) return false;
+    if (['"use strict"', "'use strict'"].includes(statement.expression.getText(file))) return true;
+  }
+  return false;
+}
+
+/**
+ * A script is joined under one "use strict" only if it was already strict throughout: either its
+ * own directive prologue says "use strict" (voice.js), or the whole script is ONE call of a function
+ * whose prologue does (contract.js's generated wrapper), so nothing outside that function exists.
+ */
+export function requireStrict(name, text, ts = loadTool("typescript")) {
+  const { file } = parseScript(name, text, ts);
+  const statements = file.statements;
+  const only = statements.length === 1 ? statements[0] : null;
+  const call = only && ts.isExpressionStatement(only) && ts.isCallExpression(only.expression) ? only.expression : null;
+  let callee = call ? call.expression : null;
+  while (callee && ts.isParenthesizedExpression(callee)) callee = callee.expression;
+  const wrapper = callee && call.arguments.length === 0 &&
+    (ts.isFunctionExpression(callee) || ts.isArrowFunction(callee)) && callee.body && ts.isBlock(callee.body) &&
+    strictPrologue(ts, file, callee.body.statements);
+  if (!strictPrologue(ts, file, statements) && !wrapper) {
     throw new Error(`${name} is not strict throughout, so joining it under "use strict" would change it`);
   }
 }
 
-const sourceName = (name) => relative(REPOSITORY, join(WEB, name)).split("\\").join("/");
+/** The name a page file carries in source maps and assets.json, wherever the checkout is. */
+const sourceName = (name) => `vibe-talk/web/${name}`;
 
 async function minifyAll(esbuild, names, loader) {
   const parts = [];
@@ -188,8 +221,6 @@ async function minifyAll(esbuild, names, loader) {
     const result = await esbuild.transform(text, {
       loader,
       minifyWhitespace: true,
-      minifySyntax: true,
-      ...(loader === "css" ? { minifyIdentifiers: true } : {}),
       sourcemap: "external",
       sourcefile: sourceName(name),
       sourcesContent: true,
@@ -220,8 +251,33 @@ function assemble(parts, { stem, extension, leading, comment }) {
   return { file: `${stem}.${digest(bytes)}.${extension}`, bytes, mapFile, mapBytes };
 }
 
-/** The shell with its script tags replaced by one naming `script`, and its stylesheets by `style`. */
+/**
+ * The shell with its script tags replaced by one naming `scriptPath`, and its stylesheet links by
+ * one naming `stylePath`. Every tag replaced must be one of the plain tags the build bundled, on a
+ * line of its own, and afterwards the shell must load exactly the bundle and the sheet: a tag with
+ * more to it (`defer`, `media=`), or one inside a comment, is refused rather than mis-linked.
+ */
 export function linkShell(html, scriptPath, stylePath) {
+  const scripts = shellScripts(html);
+  const styles = shellStyles(html);
+  const out = linkTags(html, scriptPath, stylePath);
+  const linkedScripts = shellScripts(out);
+  const linkedStyles = shellStyles(out);
+  const wanted = (list, path) => list.length === 1 && `/${list[0]}` === path;
+  const plain = [...html.matchAll(/^[ \t]*<script src="\/([^"]+)"><\/script>\n/gm)].map((m) => m[1]);
+  const plainStyles = [...html.matchAll(/^[ \t]*<link rel="stylesheet" href="\/([^"]+)" \/>\n/gm)].map((m) => m[1]);
+  if (JSON.stringify(plain) !== JSON.stringify(scripts) || JSON.stringify(plainStyles) !== JSON.stringify(styles) ||
+      !wanted(linkedScripts, scriptPath) || !wanted(linkedStyles, stylePath)) {
+    throw new Error(
+      `the shell's asset tags are not the plain, one-per-line tags the build can replace: it loads ` +
+        `${JSON.stringify(scripts)} and ${JSON.stringify(styles)}, and would load ` +
+        `${JSON.stringify(linkedScripts)} and ${JSON.stringify(linkedStyles)} once linked`
+    );
+  }
+  return out;
+}
+
+function linkTags(html, scriptPath, stylePath) {
   const replaceRun = (text, pattern, tag) => {
     let first = true;
     let count = 0;
@@ -241,6 +297,17 @@ export function linkShell(html, scriptPath, stylePath) {
   return out;
 }
 
+/** Every file below `root`, as a `/`-separated path relative to it, sorted. */
+export function filesBelow(root, prefix = "") {
+  return readdirSync(join(root, prefix), { withFileTypes: true })
+    .flatMap((entry) => {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const directory = entry.isDirectory() || (entry.isSymbolicLink() && statSync(join(root, path)).isDirectory());
+      return directory ? filesBelow(root, path) : [path];
+    })
+    .sort();
+}
+
 function writeTree(root, files) {
   for (const [path, bytes] of Object.entries(files)) {
     const target = join(root, path);
@@ -249,9 +316,28 @@ function writeTree(root, files) {
   }
 }
 
+/**
+ * Refuse an output directory that is, or holds, the sources or the repository: publishing replaces
+ * the whole directory, so `--out web` would replace the page's sources with their build.
+ */
+export function requireOutside(out) {
+  const target = resolve(out);
+  for (const tree of [WEB, TOOLS, REPOSITORY]) {
+    const from = relative(target, tree);
+    if (from === "" || (!from.startsWith("..") && !isAbsolute(from))) {
+      throw new Error(`--out ${out} is or holds ${tree}, which the build would replace`);
+    }
+  }
+  const inside = relative(WEB, target);
+  if (!inside.startsWith("..") && !isAbsolute(inside)) {
+    throw new Error(`--out ${out} is inside ${WEB}, so the build would become an input of the next one`);
+  }
+}
+
 /** Build into `out`, replacing whatever was there only once everything is written and checked. */
 export async function build(out) {
-  const esbuild = loadEsbuild();
+  requireOutside(out);
+  const esbuild = loadTool("esbuild");
   const html = readWeb(SHELL);
   const scripts = shellScripts(html);
   const styles = shellStyles(html);
@@ -259,13 +345,13 @@ export async function build(out) {
     stem: "voice",
     extension: "js",
     leading: '"use strict";\n',
-    comment: (mapFile) => `//# sourceMappingURL=${mapFile}\n`,
+    comment: (mapFile) => `//# sourceMappingURL=/assets/${mapFile}\n`,
   });
   const css = assemble(await minifyAll(esbuild, styles, "css"), {
     stem: "voice",
     extension: "css",
     leading: "",
-    comment: (mapFile) => `/*# sourceMappingURL=${mapFile} */\n`,
+    comment: (mapFile) => `/*# sourceMappingURL=/assets/${mapFile} */\n`,
   });
   const shell = linkShell(html, `/assets/${js.file}`, `/assets/${css.file}`);
 
@@ -283,16 +369,17 @@ export async function build(out) {
   const hashed = Object.keys(files).filter((path) => path.startsWith("assets/"));
   if (new Set(hashed.map((path) => basename(path))).size !== hashed.length) throw new Error("two assets share a name");
 
+  // EVERY file below web/, and the lockfile: a prebuilt page (`VIBE_TALK_WEB_DIST`) is taken only
+  // if this set matches the sources it is built into, so a file this build reads can never be left
+  // out of the comparison, and one added since is a difference too.
   const inputs = {};
-  for (const name of [SHELL, ...scripts, ...styles, "manifest.webmanifest", "page_sources.mjs", "build.mjs"]) {
-    inputs[sourceName(name)] = digest(readFileSync(join(WEB, name)));
-  }
+  for (const name of filesBelow(WEB)) inputs[sourceName(name)] = digest(readFileSync(join(WEB, name)));
   inputs["vibe-talk/contract/package-lock.json"] = digest(readFileSync(join(TOOLS, "package-lock.json")));
   const manifest = {
     page_build: digest(js.bytes),
     assets: {
-      script: { path: `/assets/${js.file}`, map: `/assets/${js.mapFile}`, sources: scripts },
-      style: { path: `/assets/${css.file}`, map: `/assets/${css.mapFile}`, sources: styles },
+      script: { path: `/assets/${js.file}`, map: `/assets/${js.mapFile}`, type: "text/javascript; charset=utf-8", sources: scripts },
+      style: { path: `/assets/${css.file}`, map: `/assets/${css.mapFile}`, type: "text/css; charset=utf-8", sources: styles },
     },
     files: Object.fromEntries(Object.entries(files).map(([path, bytes]) => [path, digest(bytes)]).sort()),
     inputs,
@@ -301,7 +388,6 @@ export async function build(out) {
   files["assets.json"] = `${JSON.stringify(manifest, null, 2)}\n`;
 
   const staging = `${out}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  rmSync(staging, { recursive: true, force: true });
   try {
     writeTree(staging, files);
     cpSync(join(WEB, "icons"), join(staging, "icons"), { recursive: true, dereference: true });
@@ -317,7 +403,13 @@ export async function build(out) {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
-    renameSync(staging, out);
+    try {
+      renameSync(staging, out);
+    } catch (error) {
+      // The previous build goes back where it was rather than being stranded beside it.
+      if (moved) renameSync(old, out);
+      throw error;
+    }
     if (moved) rmSync(old, { recursive: true, force: true });
   } catch (error) {
     rmSync(staging, { recursive: true, force: true });

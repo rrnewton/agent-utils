@@ -16,6 +16,8 @@ fn the_page_build_suite_passes() {
     let output = Command::new("node")
         .current_dir(&root)
         .arg("--test")
+        // The assertions below parse TAP; Node's default reporter varies by version.
+        .arg("--test-reporter=tap")
         .arg(SUITE)
         .output()
         .unwrap_or_else(|error| panic!("could not run node, which {SUITE} needs: {error}"));
@@ -27,5 +29,13 @@ fn the_page_build_suite_passes() {
     assert!(
         output.status.success(),
         "the page build suite failed:\n{text}"
+    );
+    assert!(
+        text.contains("# fail 0"),
+        "{SUITE} reported failures:\n{text}"
+    );
+    assert!(
+        !text.contains("# pass 0\n"),
+        "{SUITE} collected no tests:\n{text}"
     );
 }

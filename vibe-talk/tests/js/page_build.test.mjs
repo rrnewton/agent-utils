@@ -13,8 +13,12 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:f
 import { SourceMap } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import vm from "node:vm";
 
-import { build, decodeMappings, digest, encodeMappings, joinMaps, requireStrict } from "../../web/build.mjs";
+import {
+  build, decodeMappings, digest, encodeMappings, joinMaps, linkShell, loadTool, parseScript, requireOutside,
+  requireStrict,
+} from "../../web/build.mjs";
 import { SHELL, WEB, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
 
 const scratch = mkdtempSync(join(tmpdir(), "vibe-talk-page-build-"));
@@ -86,24 +90,74 @@ test("the plain addresses an older shell names: /voice.js the whole new script, 
   }
 });
 
-test("the script is strict throughout, keeps every top-level name, and links its map", () => {
-  const script = text(SCRIPT_PATH);
-  assert.ok(script.startsWith('"use strict";\n'), "the joined script does not open in strict mode");
-  const mapName = MANIFEST.assets.script.map.split("/").pop();
-  assert.ok(script.endsWith(`\n//# sourceMappingURL=${mapName}\n`), "the script does not name its map last");
-  for (const name of shellScripts(readWeb(SHELL))) {
-    const source = readWeb(name);
-    // A script wrapped in one function has nothing at the top level but the wrapper (contract.js);
-    // its column-0 lines are the function's body.
-    if (/^\(function \(\) \{/m.test(source.replace(/^(?:\/\/[^\n]*\n)*/, ""))) continue;
-    const declared = [...source.matchAll(/^(?:async )?function\*? ?([A-Za-z_$][\w$]*)\(|^(?:const|let|var) ([A-Za-z_$][\w$]*)\b/gm)]
-      .map((m) => m[1] || m[2]);
-    for (const top of declared) {
-      assert.match(script, new RegExp(`(?:function\\*? ?|const |let |var |,)${top.replace(/\$/g, "\\$")}[=(,;]`),
-        `${name}'s top-level ${top} is not declared under its own name in the bundle`);
+/** The names a script declares at its top level, by the pinned TypeScript parser. */
+function topLevelNames(name, text) {
+  const { ts, file } = parseScript(name, text);
+  const names = [];
+  const bound = (node) => {
+    if (ts.isIdentifier(node)) names.push(node.text);
+    else for (const element of node.elements) if (!ts.isOmittedExpression(element)) bound(element.name);
+  };
+  for (const statement of file.statements) {
+    if (ts.isVariableStatement(statement)) statement.declarationList.declarations.forEach((d) => bound(d.name));
+    else if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) && statement.name) {
+      names.push(statement.name.text);
     }
   }
-  assert.ok(text(STYLE_PATH).endsWith(`/*# sourceMappingURL=${MANIFEST.assets.style.map.split("/").pop()} */\n`));
+  return names;
+}
+
+test("the script is strict throughout, declares every source's top-level name at its own top level, and links its map", () => {
+  const script = text(SCRIPT_PATH);
+  assert.ok(script.startsWith('"use strict";\n'), "the joined script does not open in strict mode");
+  const declared = new Set(topLevelNames("bundle.js", script));
+  let checked = 0;
+  for (const name of shellScripts(readWeb(SHELL))) {
+    for (const top of topLevelNames(name, readWeb(name))) {
+      assert.ok(declared.has(top), `${name}'s top-level ${top} is not declared at the bundle's top level`);
+      checked += 1;
+    }
+  }
+  assert.ok(checked > 1000, `only ${checked} top-level names were checked`);
+  const mapPath = MANIFEST.assets.script.map;
+  assert.ok(script.endsWith(`\n//# sourceMappingURL=${mapPath}\n`), "the script does not name its map last");
+  assert.ok(text(STYLE_PATH).endsWith(`/*# sourceMappingURL=${MANIFEST.assets.style.map} */\n`));
+});
+
+test("an error the page throws is reported at the line of its source it was thrown from", () => {
+  // Run with no browser at all, both the sources and the bundle stop on the same missing global, at
+  // the same statement: the bundle's stack, mapped back, must name the line the sources name.
+  const thrown = (code, filename) => {
+    try {
+      new vm.Script(code, { filename }).runInContext(vm.createContext({}));
+    } catch (error) {
+      const at = new RegExp(`${filename.replace(/\./g, "\\.")}:(\\d+):(\\d+)`).exec(error.stack);
+      assert.ok(at, `no frame in ${filename}: ${error.stack}`);
+      return { message: error.message, line: Number(at[1]) - 1, column: Number(at[2]) - 1 };
+    }
+    return assert.fail(`${filename} ran to the end without a browser`);
+  };
+  const scripts = shellScripts(readWeb(SHELL));
+  const last = scripts.at(-1);
+  // The sources as the shell loads them: every script before the last runs cleanly, and the last
+  // throws.
+  const context = vm.createContext({});
+  for (const name of scripts.slice(0, -1)) new vm.Script(readWeb(name), { filename: name }).runInContext(context);
+  let fromSource;
+  try {
+    new vm.Script(readWeb(last), { filename: last }).runInContext(context);
+  } catch (error) {
+    const at = new RegExp(`${last.replace(/\./g, "\\.")}:(\\d+):`).exec(error.stack);
+    fromSource = { message: error.message, line: Number(at[1]) - 1 };
+  }
+  assert.ok(fromSource, `${last} ran to the end without a browser`);
+  const fromBundle = thrown(text(SCRIPT_PATH), "bundle.js");
+  assert.equal(fromBundle.message, fromSource.message);
+  const map = new SourceMap(JSON.parse(text(relativePath(MANIFEST.assets.script.map))));
+  const found = map.findEntry(fromBundle.line, fromBundle.column);
+  assert.equal(found.originalSource, `vibe-talk/web/${last}`);
+  assert.equal(found.originalLine, fromSource.line,
+    `the bundle's ${fromBundle.message} maps to line ${found.originalLine + 1}, not ${fromSource.line + 1}`);
 });
 
 test("a position in the minified files maps back to the line of the source it came from", () => {
@@ -128,6 +182,24 @@ test("a position in the minified files maps back to the line of the source it ca
     assert.equal(found.originalSource, `vibe-talk/web/${file}`, needle);
     assert.equal(found.originalLine, want, `${needle} maps to line ${found.originalLine + 1}, not ${want + 1}`);
   }
+});
+
+test("the shell is refused rather than mis-linked when its tags are not the plain ones the build replaces", () => {
+  const shell = (extra) => `<head>\n<link rel="stylesheet" href="/a.css" />\n</head><body>\n${extra}<script src="/a.js"></script>\n</body>`;
+  assert.equal(linkShell(shell(""), "/assets/x.js", "/assets/x.css"),
+    '<head>\n<link rel="stylesheet" href="/assets/x.css" />\n</head><body>\n<script src="/assets/x.js"></script>\n</body>');
+  for (const extra of ['<!--\n<script src="/old.js"></script>\n-->\n', '<script src="/b.js" defer></script>\n',
+    '<link rel="stylesheet" href="/print.css" media="print" />\n', '<script src="/b.js"></script><script src="/c.js"></script>\n']) {
+    assert.throws(() => linkShell(shell(extra), "/assets/x.js", "/assets/x.css"), /not the plain, one-per-line tags/, extra);
+  }
+});
+
+test("the build refuses to publish over its own sources or the repository", () => {
+  for (const out of [WEB, join(WEB, ".."), join(WEB, "..", ".."), join(WEB, "dist"), join(WEB, "..", "contract")]) {
+    assert.throws(() => requireOutside(out), /would (replace|become an input)/, out);
+  }
+  requireOutside(join(WEB, "..", "target", "web"));
+  requireOutside(OUT);
 });
 
 test("nothing built names the directory it was built in or the one it was built from", () => {
@@ -172,9 +244,20 @@ test("joined maps keep each part's positions, its sources and its names", () => 
 });
 
 test("a script that is not strict throughout is refused rather than made strict by the join", () => {
-  requireStrict("ok.js", '// a comment\n"use strict";\nlet a = 1;\n');
-  requireStrict("wrapped.js", '// generated\n(function () {\n"use strict";\nconst a = 1;\n})();\n');
-  assert.throws(() => requireStrict("sloppy.js", "let a = 1;\n"), /sloppy\.js is not strict throughout/);
-  assert.throws(() => requireStrict("late.js", 'let a = 1;\n"use strict";\n'), /late\.js is not strict/);
-  assert.throws(() => requireStrict("tail.js", '(function () {\n"use strict";\n})();\nwindow.x = 1;\n'), /tail\.js is not strict/);
+  const ts = loadTool("typescript");
+  requireStrict("ok.js", '// a comment\n/* another */\n"use strict";\nlet a = 1;\n', ts);
+  requireStrict("prologue.js", '"a directive";\n\'use strict\';\nlet a = 1;\n', ts);
+  requireStrict("wrapped.js", '// generated\n(function () {\n"use strict";\nconst a = 1;\n})();\n', ts);
+  for (const [name, code] of [
+    ["sloppy.js", "let a = 1;\n"],
+    ["late.js", 'let a = 1;\n"use strict";\n'],
+    ["escaped.js", '"use\\x20strict";\nlet a = 1;\n'],
+    ["tail.js", '(function () {\n"use strict";\n})();\nwindow.x = 1;\n'],
+    ["sandwich.js", '(function(){"use strict";})();\nwith (o) { x = 1; }\n(function(){})();\n'],
+    ["argument.js", '(function (a) {\n"use strict";\n})(window);\n'],
+    ["inner.js", '(function () {\nlet a = 1;\n"use strict";\n})();\n'],
+  ]) {
+    assert.throws(() => requireStrict(name, code, ts), new RegExp(`${name.replace(".", "\\.")} is not strict throughout`), name);
+  }
+  assert.throws(() => requireStrict("broken.js", '"use strict";\nlet = ;\n', ts), /broken\.js does not parse/);
 });

@@ -24,7 +24,6 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
