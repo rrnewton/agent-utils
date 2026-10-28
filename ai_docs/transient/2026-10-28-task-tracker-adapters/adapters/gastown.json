@@ -1,0 +1,29 @@
+{
+  "schema": "agent-utils/task-adapter@0",
+  "name": "gastown",
+  "summary": "Gas Town (gt): tasks are beads in each rig's bd database; gt adds dispatch (sling), a per-agent work pointer (hook), grouping (convoy) and completion (done).",
+  "verified": "written from Gas Town's README, docs/reference.md and docs/glossary.md at upstream commit de2ce8e (2026-10-25); gt is not installed on the authoring host, so no action has been run",
+  "extends": "beads",
+  "orchestrator": {
+    "comment": "Actions an orchestrator performs on a task. agentctl would call these instead of (or as well as) its own start/stop when a project's tasks belong to Gas Town. They are optional for every other adapter.",
+    "dispatch": {
+      "argv": ["gt", "sling", "{id}", "{target}", ["--agent", "{runtime?}"]],
+      "output": {"format": "none"},
+      "effect": "assigns the task to a worker in rig {target}, starts it, and puts the task on that worker's hook"
+    },
+    "group": {
+      "argv": ["gt", "convoy", "create", "{title}", "{ids*}"],
+      "output": {"format": "none"}
+    },
+    "group_add": {
+      "argv": ["gt", "convoy", "add", "{group}", "{ids*}"],
+      "output": {"format": "none"}
+    },
+    "complete": {
+      "argv": ["gt", "done"],
+      "run_as": "worker",
+      "output": {"format": "none"},
+      "effect": "run by the worker: submits its branch to the merge queue and ends its session"
+    }
+  }
+}

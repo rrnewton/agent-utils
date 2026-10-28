@@ -671,6 +671,15 @@ fn salvage_checkout(cfg: &Cfg, checkout: &Value, repository: &Path) -> Result<Va
     Ok(result)
 }
 
+/// Whether `git submodule status` output names an initialized submodule. A line starting with
+/// `-` is a submodule that was never initialized: an empty directory with nothing to salvage,
+/// as the Python edition's `submodule foreach` (initialized only) also treats it.
+fn has_initialized_submodule(status: &str) -> bool {
+    status
+        .lines()
+        .any(|line| !line.trim().is_empty() && !line.starts_with('-'))
+}
+
 fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) -> Result<Value> {
     let name = checkout
         .get("name")
@@ -706,7 +715,7 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
         ));
     }
     let submodules = git(&path, &["submodule", "status", "--recursive"])?;
-    if !submodules.trim().is_empty() {
+    if has_initialized_submodule(&submodules) {
         return Err(format!(
             "checkout {name} has initialized submodules; submodule salvage stays with the Python edition for now"
         ));
@@ -1705,5 +1714,27 @@ mod link_tests {
         std::fs::write(&regular, b"x").unwrap();
         assert!(!link_points_into(&regular, &slot, device).unwrap());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod submodule_tests {
+    use super::has_initialized_submodule;
+
+    #[test]
+    fn uninitialized_submodules_do_not_block_removal() {
+        assert!(!has_initialized_submodule(""));
+        assert!(!has_initialized_submodule(
+            "-56714bf4884cdc74b4a0b9d9e2a7b8427bd24fd7 ext/minibeads\n"
+        ));
+        assert!(has_initialized_submodule(
+            " 56714bf4884cdc74b4a0b9d9e2a7b8427bd24fd7 ext/minibeads (v0.29.0)\n"
+        ));
+        assert!(has_initialized_submodule(
+            "-1111111111111111111111111111111111111111 a\n+2222222222222222222222222222222222222222 b (heads/main)\n"
+        ));
+        assert!(has_initialized_submodule(
+            "U3333333333333333333333333333333333333333 c\n"
+        ));
     }
 }

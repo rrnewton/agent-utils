@@ -142,7 +142,8 @@ agentctl's private state are ignored. The end of `AGENTS.md` records the choices
 - **wrkslots**: up to 4 slots, disk-image (sparse ext4, `auto` backend) storage, `cgroup` isolation.
 - **Chat bridge**: deferred; the owner talks to the coordinator in its Herdr tab.
 - **Optional tools installed**: `herdr-run` (allow `git`, `gh`; prefix `with-proxy`; workspace `foobar-cmds`).
-- **Available on request**: `tick-hub`, `dagrun`, `wrkviz`, `gh-paced`, `vibe-talk`, `pr-landing-planner`.
+- **Available on request**: `tick-hub`, `dagrun`, `wrkviz`, `gh-paced`, `minibeads`, `vibe-talk`,
+  `pr-landing-planner`.
 ```
 
 ## 7. The smoke test

@@ -152,4 +152,8 @@ is not, follow the `agent-utils-setup` skill's "Add a tool later" section. The u
 - `dagrun`: run the project's validation graph locally under resource limits.
 - `wrkviz`: build a timeline of what you and your subagents did.
 - `gh-paced`: pace `gh` calls so many agents sharing one account stay inside GitHub's limits.
+- `minibeads`: the local task tracker (`mb`). File each dispatched task there, claim it for the
+  agent you start (`mb update ID --claim --as NAME`), name it in the brief, and have the agent
+  close it when its work lands; `mb ready` is the queue. GitHub issues stay for serious bugs and
+  outside reports.
 - `vibe-talk`: lets the owner reach you by voice from a phone.

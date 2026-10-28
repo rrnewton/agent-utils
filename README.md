@@ -64,7 +64,22 @@ project's own rules, and reports substance back to the owner.
 | Retrospective | `wrkviz` | optional | Builds a zoomable timeline of what the coordinator and its subagents did, from their transcripts, across agents and teams. |
 | Budget awareness | `agent-usage` | optional | Reads each harness's plan usage and reset times (Claude Code and Codex, the numbers their `/status` screens show) without a model call, keeps a history, and reports burn rates over 15 minutes to 24 hours plus local token use. |
 | GitHub hygiene | `gh-paced` | optional | Paces `gh` calls against per-account budgets so many agents sharing one GitHub account stay inside GitHub's limits and do not get the account suspended. |
+| Task tracking | [`minibeads`](https://github.com/rrnewton/minibeads) (`mb`) | optional, submodule | A dependency-aware issue tracker that keeps each issue as a Markdown file in the repository: a coordinator files a task, claims it for the subagent it starts, and the subagent closes it when the work lands; `mb ready` lists what is unblocked. A separate project, pinned as the submodule `ext/minibeads`. No other tool depends on it (see below). |
 | Landing | `pr-landing-planner` | experimental | Produces an advisory, conflict- and CI-aware plan for landing a queue of pull requests. |
+
+**Task trackers are a la carte too.** The suite's convention is two tiers:
+GitHub Issues for serious bugs and reports from outside, and a local tracker
+for the churn of dispatched tasks, so that churn stays off GitHub's rate
+limits and away from real bug reports. minibeads is the local tracker this
+repository uses, but nothing requires it: a design for driving any tracker CLI
+(minibeads, upstream beads, GitHub Issues, Gas Town, and others) through one
+JSON adapter format is
+[under review](ai_docs/transient/2026-10-28-task-tracker-adapters/README.md).
+To build `mb` from the submodule: `git submodule update --init --checkout ext/minibeads`,
+then `cargo install --path ext/minibeads --bin mb` (or
+`cargo install minibeads --version '^0.29'` from crates.io). The submodule is
+marked `update = none`, so a recursive update, here or in a project that embeds
+agent-utils, skips it; `--checkout` fetches it only on request.
 
 The core tools are always set up; the optional ones are offered during setup
 and can be added later by asking the coordinator. Each tool has a skill under
@@ -187,6 +202,7 @@ common/docs/       settled documentation, public related work, and rendered edit
 ai_docs/transient/ dated working designs and temporary research
 cross/             behavioral differential harnesses and shared fixtures
 examples/          runnable DAG examples
+ext/               separately developed projects pinned as git submodules (minibeads)
 vibe-talk/         a deployable service, outside the workspaces (see below)
 py/                independently publishable Python distributions
 rs/                independently publishable Rust crates

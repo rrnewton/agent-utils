@@ -1,0 +1,131 @@
+{
+  "schema": "agent-utils/task-adapter@0",
+  "name": "minibeads",
+  "summary": "minibeads (mb): Markdown issues in .minibeads/issues, dependency-aware, atomic claims with leases.",
+  "verified": "mb 0.25.0, read-only actions run against this repository's .minibeads on 2026-10-28",
+  "program": ["mb"],
+  "json_args": ["--json"],
+  "actor_args": ["--actor", "{actor}"],
+  "detect": {
+    "any_file": [".minibeads/config.yaml"],
+    "probe": ["mb", "version"]
+  },
+  "id": {
+    "pattern": "^[a-z0-9][a-z0-9-]*-[0-9a-z]+$",
+    "display": "{id}"
+  },
+  "states": {
+    "open": ["open"],
+    "in_progress": ["in_progress"],
+    "blocked": ["blocked"],
+    "closed": ["closed"]
+  },
+  "priority": {
+    "native": "integer",
+    "highest": 0,
+    "lowest": 4,
+    "default": 2
+  },
+  "fields": {
+    "id": "$.id",
+    "title": "$.title",
+    "state": "$.status",
+    "priority": "$.priority",
+    "type": "$.issue_type",
+    "labels": "$.labels[*]",
+    "assignee": "$.assignee",
+    "description": "$.description",
+    "blocked_by": "$.dependencies[?(@.type=='blocks')].id",
+    "parent": "$.dependencies[?(@.type=='parent-child')].id",
+    "external_ref": "$.external_ref",
+    "created_at": "$.created_at",
+    "updated_at": "$.updated_at",
+    "closed_at": "$.closed_at",
+    "comments": "$.comments[*]"
+  },
+  "capabilities": {
+    "in_progress": "native",
+    "blocked": "native",
+    "dependencies": "native",
+    "ready_query": "native",
+    "claim": "atomic-lease",
+    "labels": "native",
+    "comments": "native",
+    "close_reason": "native",
+    "explicit_ids": "native",
+    "external_ref": "native",
+    "parent": "native"
+  },
+  "actions": {
+    "list": {
+      "argv": ["list", ["--status", "{state?}"], ["--label", "{label?}"], ["--limit", "{limit?}"]],
+      "output": {"format": "json", "items": "$[*]"}
+    },
+    "show": {
+      "argv": ["show", "{id}"],
+      "output": {"format": "json", "item": "$[0]"}
+    },
+    "ready": {
+      "argv": ["ready", ["--limit", "{limit?}"]],
+      "output": {"format": "json", "items": "$[*]"}
+    },
+    "blocked": {
+      "argv": ["blocked"],
+      "output": {"format": "json", "items": "$[*]"}
+    },
+    "create": {
+      "argv": [
+        "create", "{title}",
+        ["--id", "{id?}"],
+        ["--description", "{description?}"],
+        ["--priority", "{priority?}"],
+        ["--type", "{type?}"],
+        ["--label", "{labels*}"],
+        ["--parent", "{parent?}"],
+        ["--external-ref", "{external_ref?}"]
+      ],
+      "output": {"format": "json", "id": "$.id"}
+    },
+    "set_state": {
+      "argv": ["update", "{id}", "--status", "{state}"],
+      "output": {"format": "json"}
+    },
+    "claim": {
+      "argv": ["update", "{id}", "--claim", "--as", "{assignee}", ["--for", "{lease?}"]],
+      "output": {"format": "json"},
+      "conflict_stderr": "active claim"
+    },
+    "release": {
+      "argv": ["claim", "{id}", "--release"],
+      "output": {"format": "json"}
+    },
+    "close": {
+      "argv": ["close", "{id}", ["--reason", "{reason?}"]],
+      "output": {"format": "json"}
+    },
+    "reopen": {
+      "argv": ["reopen", "{id}", ["--reason", "{reason?}"]],
+      "output": {"format": "json"}
+    },
+    "comment": {
+      "argv": ["comments", "add", "{id}", "--body", "{body}"],
+      "output": {"format": "json"}
+    },
+    "label_add": {
+      "argv": ["update", "{id}", "--add-label", "{label}"],
+      "output": {"format": "json"}
+    },
+    "label_remove": {
+      "argv": ["update", "{id}", "--remove-label", "{label}"],
+      "output": {"format": "json"}
+    },
+    "dep_add": {
+      "argv": ["dep", "add", "{id}", "{blocker}", "--type", "blocks"],
+      "output": {"format": "json"}
+    },
+    "dep_remove": {
+      "argv": ["dep", "remove", "{id}", "{blocker}"],
+      "output": {"format": "json"}
+    }
+  }
+}
