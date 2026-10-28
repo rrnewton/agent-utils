@@ -6030,6 +6030,126 @@ test("Forget clears the stored token and says what is now true", async () => {
   assert.match(page.el("token-state").textContent, /no token saved/);
 });
 
+// --- `#616 composer-no-autofill`: no password manager takes a send for a sign-in -----------------
+//
+// The owner, on Android: "I get this last pass suggestion every time I send a message". Every
+// control outside a <form> is one form to Chrome, and that form held the token's password field,
+// filled with the saved token, beside every message box; Chrome hands an inferred submission of it
+// to the phone's autofill service. What can be pinned here is the page's half. Whether the phone
+// stops asking is checked only on the owner's phone.
+
+/** Every text field the markup ships: inputs a reader types in, and every textarea. */
+const typedFields = () =>
+  [...HTML_CODE.matchAll(/<(input|textarea)\b([^>]*)>/g)]
+    .map(([, tag, attributes]) => ({
+      tag,
+      attributes,
+      id: (/\bid="([^"]+)"/.exec(attributes) || [])[1],
+      type: (/(?:^|\s)type="([^"]+)"/.exec(attributes) || [])[1] || (tag === "input" ? "text" : "textarea"),
+    }))
+    .filter((field) => !["checkbox", "radio", "range", "button", "submit", "reset", "file", "color", "image"].includes(field.type));
+
+test("composer-no-autofill: every field a reader types in tells password managers to stay out", () => {
+  const fields = typedFields();
+  for (const id of ["channel-compose-text", "side-compose-text", "reply-text", "compose-text", "search-field",
+    "channel-directory-search", "api-token", "pair-input"]) {
+    assert.ok(fields.some((field) => field.id === id), `${id} is no longer a text field in web/voice.html`);
+  }
+  for (const field of fields) {
+    // The opt-outs LastPass, 1Password and Dashlane read in a desktop browser.
+    for (const attribute of ['data-lpignore="true"', 'data-1p-ignore="true"', 'data-form-type="other"']) {
+      assert.ok(field.attributes.includes(attribute), `#${field.id} lacks ${attribute}`);
+    }
+    // A one-line field gets autocomplete="off" too, which Chrome hands Android's autofill service as
+    // the field's hint.
+    if (field.tag === "input") assert.ok(field.attributes.includes('autocomplete="off"'), `#${field.id} lacks autocomplete="off"`);
+  }
+  // ...but not a message box: Chrome passes autocomplete="off" to a phone's keyboard as "no
+  // suggestions", and the owner writes there with the keyboard's word suggestions.
+  for (const id of ["channel-compose-text", "side-compose-text", "reply-text"]) {
+    const box = fields.find((field) => field.id === id);
+    assert.doesNotMatch(box.attributes, /\bautocomplete=/, `#${id} would lose the keyboard's suggestions`);
+  }
+});
+
+test("composer-no-autofill: the token's password field has a form of its own, and no message box is in one", () => {
+  const forms = [...HTML_CODE.matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form>/g)];
+  assert.equal(forms.length, 1, "web/voice.html has exactly one <form>, the sign-in fields'");
+  const [, formAttributes, inside] = forms[0];
+  assert.match(formAttributes, /\bid="signin-form"/);
+  // A dialog form outside a dialog submits nowhere: an Enter can never put the token in the address.
+  assert.match(formAttributes, /\bmethod="dialog"/);
+  assert.equal(inside.trim(), "", "the form wraps nothing; its fields join it by their form attribute");
+  const joined = typedFields().filter((field) => /\bform="signin-form"/.test(field.attributes)).map((field) => field.id);
+  assert.deepEqual(joined.sort(), ["api-token", "pair-input", "pair-transfer"]);
+  for (const field of typedFields().filter((one) => one.type === "password")) {
+    assert.match(field.attributes, /\bform="signin-form"/, `password field #${field.id} is in the message boxes' form`);
+  }
+  for (const field of typedFields().filter((one) => one.id !== undefined && !joined.includes(one.id))) {
+    assert.doesNotMatch(field.attributes, /\bform="/, `#${field.id} names a form`);
+  }
+  // Send is a click or a key, never a form's submission: the one submit listener is the sign-in
+  // form's, and all it does is refuse.
+  const submits = [...SCRIPT_CODE.matchAll(/el\("([\w-]+)"\)\.addEventListener\("submit"/g)].map((m) => m[1]);
+  assert.deepEqual(submits, ["signin-form"]);
+  assert.doesNotMatch(SCRIPT_CODE, /createElement\("form"\)|\.submit\(\)|requestSubmit/);
+});
+
+test("composer-no-autofill: the sign-in form's submit goes nowhere", async () => {
+  const page = newPage();
+  let prevented = false;
+  await page.el("signin-form").dispatch("submit", { preventDefault: () => { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(page.storage.has("vibe-talk.token"), false, "a submit saved a token");
+});
+
+test("composer-no-autofill: the password field never holds the saved token", async () => {
+  const store = new Map();
+  const first = newPage(store);
+  await signIn(first);
+  assert.equal(first.el("api-token").value, "", "the token stayed in the password field after Save");
+  assert.equal(store.get("vibe-talk.token"), "write-token-aaaaaaaaaaaaaaaa");
+
+  const reloaded = newPage(store);
+  await reloaded.settle();
+  assert.equal(reloaded.screen(), "main");
+  assert.equal(reloaded.el("api-token").value, "", "a reload wrote the saved token into the password field");
+
+  // A browser that will not store it keeps what was pasted, so the owner can try again without pasting twice.
+  const unstored = newPage();
+  unstored.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  unstored.storage.set = () => unstored.storage;
+  await unstored.el("save-token").click();
+  assert.equal(unstored.el("api-token").value, "write-token-aaaaaaaaaaaaaaaa");
+});
+
+test("composer-no-autofill: a token the server refuses stays in the box, and Save on an empty box retries the saved one", async () => {
+  const page = newPage();
+  page.clientConfig = async () => json(401, { error: "unauthorized", detail: "token revoked" });
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  assert.equal(page.screen(), "signin");
+  assert.equal(page.el("api-token").value, "write-token-aaaaaaaaaaaaaaaa", "a refused token was taken out of the box");
+
+  // A reload with that token saved: the box is empty, and Save tries the saved token again rather
+  // than calling it "nothing to save".
+  const store = new Map([["vibe-talk.token", "write-token-aaaaaaaaaaaaaaaa"]]);
+  const reloaded = reloadPage(store, (p) => {
+    p.onlineConfig = p.clientConfig;
+    p.clientConfig = errorResponse(401, "unauthorized", "token revoked");
+  });
+  await reloaded.settle();
+  assert.equal(reloaded.screen(), "signin");
+  assert.equal(reloaded.el("api-token").value, "");
+  reloaded.clientConfig = reloaded.onlineConfig;
+  await reloaded.el("save-token").click();
+  await reloaded.settle();
+  assert.doesNotMatch(reloaded.el("error").textContent, /nothing to save/i);
+  assert.equal(reloaded.screen(), "main", "Save on the empty box did not retry the saved token");
+  assert.equal(store.get("vibe-talk.token"), "write-token-aaaaaaaaaaaaaaaa");
+});
+
 test("the page and the script agree about which elements exist", () => {
   // `newPage`'s getElementById throws for an unknown id, so merely constructing the page proves
   // the script's startup lookups all resolve. This states the property it relies on.

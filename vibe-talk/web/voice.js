@@ -58397,7 +58397,9 @@ function markSave(label, className, disabled) {
 
 async function saveToken() {
   clearError();
-  const value = el("api-token").value.trim();
+  // The box is empty once a token has signed in (`#616 composer-no-autofill`), so an empty box with a
+  // token saved is a retry of that token, as Save on the box it used to be shown in was.
+  const value = el("api-token").value.trim() || token();
   markSave("Saving…", "", true);
   if (!value) {
     markSave(SAVE_LABEL, "", false);
@@ -58429,7 +58431,8 @@ async function saveToken() {
   saveRevert = setTimeout(() => {
     markSave(SAVE_LABEL, "", false);
   }, 2500);
-  await signIn();
+  // Only once the server took it: a refused token stays in the box, to be corrected, not pasted again.
+  if (await signIn()) el("api-token").value = "";
 }
 
 // `#369 pairing-link`. What the page says when a pairing link does not work. One sentence for every
@@ -59116,7 +59119,12 @@ function startSettingsSync() {
 
 // --- wiring ------------------------------------------------------------------------------------
 
-el("api-token").value = token();
+// `#616 composer-no-autofill`. The token field starts EMPTY, even with a token saved, and is emptied again
+// once a token has signed in. A password field holding the token, in one form with every message box, is
+// what made a phone's password manager take a send for a sign-in and offer to save it (see #signin-form
+// in web/voice.html). The saved token lives in localStorage only, and Save with the field empty tries it
+// again. The form is never submitted; should something submit it, nothing happens.
+el("signin-form").addEventListener("submit", (event) => event.preventDefault());
 el("save-token").addEventListener("click", guardQuietly(saveToken));
 el("forget-token").addEventListener("click", forgetToken);
 el("pair-submit").addEventListener("click", guardQuietly(pairFromInput));
