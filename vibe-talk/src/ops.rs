@@ -841,6 +841,34 @@ async fn read_window(
             None,
         ));
     }
+    // `#649 voice-agent-tools`: a voice agent's read (a digest, a lookup by id) is answered from the
+    // message cache at once, dated by its last listing, with the recent read behind it. Its size is
+    // what it holds, never what was asked, so it never claims to be the whole channel.
+    if tool_read(state, caller) {
+        if let Some(copy) = cached_window(state, &channel.id, limit)
+            .await
+            .filter(|copy| !copy.messages.is_empty())
+        {
+            refresh_behind(state, caller, &channel.id);
+            crate::cache_first::note(crate::cache_first::Source::CacheFirst);
+            drop(shadow);
+            let mut messages = copy.messages;
+            stamp(state, &mut messages);
+            crate::noise::filter_for(state, &channel.id)
+                .await
+                .mark(&mut messages);
+            let held = u16::try_from(messages.len()).unwrap_or(u16::MAX);
+            return Ok((
+                Window {
+                    channel,
+                    messages,
+                    limit: held,
+                    as_of: copy.checked_ms.map(crate::clock::iso_from_ms),
+                },
+                None,
+            ));
+        }
+    }
     let fill = state.message_cache.begin_for(caller, &channel.id);
     let read = crate::recent_view::read(state, &channel.id, limit).await?;
     // Before the read is offered, so the shadow knows which offers are this read's own.
@@ -2940,12 +2968,16 @@ pub async fn activity(
     waits.extend(crate::recent::keep_or_refresh(state, &candidates, scan, grant).await);
     // What the message cache holds of each channel this server holds no window of as deep as the
     // catch-up reads: the copy that answers for it without waiting on the chat service.
-    let mut cached: std::collections::HashMap<ChannelId, crate::cache::sink::StaleTimeline> =
-        std::collections::HashMap::new();
+    // With whether the cache's coverage proves the copy has no hole: only then is its count exact.
+    let mut cached: std::collections::HashMap<
+        ChannelId,
+        (crate::cache::sink::StaleTimeline, bool),
+    > = std::collections::HashMap::new();
     for channel in &channels {
         if !recent.holds_deep(&channel.id, scan) {
             if let Some(copy) = cached_window(state, &channel.id, scan).await {
-                cached.insert(channel.id.clone(), copy);
+                let proven = cache_covers_rows(state, &channel.id, &copy.messages).await;
+                cached.insert(channel.id.clone(), (copy, proven));
             }
         }
     }
@@ -3008,21 +3040,94 @@ pub(crate) async fn cached_window(
         crate::threads::TimelineView::Flat,
         crate::threads::TimelineView::Main,
     ] {
-        let ask = Ask::Timeline {
-            view,
-            thread: None,
-            limit: usize::from(scan),
-        };
-        if let Some(copy) = state
-            .message_cache
-            .stale_timeline(channel, &ask)
-            .await
-            .filter(|copy| copy.checked_ms.is_some())
-        {
+        if let Some(copy) = cached_view(state, channel, view, usize::from(scan)).await {
             return Some(copy);
         }
     }
     None
+}
+
+/// What the message cache holds of the newest `limit` messages of `view` of `channel`, when it has
+/// listed that view's newest end at least once and its serving gates pass; never a read of the chat
+/// service. `#649 voice-agent-tools`.
+async fn cached_view(
+    state: &AppState,
+    channel: &ChannelId,
+    view: crate::threads::TimelineView,
+    limit: usize,
+) -> Option<crate::cache::sink::StaleTimeline> {
+    let ask = Ask::Timeline {
+        view,
+        thread: None,
+        limit,
+    };
+    state
+        .message_cache
+        .stale_timeline(channel, &ask)
+        .await
+        .filter(|copy| copy.checked_ms.is_some())
+}
+
+/// Whether the read being made is a voice agent's tool call, which `#649 voice-agent-tools` answers
+/// from the message cache when it holds the answer, never waiting on the chat service: the owner,
+/// 2026-10-28, wants the agent's reads "answered as quickly as possible from our vibe talk server
+/// cache and certainly not require any upstream slack operations."
+fn tool_read(state: &AppState, caller: crate::auth::Scope) -> bool {
+    crate::read_reason::ReadReason::current() == crate::read_reason::ReadReason::Tool
+        && may_serve(state, caller)
+}
+
+/// Whether the message cache's coverage of `channel`'s Main view says every message created in
+/// `[from_ms, to_ms)`, provider time, was listed into it, with no stretch missing. A copy answered
+/// without that may have a hole in it (a stretch while this server was down, say), so it is only
+/// ever said to be at least what it shows. `#649 voice-agent-tools`. (Not the intervals' `complete`
+/// flag, which a Slack read never sets: the question here is a hole, not a provider's paging.)
+async fn cache_covers(state: &AppState, channel: &ChannelId, from_ms: i64, to_ms: i64) -> bool {
+    let (Some(cache), Some(chan)) = (
+        state.message_cache.cache(),
+        state.message_cache.chan_key(channel),
+    ) else {
+        return false;
+    };
+    tokio::task::spawn_blocking(
+        move || match cache.coverage(&chan, &crate::cache::Scope::Main) {
+            crate::cache::Read::Served(intervals) => {
+                crate::cache::coverage::covers(&intervals, from_ms, to_ms).is_some()
+            }
+            _ => false,
+        },
+    )
+    .await
+    .unwrap_or(false)
+}
+
+/// Whether the cache's coverage proves `messages` (oldest first) are every Main message from the
+/// oldest of them to the newest. Empty proves nothing.
+async fn cache_covers_rows(state: &AppState, channel: &ChannelId, messages: &[Message]) -> bool {
+    let (Some(from), Some(to)) = (
+        messages.first().and_then(message_ms),
+        messages.last().and_then(message_ms),
+    ) else {
+        return false;
+    };
+    cache_covers(state, channel, from, to.saturating_add(1)).await
+}
+
+/// Start the read that brings `channel`'s recent window, and the message cache, up to date behind
+/// an answer a tool call took from the cache: single-flight with every other read of it, under the
+/// caller's grant, and not while the provider is rate-limiting it
+/// ([`crate::recent::RATE_LIMIT_BACKOFF`]). `#649 voice-agent-tools`.
+fn refresh_behind(state: &AppState, caller: crate::auth::Scope, channel: &ChannelId) {
+    if state.live.recent().backing_off(channel) {
+        return;
+    }
+    let scan = activity_scan(state, DEFAULT_ACTIVITY_LINES);
+    drop(crate::recent::refresh(
+        state,
+        channel,
+        scan,
+        crate::cache::FillGrant::for_caller(caller),
+    ));
 }
 
 /// `ms`, Unix milliseconds, as a message's spoken time is said: local, `09:51`.
@@ -3042,7 +3147,7 @@ async fn channel_activity(
     lines: u16,
     since_ms: i64,
     owner: &crate::owner::Owner,
-    cached: Option<crate::cache::sink::StaleTimeline>,
+    cached: Option<(crate::cache::sink::StaleTimeline, bool)>,
 ) -> ChannelActivity {
     let known = state.live.recent().snapshot(&channel.id);
     let fed = crate::recent::live_fed(state, &channel.id);
@@ -3053,6 +3158,8 @@ async fn channel_activity(
         .failure
         .clone()
         .map(|error| OpError::Chat(error).code());
+    // A copy the cache's coverage does not prove whole is counted as at least what it shows.
+    let mut exact = true;
     let (messages, whole, currency, as_of, copied_at) = match (known.held, cached) {
         (Some(held), None) => {
             let (currency, copied_at) =
@@ -3068,7 +3175,8 @@ async fn channel_activity(
                 };
             (held.messages, held.whole, currency, held.as_of, copied_at)
         }
-        (_, Some(copy)) => {
+        (_, Some((copy, proven))) => {
+            exact = proven;
             // On the cache's own clock, which dated the listing.
             let cache_now_ms = state
                 .message_cache
@@ -3108,9 +3216,11 @@ async fn channel_activity(
     crate::noise::filter_for(state, &channel.id)
         .await
         .mark(&mut messages);
+    let mut read = window_activity(messages, whole, lines, since_ms, owner);
+    read.complete &= exact;
     ChannelActivity {
         channel,
-        read: Ok(window_activity(messages, whole, lines, since_ms, owner)),
+        read: Ok(read),
         currency,
         as_of,
         copied_at,
@@ -3278,6 +3388,9 @@ pub struct Page {
     /// after: the page then holds every message of its last millisecond, and such a read takes
     /// the window by creation time. Fix round 1 of remote-ops-audit W10-W14 `#287 bulk-reads`.
     pub next_since: Option<String>,
+    /// When the page was answered from the message cache's copy (`#649 voice-agent-tools`): when
+    /// the cache last listed the channel's newest end, RFC 3339. `None` for a page read upstream.
+    pub as_of: Option<String>,
 }
 
 /// What separates the instant from the message id in a [`Page::next_since`].
@@ -3423,6 +3536,18 @@ pub async fn page(
     // second round trip or the guess that a full window means more exists.
     let probe = limit + 1;
 
+    // `#649 voice-agent-tools`: a voice agent's newest page, or its page of the last few hours, from
+    // the message cache when that holds it. Not a step back (`before`), a bounded span (`until`), or
+    // a step that resumes after a message.
+    if tool_read(state, caller)
+        && before.is_none()
+        && until.is_none()
+        && start.is_none_or(|start| start.after.is_none())
+    {
+        if let Some(page) = cached_page(state, caller, &channel, since, limit).await {
+            return Ok(page);
+        }
+    }
     // Before the fetch, not after: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
     // `#208 persistent-cache`. A step that resumes after a message (`Page::next_since`) leaves
@@ -3641,6 +3766,85 @@ pub async fn page(
         has_more,
         next_before,
         next_since,
+        as_of: None,
+    })
+}
+
+/// A voice agent's page answered from the message cache's newest Main messages, or `None` when the
+/// cache does not hold it and the page is read upstream. `#649 voice-agent-tools`.
+///
+/// The newest page (`since` absent) is the newest `limit` messages the cache holds, and says there
+/// may be older ones: the cache cannot prove where the channel begins. A page from `since` is
+/// answered only when the cache's newest stretch reaches back past `since`, so every message of the
+/// span from there to now is in it.
+async fn cached_page(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelInfo,
+    since: Option<i64>,
+    limit: u16,
+) -> Option<Page> {
+    let copy = cached_view(
+        state,
+        &channel.id,
+        crate::threads::TimelineView::Main,
+        usize::from(MAX_PAGE) + 1,
+    )
+    .await?;
+    let mut messages = copy.messages;
+    let wanted = usize::from(limit);
+    let (has_more, next_before, next_since) = match since {
+        None => {
+            if messages.is_empty() {
+                return None;
+            }
+            let skip = messages.len().saturating_sub(wanted);
+            messages.drain(..skip);
+            (true, messages.first().map(|m| m.id.clone()), None)
+        }
+        Some(from) => {
+            if !messages
+                .first()
+                .and_then(message_ms)
+                .is_some_and(|ms| ms < from)
+            {
+                return None;
+            }
+            let newest = messages.last().and_then(message_ms);
+            messages.retain(|m| message_ms(m).is_none_or(|ms| ms >= from));
+            if messages.is_empty() {
+                return None;
+            }
+            // Whether the copy may skip a message of the span: then the page never says the span
+            // ends here, and the next step reads upstream.
+            let holes = match newest {
+                Some(newest) => !cache_covers(state, &channel.id, from, newest + 1).await,
+                None => true,
+            };
+            let more = messages.len() > wanted || holes;
+            messages.truncate(wanted);
+            let next = if more {
+                messages.last().and_then(|last| resume_point(last, None))
+            } else {
+                None
+            };
+            (more, None, next)
+        }
+    };
+    refresh_behind(state, caller, &channel.id);
+    crate::cache_first::note(crate::cache_first::Source::CacheFirst);
+    stamp(state, &mut messages);
+    crate::noise::filter_for(state, &channel.id)
+        .await
+        .mark(&mut messages);
+    Some(Page {
+        channel: channel.clone(),
+        messages,
+        limit,
+        has_more,
+        next_before,
+        next_since,
+        as_of: copy.checked_ms.map(crate::clock::iso_from_ms),
     })
 }
 
@@ -3675,6 +3879,10 @@ pub struct MessageCount {
     /// Messages the walk passed that the owner's noise rules call read, and so did NOT count.
     /// `#196 auto-read-noise`.
     pub noise: usize,
+    /// When the count was made from the message cache's copy (`#649 voice-agent-tools`): when the
+    /// cache last listed the channel's newest end, RFC 3339; the count is exact up to then. `None`
+    /// for a count read upstream.
+    pub as_of: Option<String>,
 }
 
 /// Count the messages in a channel, up to a cap, optionally only since an instant. Read scope.
@@ -3727,6 +3935,56 @@ pub async fn count_within(
     let cap = state.effective_count_cap(cap);
 
     let filter = crate::noise::filter_for(state, &channel.id).await;
+    // `#649 voice-agent-tools`: a voice agent's count since an instant, from the message cache when
+    // its coverage proves every message from that instant to the newest it holds, and the count
+    // fits under the cap. Exact only up to the cache's newest listing, so it is said with an as-of
+    // (`MessageCount::as_of`).
+    if let (true, Some(from)) = (tool_read(state, caller), since) {
+        if let Some(copy) = cached_view(
+            state,
+            &channel.id,
+            crate::threads::TimelineView::Main,
+            usize::try_from(cap).unwrap_or(usize::MAX).saturating_add(1),
+        )
+        .await
+        {
+            let reaches = copy
+                .messages
+                .first()
+                .and_then(message_ms)
+                .is_some_and(|ms| ms < from);
+            let newest = copy.messages.last().and_then(message_ms);
+            let in_span: Vec<&Message> = copy
+                .messages
+                .iter()
+                .filter(|m| message_ms(m).is_none_or(|ms| ms >= from))
+                .collect();
+            let fits = in_span.len() <= usize::try_from(cap).unwrap_or(usize::MAX);
+            if reaches && fits {
+                // Exact only when the coverage shows no stretch of the span missing; otherwise a
+                // lower bound, said as one.
+                let proven = match newest {
+                    Some(newest) => {
+                        cache_covers(state, &channel.id, from, newest.saturating_add(1)).await
+                    }
+                    None => false,
+                };
+                let noise = in_span.iter().filter(|m| filter.is_noise(m)).count();
+                refresh_behind(state, caller, &channel.id);
+                crate::cache_first::note(crate::cache_first::Source::CacheFirst);
+                return Ok(MessageCount {
+                    counted: in_span.len() - noise,
+                    at_least: !proven,
+                    cap,
+                    oldest_seen: in_span.first().map(|m| m.id.clone()),
+                    newest_seen: in_span.last().map(|m| m.id.clone()),
+                    noise,
+                    as_of: copy.checked_ms.map(crate::clock::iso_from_ms),
+                    channel,
+                });
+            }
+        }
+    }
     // `#208 persistent-cache`. Begun before anything goes upstream: a count by range reads, and
     // the walk such a count falls back to, are one ask.
     let shadow = state.message_cache.shadow(
@@ -3822,6 +4080,7 @@ pub async fn count_within(
         oldest_seen,
         newest_seen,
         noise,
+        as_of: None,
     })
 }
 
@@ -3916,6 +4175,7 @@ async fn count_range(
             oldest_seen,
             newest_seen,
             noise,
+            as_of: None,
         },
         read: kept,
         exhausted,
@@ -3955,20 +4215,38 @@ pub async fn resolve(
         return Err(OpError::EmptyQuery);
     }
     let limit = state.effective_limit(limit);
+    // `#649 voice-agent-tools`: a voice agent's search is made over the message cache's copy at once,
+    // with the recent read behind it.
+    let cached = if tool_read(state, caller) {
+        cached_window(state, &info.id, limit)
+            .await
+            .filter(|copy| !copy.messages.is_empty())
+    } else {
+        None
+    };
     // This path does NOT go through `messages` above — it fetches directly — so it needs its own
     // stamping call. `run_find` renders a timestamp for the best match and every alternative, and
     // without this those lines would be the only ones still speaking raw UTC.
-    let fill = state.message_cache.begin_for(caller, &info.id);
-    let mut messages = match fill {
+    let fill = if cached.is_some() {
+        None
+    } else {
+        state.message_cache.begin_for(caller, &info.id)
+    };
+    let mut messages = match (cached, fill) {
+        (Some(copy), _) => {
+            refresh_behind(state, caller, &info.id);
+            crate::cache_first::note(crate::cache_first::Source::CacheFirst);
+            copy.messages
+        }
         // `#208 persistent-cache`. Read dated when the cache is offered what it saw: a provider
         // answering from a copy it keeps says how old that copy is, and what it holds is offered
         // as of then, so an edit or a deletion pushed since is never undone by it.
-        Some(fill) => {
+        (None, Some(fill)) => {
             let read = state.chat.fetch_recent_dated(&info.id, limit).await?;
             fill.offer_recent_dated(&read);
             read.messages
         }
-        None => state.chat.fetch_recent(&info.id, limit).await?,
+        (None, None) => state.chat.fetch_recent(&info.id, limit).await?,
     };
     stamp(state, &mut messages);
     // `#196 auto-read-noise`. A placeholder is never the message somebody is describing, and one

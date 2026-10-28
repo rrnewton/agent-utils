@@ -431,6 +431,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             Some("missing_tool_name"),
             None,
             millis(),
+            None,
         );
         return Outcome::Reply(Box::new(RpcResponse::err(
             id,
@@ -484,6 +485,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             Some("unknown_tool"),
             text_len,
             millis(),
+            None,
         );
         return Outcome::Reply(Box::new(RpcResponse::err(
             id,
@@ -503,6 +505,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             Some("forbidden_scope"),
             text_len,
             millis(),
+            None,
         );
         return Outcome::Forbidden(Box::new(RpcResponse::err(
             id,
@@ -523,16 +526,21 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
     // chat service that answers late still fills what this server holds, and the next catch-up
     // answers from it. A post is never cut off: half a send is worse than a slow one, and its own
     // result already says NOT CONFIRMED when the answer is lost.
+    let mut served: Option<crate::cache_first::Source> = None;
     let outcome = if tool.mutates {
         run_named(state, scope, tool.name, &args).await
     } else {
         let (owned, arguments, name) = (state.clone(), args.clone(), tool.name);
-        let read = tokio::spawn(
+        // `#649 voice-agent-tools`: where the read was answered from, for the tool's access line.
+        let read = tokio::spawn(crate::cache_first::noting(
             crate::read_reason::ReadReason::Tool
                 .scope(async move { run_named(&owned, scope, name, &arguments).await }),
-        );
+        ));
         match tokio::time::timeout(TOOL_DEADLINE, read).await {
-            Ok(Ok(outcome)) => outcome,
+            Ok(Ok((outcome, source))) => {
+                served = source;
+                outcome
+            }
             Ok(Err(failed)) if failed.is_panic() => std::panic::resume_unwind(failed.into_panic()),
             Ok(Err(_)) | Err(_) => {
                 unanswered.answered = true;
@@ -544,6 +552,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
                     Some("not_read_in_time"),
                     text_len,
                     millis(),
+                    None,
                 );
                 return Outcome::Reply(Box::new(RpcResponse::ok(
                     id,
@@ -562,6 +571,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             Some("unknown_tool"),
             text_len,
             millis(),
+            None,
         );
         return Outcome::Reply(Box::new(RpcResponse::err(
             id,
@@ -580,6 +590,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
                 None,
                 text_len,
                 millis(),
+                served,
             );
             Outcome::Reply(Box::new(RpcResponse::ok(id, text_result(text, false))))
         }
@@ -595,6 +606,7 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
                 Some(error.code()),
                 text_len,
                 millis(),
+                served,
             );
             // `post_reply` says FIRST whether anything reached the channel, in both modes, so a
             // model has no reading of a failure in which it was sent. `#264 voice-send-approval`.
@@ -842,6 +854,19 @@ async fn run_page(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
             _ => header,
         }
     };
+    // `#649 voice-agent-tools`: a page from the message cache says how current it is.
+    let header = match (&page.as_of, header.strip_suffix('\n')) {
+        (Some(as_of), Some(line)) => format!(
+            "{line} From this server's copy, as of {} ({}); a fresh read is running behind this \
+             answer.\n",
+            crate::clock::spoken(as_of, &state.config.timezone),
+            crate::clock::instant_ms(as_of).map_or_else(
+                || "an earlier moment".to_owned(),
+                |at| age(cache_now_ms(state), at)
+            )
+        ),
+        _ => header,
+    };
     Ok(format!(
         "{header}{}",
         untrusted::render_for_model_as(&page.messages, &crate::owner::Owner::of(state))
@@ -879,7 +904,25 @@ async fn run_count(state: &AppState, caller: Scope, args: &Value) -> Result<Stri
     } else {
         "messages"
     };
-    if tally.at_least {
+    // `#649 voice-agent-tools`: a count from the message cache is exact up to its last listing.
+    let as_of = tally.as_of.as_deref().map_or_else(String::new, |as_of| {
+        format!(
+            " Counted from this server's copy as of {} ({}); messages since then are not counted.",
+            crate::clock::spoken(as_of, &state.config.timezone),
+            crate::clock::instant_ms(as_of).map_or_else(
+                || "an earlier moment".to_owned(),
+                |at| age(cache_now_ms(state), at)
+            )
+        )
+    });
+    if tally.at_least && !as_of.is_empty() {
+        // From the cache, with a stretch its coverage does not vouch for.
+        Ok(format!(
+            "{label} (id {id}) holds AT LEAST {} {plural}{scope}. That is a lower bound, not a \
+             total: this server's copy may be missing some of them, so say \"at least\".{as_of}",
+            tally.counted
+        ))
+    } else if tally.at_least {
         Ok(format!(
             "{label} (id {id}) holds AT LEAST {} {plural}{scope}. That is a lower bound, not a \
              total: the walk stopped once it had passed this server's ceiling of {}, and there \
@@ -889,7 +932,7 @@ async fn run_count(state: &AppState, caller: Scope, args: &Value) -> Result<Stri
     } else {
         Ok(format!(
             "{label} (id {id}) holds exactly {} {plural}{scope}. The walk reached the end, so \
-             this is the whole count.",
+             this is the whole count.{as_of}",
             tally.counted
         ))
     }
@@ -1056,9 +1099,11 @@ fn as_of_note(as_of: Option<&str>, now_ms: i64) -> String {
     };
     let ago = crate::clock::instant_ms(as_of)
         .map_or_else(|| "an earlier moment".to_owned(), |at| age(now_ms, at));
+    // `#649 voice-agent-tools`: the copy may be the chat service's own or this server's message
+    // cache's (a voice agent's read answered from it at once), so the sentence names neither.
     format!(
-        " AS OF {ago} (exact {as_of}): the chat service answered from a copy it could not bring \
-         up to date just now, so say it may be missing newer messages."
+        " AS OF {ago} (exact {as_of}): this is a copy that was last brought up to date then, so \
+         say it may be missing newer messages."
     )
 }
 
@@ -1223,7 +1268,11 @@ fn copy_note(
         .as_deref()
         .map_or_else(String::new, |at| format!(" as of {at}"));
     let ago = held_age(age);
-    match (failed, part.fed) {
+    // The message cache's copy may be from before this server last started, and the live feed
+    // says nothing of a stretch it was down, so only a recent listing goes without the warning.
+    let fed =
+        part.fed && (!matches!(part.currency, ops::Currency::Cached { .. }) || age <= CACHE_FRESH);
+    match (failed, fed) {
         (None, true) => format!(
             " From {what}{at} ({ago}), with every change the live feed reported since; a fresh read \
              is running behind this answer."
@@ -1237,6 +1286,18 @@ fn copy_note(
              it may be missing newer messages."
         ),
     }
+}
+
+/// How recently the message cache must have listed a channel for its copy to be presented without
+/// a warning that it may be missing newer messages. `#649 voice-agent-tools`.
+const CACHE_FRESH: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The message cache's own clock, which dates its listings: the wall clock in production.
+fn cache_now_ms(state: &AppState) -> i64 {
+    state
+        .message_cache
+        .cache()
+        .map_or_else(ops::now_ms, |cache| cache.now_ms())
 }
 
 /// The closing sentence when the size cap left something out, or nothing.
@@ -1518,6 +1579,26 @@ async fn run_read(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
     // reads the reply there. One that does not still finds a reply in a thread this server knows
     // of: see `ops::message_by_id`.
     let thread_id = arg_id(args, "thread_id");
+    // `#649 voice-agent-tools`: the message cache's whole copy of it, when it holds one, at once.
+    if let Some(message) = ops::held_message(
+        state,
+        caller,
+        &channel_id,
+        &message_id,
+        thread_id.as_deref(),
+    )
+    .await?
+    {
+        let info = ops::allowed_channel(state, &channel_id).await?;
+        crate::cache_first::note(crate::cache_first::Source::CacheFirst);
+        let id = message.id.clone();
+        return Ok(format!(
+            "Message {} from {}:\n{}",
+            id.as_str(),
+            info.display_name(),
+            untrusted::render_for_model_as(&[message], &crate::owner::Owner::of(state))
+        ));
+    }
     let (info, message) = ops::message_by_id_scoped(
         state,
         caller,

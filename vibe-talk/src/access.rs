@@ -240,6 +240,8 @@ pub fn rpc(rpc_method: &str, credential: Credential, is_notification: bool) {
 /// from the moment the call was parsed. `#210 voice-catchup-speed`: without it a tool's latency
 /// could only be recovered by pairing this line with its `request` line, and that line is missing
 /// in exactly the case that matters — a call the caller gave up on.
+// One line of named fields, each its own argument so a caller cannot leave one out.
+#[allow(clippy::too_many_arguments)]
 pub fn tool_call(
     tool: &str,
     channel: Option<&str>,
@@ -248,6 +250,7 @@ pub fn tool_call(
     reason: Option<&str>,
     text_len: Option<usize>,
     millis: u128,
+    served_from: Option<crate::cache_first::Source>,
 ) {
     tracing::info!(
         target: "vibe_talk::access",
@@ -260,6 +263,9 @@ pub fn tool_call(
         // putting a word of it in the log.
         text_len = text_len.map_or(-1_i64, |n| i64::try_from(n).unwrap_or(i64::MAX)),
         millis,
+        // `#649 voice-agent-tools`: where its read was answered from: `cache-first` from the
+        // message cache, `cache` by its serve rule, `-` read upstream or not a read.
+        served_from = served_from.map_or("-", crate::cache_first::Source::as_str),
         "tool"
     );
 }
