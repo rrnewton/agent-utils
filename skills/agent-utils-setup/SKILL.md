@@ -314,6 +314,9 @@ Sandbox off (`cgroup`):
   /tmp/<repo>-handoffs/<slot>.md), then run: <WS> write-handoff <slot> --agent <name> --owner-pid
   <pid> --expected-generation <n> --from-file <file>; and <WS> release <slot> --agent <name>
   --owner-pid <pid> --expected-generation <n>.
+- Message the coordinator or another agent only with agentctl send NAME TEXT, which opens the
+  prompt with a sender header naming you; never type into a pane with herdr pane send-text or
+  herdr pane run.
 - Then reply with a short summary. The coordinator stops you and removes the slot.
 ```
 
@@ -324,6 +327,9 @@ Sandbox on (`userns` or `root`):
   wrkslots registry is read-only to you. Do not try to adopt, hand off, or release the slot.
 - Work and commit only in your slot, on your branch. Publish the branch as the primary
   repository's rules require.
+- Message the coordinator or another agent only with agentctl send NAME TEXT, which opens the
+  prompt with a sender header naming you; never type into a pane with herdr pane send-text or
+  herdr pane run.
 - When done, reply with your handoff: what changed, the commit, how it was validated, and open
   questions. The coordinator stops you and removes the slot after its time-to-live.
 ```

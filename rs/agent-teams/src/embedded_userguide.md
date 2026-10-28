@@ -238,7 +238,8 @@ terminal and undelivered; 2 usage or configuration. `check`: 0 or 1.
 ## The team tag
 
 Every rendered message starts with one fixed tag written by agent-teams —
-`[sender host -> team host tm-...]` — then a receiver-generated line (kind,
-topic, expiry, proof, route), then the body with any line starting with `[`
-indented so a body cannot forge a header, then a reply command. Agents never
-write the tag themselves.
+`[from sender@host via agent-teams · to: team@host · id: tm-...]`, in the same
+one-line sender-header grammar every `agentctl send` prompt opens with — then
+a receiver-generated line (kind, topic, expiry, proof, route), then the body
+with any line starting with `[` indented so a body cannot forge a header, then
+a reply command. Agents never write the tag themselves.

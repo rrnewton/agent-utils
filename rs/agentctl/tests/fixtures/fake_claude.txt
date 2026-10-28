@@ -24,13 +24,18 @@ def draw():
     os.write(1, out.encode())
 
 
-def submit(text):
+def submit(prompt):
     global working_until, composer
     composer = ""
+    # agentctl send opens every prompt with a sender header line, which a paste joins to the
+    # body with a space; the fake acts on the body, as an agent reads past the header.
+    text = prompt
+    if text.startswith("[from ") and "] " in text:
+        text = text.split("] ", 1)[1]
     if text == "die-now":
         draw()
         raise SystemExit(0)
-    transcript.append("❯ " + text)
+    transcript.append("❯ " + prompt)
     if text == "finish-now":
         working_until = None
         transcript.append("• finished")

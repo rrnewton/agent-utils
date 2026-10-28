@@ -14,8 +14,8 @@ use crate::cadence::{
 };
 use crate::emit::{
     format_action, format_clean, format_error, format_health, format_no_result, format_note,
-    format_suppressed, format_unevaluable, HEALTH_STATUS_MISSING, HEALTH_STATUS_OK,
-    HEALTH_STATUS_STALE,
+    format_schedule, format_suppressed, format_tick_header, format_unevaluable,
+    HEALTH_STATUS_MISSING, HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
 };
 use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig};
 use crate::protocols::{FileAgeProbe, GateRunner};
@@ -115,14 +115,17 @@ struct ReminderEvaluation<'a> {
     error: Option<String>,
 }
 
+/// A flag-suppressed reminder's records in a pending report: its header, then `SUPPRESSED:`.
+type SuppressedLines = [String; 2];
+
 enum PlannedReminder<'a> {
     Runnable(&'a Reminder),
-    Suppressed(String),
+    Suppressed(SuppressedLines),
 }
 
 enum ReminderReport<'a> {
     Evaluated(ReminderEvaluation<'a>),
-    Suppressed(String),
+    Suppressed(SuppressedLines),
 }
 
 type EmitLine<'a> = Option<&'a mut dyn FnMut(&str) -> io::Result<()>>;
@@ -389,6 +392,19 @@ fn record_line(lines: &mut Vec<String>, emit: &mut EmitLine<'_>, line: String) -
     Ok(())
 }
 
+/// The header that opens a reminder's records: `[tick-hub: NAME · SCHEDULE]`.
+fn reminder_header(reminder: &crate::model::Reminder) -> String {
+    format_tick_header(
+        &reminder.name,
+        &format_schedule(reminder.cadence_secs, reminder.cadence_offset_secs),
+    )
+}
+
+/// The header that opens the ops-state action, which no reminder owns and every tick checks.
+fn ops_state_header() -> String {
+    format_tick_header("ops-state", "every tick")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_evaluation(
     evaluation: &ReminderEvaluation<'_>,
@@ -400,8 +416,11 @@ fn render_evaluation(
     report_pending: bool,
 ) -> io::Result<usize> {
     let reminder = evaluation.reminder;
+    // Every group of records a reminder writes opens with its header (#609
+    // sender-header-mandatory), so each one forwarded to an agent says where it came from.
     if let Some(error) = &evaluation.error {
         clear_render_failure_state(new_fired, &reminder.name);
+        record_line(lines, emit, reminder_header(reminder))?;
         record_line(
             lines,
             emit,
@@ -421,6 +440,7 @@ fn render_evaluation(
             .get("summary")
             .map(String::as_str)
             .unwrap_or("");
+        record_line(lines, emit, reminder_header(reminder))?;
         record_line(lines, emit, format_no_result(&reminder.name, detail))?;
         record_line(
             lines,
@@ -438,6 +458,7 @@ fn render_evaluation(
             .cloned()
             .collect();
         if !unavailable_dependencies.is_empty() {
+            record_line(lines, emit, reminder_header(reminder))?;
             record_line(
                 lines,
                 emit,
@@ -456,11 +477,13 @@ fn render_evaluation(
             return Ok(1);
         }
         if report_pending {
+            record_line(lines, emit, reminder_header(reminder))?;
             record_line(lines, emit, format_clean(&reminder.name))?;
         }
         new_fired.insert(reminder.name.clone(), now);
         return Ok(0);
     }
+    record_line(lines, emit, reminder_header(reminder))?;
     let line = match render_emit(&reminder.emit, &evaluation.captured) {
         Ok(line) => line,
         Err(error) => {
@@ -551,7 +574,11 @@ fn render_after_dependency_pass(
     let mut actions = 0;
     for report in &reports[render_from..] {
         match report {
-            ReminderReport::Suppressed(line) => record_line(lines, emit, line.clone())?,
+            ReminderReport::Suppressed(suppressed) => {
+                for line in suppressed {
+                    record_line(lines, emit, line.clone())?;
+                }
+            }
             ReminderReport::Evaluated(evaluation) => {
                 actions += render_evaluation(
                     evaluation,
@@ -643,6 +670,7 @@ fn run_tick_inner(
     for line in state_lines(state, current_tick_min) {
         if line.starts_with("ACTION: ") {
             actions += 1;
+            record_line(&mut lines, &mut emit, ops_state_header())?;
         }
         record_line(&mut lines, &mut emit, line)?;
     }
@@ -678,10 +706,10 @@ fn run_tick_inner(
                         .filter(|name| !flag_truthy(&state.flags, name))
                         .cloned()
                         .collect::<Vec<_>>();
-                    planned.push(PlannedReminder::Suppressed(format_suppressed(
-                        &reminder.name,
-                        &missing,
-                    )));
+                    planned.push(PlannedReminder::Suppressed([
+                        reminder_header(reminder),
+                        format_suppressed(&reminder.name, &missing),
+                    ]));
                 }
                 continue;
             }
@@ -729,7 +757,7 @@ fn run_tick_inner(
             let mut next_parallel = MAX_PARALLEL_GATES;
             for (index, entry) in planned.iter().enumerate() {
                 let report = match entry {
-                    PlannedReminder::Suppressed(line) => ReminderReport::Suppressed(line.clone()),
+                    PlannedReminder::Suppressed(lines) => ReminderReport::Suppressed(lines.clone()),
                     PlannedReminder::Runnable(reminder) => {
                         let evaluated = match parallel.remove(&index) {
                             Some(handle) => {
@@ -770,8 +798,10 @@ fn run_tick_inner(
                 reports.push(report);
                 if index < stream_prefix_len {
                     match reports.last().expect("report was just appended") {
-                        ReminderReport::Suppressed(line) => {
-                            record_line(&mut lines, &mut emit, line.clone())?;
+                        ReminderReport::Suppressed(suppressed) => {
+                            for line in suppressed {
+                                record_line(&mut lines, &mut emit, line.clone())?;
+                            }
                         }
                         ReminderReport::Evaluated(evaluation) => {
                             actions += render_evaluation(
@@ -1083,6 +1113,109 @@ mod tests {
                 ("d".into(), "4".into()),
                 ("e".into(), "5".into()),
             ])
+        );
+    }
+
+    #[test]
+    fn each_reminders_records_open_with_its_tick_header() {
+        let mut status = Reminder::new("owner_status", Emit::action("owner-status", "report"));
+        status.cadence_secs = 3540;
+        let mut failing = Reminder::new("probe", Emit::action("probe", "probe"));
+        failing.gate = Some(Gate::new("boom"));
+        let mut quiet = Reminder::new("quiet", Emit::note("never shown"));
+        let mut quiet_gate = Gate::new("quiet-gate");
+        quiet_gate.when = crate::model::GateWhen::Failure;
+        quiet.gate = Some(quiet_gate);
+        let config = TickConfig {
+            reminders: vec![status, failing, quiet],
+            ..TickConfig::default()
+        };
+        let (mut gate, probe) = fakes();
+        gate.outcomes.insert(
+            "boom".into(),
+            GateResult {
+                returncode: 127,
+                stdout: String::new(),
+                ok: false,
+                error: Some("not found".into()),
+            },
+        );
+        let state = OpsState::default();
+        let current = Some(state.tick_frequency_min + 1);
+        let result = run_tick(
+            &config,
+            &state,
+            10,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            current,
+        );
+        let headers: Vec<(usize, &str)> = result
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("[tick-hub: "))
+            .map(|(index, line)| (index, line.as_str()))
+            .collect();
+        assert_eq!(
+            headers.iter().map(|(_, line)| *line).collect::<Vec<_>>(),
+            [
+                "[tick-hub: ops-state · every tick]",
+                "[tick-hub: owner_status · every 3540s]",
+                "[tick-hub: probe · every tick]",
+            ],
+            "{:#?}",
+            result.lines
+        );
+        // Each header stands directly above the records it introduces; a quiet reminder writes
+        // neither.
+        assert!(result.lines[headers[0].0 + 1].starts_with("ACTION: actualize-tick-frequency"));
+        assert!(result.lines[headers[1].0 + 1].starts_with("ACTION: owner-status"));
+        assert!(result.lines[headers[2].0 + 1].starts_with("ERROR: reminder probe"));
+        assert_eq!(result.actions_emitted, 3);
+    }
+
+    #[test]
+    fn a_pending_reports_suppressed_and_clean_lines_open_with_their_tick_header() {
+        let mut bench = Reminder::new("bench", Emit::action("run-benchmark", "run"));
+        bench.cadence_secs = 86400;
+        bench.requires_flags.push("benchmark_enabled".into());
+        let mut quiet = Reminder::new("quiet", Emit::note("never shown"));
+        let mut quiet_gate = Gate::new("quiet-gate");
+        quiet_gate.when = crate::model::GateWhen::Failure;
+        quiet.gate = Some(quiet_gate);
+        let config = TickConfig {
+            reminders: vec![bench, quiet],
+            ..TickConfig::default()
+        };
+        let state = OpsState {
+            flags: BTreeMap::from([("benchmark_enabled".into(), FlagValue::Bool(false))]),
+            ..OpsState::default()
+        };
+        let (gate, probe) = fakes();
+        let result = run_tick_with_emit(
+            &config,
+            &state,
+            10,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            None,
+            true,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            result.lines[1..5],
+            [
+                "[tick-hub: bench · every 86400s]",
+                "SUPPRESSED: bench did not run; required flag(s) not set: benchmark_enabled",
+                "[tick-hub: quiet · every tick]",
+                "CLEAN: quiet ran and found nothing to report",
+            ],
+            "{:#?}",
+            result.lines
         );
     }
 

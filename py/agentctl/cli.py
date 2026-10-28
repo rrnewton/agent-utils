@@ -13,7 +13,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agentctl import __version__, registry_layout
+from agentctl import __version__, registry_layout, sender_header
 from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
@@ -520,7 +520,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "status":
             result = sessions.status(name)
         elif args.command == "send":
-            result = sessions.send_session(name, _text(args) or "", message_id=args.message_id, model=args.model, **options)
+            # Every path delivers the prompt opened with its sender header (#609
+            # sender-header-mandatory); nothing suppresses it.
+            text = sender_header.stamp(_text(args) or "",
+                                       sender_header.resolve_current(sessions.caller_agent()),
+                                       sender_header.ROUTE)
+            result = sessions.send_session(name, text, message_id=args.message_id, model=args.model, **options)
         elif args.command == "prompts":
             result = sessions.prompts(name)
         elif args.command == "answer":

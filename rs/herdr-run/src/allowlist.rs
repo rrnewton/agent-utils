@@ -336,6 +336,9 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
             }
         }
     }
+    if program == "herdr" {
+        refuse_unlabelled_typing(args)?;
+    }
     let rendered = prefix
         .iter()
         .chain(std::iter::once(&program))
@@ -350,6 +353,83 @@ pub fn admit_with_home(command: &str, config: &Config, home: Option<&OsStr>) -> 
         subcommand,
         rendered,
     })
+}
+
+// Refuse herdr commands that would type an unlabelled message into another pane (#609
+// sender-header-mandatory), whatever the configuration allows: `pane send-text`, `pane run` and
+// `agent prompt` are admitted only when their text opens with a sender header, followed by a
+// space or nothing, and `pane send-keys` and `agent send-keys` never are, since key presses carry
+// no header. A line typed straight into an agent's pane reaches its reader with no sign of who
+// wrote it; agents message each other through their agent manager's send command instead.
+//
+// The verb is found as any adjacent `pane VERB` or `agent VERB` pair, so a global option and its
+// value (`--session NAME`) cannot hide it.
+fn refuse_unlabelled_typing(args: &[String]) -> Result<()> {
+    let Some(index) = args.windows(2).position(|pair| {
+        matches!(
+            (pair[0].as_str(), pair[1].as_str()),
+            ("pane", "send-text" | "run" | "send-keys") | ("agent", "prompt" | "send-keys")
+        )
+    }) else {
+        return Ok(());
+    };
+    let command = format!("herdr {} {}", args[index], args[index + 1]);
+    let advice = "agents message each other with `agentctl send NAME TEXT`, which opens every prompt with the sender header";
+    if args[index + 1] == "send-keys" {
+        return Err(HerdrRunError::refused(format!(
+            "{} types into another pane without a sender header; {advice}",
+            quote(&command)
+        )));
+    }
+    let text = args[index + 2..]
+        .iter()
+        .map(String::as_str)
+        .filter(|word| !word.starts_with('-'))
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if opens_with_sender_header(&text) {
+        Ok(())
+    } else {
+        Err(HerdrRunError::refused(format!(
+            "{} types into another pane without a sender header such as \"[from NAME via agentctl]\"; {advice}",
+            quote(&command)
+        )))
+    }
+}
+
+// Whether `text` opens with a sender header `[from SENDER via ROUTE( · KEY: VALUE)*]`, followed
+// by a space or nothing.
+fn opens_with_sender_header(text: &str) -> bool {
+    let Some(end) = text.find(']') else {
+        return false;
+    };
+    let (header, rest) = text.split_at(end + 1);
+    if !(rest.is_empty() || rest.starts_with(' ')) {
+        return false;
+    }
+    let Some(inner) = header
+        .strip_prefix("[from ")
+        .and_then(|inner| inner.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let mut parts = inner.split(" · ");
+    let Some((sender, route)) = parts.next().and_then(|first| first.split_once(" via ")) else {
+        return false;
+    };
+    !sender.is_empty()
+        && !sender.chars().any(|c| c.is_whitespace() || c == '·')
+        && !route.trim().is_empty()
+        && !route.contains('·')
+        && parts.all(|part| {
+            part.split_once(": ").is_some_and(|(key, value)| {
+                !key.is_empty()
+                    && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                    && !value.trim().is_empty()
+                    && !value.contains('·')
+            })
+        })
 }
 
 /// Whether `token` spells the denied option `denied`. Every `deny_*` option rule uses this.
@@ -670,6 +750,58 @@ pub(crate) mod tests {
             let error = admit(command, &config).expect_err(command);
             assert_eq!(error.exit_code(), crate::error::EXIT_REFUSED);
             assert!(error.to_string().contains(fragment), "{error}");
+        }
+    }
+
+    /// #609 sender-header-mandatory: no configuration lets an agent type an unlabelled message
+    /// into another pane through herdr-run.
+    #[test]
+    fn typing_into_another_pane_needs_a_sender_header() {
+        let config = Config {
+            allow: vec!["*".into()],
+            ..Config::default()
+        };
+        for command in [
+            "herdr pane send-text w1:p2 '[from cl-foo via agentctl] HELD: x'",
+            "herdr pane run w1:p2 '[from cl-foo via agentctl · reply: agentctl send cl-foo]'",
+            "herdr pane run w1:p2 [from cl-foo via herdr-run] status",
+            "herdr agent prompt w1:p2 '[from cl-foo via agentctl] status?' --wait",
+            "herdr --session x pane read w1:p2",
+            "herdr pane read w1:p2",
+            "herdr pane list",
+        ] {
+            assert_eq!(admit(command, &config).expect(command).program, "herdr");
+        }
+        for (command, fragment) in [
+            (
+                "herdr pane send-text w1:p2 'D127030260 | HELD: x | SCOPE (proposed): y'",
+                "without a sender header",
+            ),
+            ("herdr pane run w1:p2 git status", "without a sender header"),
+            (
+                "herdr pane send-text w1:p2 '[from cl-foo]'",
+                "sender header",
+            ),
+            (
+                "herdr pane send-text w1:p2 '[from cl-foo via agentctl]trailing'",
+                "sender header",
+            ),
+            ("herdr pane send-keys w1:p2 Enter", "send-keys"),
+            ("herdr --json pane send-text w1:p2 hello", "agentctl send"),
+            // A global option's value cannot hide the verb.
+            (
+                "herdr --session x pane send-text w1:p2 hello",
+                "sender header",
+            ),
+            ("herdr agent prompt w1:p2 hello", "\"herdr agent prompt\""),
+            (
+                "herdr agent send-keys w1:p2 Enter",
+                "\"herdr agent send-keys\"",
+            ),
+        ] {
+            let error = admit(command, &config).expect_err(command);
+            assert_eq!(error.exit_code(), crate::error::EXIT_REFUSED, "{command}");
+            assert!(error.to_string().contains(fragment), "{command}: {error}");
         }
     }
 

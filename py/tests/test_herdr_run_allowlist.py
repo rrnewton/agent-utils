@@ -217,6 +217,38 @@ def test_project_can_narrow_allowlist() -> None:
         admit("gh pr list", config)
 
 
+def test_typing_into_another_pane_needs_a_sender_header() -> None:
+    """#609 sender-header-mandatory: no configuration lets an agent type an unlabelled message
+    into another pane through herdr-run."""
+    config = Config(allow=("*",))
+    for command in (
+        "herdr pane send-text w1:p2 '[from cl-foo via agentctl] HELD: x'",
+        "herdr pane run w1:p2 '[from cl-foo via agentctl · reply: agentctl send cl-foo]'",
+        "herdr pane run w1:p2 [from cl-foo via herdr-run] status",
+        "herdr agent prompt w1:p2 '[from cl-foo via agentctl] status?' --wait",
+        "herdr --session x pane read w1:p2",
+        "herdr pane read w1:p2",
+        "herdr pane list",
+    ):
+        assert admit(command, config).program == "herdr", command
+    for command, fragment in (
+        ("herdr pane send-text w1:p2 'D127030260 | HELD: x | SCOPE (proposed): y'",
+         "without a sender header"),
+        ("herdr pane run w1:p2 git status", "without a sender header"),
+        ("herdr pane send-text w1:p2 '[from cl-foo]'", "sender header"),
+        ("herdr pane send-text w1:p2 '[from cl-foo via agentctl]trailing'", "sender header"),
+        ("herdr pane send-keys w1:p2 Enter", "send-keys"),
+        ("herdr --json pane send-text w1:p2 hello", "agentctl send"),
+        # A global option's value cannot hide the verb.
+        ("herdr --session x pane send-text w1:p2 hello", "sender header"),
+        ("herdr agent prompt w1:p2 hello", '"herdr agent prompt"'),
+        ("herdr agent send-keys w1:p2 Enter", '"herdr agent send-keys"'),
+    ):
+        with pytest.raises(Refused) as excinfo:
+            admit(command, config)
+        assert fragment in str(excinfo.value), command
+
+
 def test_the_allow_wildcard_admits_any_program_and_keeps_every_other_rule() -> None:
     """The wildcard turns off the PROGRAM-NAME check and nothing else.
 

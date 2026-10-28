@@ -19,7 +19,7 @@ _PKG_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 
-from agentctl import __version__
+from agentctl import __version__, sender_header
 from agentctl.agent import Target, drain, read, send, status
 from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
@@ -163,7 +163,11 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
             raise ValueError("list does not accept an agent name")
         result = manager.list()
     elif command == "send":
-        result = manager.send(name, _message(args), message_id=None, expected_token=None, **options).__dict__
+        # The same mandatory sender header as ``agentctl send`` (#609 sender-header-mandatory).
+        text = sender_header.stamp(_message(args),
+                                   sender_header.resolve_current(manager.caller_agent()),
+                                   sender_header.ROUTE)
+        result = manager.send(name, text, message_id=None, expected_token=None, **options).__dict__
     elif command == "drain":
         drained = manager.drain(name, **options)
         result = drained.__dict__
@@ -267,8 +271,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.name is not None or args.command in ("start", "stop", "list", "wait", "goal", "bind-session"):
             return _managed(args, client)
         if args.command == "send":
+            # Typed straight into a pane, so it carries the sender header too (#609
+            # sender-header-mandatory); without a registry the sender comes from the environment.
+            text = sender_header.stamp(_message(args), sender_header.resolve_current(None),
+                                       sender_header.ROUTE)
             result = send(
-                client, target, queue, _message(args), ready_timeout=args.ready_timeout,
+                client, target, queue, text, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts,
             )
             json.dump(result.__dict__, sys.stdout, indent=2, sort_keys=True)

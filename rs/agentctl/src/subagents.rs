@@ -45,6 +45,7 @@ pub use retire_registration::RetireStaleOptions;
 mod stop_advice;
 mod turn_runner;
 
+pub(crate) use cloud::local_hostname;
 pub(crate) use cloud::FleetCache;
 pub(crate) use cloud::{
     validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,

@@ -1989,6 +1989,35 @@ class ManagedAgents:
         """The agent's directory in whichever registry layout holds it; a new agent's is in layout 2."""
         return registry_layout.directory(self.registry, _name(name))
 
+    def caller_agent(self) -> str | None:
+        """The registered agent this process acts for: the one whose pinned harness (else pinned
+        runtime process) is the nearest ancestor of this process. ``None`` for a human at a shell,
+        a timer, or a process whose ancestry cannot be read."""
+        from agentctl import sender_header
+
+        try:
+            boot = sender_header.boot_id()
+            names = self._registered_names() if self.registry.exists() else []
+        except OSError:
+            return None
+        links = sender_header.ancestry()
+        best: tuple[int, str] | None = None
+        for name in names:
+            try:
+                record = self._load(name)
+            except (AgentDeliveryError, OSError, ValueError):
+                continue
+            identity = record.harness_identity or record.custom_process_identity
+            if (identity is None or identity.version != 1 or identity.boot_id != boot
+                    or identity.pid <= 0 or identity.starttime_ticks <= 0
+                    or identity.executable_device <= 0 or identity.executable_inode <= 0):
+                continue
+            depth = next((index for index, link in enumerate(links)
+                          if link == (identity.pid, identity.starttime_ticks)), None)
+            if depth is not None and (best is None or depth < best[0]):
+                best = (depth, record.name)
+        return None if best is None else best[1]
+
     def _registered_names(self) -> builtins.list[str]:
         """Every agent name in either registry layout, sorted."""
         return registry_layout.names(self.registry)

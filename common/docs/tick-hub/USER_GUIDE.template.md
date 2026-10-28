@@ -88,15 +88,25 @@ happen without mutating the file.
 
 ## Output records
 
-Every standard-output line begins with a stable record type:
+Every standard-output line begins with a stable record type (the reminder
+header's is `[tick-hub:`):
 
 ```text
 HEALTH: newest_snapshot ok age_secs=120 threshold_secs=86400 detail="newest data snapshot"
 NOTE: ops-state enabled=true tick_frequency_min=30 flags=maintenance_enabled=true
+[tick-hub: refresh_cache · every 3600s]
 ACTION: refresh-cache priority=normal title="refresh the shared cache"
 NOTE: emitted 1 instruction(s) this tick
 ```
 
+- `[tick-hub: NAME · SCHEDULE]` opens every group of records one reminder
+  writes (its `ACTION:` or `NOTE:`, or its `ERROR:`, `NO_RESULT:` and
+  `NO-SIGNAL` records, or its `CLEAN:` or `SUPPRESSED:` line), so a record
+  forwarded to an agent always says which reminder sent it. `HEALTH:` lines
+  name their check and carry no header. SCHEDULE is `every tick`, `every Ns`, or
+  `every Ns at +Ms` for a phased cadence. The `actualize-tick-frequency` action
+  opens with `[tick-hub: ops-state · every tick]`. The header is always written;
+  nothing turns it off.
 - `HEALTH:` reports the newest file matching a glob as `ok`, `stale`, or
   `missing`.
 - `ACTION:` names one caller-defined handler and carries ordered `key=value`

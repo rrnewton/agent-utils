@@ -52,7 +52,10 @@ created from.
 4. Use a fresh agent name for a fresh task.
 
 Start, message, read, and stop agents only through `agentctl`, never with raw terminal-multiplexer
-commands. If a suite tool fails or lacks a capability, report it (and fix it in agent-utils if
+commands. `agentctl send` opens every prompt with a sender header
+(`[from NAME via agentctl · reply: agentctl send NAME]`); a line typed into a pane with
+`herdr pane send-text` carries none, so its reader cannot tell who wrote it. Say so in every
+brief: agents message each other with `agentctl send`, never by raw pane typing. If a suite tool fails or lacks a capability, report it (and fix it in agent-utils if
 that is your job) rather than routing around it.
 
 ## Message other teams

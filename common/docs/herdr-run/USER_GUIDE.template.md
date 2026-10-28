@@ -775,6 +775,13 @@ every argument position, including attached forms. Fetching through the pane and
 locally with `--offline` can still be operationally useful, but it is not a no-code-execution
 guarantee.
 
+**Typing into another pane needs a sender header.** Whatever `allow` says, `herdr pane send-text`
+and `herdr pane run` are admitted only when their text opens with a sender header,
+`[from SENDER via ROUTE( · KEY: VALUE)*]`, followed by a space or nothing, and
+`herdr pane send-keys` is never admitted. A line typed straight into an agent's pane otherwise
+reaches its reader with no sign of who wrote it; agents message each other through their agent
+manager's send command, which writes that header, instead.
+
 **What is NOT guaranteed:** anything an allowlisted program can do by itself. `git` writes files,
 runs hooks from the repository being operated on, and honours ambient configuration. `gh`
 authenticates as you and can modify repositories. The `deny_*` lists remove the best-known

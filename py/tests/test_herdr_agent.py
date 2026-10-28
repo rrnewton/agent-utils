@@ -1593,6 +1593,9 @@ def test_stop_refusal_changes_leave_ordinary_send_pending_json_and_stderr_unchan
              if possibly_submitted else AgentPending("busy", message_id="m", artifact="retained.json"))
 
     class Backend:
+        def caller_agent(self) -> None:
+            return None
+
         def send_session(self, _name: str, _text: str, **_options: object) -> dict[str, object]:
             raise error
 

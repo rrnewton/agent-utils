@@ -40,7 +40,9 @@ from tick_hub.emit import (
     format_error,
     format_health,
     format_note,
+    format_schedule,
     format_suppressed,
+    format_tick_header,
     format_unevaluable,
 )
 from tick_hub.model import Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig
@@ -125,6 +127,13 @@ class GateOutcome(Enum):
     QUIET = "quiet"
     FIRE = "fire"
     NO_RESULT = "no-result"
+
+
+@dataclass(frozen=True)
+class _Suppressed:
+    """A flag-suppressed reminder's records in a pending report: its header, then SUPPRESSED."""
+
+    lines: tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -371,16 +380,17 @@ def run_tick(
         record(evaluate_health(hc, age_probe, now))
 
     for line in state_lines(state, current_tick_min):
-        record(line)
         if line.startswith("ACTION: "):
             actions += 1
+            record(_ops_state_header())
+        record(line)
 
     new_fired = dict(fired)
     _prune_removed_render_failure_state(
         new_fired, {reminder.name for reminder in config.reminders}
     )
     if state.enabled:
-        planned: list[Reminder | str] = []
+        planned: list[Reminder | _Suppressed] = []
         for rem in config.reminders:
             if not is_due(
                 rem.name,
@@ -402,7 +412,9 @@ def run_tick(
                         for flag in rem.requires_flags
                         if not state.flags.get(flag, False)
                     )
-                    planned.append(format_suppressed(rem.name, missing))
+                    planned.append(_Suppressed(
+                        (_reminder_header(rem), format_suppressed(rem.name, missing))
+                    ))
                 continue
             planned.append(rem)
 
@@ -425,7 +437,7 @@ def run_tick(
             )
 
         no_dependencies: set[str] = set()
-        reports: list[_ReminderEvaluation | str] = []
+        reports: list[_ReminderEvaluation | _Suppressed] = []
 
         def evaluate(reminder: Reminder) -> _ReminderEvaluation:
             outcome, captured, error = _eval_gate(reminder.gate, gate_runner)
@@ -434,16 +446,17 @@ def run_tick(
         def collect(futures: Mapping[int, Future[_ReminderEvaluation]]) -> None:
             nonlocal actions
             for index, entry in enumerate(planned):
-                if isinstance(entry, str):
-                    report: _ReminderEvaluation | str = entry
+                if isinstance(entry, _Suppressed):
+                    report: _ReminderEvaluation | _Suppressed = entry
                 elif index in futures:
                     report = futures[index].result()
                 else:
                     report = evaluate(entry)
                 reports.append(report)
                 if index < stream_prefix_len:
-                    if isinstance(report, str):
-                        record(report)
+                    if isinstance(report, _Suppressed):
+                        for line in report.lines:
+                            record(line)
                     else:
                         actions += _render_evaluation(
                             report,
@@ -497,7 +510,7 @@ def run_tick(
 
 
 def _render_after_dependency_pass(
-    reports: Sequence[_ReminderEvaluation | str],
+    reports: Sequence[_ReminderEvaluation | _Suppressed],
     new_fired: dict[str, int],
     now: int,
     record: Callable[[str], None],
@@ -506,7 +519,7 @@ def _render_after_dependency_pass(
     render_from: int = 0,
 ) -> int:
     """Interpret dependency edges over completed evaluations, then render in config order."""
-    evaluations = tuple(report for report in reports if not isinstance(report, str))
+    evaluations = tuple(report for report in reports if not isinstance(report, _Suppressed))
     # Evaluate every due gate before interpreting dependency edges. A
     # dependency never decides whether another gate runs, and config order
     # therefore cannot turn a forward reference into a false clean.
@@ -532,13 +545,26 @@ def _render_after_dependency_pass(
 
     actions = 0
     for report in reports[render_from:]:
-        if isinstance(report, str):
-            record(report)
+        if isinstance(report, _Suppressed):
+            for line in report.lines:
+                record(line)
         else:
             actions += _render_evaluation(
                 report, unavailable, new_fired, now, record, report_pending
             )
     return actions
+
+
+def _reminder_header(reminder: Reminder) -> str:
+    """The header that opens a reminder's records: ``[tick-hub: NAME · SCHEDULE]``."""
+    return format_tick_header(
+        reminder.name, format_schedule(reminder.cadence_secs, reminder.cadence_offset_secs)
+    )
+
+
+def _ops_state_header() -> str:
+    """The header that opens the ops-state action, which no reminder owns and every tick checks."""
+    return format_tick_header("ops-state", "every tick")
 
 
 def _render_evaluation(
@@ -555,8 +581,11 @@ def _render_evaluation(
     outcome = evaluation.outcome
     captured = evaluation.captured
     error = evaluation.error
+    # Every group of records a reminder writes opens with its header (#609
+    # sender-header-mandatory), so each one forwarded to an agent says where it came from.
     if error is not None:
         _clear_render_failure_state(new_fired, rem.name)
+        record(_reminder_header(rem))
         # The check did not complete. Keep the ERROR for full diagnostic
         # readers and emit a counted NO-SIGNAL action because production
         # consumers may intentionally forward ACTION lines only. Retry
@@ -574,6 +603,7 @@ def _render_evaluation(
         # exists to remove. Cadence is left unconsumed so it
         # re-announces every tick until it can determine something.
         detail = captured.get("summary", "")
+        record(_reminder_header(rem))
         record(format_no_result(rem.name, detail))
         record(_no_signal_action(rem, "could-not-determine", detail=detail))
         return actions + 1
@@ -583,6 +613,7 @@ def _render_evaluation(
             dependency for dependency in rem.depends_on if dependency in unavailable
         )
         if unavailable_dependencies:
+            record(_reminder_header(rem))
             record(format_unevaluable(rem.name, unavailable_dependencies))
             record(
                 _no_signal_action(
@@ -593,9 +624,11 @@ def _render_evaluation(
             )
             return actions + 1
         if report_pending:
+            record(_reminder_header(rem))
             record(format_clean(rem.name))
         new_fired[rem.name] = now  # the check ran; the cadence clock resets
         return actions
+    record(_reminder_header(rem))
     try:
         line = render_emit(rem.emit, captured)
     except UnresolvedPlaceholderError as exc:

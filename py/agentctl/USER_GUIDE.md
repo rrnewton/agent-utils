@@ -605,6 +605,56 @@ fails, its retained status record uses a generic diagnostic so terminal-control
 errors cannot copy a value into later status output; the immediate command still
 reports the launch failure to its caller.
 
+### The sender header on every prompt
+
+Every prompt `agentctl send` delivers opens with one line naming who sent it
+and how, whatever the path (queued, typed at once, headless, agentcloud, or
+`--urgent` where the edition offers it), and so does every prompt
+`herdr-agent send` delivers:
+
+```text
+[from cl-foo via agentctl · reply: agentctl send cl-foo]
+Please also check the cancellation path.
+```
+
+The grammar is `[from SENDER via ROUTE( · KEY: VALUE)*]` on a line of its own.
+SENDER holds no white space, `·` or `]`; ROUTE and each VALUE hold no `·` or
+`]`; readers ignore keys they do not know. ROUTE is `agentctl`, or
+`agentctl --urgent` for an urgent send. SENDER is, from the first source that
+names one:
+
+1. the registered agent whose pinned harness is the nearest ancestor of the
+   `agentctl` process (its registry identity);
+2. `$AGENTCTL_AGENT`, when it is a valid agent name;
+3. the nearest `claude`, `codex` or `muse` ancestor, as `claude:PID@HOST`;
+4. `human@HOST` when standard input is a terminal, else `unknown@HOST`.
+
+`reply: agentctl send NAME` appears only for the first two, which can be
+answered by name. HOST is the host name up to its first dot. The header
+attributes messages between cooperating agents of one user; it is not
+authentication, and `$AGENTCTL_AGENT` in particular is taken on trust.
+
+The header is mandatory: no option suppresses it, and it is added even when the
+text already opens with one, so a header written into a body never stands
+first. Two kinds of input go without: the chat bridge's owner messages, which
+carry their own opening and never pass through `agentctl send`, and a one-line
+harness slash command (after any spaces or tabs, `/`, an ASCII letter, then
+letters, digits, `_`, `:` or `-`, then nothing or a space and arguments, such
+as `/compact` or `/goal finish the review`), which is a command for the
+harness rather than a message and would stop working behind a header. A path
+such as `/tmp/build.log` or a second line makes the text a message. Other tools
+that hand agents messages open them with the same `[from SENDER via ROUTE]`
+grammar and a ROUTE of their own.
+
+Only `send` stamps prompts. A `start` brief, `agentctl goal`, and the notices
+agentctl itself sends (watch-agents, restore) are not stamped; the notices open
+with their own `[agentctl ...]` label. Prompts queued by an earlier version are
+typed as they were queued.
+
+Agents message each other with `agentctl send`, never by typing into a pane
+with `herdr pane send-text` or `herdr pane run`: a raw line reaches its reader
+with no sign of who wrote it.
+
 ### Revive a dead harness
 
 After a harness is killed, its terminal server restarts, or the host reboots,

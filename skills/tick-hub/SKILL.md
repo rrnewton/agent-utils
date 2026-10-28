@@ -9,7 +9,9 @@ A single scheduled "tick" (a cron job, coordinator loop, or systemd timer) check
 reminder — plain timed, flag-gated, or shell-gated with captured values — plus file-freshness
 health checks, and emits a stable, line-oriented `HEALTH:` / `ACTION:` / `NOTE:` / `ERROR:` report.
 One loop carries every recurring responsibility instead of N separate timers. Reminders, gates, and
-health checks are all caller config; the engine is pure and deterministic given `now`.
+health checks are all caller config; the engine is pure and deterministic given `now`. Each
+reminder's records open with a `[tick-hub: NAME · SCHEDULE]` line, so a record forwarded to an
+agent says which reminder sent it.
 
 The CLI is the source of truth for usage — do not rely on this file for details. Run:
 

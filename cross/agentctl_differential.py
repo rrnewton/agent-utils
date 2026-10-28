@@ -23,7 +23,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from herdr_agent_differential import (
-    FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _option_values, _queue_snapshot, _revive_interop, _state,
+    FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _option_values, _queue_snapshot, _revive_interop, _state, _submitted,
+    SENDER_HEADER,
     _stop_recovery_arguments,
     init_case_repository,
 )
@@ -132,7 +133,7 @@ def _change(case: PairCase, values: Mapping[str, object]) -> None:
 
 
 def _submission_count(root: Path, text: str) -> int:
-    values = _state(root).get("submitted")
+    values = _submitted(root)
     return values.count(text) if isinstance(values, list) else 0
 
 
@@ -273,6 +274,13 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         _pair(harness, report, case, f"primary/{kind}/duplicate-id", ("send", "worker", text, "--message-id", "followup", *_COMMON), 75)
         report.require(f"primary/{kind}/send-exactly-once", all(_submission_count(root, text) == 1
                        for root in (case.python_root, case.rust_root)), "explicit ID was delivered twice")
+        typed = [_state(root).get("submitted") for root in (case.python_root, case.rust_root)]
+        lasts = [value[-1] if isinstance(value, list) and value and isinstance(value[-1], str) else ""
+                 for value in typed]
+        report.require(f"primary/{kind}/sender-header",
+                       all(SENDER_HEADER.match(last) and last.endswith("\n" + text) for last in lasts)
+                       and lasts[0].split("\n", 1)[0] == lasts[1].split("\n", 1)[0],
+                       f"send did not open the prompt with the same sender header: {lasts!r}")
         for root in (case.python_root, case.rust_root):
             (root / "prompt.txt").write_text("file instruction\nwith newline\n", encoding="utf-8")
         _pair(harness, report, case, f"primary/{kind}/send-file", ("send", "worker", "--file", "<ROOT>/prompt.txt", *_COMMON))
@@ -350,7 +358,7 @@ def _conversations(harness: Harness, report: Report) -> None:
         "--resume", "chosen-conversation", "--brief", "must never arrive", *_COMMON,
     ), 75)
     report.require("primary/conversation/resume/no-brief",
-                   all(not _state(root).get("submitted") for root in (mismatch.python_root, mismatch.rust_root)),
+                   all(not _submitted(root) for root in (mismatch.python_root, mismatch.rust_root)),
                    "brief reached a contradictory conversation")
 
 
@@ -665,7 +673,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "send", "worker", prompt, "--message-id", "muse-first", *_COMMON,
             ))
             report.require("primary/profile/watermelon/pane-delivery",
-                           all(_state(root).get("submitted") == [prompt]
+                           all(_submitted(root) == [prompt]
                                and _state(root).get("paste_wrapped") is True
                                and (root / "registry/agents/worker/queue/processed/muse-first.json").is_file()
                                and not list((root / "registry/agents/worker/queue/inflight").glob("*.json"))
@@ -807,7 +815,7 @@ def _profile_resume(harness: Harness, report: Report) -> None:
             "--profile", "local-policy", "--resume", conversation, "--brief", "must never arrive", *_COMMON,
         ), 75)
         report.require(f"primary/profile/resume/{kind}/mismatch-no-brief",
-                       all(not _state(root).get("submitted")
+                       all(not _submitted(root)
                            for root in (mismatch.python_root, mismatch.rust_root)),
                        "a startup brief reached a contradictory conversation")
         _retire_fixture_processes(mismatch)
@@ -1387,7 +1395,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     ))
     report.require("primary/muse/trust-refusal",
                    all(outcome.returncode == 75 and "trust prompt" in outcome.stderr
-                       and _state(root).get("submitted") == []
+                       and _submitted(root) == []
                        for outcome, root in zip(outcomes, (trust.python_root, trust.rust_root), strict=True)),
                    f"Muse trust prompt was accepted or mutated: {outcomes!r}")
     stopped = harness.invoke(trust, ("stop", "worker", *_COMMON))
@@ -1414,7 +1422,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
             all(outcome.returncode == 76 for outcome in outcomes)
             and all(
                 _state(root).get("custom_submitted") is False
-                and _state(root).get("submitted") == []
+                and _submitted(root) == []
                 and (root / "registry/agents/worker/queue/failed/exit-race.json").is_file()
                 for root in (exited.python_root, exited.rust_root)
             ),
@@ -1507,7 +1515,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
             "--startup-timeout", "0.1", "--brief", "must remain unsent", *_COMMON,
         ), 75)
         report.require(f"primary/herdr-093/codex/refuse-{label}-atomic", all(
-            _state(root).get("submitted") == []
+            _submitted(root) == []
             and sum(call[:2] == ["agent", "start"]
                     for call in _fixture_calls(root)) == 1
             and json.loads((root / "registry/agents/worker/agent.json").read_text(
@@ -1560,7 +1568,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
         report.require(f"primary/herdr-093/muse/refuse-{label}",
                        outcomes[0].returncode == outcomes[1].returncode
                        and outcomes[0].returncode in (69, 75)
-                       and all(_state(root).get("submitted") == []
+                       and all(_submitted(root) == []
                                and json.loads((root / "registry/agents/worker/agent.json").read_text(
                                    encoding="utf-8")).get("lifecycle") == "launch_failed"
                                for root in (failed.python_root, failed.rust_root)),
@@ -1735,7 +1743,7 @@ def _muse14_status(harness: Harness, report: Report) -> None:
     _change(case, {"status": "idle", "screen": ""})
     _pair(harness, report, case, "primary/muse14/resumed-drain", ("drain", "foreign", *_COMMON))
     report.require("primary/muse14/delivered-once-in-order", all(
-        _state(root).get("submitted") == ["held while paused", "held while staged"]
+        _submitted(root) == ["held while paused", "held while staged"]
         for root in (case.python_root, case.rust_root)), "held Muse input was lost, repeated or reordered")
     _retire_fixture_processes(case)
 
@@ -1803,13 +1811,13 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
         _pair(harness, report, case, f"primary/handoff/paused-{command[0]}", (*command, *_COMMON), 75)
     _pair(harness, report, case, "primary/handoff/attach", ("attach", "worker", *_COMMON))
     _pair(harness, report, case, "primary/handoff/read", ("read", "worker", *_COMMON))
-    report.require("primary/handoff/preserved-input", all(_state(root).get("submitted") == []
+    report.require("primary/handoff/preserved-input", all(_submitted(root) == []
                    and _state(root).get("focused") == "w1:p1" for root in (case.python_root, case.rust_root)),
                    "handoff injected input or failed to focus the owned pane")
     _change(case, {"status": "idle", "screen": ""})
     _pair(harness, report, case, "primary/handoff/resume", ("resume", "worker", *_COMMON))
     _pair(harness, report, case, "primary/handoff/drain", ("drain", "worker", *_COMMON))
-    report.require("primary/handoff/pending-once", all(_state(root).get("submitted") == ["queued before handoff"]
+    report.require("primary/handoff/pending-once", all(_submitted(root) == ["queued before handoff"]
                    for root in (case.python_root, case.rust_root)) and
                    _queue_snapshot(case.python_root, "registry/agents/worker/queue") == _queue_snapshot(case.rust_root, "registry/agents/worker/queue"),
                    "resume lost, duplicated, or changed the pending request")
@@ -1819,7 +1827,7 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
     _change(case, {"run_mode": "normal"})
     _pair(harness, report, case, "primary/handoff/no-replay", ("drain", "worker", *_COMMON))
     report.require("primary/handoff/uncertain-retained", all(
-        _state(root).get("submitted") == ["queued before handoff", "uncertain request"]
+        _submitted(root) == ["queued before handoff", "uncertain request"]
         and (root / "registry/agents/worker/queue/failed/uncertain.json").exists()
         for root in (case.python_root, case.rust_root)), "uncertain work was replayed or discarded")
 
@@ -1867,11 +1875,11 @@ def _queue_lanes(harness: Harness, report: Report) -> None:
             "only the Rust edition of agentctl honours" in outcome.stderr for outcome in refused),
             f"the other edition did not name the Rust edition: {refused!r}")
     report.require("primary/lanes/python-typed-nothing", all(
-        _state(root).get("submitted") == [] for root in roots),
+        _submitted(root) == [] for root in roots),
         "the other edition typed into a queue with Rust-only lanes")
     both(rust, "primary/lanes/rust-drain", ("drain", "worker", *_COMMON), 0)
     report.require("primary/lanes/rust-typed-once", all(
-        _state(root).get("submitted") == ["expiring prompt"]
+        _submitted(root) == ["expiring prompt"]
         and (root / "registry/agents/worker/queue/processed/lane.json").is_file()
         and (root / "registry/agents/worker/queue/cancelled/gone.json").is_file() for root in roots),
         "the Rust drain did not type the expiring prompt once, or the cancelled one left cancelled/")
@@ -1925,7 +1933,7 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
         stopped = harness._invoke_one(producer, root, ("stop", "worker", *_COMMON))
         outcomes = (started, paused, resumed, sent, stopped)
         report.require(f"primary/interop/{label}", all(outcome.returncode == 0 for outcome in outcomes)
-                       and refused.returncode == 75 and _state(root).get("submitted") == ["shared primary registry"],
+                       and refused.returncode == 75 and _submitted(root) == ["shared primary registry"],
                        f"canonical registry/handoff incompatible: {outcomes!r}; refused={refused!r}")
         archives = list((root / "registry/archive").glob("*/agent.json"))
         report.require(f"primary/interop/{label}/extension-metadata", len(archives) == 1
@@ -2091,6 +2099,7 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     processed = snapshots[0].get("processed/000000000007.json")
     report.require(
         "primary/legacy-adopted/drained-once",
+        # Queued before the sender header existed, so drained exactly as written.
         all(_state(root).get("submitted") == ["legacy fifo"]
             and not list((root / "registry/agents/foreign/queue/inbox").iterdir())
             and (root / "registry/agents/foreign/queue/processed/000000000007.json").is_file()
@@ -2376,7 +2385,7 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
         and all((archived[0].parent / relative).read_bytes() == content
                 for relative, content in originals[index].items())
         and _fixture_calls(root) == calls[index]
-        and _state(root).get("submitted") == []
+        and _submitted(root) == []
         and _state(root).get("closed_panes") == []
         for index, (_command, root) in enumerate(consumers)
     ) and harness.replacement_shell.poll() is None,
@@ -2879,7 +2888,7 @@ def _adoption(harness: Harness, report: Report) -> None:
         stopped = harness._invoke_one(consumer, root, ("stop", "foreign", *common))
         report.require(f"primary/adopt/interop-{label}", all(
             outcome.returncode == 0 for outcome in (adopted, status, sent, stopped)
-        ) and _state(root).get("submitted") == ["cross-engine adopted request"]
+        ) and _submitted(root) == ["cross-engine adopted request"]
             and not _state(root).get("closed") and not _state(root).get("closed_panes")
             and len(list((root / "registry/archive").glob("*/agent.json"))) == 1,
             f"adopted record was not safely portable between editions: "

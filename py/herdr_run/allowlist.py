@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import pwd
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from herdr_run.config import CARGO_ALWAYS_DENIED, Config
@@ -204,6 +205,68 @@ def _matches_denied_option(token: str, denied: str) -> bool:
     )
 
 
+_TYPING_VERBS = frozenset({
+    ("pane", "send-text"), ("pane", "run"), ("pane", "send-keys"),
+    ("agent", "prompt"), ("agent", "send-keys"),
+})
+_TYPING_ADVICE = (
+    "agents message each other with `agentctl send NAME TEXT`, which opens every prompt with the "
+    "sender header"
+)
+
+
+def _refuse_unlabelled_typing(args: Sequence[str]) -> None:
+    """Refuse herdr commands that would type an unlabelled message into another pane.
+
+    #609 sender-header-mandatory, whatever the configuration allows: ``pane send-text``,
+    ``pane run`` and ``agent prompt`` are admitted only when their text opens with a sender header,
+    followed by a space or nothing, and ``pane send-keys`` and ``agent send-keys`` never are, since
+    key presses carry no header. A line typed straight into an agent's pane reaches its reader with
+    no sign of who wrote it.
+
+    The verb is found as any adjacent ``pane VERB`` or ``agent VERB`` pair, so a global option and
+    its value (``--session NAME``) cannot hide it.
+    """
+    index = next((position for position in range(len(args) - 1)
+                  if (args[position], args[position + 1]) in _TYPING_VERBS), None)
+    if index is None:
+        return
+    command = f"herdr {args[index]} {args[index + 1]}"
+    if args[index + 1] == "send-keys":
+        raise Refused(f"{quote(command)} types into another pane without a sender header; "
+                      + _TYPING_ADVICE)
+    words = [word for word in args[index + 2:] if not word.startswith("-")]
+    if not _opens_with_sender_header(" ".join(words[1:])):
+        raise Refused(
+            f"{quote(command)} types into another pane without a sender header such "
+            f'as "[from NAME via agentctl]"; {_TYPING_ADVICE}'
+        )
+
+
+def _opens_with_sender_header(text: str) -> bool:
+    """Whether ``text`` opens with ``[from SENDER via ROUTE( · KEY: VALUE)*]`` and then a space or
+    nothing."""
+    end = text.find("]")
+    if end < 0:
+        return False
+    header, rest = text[: end + 1], text[end + 1 :]
+    if rest and not rest.startswith(" "):
+        return False
+    if not header.startswith("[from ") or not header.endswith("]"):
+        return False
+    parts = header[len("[from ") : -1].split(" · ")
+    sender, via, route = parts[0].partition(" via ")
+    if (not via or not sender or any(c.isspace() or c == "·" for c in sender)
+            or not route.strip() or "·" in route):
+        return False
+    for part in parts[1:]:
+        key, colon, value = part.partition(": ")
+        if (not colon or not key or any(not (c.islower() and c.isascii()) and c != "-" for c in key)
+                or not value.strip() or "·" in value):
+            return False
+    return True
+
+
 def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> Admission:
     """Admit ``command`` under ``config``, or raise :class:`Refused` explaining exactly why.
 
@@ -359,6 +422,9 @@ def admit(command: str, config: Config, *, home: object = _FROM_ENVIRONMENT) -> 
                     f"option {quote(token)} is denied for {quote(program + ' ' + subcommand)}: "
                     f"it names a program for {program} to execute"
                 )
+
+    if program == "herdr":
+        _refuse_unlabelled_typing(args)
 
     return Admission(
         argv=argv,
