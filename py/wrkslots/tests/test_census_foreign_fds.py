@@ -22,16 +22,13 @@ import pytest
 from wrkslots import cli
 
 
-from collections.abc import Callable
+_REAL_READLINK = os.readlink
 
 
-def _readlink_fails_on_fd(real: Callable[..., str]) -> Callable[..., str]:
-    def fake(path: object, *args: object, **kwargs: object) -> str:
-        if "/fd/" in str(path) or str(path).endswith("/cwd"):
-            raise OSError(errno.ENAMETOOLONG, "File name too long", str(path))
-        return real(path, *args, **kwargs)
-
-    return fake
+def _failing_readlink(path: str | Path) -> str:
+    if "/fd/" in str(path) or str(path).endswith("/cwd"):
+        raise OSError(errno.ENAMETOOLONG, "File name too long", str(path))
+    return _REAL_READLINK(path)
 
 
 def _fd_link(tmp_path: Path, held: Path) -> Path:
@@ -48,7 +45,7 @@ def test_unreadable_foreign_device_descriptor_is_not_use(
     held = tmp_path / "held.txt"
     held.write_text("x\n")
     device = os.stat(held).st_dev
-    monkeypatch.setattr(os, "readlink", _readlink_fails_on_fd(os.readlink))
+    monkeypatch.setattr(os, "readlink", _failing_readlink)
     assert cli._readable_link_target(_fd_link(tmp_path, held), slot_device=device + 4096) is None
 
 
@@ -58,7 +55,7 @@ def test_unreadable_same_device_descriptor_stays_indeterminate(
     held = tmp_path / "held.txt"
     held.write_text("x\n")
     device = os.stat(held).st_dev
-    monkeypatch.setattr(os, "readlink", _readlink_fails_on_fd(os.readlink))
+    monkeypatch.setattr(os, "readlink", _failing_readlink)
     with pytest.raises(cli.Refusal, match="process use is indeterminate"):
         cli._readable_link_target(_fd_link(tmp_path, held), slot_device=device)
 
@@ -67,7 +64,7 @@ def test_unreadable_descriptor_with_failed_stat_stays_indeterminate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     missing = tmp_path / "fd" / "9"
-    monkeypatch.setattr(os, "readlink", _readlink_fails_on_fd(os.readlink))
+    monkeypatch.setattr(os, "readlink", _failing_readlink)
     with pytest.raises(cli.Refusal, match="process use is indeterminate"):
         cli._readable_link_target(missing, slot_device=12345)
 
@@ -96,7 +93,7 @@ def _scan(
     proc_root = tmp_path / "proc"
     proc_root.mkdir()
     (proc_root / str(holder_pid)).symlink_to(Path("/proc") / str(holder_pid))
-    monkeypatch.setattr(os, "readlink", _readlink_fails_on_fd(os.readlink))
+    monkeypatch.setattr(os, "readlink", _failing_readlink)
     return cli._agent_batch_fresh_use(
         slot, None, capture_generation=False, proc_root=proc_root
     )
@@ -130,7 +127,7 @@ def test_link_target_foreign_device_is_not_use(
     held = tmp_path / "held.txt"
     held.write_text("x\n")
     device = os.stat(held).st_dev
-    monkeypatch.setattr(os, "readlink", _readlink_fails_on_fd(os.readlink))
+    monkeypatch.setattr(os, "readlink", _failing_readlink)
     link = _fd_link(tmp_path, held)
     assert cli._link_target(link, slot_device=device + 4096) is None
     with pytest.raises(cli.Refusal, match="process use is indeterminate"):
