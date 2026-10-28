@@ -71,7 +71,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import shutil
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -324,15 +323,10 @@ def main() -> int:
         for label, width, height, thread_room in SIZES:
             report.append(walk(playwright.chromium, args, label, width, height, thread_room, rest_ms))
         for at, (name, file, patches, tags) in enumerate(() if args.no_controls else CONTROLS):
-            broken = Path(copies) / f"control-{at}"
-            shutil.copytree(root, broken)
-            text = (broken / file).read_text()
-            for part, instead in patches:
-                check(text.count(part) == 1, f"the control '{name}' patches {part!r}, which {root / file} no "
-                                             "longer holds exactly once")
-                text = text.replace(part, instead, 1)
-            (broken / file).write_text(text)
-            fixture.WEB_ROOT = broken.resolve()
+            # Built from patched sources exactly as the page is (`#624 voice-page-modularity`): each
+            # text must occur once, or the control is refused rather than run unchanged.
+            fixture.WEB_ROOT = page_sources.variant(root, Path(copies) / f"control-{at}",
+                                                    [(file, part, instead) for part, instead in patches])
             failed = ""
             try:
                 walk(playwright.chromium, args, f"control-{at}", *CONTROL_SIZE[1:], rest_ms)

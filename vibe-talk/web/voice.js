@@ -19892,12 +19892,16 @@ function stepCollapsedLines(direction) {
 // both builds in Settings' Server section. A press reloads; nothing reloads by itself, so no call,
 // draft or reading place is ever taken away unasked.
 
-/** This page's script's content hash: the `v=` of the address it was loaded from, or "" without one. */
+/**
+ * This page's script's content hash: the hash in its name when the shell loaded the page build's
+ * script, `/assets/voice.<hash>.js` (`#624 voice-page-modularity`), else the `v=` of the address an
+ * older shell loaded it from, `/voice.js?v=<hash>`; "" without either.
+ */
 const PAGE_BUILD = (() => {
   try {
     const script = /** @type {HTMLScriptElement | null} */ (document.currentScript);
     const src = script && typeof script.src === "string" ? script.src : "";
-    const found = /[?&]v=([0-9a-f]+)(?:&|#|$)/.exec(src);
+    const found = /\/assets\/voice\.([0-9a-f]{32})\.js(?:[?#]|$)/.exec(src) || /[?&]v=([0-9a-f]+)(?:&|#|$)/.exec(src);
     return found ? found[1] : "";
   } catch (_error) {
     return "";

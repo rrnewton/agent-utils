@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import tempfile
 import threading
 import time
@@ -200,6 +202,27 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def unknown_build_root(source: Path, into: Path) -> Path:
+    """The page at `source` served so that it does not know its own build, the state this walk has
+    always measured Settings in: a page build's shell with its script named by the plain /voice.js
+    (the same bytes) rather than by its hash. A directory of sources already names it so.
+
+    `#676 settings-head-page-build`: once the page knows its build, as production's does, Settings
+    draws "This page is build ..." between the host line and the buttons on a phone, and the head
+    takes three rows, not the two this walk holds it to. That is the production page's bug, fixed
+    after `#624 voice-page-modularity`; until then this keeps the coverage this walk had, and the fix
+    makes it serve the page build as every other walk does.
+    """
+    if not (source / "assets.json").is_file():
+        return source
+    shutil.copytree(source, into)
+    shell = (into / "voice.html").read_text()
+    named = re.findall(r'src="/assets/voice\.[0-9a-f]{32}\.js"', shell)
+    check(len(named) == 1, f"the page build's shell does not name its one script by hash: {named}")
+    (into / "voice.html").write_text(shell.replace(named[0], 'src="/voice.js"'))
+    return into.resolve()
+
+
 def main() -> int:
     args = arguments()
     try:
@@ -211,9 +234,9 @@ def main() -> int:
         ) from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
     report: list[str] = []
-    with sync_playwright() as playwright:
+    with sync_playwright() as playwright, tempfile.TemporaryDirectory(prefix="vibe-talk-unknown-build-") as copy:
+        fixture.WEB_ROOT = unknown_build_root(args.web_root.resolve(), Path(copy) / "web")
         for label, width, height, touch in SETTINGS_SIZES:
             report.append(run(playwright.chromium, args, LongReplyApi(), label, width, height, touch, settings_walk))
         for label, width, height in COLUMN_SIZES:

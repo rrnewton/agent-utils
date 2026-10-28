@@ -47,7 +47,7 @@ import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { SHELL, WEB, readWeb, shellScripts, shellStyles } from "./page_sources.mjs";
+import { SHELL, WEB, shellScripts, shellStyles } from "./page_sources.mjs";
 
 /** The lockfile-pinned toolchain: contract/package.json, installed by `npm ci --prefix contract`. */
 const TOOLS = join(WEB, "..", "contract");
@@ -213,10 +213,10 @@ export function requireStrict(name, text, ts = loadTool("typescript")) {
 /** The name a page file carries in source maps and assets.json, wherever the checkout is. */
 const sourceName = (name) => `vibe-talk/web/${name}`;
 
-async function minifyAll(esbuild, names, loader) {
+async function minifyAll(esbuild, web, names, loader) {
   const parts = [];
   for (const name of names) {
-    const text = readWeb(name);
+    const text = readFileSync(join(web, name), "utf8");
     if (loader === "js") requireStrict(name, text);
     const result = await esbuild.transform(text, {
       loader,
@@ -320,34 +320,42 @@ function writeTree(root, files) {
  * Refuse an output directory that is, or holds, the sources or the repository: publishing replaces
  * the whole directory, so `--out web` would replace the page's sources with their build.
  */
-export function requireOutside(out) {
+export function requireOutside(out, web = WEB) {
   const target = resolve(out);
-  for (const tree of [WEB, TOOLS, REPOSITORY]) {
+  for (const tree of [web, WEB, TOOLS, REPOSITORY]) {
     const from = relative(target, tree);
     if (from === "" || (!from.startsWith("..") && !isAbsolute(from))) {
       throw new Error(`--out ${out} is or holds ${tree}, which the build would replace`);
     }
   }
-  const inside = relative(WEB, target);
-  if (!inside.startsWith("..") && !isAbsolute(inside)) {
-    throw new Error(`--out ${out} is inside ${WEB}, so the build would become an input of the next one`);
+  for (const sources of new Set([resolve(web), WEB])) {
+    const inside = relative(sources, target);
+    if (!inside.startsWith("..") && !isAbsolute(inside)) {
+      throw new Error(`--out ${out} is inside ${sources}, so the build would become an input of the next one`);
+    }
   }
 }
 
 /** Build into `out`, replacing whatever was there only once everything is written and checked. */
-export async function build(out) {
-  requireOutside(out);
+/**
+ * Build the page whose sources are in `web` (by default this directory, vibe-talk/web) into `out`.
+ * Another `web` is a copy of the sources with something changed on purpose: a browser walk's
+ * negative control, built exactly as the page is. Its inputs are recorded under the same
+ * `vibe-talk/web/` names, with the copy's digests.
+ */
+export async function build(out, { web = WEB } = {}) {
+  requireOutside(out, web);
   const esbuild = loadTool("esbuild");
-  const html = readWeb(SHELL);
+  const html = readFileSync(join(web, SHELL), "utf8");
   const scripts = shellScripts(html);
   const styles = shellStyles(html);
-  const js = assemble(await minifyAll(esbuild, scripts, "js"), {
+  const js = assemble(await minifyAll(esbuild, web, scripts, "js"), {
     stem: "voice",
     extension: "js",
     leading: '"use strict";\n',
     comment: (mapFile) => `//# sourceMappingURL=/assets/${mapFile}\n`,
   });
-  const css = assemble(await minifyAll(esbuild, styles, "css"), {
+  const css = assemble(await minifyAll(esbuild, web, styles, "css"), {
     stem: "voice",
     extension: "css",
     leading: "",
@@ -364,7 +372,7 @@ export async function build(out) {
     "voice.js": js.bytes,
   };
   for (const name of ["contract.js", "style.css", "voice.css", "manifest.webmanifest"]) {
-    files[name] = readFileSync(join(WEB, name));
+    files[name] = readFileSync(join(web, name));
   }
   const hashed = Object.keys(files).filter((path) => path.startsWith("assets/"));
   if (new Set(hashed.map((path) => basename(path))).size !== hashed.length) throw new Error("two assets share a name");
@@ -373,7 +381,7 @@ export async function build(out) {
   // if this set matches the sources it is built into, so a file this build reads can never be left
   // out of the comparison, and one added since is a difference too.
   const inputs = {};
-  for (const name of filesBelow(WEB)) inputs[sourceName(name)] = digest(readFileSync(join(WEB, name)));
+  for (const name of filesBelow(web)) inputs[sourceName(name)] = digest(readFileSync(join(web, name)));
   inputs["vibe-talk/contract/package-lock.json"] = digest(readFileSync(join(TOOLS, "package-lock.json")));
   const manifest = {
     page_build: digest(js.bytes),
@@ -390,7 +398,7 @@ export async function build(out) {
   const staging = `${out}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
   try {
     writeTree(staging, files);
-    cpSync(join(WEB, "icons"), join(staging, "icons"), { recursive: true, dereference: true });
+    cpSync(join(web, "icons"), join(staging, "icons"), { recursive: true, dereference: true });
     // Read back: what is published is what was hashed.
     for (const [path, want] of Object.entries(manifest.files)) {
       if (digest(readFileSync(join(staging, path))) !== want) throw new Error(`${path} was not written as built`);
@@ -419,20 +427,40 @@ export async function build(out) {
 }
 
 function usage() {
-  return "usage: node web/build.mjs --out DIR\n";
+  return `usage: node web/build.mjs --out DIR [--web SOURCES]
+
+Build the page the server embeds into DIR: assets/voice.<hash>.js and .css with their source maps,
+the shell naming them, the plain files an older shell asks for, the manifest and icons, and
+assets.json. DIR is replaced whole, once everything is written and checked.
+
+  --out DIR      where to write the page; refused if it is or holds the sources or the repository
+  --web SOURCES  the page's sources (default: the directory this script is in, vibe-talk/web): a
+                 copy with something changed on purpose, such as a browser walk's negative control
+
+Needs the esbuild and TypeScript that vibe-talk/contract/package-lock.json pins:
+npm ci --prefix vibe-talk/contract
+`;
+}
+
+/** The value after `flag` in `args`, or `fallback` when `flag` is absent. */
+function option(args, flag, fallback) {
+  const at = args.indexOf(flag);
+  if (at === -1) return fallback;
+  if (!args[at + 1] || args[at + 1].startsWith("--")) throw new Error(`${flag} needs a value`);
+  return args[at + 1];
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  const at = args.indexOf("--out");
+  const known = new Set(["--out", "--web"]);
   if (args.includes("--help") || args.includes("-h")) {
     process.stdout.write(usage());
-  } else if (at === -1 || !args[at + 1] || args.length !== 2) {
+  } else if (!args.includes("--out") || args.length % 2 !== 0 ||
+             args.some((arg, i) => i % 2 === 0 && !known.has(arg))) {
     process.stderr.write(usage());
     process.exit(2);
   } else {
-    const manifest = await build(resolve(args[at + 1]));
+    const manifest = await build(resolve(option(args, "--out")), { web: resolve(option(args, "--web", WEB)) });
     process.stdout.write(`page build ${manifest.page_build}: ${manifest.assets.script.path} ${manifest.assets.style.path}\n`);
   }
 }
-

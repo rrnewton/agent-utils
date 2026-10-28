@@ -28,7 +28,13 @@ renders it, with one reply, as on Slack:
   clamped, no cell of the table on it; unpacked, the continuation draws the table whole, seven cells to a row.
 * build (`#529 page-build-stale-notice`): a read saying the server serves the page's own script shows
   nothing; one saying another shows "New version — reload" on the line over the list, inside the
-  window and clear of the freshness pill, and a press reloads the page.
+  window and clear of the freshness pill, and a press reloads the page. The page's own build is the
+  page build's script hash, read from the hashed name its shell gives it.
+* old-shell (`#624 voice-page-modularity`): a shell from before the page build (two plain script tags,
+  `/voice.js?v=<that build's hash>`, as a back/forward or restored tab can still hold) against
+  today's files: the whole page build at /voice.js and the standalone validators at /contract.js. The
+  page starts and signs in without an error, knows the old build it was named by, and offers
+  "New version — reload" as soon as a read says the server serves the page build.
 
 Pass --screenshots DIR to keep a PNG of each state, and --web-root DIR to run against another copy
 of the page. --report-only measures the load part without failing on it, for an older page's numbers.
@@ -38,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -51,6 +58,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from offline_cache_browser import FakeApi, Json, check, handler_for, message, thread_of
 from two_column_browser import Desk
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -237,7 +245,7 @@ def arguments() -> argparse.Namespace:
                         help="loopback port for the fake server (default: 0, any free port)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable (default: all of them)")
-    parser.add_argument("--only", choices=("format", "pending", "load", "table", "build"), action="append",
+    parser.add_argument("--only", choices=("format", "pending", "load", "table", "build", "old-shell"), action="append",
                         help="run only these parts of the walk, repeatable (default: all of them)")
     parser.add_argument("--latency", type=float, default=0.6,
                         help="seconds every timeline read takes in the load part (default: 0.6)")
@@ -257,7 +265,7 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     fixture.WEB_ROOT = args.web_root.resolve()
     report: list[str] = []
-    parts = args.only or ["format", "pending", "load", "table", "build"]
+    parts = args.only or ["format", "pending", "load", "table", "build", "old-shell"]
     with sync_playwright() as playwright:
         for label, width, height, touch in SIZES:
             if args.size and label not in args.size:
@@ -270,8 +278,11 @@ def main() -> int:
 
 
 def hashed_web_root(source: Path, into: Path) -> Path:
-    """A copy of the page at `source` whose shell names its script by its content hash, as the server's
-    shell does (src/http/assets.rs): the fake server serves files as written, with no hash."""
+    """The page at `source` with its shell naming its script by its content hash, as the server's shell
+    does (src/http/assets.rs). A page build's shell already does (`/assets/voice.<hash>.js`, `#624
+    voice-page-modularity`); a directory of sources is copied and its `/voice.js` given a `?v=`."""
+    if (source / "assets.json").is_file():
+        return source
     shutil.copytree(source, into)
     script = (into / "voice.js").read_bytes()
     build = hashlib.sha256(script).hexdigest()[:32]
@@ -280,13 +291,38 @@ def hashed_web_root(source: Path, into: Path) -> Path:
     return into
 
 
+def old_shell_root(source: Path, into: Path) -> tuple[Path, str, str]:
+    """A copy of the page build at `source` served with the shell from before the page build: the
+    source shell, its script named `/voice.js?v=<hash>` as that server named it, with the hash of the
+    script it served then. Returns the directory, that hash, and the page build's own."""
+    if not (source / "assets.json").is_file():
+        raise SystemExit(f"the old-shell part needs a page build to serve, and {source} is not one")
+    shutil.copytree(source, into)
+    script = page_sources.source_text(source, "voice.js").encode()
+    build = hashlib.sha256(script).hexdigest()[:32]
+    shell = page_sources.source_text(source, "voice.html")
+    check(shell.count('src="/voice.js"') == 1, "the source shell no longer loads /voice.js by a plain tag")
+    (into / "voice.html").write_text(shell.replace('src="/voice.js"', f'src="/voice.js?v={build}"'))
+    return into, build, str(json.loads((source / "assets.json").read_text())["page_build"])
+
+
+# While the old-shell part runs: the build an old shell names its script by, and the page build.
+OLD_SHELL_BUILD = ""
+PAGE_BUILD_SERVED = ""
+
+
 def walk(chromium: BrowserType, args: argparse.Namespace, part: str, label: str, width: int, height: int,
          touch: bool) -> str:
-    if part != "build":
+    global OLD_SHELL_BUILD, PAGE_BUILD_SERVED
+    if part not in ("build", "old-shell"):
         return walk_part(chromium, args, part, label, width, height, touch)
     served = fixture.WEB_ROOT
     with tempfile.TemporaryDirectory(prefix="vibe-talk-hashed-web-") as copy:
-        fixture.WEB_ROOT = hashed_web_root(served, Path(copy) / "web").resolve()
+        if part == "old-shell":
+            root, OLD_SHELL_BUILD, PAGE_BUILD_SERVED = old_shell_root(served, Path(copy) / "web")
+            fixture.WEB_ROOT = root.resolve()
+        else:
+            fixture.WEB_ROOT = hashed_web_root(served, Path(copy) / "web").resolve()
         try:
             return walk_part(chromium, args, part, label, width, height, touch)
         finally:
@@ -322,6 +358,8 @@ def walk_part(chromium: BrowserType, args: argparse.Namespace, part: str, label:
                 pending_walk(desk, api)
             elif part == "build":
                 build_walk(desk, api)
+            elif part == "old-shell":
+                old_shell_walk(desk, api)
             elif part == "table":
                 table_walk(desk)
             else:
@@ -457,6 +495,11 @@ def build_walk(desk: Desk, api: MarkdownApi) -> None:
     page = desk.page
     own = str(page.evaluate("() => PAGE_BUILD"))
     desk.check(len(own) == 32, f"the page does not know its own build: {own!r}")
+    # A page build's shell names the script by its hash, which is the build every read reports.
+    manifest = fixture.WEB_ROOT / "assets.json"
+    if manifest.is_file():
+        built = str(json.loads(manifest.read_text())["page_build"])
+        desk.check(own == built, f"the page thinks it is build {own!r}, not the page build {built!r}")
     reread = "() => { threadDirectoryReadAt.clear(); return refreshThreadDirectory(); }"
     with api.lock:
         api.page_build = own
@@ -487,6 +530,26 @@ def build_walk(desk: Desk, api: MarkdownApi) -> None:
     desk.check(not page.evaluate("() => Boolean(window.__beforeReload)"), "the chip did not reload the page")
     desk.notes.append(f"a newer build showed the chip at x {float(chip['left']):.0f}-{float(chip['right']):.0f}px "
                       "beside the pill, and a press reloaded the page")
+
+
+def old_shell_walk(desk: Desk, api: MarkdownApi) -> None:
+    """The old shell's page started (sign_in passed and nothing threw); it knows the build its shell
+    named, and a read saying the server serves the page build offers the reload."""
+    page = desk.page
+    own = str(page.evaluate("() => PAGE_BUILD"))
+    desk.check(own == OLD_SHELL_BUILD, f"the old shell's page thinks it is build {own!r}, not {OLD_SHELL_BUILD!r}")
+    desk.check(bool(page.evaluate("() => typeof VibeTalkContract.decode === 'function'")),
+               "the validators are not there for the old shell's page")
+    served = PAGE_BUILD_SERVED
+    desk.check(served != own, "the page build and the old shell's build are the same")
+    with api.lock:
+        api.page_build = served
+    page.evaluate("() => { threadDirectoryReadAt.clear(); return refreshThreadDirectory(); }")
+    desk.wait_for("() => !document.getElementById('page-update').hidden",
+                  "the old shell's page did not offer the page build")
+    desk.shot("1-old-shell")
+    desk.notes.append(f"a shell from before the page build started on today's /voice.js and /contract.js, knew its "
+                      f"build {own[:8]} and offered the page build {str(served)[:8]}")
 
 
 def summarised_at(desk: Desk) -> str:

@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { SourceMap } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -192,6 +192,20 @@ test("the shell is refused rather than mis-linked when its tags are not the plai
     '<link rel="stylesheet" href="/print.css" media="print" />\n', '<script src="/b.js"></script><script src="/c.js"></script>\n']) {
     assert.throws(() => linkShell(shell(extra), "/assets/x.js", "/assets/x.css"), /not the plain, one-per-line tags/, extra);
   }
+});
+
+test("a copy of the sources changed on purpose builds the same way, and is refused as an output too", async () => {
+  // A browser walk's negative control: the page with one thing broken, built exactly as the page is.
+  const copy = join(scratch, "patched-sources");
+  cpSync(WEB, copy, { recursive: true });
+  const voice = join(copy, "voice.js");
+  writeFileSync(voice, readFileSync(voice, "utf8").replace("const TOKEN_KEY = ", "const TOKEN_KEY_PATCHED = "));
+  const out = join(scratch, "patched");
+  const patched = await build(out, { web: copy });
+  assert.notEqual(patched.page_build, MANIFEST.page_build);
+  assert.match(readFileSync(join(out, relativePath(patched.assets.script.path)), "utf8"), /const TOKEN_KEY_PATCHED=/);
+  assert.notEqual(patched.inputs["vibe-talk/web/voice.js"], MANIFEST.inputs["vibe-talk/web/voice.js"]);
+  assert.throws(() => requireOutside(join(copy, "out"), copy), /inside/);
 });
 
 test("the build refuses to publish over its own sources or the repository", () => {

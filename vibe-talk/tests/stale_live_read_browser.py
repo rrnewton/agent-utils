@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import tempfile
 import threading
 import time
@@ -44,6 +43,7 @@ from urllib.parse import parse_qs, urlsplit
 import offline_cache_browser as fixture
 from all_thread_strip_browser import StripApi, handler
 from offline_cache_browser import Json, check
+import page_sources
 from two_column_browser import Desk
 
 if TYPE_CHECKING:
@@ -182,12 +182,9 @@ def main() -> int:
         check(fixed.missing == 0, f"the second live message's row was not drawn in {fixed.missing} frames after it appeared: {fixed}")
         check(fixed.first_missing == 0, f"the first live message's row was not drawn in {fixed.first_missing} frames: {fixed}")
         # THE NEGATIVE CONTROL: the same walk against the page with the fix taken out.
-        unfixed = Path(copy) / "web"
-        shutil.copytree(root, unfixed)
-        script = (unfixed / "voice.js").read_text()
-        check(FIX in script, f"the negative control patches {FIX!r}, which {root / 'voice.js'} no longer contains")
-        (unfixed / "voice.js").write_text(script.replace(FIX, UNFIXED, 1))
-        fixture.WEB_ROOT = unfixed.resolve()
+        # Built from patched sources exactly as the page is (`#624 voice-page-modularity`); FIX must
+        # occur once, or the control is refused rather than run unchanged.
+        fixture.WEB_ROOT = page_sources.variant(root, Path(copy), [("voice.js", FIX, UNFIXED)])
         control = walk(playwright.chromium, args, "control-1280")
         fixture.WEB_ROOT = root
         check(control.missing > 0,
