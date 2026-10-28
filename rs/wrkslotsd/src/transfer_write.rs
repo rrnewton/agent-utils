@@ -244,3 +244,52 @@ pub(crate) fn transfer_owner(
         "already_transferred": false,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::cgroup_in_slot_box;
+
+    #[test]
+    fn slot_box_matches_own_slice_only() {
+        assert!(cgroup_in_slot_box(
+            "/user.slice/user-1000.slice/user@1000.service/wrkslots-slot-a.slice/run.scope",
+            "agent",
+            "slot-a"
+        ));
+        assert!(cgroup_in_slot_box(
+            "/user.slice/prefix-wrkslots-slot-a.slice/run.scope",
+            "agent",
+            "slot-a"
+        ));
+        assert!(!cgroup_in_slot_box(
+            "/user.slice/wrkslots-slot-b.slice/run.scope",
+            "agent",
+            "slot-a"
+        ));
+        assert!(!cgroup_in_slot_box(
+            "/user.slice/wrkslots-slot-a.slice/run.scope",
+            "agent",
+            "slot-b"
+        ));
+        assert!(!cgroup_in_slot_box(
+            "/user.slice/wrkslots-slot-a-extra.slice/run.scope",
+            "agent",
+            "slot-a"
+        ));
+    }
+
+    #[test]
+    fn slot_box_uses_systemd_escaped_label() {
+        // systemd-escape renders "kvm-foo" as "kvm\x2dfoo".
+        assert!(cgroup_in_slot_box(
+            "/user.slice/wrkslots-kvm\\x2dfoo.slice/run.scope",
+            "agent",
+            "kvm-foo"
+        ));
+        assert!(!cgroup_in_slot_box(
+            "/user.slice/wrkslots-kvm-foo.slice/run.scope",
+            "agent",
+            "kvm-foo"
+        ));
+    }
+}

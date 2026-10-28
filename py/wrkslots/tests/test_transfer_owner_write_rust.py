@@ -184,17 +184,32 @@ def _active(root: Path) -> dict[str, object]:
 
 
 def _kinds(root: Path) -> list[str]:
+    return [str(event["kind"]) for event in _events(root)]
+
+
+def _events(root: Path) -> list[dict[str, object]]:
     directory = root / "worktrees" / "EVENTS.node-a"
     if not directory.is_dir():
         return []
-    kinds: list[str] = []
+    events: list[dict[str, object]] = []
     for path in sorted(directory.iterdir()):
         event: dict[str, object] = json.loads(path.read_text())
         assert event["sha256"] == wrkslots_cli._event_digest(
             {k: v for k, v in event.items() if k != "sha256"}
         )
-        kinds.append(str(event["kind"]))
-    return kinds
+        event.pop("recorded_at")
+        event.pop("sha256")
+        event.pop("previous_sha256")
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            record = payload.get("record")
+            if isinstance(record, dict):
+                record.pop("heartbeat_at", None)
+                for checkout in cast(list[dict[str, object]], record.get("checkouts", [])):
+                    checkout["head"] = "HEAD"
+                    checkout["start_point"] = "HEAD"
+        events.append(event)
+    return events
 
 
 def test_transfer_dead_owner_matches_python(tmp_path: Path) -> None:
@@ -207,7 +222,7 @@ def test_transfer_dead_owner_matches_python(tmp_path: Path) -> None:
     assert outcome["basis"] == "caller-ancestry"
     assert outcome["previous_owner_state"] == "dead"
     assert _active(rust_root) == _active(oracle_root)
-    assert _kinds(rust_root) == _kinds(oracle_root)
+    assert _events(rust_root) == _events(oracle_root)
 
 
 def test_transfer_unowned_matches_python(tmp_path: Path) -> None:
@@ -217,7 +232,7 @@ def test_transfer_unowned_matches_python(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["previous_owner_state"] == "indeterminate"
     assert _active(rust_root) == _active(oracle_root)
-    assert _kinds(rust_root) == _kinds(oracle_root)
+    assert _events(rust_root) == _events(oracle_root)
 
 
 def test_transfer_repeat_is_already_transferred(tmp_path: Path) -> None:
@@ -228,7 +243,8 @@ def test_transfer_repeat_is_already_transferred(tmp_path: Path) -> None:
     result = _rust(rust_root, os.getpid())
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["already_transferred"] is True
-    assert _kinds(rust_root) == _kinds(oracle_root)
+    assert _active(rust_root) == _active(oracle_root)
+    assert _events(rust_root) == _events(oracle_root)
 
 
 def test_transfer_live_owner_refuses(tmp_path: Path) -> None:
@@ -243,10 +259,95 @@ def test_transfer_live_owner_refuses(tmp_path: Path) -> None:
 
 
 def test_transfer_outsider_successor_refuses(tmp_path: Path) -> None:
-    rust_root = _fixture(tmp_path / "rust", _dead_identity())
-    result = _rust(rust_root, 1)
-    assert result.returncode == 1
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    outsider = subprocess.Popen(["sleep", "60"])
+    try:
+        with pytest.raises(Exception) as caught:
+            _python(oracle_root, outsider.pid)
+        assert "neither in the invoking process ancestry" in str(caught.value)
+        result = _rust(rust_root, outsider.pid)
+        assert result.returncode == 1
+        assert "neither in the invoking process ancestry" in result.stderr
+    finally:
+        outsider.kill()
+        outsider.wait()
     assert _active(rust_root)["revision"] == 7
+
+
+def test_transfer_stale_generation_and_wrong_agent_refuse(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust", _dead_identity())
+    result = _rust(rust_root, os.getpid())
+    assert result.returncode == 0
+    again = subprocess.run(
+        [
+            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
+            "-p", "wrkslotsd", "--", "transfer-owner", "slot-a",
+            "--agent", "agent-slot-a", "--owner-pid", str(os.getpid()),
+            "--expected-generation", "9", "--root", str(rust_root),
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+        env={**os.environ, "WRKSLOTSD_FIXTURE_WRITER": "1"},
+    )
+    assert again.returncode == 1
+    assert "stale generation" in again.stderr
+
+
+def test_transfer_indeterminate_owner_refuses(tmp_path: Path) -> None:
+    owner = _dead_identity()
+    owner["host_id"] = "another-host"
+    rust_root, oracle_root = _pair(tmp_path, owner)
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, os.getpid())
+    assert "only replaces an owner that is provably dead" in str(caught.value)
+    result = _rust(rust_root, os.getpid())
+    assert result.returncode == 1
+    assert "only replaces an owner that is provably dead" in result.stderr
+
+
+def _release_with_dying_owner(root: Path, source_root: Path) -> None:
+    """Publish + release from a helper whose exit makes the owner dead."""
+    source = source_root / "notes.md"
+    source_root.mkdir(parents=True, exist_ok=True)
+    source.write_text("# Handoff\n\nAll done.\n")
+    helper = (
+        "import argparse, json, os, sys\n"
+        "from pathlib import Path\n"
+        "from wrkslots import cli\n"
+        "root = sys.argv[1]; source = sys.argv[2]\n"
+        "active = Path(root) / 'worktrees' / 'ACTIVE.node-a.json'\n"
+        "doc = json.loads(active.read_text())\n"
+        "identity = cli._read_process_identity(os.getpid())\n"
+        "me = {'pid': identity.pid, 'start_ticks': identity.start_ticks,"
+        " 'boot_id': identity.boot_id, 'host_id': identity.host_id,"
+        " 'cgroup_path': identity.cgroup_path}\n"
+        "doc['slots'][0]['owner'] = me\n"
+        "doc['slots'][0]['coordinator_lease'] = me\n"
+        "active.write_text(json.dumps(doc))\n"
+        "base = dict(project_root=root, machine=None, slot='slot-a',"
+        " agent='agent-slot-a', owner_pid=os.getpid(), expected_generation=1,"
+        " wait_lock=0.0)\n"
+        "cli._cmd_write_handoff(argparse.Namespace(**base, from_file=source))\n"
+        "cli._cmd_release(argparse.Namespace(**base))\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(AU_ROOT / "py")
+    proc = subprocess.run(
+        ["python3", "-c", helper, str(root), str(source)],
+        capture_output=True, text=True, check=False, timeout=300, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_transfer_released_generation_refuses(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path, None)
+    _release_with_dying_owner(rust_root, tmp_path / "rust-src")
+    _release_with_dying_owner(oracle_root, tmp_path / "oracle-src")
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, os.getpid())
+    assert "was released by its owner" in str(caught.value)
+    result = _rust(rust_root, os.getpid())
+    assert result.returncode == 1
+    assert "was released by its owner" in result.stderr
 
 
 def test_transfer_refuses_without_fixture_attestation(tmp_path: Path) -> None:
