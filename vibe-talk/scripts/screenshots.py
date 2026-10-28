@@ -5447,8 +5447,9 @@ SCENES: tuple[Scene, ...] = (
                 # `#266 link-filter-kinds`, "add Issues and Files and Other". The layout half only a
                 # browser has: below the bar, spanning the Links icon's middle, inside the screen and
                 # no wider than the bar, each a whole 44px target; the pull request counted, and the
-                # two documents beside it counted as Other.
-                "PRs, Commits, Actions, Issues, Files and Other hang under Links, all on, inside the screen, 44px each",
+                # two documents beside it counted as Other. `#620 link-url-chip`: URL before them,
+                # off, a 44px target too.
+                "URL, then PRs, Commits, Actions, Issues, Files and Other hang under Links, the kinds all on and URL off, inside the screen, 44px each",
                 "(() => { const row = document.getElementById('link-kinds'); "
                 "const r = row.getBoundingClientRect(); "
                 "const l = document.getElementById('links-filter').getBoundingClientRect(); "
@@ -5456,8 +5457,8 @@ SCENES: tuple[Scene, ...] = (
                 "const mid = (l.left + l.right) / 2; "
                 "const chips = [...row.querySelectorAll('button')]; "
                 "return window.__visible('link-kinds') "
-                "&& chips.map((c) => c.firstChild.textContent).join(' ') === 'PRs Commits Actions Issues Files Other' "
-                "&& chips.every((c) => c.getAttribute('aria-pressed') === 'true' "
+                "&& chips.map((c) => c.firstChild.textContent).join(' ') === 'URL PRs Commits Actions Issues Files Other' "
+                "&& chips.every((c, i) => c.getAttribute('aria-pressed') === (i === 0 ? 'false' : 'true') "
                 "&& c.getBoundingClientRect().width >= 44 && c.getBoundingClientRect().height >= 44) "
                 "&& window.__text('link-kind-pr-count') === '1' "
                 "&& window.__text('link-kind-other-count') === '2' "
