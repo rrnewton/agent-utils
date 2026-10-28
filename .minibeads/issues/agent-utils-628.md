@@ -1,13 +1,14 @@
 ---
 title: 'documents-index-server: fold index, fetch-on-demand and list APIs for linked documents'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 - documents
 created_at: 2026-10-28T13:42:29.697292909+00:00
-updated_at: 2026-10-28T13:42:29.697292909+00:00
+updated_at: 2026-10-28T15:00:48.351756464+00:00
+closed_at: 2026-10-28T15:00:48.351756274+00:00
 ---
 
 # Description
