@@ -1,12 +1,13 @@
 ---
 title: 'headless-approval-surface: route a headless agent''s permission prompts to the owner through the chat bridge, and show full denial reasons in tail'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-10-28T19:20:14.306897689+00:00
-updated_at: 2026-10-28T19:20:14.306897689+00:00
+updated_at: 2026-10-28T21:54:25.040849784+00:00
+closed_at: 2026-10-28T21:54:25.040849614+00:00
 ---
 
 # Description
