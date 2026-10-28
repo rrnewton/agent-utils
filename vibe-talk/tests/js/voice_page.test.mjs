@@ -42954,8 +42954,8 @@ test("`#270 voice-transcript-markers`: the line above a call says what recap it 
     label: "new conversation",
     chip: "412-word recap sent",
     detail: resume.ended,
-    recap: "This call was sent 412 words of the conversation above as a recap, so it can carry on from there.",
-    title: `${resume.ended} This call was sent 412 words of the conversation above as a recap, so it can carry on from there.`,
+    recap: "This call was sent 412 words as a recap: the newest of what was said in your calls of the last 12 hours, word for word.",
+    title: `${resume.ended} This call was sent 412 words as a recap: the newest of what was said in your calls of the last 12 hours, word for word.`,
   });
   // A turn, a Hang up, and the next call: the line the Hang up drew keeps #268's sentence for it,
   // in the resuming wording because a recap went, and gains the chip and its own sentence.
@@ -43257,8 +43257,8 @@ test("`#270 voice-transcript-markers`: a replay that does not say how many words
   // Found by the screenshot walk, whose canned replay answer is an older server's: the line read
   // "0-word recap sent" above a call that had been sent three lines.
   for (const [maxTurns, sentence] of [
-    [40, "This call was sent the lines of the conversation above as a recap, so it can carry on from there."],
-    [1, "This call was sent the last lines above as a recap; 1 older line did not fit, so it cannot see those."],
+    [40, "This call was sent the lines as a recap: the newest of what was said in your calls of the last 12 hours, word for word."],
+    [1, "This call was sent the last lines of your calls of the last 12 hours; 1 older line did not fit, so it cannot see those."],
   ]) {
     const page = newPage();
     page.replayWords = false;

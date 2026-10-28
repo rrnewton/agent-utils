@@ -2503,6 +2503,77 @@ async fn a_replay_carries_the_earlier_exchange_framed_as_a_record() {
     );
 }
 
+/// `#649 voice-agent-tools`. The owner, 2026-10-28: "Is the recap just from the immediately prior
+/// session, not cumulative in a transcript?" It was. Now a replay carries the calls before the one
+/// asked for, oldest first, and over budget keeps the most recent suffix across them, word for word;
+/// a turn heard whose words never arrived as text is a line that says so, not nothing.
+#[tokio::test]
+async fn a_replay_carries_the_recent_calls_before_it_and_keeps_the_newest_suffix_across_them() {
+    let (harness, _store) = replay_harness("max_turns = 4\n");
+    for (id, lines) in [
+        ("conv_one", ["the first question", "the first answer"]),
+        ("conv_two", ["the second question", "the second answer"]),
+        ("conv_three", ["the third question", "the third answer"]),
+    ] {
+        record(&harness, id, "you", lines[0]).await;
+        record(&harness, id, "agent", lines[1]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    record(
+        &harness,
+        "conv_three",
+        "note",
+        "spoken reply — no text received (cut off)",
+    )
+    .await;
+
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_three/replay",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["included"], 4, "{payload}");
+    assert_eq!(payload["conversations"], 2, "{payload}");
+    assert_eq!(payload["truncated"], true, "{payload}");
+    let text = payload["text"].as_str().expect("text");
+    assert!(
+        !text.contains("the first"),
+        "the oldest call is past the budget: {text}"
+    );
+    assert!(!text.contains("the second question"), "{text}");
+    let second = text
+        .find("agent: the second answer")
+        .expect("the call before");
+    let third = text
+        .find("you: the third question")
+        .expect("the call asked for");
+    assert!(second < third, "oldest first: {text}");
+    assert!(
+        text.contains("its words did not arrive as text"),
+        "a turn heard without text is said: {text}"
+    );
+    assert_eq!(
+        payload["words"], 9,
+        "the words said, not the note's: {payload}"
+    );
+
+    // A replay of the first call reaches back to nothing older.
+    let (_, first) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_one/replay",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(first["conversations"], 1, "{first}");
+    assert_eq!(first["included"], 2, "{first}");
+}
+
 #[tokio::test]
 async fn a_transcript_over_budget_reports_what_it_dropped_and_drops_the_oldest() {
     let (harness, _store) = replay_harness("max_turns = 2\n");

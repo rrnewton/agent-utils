@@ -9246,13 +9246,17 @@ function noteConversationEnded(cause = "ended") {
 // becomes the one a new call resumes from.
 
 /** The recap sentence, per state. `{n}` is the words sent, `{d}` the older lines that did not fit. */
+// `#649 voice-agent-tools`. The owner asked whether the recap was only the call just before or
+// cumulative, and decided (2026-10-28 11:07 ET): cumulative across recent calls within a size budget,
+// over budget the most recent part, never summarised. The server builds it so (`recent_turns` in
+// src/replay.rs: the calls of the last 12 hours, newest kept), and these sentences say so.
 const RECAP_DETAILS = {
   sent:
-    "This call was sent {n} words of the conversation above as a recap, so it can carry on from " +
-    "there.",
+    "This call was sent {n} words as a recap: the newest of what was said in your calls of the " +
+    "last 12 hours, word for word.",
   dropped:
-    "This call was sent the last {n} words above as a recap; {d} older lines did not fit, so it " +
-    "cannot see those.",
+    "This call was sent the last {n} words of your calls of the last 12 hours; {d} older lines did " +
+    "not fit, so it cannot see those.",
   client_data:
     "This call was sent {n} words above as a recap with its start request; the agent's own " +
     "settings may ignore a recap sent that way.",

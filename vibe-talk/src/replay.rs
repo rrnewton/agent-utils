@@ -46,8 +46,108 @@
 //! characters is the right number is not something this crate can know — see
 //! `scripts/smoke-agent.py --replay-check`, which is the only thing that can answer it.
 
-use crate::store::{SendOutcome, Speaker, Turn, TurnDetail};
+use crate::store::{
+    ConversationId, SendOutcome, Speaker, StateStore, StoreError, Turn, TurnDetail,
+};
 use crate::untrusted;
+
+/// How far back before the end of the conversation it is built for a recap reaches into the
+/// calls before it. `#649 voice-agent-tools`: the owner, 2026-10-28, "Is the recap just from the
+/// immediately prior session, not cumulative in a transcript?" It was: one conversation, so a call
+/// that dropped twice in a minute handed the third session a 19-word recap. The owner's rule, 11:07
+/// ET: cumulative across recent sessions within a size budget, and over budget, the most recent
+/// suffix of the transcript; no summarising or compaction. The budget is [`ReplayPolicy`]'s, as
+/// before; this bounds how many calls are read to fill it.
+pub const RECAP_SPAN_MS: i64 = 12 * 60 * 60 * 1000;
+
+/// The most conversations a recap reads, the one it is built for included. With the budget at
+/// forty turns, more calls than this inside [`RECAP_SPAN_MS`] would almost never reach the record.
+pub const RECAP_MAX_CONVERSATIONS: usize = 8;
+
+/// The text of the page's note for a turn that played and none of whose words arrived as text
+/// (`#330 voice-long-turn-drop`), as the page files it: the start of the note, which may go on to
+/// say the turn was cut off.
+pub const SPOKEN_WITHOUT_TEXT_NOTE: &str = "spoken reply — no text received";
+
+/// The turns a recap of `id` is built from: that conversation's, after those of the calls before
+/// it that ended within [`RECAP_SPAN_MS`] of its end, oldest first, at most
+/// [`RECAP_MAX_CONVERSATIONS`] conversations, and no more of the older ones than the budget could
+/// keep. Then [`build`] keeps the most recent suffix that fits. Also how many conversations
+/// contributed a turn. `#649 voice-agent-tools`.
+///
+/// A store that cannot list its conversations is no reason to send less than before: the recap is
+/// then the one conversation, as it always was.
+///
+/// # Errors
+///
+/// As [`StateStore::turns`] for `id` itself; a failure reading an earlier one leaves it out.
+pub async fn recent_turns(
+    store: &dyn StateStore,
+    id: &ConversationId,
+    policy: &ReplayPolicy,
+) -> Result<(Vec<Turn>, usize), StoreError> {
+    let own = store.turns(id).await?;
+    let mut spoken = own.iter().filter(|turn| speaks(turn)).count();
+    let mut parts = vec![own];
+    if let Ok(summaries) = store.conversations().await {
+        if let Some(this) = summaries.iter().find(|summary| summary.id == *id) {
+            let floor = this.last_at_ms.saturating_sub(RECAP_SPAN_MS);
+            let mut earlier: Vec<_> = summaries
+                .iter()
+                .filter(|summary| {
+                    // Calls before this one: begun before it, and over by its end (one still going
+                    // after it, from another tab, would put later lines above this call's).
+                    summary.id != *id
+                        && summary.started_at_ms < this.started_at_ms
+                        && summary.last_at_ms <= this.last_at_ms
+                        && summary.last_at_ms >= floor
+                })
+                .collect();
+            // Most recently active first: the suffix is filled from the end.
+            earlier.sort_by_key(|summary| std::cmp::Reverse(summary.last_at_ms));
+            for summary in earlier {
+                if spoken >= policy.max_turns || parts.len() >= RECAP_MAX_CONVERSATIONS {
+                    break;
+                }
+                if let Ok(turns) = store.turns(&summary.id).await {
+                    spoken += turns.iter().filter(|turn| speaks(turn)).count();
+                    parts.push(turns);
+                }
+            }
+        }
+    }
+    let conversations = parts
+        .iter()
+        .filter(|turns| turns.iter().any(speaks))
+        .count();
+    Ok((parts.into_iter().rev().flatten().collect(), conversations))
+}
+
+/// Whether a turn has a line in a recap: something said, a message sent, or a turn heard whose
+/// words never arrived as text, which is said as that.
+fn speaks(turn: &Turn) -> bool {
+    match turn.speaker {
+        Speaker::You | Speaker::Agent | Speaker::Sent => true,
+        Speaker::Note => turn.text.starts_with(SPOKEN_WITHOUT_TEXT_NOTE),
+        Speaker::Marker => false,
+    }
+}
+
+/// Whether the turn at `at` is a "no text received" note whose words arrived after all: an agent
+/// turn follows it before the user speaks again. The page files the note when the turn ends and the
+/// late words when they come (`#649 voice-agent-tools`), so the note no longer says anything true.
+fn text_came_later(turns: &[Turn], at: usize) -> bool {
+    turns[at].speaker == Speaker::Note
+        && turns[at + 1..]
+            .iter()
+            .take_while(|turn| turn.speaker != Speaker::You)
+            .any(|turn| turn.speaker == Speaker::Agent)
+}
+
+/// The line a recap gives a turn that played with none of its words arriving as text. `#649
+/// voice-agent-tools`: left out, a recap read as though the agent had said nothing at all.
+const SPOKEN_WITHOUT_TEXT_LINE: &str =
+    "agent: (answered aloud here; its words did not arrive as text, so they are not in this record)";
 
 /// What the agent is told when the record holds a message it posted, or tried to. `#270
 /// voice-transcript-markers`. Outside the fence, with the preamble, because it is this server
@@ -183,7 +283,9 @@ pub struct Replay {
 pub fn build(turns: &[Turn], policy: &ReplayPolicy) -> Replay {
     let spoken: Vec<&Turn> = turns
         .iter()
-        .filter(|turn| matches!(turn.speaker, Speaker::You | Speaker::Agent | Speaker::Sent))
+        .enumerate()
+        .filter(|(at, turn)| speaks(turn) && !text_came_later(turns, *at))
+        .map(|(_, turn)| turn)
         .collect();
 
     let mut lines: Vec<String> = Vec::new();
@@ -206,7 +308,10 @@ pub fn build(turns: &[Turn], policy: &ReplayPolicy) -> Replay {
         }
         used += cost;
         lines.push(line);
-        words += turn.text.split_whitespace().count();
+        // The words said or sent: a turn whose words never arrived holds none.
+        if turn.speaker != Speaker::Note {
+            words += turn.text.split_whitespace().count();
+        }
         sent_lines |= turn.speaker == Speaker::Sent;
     }
     lines.reverse();
@@ -255,6 +360,9 @@ pub fn build(turns: &[Turn], policy: &ReplayPolicy) -> Replay {
 
 /// One transcript line, with the speaker named and the words neutralized.
 fn render(turn: &Turn) -> String {
+    if turn.speaker == Speaker::Note {
+        return SPOKEN_WITHOUT_TEXT_LINE.to_owned();
+    }
     let who = match turn.speaker {
         Speaker::Sent => sent_label(turn.detail.as_ref()),
         speaker => speaker.as_str().to_owned(),
@@ -737,6 +845,36 @@ mod tests {
         assert!(
             built.text.find("you: line 0").expect("a line") > first_fence,
             "the record must be inside the fence"
+        );
+    }
+
+    #[test]
+    fn a_no_text_note_whose_words_came_later_is_not_replayed_but_one_whose_never_came_is() {
+        // `#649 voice-agent-tools`.
+        let turns = vec![
+            turn(Speaker::You, "what is the runner doing"),
+            turn(Speaker::Note, SPOKEN_WITHOUT_TEXT_NOTE),
+            turn(Speaker::Agent, "it came back at nine"),
+            turn(Speaker::You, "and the build"),
+            turn(
+                Speaker::Note,
+                &format!("{SPOKEN_WITHOUT_TEXT_NOTE} (cut off)"),
+            ),
+        ];
+        let built = build(&turns, &policy(6000, 40));
+        assert_eq!(built.included, 4, "{}", built.text);
+        assert_eq!(
+            built.text.matches("did not arrive as text").count(),
+            1,
+            "{}",
+            built.text
+        );
+        assert!(
+            built
+                .text
+                .contains(&format!("you: and the build\n{SPOKEN_WITHOUT_TEXT_LINE}")),
+            "the note whose words never came is said, after the question it answered: {}",
+            built.text
         );
     }
 

@@ -5263,7 +5263,7 @@ link or existing strong pairing code is accepted; links for a different server a
 | GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider; with `conversation.relay_upstream`, its socket URL is the relay below with a single-use ticket |
 | GET | `/api/v1/voice-socket` | ticket or voice | WebSocket relay to `conversation.relay_upstream`: a page's single-use `ticket`, or the voice-only token without chat tools; no browser token opens it; `502 voice_relay_unreachable`, `503 voice_relay_busy` — see "Relaying the voice socket" |
 | GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers"; to the write token, once, the recap a page armed (`prompt.recap` says its number and counts, never its words) — see "A recap in the profile the bridge fetches" |
-| POST | `/api/v1/voice-recap` | **write** | `{conversation_id}`: arm a recap of that conversation for the bridge's next profile fetch, built as the replay route builds one; answers `{id, armed, included, dropped, truncated, words, expires_in_seconds}`, never the words; `409 recap_unavailable` unless the server hands recaps over that way — see "A recap in the profile the bridge fetches" |
+| POST | `/api/v1/voice-recap` | **write** | `{conversation_id}`: arm a recap of that conversation for the bridge's next profile fetch, built as the replay route builds one; answers `{id, armed, included, dropped, truncated, words, conversations, expires_in_seconds}`, never the words; `409 recap_unavailable` unless the server hands recaps over that way — see "A recap in the profile the bridge fetches" |
 | DELETE | `/api/v1/voice-recap` | **write** | withdraw whatever recap is armed (204): a page starting a call it hands no recap |
 | GET, DELETE | `/api/v1/voice-recap/{id}` | **write** | what became of that recap, `{id, state}`: `armed`, `served`, `withdrawn`, `expired` or `unknown`; `DELETE` withdraws one no fetch has taken and answers `served` when a fetch already did |
 | POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
@@ -5293,7 +5293,7 @@ link or existing strong pairing code is accepted; links for a different server a
 | GET | `/api/v1/conversations/{id}?records=` | **write** | one stored transcript, oldest turn first; `records=1` adds the record rows (`sent`, `marker`) and each row's `detail` (`#270 voice-transcript-markers`), which a read without it never sees |
 | DELETE | `/api/v1/conversations/{id}` | **write** | erase one stored transcript |
 | POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn, `{speaker, text}`; a `you` turn may carry `answer` (the proposal a spoken yes sent). Also the voice page's records: `{speaker: "sent", send}` files the send memory's own copy of send `send` (`404 send_unknown` once forgotten, `409 send_recorded` the second time), and `{speaker: "marker", marker}` a conversation's start or a draft not sent; both carry no text, and anything else is `400 bad_record`. Answers `{id, turn}`, the turn as stored: a record filed in a conversation another has been written to since carries that conversation's last time as its `at_ms`, so it stays inside that conversation and does not move it up the listing |
-| GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call, with `words`, how many words of what was said or sent it holds — see "Resuming" |
+| GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call, with the calls before it in the last 12 hours, `words`, how many words of what was said or sent it holds, and `conversations`, how many calls its lines came from — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
 | GET | `/api/v1/channels/{id}/todo?limit=&reason=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
 | POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
@@ -5504,6 +5504,16 @@ old one, so the agent can carry on from it.
 **That is a reconstruction, and every part of this is arranged so it cannot read as more than
 one.** `replay.enabled` is off by default; when it is on, `GET /api/v1/conversations/{id}/replay`
 renders the stored transcript and the page sends it on the new socket.
+
+**What the record holds** (`#649 voice-agent-tools`; the owner's rule, 2026-10-28): not only the
+conversation just before, but the calls before it too, cumulatively. The record is the
+conversation asked for after every call that ended within the 12 hours before it ended (at most
+eight calls), oldest first, word for word; over the budget (`replay.max_turns`,
+`replay.max_chars`) it keeps the most recent part and drops the oldest lines, and it never
+summarises or compacts. A turn that was heard but whose words never arrived as text is a line
+saying so (`agent: (answered aloud here; its words did not arrive as text ...)`), counted as a
+line and not as words. The answer's `conversations` says how many calls its lines came from; the
+recap the bridge fetches in the profile is built the same way.
 
 ### The states, which are that many different sentences
 

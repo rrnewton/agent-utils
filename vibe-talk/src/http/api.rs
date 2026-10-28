@@ -1550,6 +1550,9 @@ pub struct ArmRecapResponse {
     pub truncated: bool,
     /// Words of the lines it holds.
     pub words: usize,
+    /// How many calls its lines come from. `#649 voice-agent-tools`: see
+    /// [`crate::replay::recent_turns`].
+    pub conversations: usize,
     /// How long it waits for a fetch, in seconds.
     pub expires_in_seconds: u64,
 }
@@ -1587,7 +1590,8 @@ pub async fn arm_voice_recap(
              that has not said it takes the replay frame",
         ));
     }
-    let turns = state.store.turns(&id).await?;
+    let (turns, conversations) =
+        crate::replay::recent_turns(state.store.as_ref(), &id, &state.config.replay.policy).await?;
     let built = crate::replay::build(&turns, &state.config.replay.policy);
     // A session this server is opening itself (its hello, read-aloud) is owed the next fetch; armed
     // after it has started, the call's own fetch is the one that finds the recap. Bounded: a bridge
@@ -1607,6 +1611,7 @@ pub async fn arm_voice_recap(
         dropped: built.dropped,
         truncated: built.truncated,
         words: built.words,
+        conversations: if built.included > 0 { conversations } else { 0 },
         expires_in_seconds: crate::voice_recap::RECAP_TTL.as_secs(),
     })))
 }
@@ -3980,6 +3985,9 @@ pub struct ReplayResponse {
     /// whitespace. `#270 voice-transcript-markers`: what the new conversation's seam says it was
     /// sent.
     pub words: usize,
+    /// How many calls its lines come from: the conversation asked for and the ones before it, up
+    /// to [`crate::replay::RECAP_SPAN_MS`] back. `#649 voice-agent-tools`.
+    pub conversations: usize,
     /// The budget that produced it.
     pub policy: crate::replay::ReplayPolicy,
     /// How the page should hand `text` to the hosted vendor. A `vibe-talk-v1` call sends it in the
@@ -4018,18 +4026,24 @@ pub async fn replay(
     // Not fetched at all when resuming is off. The point of the setting is that prior conversation
     // content is not re-sent to a vendor, and a server that assembled the payload anyway and let
     // the page decide would have already read the whole transcript to do it.
-    let built = if settings.enabled {
-        let turns = state.store.turns(&id).await?;
-        crate::replay::build(&turns, &settings.policy)
+    let (built, conversations) = if settings.enabled {
+        let (turns, conversations) =
+            crate::replay::recent_turns(state.store.as_ref(), &id, &settings.policy).await?;
+        (
+            crate::replay::build(&turns, &settings.policy),
+            conversations,
+        )
     } else {
-        crate::replay::build(&[], &settings.policy)
+        (crate::replay::build(&[], &settings.policy), 0)
     };
+    let conversations = if built.included > 0 { conversations } else { 0 };
     Ok(no_store(Json(ReplayResponse {
         text: built.text,
         included: built.included,
         dropped: built.dropped,
         truncated: built.truncated,
         words: built.words,
+        conversations,
         policy: built.policy,
         transport: settings.transport,
         enabled: settings.enabled,
