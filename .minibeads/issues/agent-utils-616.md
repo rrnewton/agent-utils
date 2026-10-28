@@ -1,13 +1,14 @@
 ---
 title: 'composer-no-autofill: no password manager offers to save on a send'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - web
 created_at: 2026-10-28T07:45:43.301311704+00:00
-updated_at: 2026-10-28T07:45:43.301311704+00:00
+updated_at: 2026-10-28T08:54:27.010629455+00:00
+closed_at: 2026-10-28T08:54:27.010629144+00:00
 ---
 
 # Description
