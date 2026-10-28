@@ -202,9 +202,11 @@ async fn a_catch_up_after_a_call_starts_answers_inside_the_deadline() {
     );
 }
 
-/// The incident of 10-07: one provider command stalled for a minute. The catch-up answers at its
-/// deadline, the stalled channel from its held copy, labelled; the channel queued behind it too.
-/// A second catch-up during the stall answers the same way and asks the provider for nothing.
+/// The incident of 10-07: one provider command stalled for a minute. `#649 voice-agent-tools`: the
+/// catch-up answers at once from the held copies, labelled, and reads every channel behind the
+/// answer; the next catch-up finds the channel read in time current, and the stalled channel and
+/// the one queued behind it still labelled. Neither catch-up waited, and the second asked the
+/// provider for nothing.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_channel_is_answered_from_its_held_copy_and_a_retry_adds_no_reads() {
     let h = harness();
@@ -220,20 +222,17 @@ async fn a_stalled_channel_is_answered_from_its_held_copy_and_a_retry_adds_no_re
     let took = began.elapsed();
 
     assert_eq!(
-        took, ACTIVITY_DEADLINE,
-        "answered at the deadline, not after the stall"
+        took,
+        Duration::ZERO,
+        "answered at once from the held copies"
     );
-    assert!(
-        current(&activity, READ_CHANNEL),
-        "the channel read in time is current"
-    );
-    for id in [WRITE_CHANNEL, THIRD] {
+    for id in [READ_CHANNEL, WRITE_CHANNEL, THIRD] {
         match part(&activity, id).currency {
             Currency::Held { age, failed } => {
                 assert!(age >= Duration::from_secs(20), "{id}: {age:?}");
                 assert_eq!(failed, None, "{id}: still being read, not failed");
             }
-            Currency::Current => panic!("{id} was presented as current"),
+            other => panic!("{id} was presented as {other:?}"),
         }
     }
     assert_eq!(
@@ -241,16 +240,14 @@ async fn a_stalled_channel_is_answered_from_its_held_copy_and_a_retry_adds_no_re
         ["ship it"],
         "stale, not dropped"
     );
+    // The reads it started run on behind the answer.
+    tokio::time::sleep(ACTIVITY_DEADLINE).await;
     assert_eq!(h.slow.reads() - before, 3);
 
     // The retry, at the voice runtime's pace.
     let began = Instant::now();
     let text = text_of(&dispatch(&h.state, Scope::Read, &tool_call()).await);
-    assert!(
-        began.elapsed() <= ACTIVITY_DEADLINE,
-        "{:?}",
-        began.elapsed()
-    );
+    assert_eq!(began.elapsed(), Duration::ZERO);
     assert_eq!(
         h.slow.reads() - before,
         3,
@@ -261,7 +258,8 @@ async fn a_stalled_channel_is_answered_from_its_held_copy_and_a_retry_adds_no_re
         .find(|line| line.starts_with("lead team"))
         .expect("the stalled channel has a block");
     assert!(lead.contains("NOT CURRENT"), "{lead}");
-    assert!(lead.contains("did not answer in time"), "{lead}");
+    assert!(lead.contains("a fresh read is running"), "{lead}");
+    assert!(lead.contains("as of "), "{lead}");
     assert!(lead.contains("may be missing newer messages"), "{lead}");
     let build = text
         .lines()
@@ -276,6 +274,7 @@ async fn a_stalled_channel_is_answered_from_its_held_copy_and_a_retry_adds_no_re
     for id in [WRITE_CHANNEL, THIRD] {
         assert!(current(&activity, id), "{id}");
     }
+    tokio::time::sleep(READ).await;
     assert_eq!(
         h.slow.reads() - before,
         1,
@@ -317,12 +316,16 @@ async fn a_failed_read_is_answered_from_the_held_copy_and_names_the_failure() {
     catch_up(&h.state).await;
     tokio::time::sleep(Duration::from_secs(20)).await;
     h.fake.revoke_token();
+    // `#649 voice-agent-tools`: this catch-up answers from the held copies at once, and the reads
+    // it starts fail behind it; the next one names the failure.
+    catch_up(&h.state).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let activity = catch_up(&h.state).await;
     for id in [READ_CHANNEL, WRITE_CHANNEL, THIRD] {
         match part(&activity, id).currency {
             Currency::Held { failed, .. } => assert_eq!(failed, Some("chat_error"), "{id}"),
-            Currency::Current => panic!("{id} was presented as current"),
+            other => panic!("{id} was presented as {other:?}"),
         }
         assert!(
             part(&activity, id).read.is_ok(),
@@ -363,6 +366,10 @@ async fn a_channel_with_nothing_held_says_it_was_not_read_in_time() {
         text.contains("call recent_activity again in a moment"),
         "{text}"
     );
+    // `#649 voice-agent-tools`: what the agent told the owner on 2026-10-28 was this answer's
+    // first line, "No messages in the last 12 hours in any channel".
+    assert!(text.starts_with("NOTHING COULD BE READ"), "{text}");
+    assert!(!text.contains("No messages in the last"), "{text}");
 }
 
 /// The live feed keeps a held window current: a message pushed after the read is in the next
@@ -420,7 +427,8 @@ fn fed_harness() -> Harness {
 
 /// Start a catch-up that needs every window read again, and come back while the lead team's read
 /// is running: it took the slot two seconds in, after the first channel's, and answers with the
-/// channel as it was then. Returns the catch-up, still running.
+/// channel as it was then. Returns the catch-up, which answered at once from the held windows
+/// (`#649 voice-agent-tools`) and left the reads running.
 async fn into_the_lead_teams_read(h: &Harness) -> tokio::task::JoinHandle<ops::Activity> {
     catch_up(&h.state).await;
     tokio::time::sleep(recent::REUSE_LIVE_FED + Duration::from_secs(1)).await;
@@ -445,8 +453,12 @@ async fn a_message_pushed_while_its_channel_is_being_read_survives_the_read_land
         .live
         .publish(&lead, h.fake.message(&id).expect("seeded"));
 
-    let first = running.await.expect("the catch-up ran");
-    assert!(!current(&first, WRITE_CHANNEL), "not read again in time");
+    running
+        .await
+        .expect("the catch-up that started the read ran");
+    // `#649 voice-agent-tools`: a catch-up while the read runs answers at once from the window.
+    let first = catch_up(&h.state).await;
+    assert!(!current(&first, WRITE_CHANNEL), "not read again yet");
     assert_eq!(said(&first, WRITE_CHANNEL), ["ship it", "pushed mid read"]);
 
     // The read has landed by now, without the message: it answered from before it was created.
@@ -480,8 +492,12 @@ async fn a_message_deleted_while_its_channel_is_being_read_stays_deleted() {
         tombstone,
     ));
 
-    let first = running.await.expect("the catch-up ran");
-    assert!(!current(&first, WRITE_CHANNEL), "not read again in time");
+    running
+        .await
+        .expect("the catch-up that started the read ran");
+    // `#649 voice-agent-tools`: a catch-up while the read runs answers at once from the window.
+    let first = catch_up(&h.state).await;
+    assert!(!current(&first, WRITE_CHANNEL), "not read again yet");
     assert_eq!(said(&first, WRITE_CHANNEL), ["ship it"]);
 
     tokio::time::sleep(Duration::from_secs(3)).await;

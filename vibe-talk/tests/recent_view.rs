@@ -335,10 +335,9 @@ async fn a_held_copy_says_when_this_server_read_it_and_as_of_how_old_it_is() {
         .find(|line| line.starts_with("build noise"))
         .expect("the channel has a block");
     assert!(block.contains("NOT CURRENT"), "{block}");
-    assert!(
-        block.contains("the copy this server read 2 minutes ago"),
-        "{block}"
-    );
+    // `#649 voice-agent-tools`: said as of a local time, with how long ago this server read it.
+    assert!(block.contains("this server's copy as of "), "{block}");
+    assert!(block.contains("(2 minutes ago)"), "{block}");
     assert!(block.contains("AS OF 10 minutes ago"), "{block}");
 }
 

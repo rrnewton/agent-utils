@@ -171,10 +171,12 @@ pub fn tool_manifest_with_services(
                  It needs no list_channels call first, and `hours` is counted back from now for \
                  you, so never look up the time first. The first line names the channel and local \
                  time of the newest message; then each channel's messages, newest channel first, \
-                 with an honest count — when it says \"at least\", say so. It answers within a \
-                 few seconds even when the chat service is slow: a channel marked NOT CURRENT is \
-                 this server's earlier copy, so say it may be missing newer messages, and one that \
-                 was not read can be asked again in a moment. To read further back than it \
+                 with an honest count — when it says \"at least\", say so. It answers at once \
+                 from this server's own copy of each channel, never waiting on the chat service; \
+                 each channel says how current its copy is. One marked NOT CURRENT may be missing \
+                 newer messages, so say so; one marked not read can be asked again in a moment; \
+                 and when the answer says NOTHING COULD BE READ, never say there were no \
+                 messages. To read further back than it \
                  reaches, use read_page. Each message reads [message id | local time | exact \
                  instant | author <@author id>] and then its text: say the local time and the \
                  author when they help, and never read an id aloud. It reads chat messages and \

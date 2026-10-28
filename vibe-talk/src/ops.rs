@@ -2703,6 +2703,13 @@ pub struct ChannelActivity {
     /// that read was complete only up to then: true however recently the read itself ran. `#208
     /// persistent-cache`; see [`crate::recent::Held::as_of`].
     pub as_of: Option<String>,
+    /// The local time, as every message's spoken time (`09:51`), that a copy that is not
+    /// [`Currency::Current`] is as of; `None` beside a current read or an error. `#649
+    /// voice-agent-tools`: "as of 09:51" is what the owner asked a stale answer to say.
+    pub copied_at: Option<String>,
+    /// Whether a live producer feeds the channel ([`crate::recent::live_fed`]), so that a copy
+    /// has had every change since it was read merged in.
+    pub fed: bool,
 }
 
 /// How current one channel's part of an [`Activity`] is. `#210 voice-catchup-speed`.
@@ -2710,13 +2717,22 @@ pub struct ChannelActivity {
 pub enum Currency {
     /// Read from the chat service during this call, or recently enough to stand for now.
     Current,
-    /// This server's earlier copy, because the channel was not read again in time.
+    /// This server's earlier copy, held in memory ([`crate::recent`]): a catch-up does not wait
+    /// for the read that brings it up to date (`#649 voice-agent-tools`), which runs behind it.
     Held {
         /// How long ago this server's read of the copy began. A copy the provider dated with
         /// `as_of` is older than that: [`ChannelActivity::as_of`] says how much.
         age: std::time::Duration,
-        /// Why it was not read again: the code of the newest read's failure, or `None` when that
-        /// read is still running.
+        /// The code of the newest read's failure, or `None` when that read is still running (or
+        /// was not needed).
+        failed: Option<&'static str>,
+    },
+    /// The message cache's copy, because this server held none in memory. `#649
+    /// voice-agent-tools`.
+    Cached {
+        /// How long ago the cache last listed the channel's newest end from the chat service.
+        age: std::time::Duration,
+        /// As for [`Currency::Held`].
         failed: Option<&'static str>,
     },
 }
@@ -2762,8 +2778,30 @@ pub struct ActivitySources {
     pub current: usize,
     /// Answered from this server's earlier copy.
     pub held: usize,
+    /// Answered from the message cache. `#649 voice-agent-tools`.
+    pub cached: usize,
     /// Not answered: nothing held, and the read failed or did not finish in time.
     pub unread: usize,
+    /// Messages inside the window across every channel answered: the number the log says beside
+    /// where they came from.
+    pub rows: usize,
+}
+
+impl ActivitySources {
+    /// One word for where a catch-up was answered from, for the log: `upstream` when every channel
+    /// answered was read during the call or recently enough to stand for now, `memory` or `cache`
+    /// when every one came from that copy, `mixed` for several, `none` when none was answered.
+    /// `#649 voice-agent-tools`.
+    #[must_use]
+    pub fn served_from(&self) -> &'static str {
+        match (self.current > 0, self.held > 0, self.cached > 0) {
+            (false, false, false) => "none",
+            (true, false, false) => "upstream",
+            (false, true, false) => "memory",
+            (false, false, true) => "cache",
+            _ => "mixed",
+        }
+    }
 }
 
 impl Activity {
@@ -2802,6 +2840,10 @@ impl Activity {
                 (Err(_), _) => sources.unread += 1,
                 (Ok(_), Currency::Current) => sources.current += 1,
                 (Ok(_), Currency::Held { .. }) => sources.held += 1,
+                (Ok(_), Currency::Cached { .. }) => sources.cached += 1,
+            }
+            if let Ok(read) = &part.read {
+                sources.rows += read.counted;
             }
         }
         sources
@@ -2829,14 +2871,18 @@ pub fn activity_scan(state: &AppState, lines: u16) -> u16 {
 /// day?" across three channels was list, clock, then one read per channel: up to five rounds, any
 /// of which could be the one that fails. This answers it in one, with no required argument.
 ///
-/// **It answers by a deadline, not when the slowest read ends.** `#210 voice-catchup-speed`. Each
-/// channel is one read of its most recent messages — the same read, noise marks and spoken times
-/// every other read gets — filtered to the window, started for every channel at once and shared
-/// with any read of that channel already running (see [`crate::recent`]). A channel read again
-/// within [`crate::recent::Timing::deadline`] is current; one that was not is answered from this
-/// server's held copy and says how old it is ([`Currency::Held`]); one with nothing held waits up
-/// to [`crate::recent::Timing::cold_deadline`] and is then [`OpError::NotReadInTime`]. A window
-/// young enough to reuse ([`crate::recent::reuse_for`]) is served without a read at all.
+/// **It answers from what this server holds, at once.** `#649 voice-agent-tools` (after `#210
+/// voice-catchup-speed`). Each channel is one read of its most recent messages — the same read,
+/// noise marks and spoken times every other read gets — filtered to the window, started for every
+/// channel at once and shared with any read of that channel already running (see
+/// [`crate::recent`]), and NOT waited for when the channel can be answered from a copy: this
+/// server's held window ([`Currency::Held`]) or, with none held, the message cache's
+/// ([`Currency::Cached`]), each saying how old it is. A window young enough to reuse
+/// ([`crate::recent::reuse_for`]) is current and read again not at all, nor is a channel whose
+/// last read the provider rate-limited ([`crate::recent::RATE_LIMIT_BACKOFF`]). Only a channel
+/// held nowhere is waited for: [`crate::recent::Timing::deadline`] when other channels can be
+/// answered, [`crate::recent::Timing::cold_deadline`] when none can, and is then
+/// [`OpError::NotReadInTime`].
 ///
 /// A read this starts runs under the caller's grant ([`crate::cache::FillGrant::for_caller`]):
 /// none for read scope. A parameter rather than a field of [`ActivityRequest`], which has a
@@ -2876,11 +2922,13 @@ pub async fn activity(
     let timing = recent.timing();
     let began = tokio::time::Instant::now();
 
-    // Every read starts before any is waited for, so their waits overlap rather than add up.
+    // Every read starts before any is waited for, so their waits overlap rather than add up. None
+    // of a channel the provider is rate-limiting: it would only spend its retry budget again.
     let due: Vec<ChannelId> = channels
         .iter()
         .map(|channel| channel.id.clone())
         .filter(|channel| !recent.reusable(channel, scan, crate::recent::reuse_for(state, channel)))
+        .filter(|channel| !recent.backing_off(channel))
         .collect();
     // remote-ops-audit W12 `#287 bulk-reads`: a held window a native head proves unchanged is kept
     // rather than read again. Every other read is started first, so the head read never delays it,
@@ -2890,24 +2938,43 @@ pub async fn activity(
     let (candidates, now) = crate::recent::head_candidates(state, due, scan);
     let mut waits = crate::recent::refresh_all(state, &now, scan, grant);
     waits.extend(crate::recent::keep_or_refresh(state, &candidates, scan, grant).await);
+    // What the message cache holds of each channel this server holds no window of as deep as the
+    // catch-up reads: the copy that answers for it without waiting on the chat service.
+    let mut cached: std::collections::HashMap<ChannelId, crate::cache::sink::StaleTimeline> =
+        std::collections::HashMap::new();
+    for channel in &channels {
+        if !recent.holds_deep(&channel.id, scan) {
+            if let Some(copy) = cached_window(state, &channel.id, scan).await {
+                cached.insert(channel.id.clone(), copy);
+            }
+        }
+    }
+    let answerable = |id: &ChannelId| recent.holds_deep(id, scan) || cached.contains_key(id);
+    let budget = if channels.iter().any(|channel| answerable(&channel.id)) {
+        timing.deadline
+    } else {
+        timing.cold_deadline
+    };
     for channel in &channels {
         let Some(mut done) = waits.remove(&channel.id) else {
             continue;
         };
-        let budget = if recent.holds(&channel.id) {
-            timing.deadline
-        } else {
-            timing.cold_deadline
-        };
-        // A deadline passing is not a failure here: what was not read in time is answered from
-        // what is held, below. Nor is a finished read's sender being gone.
+        if answerable(&channel.id) {
+            // Its read runs on behind the answer and fills what the next catch-up reads.
+            continue;
+        }
+        // A deadline passing is not a failure here: what was not read in time is said to be, in
+        // its own words, below. Nor is a finished read's sender being gone.
         let _ = tokio::time::timeout_at(began + budget, done.wait_for(|over| *over)).await;
     }
 
     let mut reads: Vec<ChannelActivity> = Vec::with_capacity(channels.len());
     for channel in channels {
         let reuse = crate::recent::reuse_for(state, &channel.id);
-        reads.push(channel_activity(state, channel, began, reuse, lines, since_ms, &owner).await);
+        let copy = cached.remove(&channel.id);
+        reads.push(
+            channel_activity(state, channel, began, reuse, lines, since_ms, &owner, copy).await,
+        );
     }
     if !reads.is_empty()
         && reads
@@ -2927,7 +2994,46 @@ pub async fn activity(
     })
 }
 
-/// One channel's part of [`activity`], from what this server holds once the waiting is over.
+/// What the message cache holds of `channel`'s newest `scan` messages, replies included where the
+/// provider keeps them in threads (Slack's All, as a recent read lists them), when the cache has
+/// listed the channel's newest end at least once and its serving gates pass. `#649
+/// voice-agent-tools`: the copy a catch-up answers from at once when this server holds no window
+/// of the channel in memory, as after a restart. Never a read of the chat service.
+pub(crate) async fn cached_window(
+    state: &AppState,
+    channel: &ChannelId,
+    scan: u16,
+) -> Option<crate::cache::sink::StaleTimeline> {
+    for view in [
+        crate::threads::TimelineView::Flat,
+        crate::threads::TimelineView::Main,
+    ] {
+        let ask = Ask::Timeline {
+            view,
+            thread: None,
+            limit: usize::from(scan),
+        };
+        if let Some(copy) = state
+            .message_cache
+            .stale_timeline(channel, &ask)
+            .await
+            .filter(|copy| copy.checked_ms.is_some())
+        {
+            return Some(copy);
+        }
+    }
+    None
+}
+
+/// `ms`, Unix milliseconds, as a message's spoken time is said: local, `09:51`.
+fn spoken_ms(state: &AppState, ms: i64) -> String {
+    crate::clock::spoken(&crate::clock::iso_from_ms(ms), &state.config.timezone)
+}
+
+/// One channel's part of [`activity`], from what this server holds once the waiting is over:
+/// `cached`, the message cache's copy, when [`activity`] found the window held in memory too
+/// shallow for the catch-up (or none); else that window.
+#[allow(clippy::too_many_arguments)]
 async fn channel_activity(
     state: &AppState,
     channel: ChannelInfo,
@@ -2936,42 +3042,79 @@ async fn channel_activity(
     lines: u16,
     since_ms: i64,
     owner: &crate::owner::Owner,
+    cached: Option<crate::cache::sink::StaleTimeline>,
 ) -> ChannelActivity {
     let known = state.live.recent().snapshot(&channel.id);
-    let Some(held) = known.held else {
-        let error = match known.failure {
-            Some(error) if !known.refreshing => OpError::Chat(error),
-            _ => OpError::NotReadInTime,
-        };
-        return ChannelActivity {
-            channel,
-            read: Err(error),
-            currency: Currency::Current,
-            as_of: None,
-        };
-    };
-    let currency = if held.read_finished >= began || held.since_finished() <= reuse {
-        Currency::Current
-    } else {
-        Currency::Held {
-            age: held.read_began.elapsed(),
-            // Said even while another read is running: "the last read failed" is the more useful
-            // of the two things that are true.
-            failed: known.failure.map(|error| OpError::Chat(error).code()),
+    let fed = crate::recent::live_fed(state, &channel.id);
+    let now_ms = now_ms();
+    // Said even while another read is running: "the last read failed" is the more useful of the
+    // two things that are true.
+    let failed = known
+        .failure
+        .clone()
+        .map(|error| OpError::Chat(error).code());
+    let (messages, whole, currency, as_of, copied_at) = match (known.held, cached) {
+        (Some(held), None) => {
+            let (currency, copied_at) =
+                if held.read_finished >= began || held.since_finished() <= reuse {
+                    (Currency::Current, None)
+                } else {
+                    let age = held.read_began.elapsed();
+                    let ago = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+                    (
+                        Currency::Held { age, failed },
+                        Some(spoken_ms(state, now_ms.saturating_sub(ago))),
+                    )
+                };
+            (held.messages, held.whole, currency, held.as_of, copied_at)
+        }
+        (_, Some(copy)) => {
+            // On the cache's own clock, which dated the listing.
+            let cache_now_ms = state
+                .message_cache
+                .cache()
+                .map_or(now_ms, |cache| cache.now_ms());
+            let checked_ms = copy.checked_ms.unwrap_or(cache_now_ms);
+            let age = std::time::Duration::from_millis(
+                u64::try_from(cache_now_ms.saturating_sub(checked_ms)).unwrap_or(0),
+            );
+            // Not `whole`: the cache's newest page says nothing of whether the channel ends below
+            // it, so a count from it is exact only when it reaches past the window's start.
+            (
+                copy.messages,
+                false,
+                Currency::Cached { age, failed },
+                None,
+                Some(spoken_ms(state, checked_ms)),
+            )
+        }
+        (None, None) => {
+            let error = match known.failure {
+                Some(error) if !known.refreshing => OpError::Chat(error),
+                _ => OpError::NotReadInTime,
+            };
+            return ChannelActivity {
+                channel,
+                read: Err(error),
+                currency: Currency::Current,
+                as_of: None,
+                copied_at: None,
+                fed,
+            };
         }
     };
-    let mut messages = held.messages;
+    let mut messages = messages;
     stamp(state, &mut messages);
     crate::noise::filter_for(state, &channel.id)
         .await
         .mark(&mut messages);
     ChannelActivity {
         channel,
-        read: Ok(window_activity(
-            messages, held.whole, lines, since_ms, owner,
-        )),
+        read: Ok(window_activity(messages, whole, lines, since_ms, owner)),
         currency,
-        as_of: held.as_of,
+        as_of,
+        copied_at,
+        fed,
     }
 }
 

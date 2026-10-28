@@ -652,9 +652,9 @@ fn deadline_text(tool: &str) -> String {
     format!(
         "not_read_in_time: this {tool} read of the chat messages did not finish within {} \
          seconds, so nothing was read. If you tell the user, say the {tool} read timed out, and \
-         give no other cause. recent_activity answers from this server's own copy of each \
-         channel's recent messages within a few seconds: call it for a catch-up. Try this read \
-         again in a moment.",
+         give no other cause. recent_activity answers at once from this server's own copy of \
+         each channel's recent messages: call it for a catch-up. Try this read again in a \
+         moment.",
         TOOL_DEADLINE.as_secs()
     )
 }
@@ -1022,12 +1022,17 @@ async fn run_activity(state: &AppState, caller: Scope, args: &Value) -> Result<S
     .await?;
     // `#210 voice-catchup-speed`. How each channel was answered, as counts: the line that says
     // whether a slow catch-up was the chat service or this server, with no channel text in it.
+    // `#649 voice-agent-tools`: and from the cache, with how many messages, so "fast but empty" and
+    // "slow but full" read differently in the log.
     let sources = activity.sources();
     tracing::info!(
         target: "vibe_talk::access",
         current = sources.current,
         held = sources.held,
+        cached = sources.cached,
         unread = sources.unread,
+        rows = sources.rows,
+        served_from = sources.served_from(),
         millis = started.elapsed().as_millis(),
         "recent_activity"
     );
@@ -1143,14 +1148,14 @@ fn activity_block_around(block: &ActivityBlock<'_>, span: &str, body: &str) -> S
     // as the latest.
     let held = match block.part.currency {
         ops::Currency::Current => String::new(),
-        ops::Currency::Held { age, failed } => format!(
-            " NOT CURRENT: {}, so this is the copy this server read {}; say it may be missing \
-             newer messages.",
-            match failed {
-                Some(code) => format!("the latest read of it failed ({code})"),
-                None => "the chat service did not answer in time".to_owned(),
-            },
-            held_age(age)
+        ops::Currency::Held { age, failed } => {
+            copy_note("this server's copy", age, failed, block.part)
+        }
+        ops::Currency::Cached { age, failed } => copy_note(
+            "this server's message cache, last brought up to date from the chat service",
+            age,
+            failed,
+            block.part,
         ),
     };
     let held = format!("{held}{}", block.as_of);
@@ -1201,6 +1206,39 @@ fn activity_block_around(block: &ActivityBlock<'_>, span: &str, body: &str) -> S
     )
 }
 
+/// The sentence that says one channel's part of a catch-up came from a copy, how old it is, and
+/// whether to warn that it may be missing newer messages. `#649 voice-agent-tools`: a catch-up
+/// answers from what this server holds at once and reads the chat service behind the answer, so
+/// the copy is the usual case and says so plainly, as of a local time ("as of 09:51"). A copy the
+/// live feed has kept up to date, with no failed read, needs no warning; one whose latest read
+/// failed, or that nothing feeds, does.
+fn copy_note(
+    what: &str,
+    age: std::time::Duration,
+    failed: Option<&str>,
+    part: &ops::ChannelActivity,
+) -> String {
+    let at = part
+        .copied_at
+        .as_deref()
+        .map_or_else(String::new, |at| format!(" as of {at}"));
+    let ago = held_age(age);
+    match (failed, part.fed) {
+        (None, true) => format!(
+            " From {what}{at} ({ago}), with every change the live feed reported since; a fresh read \
+             is running behind this answer."
+        ),
+        (None, false) => format!(
+            " NOT CURRENT: from {what}{at} ({ago}); a fresh read is running behind this answer, so \
+             say it may be missing newer messages."
+        ),
+        (Some(code), _) => format!(
+            " NOT CURRENT: from {what}{at} ({ago}); the latest read of it failed ({code}), so say \
+             it may be missing newer messages."
+        ),
+    }
+}
+
 /// The closing sentence when the size cap left something out, or nothing.
 fn truncation_note(trimmed: usize, dropped: &[&str], cap: usize) -> String {
     if trimmed == 0 && dropped.is_empty() {
@@ -1233,6 +1271,21 @@ fn truncation_note(trimmed: usize, dropped: &[&str], cap: usize) -> String {
     out
 }
 
+/// "any channel", or, when some channels could not be read, "the channels that could be read (N
+/// could not be, see below)": a quiet answer about the channels read is not one about the rest.
+fn read_channels_phrase(activity: &ops::Activity) -> String {
+    match activity
+        .channels
+        .iter()
+        .filter(|part| part.read.is_err())
+        .count()
+    {
+        0 => "any channel".to_owned(),
+        1 => "the channels that could be read (one could not be, see below)".to_owned(),
+        n => format!("the channels that could be read ({n} could not be, see below)"),
+    }
+}
+
 /// Render an [`ops::Activity`] for a model, within about `cap` bytes.
 ///
 /// The first line answers "what was the last thing said, and where?" in this server's own words —
@@ -1261,13 +1314,23 @@ fn activity_text(
             channel.display_name()
         ),
         Some((channel, newest)) => format!(
-            "No messages in the last {span} in any channel. The newest message any channel holds \
-             is older: {}, {} ({}).\n",
+            "No messages in the last {span} in {}. The newest message any channel holds is older: \
+             {}, {} ({}).\n",
+            read_channels_phrase(activity),
             channel.display_name(),
             newest.entry.spoken_time,
             age(activity.now_ms, newest.at_ms)
         ),
-        None => format!("No messages in the last {span} in any channel.\n"),
+        // `#649 voice-agent-tools`: on 2026-10-28 every channel missed its read and this said "No
+        // messages in the last 12 hours in any channel", which the agent told the owner. Nothing
+        // read is not nothing said.
+        None if activity.channels.iter().all(|part| part.read.is_err()) => format!(
+            "NOTHING COULD BE READ: no channel could be read just now and this server holds no copy \
+             of any, so this says NOTHING about whether there were messages in the last {span}. \
+             Do not say there were none: say the channels could not be read yet, and call \
+             recent_activity again in a moment.\n"
+        ),
+        None => format!("No messages in the last {span} in {}.\n", read_channels_phrase(activity)),
     };
     let channels = activity.channels.len();
     head.push_str(&format!(

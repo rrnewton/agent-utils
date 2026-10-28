@@ -243,18 +243,30 @@ async fn get(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
 /// A voice catch-up, as `recent_activity` asks for one, projected onto what it answered channel by
 /// channel: what it said, how it counted, whether it was current or a held copy (and how old, and
 /// why), and the newest message it saw.
+///
+/// `#649 voice-agent-tools`: a catch-up answers a channel it holds a window of at once and reads it
+/// behind the answer. So this is that catch-up, then a moment for the reads behind it to land (the
+/// fakes answer at once), then the catch-up a listener asking again would get: what this server
+/// answers once its reads are in, at the cost the first one paid. The second reads nothing a
+/// window young enough to reuse already holds.
 async fn catch_up(state: &AppState) -> Value {
-    let activity = vibe_talk::ops::activity(
-        state,
-        vibe_talk::auth::Scope::Read,
-        vibe_talk::ops::ActivityRequest {
-            hours: None,
-            per_channel_limit: None,
-            channel: None,
-            now_ms: vibe_talk::ops::now_ms(),
-        },
-    )
-    .await;
+    let ask = || {
+        vibe_talk::ops::activity(
+            state,
+            vibe_talk::auth::Scope::Read,
+            vibe_talk::ops::ActivityRequest {
+                hours: None,
+                per_channel_limit: None,
+                channel: None,
+                now_ms: vibe_talk::ops::now_ms(),
+            },
+        )
+    };
+    drop(ask().await);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let activity = ask().await;
+    // And whatever the second started, so every read lands in its own case.
+    tokio::time::sleep(Duration::from_millis(10)).await;
     let activity = match activity {
         Ok(activity) => activity,
         Err(error) => return json!({ "error": error.code() }),
@@ -270,6 +282,9 @@ async fn catch_up(state: &AppState) -> Value {
                 vibe_talk::ops::Currency::Current => json!("current"),
                 vibe_talk::ops::Currency::Held { age, failed } => {
                     json!({ "held_seconds": age.as_secs(), "failed": failed })
+                }
+                vibe_talk::ops::Currency::Cached { age, failed } => {
+                    json!({ "cached_seconds": age.as_secs(), "failed": failed })
                 }
             };
             let read = match &part.read {
@@ -472,9 +487,11 @@ async fn a_provider_without_a_read_of_several_channels_gets_todays_answers_at_to
         5
     );
     assert!(upstream("a catch-up right after the warm-up").is_empty());
+    // Five, and the failed channel once more for the catch-up asked again after it (`#649
+    // voice-agent-tools`: see `catch_up`): a failure that is not a rate limit starts no backoff.
     assert_eq!(
         upstream("a catch-up while one channel's read fails").len(),
-        5
+        6
     );
     let failed = case("a catch-up while one channel's read fails")["answer"].to_string();
     assert!(failed.contains("chat_error"), "{failed}");

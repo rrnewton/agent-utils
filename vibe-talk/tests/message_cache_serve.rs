@@ -2486,3 +2486,94 @@ async fn an_answer_from_the_cache_is_dated_by_the_last_upstream_read_that_answer
     assert!(body["refresh_failed"].is_string(), "{body}");
     assert_eq!(as_of(&body), T0 + 3 * HOUR, "{body}");
 }
+
+/// A voice catch-up of the Slack channel, as `recent_activity` asks for one over the last `hours`
+/// counted back from the fixtures' clock.
+async fn slack_catch_up(state: &AppState, hours: u64) -> vibe_talk::ops::Activity {
+    vibe_talk::ops::activity(
+        state,
+        vibe_talk::auth::Scope::Write,
+        vibe_talk::ops::ActivityRequest {
+            hours: Some(hours),
+            per_channel_limit: None,
+            channel: None,
+            now_ms: slack_ms(3_600),
+        },
+    )
+    .await
+    .expect("a catch-up answers")
+}
+
+/// `#649 voice-agent-tools`. The owner's catch-up of 2026-10-28: after a restart this server held
+/// no window of any channel in memory, Slack was rate-limiting history and replies, every channel
+/// missed its eight-second read, and the answer said there were no messages in any channel. With
+/// the message cache holding the channel, the catch-up answers from it at once, replies and all,
+/// says it is the cache's copy and how old, and reads Slack behind the answer; once that read is
+/// rate-limited, the next catch-up does not start it again.
+#[tokio::test]
+async fn a_catch_up_with_nothing_held_answers_from_the_cache_at_once_under_a_rate_limit() {
+    let (state, fake, _clock, _dir) = slack_threads_deployment("catch-up-cache-first", false).await;
+    state.message_cache.set_serve(true);
+    rate_limit(&fake, "conversations.history");
+    rate_limit(&fake, "conversations.replies");
+    let channel = ChannelId(SLACK_CH.to_owned());
+    assert!(!state.live.recent().holds(&channel), "nothing in memory");
+
+    let began = std::time::Instant::now();
+    let activity = slack_catch_up(&state, 12).await;
+    let took = began.elapsed();
+    eprintln!(
+        "voice-agent-tools measurement: recent_activity from the cache, nothing held, Slack \
+         rate-limited: {} ms",
+        took.as_millis()
+    );
+    assert!(took < Duration::from_millis(300), "{took:?}");
+    let part = &activity.channels[0];
+    assert!(
+        matches!(
+            part.currency,
+            vibe_talk::ops::Currency::Cached { age, .. } if age < Duration::from_secs(3_600)
+        ),
+        "the cache's copy, dated by its own clock: {:?}",
+        part.currency
+    );
+    assert!(part.copied_at.is_some(), "says what time the copy is as of");
+    let read = part.read.as_ref().expect("answered");
+    let said: Vec<&str> = read.messages.iter().map(|m| m.content.as_str()).collect();
+    for text in ["message 0", "first reply", "only reply", "message 5"] {
+        assert!(said.contains(&text), "{text}: {said:?}");
+    }
+    let sources = activity.sources();
+    assert_eq!((sources.cached, sources.unread), (1, 0), "{sources:?}");
+    assert_eq!(sources.served_from(), "cache");
+
+    // The read behind the answer meets the rate limit; the next catch-up names the failure and
+    // starts no read of its own while the backoff runs.
+    tokio::time::timeout(WAIT, async {
+        while state.live.recent().snapshot(&channel).failure.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the read behind the answer failed on the rate limit");
+    assert!(state.live.recent().backing_off(&channel));
+    let history = fake.calls("conversations.history");
+    let activity = slack_catch_up(&state, 12).await;
+    assert!(
+        matches!(
+            activity.channels[0].currency,
+            vibe_talk::ops::Currency::Cached {
+                failed: Some(_),
+                ..
+            }
+        ),
+        "{:?}",
+        activity.channels[0].currency
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fake.calls("conversations.history"),
+        history,
+        "no read started while Slack is refusing them"
+    );
+}

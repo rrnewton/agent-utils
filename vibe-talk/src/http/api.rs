@@ -2540,8 +2540,9 @@ pub struct ChannelActivityResponse {
     pub at_least: bool,
     /// Placeholders inside the window that the owner's noise rules call read.
     pub noise: usize,
-    /// Present when this channel was not read again in time and is answered from this server's
-    /// earlier copy: how many seconds ago that copy's read began. `#210 voice-catchup-speed`.
+    /// Present when this channel is answered from a copy rather than a read during the call: how
+    /// many seconds ago that copy's read began, or, for the message cache's copy, when the cache
+    /// last listed the channel's newest end. `#210 voice-catchup-speed`, `#649 voice-agent-tools`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_age_seconds: Option<u64>,
 }
@@ -2596,7 +2597,9 @@ pub async fn activity(
                 noise: read.noise,
                 held_age_seconds: match part.currency {
                     ops::Currency::Current => None,
-                    ops::Currency::Held { age, .. } => Some(age.as_secs()),
+                    ops::Currency::Held { age, .. } | ops::Currency::Cached { age, .. } => {
+                        Some(age.as_secs())
+                    }
                 },
             },
             Err(error) => ChannelActivityResponse {

@@ -169,6 +169,19 @@ fn server() -> (AppState, Arc<FakeDiscord>, Arc<Plain>) {
     (state, fake, plain)
 }
 
+/// A voice catch-up, as the activity route answers it. `#649 voice-agent-tools`: a catch-up
+/// answers a channel it holds a window of at once and reads it behind the answer, so this is that
+/// catch-up, a moment for its reads to land (the fakes answer at once), and then the catch-up a
+/// listener asking again would get, with a moment for whatever that one started: what this server
+/// answers once its reads are in, at the cost the first one paid.
+async fn ask_activity(router: &axum::Router) -> (StatusCode, Value) {
+    get(router, "/api/v1/activity").await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let answer = get(router, "/api/v1/activity").await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    answer
+}
+
 async fn get(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
     let request = Request::builder()
         .uri(uri)
@@ -303,14 +316,14 @@ async fn record() -> Value {
     poller.abort();
     let _ = poller.await;
 
-    let (status, body) = get(&router, "/api/v1/activity").await;
+    let (status, body) = ask_activity(&router).await;
     case(
         "a catch-up with nothing held",
         plain.take(),
         activity(status, &body),
         &labels,
     );
-    let (status, body) = get(&router, "/api/v1/activity").await;
+    let (status, body) = ask_activity(&router).await;
     case(
         "a catch-up at once after it",
         plain.take(),
@@ -318,7 +331,7 @@ async fn record() -> Value {
         &labels,
     );
     tokio::time::sleep(Duration::from_secs(61)).await;
-    let (status, body) = get(&router, "/api/v1/activity").await;
+    let (status, body) = ask_activity(&router).await;
     case(
         "a catch-up after the reuse period, nothing changed",
         plain.take(),
@@ -333,7 +346,7 @@ async fn record() -> Value {
     );
     labels.add(&edited, "write-2");
     tokio::time::sleep(Duration::from_secs(61)).await;
-    let (status, body) = get(&router, "/api/v1/activity").await;
+    let (status, body) = ask_activity(&router).await;
     case(
         "a catch-up after a message arrived",
         plain.take(),
@@ -349,7 +362,7 @@ async fn record() -> Value {
     );
     labels.add(&gone, "third-2");
     tokio::time::sleep(Duration::from_secs(61)).await;
-    let (status, body) = get(&router, "/api/v1/activity").await;
+    let (status, body) = ask_activity(&router).await;
     case(
         "a catch-up after an edit and a message arrived",
         plain.take(),
@@ -358,7 +371,7 @@ async fn record() -> Value {
     );
     fake.delete(&gone);
     tokio::time::sleep(Duration::from_secs(61)).await;
-    let (status, body) = get(&router, "/api/v1/activity").await;
+    let (status, body) = ask_activity(&router).await;
     case(
         "a catch-up after a delete, and nothing added",
         plain.take(),
@@ -1073,7 +1086,7 @@ async fn catch_up_once(
     counting: &CountingChat,
     seen: &mut usize,
 ) -> (Value, Vec<String>) {
-    let (status, body) = get(router, "/api/v1/activity").await;
+    let (status, body) = ask_activity(router).await;
     let calls = counting.calls();
     let asked = calls[*seen..]
         .iter()
@@ -1267,7 +1280,11 @@ async fn a_catch_up_reads_the_channels_when_their_heads_are_late() {
     tokio::time::sleep(Duration::from_secs(61)).await;
     let began = tokio::time::Instant::now();
     let (answer, asked) = catch_up_once(&router, &counting, &mut seen).await;
-    assert_eq!(began.elapsed(), vibe_talk::recent::HEADS_DEADLINE);
+    // The heads' deadline, then the two moments `ask_activity` gives the reads to land.
+    assert_eq!(
+        began.elapsed(),
+        vibe_talk::recent::HEADS_DEADLINE + Duration::from_millis(20)
+    );
     assert_eq!(asked.len(), 4, "{asked:?}");
     assert!(all_current(&answer), "{answer}");
 }

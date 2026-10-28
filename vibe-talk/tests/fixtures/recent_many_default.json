@@ -412,7 +412,8 @@
       "fetch_recent 2222222222 limit=20",
       "fetch_recent 3333333333 limit=20",
       "fetch_recent 4444444444 limit=20",
-      "fetch_recent 5555555555 limit=20"
+      "fetch_recent 5555555555 limit=20",
+      "fetch_recent 4444444444 limit=20"
     ]
   },
   {

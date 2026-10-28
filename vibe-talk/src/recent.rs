@@ -11,9 +11,11 @@
 //! not available: the adapter's single slot is a resource limit, not an oversight.
 //!
 //! What the server can do on its own is not wait for the slowest read. It keeps the newest window
-//! it has read of each channel, keeps that window current from the live feed, and gives a catch-up
-//! a deadline: whatever has not been read again by then is answered from the held copy, labelled
-//! with its age, rather than not at all.
+//! it has read of each channel, keeps that window current from the live feed, and answers a
+//! catch-up from it at once, labelled with its age, with the read that brings it up to date
+//! running behind the answer. A channel with no window here is answered from the message cache
+//! when that holds it (`#649 voice-agent-tools`); only a channel held nowhere is waited for, by a
+//! deadline.
 //!
 //! See also [`crate::read_ahead`], read-aloud's separate 30-second memory of fetched messages.
 //!
@@ -97,13 +99,19 @@ use crate::live::{LiveKind, LiveMessage};
 use crate::model::{ChannelId, Message};
 use crate::state::AppState;
 
-/// How long a catch-up waits for the channels it holds a copy of. Measured catch-ups took five to
+/// How long a catch-up waits for a channel this server holds NO copy of (neither here nor in the
+/// message cache) while other channels can be answered at once. Measured catch-ups took five to
 /// nine seconds against a fifteen-second tool limit; this leaves room for the speech model too.
+///
+/// A channel it holds a copy of is not waited for at all. `#649 voice-agent-tools`: the owner,
+/// 2026-10-28, "I want that to be answered as quickly as possible from our vibe talk server cache
+/// and certainly not require any upstream slack operations." Its read runs behind the answer, and
+/// the answer says how old the copy is.
 pub const ACTIVITY_DEADLINE: Duration = Duration::from_millis(2_500);
 
-/// How long a catch-up waits for a channel it holds NO copy of, before saying it could not be read
-/// in time. Longer, because the alternative is an answer with nothing in it, and still well inside
-/// the fifteen-second tool limit.
+/// How long a catch-up waits when NO channel can be answered from a copy, before saying it could
+/// not be read in time. Longer, because the alternative is an answer with nothing in it, and still
+/// well inside the fifteen-second tool limit.
 pub const COLD_DEADLINE: Duration = Duration::from_secs(8);
 
 /// How old a window may be and still be served without reading the channel again, when a live
@@ -135,6 +143,14 @@ pub const HEAD_CLOCK_MARGIN: Duration = Duration::from_secs(120);
 /// provider's memory; one that takes longer must not eat the catch-up's own deadline.
 /// remote-ops-audit W12 `#287 bulk-reads`.
 pub const HEADS_DEADLINE: Duration = Duration::from_secs(1);
+
+/// How long a channel whose read the provider rate-limited is not read again for a catch-up, at
+/// least: the provider's own `retry_after` when that is longer. `#649 voice-agent-tools`: on
+/// 2026-10-28 a catch-up after a restart asked Slack for every channel's history and replies while
+/// Slack was already refusing them, so each read spent its whole retry budget (28 s for one) and
+/// the catch-up had nothing to show. A catch-up answers from this server's copy instead, and the
+/// read waits until the provider will take it.
+pub const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How many pushes each channel keeps, to apply again to a read that was running when they
 /// arrived. The depth the live hub keeps for a page that attaches late, and far more than one
@@ -247,6 +263,10 @@ struct Slot {
     refreshing: Option<(u64, watch::Receiver<bool>)>,
     /// The newest refresh failure and when its read began. Cleared by a later success.
     failure: Option<(ChatError, Instant)>,
+    /// Until when a catch-up starts no read of this channel, because the provider rate-limited
+    /// the last one: [`RATE_LIMIT_BACKOFF`] or its own `retry_after`, from when that read failed.
+    /// Cleared by a later success. `#649 voice-agent-tools`.
+    backoff_until: Option<Instant>,
     /// How many pushes this channel has had: the number of the newest one.
     pushes: u64,
     /// The newest [`JOURNAL`] of them, with their numbers, oldest first.
@@ -395,6 +415,8 @@ impl RecentWindows {
         {
             slot.failure = None;
         }
+        // And the provider took it, so a rate limit before it is over.
+        slot.backoff_until = None;
         if slot
             .held
             .as_ref()
@@ -432,6 +454,10 @@ impl RecentWindows {
             return;
         }
         let slot = windows.slots.entry(channel.clone()).or_default();
+        // Whatever else was read meanwhile, the provider is refusing reads of this channel now.
+        if let Some(after) = error.retry_after() {
+            slot.backoff_until = Some(Instant::now() + after.max(RATE_LIMIT_BACKOFF));
+        }
         if slot
             .held
             .as_ref()
@@ -440,6 +466,17 @@ impl RecentWindows {
             return;
         }
         slot.failure = Some((error, started));
+    }
+
+    /// Whether a catch-up should leave `channel` unread for now, because the provider rate-limited
+    /// its last read and the backoff has not run out. See [`RATE_LIMIT_BACKOFF`].
+    #[must_use]
+    pub fn backing_off(&self, channel: &ChannelId) -> bool {
+        self.windows()
+            .slots
+            .get(channel)
+            .and_then(|slot| slot.backoff_until)
+            .is_some_and(|until| Instant::now() < until)
     }
 
     /// Drop every held window, every journalled push and every failure, and forget every refresh
@@ -821,6 +858,16 @@ pub fn refresh(
     done
 }
 
+/// Whether a refresh gives up at the provider's first rate limit rather than waiting it out
+/// ([`crate::read_reason::hurry`]): when the message cache serves, since a catch-up then answers
+/// from the cache in the read's place and does not wait for it. `#649 voice-agent-tools`: on
+/// 2026-10-28 one such read held a refresh permit for 28 s waiting out Slack's limits, for a
+/// catch-up that had already answered. The failure starts the channel's
+/// [`RATE_LIMIT_BACKOFF`].
+fn gives_up_early(state: &AppState) -> bool {
+    state.message_cache.serve_enabled()
+}
+
 /// Read one claimed channel's newest `limit` messages on their own, keep what the read brought or
 /// its failure, and end the refresh.
 async fn read_alone(state: AppState, claim: Claim, limit: u16) {
@@ -840,7 +887,10 @@ async fn read_alone(state: AppState, claim: Claim, limit: u16) {
         // `remote-ops-audit`: counted as the catch-up's, whoever's request queued it.
         Ok(_permit) => {
             crate::read_reason::ReadReason::Recent
-                .scope(crate::recent_view::read(&state, &claim.channel, limit))
+                .scope(crate::read_reason::hurry(
+                    gives_up_early(&state),
+                    crate::recent_view::read(&state, &claim.channel, limit),
+                ))
                 .await
         }
         Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
@@ -975,7 +1025,10 @@ async fn read_together(
         // `remote-ops-audit`: counted as the catch-up's, as a channel read on its own is.
         Ok(_permit) => {
             crate::read_reason::ReadReason::Recent
-                .scope(crate::recent_view::read_many(&state, &asks))
+                .scope(crate::read_reason::hurry(
+                    gives_up_early(&state),
+                    crate::recent_view::read_many(&state, &asks),
+                ))
                 .await
         }
         // Nothing answered: each channel is read on its own, and meets the same refusal there.
@@ -1133,6 +1186,7 @@ pub fn warm(state: &AppState) -> usize {
         .into_iter()
         .map(|channel| channel.id)
         .filter(|channel| !recent.reusable(channel, scan, reuse_for(state, channel)))
+        .filter(|channel| !recent.backing_off(channel))
         .collect();
     let reading = due.len();
     let (candidates, now) = head_candidates(state, due, scan);
