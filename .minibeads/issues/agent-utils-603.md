@@ -1,6 +1,6 @@
 ---
 title: 'server-side-search: Phase 0, honest scope on the page and All without the ten-thread bound'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-521: parent-child
 created_at: 2026-10-28T01:27:47.726771237+00:00
-updated_at: 2026-10-28T01:27:47.726771237+00:00
+updated_at: 2026-10-28T03:35:35.758872902+00:00
+closed_at: 2026-10-28T03:35:35.758872682+00:00
 ---
 
 # Description

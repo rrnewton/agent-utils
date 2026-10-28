@@ -1,6 +1,6 @@
 ---
 title: 'server-side-search: a /search route under the serving rules, and the scope line'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-521: parent-child
 created_at: 2026-10-28T01:27:55.039913970+00:00
-updated_at: 2026-10-28T01:27:55.039913970+00:00
+updated_at: 2026-10-28T03:35:35.762722898+00:00
+closed_at: 2026-10-28T03:35:35.762722768+00:00
 ---
 
 # Description

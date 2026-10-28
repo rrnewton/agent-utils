@@ -2050,6 +2050,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     history: new Map(),
     /** Every history request, as `METHOD channel[ prioritize] body`. */
     historyCalls: [],
+    /** `#608 server-side-search`. Set to `{status, error, detail}` to make the history routes refuse that way. */
+    historyFailure: null,
     /**
      * `#253 upstream-clear-polish`. What `POST .../upstream-clear/now` answers: a function of the
      * channel's held state returning `{outcome, state, attempt?, message_id?, message_at_ms?}`, the
@@ -2082,6 +2084,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     timelineCalls: [],
     /** Every request the page made, as `METHOD path`, so a test can count what did NOT happen. */
     requests: [],
+    /** `#605 server-side-search`. Every search of the server's copy the page sent, and the answer to each. */
+    serverSearchCalls: [],
+    serverSearch: async () => json(200, { hits: [], scopes: [], upstream: "none", untrusted_content_notice: "third-party text" }),
+
     /**
      * `#34 voice-chat-write-confirm`. The one post the fake server holds for confirmation, as a
      * `PendingPost`, or null. Set it with `page.propose`, which also wakes a parked watch, exactly
@@ -3775,6 +3781,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         const id = decodeURIComponent(historyPath[1]);
         const bump = historyPath[2] === "/prioritize";
         page.historyCalls.push(`${method} ${id}${bump ? " prioritize" : ""} ${(options && options.body) || ""}`.trim());
+        if (page.historyFailure) {
+          const { status, error, detail } = page.historyFailure;
+          return json(status, { error, detail });
+        }
         const held = page.history.get(id) || {
           channel_id: id, server_mode: "full", mode: "full", settable: true, messages: 0,
           walking: false, complete: false, cycle_pages: 0, now_ms: Date.UTC(2026, 9, 27, 22, 0),
@@ -4175,6 +4185,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         }));
         listed.sort((a, b) => b.last_at_ms - a.last_at_ms || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
         return json(200, { conversations: listed });
+      }
+      // `#605 server-side-search`: the server's copy searched, one channel or all.
+      if (/^\/api\/v1\/(channels\/[^/]+\/)?search\?/.test(String(path))) {
+        page.serverSearchCalls.push(String(path));
+        return page.serverSearch(String(path), options);
       }
       throw new Error(`the page fetched ${path}, which this fixture does not serve`);
     },
@@ -5256,6 +5271,14 @@ const TUNING_BANDS = {
   SEARCH_OLDER_HITS: [1, 10,
     "new matches that end a walk. One stops before the reader sees whether the term is common; past " +
     "about ten, a common term reads the whole budget where a few matches were what was asked for"],
+  SERVER_SEARCH_DELAY_MS: [150, 1500,
+    "how long after the typing pauses the server's copy is searched (`#605 server-side-search`). Under a " +
+    "sixth of a second every keystroke of a word is a search of the whole copy; past a second and a half " +
+    "the line says 'searching' long after the reader stopped typing"],
+  SEARCH_FURTHER_POLL_MS: [1000, 30000,
+    "how often the page asks how the gathering of older history stands (`#608 server-side-search`). " +
+    "Under a second it asks the server faster than a page of history is read; past half a minute the " +
+    "line and the hits lag the archive the owner is watching grow"],
   SEARCH_OLDER_TAP_MS: [200, 1000,
     "how long after a walk starts a tap on its control is still the tap that started it, not Stop. " +
     "Under a fifth of a second a double tap stops the walk it started; past a second a reader who " +
@@ -55561,9 +55584,11 @@ test("`#229 desktop-two-column`: the search and Links reach both columns, and th
   await page.settle();
   const visible = (list) => page.el(list).children.filter((li) => !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
   assert.deepStrictEqual(visible("side-log"), ["202"], "the search did not reach the right column");
-  assert.deepStrictEqual(visible("discord-log"), [], "the left column was not searched");
-  assert.equal(page.el("search-count").textContent, "1 of 5 loaded", "the count does not speak for both columns");
-  assert.equal(page.el("search-empty").hidden, false, "the left column said nothing of its empty list");
+  // `#606 server-side-search`: in Main a thread stands for its replies, so the roots of the threads
+  // whose held replies match stay.
+  assert.deepStrictEqual(visible("discord-log"), ["201", "203"], "the left column was not searched");
+  assert.equal(page.el("search-count").textContent, "3 of 5 loaded", "the count does not speak for both columns");
+  assert.equal(page.el("search-empty").hidden, true, "the left column said its list was empty");
   assert.equal(page.el("side-search-empty").hidden, true);
   await page.el("search-field").setValue("root");
   await page.settle();
@@ -64953,7 +64978,7 @@ test("`#262 search-load-older`: in two columns the right column's thread walks i
   await page.settle();
   // Main holds the first message alone, and says so.
   assert.equal(page.el("search-empty").hidden, false);
-  assert.match(page.el("search-empty").textContent, / Thread replies are not in Main\.$/);
+  assert.match(page.el("search-empty").textContent, / Main shows a thread when a reply held here matches; All may hold more replies\.$/);
   assert.equal(page.el("search-in-all").hidden, true, "Search All was offered in two columns");
   const chip = page.el("side-older");
   assert.equal(chip.hidden, false);
@@ -65111,18 +65136,27 @@ test("`#262 search-load-older`: a card that shows its thread's summary is found 
 
 test("`#262 search-load-older`: in one column on Main a search nothing matches offers All, which has the replies, and keeps the search", async () => {
   const page = await threadPage("main");
+  // `#606 server-side-search`: in Main a thread stands for its replies, so a word only replies say
+  // keeps their roots, and All is not offered over them.
   await search(page, "answer");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["201", "203"], "Main did not keep the roots whose replies match");
+  assert.equal(page.el("search-in-all").hidden, true, "Search All was offered over matches");
+  await page.el("search-field").setValue("kestrel");
   await page.settle();
   assert.deepStrictEqual(matchedIds(page), []);
   assert.equal(page.el("search-empty").hidden, false);
-  assert.match(page.el("search-empty").textContent, /^Searched .+ in this browser.+ None match\. Thread replies are not in Main\.$/);
+  assert.match(page.el("search-empty").textContent, /^Searched .+ in this browser.+ None match\. Main shows a thread when a reply held here matches; All may hold more replies\.$/);
   const all = page.el("search-in-all");
   assert.equal(all.hidden, false, "Main offered no way to the replies");
   assert.equal(all.textContent, "Search All — thread replies too");
   await all.click();
   await page.settle();
   assert.equal(page.el("thread-select").value, "flat", "Search All did not open All");
-  assert.equal(page.el("search-field").value, "answer", "Search All dropped the search");
+  assert.equal(page.el("search-field").value, "kestrel", "Search All dropped the search");
+  assert.deepStrictEqual(matchedIds(page), [], "All found what nothing held says");
+  await page.el("search-field").setValue("answer");
+  await page.settle();
   assert.deepStrictEqual(matchedIds(page), ["202", "204"], "All did not show the replies the search finds");
   assert.equal(all.hidden, true, "Search All stayed up once there were matches");
   // Not offered while something on Main matches, nor with nothing typed.
@@ -65179,7 +65213,7 @@ test("`#262 search-load-older`: a finger on the glass holds the walk's next page
 
 test("`#262 search-load-older`: Search All goes when two columns come, and a press left on it does not make the left column All", async () => {
   const page = await threadPage("main");
-  await search(page, "answer");
+  await search(page, "kestrel");
   await page.settle();
   const all = page.el("search-in-all");
   assert.equal(all.hidden, false, "Main offered no way to the replies");
@@ -65198,11 +65232,11 @@ test("`#262 search-load-older`: Search All goes when two columns come, and a pre
 test("`#262 search-load-older`: back in one column on Main, a search that still matches nothing offers Search All at once", async () => {
   const page = await threadPage("main");
   await twoColumns(page);
-  await search(page, "answer");
+  await search(page, "kestrel");
   await page.settle();
   const all = page.el("search-in-all");
   assert.equal(all.hidden, true, "Search All was offered in two columns");
-  assert.match(page.el("search-empty").textContent, / Thread replies are not in Main\.$/);
+  assert.match(page.el("search-empty").textContent, / Main shows a thread when a reply held here matches; All may hold more replies\.$/);
   // One column again, in Main, the view last chosen in one: nothing reads or searches it again.
   await page.el("column-toggle").click();
   await page.settle();
@@ -65212,11 +65246,12 @@ test("`#262 search-load-older`: back in one column on Main, a search that still 
   await all.click();
   await page.settle();
   assert.equal(page.el("thread-select").value, "flat", "Search All did not open All");
-  assert.deepStrictEqual(matchedIds(page), ["202", "204"]);
+  assert.deepStrictEqual(matchedIds(page), [], "All found what nothing held says");
+  assert.equal(page.el("search-field").value, "kestrel", "Search All dropped the search");
   // ...and the narrow window's way out of two columns does the same.
   const second = await threadPage("main");
   await twoColumns(second);
-  await search(second, "answer");
+  await search(second, "kestrel");
   await second.settle();
   await second.setDesk(false);
   assert.equal(second.el("search-in-all").hidden, false, "a window narrowed to one column on Main did not offer Search All");
@@ -65461,7 +65496,7 @@ test("`#262 search-load-older`: Main drawn from All reads its own newest page fi
   assert.deepStrictEqual(reads, [["main", false], ...Array(SEARCH_OLDER_PAGES).fill(["main", true])],
     "the walk did not read Main's newest page and then five older ones");
   assert.match(page.el("search-empty").textContent,
-    /^Searched \d+ messages in this browser, a complete history back to .+ \(no gaps\)\. None match\. Thread replies are not in Main\.$/);
+    /^Searched \d+ messages in this browser, a complete history back to .+ \(no gaps\)\. None match\. Main shows a thread when a reply held here matches; All may hold more replies\.$/);
 });
 
 // --- searching the threads' replies further back ------------------------------------------------------
@@ -65589,7 +65624,7 @@ test("`#262 search-load-older`: one column on All walks back to three older repl
   await search(page, "engine");
   await page.settle();
   assert.deepStrictEqual(matchedIds(page), []);
-  assert.match(page.el("search-empty").textContent, / Thread replies are not in Main\.$/);
+  assert.match(page.el("search-empty").textContent, / Main shows a thread when a reply held here matches; All may hold more replies\.$/);
   assert.deepStrictEqual(shownCards(page), [], "a card was found before any older reply was read");
   assert.equal(page.el("side-list-state").textContent, "No threads match that search.");
   // The cards offer to search their threads' older replies, from where All reaches back to.
@@ -82422,6 +82457,333 @@ async function unpackPage(storage = null, read = []) {
   await page.settle();
   return { page, data };
 }
+
+// --- `#606 server-side-search`: the search follows the view ----------------------------------------
+//
+// The owner, 2026-10-27: in Main a thread stands for all its children, so any hit in the thread keeps
+// it; in All threads are unpacked inline and every message is a candidate on its own; over the cards a
+// thread with any hit is chosen, and unpacking it shows only the hits, with folded lines between them.
+
+test("`#606 server-side-search`: in All every message is a candidate on its own, by the shared language", async () => {
+  const page = await threadPage("flat");
+  await search(page, "in:thread");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["202", "204"], "in:thread is the replies, and nothing else");
+  await page.el("search-field").setValue("root OR announcement");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["200", "201", "203"]);
+  await page.el("search-field").setValue("thread -answer");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["201", "203"], "a minus takes the replies out");
+  await page.el("search-field").setValue("\"FIRST thread\"");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["201", "202"], "a phrase, whatever its case");
+  // NEGATIVE CONTROL: a word nothing says matches nothing.
+  await page.el("search-field").setValue("kestrel");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), []);
+});
+
+test("`#606 server-side-search`: in Main a thread stands for its children, so a hit in any reply keeps its root", async () => {
+  const page = await threadPage("main");
+  await search(page, "in:thread");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["201", "203"], "the roots of the threads whose replies match");
+  await page.el("search-field").setValue("second answer");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["203"], "only the thread whose reply says both words");
+  await page.el("search-field").setValue("announcement");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["200"], "a message of Main's own matches as itself");
+  // NEGATIVE CONTROL: a reply holding one word and its root the other is no message holding both.
+  await page.el("search-field").setValue("root answer");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), [], "the thread's words were matched together, not message by message");
+});
+
+test("`#606 server-side-search`: over the cards a thread with any hit is chosen, and unpacked it shows only its hits, with lines that open the rest", async () => {
+  const { page } = await unpackPage();
+  await page.el("side-unpack").click();
+  await page.settle();
+  const cards = () => page.el("side-cards").children.filter((li) => li.hasAttribute("data-card") &&
+    !li.hidden && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+  const shownRows = (threadId) => unpackRows(page, threadId)
+    .filter((li) => !li.hidden && !li.hasClass("search-hidden"))
+    .flatMap((li) => (li.getAttribute("data-ids") || "").split(" "));
+  const line = (li, below) => {
+    const seam = below ? li.seamBelowLine : li.seamLine;
+    return seam && seam.parentNode === li ? seam.textContent : null;
+  };
+  await search(page, "read two");
+  await page.settle();
+  assert.deepStrictEqual(cards(), ["spaces/A/threads/sum", "spaces/A/threads/raw"], "a reply's hit did not choose its card");
+  assert.deepStrictEqual(shownRows("spaces/A/threads/sum"), ["702"]);
+  assert.deepStrictEqual(shownRows("spaces/A/threads/raw"), ["706"]);
+  const sumCard = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === "spaces/A/threads/sum");
+  const hit = unpackRows(page, "spaces/A/threads/sum").find((li) => (li.getAttribute("data-ids") || "").split(" ").includes("702"));
+  assert.equal(line(sumCard, true), "… 2 unmatched messages …", "no line for the run before the first hit");
+  assert.equal(line(hit, true), "… 1 unmatched message …", "no line for the run after the last hit");
+  // A tap on the card's line opens the run it stands for, and only that run.
+  await sumCard.seamBelowLine.click();
+  await page.settle();
+  assert.deepStrictEqual(shownRows("spaces/A/threads/sum"), ["700", "701", "702"]);
+  assert.equal(line(sumCard, true), null, "the opened run kept its line");
+  // A word only one thread's card says chooses that card alone; NEGATIVE CONTROL for the reply rule.
+  await page.el("search-field").setValue("jog memory");
+  await page.settle();
+  assert.deepStrictEqual(cards(), ["spaces/A/threads/sum"]);
+  // The search closed: every block whole again, and no line left behind.
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(shownRows("spaces/A/threads/sum"), ["700", "701", "702", "703"]);
+  // Closing the search draws the cards again: every card and row as it now stands.
+  for (const li of page.el("side-cards").children) {
+    assert.equal(line(li, true), null, `a line was left below ${li.getAttribute("data-id")}`);
+    assert.equal(line(li, false), null, `a line was left above ${li.getAttribute("data-id")}`);
+  }
+});
+
+test("`#606 server-side-search`: the cards' line for the threads after a card and its block's line for the run before its hit each keep their own place", async () => {
+  const { page } = await unpackPage();
+  await page.el("side-unpack").click();
+  await page.settle();
+  const line = (li, below) => {
+    const seam = below ? li.seamBelowLine : li.seamLine;
+    return seam && seam.parentNode === li ? seam.textContent : null;
+  };
+  const byId = (id) => page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id ||
+    (li.getAttribute("data-ids") || "").split(" ").includes(id));
+  // Only the summed thread's second read reply says it: the raw thread after it is hidden.
+  await search(page, "sum read two");
+  await page.settle();
+  for (let pass = 0; pass < 2; pass += 1) {
+    assert.equal(line(byId("spaces/A/threads/sum"), true), "… 4 unmatched messages in 1 thread …",
+      `pass ${pass}: the cards' line below the card was taken`);
+    assert.equal(line(byId("702"), false), "… 2 unmatched messages …", `pass ${pass}: the block's run before its hit has no line`);
+    assert.equal(line(byId("702"), true), "… 1 unmatched message …");
+    // Another pass of the search draws the same lines, not the other's.
+    await page.el("search-field").setValue("sum read two ");
+    await page.settle();
+  }
+});
+
+// --- `#605`, `#607`, `#608 server-side-search`: the server's copy, searched --------------------------
+
+const SERVER_SEARCH_DELAY_MS = sourceConstant("SERVER_SEARCH_DELAY_MS");
+const SEARCH_FURTHER_POLL_MS = sourceConstant("SEARCH_FURTHER_POLL_MS");
+
+/** A channel with two threads, open in `view`, on a server that keeps a copy (or none, with `cache` false). */
+async function serverSearchPage(view = "flat", cache = true) {
+  const page = newPage();
+  if (cache) page.messageCache = messageCacheStatus();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, view);
+  return page;
+}
+
+/** Type `query`, and let the typing pause long enough for the server to be asked and to answer. */
+async function searchServer(page, query) {
+  await search(page, query);
+  await page.settle();
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+}
+
+/** One channel's part of a search answer: searched, back to `back`, with these facts. */
+const searchedScope = (fields = {}) => ({
+  channel: CHANNEL, state: "searched", examined: 120, searched_back_to_ms: Date.parse("2026-08-01T12:00:00Z"),
+  held_from_ms: Date.parse("2026-08-01T12:00:00Z"), top_level_only: true, whole: false, expanding: true,
+  capped: 0, partial: 0, withheld: 0, ...fields,
+});
+
+const searchAnswer = (hits, scopes, extra = {}) =>
+  json(200, { hits, scopes, upstream: "none", untrusted_content_notice: "third-party text", ...extra });
+
+test("`#605 server-side-search`: a pause in the typing searches the server's copy below what is loaded, and the line says what was searched", async () => {
+  const page = await serverSearchPage();
+  const old = message({ id: "150", content: "an old kestrel by the weir", timestamp: "2026-08-02T09:00:00Z" });
+  page.serverSearch = async () => searchAnswer([old], [searchedScope()]);
+  await search(page, "kestrel");
+  await page.settle();
+  assert.equal(page.serverSearchCalls.length, 0, "the server was asked before the typing paused");
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(page.serverSearchCalls.length, 1);
+  const asked = new URL(page.serverSearchCalls[0], "http://fixture.test");
+  assert.equal(asked.pathname, `/api/v1/channels/${CHANNEL.id}/search`);
+  assert.equal(asked.searchParams.get("q"), "kestrel");
+  assert.ok(Number(asked.searchParams.get("below")) > 0, "not only what lies below the loaded messages");
+  assert.equal(page.el("server-search").hidden, false);
+  assert.match(page.el("search-scope").textContent,
+    /^No upstream search · this page: back to .+ · server: back to .+ \(still expanding\) · 125 messages searched$/);
+  const hits = page.el("server-hits").children;
+  assert.deepStrictEqual(hits.map((li) => li.getAttribute("data-id")), ["150"]);
+  assert.ok(hits[0].descendants().some((n) => n.textContent === "Show in channel"), "a hit has no way to its channel");
+  // The same search again asks nothing; a change of search asks again.
+  await page.el("search-field").setValue("kestrel ");
+  await page.settle();
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(page.serverSearchCalls.length, 1, "the same search was asked twice");
+  // Closed, the section goes, and nothing more is asked.
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.equal(page.el("server-search").hidden, true);
+});
+
+test("`#605 server-side-search`: the line says why the server did not search, and a page with no copy on the server asks nothing", async () => {
+  const page = await serverSearchPage();
+  page.serverSearch = async () => searchAnswer([], [{ ...searchedScope(), state: "not_searched", reason: "read_scope",
+    examined: 0, searched_back_to_ms: undefined, held_from_ms: undefined }]);
+  await searchServer(page, "kestrel");
+  assert.match(page.el("search-scope").textContent, / · server: not searched \(this device holds the read-only token\) · /);
+  page.serverSearch = async () => json(502, { error: "chat_error", detail: "the server is restarting" });
+  await searchServer(page, "heron");
+  assert.match(page.el("search-scope").textContent, / · server: could not be searched \(the server is restarting\) · /);
+  // NEGATIVE CONTROL: no copy kept, nothing asked, and the line says so.
+  const bare = await serverSearchPage("flat", false);
+  await searchServer(bare, "kestrel");
+  assert.equal(bare.serverSearchCalls.length, 0);
+  assert.match(bare.el("search-scope").textContent, / · server: keeps no copy · /);
+});
+
+test("`#607 server-side-search`: hits the page already holds are not repeated, and All channels searches every channel", async () => {
+  const page = await serverSearchPage();
+  const held = page.messages.find((m) => m.id === "202");
+  const elsewhere = { ...message({ id: "990", content: "a kestrel elsewhere", timestamp: "2026-08-03T09:00:00Z" }),
+    channel_id: "2220000000000000002" };
+  page.serverSearch = async (path) => (path.startsWith("/api/v1/search?")
+    ? searchAnswer([elsewhere, held], [searchedScope(), searchedScope({ channel: { ...CHANNEL, id: "2220000000000000002", label: "ops" }, whole: true, expanding: false })])
+    : searchAnswer([held], [searchedScope()]));
+  await searchServer(page, "answer");
+  assert.deepStrictEqual(page.el("server-hits").children.map((li) => li.getAttribute("data-id")), [],
+    "a hit the page holds was drawn again");
+  await page.el("search-all-channels").setChecked(true);
+  await page.settle();
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  const asked = new URL(page.serverSearchCalls.at(-1), "http://fixture.test");
+  assert.equal(asked.pathname, "/api/v1/search");
+  assert.equal(asked.searchParams.get("below"), null, "every channel's newest, not below this page's floor");
+  assert.deepStrictEqual(page.el("server-hits").children.map((li) => li.getAttribute("data-id")), ["990"]);
+  assert.match(page.el("search-scope").textContent, / · server: 2 of 2 channels, all back to .+, 1 whole · /);
+  // Counted once: the server's search of every channel includes this one's newest.
+  assert.match(page.el("search-scope").textContent, / · 240 messages searched$/);
+  assert.equal(page.el("search-further").hidden, true, "Search further back is one channel's");
+});
+
+test("`#605 server-side-search`: the line never says the server searched further back than it says it did", async () => {
+  const page = await serverSearchPage();
+  // A budget spent above the stretch the server vouches for: no reach to claim.
+  page.serverSearch = async () => searchAnswer([], [searchedScope({ searched_back_to_ms: undefined,
+    resume_below_ms: 1_700_000_000_000 })], { resume_below_ms: 1_700_000_000_000 });
+  await searchServer(page, "kestrel");
+  assert.match(page.el("search-scope").textContent, / · server: its newest part searched so far \(still expanding\) · /);
+  // Every row held searched, none of it vouched whole.
+  page.serverSearch = async () => searchAnswer([], [searchedScope({ searched_back_to_ms: undefined,
+    held_from_ms: undefined, expanding: false })]);
+  await searchServer(page, "heron");
+  assert.match(page.el("search-scope").textContent, / · server: all it holds searched, with gaps · /);
+  // NEGATIVE CONTROL: a reach the server says is said.
+  page.serverSearch = async () => searchAnswer([], [searchedScope({ whole: true, expanding: false })]);
+  await searchServer(page, "otter");
+  assert.match(page.el("search-scope").textContent, / · server: back to .+ \(complete\) · /);
+});
+
+test("`#608 server-side-search`: a look that fails keeps watching and says so, and Stop then Search further back starts one watch, not two", async () => {
+  const page = await serverSearchPage();
+  page.serverSearch = async () => searchAnswer([], [searchedScope()]);
+  const state = { channel_id: CHANNEL.id, server_mode: "full", mode: "full", settable: true, messages: 300,
+    oldest_ms: Date.parse("2026-08-01T12:00:00Z"), walking: true, complete: false, cycle_pages: 3, queue_position: 0,
+    now_ms: Date.now() };
+  page.history.set(CHANNEL.id, state);
+  await searchServer(page, "kestrel");
+  const further = page.el("search-further");
+  await further.click();
+  await page.settle();
+  page.historyFailure = { status: 502, error: "chat_error", detail: "the server is restarting" };
+  page.expireTimers(SEARCH_FURTHER_POLL_MS);
+  await page.settle();
+  assert.match(page.el("search-scope").textContent, /gathering older history: the server is restarting/);
+  page.historyFailure = null;
+  page.expireTimers(SEARCH_FURTHER_POLL_MS);
+  await page.settle();
+  assert.match(page.el("search-scope").textContent, /gathering older history back to /, "the watch died after one failure");
+  // Stop, and at once Search further back again: one watch, so each period asks once.
+  await further.click();
+  await further.click();
+  await page.settle();
+  const looks = () => page.historyCalls.filter((call) => call === `GET ${CHANNEL.id}`).length;
+  const before = looks();
+  page.expireTimers(SEARCH_FURTHER_POLL_MS);
+  await page.settle();
+  assert.equal(looks() - before, 1, "two watches ran at once");
+});
+
+test("`#605 server-side-search`: More from the server goes on below where its last answer stopped", async () => {
+  const page = await serverSearchPage();
+  const first = message({ id: "160", content: "kestrel one", timestamp: "2026-08-05T09:00:00Z" });
+  const second = message({ id: "140", content: "kestrel two", timestamp: "2026-08-01T09:00:00Z" });
+  const resume = Date.parse("2026-08-04T00:00:00Z");
+  page.serverSearch = async (path) => (new URL(path, "http://fixture.test").searchParams.get("below") === String(resume)
+    ? searchAnswer([second], [searchedScope()])
+    : searchAnswer([first], [searchedScope({ resume_below_ms: resume })], { resume_below_ms: resume }));
+  await searchServer(page, "kestrel");
+  assert.match(page.el("search-scope").textContent, / · server: back to .+ so far \(still expanding\) · /);
+  assert.equal(page.el("server-more").hidden, false);
+  await page.el("server-more").click();
+  await page.settle();
+  assert.deepStrictEqual(page.el("server-hits").children.map((li) => li.getAttribute("data-id")), ["160", "140"]);
+  assert.equal(page.el("server-more").hidden, true);
+  assert.match(page.el("search-scope").textContent, / · 245 messages searched$/);
+});
+
+test("`#608 server-side-search`: Search further back asks the server to gather this channel next, watches it grow, searches again, and Stop takes it back", async () => {
+  const page = await serverSearchPage();
+  let oldest = Date.parse("2026-08-01T12:00:00Z");
+  page.serverSearch = async () => searchAnswer([], [searchedScope({ held_from_ms: oldest, searched_back_to_ms: oldest })]);
+  const state = () => ({ channel_id: CHANNEL.id, server_mode: "full", mode: "full", settable: true, messages: 300,
+    oldest_ms: oldest, reached_ms: oldest, walking: true, complete: false, cycle_pages: 12, pages_per_hour: 60,
+    days_per_hour: 2, eta_s: 600, queue_position: 0, requests_per_minute: 20, requests_last_minute: 3,
+    now_ms: Date.now() });
+  page.history.set(CHANNEL.id, state());
+  await searchServer(page, "kestrel");
+  const further = page.el("search-further");
+  assert.equal(further.hidden, false, "Search further back was not offered over a copy that is not whole");
+  await further.click();
+  await page.settle();
+  assert.deepStrictEqual(page.historyCalls, [`POST ${CHANNEL.id} prioritize`]);
+  assert.equal(further.textContent, "Stop gathering older history");
+  assert.match(page.el("search-scope").textContent, / · gathering older history back to .+, about 10 min left · /);
+  // The walk reaches further back: the page sees it on its next look, and searches the copy again.
+  const searched = page.serverSearchCalls.length;
+  oldest = Date.parse("2026-07-01T12:00:00Z");
+  page.history.set(CHANNEL.id, state());
+  page.expireTimers(SEARCH_FURTHER_POLL_MS);
+  await page.settle();
+  assert.equal(page.historyCalls.at(-1), `GET ${CHANNEL.id}`);
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(page.serverSearchCalls.length, searched + 1, "the copy grew and was not searched again");
+  // Stop: the bump is taken back and nothing more is asked.
+  await further.click();
+  await page.settle();
+  assert.equal(page.historyCalls.at(-1), `DELETE ${CHANNEL.id} prioritize`);
+  assert.equal(further.textContent, "Search further back");
+  const looked = page.historyCalls.length;
+  page.expireTimers(SEARCH_FURTHER_POLL_MS);
+  await page.settle();
+  assert.equal(page.historyCalls.length, looked, "the page went on watching after Stop");
+  // NEGATIVE CONTROL: a server that gathers no history says so, and nothing is watched.
+  page.historyFailure = { status: 409, error: "history_backfill_off", detail: "the backfill is off" };
+  await further.click();
+  await page.settle();
+  assert.match(page.el("search-scope").textContent, /gathering older history: the server does not gather history for this channel/);
+});
 
 test("`#404 threads-unpack-all`: Unpack is a chip in the cards' heading, Pack all means cards alone, u is in the help", async () => {
   assertMarkupContains("side-heading", "side-unpack");

@@ -621,6 +621,32 @@ default. Nothing below changes what the page shows today.
 | Context around far-back hits | 9 |
 | Phase 0's page wording | 1 |
 
+## 12. The build (2026-10-27, `#603`-`#608`)
+
+The owner answered every question in §8 on 2026-10-27 (Q1 yes; Q2 view rules below; Q3, Q4, Q10 as
+in §11; Q5-Q7 a button that prioritises our own crawl, full history instead of 14 days, upstream
+hints deferred; Q8 an "All channels" checkbox; Q9 hits alone with Show in channel). The epic is
+`#521 server-side-search`; each phase has its own issue.
+
+- **`#603` Phase 0.** Slack's All reads the replies of every thread on its page (the ten-thread bound
+  is gone). A thread of at most 50 replies that the message cache holds whole as its root describes
+  it (same count, same latest reply, coverage from the root, the band vouched, listings within 15
+  minutes and after any dropped offer) comes from the cache at no call, for a write-scope caller with
+  serving on; replies taken so are kept out of the fill. Landed as 6c9d067a.
+- **`#605` the route.** `GET /api/v1/channels/{id}/search` and `GET /api/v1/search` search the cache
+  under the serving rules (`Sink::search`: cache open, serving on, channel routed, account verified,
+  not suspended, scope not blocked; a reply of a blocked thread is withheld), and answer with each
+  channel's scope: how far back the search reached, what the cache vouches it holds, whether the
+  channel is whole or still expanding, and where to resume. Upstream is always `none`.
+- **`#606` the view rules.** The page matches messages with the shared language: Main keeps a root
+  when any held reply matches, All matches each message, the cards choose a thread with any hit and
+  an unpacked thread shows only its hits with folded lines between them.
+- **`#607`** hits older than the loaded stretch drawn alone with Show in channel; All channels.
+- **`#608`** Search further back calls `#602 history-settings-and-limits`' prioritize route and polls
+  its state, searching again as the copy grows; Stop takes the bump back.
+- **`#604` the index** (folded `search_text`, LIKE over the `detail=none` trigram index `#602` landed)
+  follows separately, because it rebuilds the live cache's index text on deploy.
+
 ## Evidence
 
 - `evidence/01-flat-bound.md`: channel A's real shape, the replay, the reproduction test and its

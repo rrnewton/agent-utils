@@ -258,7 +258,7 @@
                 autocomplete="off"
                 placeholder="Search loaded messages"
                 aria-label="Search loaded messages; Enter searches older messages"
-                title="Filters the messages already on screen. Quote a phrase to match it whole. Enter searches older messages, a few pages at a time."
+                title="Filters the messages loaded here, and searches the server's copy past them. Words match anywhere, in any case and without accents; &quot;a phrase&quot;, OR, -word, from:name, in:thread, in:main, has:link, before: and after: a date. Enter searches older messages, a few pages at a time."
                 hidden
               />
               <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
@@ -574,6 +574,26 @@
                 the search changes. A status, written once when a walk ends.
               -->
               <p id="search-older-note" class="hint search-older-note" role="status" hidden></p>
+              <!--
+                `#605`-`#608 server-side-search`. While a search is typed over a channel, what the
+                server's own copy holds that matches, older than what this page has loaded, each hit
+                alone with a way to it in the channel (owner, 2026-10-27, question 9); the line says
+                exactly what was searched: no upstream search, this page back to when, the server back
+                to when and whether it holds the whole channel or is still gathering it, and how many
+                messages in all. All channels widens the server's search to every channel (question
+                8; the current channel by default). Search further back asks the server to gather this
+                channel's older history next, and the line moves as it does.
+              -->
+              <section id="server-search" class="server-search" aria-label="The server's copy, searched" hidden>
+                <p id="search-scope" class="hint search-scope"></p>
+                <label class="search-all-channels">
+                  <input id="search-all-channels" type="checkbox" />
+                  All channels
+                </label>
+                <ol id="server-hits" class="server-hits"></ol>
+                <button id="server-more" class="chip" type="button" hidden>More from the server</button>
+                <button id="search-further" class="chip" type="button" hidden>Search further back</button>
+              </section>
               <p id="timeline-notice" class="hint" hidden></p>
               <p id="channel-loading" class="channel-loading hint" role="status" aria-live="polite" hidden>
                 Loading messages…

@@ -1,6 +1,6 @@
 ---
 title: 'server-side-search: search results follow the view (Main, All, Threads)'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-521: parent-child
 created_at: 2026-10-28T01:27:58.534995808+00:00
-updated_at: 2026-10-28T01:27:58.534995808+00:00
+updated_at: 2026-10-28T03:35:35.765999168+00:00
+closed_at: 2026-10-28T03:35:35.765999038+00:00
 ---
 
 # Description

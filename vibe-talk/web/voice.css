@@ -5984,6 +5984,64 @@ a.search-hit-link {
   text-align: center;
 }
 
+/* `#605`-`#608 server-side-search`. The server's copy, searched: the line saying what was searched, All
+   channels, and the server's hits, each alone with its way to the channel, under the step back. The
+   hits are the list's own quiet rows, so they read as messages and not as a second pane. */
+.server-search {
+  margin: 0 1rem 0.6rem;
+}
+
+.search-scope {
+  margin: 0 0 0.3rem;
+  text-align: center;
+}
+
+.search-all-channels {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  width: fit-content;
+  font-size: 0.8rem;
+  margin: 0 auto 0.4rem;
+}
+
+.search-all-channels input {
+  width: auto;
+  margin: 0;
+}
+
+.server-hits {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.server-hit {
+  padding: 0.45rem 0.6rem;
+  border-left: 2px solid var(--accent);
+  margin: 0 0 0.4rem;
+  overflow-wrap: anywhere;
+}
+
+.server-hit-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+  opacity: 0.8;
+}
+
+.server-hit .md {
+  margin: 0.2rem 0;
+}
+
+#server-more,
+#search-further {
+  display: block;
+  margin: 0.2rem auto 0.4rem;
+}
+
 /* One column on Main, a search nothing loaded matches: All, which has the replies. Under the sentence
    saying so. */
 #search-in-all {

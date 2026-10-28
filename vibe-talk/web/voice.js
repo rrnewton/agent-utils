@@ -159,7 +159,7 @@ const ALL_CHANNELS = "*";
 // controls.
 /**
  * @overload
- * @param {"api-token" | "pair-input" | "pair-transfer" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
+ * @param {"search-all-channels" | "api-token" | "pair-input" | "pair-transfer" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
  *   | "card-max-lines" | "collapsed-lines"
  *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "in-app-links" | "mark-own-read" | "mic-auto-gain"
  *   | "mic-echo-cancellation" | "side-compose-grow"
@@ -217,7 +217,7 @@ const ALL_CHANNELS = "*";
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
  *   | "save-voice-post-prefix" | "save-voice-system-prompt"
- *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
+ *   | "search-further" | "search-in-all" | "search-toggle" | "send-text" | "server-more" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-newline" | "side-older" | "side-search-replies" | "side-send" | "side-thread-card-text"
  *   | "side-main" | "side-order" | "side-unpack" | "speaker"
  *   | "summarise" | "talk"
@@ -5842,49 +5842,11 @@ function markSearchNow() {
  */
 const SEARCH_LISTS = ["transcript", "thread-list", "discord-log", "pinned-log", "outgoing-log"];
 
+/** What the empty search's sentence adds in Main, where a thread stands for its replies. `#606 server-side-search`. */
+const MAIN_REPLIES_SEARCHED = "Main shows a thread when a reply held here matches; All may hold more replies.";
+
 /** What `#search-empty` says over a list that has rows and none of them match. */
 const SEARCH_EMPTY_LOADED = "Nothing in the messages loaded so far matches that search.";
-
-/** The grouping character, written as an escape so no line here holds an odd number of them. */
-const SEARCH_QUOTE = "\"";
-
-/**
- * One term per word, and a double-quoted run is one term however many words are in it.
- *
- * AN UNTERMINATED QUOTE GROUPS TO THE END of what has been typed, rather than being ignored until
- * its partner arrives. A reader types the opening quote several keystrokes before the closing
- * one, and treating `"read new` as two words for that whole time means the list flickers through
- * matches for a query nobody asked for and then settles somewhere else. Reading it as the phrase
- * it is about to become is both steadier and what the reader already means.
- *
- * Scanned rather than matched by a pattern: the closing quote is optional, quotes may open mid
- * word, and expressing both in one regular expression costs more to read than the loop does.
- */
-function searchTerms(query) {
-  const terms = [];
-  let current = "";
-  let quoting = false;
-  const finish = () => {
-    if (current) {
-      terms.push(current);
-    }
-    current = "";
-  };
-  for (const character of String(query).toLowerCase()) {
-    if (character === SEARCH_QUOTE) {
-      // A quote always ends whatever run it touches, opening or closing. Otherwise `a"b c"` would
-      // put `a` and `b c` in one term, which is not what either half of it looks like.
-      finish();
-      quoting = !quoting;
-    } else if (!quoting && /\s/.test(character)) {
-      finish();
-    } else {
-      current += character;
-    }
-  }
-  finish();
-  return terms;
-}
 
 /*
  * THE SEARCH LANGUAGE (`#521 server-side-search`), the page's twin of src/search_query.rs.
@@ -5893,8 +5855,8 @@ function searchTerms(query) {
  * parentheses) plus the shared field operators from:, in:, before:, after: and has:, over SUBSTRING
  * matching that ignores case and accents. The rules are written once, in that file's module
  * documentation, and both copies answer to the corpus in tests/fixtures/search_query.json: a change
- * to one that the other does not make fails a suite. Nothing on the page calls these yet; the
- * search box still uses `searchTerms` above until the move to the new matcher (Phase 1).
+ * to one that the other does not make fails a suite. The search box matches by them, message by
+ * message (`#606 server-side-search`, below).
  */
 
 /**
@@ -6178,6 +6140,107 @@ function searchSubject({ author = "", authorId = "", text = "", links = [], crea
   };
 }
 
+// --- the language on the page (`#606 server-side-search`) -----------------------------------------
+//
+// The owner, 2026-10-27, question 2 of `#521 server-side-search`: in Main (Cmd-1) a thread stands for
+// all its children, so any hit in a thread keeps its row; in All (Cmd-2) threads are unpacked inline and
+// every message is a candidate on its own; over the cards a thread with any hit is chosen, and unpacking
+// it shows only the hits, with folded lines between them. So the page matches MESSAGES, by the shared
+// language above, each folded once (`messageSubject`); a row of several messages shows when any of them
+// matches, and a row that holds no message (a turn of the call, a card) is matched by the text it
+// declares (`data-search`).
+
+/** The query parsed, and the words to mark, for the last text asked about: one parse per change. */
+let searchParse = { query: /** @type {string | null} */ (null), node: /** @type {any} */ (null),
+  terms: /** @type {string[]} */ ([]) };
+
+/** `query` parsed by the shared language: its tree (null for no search) and its words to mark. */
+function searchParsed(query) {
+  if (searchParse.query !== query) {
+    const node = searchQueryParse(query);
+    searchParse = { query, node, terms: searchPositiveTerms(node) };
+  }
+  return searchParse;
+}
+
+/** Whether `query` is a search at all: some term, not only spaces or operators. */
+const searchTyped = (query) => searchParsed(query).node !== null;
+
+/** What identifies a search, for a walk or an opened run that belongs to one: its parsed tree. */
+const searchIdentity = (query) => JSON.stringify(searchQueryTree(searchParsed(query).node));
+
+/** The words and phrases a match may hold, folded, to mark: not those under a minus, nor fields. */
+function searchPositiveTerms(node) {
+  /** @type {string[]} */
+  const out = [];
+  const walk = (/** @type {any} */ at) => {
+    if (!at) return;
+    if (at.kind === "word" || at.kind === "phrase") out.push(at.text);
+    else if (at.kind === "and" || at.kind === "or") at.children.forEach(walk);
+  };
+  walk(node);
+  return [...new Set(out)];
+}
+
+/** The start of a calendar day in this browser's zone, for `before:` and `after:`. */
+const searchDayStart = (/** @type {{year: number, month: number, day: number}} */ day) =>
+  new Date(day.year, day.month - 1, day.day).getTime();
+
+/** Each copy of a message folded once for matching: a new copy, as an edit brings, is folded again. */
+const subjectByMessage = new WeakMap();
+
+/** A message as the matcher sees it: its author, the text it draws and its links' addresses. */
+function messageSubject(message) {
+  let subject = subjectByMessage.get(message);
+  if (!subject) {
+    subject = searchSubject({
+      author: String(message.author || ""),
+      authorId: String(message.author_id || ""),
+      text: messageText(message),
+      links: messageLinks(message).map((link) => String(link.href)),
+      createdMs: Date.parse(message.timestamp) || 0,
+      inThread: Boolean(message.thread && message.thread.is_root === false),
+    });
+    subjectByMessage.set(message, subject);
+  }
+  return subject;
+}
+
+/** Whether one message matches the parsed query `node`. */
+const messageMatches = (node, message) => searchQueryMatches(node, messageSubject(message), searchDayStart);
+
+/**
+ * Whether a row matches the parsed query `node`: any of the messages it holds, or for a row that holds
+ * none, the text it declares (`text`, its `data-search`).
+ */
+function rowMatches(row, node, text) {
+  const messages = rowMessages(row);
+  if (messages.length > 0) return messages.some((message) => messageMatches(node, message));
+  return text !== null && searchQueryMatches(node, searchSubject({ text }), searchDayStart);
+}
+
+/**
+ * The threads of the channel on screen with a reply the parsed query `node` matches, among the replies
+ * the page holds: in Main a root stands for its thread, and over the cards a thread with any hit is
+ * chosen.
+ */
+function threadsWithHits(node) {
+  /** @type {Set<string>} */
+  const hits = new Set();
+  if (!node || !threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return hits;
+  for (const message of channelCanon.messages) {
+    const id = threadOf(message);
+    if (id && message.thread.is_root === false && messageMatches(node, message)) hits.add(String(id));
+  }
+  return hits;
+}
+
+/** Whether a row of Main heads a thread that `hits` (`threadsWithHits`) names. */
+const rowHeadsHitThread = (row, hits) => rowMessages(row).some((message) => {
+  const id = threadOf(message);
+  return Boolean(id) && message.thread.is_root === true && hits.has(String(id));
+});
+
 /** The most upstream queries one search sends; the same number as src/search_query.rs. */
 const SEARCH_MAX_UPSTREAM_QUERIES = 4;
 
@@ -6295,16 +6358,22 @@ function applySearch() {
   // `#221 read-modes`. FIRST: a filter choosing rows opens every collapsed run, so no match is
   // hidden behind a line, and closing it collapses them again.
   applyReadRuns();
-  const terms = searchOpen ? searchTerms(searchQuery) : [];
+  // `#606 server-side-search`. The query in the shared language, matched message by message.
+  const node = searchOpen ? searchParsed(searchQuery).node : null;
+  const typed = node !== null;
   // `#249 search-highlight`. Where the hits are drawn: what was typed when the typing paused.
-  const marking = searchOpen ? searchTerms(markedQuery) : [];
+  const marking = searchOpen ? searchParsed(markedQuery).terms : [];
+  // In Main a root stands for its thread, and among the Threads list's cards a thread with any hit is
+  // chosen: the threads whose held replies match.
+  const replyHits = typed && threadingSupported && (channelView === "main" || channelView === "threads")
+    ? threadsWithHits(node) : null;
   const links = searchOpen && linksOnly;
   // `#251 author-filter`. Whose messages, ANDed with the rest.
   const author = authorChoosing();
   // `#215 reply-coalesce`. A filter that takes rows away shows a subset of the channel in time order,
   // and gathered replies go back to theirs before it does: a bridge to rows it hides would be a
   // bridge to nothing. See the section on gathering replies.
-  if (gatheredParent() !== null && (terms.length > 0 || links || pinnedOnly || author !== "everyone")) putRepliesBack();
+  if (gatheredParent() !== null && (typed || links || pinnedOnly || author !== "everyone")) putRepliesBack();
   const scope = searchScope();
   let matched = 0;
   let loaded = 0;
@@ -6337,7 +6406,9 @@ function applySearch() {
       // A row with nothing declared is not a message — a seam, a date rule, the notice at the head
       // of the channel. It goes away while a filter is on, because it explains a neighbour that is
       // no longer beside it, and it is never counted either way.
-      const said = terms.length === 0 || (text !== null && terms.every((term) => text.includes(term)));
+      const said = !typed || (text !== null && (rowMatches(row, node, text) || (replyHits !== null &&
+        (id === "thread-list" ? replyHits.has(String(row.getAttribute("data-context-id")))
+          : id === "discord-log" && rowHeadsHitThread(row, replyHits)))));
       const hit = said && (!links || shown > 0) && authorPasses(row, author);
       const revealed = !hit && text !== null && (id === "thread-list"
         ? openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-context-id")))
@@ -6387,14 +6458,16 @@ function applySearch() {
   // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them.
   const pinned = pinnedOnly && currentView === "discord";
   activeColumn.searched = { matched, loaded, tally, pinned };
-  renderSearchCount(terms.length > 0, links, author !== "everyone");
+  renderSearchCount(typed, links, author !== "everyone");
   // `#262 search-load-older`. The step back offers to search further back while a filter chooses rows,
   // and a walk that the change of filter just made nobody's ends here, before anything below says what
   // it found. And in one column on Main, a search nothing matches offers All, which has the replies.
   if (currentView === "discord") renderOlderControl();
   if (!sideActive) renderSearchInAll();
+  // `#605 server-side-search`. The server's copy, asked again when the search wanted has changed.
+  if (!sideActive) scheduleServerSearch();
   if (pinned) {
-    const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? tally : null, author);
+    const sentence = pinnedEmptySentence(loaded, matched, typed, links ? tally : null, author);
     el("search-empty").textContent = sentence;
     el("search-empty").hidden = sentence === "";
     return;
@@ -6413,12 +6486,12 @@ function applySearch() {
   if (author !== "everyone") {
     const sentence = currentView === "discord" && channelView === "threads"
       ? "This is a list of threads, and who wrote what is in their messages — open a thread to see it."
-      : matched > 0 || loaded === 0 ? "" : authorEmptySentence(author, terms.length > 0, false);
+      : matched > 0 || loaded === 0 ? "" : authorEmptySentence(author, typed, false);
     el("search-empty").textContent = sentence;
     el("search-empty").hidden = sentence === "";
     return;
   }
-  const empty = terms.length === 0 || matched > 0 || loaded === 0;
+  const empty = !typed || matched > 0 || loaded === 0;
   // `#262 search-load-older`. How far back the search has looked, and what it cannot see. Not rewritten
   // while a walk reads older pages, so a status says it once, when the walk is over, and not per page.
   if (!activeColumn.searchWalk) setTextIfChanged(el("search-empty"), empty ? SEARCH_EMPTY_LOADED : searchEmptySentence(loaded));
@@ -6439,7 +6512,7 @@ function applySearch() {
  */
 function searchInAllOffered(searched) {
   return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchOpen &&
-    !linksOnly && authorChoosing() === "everyone" && searchTerms(searchQuery).length > 0 &&
+    !linksOnly && authorChoosing() === "everyone" && searchTyped(searchQuery) &&
     currentView === "discord" && threadingSupported && !sideColumnUp() && channelView === "main";
 }
 
@@ -6504,7 +6577,9 @@ function searchEmptySentence(loaded) {
   }
   // Main holds a thread's first message and nothing of the rest, and the cards on the right, or All,
   // are where a reply is found. Most of why a search on the left of two columns finds nothing.
-  if (threadingSupported && channelView === "main") return `${said} Thread replies are not in Main.`;
+  // `#606 server-side-search`: a thread stands for its replies in Main, so the replies held here were
+  // searched; the ones All has not brought were not.
+  if (threadingSupported && channelView === "main") return `${said} ${MAIN_REPLIES_SEARCHED}`;
   if (todoMode && !threadingSupported) return `${said} Hide read is on — press h for Show read to search older messages.`;
   return said;
 }
@@ -6542,7 +6617,7 @@ function renderSearchCount(typed, links, author = false) {
 
 /** The count in the bar again, from what each column last counted: for a change of layout that redrew no row. */
 function refreshSearchCount() {
-  renderSearchCount(searchOpen && searchTerms(searchQuery).length > 0, searchOpen && linksOnly,
+  renderSearchCount(searchOpen && searchTyped(searchQuery), searchOpen && linksOnly,
     authorChoosing() !== "everyone");
 }
 
@@ -6555,7 +6630,7 @@ let sideCardCount = { cards: 0, shown: 0 };
  * hold neither.
  */
 function sayCardCount() {
-  const typed = searchOpen && searchTerms(searchQuery).length > 0;
+  const typed = searchOpen && searchTyped(searchQuery);
   const { cards, shown } = sideCardCount;
   setTextIfChanged(el("search-count"), typed ? `${shown} of ${cards} thread${cards === 1 ? "" : "s"}` : "");
 }
@@ -6620,7 +6695,7 @@ function linksEmptySentence(loaded, tally, matched, author = "everyone") {
   if (matched > 0) return "";
   // `#251 author-filter`. With nothing typed, a link is still shown and none is left: whose messages
   // took them away.
-  if (author !== "everyone" && searchTerms(searchQuery).length === 0) {
+  if (author !== "everyone" && !searchTyped(searchQuery)) {
     return author === "mine" ? "None of your messages loaded so far has a link." :
       "None of the messages from anyone else loaded so far has a link.";
   }
@@ -7164,6 +7239,7 @@ function seamLineOf(row, below, seam) {
   }
   if (held) {
     /** @type {any} */ (held).gapCards = Boolean(seam && seam.cards);
+    /** @type {any} */ (held).gapUnpack = Boolean(seam && seam.unpack);
     const classes = (below ? "row-seam row-seam-below" : "row-seam") + (seam && seam.cards ? " card-seam" : "");
     if (held.className !== classes) held.className = classes;
     return held;
@@ -7171,13 +7247,15 @@ function seamLineOf(row, below, seam) {
   const line = document.createElement(control ? "button" : "div");
   line.className = (below ? "row-seam row-seam-below" : "row-seam") + (seam && seam.cards ? " card-seam" : "");
   /** @type {any} */ (line).gapCards = Boolean(seam && seam.cards);
+  /** @type {any} */ (line).gapUnpack = Boolean(seam && seam.unpack);
   if (control) {
     line.setAttribute("type", "button");
     line.addEventListener("click", inThisColumn((event) => {
       // The row's own tap would select or open it; this tap is the line's alone, as a run's is.
       if (event) event.stopPropagation();
       const focused = document.activeElement === line && line.matches(":focus-visible");
-      const first = /** @type {any} */ (line).gapCards ? openCardGap(row, below) : openSearchGap(row, below);
+      const first = /** @type {any} */ (line).gapUnpack ? openUnpackGap(row, below)
+        : /** @type {any} */ (line).gapCards ? openCardGap(row, below) : openSearchGap(row, below);
       if (focused && first) {
         first.setAttribute("tabindex", "-1");
         first.focus({ preventScroll: true });
@@ -7198,7 +7276,7 @@ function seamDrawn(row, seam, below) {
   if (!seam) return !drawn;
   return drawn && held.textContent === seam.words && row.getAttribute(below ? "data-seam-below" : "data-seam") === seam.kind &&
     (String(held.tagName).toLowerCase() === "button") === (seam.kind === "gap") &&
-    Boolean(held.gapCards) === Boolean(seam.cards);
+    Boolean(held.gapCards) === Boolean(seam.cards) && Boolean(held.gapUnpack) === Boolean(seam.unpack);
 }
 
 /** Put `row`'s line above it, or below it, as `seam` says: `{kind, words}`, or null for none. */
@@ -41649,7 +41727,7 @@ const SEARCH_OLDER_HITS = 3;
 const SEARCH_OLDER_TAP_MS = 500;
 
 /** Everything a walk for the search depends on: a change in any of them ends it, and clears its note. */
-const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchTerms(searchQuery) : [], searchOpen && linksOnly,
+const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchIdentity(searchQuery) : null, searchOpen && linksOnly,
   [...hiddenLinkKinds], authorChoosing(), readMode]);
 
 /**
@@ -42169,6 +42247,393 @@ function searchOlderFromField() {
   return true;
 }
 
+// --- the server's copy, searched (`#605`, `#607` and `#608 server-side-search`) ----------------------
+//
+// The owner, 2026-10-27: search the server's own copy first; upstream search is deferred, so the line
+// says "no upstream search"; and it says exactly what was searched — "No upstream search · this page:
+// back to DATE · server: back to DATE (complete / still expanding) · N messages searched". Hits the
+// server holds older than what this page has loaded come alone (question 9), each with "Show in
+// channel", the in-app jump (`#543`); "All channels" widens the server's search to every channel the
+// server answers for (question 8; the current channel by default).
+//
+// THE SERVER ANSWERS ONLY FROM WHAT IT MAY HAND OUT. Its copy is searched under the rules a served read
+// keeps (src/server_search.rs): a channel it may not answer for says why, and the line says so rather
+// than claiming a search that did not happen. The page asks only where client-config says a copy is
+// open, and it asks once per search, a moment after the typing pauses; a change of search, channel or
+// the box asks again, and an answer to an older question is dropped.
+
+/** How long after the typing pauses the server is asked. */
+const SERVER_SEARCH_DELAY_MS = 400;
+
+/** Whether the server's search covers every channel (`#search-all-channels`), for this page's life. */
+let searchAllChannels = false;
+
+/** Where the server's search stands for the search typed now. */
+let serverSearch = {
+  key: "",
+  ticket: 0,
+  loading: false,
+  failed: "",
+  /** @type {VibeTalk.Message[]} */
+  hits: [],
+  /** @type {VibeTalk.SearchScope[]} */
+  scopes: [],
+  examined: 0,
+  /** @type {number | null} */
+  resume: null,
+};
+
+/** The timer that asks the server once the typing pauses, or null. */
+let serverSearchTimer = null;
+
+/** Whether the server keeps a copy this page may search: an open cache, and not the read-only token. */
+const serverCopyOpen = () => Boolean(serverCache && serverCache.available) && tokenScope !== "read";
+
+/** What identifies the server's search wanted now, or "" for none. */
+function serverSearchKeyNow() {
+  if (!searchOpen || currentScreen !== "main" || currentView !== "discord" || !searchTyped(searchQuery)) return "";
+  const channel = String(el("discord-channel").value || "");
+  if (!channel) return "";
+  return JSON.stringify([searchAllChannels ? "*" : channel, searchIdentity(searchQuery)]);
+}
+
+/**
+ * Ask the server again if the search wanted has changed since it was last asked: after every pass of
+ * the search in the left column, and when All channels is ticked. Cheap when nothing changed.
+ */
+function scheduleServerSearch() {
+  const key = serverSearchKeyNow();
+  // A gathering asked for elsewhere, or with the search closed, is no longer watched here; the
+  // server's own bump clears itself once the walk reaches the channel's beginning.
+  if (searchFurther.channel !== "" && (key === "" || !searchFurtherRunning())) stopSearchFurther();
+  // The same search: drawn again all the same, so the line follows what the page has loaded since
+  // and a hit the page now holds goes.
+  if (key === serverSearch.key) {
+    renderServerSearch();
+    return;
+  }
+  if (serverSearchTimer !== null) clearTimeout(serverSearchTimer);
+  serverSearchTimer = null;
+  serverSearch = { key, ticket: serverSearch.ticket + 1, loading: key !== "" && serverCopyOpen(), failed: "",
+    hits: [], scopes: [], examined: 0, resume: null };
+  renderServerSearch();
+  if (key === "" || !serverCopyOpen()) return;
+  serverSearchTimer = setTimeout(() => {
+    serverSearchTimer = null;
+    guardQuietly(() => runServerSearch(false))();
+  }, SERVER_SEARCH_DELAY_MS);
+}
+
+/** This browser's time zone, which the server resolves `before:` and `after:` in. */
+function readerZone() {
+  try {
+    return String(Intl.DateTimeFormat().resolvedOptions().timeZone || "");
+  } catch (_error) {
+    return "";
+  }
+}
+
+/**
+ * Ask the server: the hits older than this page's oldest loaded message in this channel, or every
+ * channel's newest, and with `more` the next stretch below where the last answer stopped.
+ */
+async function runServerSearch(more) {
+  const state = serverSearch;
+  const ticket = state.ticket;
+  const channel = String(el("discord-channel").value || "");
+  const zone = readerZone();
+  const below = more ? state.resume : searchAllChannels ? null : oldestLoadedMs();
+  const params = [`q=${encodeURIComponent(searchQuery)}`, ...(zone ? [`tz=${encodeURIComponent(zone)}`] : []),
+    ...(below !== null && below !== undefined ? [`below=${below}`] : [])].join("&");
+  const path = searchAllChannels ? `/api/v1/search?${params}`
+    : `/api/v1/channels/${encodeURIComponent(channel)}/search?${params}`;
+  state.loading = true;
+  renderServerSearch();
+  try {
+    const answer = await apiDecoded("SearchResponse", path);
+    if (serverSearch.ticket !== ticket) return;
+    const known = new Set(state.hits.map((hit) => `${hit.channel_id} ${hit.id}`));
+    state.hits = [...state.hits, ...answer.hits.filter((hit) => !known.has(`${hit.channel_id} ${hit.id}`))];
+    state.scopes = answer.scopes;
+    state.examined += answer.scopes.reduce((sum, scope) => sum + scope.examined, 0);
+    state.resume = typeof answer.resume_below_ms === "number" ? answer.resume_below_ms : null;
+    state.failed = "";
+  } catch (error) {
+    if (serverSearch.ticket !== ticket) return;
+    state.failed = String((error && (error.detail || error.message)) || "the server did not answer");
+  } finally {
+    if (serverSearch.ticket === ticket) {
+      state.loading = false;
+      renderServerSearch();
+    }
+  }
+}
+
+/** Why the server's copy of a channel was not searched, in the owner's words. */
+const SERVER_SEARCH_REASONS = {
+  no_cache: "it keeps no copy",
+  serve_off: "answering from its copy is off",
+  not_kept: "it keeps no copy of this channel",
+  unverified: "its account is still being checked",
+  suspended: "the chat service refused its credential",
+  in_doubt: "access to this channel is in doubt",
+  read_scope: "this device holds the read-only token",
+};
+
+/** The server's part of the line, for the scopes it answered with. Never more than they say. */
+function serverScopeWords() {
+  if (tokenScope === "read") return `server: not searched (${SERVER_SEARCH_REASONS.read_scope})`;
+  if (!serverCopyOpen()) return "server: keeps no copy";
+  if (serverSearch.failed) return `server: could not be searched (${serverSearch.failed})`;
+  if (serverSearch.loading && serverSearch.scopes.length === 0) return "server: searching…";
+  const scopes = serverSearch.scopes;
+  if (scopes.length === 0) return "server: not searched yet";
+  const searched = scopes.filter((scope) => scope.state === "searched");
+  const more = serverSearch.resume !== null;
+  if (searchAllChannels) {
+    const whole = searched.filter((scope) => scope.whole).length;
+    // Every channel searched reaches back at least as far as the NEWEST of their reaches, and only
+    // when each one says how far it reached.
+    const backs = searched.map((scope) => scope.searched_back_to_ms);
+    const all = backs.length > 0 && backs.every((ms) => typeof ms === "number");
+    const back = all ? `, all back to ${searchMomentWords(Math.max(.../** @type {number[]} */ (backs)))}` : "";
+    const left = scopes.length - searched.length;
+    return `server: ${searched.length} of ${scopes.length} channel${scopes.length === 1 ? "" : "s"}` +
+      `${back}${more ? " so far" : ""}${whole > 0 ? `, ${whole} whole` : ""}${left > 0 ? `, ${left} not searched` : ""}`;
+  }
+  const scope = scopes[0];
+  if (scope.state !== "searched") {
+    return `server: not searched (${SERVER_SEARCH_REASONS[scope.reason || ""] || "it could not answer"})`;
+  }
+  const state = scope.whole ? " (complete)" : scope.expanding ? " (still expanding)" : "";
+  if (typeof scope.searched_back_to_ms === "number") {
+    return `server: back to ${searchMomentWords(scope.searched_back_to_ms)}${more ? " so far" : ""}${state}`;
+  }
+  // No stretch the server vouches it holds whole was searched to its end: say what was done.
+  if (more) return `server: its newest part searched so far${state}`;
+  return `server: all it holds searched, with gaps${state}`;
+}
+
+/** The line: what was searched, where, and how far back, in one sentence. */
+function searchScopeLine() {
+  const loaded = columns.main.searched ? columns.main.searched.loaded : 0;
+  const from = oldestLoadedMs();
+  const page = historyReadToStart() && historyReach().whole ? "this page: back to the first message"
+    : from === null ? "this page: nothing loaded" : `this page: back to ${searchMomentWords(from)}`;
+  // Over every channel the server searched this channel's newest too: counted once.
+  const total = (searchAllChannels && serverSearch.scopes.length > 0 ? 0 : loaded) + serverSearch.examined;
+  return ["No upstream search", page, serverScopeWords(), searchFurtherWords(),
+    `${total} message${total === 1 ? "" : "s"} searched`].filter((part) => part !== "").join(" · ");
+}
+
+/** One hit of the server's, alone: who, where, when, what it says, and the way to it in its channel. */
+function serverHitNode(hit) {
+  const li = document.createElement("li");
+  li.className = "server-hit";
+  li.setAttribute("data-id", String(hit.id));
+  li.setAttribute("data-channel", String(hit.channel_id));
+  const meta = document.createElement("div");
+  meta.className = "meta server-hit-meta";
+  const who = document.createElement("span");
+  who.className = "who";
+  who.textContent = String(hit.author || "");
+  meta.append(who);
+  if (searchAllChannels) {
+    // The answer names every channel it searched, the one the page knows by the owner's name.
+    const scope = serverSearch.scopes.find((one) => String(one.channel.id) === String(hit.channel_id));
+    const where = document.createElement("span");
+    where.textContent = `#${channelName(knownChannels.find((one) => String(one.id) === String(hit.channel_id)) ||
+      (scope ? scope.channel : { id: hit.channel_id }))}`;
+    meta.append(where);
+  }
+  const when = document.createElement("span");
+  const at = Date.parse(hit.timestamp);
+  when.textContent = Number.isNaN(at) ? "" : searchMomentWords(at);
+  meta.append(when);
+  if (hit.thread && hit.thread.is_root === false) {
+    const reply = document.createElement("span");
+    reply.textContent = "in a thread";
+    meta.append(reply);
+  }
+  const show = document.createElement("button");
+  show.className = "chip server-hit-show";
+  show.setAttribute("type", "button");
+  show.textContent = "Show in channel";
+  show.addEventListener("click", () => guardQuietly(() => jumpToMessageLink({
+    service: String(chatProviderName || ""),
+    channel: String(hit.channel_id),
+    message: String(hit.id),
+    thread: hit.thread && hit.thread.is_root === false ? String(hit.thread.id) : null,
+  }))());
+  // As a row's parts are, so the search's marks find its words (`findableParts`).
+  const body = document.createElement("div");
+  body.className = "body";
+  body.append(messageBody(hit));
+  li.append(meta, body, show);
+  markSearchHits(li, searchParsed(searchQuery).terms);
+  return li;
+}
+
+/** Draw the server's search as it stands: the line, the hits this page does not already hold, More. */
+function renderServerSearch() {
+  const section = el("server-search");
+  const wanted = serverSearch.key !== "";
+  if (section.hidden === wanted) section.hidden = !wanted;
+  if (!wanted) {
+    if (el("server-hits").children.length > 0) el("server-hits").replaceChildren();
+    return;
+  }
+  setTextIfChanged(el("search-scope"), searchScopeLine());
+  const checkbox = /** @type {HTMLInputElement} */ (el("search-all-channels"));
+  if (checkbox.checked !== searchAllChannels) checkbox.checked = searchAllChannels;
+  const channel = String(el("discord-channel").value || "");
+  const held = heldMessagesById();
+  const fresh = serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
+  const drawn = [...el("server-hits").children].map((li) => `${li.getAttribute("data-channel")} ${li.getAttribute("data-id")}`);
+  const want = fresh.map((hit) => `${hit.channel_id} ${hit.id}`);
+  if (drawn.join("\n") !== want.join("\n")) el("server-hits").replaceChildren(...fresh.map(serverHitNode));
+  const more = serverSearch.resume !== null && !serverSearch.loading && !serverSearch.failed;
+  if (el("server-more").hidden === more) el("server-more").hidden = !more;
+  renderSearchFurther();
+}
+
+/** The press of More from the server: the next stretch below where its last answer stopped. */
+function serverSearchMore() {
+  if (serverSearch.resume === null || serverSearch.loading) return Promise.resolve();
+  return runServerSearch(true);
+}
+
+// `#608 server-side-search`. "Search further back": the server is asked to gather this channel's older
+// history next (`#602 history-settings-and-limits`' prioritize, POST .../history/prioritize), at its
+// own pace under the chat service's limits; the page asks how far it has got every few seconds, says
+// so on the line, and searches the server's copy again each time it holds older messages. Stop takes
+// the request back (DELETE). Never automatic: the owner chose a button over background scans.
+
+/** How often the page asks how the gathering of older history stands while it waits for it. */
+const SEARCH_FURTHER_POLL_MS = 5000;
+
+/** The gathering this page asked for: its channel, what the server last said of it, and its timer. */
+let searchFurther = { channel: "", run: 0, /** @type {VibeTalk.ChannelHistoryState | null} */ state: null,
+  timer: /** @type {any} */ (null), failed: "" };
+
+/** Each gathering this page asks for, numbered, so a look begun for one never acts for the next. */
+let searchFurtherRuns = 0;
+
+/** Whether a gathering this page asked for is under way in the channel on screen. */
+const searchFurtherRunning = () => searchFurther.channel !== "" &&
+  searchFurther.channel === String(el("discord-channel").value || "");
+
+/** Whether Search further back is offered: one channel, a copy the server keeps, not yet whole. */
+function searchFurtherOffered() {
+  if (serverSearch.key === "" || searchAllChannels || !serverCopyOpen() || tokenScope === "read") return false;
+  const scope = serverSearch.scopes[0];
+  return Boolean(scope) && scope.state === "searched" && !scope.whole;
+}
+
+/** The line's words for a gathering under way, or "". */
+function searchFurtherWords() {
+  if (!searchFurtherRunning()) return "";
+  if (searchFurther.failed) return `gathering older history: ${searchFurther.failed}`;
+  const state = searchFurther.state;
+  if (!state) return "asking the server to gather older history…";
+  const reached = typeof state.reached_ms === "number" ? state.reached_ms : state.oldest_ms;
+  const back = typeof reached === "number" ? ` back to ${searchMomentWords(reached)}` : "";
+  const eta = typeof state.eta_s === "number" ? `, about ${Math.max(1, Math.round(state.eta_s / 60))} min left` : "";
+  if (state.complete) return `gathered the whole channel${back}`;
+  if (state.held_reason === "rate_limited") return `gathering older history paused by the chat service's limit${back}`;
+  return `gathering older history${back}${eta}`;
+}
+
+/** Show Search further back, or Stop while a gathering this page asked for runs. */
+function renderSearchFurther() {
+  const button = el("search-further");
+  const running = searchFurtherRunning();
+  const offered = running || searchFurtherOffered();
+  if (button.hidden === offered) button.hidden = !offered;
+  setTextIfChanged(button, running ? "Stop gathering older history" : "Search further back");
+}
+
+/** The press: ask the server to gather this channel's older history next, or take that back. */
+async function searchFurtherPressed() {
+  const channel = String(el("discord-channel").value || "");
+  if (!channel) return;
+  if (searchFurtherRunning()) {
+    stopSearchFurther();
+    await api(`/api/v1/channels/${encodeURIComponent(channel)}/history/prioritize`, { method: "DELETE" })
+      .catch(() => null);
+    return;
+  }
+  searchFurtherRuns += 1;
+  const run = searchFurtherRuns;
+  searchFurther = { channel, run, state: null, timer: null, failed: "" };
+  renderServerSearch();
+  try {
+    const state = await apiDecoded("ChannelHistoryState",
+      `/api/v1/channels/${encodeURIComponent(channel)}/history/prioritize`, { method: "POST" });
+    if (searchFurther.run !== run) return;
+    searchFurther.state = state;
+  } catch (error) {
+    if (searchFurther.run !== run) return;
+    searchFurther.failed = error && (error.code === "history_backfill_off" || error.code === "history_not_cached")
+      ? "the server does not gather history for this channel"
+      : String((error && (error.detail || error.message)) || "the server did not answer");
+  }
+  renderServerSearch();
+  if (!searchFurther.failed) pollSearchFurther(channel, run);
+}
+
+/**
+ * Ask how the gathering stands, and search the server's copy again when it holds older messages.
+ * Goes on while the walk runs, is queued, or is held back for a while (a rate limit, an error), and
+ * through a look that fails, which the line says; ends when the walk is done, or with Stop.
+ */
+function pollSearchFurther(channel, run) {
+  searchFurther.timer = setTimeout(() => guardQuietly(async () => {
+    if (searchFurther.run !== run) return;
+    const before = searchFurther.state;
+    /** @type {VibeTalk.ChannelHistoryState | null} */
+    let state = null;
+    try {
+      state = await apiDecoded("ChannelHistoryState", `/api/v1/channels/${encodeURIComponent(channel)}/history`);
+    } catch (error) {
+      if (searchFurther.run !== run) return;
+      searchFurther.failed = String((error && (error.detail || error.message)) || "the server did not answer");
+      renderServerSearch();
+      pollSearchFurther(channel, run);
+      return;
+    }
+    if (searchFurther.run !== run) return;
+    searchFurther.state = state;
+    searchFurther.failed = "";
+    const older = (/** @type {VibeTalk.ChannelHistoryState | null} */ held) =>
+      (held && typeof held.oldest_ms === "number" ? held.oldest_ms : null);
+    if (older(state) !== older(before) || state.complete !== Boolean(before && before.complete)) {
+      // The copy grew: the same search, asked again from the start.
+      serverSearch.key = "";
+      scheduleServerSearch();
+    } else {
+      renderServerSearch();
+    }
+    const going = state.walking || (state.queue_position !== null && state.queue_position !== undefined) ||
+      (typeof state.held_until_ms === "number");
+    if (!state.complete && going) pollSearchFurther(channel, run);
+    else searchFurther.timer = null;
+  })(), SEARCH_FURTHER_POLL_MS);
+}
+
+/** Stop asking how the gathering stands: Stop, another channel, or the search closed. */
+function stopSearchFurther() {
+  if (searchFurther.timer !== null) clearTimeout(searchFurther.timer);
+  searchFurther = { channel: "", run: 0, state: null, timer: null, failed: "" };
+  renderServerSearch();
+}
+
+/** All channels ticked or unticked: the server is asked again over the channels it now names. */
+function chooseSearchAllChannels(on) {
+  searchAllChannels = Boolean(on);
+  scheduleServerSearch();
+}
+
 // --- searching the threads' replies further back ----------------------------------------------------
 //
 // `#262 search-load-older`, the cards' half. The owner's search found nothing in two columns, and the
@@ -42211,7 +42676,7 @@ let repliesWalk = null;
 let repliesNote = /** @type {{key: string, text: string} | null} */ (null);
 
 /** Everything the cards' walk depends on: a change in either ends it, and clears its note. */
-const repliesKey = () => JSON.stringify([String(el("discord-channel").value), searchOpen ? searchTerms(searchQuery) : []]);
+const repliesKey = () => JSON.stringify([String(el("discord-channel").value), searchOpen ? searchIdentity(searchQuery) : null]);
 
 /** All's cover in the selected channel's store, or null where no page of All has covered it. */
 function allCover() {
@@ -42230,7 +42695,7 @@ const sideCardsShown = () => cardsOnScreen() === leftEl("side-cards");
 
 /** Whether the cards offer to search their threads' older replies: see the head of this section. */
 function repliesSearchOffered() {
-  return threadingSupported && sideCardsShown() && searchOpen && searchTerms(searchQuery).length > 0 &&
+  return threadingSupported && sideCardsShown() && searchOpen && searchTyped(searchQuery) &&
     channelCanon.channel === String(el("discord-channel").value) && !channelCanon.scope && !allLoaded();
 }
 
@@ -42435,15 +42900,15 @@ function searchReplies() {
   const count = () => {
     walk.found = cardsFound().filter((id) => !walk.held.has(id) && walk.brought.has(id)).length;
   };
-  const terms = searchTerms(searchQuery);
+  const node = searchParsed(searchQuery).node;
   /** @param {VibeTalk.TimelineResponse} payload */
   const note = (payload) => {
     for (const message of payload.messages || []) {
       const id = threadOf(message);
       if (!id) continue;
       walk.brought.add(id);
-      const words = `${message.author || ""} ${messageText(message)}`.toLowerCase();
-      if (!message.thread.is_root && terms.every((term) => words.includes(term))) walk.matched.add(id);
+      // `#606 server-side-search`: a reply the shared language matches, on its own.
+      if (!message.thread.is_root && node !== null && messageMatches(node, message)) walk.matched.add(id);
     }
   };
   walk.promise = (async () => {
@@ -43625,7 +44090,7 @@ function openThreadRootId() {
 
 /** Whether a filter is choosing rows: then every match is shown, and no run hides one behind a line. */
 function readRunsSuspended() {
-  return searchOpen && (linksOnly || authorFilter !== "everyone" || searchTerms(searchQuery).length > 0);
+  return searchOpen && (linksOnly || authorFilter !== "everyone" || searchTyped(searchQuery));
 }
 
 /**
@@ -49922,11 +50387,14 @@ function filterSideCards() {
     return;
   }
   unpackSuspendedDrawn = readRunsSuspended();
-  const terms = searchOpen ? searchTerms(searchQuery) : [];
-  const marking = searchOpen ? searchTerms(markedQuery) : [];
+  // `#606 server-side-search`. The shared language, message by message: a thread with any hit is
+  // chosen, by its card's own words or by a reply the page holds.
+  const node = searchOpen ? searchParsed(searchQuery).node : null;
+  const typed = node !== null;
+  const marking = searchOpen ? searchParsed(markedQuery).terms : [];
   const allRows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
   const rows = allRows.filter((row) => row.hasAttribute("data-card"));
-  const replies = terms.length > 0 ? heldReplyText() : null;
+  const replyHits = typed ? threadsWithHits(node) : null;
   // `#439 search-unmatched-separators`. The runs among the cards the reader has opened: shown, as in
   // the channel's lists, but never counted among the matches the bar names.
   const openedCards = openedCardGaps(false);
@@ -49942,9 +50410,8 @@ function filterSideCards() {
     // message out of Main; a card in a folded run is hidden behind the run's line. A card in a run
     // the reader opened from its unmatched line (`#439`) stands through either, while the search stands.
     const kept = (((!hidingRead() || fresh) && row.getAttribute("data-read-run") !== "member") || revealed);
-    const own = terms.every((term) => text.includes(term));
-    const theirs = !own && replies ? replies.get(String(row.getAttribute("data-id"))) || "" : "";
-    const inReplies = theirs !== "" && terms.every((term) => text.includes(term) || theirs.includes(term));
+    const own = !typed || rowMatches(row, node, text);
+    const inReplies = !own && replyHits !== null && replyHits.has(String(row.getAttribute("data-id")));
     const said = own || inReplies || revealed;
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
@@ -49963,7 +50430,7 @@ function filterSideCards() {
     if (!row.hasAttribute("data-main-row")) continue;
     const revealed = openedCards !== null && inOpenedGap(row, openedCards.ids);
     const kept = row.getAttribute("data-read-run") !== "member" || revealed;
-    const matched = terms.every((term) => (row.getAttribute("data-search") || "").includes(term));
+    const matched = !typed || rowMatches(row, node, row.getAttribute("data-search") || "");
     const said = matched || revealed;
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
@@ -49978,6 +50445,12 @@ function filterSideCards() {
     // ...and a block whose card heads a folded run of read threads goes behind the run's line with it.
     const folded = row.getAttribute("data-card-run") === "member";
     if (row.hidden === (shownBlock && !folded)) row.hidden = !(shownBlock && !folded);
+    // `#606 server-side-search`. Unpacked under a search, a thread shows only its hits, its other
+    // messages folded into lines between them (`drawUnpackGaps`), until the reader opens one.
+    const hit = !typed || rowMatches(row, node, row.getAttribute("data-search")) ||
+      (openedCards !== null && inOpenedGap(row, openedCards.ids));
+    setClassWord(row, "search-hidden", !hit);
+    markSearchHits(row, typed && hit ? marking : []);
   }
   // `#281 view-keys`. A failed read of older threads is said over the cards it left as they were.
   const state = [olderThreadsFailure(), sideListState(rows.length, unread, shown)].filter((part) => part !== "").join(" ");
@@ -50071,13 +50544,123 @@ function cardGapTally(group) {
 }
 
 /**
+ * The blocks of messages unpacked under the cards of `list`, each as its card and its rows in order.
+ * `#606 server-side-search`.
+ *
+ * @param {HTMLElement} list
+ */
+function unpackBlocks(list) {
+  /** @type {Map<string, {card: any, rows: any[]}>} */
+  const blocks = new Map();
+  let card = null;
+  for (const row of /** @type {any[]} */ ([...list.children])) {
+    const thread = row.getAttribute("data-unpack-thread");
+    if (thread === null) {
+      card = row.hasAttribute("data-card") ? row : null;
+      continue;
+    }
+    if (!blocks.has(thread)) blocks.set(thread, { card: card && String(cardThread(card)) === thread ? card : null, rows: [] });
+    /** @type {{card: any, rows: any[]}} */ (blocks.get(thread)).rows.push(row);
+  }
+  return [...blocks.values()];
+}
+
+/**
+ * `#606 server-side-search`. In each thread unpacked under its card while a search is typed, a line
+ * for each run of its messages the search leaves out: "… 3 unmatched messages …" above the hit after
+ * the run, or below the last hit for a run at the end, or below the card for a run before the first
+ * hit — above that hit instead when the cards' own line for the threads after it holds the card's
+ * place below (`drawCardGaps` draws first), so neither line takes the other's. A block the read mode
+ * or the search hides is skipped; every line comes down with the search. A tap opens its run
+ * (`openUnpackGap`), as among the channel's messages.
+ *
+ * @param {HTMLElement} list
+ * @param {boolean} searching
+ */
+function drawUnpackGaps(list, searching) {
+  for (const { card, rows } of unpackBlocks(list)) {
+    /** @type {Map<any, {above: any, below: any}>} */
+    const wanted = new Map();
+    // The cards' own line for the threads after this one, on the card's place below.
+    const cardBusy = Boolean(card && card.hasAttribute("data-seam-below") && card.seamBelowLine &&
+      !card.seamBelowLine.gapUnpack);
+    if (searching) {
+      let run = 0;
+      let last = null;
+      const line = (count) => ({ kind: "gap", unpack: true, words: gapWords(count) });
+      for (const row of rows) {
+        if (row.hidden) continue;
+        if (!rowShown(row)) {
+          run += Math.max(1, idsOf(row).length);
+          continue;
+        }
+        const onCard = run > 0 && last === null && card && !cardBusy;
+        wanted.set(row, { above: run > 0 && (last !== null || !onCard) ? line(run) : null, below: null });
+        if (onCard) wanted.set(card, { above: null, below: line(run) });
+        run = 0;
+        last = row;
+      }
+      if (run > 0) {
+        if (last !== null) /** @type {{above: any, below: any}} */ (wanted.get(last)).below = line(run);
+        else if (card && rowShown(card) && !cardBusy) wanted.set(card, { above: null, below: line(run) });
+      }
+    }
+    for (const row of rows) {
+      const want = wanted.get(row) || { above: null, below: null };
+      if (!row.hidden || row.hasAttribute("data-seam") || row.hasAttribute("data-seam-below")) {
+        placeSeam(row, want.above, false);
+        placeSeam(row, want.below, true);
+      }
+    }
+    // The card's line below it is the block's alone while the block wants one; the cards' own runs
+    // put theirs above the next card shown, so the two never meet on one card.
+    if (card) {
+      const own = wanted.get(card);
+      const held = card.seamBelowLine;
+      if (own) placeSeam(card, own.below, true);
+      else if (held && held.gapUnpack) placeSeam(card, null, true);
+    }
+  }
+}
+
+/**
+ * Open the run of an unpacked thread's messages a line on `row` stands for: above it, the messages the
+ * search hid before it; below it (or below the card, `row` being the card), those after it. Returns the
+ * first row shown, for a keyboard's focus. `#606 server-side-search`.
+ */
+function openUnpackGap(row, below) {
+  const list = row.parentNode;
+  if (!list) return null;
+  const thread = row.getAttribute("data-unpack-thread") ?? String(cardThread(row));
+  const block = unpackBlocks(list).find((one) => one.rows.length > 0 &&
+    String(one.rows[0].getAttribute("data-unpack-thread")) === String(thread));
+  const opened = openedCardGaps(true);
+  if (!block || !opened) return null;
+  const rows = block.rows.filter((one) => !one.hidden);
+  const at = row.hasAttribute("data-unpack-thread") ? rows.indexOf(row) : -1;
+  let first = null;
+  const take = (one) => {
+    for (const id of idsOf(one)) opened.ids.add(id);
+    if (first === null || !below) first = one;
+  };
+  if (below) {
+    for (let next = at + 1; next < rows.length && !rowShown(rows[next]); next += 1) take(rows[next]);
+  } else {
+    for (let next = at - 1; next >= 0 && !rowShown(rows[next]); next -= 1) take(rows[next]);
+  }
+  if (first === null) return null;
+  keepingCardPlace(filterSideCards);
+  return first;
+}
+
+/**
  * Draw a line in each run the search leaves among `list`'s cards, and take away every one no
  * longer wanted: `drawSeams` for a list of threads. Each card keeps the words it was drawn with
  * (`placeSeam`), so a pass that changes nothing writes nothing, as among messages.
  */
 function drawCardGaps(list) {
   if (!list) return;
-  const searching = searchOpen && searchTerms(searchQuery).length > 0;
+  const searching = searchOpen && searchTyped(searchQuery);
   if (!searching) {
     // No grouping to do: only lines a closed search left behind come down, and on most passes
     // there are none — an attribute each, asked on the way past.
@@ -50119,6 +50702,9 @@ function drawCardGaps(list) {
     placeSeam(group.head, want.above, false);
     placeSeam(group.head, want.below, true);
   }
+  // `#606 server-side-search`. Then the lines inside the threads unpacked under the cards: a card's
+  // line below it is the block's while the block wants one.
+  drawUnpackGaps(list, searching);
 }
 
 /**
@@ -50148,23 +50734,6 @@ function openCardGap(row, below) {
   if (list === leftEl("side-cards")) keepingCardPlace(filterSideCards);
   else applySearch();
   return first;
-}
-
-/**
- * The words of the replies the page holds, by thread, lower-cased as `searchable` lower-cases a row's:
- * each reply's author and what it says, as its row would be found by. For the search over the cards.
- */
-function heldReplyText() {
-  /** @type {Map<string, string>} */
-  const byThread = new Map();
-  if (channelCanon.channel !== String(el("discord-channel").value)) return byThread;
-  for (const message of channelCanon.messages) {
-    const id = threadOf(message);
-    if (!id || message.thread.is_root) continue;
-    const said = `${message.author || ""} ${messageText(message)}`.toLowerCase();
-    byThread.set(id, byThread.has(id) ? `${byThread.get(id)} ${said}` : said);
-  }
-  return byThread;
 }
 
 /**
@@ -59359,6 +59928,11 @@ el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
 el("load-older").addEventListener("click", guardQuietly(olderControlPressed));
 // `#262 search-load-older`. One column on Main, a search nothing loaded matches: All has the replies.
 leftEl("search-in-all").addEventListener("click", guardQuietly(searchInAll));
+// `#605`-`#608 server-side-search`.
+el("server-more").addEventListener("click", guardQuietly(serverSearchMore));
+el("search-all-channels").addEventListener("change", () =>
+  chooseSearchAllChannels(/** @type {HTMLInputElement} */ (el("search-all-channels")).checked));
+el("search-further").addEventListener("click", guardQuietly(searchFurtherPressed));
 el("load-older-turns").addEventListener("click", guardQuietly(loadOlderTurns));
 el("collapse-all").addEventListener("click", () => setAllFolded(true));
 el("expand-all").addEventListener("click", () => setAllFolded(false));
@@ -59399,7 +59973,7 @@ el("search-field").addEventListener("input", () => {
     searchQuery = el("search-field").value;
     // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
     // one redraw; otherwise they follow once the typing pauses (`markedQuery`).
-    if (searchTerms(searchQuery).length === 0) markedQuery = searchQuery;
+    if (!searchTyped(searchQuery)) markedQuery = searchQuery;
     eachColumn(renderScrollTools);
     if (sideColumnUp()) refilterSideCards();
   }));

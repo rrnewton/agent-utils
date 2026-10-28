@@ -1,6 +1,6 @@
 ---
 title: 'server-side-search: an All channels checkbox, and hits shown alone with Show in channel'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-521: parent-child
 created_at: 2026-10-28T01:28:02.146312560+00:00
-updated_at: 2026-10-28T01:28:02.146312560+00:00
+updated_at: 2026-10-28T03:35:35.769190579+00:00
+closed_at: 2026-10-28T03:35:35.769190439+00:00
 ---
 
 # Description

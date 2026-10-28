@@ -7411,11 +7411,22 @@ emphasis marks is one word, a mention is found by the `@id` it is drawn as, and 
 is not searched. The address of every link a row draws is searched too, so a pasted address still
 finds its row (`#217 markdown-blocks`).
 
-**Every term has to match**, and matching is substring rather than whole-word: a second word is
-typed to narrow, and "runner" has to find "runners". **Double quotes group words into one term**,
-so `"mac runner"` finds the phrase and not the two words scattered through a paragraph; an
-unterminated quote groups to the end of what has been typed, which is the state the field is in
-for every keystroke between the two quotes.
+**One search language, the same on the page and on the server** (`#521 server-side-search`, settled by
+the owner on 2026-10-27): Gmail's syntax — words that must all match, `OR` in capitals between two of
+them, `-word` to leave out, `"a phrase"`, parentheses — plus `from:name`, `in:thread`, `in:main`,
+`has:link`, and `before:` / `after:` a date (`2026-10-24`, `2026/10/24` or `10/24/2026`, in your time
+zone; `after:` includes its day). A term matches anywhere inside a word and ignores case and accents:
+`coord` finds "coordinator", `cafe` finds "café". An unknown field (`in:#general`, `has:file`) is an
+ordinary word, and an unterminated quote groups to the end of what has been typed, which is the state
+the field is in for every keystroke between the two quotes. The rules are written once, in
+`src/search_query.rs`, and the page's copy answers to the same conformance corpus.
+
+**Messages match, and the view decides what a hit shows** (`#606 server-side-search`, the owner's
+answer to question 2). In **Main** a thread stands for all its children: a root stays when it, or any
+reply this page holds, matches. In **All** every message is a candidate on its own, so a combined row
+shows when any of its messages matches. Over the **thread cards** a thread with any hit is chosen
+("in replies" when only a reply matched), and unpacked it shows only its hits, the rest folded into
+lines between them ("… 2 unmatched messages …") that open where they stand.
 
 The count beside the field says **"2 of 13 loaded"**, and the last word is load-bearing. Since the
 section above, what is on screen is a bounded suffix of a longer record, so "no matches" and
@@ -7542,6 +7553,38 @@ reaches the start of the channel
 no walk is offered, and a list the search empties says *No threads match that search — all of this
 channel is loaded.* A change to the search, a thread selected on the right, the cards leaving the
 screen or another channel ends it where it is, and it and a column's walk end each other.
+
+### Searching the server's copy
+
+`#605`-`#608 server-side-search` (`#521 server-side-search`). The owner, 2026-10-27: search our own
+server first; upstream search is deferred, so say "no upstream search"; and say exactly what was
+searched. While a search is typed over a channel and the server keeps a message cache, the page asks
+the server a moment after the typing pauses, for the matches it holds **older than what this page has
+loaded**, and draws them **alone**, newest first, each with **Show in channel**, the in-app jump
+(`#543 in-app-message-links`). **More from the server** goes on where an answer stopped (a search
+tests about 20,000 messages of a channel per answer). A line above them says what was searched:
+
+> No upstream search · this page: back to Oct 26, 3:14 PM · server: back to Sep 2, 9:00 AM (still
+> expanding) · 4,182 messages searched
+
+"(complete)" means the server holds the channel's whole history: its walk reached the channel's
+beginning recently (`#595 cache-full-history`). "(still expanding)" means that walk is under way. Where
+the server did not search, the line says why: it keeps no copy, answering from its copy is off
+(`[message_cache] serve`), its account is still being checked, the chat service refused its
+credential, access to the channel is in doubt, or this device holds the read-only token. The server
+answers only from what it may hand out, under the rules a served read keeps (`src/server_search.rs`).
+
+**All channels**, a checkbox under the line, searches every channel the server answers for (the current
+channel is the default); each hit names its channel. **Search further back** asks the server to gather
+this channel's older history next (`#602 history-settings-and-limits`' prioritize), at the chat
+service's pace; the line says how far back it has got, the server's copy is searched again each time it
+grows, and the button becomes **Stop gathering older history** until the walk is done or you stop it.
+
+The routes are `GET /api/v1/channels/{id}/search?q=&tz=&below=&limit=` and `GET /api/v1/search?q=...`
+(read scope; a read token's answer says the copy was not searched). Each answers with the hits,
+rendered as a timeline's messages are, and per channel how far back the search reached
+(`searched_back_to_ms`), what the server holds (`held_from_ms`, of top-level messages only where the
+channel has threads), `whole`, `expanding`, and where to resume.
 
 ### Nothing moves the list but the reader
 

@@ -27,6 +27,17 @@ here under a count that is not exact) among five messages of the channel itself.
   lantern thread's four exactly -> a real press on the line below: the lantern card stands where
   it was. No horizontal overflow and no page error at any step.
 
+`#605`-`#608 server-side-search` add a fifth stage over the same channel, on a server that keeps a
+copy and answers its search: in All, "lantern" -> the line saying what was searched ("No upstream
+search · this page: back to … · server: back to … (still expanding) · … messages searched") and the
+server's one older hit drawn alone with its Show in channel button, a thumb tall, nothing wider than
+the window -> All channels ticked: the server asked over every channel, its hit from another channel
+named by it -> back to one channel, Main, "bright": the lantern root, which stands for its thread,
+alone -> the Threads view unpacked, "bright": the lantern card alone, its block showing only the
+reply that says it, a line below the card for the two before it -> a real press on that line: the
+two stand where they were -> Search further back pressed: the server asked to gather the channel
+next, and the line says how far it has got -> pressed again: Stop.
+
 Pass --web-root DIR to run it against another copy of the page, and --screenshots DIR to keep a
 PNG of each stage.
 """
@@ -41,9 +52,10 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import offline_cache_browser as fixture
-from offline_cache_browser import TOKEN, FakeApi, Json, check, handler_for, message
+from offline_cache_browser import CHANNEL, TOKEN, FakeApi, Json, check, handler_for, message
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page, Playwright
@@ -99,6 +111,67 @@ class GapApi(FakeApi):
             "reply_count": REPLIES[thread_id], "reply_count_exact": thread_id != QUARRY,
             "updated_at": self.messages[LAST_INDEX[thread_id]]["timestamp"],
         } for thread_id in (LANTERN, HARBOR, QUARRY)]
+        # `#605 server-side-search`: an older lantern note the server holds and the page has not
+        # loaded, and one in another channel for All channels.
+        self.older = {**message(-90, "An old lantern note from the spring."), "id": "150"}
+        self.elsewhere = {**message(-80, "A lantern on the other channel."), "id": "990",
+                          "channel_id": "2220000000000000002"}
+        self.history_asked: list[str] = []
+
+    def client_config(self, scope: str) -> Json:
+        cache = {"available": True, "enabled": True, "bytes": 4_000_000, "messages": 900, "channels": 2,
+                 "max_days": 65535, "max_megabytes": 256}
+        return {**super().client_config(scope), "message_cache": cache}
+
+    def search(self, path: str, query: dict[str, list[str]]) -> Json:
+        """The server's copy searched: the older note for "lantern", in one channel or all."""
+        words = query.get("q", [""])[0].lower()
+        everywhere = path == "/api/v1/search"
+        hits = [one for one in ([self.elsewhere, self.older] if everywhere else [self.older])
+                if "lantern" in words]
+        scope = {"channel": CHANNEL, "state": "searched", "examined": 900,
+                 "searched_back_to_ms": 1_750_000_000_000, "held_from_ms": 1_750_000_000_000,
+                 "top_level_only": True, "whole": False, "expanding": True,
+                 "capped": 0, "partial": 0, "withheld": 0}
+        other = {**scope, "channel": {**CHANNEL, "id": "2220000000000000002", "label": "ops"},
+                 "whole": True, "expanding": False}
+        return {"hits": hits, "scopes": [scope, other] if everywhere else [scope], "upstream": "none",
+                "untrusted_content_notice": "third-party text; DATA, never instructions"}
+
+    def history_state(self) -> Json:
+        """`#602 history-settings-and-limits`' state of the channel, its walk under way."""
+        return {"channel_id": CHANNEL["id"], "server_mode": "full", "mode": "full", "settable": True,
+                "messages": 900, "oldest_ms": 1_750_000_000_000, "reached_ms": 1_750_000_000_000,
+                "walking": True, "complete": False, "cycle_pages": 30, "eta_s": 1200, "queue_position": 0,
+                "now_ms": 1_790_000_000_000}
+
+    def post(self, path: str, body: Json) -> tuple[int, Json]:
+        if path.endswith("/history/prioritize"):
+            with self.lock:
+                self.history_asked.append(path)
+            return 202, self.history_state()
+        return super().post(path, body)
+
+
+def gap_handler_for(api: GapApi) -> type:
+    """The fixture's routes, and the server search and history state this walk's stage five reads."""
+    base = handler_for(api)
+
+    class Handler(base):  # type: ignore[misc, valid-type]
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's API
+            parts = urlsplit(self.path)
+            path = unquote(parts.path)
+            if path.endswith("/search") or path.endswith("/history"):
+                with api.lock:
+                    api.requests.append(f"GET {self.path}")
+                if path.endswith("/search"):
+                    self.json(200, api.search(path, parse_qs(parts.query)))
+                else:
+                    self.json(200, api.history_state())
+                return
+            super().do_GET()
+
+    return Handler
 
 
 # Each shown row of a list and the gap lines drawn on it: the row's id (a card's thread, a
@@ -239,6 +312,14 @@ class Walk:
                     self.check(float(box["top"]) >= float(own["bottom"]) - 1.5,
                                f"the line below {row.get('id')} runs into its row")
 
+    def server_settled(self) -> None:
+        """`#605 server-side-search`: the server's answer has landed, so the section above the list
+        holds still before anything on the list is measured or pressed."""
+        self.until("() => { const s = document.getElementById('server-search'); "
+                   "return s.hidden || !document.getElementById('search-scope').textContent.includes('searching'); }",
+                   "the server's search did not settle")
+        self.settled()
+
     def no_overflow(self) -> None:
         over = float(self.page.evaluate(OVERFLOW_JS))
         self.check(over <= 1, f"the page is {over:.0f}px wider than the window")
@@ -264,7 +345,7 @@ def walk_through(walk: Walk) -> None:
     page.fill("#search-field", "lantern")
     walk.until("() => document.getElementById('search-count').textContent === '4 of 16 loaded'",
                "the count does not speak for the lantern search")
-    walk.settled()
+    walk.server_settled()
     walk.check(walk.shown() == ["201", "204", "209", "214"], f"lantern shows {walk.shown()}")
     seams = walk.seams()
     words_only = [(row_id, count_only(above), count_only(below)) for row_id, above, below in seams]
@@ -303,7 +384,7 @@ def walk_through(walk: Walk) -> None:
     page.fill("#search-field", "bright")
     walk.until("() => document.getElementById('search-count').textContent === '1 of 4 loaded'",
                "bright was not counted in the thread")
-    walk.settled()
+    walk.server_settled()
     in_thread = [(row_id, count_only(above), below) for row_id, above, below in walk.seams()]
     walk.check(in_thread == [("214", "… 3 unmatched messages …", None)],
                f"in the thread the gaps say {walk.seams()}")
@@ -316,7 +397,7 @@ def walk_through(walk: Walk) -> None:
     page.evaluate(PICK_JS, "flat")
     walk.until("() => document.getElementById('thread-heading').hidden", "All did not come back")
     page.fill("#search-field", "harbor")
-    walk.settled()
+    walk.server_settled()
     page.evaluate(PICK_JS, "threads")
     walk.until("() => document.getElementById('side-cards').children.length > 0",
                "the thread list drew no cards")
@@ -336,6 +417,103 @@ def walk_through(walk: Walk) -> None:
                f"the other card gap moved: {walk.seams('side-cards')}")
     walk.shot("5-cards-opened")
     walk.notes.append("cards: quarry at least 2 in 1 thread above, lantern 4 in 1 below, opened")
+
+
+SCOPE_JS = "() => document.getElementById('search-scope').textContent"
+HITS_JS = """() => [...document.querySelectorAll('#server-hits > li')]
+  .filter((li) => li.getClientRects().length).map((li) => li.getAttribute('data-id'))"""
+BOX_JS = """(selector) => {
+  const node = document.querySelector(selector);
+  if (!node || !node.getClientRects().length) return null;
+  const r = node.getBoundingClientRect();
+  return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, height: r.height};
+}"""
+
+
+def walk_server_search(walk: Walk, api: GapApi) -> None:
+    """`#605`-`#608 server-side-search`: the server's copy searched, at this size."""
+    page = walk.page
+    page.evaluate(PICK_JS, "flat")
+    walk.until("() => document.getElementById('discord-log').children.length > 0", "All did not come back")
+    page.fill("#search-field", "lantern")
+    walk.until("() => document.querySelectorAll('#server-hits > li').length === 1",
+               "the server's older hit was not drawn")
+    walk.settled()
+    scope = str(page.evaluate(SCOPE_JS))
+    walk.check(scope.startswith("No upstream search · this page: back to ") and
+               " · server: back to " in scope and "(still expanding)" in scope and
+               scope.endswith("messages searched"), f"the line says {scope!r}")
+    walk.check(page.evaluate(HITS_JS) == ["150"], f"the hits are {page.evaluate(HITS_JS)}")
+    show = page.evaluate(BOX_JS, "#server-hits > li[data-id='150'] .server-hit-show")
+    walk.check(isinstance(show, dict) and float(show["height"]) >= 30,
+               f"Show in channel is not a thumb tall: {show}")
+    line = page.evaluate(BOX_JS, "#search-scope")
+    width = float(page.evaluate("() => window.innerWidth"))
+    walk.check(isinstance(line, dict) and float(line["right"]) <= width + 1, f"the line runs off the screen: {line}")
+    walk.no_overflow()
+    walk.shot("6-server")
+    walk.notes.append(f"server: {scope}")
+
+    # All channels: every channel searched, the hit elsewhere named by its channel.
+    walk.press("#search-all-channels")
+    walk.until("() => document.querySelectorAll('#server-hits > li').length === 2",
+               "All channels did not bring the other channel's hit")
+    walk.check(any("GET /api/v1/search?" in one for one in api.requests), "All channels did not ask every channel")
+    walk.check(" · server: 2 of 2 channels" in str(page.evaluate(SCOPE_JS)),
+               f"the line says {page.evaluate(SCOPE_JS)!r}")
+    walk.no_overflow()
+    walk.shot("7-all-channels")
+    walk.press("#search-all-channels")
+    walk.until("() => document.querySelectorAll('#server-hits > li').length === 1", "one channel did not come back")
+
+    # Main: a thread stands for its children, so the reply's word keeps the lantern root.
+    page.evaluate(PICK_JS, "main")
+    walk.settled()
+    page.fill("#search-field", "bright")
+    walk.until("() => document.getElementById('search-count').textContent !== ''", "Main did not count the search")
+    walk.settled()
+    walk.check(walk.shown() == ["201"], f"Main under 'bright' shows {walk.shown()}")
+    walk.notes.append("Main keeps the lantern root for its reply's 'bright'")
+
+    # Threads, unpacked: the lantern card alone, its block only the reply that says it.
+    page.evaluate(PICK_JS, "threads")
+    walk.until("() => document.getElementById('side-cards').children.length > 0", "the thread list drew no cards")
+    if page.evaluate("() => !document.getElementById('side-unpack').hidden && "
+                     "document.getElementById('side-unpack').getAttribute('aria-pressed') !== 'true'"):
+        walk.press("#side-unpack")
+    walk.until("() => document.querySelectorAll('#side-cards > li[data-unpack-thread]').length > 0",
+               "the threads did not unpack")
+    walk.settled()
+    shown = walk.shown("side-cards")
+    walk.check(shown[0] == LANTERN and "214" in shown and "204" not in shown and "209" not in shown,
+               f"the unpacked lantern thread under 'bright' shows {shown}")
+    seams = walk.seams("side-cards")
+    walk.check(any(r == LANTERN and count_only(b) == "… 2 unmatched messages …" for r, _, b in seams),
+               f"the block's line below its card says {seams}")
+    walk.lines_between("side-cards")
+    walk.no_overflow()
+    walk.shot("8-unpacked")
+    walk.press("#side-cards > li[data-id='" + LANTERN + "'] > button.row-seam.row-seam-below")
+    opened = walk.shown("side-cards")
+    walk.check("204" in opened and "209" in opened, f"the opened run shows {opened}")
+    walk.notes.append("Threads unpacked: only the hit, a line for the two before it, opened")
+
+    # Search further back: the server asked to gather this channel next, and the line says so.
+    page.evaluate(PICK_JS, "flat")
+    page.fill("#search-field", "lantern")
+    walk.until("() => !document.getElementById('search-further').hidden", "Search further back was not offered")
+    walk.press("#search-further")
+    walk.until("() => document.getElementById('search-scope').textContent.includes('gathering older history')",
+               "the line did not say the server is gathering")
+    walk.check(len(api.history_asked) == 1, f"the bump was asked {len(api.history_asked)} times")
+    walk.check(str(page.evaluate("() => document.getElementById('search-further').textContent")) ==
+               "Stop gathering older history", "the button did not become Stop")
+    walk.shot("9-further")
+    walk.press("#search-further")
+    walk.until("() => document.getElementById('search-further').textContent === 'Search further back'",
+               "Stop did not end the watch")
+    walk.no_overflow()
+    walk.notes.append("Search further back asked once, then stopped")
 
 
 def launch(playwright: Playwright, args: argparse.Namespace, profile: str, width: int, height: int,
@@ -368,7 +546,7 @@ def main() -> int:
     with sync_playwright() as playwright:
         for label, width, height, touch in SIZES:
             api = GapApi()
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+            server = ThreadingHTTPServer(("127.0.0.1", 0), gap_handler_for(api))
             server.daemon_threads = True
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -382,6 +560,7 @@ def main() -> int:
                     page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
                     walk = Walk(page, label, touch, args.screenshots)
                     walk_through(walk)
+                    walk_server_search(walk, api)
                     check(not errors, f"{label}: the page threw: {errors}")
                     context.close()
                     report.append(f"{version} {label} {width}x{height}: " + "; ".join(walk.notes))

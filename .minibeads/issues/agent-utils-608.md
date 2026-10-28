@@ -1,6 +1,6 @@
 ---
 title: 'server-side-search: Search further back, prioritising the channel''s crawl'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-521: parent-child
 created_at: 2026-10-28T01:28:05.700978227+00:00
-updated_at: 2026-10-28T01:28:05.700978227+00:00
+updated_at: 2026-10-28T03:35:35.772921275+00:00
+closed_at: 2026-10-28T03:35:35.772921125+00:00
 ---
 
 # Description
