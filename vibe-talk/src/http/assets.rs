@@ -114,6 +114,18 @@
 //!
 //! The documents are built once per pair of names, on first use: a deployment has one pair, so
 //! once per process, as before; a test process holding several configurations builds one each.
+//!
+//! # The page build's hashed files, at `/assets/`
+//!
+//! `#624 voice-page-modularity`. `web/build.mjs`, run by `build.rs`, builds the page into one
+//! minified script and one stylesheet named by their content hashes, `/assets/voice.<hash>.js` and
+//! `.css`, each with a source map named by its own hash. They are served here from the table
+//! `build.rs` generates, never from the filesystem, and the name is the version: under exactly its
+//! current name, with no query, a file is immutable for a year. Any other `voice.<hash>.js` or
+//! `.css` (a page open across a deploy asking for the files of the shell it was loaded from) gets
+//! the CURRENT file of that kind, revalidated, under the current file's ETag, the same rule as an
+//! old `?v=`. A map is different: an old map's name is a 404, because the current map would point
+//! an old script's positions at the wrong lines. Anything else below `/assets/` is a 404.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -137,6 +149,12 @@ const CONTRACT_JS: &str = include_str!("../../web/contract.js");
 const VOICE_CSS: &str = include_str!("../../web/voice.css");
 const STYLE_CSS: &str = include_str!("../../web/style.css");
 const MANIFEST: &str = include_str!("../../web/manifest.webmanifest");
+
+/// The page build's hashed files (`HASHED`), as `build.rs` generated them from `web/build.mjs`'s
+/// output. See "The page build's hashed files" in the module documentation.
+mod built {
+    include!(concat!(env!("OUT_DIR"), "/page_assets.rs"));
+}
 
 const HTML: &str = "text/html; charset=utf-8";
 const JAVASCRIPT: &str = "text/javascript; charset=utf-8";
@@ -246,6 +264,9 @@ struct Entry {
 struct Site {
     names: Names,
     entries: BTreeMap<&'static str, Entry>,
+    /// The page build's hashed files, by path (`/assets/voice.<hash>.js`). Each entry's version is
+    /// the hash its name carries.
+    hashed: BTreeMap<&'static str, Entry>,
 }
 
 /// What the installed app is called: `[server] app_name` and `short_name`. `#343 pwa-app-name`.
@@ -289,7 +310,7 @@ fn site(name: &str, short_name: &str) -> Arc<Site> {
         name: name.to_owned(),
         short_name: short_name.to_owned(),
     };
-    let site = Arc::new(Site::new(SOURCES, names));
+    let site = Arc::new(Site::new(SOURCES, built::HASHED, names));
     sites.push(Arc::clone(&site));
     site
 }
@@ -334,7 +355,11 @@ fn root_keeping_query(uri: &Uri) -> HeaderValue {
 }
 
 impl Site {
-    fn new(sources: &[Source], names: Names) -> Self {
+    fn new(
+        sources: &[Source],
+        hashed: &[(&'static str, &'static str, &'static [u8])],
+        names: Names,
+    ) -> Self {
         // Every file's hash first: a shell cannot be generated until each file it may name has one.
         let versions: BTreeMap<&'static str, String> = sources
             .iter()
@@ -365,11 +390,28 @@ impl Site {
                 (source.path, Entry::new(source.content_type, body, version))
             })
             .collect();
-        Self { names, entries }
+        let hashed = hashed
+            .iter()
+            .map(|&(path, content_type, body)| {
+                let version = digest(body);
+                (
+                    path,
+                    Entry::new(content_type, Bytes::from_static(body), Some(version)),
+                )
+            })
+            .collect();
+        Self {
+            names,
+            entries,
+            hashed,
+        }
     }
 
     /// The answer for `uri`, or `None` when no static file lives at its path.
     fn answer(&self, uri: &Uri, headers: &HeaderMap) -> Option<Response> {
+        if uri.path().starts_with("/assets/") {
+            return self.answer_hashed(uri, headers);
+        }
         let entry = self.entries.get(uri.path())?;
         // Immutable only under EXACTLY the URL the current shell names. No query, an older hash, or
         // anything added to it gets the same bytes revalidated instead; see the module comment.
@@ -377,27 +419,62 @@ impl Site {
             .version
             .as_deref()
             .is_some_and(|version| uri.query() == Some(format!("v={version}").as_str()));
-        let cache_control = HeaderValue::from_static(if named { IMMUTABLE } else { REVALIDATE });
-        let validators = [
-            (header::ETAG, entry.etag.clone()),
-            (header::CACHE_CONTROL, cache_control),
-            (header::VARY, HeaderValue::from_static("accept-encoding")),
-        ];
-        if already_held(headers, &entry.etag) {
-            return Some((StatusCode::NOT_MODIFIED, validators).into_response());
-        }
-        Some(
-            (
-                validators,
-                [(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static(entry.content_type),
-                )],
-                entry.body.clone(),
-            )
-                .into_response(),
-        )
+        Some(respond(entry, named, headers))
     }
+
+    /// A path below `/assets/`: a hashed file under its current name, immutable; the current file
+    /// of the same kind under an older hash, revalidated; otherwise `None`. See the module
+    /// documentation.
+    fn answer_hashed(&self, uri: &Uri, headers: &HeaderMap) -> Option<Response> {
+        if let Some(entry) = self.hashed.get(uri.path()) {
+            return Some(respond(entry, uri.query().is_none(), headers));
+        }
+        let extension = stale_hashed_name(uri.path())?;
+        let (_, current) = self
+            .hashed
+            .iter()
+            .find(|(path, _)| stale_hashed_name(path) == Some(extension))?;
+        Some(respond(current, false, headers))
+    }
+}
+
+/// The kind, `js` or `css`, of a well-formed hashed page file name, `/assets/voice.<32 hex>.js` or
+/// `.css`; `None` for anything else, a map included.
+fn stale_hashed_name(path: &str) -> Option<&'static str> {
+    let name = path.strip_prefix("/assets/voice.")?;
+    let (hash, extension) = name.split_once('.')?;
+    let hex = hash.len() == 32
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    match extension {
+        "js" if hex => Some("js"),
+        "css" if hex => Some("css"),
+        _ => None,
+    }
+}
+
+/// `entry`'s answer: `304` when `headers` show the client holds it, else its body; immutable when
+/// `named` (the exact current name), revalidated otherwise.
+fn respond(entry: &Entry, named: bool, headers: &HeaderMap) -> Response {
+    let cache_control = HeaderValue::from_static(if named { IMMUTABLE } else { REVALIDATE });
+    let validators = [
+        (header::ETAG, entry.etag.clone()),
+        (header::CACHE_CONTROL, cache_control),
+        (header::VARY, HeaderValue::from_static("accept-encoding")),
+    ];
+    if already_held(headers, &entry.etag) {
+        return (StatusCode::NOT_MODIFIED, validators).into_response();
+    }
+    (
+        validators,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(entry.content_type),
+        )],
+        entry.body.clone(),
+    )
+        .into_response()
 }
 
 impl Entry {
@@ -584,6 +661,7 @@ mod tests {
                 source("/a.js", JAVASCRIPT, script, Role::File),
                 source("/a.css", CSS, b"body {}", Role::File),
             ],
+            &[],
             Names::default(),
         )
     }
@@ -612,7 +690,7 @@ mod tests {
     fn the_page_build_is_the_hash_the_shell_names_the_script_by() {
         // `#529 page-build-stale-notice`: what a read reports is exactly the `v=` a page loaded
         // from this server's shell finds on its own script's address.
-        let site = Site::new(SOURCES, Names::default());
+        let site = Site::new(SOURCES, built::HASHED, Names::default());
         let shell = String::from_utf8(site.entries["/"].body.to_vec()).expect("a text shell");
         assert!(
             shell.contains(&format!("src=\"/voice.js?v={}\"", page_build())),
@@ -778,5 +856,156 @@ mod tests {
                 "{held}"
             );
         }
+    }
+
+    const SCRIPT_V1: &[u8] = b"one();";
+    const SCRIPT_V2: &[u8] = b"two();";
+    const STYLE: &[u8] = b"body{}";
+
+    /// A site whose page build is `script` and `STYLE`, under the names a build would give them.
+    fn built_site(script: &'static [u8]) -> (Site, String, String) {
+        let js = Box::leak(format!("/assets/voice.{}.js", digest(script)).into_boxed_str());
+        let css = Box::leak(format!("/assets/voice.{}.css", digest(STYLE)).into_boxed_str());
+        let map = Box::leak(format!("/assets/voice.{}.js.map", digest(b"{}")).into_boxed_str());
+        let hashed: &'static [(&'static str, &'static str, &'static [u8])] = Box::leak(Box::new([
+            (&*js, JAVASCRIPT, script),
+            (&*css, CSS, STYLE),
+            (&*map, "application/json; charset=utf-8", b"{}" as &[u8]),
+        ]));
+        (
+            Site::new(&[], hashed, Names::default()),
+            js.to_owned(),
+            css.to_owned(),
+        )
+    }
+
+    fn try_get(site: &Site, uri: &str) -> Option<Response> {
+        site.answer(&uri.parse().expect("uri"), &HeaderMap::new())
+    }
+
+    #[test]
+    fn a_hashed_file_is_immutable_under_its_current_name_alone() {
+        // `#624 voice-page-modularity`.
+        let (site, js, css) = built_site(SCRIPT_V1);
+        for path in [&js, &css] {
+            let named = get(&site, path, None);
+            assert_eq!(named.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                header_of(&named, header::CACHE_CONTROL),
+                IMMUTABLE,
+                "{path}"
+            );
+            assert_eq!(header_of(&named, header::VARY), "accept-encoding", "{path}");
+            let hash = path
+                .trim_start_matches("/assets/voice.")
+                .split('.')
+                .next()
+                .expect("a hash");
+            assert_eq!(
+                header_of(&named, header::ETAG),
+                format!("W/\"{hash}\""),
+                "{path}"
+            );
+            // The same name with anything added is the same bytes, revalidated.
+            let queried = get(&site, &format!("{path}?v=1"), None);
+            assert_eq!(
+                header_of(&queried, header::CACHE_CONTROL),
+                REVALIDATE,
+                "{path}"
+            );
+            assert_eq!(
+                header_of(&queried, header::ETAG),
+                header_of(&named, header::ETAG)
+            );
+            let held = get(&site, path, Some(header_of(&named, header::ETAG)));
+            assert_eq!(held.status(), StatusCode::NOT_MODIFIED, "{path}");
+            assert_eq!(header_of(&held, header::VARY), "accept-encoding", "{path}");
+        }
+        assert_eq!(
+            header_of(&get(&site, &js, None), header::CONTENT_TYPE),
+            JAVASCRIPT
+        );
+        assert_eq!(
+            header_of(&get(&site, &css, None), header::CONTENT_TYPE),
+            CSS
+        );
+    }
+
+    #[test]
+    fn an_older_hashed_name_gets_the_current_file_revalidated_and_an_older_map_nothing() {
+        // A page left open across a deploy asks for the files of the shell it was loaded from.
+        let (old, old_js, old_css) = built_site(SCRIPT_V1);
+        let (site, js, _) = built_site(SCRIPT_V2);
+        let stale = get(&site, &old_js, None);
+        assert_eq!(stale.status(), StatusCode::OK);
+        assert_eq!(header_of(&stale, header::CACHE_CONTROL), REVALIDATE);
+        assert_eq!(
+            header_of(&stale, header::ETAG),
+            header_of(&get(&site, &js, None), header::ETAG),
+            "an older name was not answered with the current file's validator"
+        );
+        assert_eq!(header_of(&stale, header::CONTENT_TYPE), JAVASCRIPT);
+        // The stylesheet did not change, so its old name is its current name.
+        assert_eq!(
+            header_of(&get(&site, &old_css, None), header::CACHE_CONTROL),
+            IMMUTABLE
+        );
+        // Never a map for a script it was not made from.
+        let old_map = old
+            .hashed
+            .keys()
+            .find(|path| path.ends_with(".map"))
+            .expect("a map");
+        let other_map = format!("/assets/voice.{}.js.map", "0".repeat(32));
+        assert!(
+            try_get(&site, old_map).is_some(),
+            "the current map is served"
+        );
+        assert!(
+            try_get(&site, &other_map).is_none(),
+            "an older map was served"
+        );
+    }
+
+    #[test]
+    fn nothing_else_below_assets_is_served() {
+        let (site, js, _) = built_site(SCRIPT_V1);
+        let hash = "0123456789abcdef0123456789abcdef";
+        for path in [
+            "/assets/".to_owned(),
+            "/assets/voice.js".to_owned(),
+            format!("/assets/voice.{hash}.mjs"),
+            format!("/assets/voice.{}.js", hash.to_uppercase()),
+            format!("/assets/voice.{}.js", &hash[..31]),
+            format!("/assets/voice.{hash}0.js"),
+            format!("/assets/other.{hash}.js"),
+            format!("/assets/voice.{hash}.js/x"),
+            format!("/assets/../assets/voice.{hash}.js"),
+            js.replace("/assets/", "/assets/x/"),
+        ] {
+            assert!(try_get(&site, &path).is_none(), "{path} was served");
+        }
+        // And the page build's table is never consulted outside /assets/.
+        assert!(try_get(&site, &js.replace("/assets/", "/")).is_none());
+    }
+
+    #[test]
+    fn the_page_build_names_each_hashed_file_by_the_hash_of_its_bytes() {
+        // What build.rs embedded is what web/build.mjs named: one script, one stylesheet, a map each.
+        let mut kinds: Vec<&str> = Vec::new();
+        for &(path, _, body) in built::HASHED {
+            let name = path
+                .strip_prefix("/assets/voice.")
+                .expect("an /assets/voice. path");
+            let (hash, kind) = name.split_once('.').expect("a hash and a kind");
+            assert_eq!(
+                hash,
+                digest(body),
+                "{path} does not hold the bytes its name says"
+            );
+            kinds.push(kind);
+        }
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["css", "css.map", "js", "js.map"]);
     }
 }

@@ -182,6 +182,8 @@ fn routes(state: AppState) -> Router {
         .route("/style.css", get(assets::serve))
         .route("/manifest.webmanifest", get(assets::serve))
         .route("/icons/{name}", get(assets::serve))
+        // The page build's hashed script, stylesheet and maps (`#624 voice-page-modularity`).
+        .route("/assets/{name}", get(assets::serve))
         // `#628 documents-index-server`. READ to list/read/check, WRITE to fetch
         // (fetching spends credentials). No MCP tool.
         .route("/api/v1/documents", get(api::list_documents))

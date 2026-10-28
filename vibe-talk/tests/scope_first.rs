@@ -103,6 +103,7 @@ fn inventory() -> Vec<Route> {
         route("GET", "/style.css", Public, Nothing),
         route("GET", "/manifest.webmanifest", Public, Nothing),
         route("GET", "/icons/{name}", Public, Nothing),
+        route("GET", "/assets/{name}", Public, Nothing),
         // `#628 documents-index-server`.
         route(
             "GET",

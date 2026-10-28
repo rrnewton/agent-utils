@@ -10,6 +10,16 @@
 # environment or from a mounted configuration file, so the same image runs on a laptop, on this
 # host, and in a cloud without a rebuild.
 
+# The page (`#624 voice-page-modularity`): web/build.mjs with the esbuild contract/package-lock.json
+# pins, in a stage of its own, so the Rust stage needs no Node. build.rs takes this directory through
+# VIBE_TALK_WEB_DIST only after checking it was built from the sources the Rust stage was given.
+FROM docker.io/library/node:22-bookworm-slim AS web
+WORKDIR /src
+COPY contract/package.json contract/package-lock.json ./contract/
+RUN npm ci --prefix contract --no-audit --no-fund
+COPY web ./web
+RUN node web/build.mjs --out /web-dist
+
 FROM docker.io/library/rust:1-slim-bookworm AS build
 WORKDIR /src
 
@@ -35,6 +45,10 @@ COPY prompts ./prompts
 # build.rs the placeholder build has no build script, so its build dependencies wait for this one.
 COPY build.rs ./
 COPY syntaxes ./syntaxes
+# The page, built above, and the lockfile build.rs checks it against.
+COPY contract/package-lock.json ./contract/
+COPY --from=web /web-dist ./web-dist
+ENV VIBE_TALK_WEB_DIST=/src/web-dist
 # Touch the entry points so cargo cannot reuse the placeholder build above. Only the server is
 # built: the image ships a bridge, not a machine that can mint fake conversations.
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked --bin vibe-talk

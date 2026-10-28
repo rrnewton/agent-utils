@@ -25,6 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85.0
+      # build.rs builds the page with the esbuild contract/package-lock.json pins
+      # (`#624 voice-page-modularity`), so the check needs Node and those tools installed first.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: install the page build's pinned tools
+        run: npm ci --prefix contract --no-audit --no-fund
       - name: check the declared Rust 1.85 MSRV
         run: cargo check --locked --all-targets
 

@@ -64,6 +64,9 @@ steps:
       classification: light
       rss_baseline_bytes: 268435456
 
+  # Every cargo command here runs build.rs, which builds the page with the esbuild
+  # contract/package-lock.json pins (`#624 voice-page-modularity`): so each depends on the step that
+  # installs it, here and in `build.release` (which the other cargo steps follow).
   - group: check
     job: clippy
     desc: clippy over every target, warnings denied
@@ -71,6 +74,7 @@ steps:
     cmd: cd vibe-talk && cargo clippy --all-targets --locked -- -D warnings
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
+    deps: [setup.contract-tools]
     cpu_timeout: 900
     hint:
       est_duration_s: 120
@@ -2024,6 +2028,7 @@ steps:
     cmd: cd vibe-talk && cargo build --release --locked
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
+    deps: [setup.contract-tools]
     cpu_timeout: 1800
     hint:
       est_duration_s: 240

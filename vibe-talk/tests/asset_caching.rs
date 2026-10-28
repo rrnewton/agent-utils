@@ -289,3 +289,75 @@ async fn the_manifest_names_its_icons_by_their_plain_urls() {
         assert_eq!(header(&headers, "cache-control"), REVALIDATE, "{src}");
     }
 }
+
+/// The page build's `assets.json`, as `build.rs` left it beside the files it embedded.
+/// `#624 voice-page-modularity`.
+const PAGE_BUILD_MANIFEST: &str = include_str!(concat!(env!("OUT_DIR"), "/web/assets.json"));
+
+#[tokio::test]
+async fn the_page_builds_files_are_immutable_under_their_hashed_names_and_compressed() {
+    // `#624 voice-page-modularity`. Served from the table build.rs generated, through the whole
+    // router: each name carries the hash of the bytes it answers with, and a browser may keep it.
+    let manifest: serde_json::Value = serde_json::from_str(PAGE_BUILD_MANIFEST).expect("JSON");
+    let app = app();
+    let mut served = 0;
+    for kind in ["script", "style"] {
+        let asset = &manifest["assets"][kind];
+        let content_type = asset["type"].as_str().expect("a type");
+        for (path, expected_type) in [
+            (asset["path"].as_str().expect("a path"), content_type),
+            (
+                asset["map"].as_str().expect("a map"),
+                "application/json; charset=utf-8",
+            ),
+        ] {
+            let hash = path
+                .strip_prefix("/assets/voice.")
+                .and_then(|name| name.split('.').next())
+                .expect("an /assets/voice.<hash> path");
+            let (status, headers, body) =
+                fetch(&app, path, &[("accept-encoding", "identity")]).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(header(&headers, "cache-control"), IMMUTABLE, "{path}");
+            assert_eq!(header(&headers, "content-type"), expected_type, "{path}");
+            assert_eq!(content_hash(&body), hash, "{path} is not its name's bytes");
+            assert_eq!(header(&headers, "etag"), format!("W/\"{hash}\""), "{path}");
+            assert_eq!(varies_on(&headers), ["accept-encoding"], "{path}");
+            // The compression layer still compresses them, and the validator survives it.
+            let (status, compressed, _) = fetch(&app, path, &[("accept-encoding", "br")]).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(header(&compressed, "content-encoding"), "br", "{path}");
+            assert_eq!(
+                header(&compressed, "etag"),
+                header(&headers, "etag"),
+                "{path}"
+            );
+            let (status, _, _) =
+                fetch(&app, path, &[("if-none-match", header(&headers, "etag"))]).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{path}");
+            served += 1;
+        }
+    }
+    assert_eq!(served, 4);
+
+    // An older name of the script: the current script, revalidated, under the current validator.
+    let script = manifest["assets"]["script"]["path"]
+        .as_str()
+        .expect("a path");
+    let older = format!("/assets/voice.{}.js", "0".repeat(32));
+    let (status, headers, body) = fetch(&app, &older, &[("accept-encoding", "identity")]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(header(&headers, "cache-control"), REVALIDATE);
+    let (_, current, current_body) = fetch(&app, script, &[("accept-encoding", "identity")]).await;
+    assert_eq!(header(&headers, "etag"), header(&current, "etag"));
+    assert!(body == current_body, "an older name served other bytes");
+    // An older map, and anything else below /assets/, is not found.
+    for missing in [
+        format!("/assets/voice.{}.js.map", "0".repeat(32)),
+        "/assets/nope".to_owned(),
+        "/assets/voice.js".to_owned(),
+    ] {
+        let (status, _, _) = fetch(&app, &missing, &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    }
+}

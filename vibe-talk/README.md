@@ -1117,11 +1117,15 @@ cloud instance are all the same deployment, and moving between them is moving a 
 
 Two ways to run it, and neither is preferred:
 
-* **Cargo, on a machine you already have.** A Rust toolchain, `cargo run`, done. `web/` is compiled
-  into the binary, so there is no asset directory to serve and no build step for the front end.
+* **Cargo, on a machine you already have.** A Rust toolchain and Node: `npm ci --prefix contract`
+  once (the page build's pinned esbuild), then `cargo run`. The page is built and compiled into the
+  binary, so there is no asset directory to serve, and the running server needs no Node.
 * **The container image.** `podman build` (or `docker build`) from `vibe-talk/Containerfile`. The
   image runs as a non-root user, contains no configuration, and fails immediately rather than
-  starting with defaults if it is given no credentials.
+  starting with defaults if it is given no credentials. Its Node stage builds the page and hands it
+  to the Rust stage as `VIBE_TALK_WEB_DIST`, which any build without Node can use the same way:
+  `node web/build.mjs --out DIR` elsewhere, then `VIBE_TALK_WEB_DIST=DIR cargo build`. The build
+  refuses a directory that was not built from exactly the sources it is compiling.
 
 Both are spelled out under **Running it** below, including the volume mount you need if you want
 state to survive a rebuild. If you just want to look at the web app, `--fake-discord` needs no bot
@@ -1270,6 +1274,7 @@ Locally, without touching Discord at all:
 
 ```sh
 cd vibe-talk
+npm ci --prefix contract    # once, and after contract/package-lock.json changes: the page build's tools
 cargo run -- --config vibe-talk.toml --fake-discord
 ```
 
@@ -5512,8 +5517,9 @@ make contract-check typecheck   # what validation runs: stale generated files, t
 ```
 
 `cargo test --test integration contract::` fails when the schema or samples no longer match the Rust types, and
-`make contract-check` fails when the browser files no longer match the schema. Serving the page
-needs none of this tooling: `web/contract.js` is plain JavaScript with no dependencies.
+`make contract-check` fails when the browser files no longer match the schema. The same install
+also brings the page build's esbuild, which every `cargo build` runs (`build.rs`, `web/build.mjs`,
+`#624 voice-page-modularity`); a binary built that way serves the page with no Node at all.
 
 ## Resuming a conversation across a hang-up
 

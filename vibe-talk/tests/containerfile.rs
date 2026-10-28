@@ -83,8 +83,12 @@ fn production_compile_time_inputs(root: &Path) -> BTreeSet<PathBuf> {
     inputs
 }
 
+/// The sources of every `COPY` in the stage named `build` (`FROM ... AS build`), the one that runs
+/// cargo. Other stages, such as the one building the page with Node (`#624 voice-page-modularity`),
+/// hand their output over with `COPY --from=`, which is not a source from the build context.
 fn build_stage_copy_sources(containerfile: &str) -> Vec<PathBuf> {
     let mut in_build_stage = false;
+    let mut found_build_stage = false;
     let mut sources = Vec::new();
 
     for line in containerfile.lines().map(str::trim) {
@@ -92,7 +96,8 @@ fn build_stage_copy_sources(containerfile: &str) -> Vec<PathBuf> {
             if in_build_stage {
                 break;
             }
-            in_build_stage = true;
+            in_build_stage = line.to_ascii_lowercase().ends_with(" as build");
+            found_build_stage |= in_build_stage;
             continue;
         }
         if !in_build_stage || !line.starts_with("COPY ") || line.contains("--from=") {
@@ -111,6 +116,10 @@ fn build_stage_copy_sources(containerfile: &str) -> Vec<PathBuf> {
                 .map(|field| PathBuf::from(field.trim_start_matches("./").trim_end_matches('/'))),
         );
     }
+    assert!(
+        found_build_stage,
+        "the Containerfile has no stage named `build`"
+    );
     sources
 }
 

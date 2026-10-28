@@ -99,8 +99,9 @@ page:
 	node --test tests/js/*.test.mjs
 
 # The page build (`#624 voice-page-modularity`): the shell, one minified script and one stylesheet
-# under content-hashed names, their source maps and assets.json, into target/web. The server does
-# not serve this yet; it serves web/ as written. Needs the pinned esbuild: `npm ci --prefix contract`.
+# under content-hashed names, their source maps and assets.json, into target/web. Every cargo build
+# runs the same build (build.rs) and embeds it: the server serves its hashed files at /assets/, while
+# its shell still names web/'s files as written. Needs the pinned esbuild: `npm ci --prefix contract`.
 web-build:
 	node web/build.mjs --out target/web
 
