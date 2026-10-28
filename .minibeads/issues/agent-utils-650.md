@@ -1,15 +1,16 @@
 ---
 title: 'cache-first-older-reads: step-back (older) and counts reads still go to Slack; one page repeats an older read every 45 s'
-status: in_progress
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 depends_on:
-  agent-utils-630: related
   agent-utils-622: related
+  agent-utils-630: related
 created_at: 2026-10-28T14:15:34.246403792+00:00
-updated_at: 2026-10-28T14:22:29.008848275+00:00
+updated_at: 2026-10-28T16:02:17.311834718+00:00
+closed_at: 2026-10-28T16:02:17.311834567+00:00
 ---
 
 # Description
