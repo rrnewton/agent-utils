@@ -343,3 +343,22 @@ flakes only (repository-infrastructure 149, cross agentctl
 777, wrkslots shards 522 + 521 passed alone). Upstream
 commits shared no files; rebased and pushed without a
 second gate.
+
+[muse watermelon] Slice 33 landed (3cd02ec8): `wrkslotsd adopt`,
+the eighth writer slice, reproduces the owner-binding mutation
+(caller capture, generation/agent checks, already-adopted and
+historical-owner outcomes, the systemd task-scope verification
+with pinned invocation symlink and in-lock re-verification, and
+the `owner-bound` event) behind the fixture-only writer guard.
+Adversarial review found the same-owner/different-scope refusal,
+the single scope verification, and the unpinned symlink read;
+all fixed. Known divergences: derived-log records are folded
+without per-record strict parsing, global validation reads
+snapshots while the target read folds events, and `--wait-lock`
+is not offered. Differential: 6 passed in this slice's file
+(62 across the writer files). Gate 44 failures were load
+timeouts only (repository-infrastructure 149, wrkslots shards
+527 + 524 passed alone; one intermittent single-test failure
+under load did not reproduce across two logged reruns). Upstream
+commits shared no files; rebased and pushed without a second
+gate.
