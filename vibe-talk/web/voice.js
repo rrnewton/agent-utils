@@ -161,7 +161,7 @@ const ALL_CHANNELS = "*";
  * @overload
  * @param {"search-all-channels" | "api-token" | "pair-input" | "pair-transfer" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
  *   | "card-max-lines" | "collapsed-lines"
- *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "in-app-links" | "mark-own-read" | "mic-auto-gain"
+ *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "in-app-links" | "keyboard-debug" | "mark-own-read" | "mic-auto-gain"
  *   | "mic-echo-cancellation" | "side-compose-grow"
  *   | "message-cache-enabled"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
@@ -59771,13 +59771,22 @@ const KEYBOARD_MIN_SHARE = 0.2;
  *
  * `shown`: whether the page lays itself out for it (`data-keyboard`), which it does not for the pace box.
  *
- * `fitted`: the field the page last brought to the keyboard's top (`fitComposerToKeyboard`), so it is
- * done once as the keyboard comes up or the focus moves, never under a reader scrolling with it up; and
- * `inset`, what the keyboard covers of the layout viewport (`renderKeyboardInset`).
+ * `fitted`: the composer's box the page last brought to the keyboard's top (`fitComposerToKeyboard`), and
+ * `fittedHeight`, the visual viewport's height then: the jump is made as the keyboard comes up, as the
+ * focus moves to another box, and as the keyboard itself changes size, and at no other time (`#610`).
+ * `settling`: the jump's own moment, while the browser is still moving the viewport for the keyboard
+ * (Safari pans after its resize), in which it is made again as the viewport moves, and `generation`,
+ * counting jumps, so a moment's end is only its own; `readerMoved`, a touch, a press or a wheel since
+ * the jump, which ends that moment at once. `inset`, the room a composer
+ * keeps under itself for the keyboard (`renderKeyboardInset`); `lastFit`, what the last jump measured,
+ * for the readout (`renderKeyboardDebug`).
  *
- * @type {{up: boolean, shown: boolean, tallest: Map<number, number>, width: number, turnedAt: number | null, fitted: any, inset: number}}
+ * @type {{up: boolean, shown: boolean, tallest: Map<number, number>, width: number, turnedAt: number | null,
+ *   fitted: any, fittedHeight: number, settling: boolean, generation: number, readerMoved: boolean, inset: number,
+ *   lastFit: any}}
  */
-const onScreenKeyboard = { up: false, shown: false, tallest: new Map(), width: -1, turnedAt: null, fitted: null, inset: 0 };
+const onScreenKeyboard = { up: false, shown: false, tallest: new Map(), width: -1, turnedAt: null, fitted: null,
+  fittedHeight: 0, settling: false, generation: 0, readerMoved: false, inset: 0, lastFit: null };
 
 /**
  * Decide again whether the on-screen keyboard is up, as above, and tell the stylesheet when that
@@ -59819,27 +59828,108 @@ function noteKeyboard() {
     document.documentElement.setAttribute("data-keyboard", shown ? "open" : "closed");
     if (shown && !el("speed-popover").hidden) closeSpeedPopover();
   }
-  // `#575 mobile-keyboard-compose`. Once the stylesheet has the keyboard, so the box is measured as drawn for it.
-  renderKeyboardInset(shown ? keyboardInset(viewport) : 0);
-  const fit = shown ? field : null;
+  // `#575 mobile-keyboard-compose`, `#610`. Once the stylesheet has the keyboard, so the box is measured as drawn
+  // for it. The jump is made as the keyboard comes up or the focus moves to another box; as the keyboard
+  // itself changes size (its suggestion strip, its emoji keys), unless the reader has moved since; and
+  // again as the viewport moves in the jump's own moment (`settling`). Never otherwise: a pan or a scroll
+  // of the reader's own is theirs.
+  const fit = shown && KEYBOARD_FIT_PARTS[field.id] ? field : null;
+  const height = viewport ? Number(viewport.height) || 0 : window.innerHeight || 0;
   if (fit !== onScreenKeyboard.fitted) {
     onScreenKeyboard.fitted = fit;
-    if (fit) fitComposerToKeyboard(fit);
+    onScreenKeyboard.settling = false;
+    if (fit) startKeyboardFit(fit, height);
+    else renderKeyboardInset(0);
+  } else if (fit && Math.abs(height - onScreenKeyboard.fittedHeight) >= 1) {
+    // The room follows the keyboard's size whatever the reader is doing: without it the box could sit
+    // under a grown keyboard with no scroll left to reach it.
+    onScreenKeyboard.fittedHeight = height;
+    renderKeyboardInset(keyboardInset(fit));
+    if (!onScreenKeyboard.readerMoved) startKeyboardFit(fit, height);
+  } else if (fit && onScreenKeyboard.settling) {
+    settleKeyboardFit(fit);
   }
+  renderKeyboardDebug();
 }
 
 /**
- * `#575 mobile-keyboard-compose`. How much of the layout viewport's foot the keyboard covers, in CSS pixels:
- * none where the browser resizes the content for it (Chrome on Android, told so by web/voice.html), and
- * the keyboard's height where only the visual viewport shrinks (Safari), less however far the browser has
- * panned the page up over it.
- *
- * @param {any} viewport `window.visualViewport`, where the browser has one
+ * `#610 mobile-keyboard-compose`. How long the jump to the keyboard's top is made again as the browser goes on
+ * moving the viewport for the keyboard, in milliseconds: Safari animates its keyboard up and then pans
+ * the visual viewport over the focused field, which can come after the resize the jump was made at. A
+ * touch, a press or a wheel ends it at once (`readerMoved`).
  */
-function keyboardInset(viewport) {
-  if (!viewport) return 0;
+const KEYBOARD_SETTLE_MS = 1200;
+
+/**
+ * `#610 mobile-keyboard-compose`. Jump to the keyboard's top for `field`, and go on doing so as the viewport moves
+ * until the keyboard has settled (`KEYBOARD_SETTLE_MS`) or the reader moves.
+ *
+ * @param {any} field
+ * @param {number} height the visual viewport's height the jump is made at
+ */
+function startKeyboardFit(field, height) {
+  onScreenKeyboard.fittedHeight = height;
+  onScreenKeyboard.readerMoved = false;
+  onScreenKeyboard.settling = true;
+  const generation = ++onScreenKeyboard.generation;
+  onScreenKeyboard.lastFit = null;
+  settleKeyboardFit(field);
+  setTimeout(() => {
+    if (onScreenKeyboard.generation === generation) onScreenKeyboard.settling = false;
+  }, KEYBOARD_SETTLE_MS);
+}
+
+/**
+ * `#610 mobile-keyboard-compose`. The jump itself: the room for the keyboard as it now stands, then the box's foot
+ * brought to the keyboard's top, which the room makes the very end of the list.
+ *
+ * @param {any} field
+ */
+function settleKeyboardFit(field) {
+  renderKeyboardInset(keyboardInset(field));
+  fitComposerToKeyboard(field);
+}
+
+/**
+ * `#610 mobile-keyboard-compose`. The reader touching, pressing or turning a wheel: the jump's moment is over, and
+ * the keyboard changing size no longer takes them back to the box. Its own tap into the box comes before
+ * the keyboard does, and the jump that keyboard makes starts afresh.
+ */
+function noteKeyboardReader() {
+  if (!onScreenKeyboard.fitted) return;
+  onScreenKeyboard.readerMoved = true;
+  onScreenKeyboard.settling = false;
+}
+
+/**
+ * `#575 mobile-keyboard-compose`, `#610`. The room, in CSS pixels, the composer `field` is written in keeps under
+ * itself while the keyboard is up, so its box can be brought to the keyboard's top: as much of the list
+ * it is in as the keyboard covers, from the visual viewport's foot to the list's own foot.
+ *
+ * NOT FROM `innerHeight`, which `#575` measured it from. Chrome on Android resizes the layout for the
+ * keyboard (`interactive-widget=resizes-content`, web/voice.html), so the list already ends at the keys
+ * and this is none, as before. Safari shrinks the visual viewport, and what it says `innerHeight` is
+ * depends on its version: recent WebKit gives a page asking for `resizes-content`, as this one does, the
+ * keyboard-respecting size there, where older versions gave the full height. Where `innerHeight` left
+ * the keyboard out and the page was still laid out at full height, `#575` kept no room at all, and the
+ * box sat under the keyboard at the very end of a list that could scroll no further: the owner's "the
+ * ENTIRE message box is hidden" and "it won't scroll further at all". The list's own rectangle is where
+ * the browser really laid it out, whichever it did.
+ *
+ * LESS SAFARI'S PAN, so that the box on the keyboard's top is the very end of the list: every way the
+ * page goes to the list's foot (a send, Newest, the keepers holding a reader there as rows arrive) then
+ * leaves the box on the keys, as on Android, and never the room's blank beneath it. BUT MEASURED ONLY
+ * AT THE JUMP (`settleKeyboardFit`) and as the keyboard changes size, not as the viewport pans, as
+ * `#575` did: a pan of the reader's own then moves nothing under them.
+ *
+ * @param {any} field
+ */
+function keyboardInset(field) {
+  const viewport = window.visualViewport;
+  const where = composerFit(field);
+  if (!viewport || !where) return 0;
   const keysTop = (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0);
-  return Math.max(0, Math.round((window.innerHeight || 0) - keysTop));
+  return Math.max(0, Math.floor(where.area.getBoundingClientRect().bottom - keysTop));
 }
 
 /** Tell the stylesheet what the keyboard covers (`--keyboard-inset`), which a composer keeps as room under itself. */
@@ -59856,43 +59946,190 @@ const KEYBOARD_FIT_PARTS = {
 };
 
 /**
- * `#575 mobile-keyboard-compose`. Bring the foot of the composer `field` is written in to the keyboard's top:
- * its box, or its Send where Send is still drawn (Enter to send off, when the keyboard's key is a new
- * line), or its state line where that has something to say (a send failed, a send waits), so nothing of
- * the list is wasted between the two and nothing below is left on screen. The owner: "scroll it so that
- * the bottom of the text entry box is flush with the top of the keyboard".
+ * The composer `field` is written in, the list it is in, and its foot, where the stylesheet lays it out
+ * for the keyboard (`--keyboard-fit`, which it sets under a coarse pointer alone); null elsewhere, as on
+ * a desk whose window is made shorter with the box focused.
  *
- * Only where the stylesheet lays the composer out for the keyboard (`--keyboard-fit`, which it sets under
- * a coarse pointer alone): a desk's window made shorter with the box focused is left as it is. A list too
- * short to scroll stays where it is. The list is the one the composer is in, not the one its box belongs
- * to: the Threads view with Main's messages (`#419`) puts the channel's composer among the right column's
- * cards.
+ * The foot is its box, or its Send where Send is still drawn (Enter to send off, when the keyboard's key
+ * is a new line), or its state line where that has something to say (a send failed, a send waits). The
+ * list is the one the composer is in, not the one its box belongs to: the Threads view with Main's
+ * messages (`#419`) puts the channel's composer among the right column's cards.
+ *
+ * @param {any} field
+ * @returns {{area: any, foot: any} | null}
+ */
+function composerFit(field) {
+  const parts = field && KEYBOARD_FIT_PARTS[field.id];
+  if (!parts || typeof window.getComputedStyle !== "function") return null;
+  const composer = leftEl(parts[0]);
+  if (window.getComputedStyle(composer).getPropertyValue("--keyboard-fit").trim() !== "on") return null;
+  const area = ["scroll-area", "side-scroll"].map((id) => leftEl(id)).find((list) => nodeWithin(list, composer));
+  if (!area) return null;
+  const drawn = (node) => node.getClientRects().length > 0;
+  return { area, foot: [leftEl(parts[2]), leftEl(parts[1])].find(drawn) || field };
+}
+
+/**
+ * `#575 mobile-keyboard-compose`. Bring the foot of the composer `field` is written in to the keyboard's top, so
+ * nothing of the list is wasted between the two and nothing below is left on screen. The owner: "scroll
+ * it so that the bottom of the text entry box is flush with the top of the keyboard".
+ *
+ * `#610`. The keyboard's top is the visual viewport's foot, `offsetTop + height`, in the layout viewport's
+ * coordinates, which are the ones `getBoundingClientRect` measures in. On iOS that is the top of all
+ * Safari draws over the page: the keys, the suggestion strip, and the floating round control above them
+ * (the form accessory bar: Done, and previous and next field), which no page can take away. A JUMP, NOT
+ * A CAP: made as the keyboard comes up (`noteKeyboard`), after which the reader scrolls as they like, up
+ * to what they are answering and back down, and nothing takes them back: what is heard of the list's
+ * scrolling and the viewport's panning is heard only in the jump's own moment, which their first touch
+ * ends. Then the box on the keys is the list's end, as on Android (`keyboardInset`). A list too short to
+ * scroll stays where it is.
  *
  * @param {any} field
  */
 function fitComposerToKeyboard(field) {
-  const parts = KEYBOARD_FIT_PARTS[field.id];
-  if (!parts || typeof window.getComputedStyle !== "function") return;
-  const composer = leftEl(parts[0]);
-  if (window.getComputedStyle(composer).getPropertyValue("--keyboard-fit").trim() !== "on") return;
-  const area = ["scroll-area", "side-scroll"].map((id) => leftEl(id)).find((list) => nodeWithin(list, composer));
-  if (!area) return;
-  const drawn = (node) => node.getClientRects().length > 0;
-  const foot = [leftEl(parts[2]), leftEl(parts[1])].find(drawn) || field;
+  const where = composerFit(field);
+  if (!where) return;
+  const { area, foot } = where;
   const viewport = window.visualViewport;
-  const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + viewport.height : window.innerHeight || 0;
-  const off = foot.getBoundingClientRect().bottom - Math.min(area.getBoundingClientRect().bottom, keysTop);
+  const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0) : window.innerHeight || 0;
+  const target = Math.min(area.getBoundingClientRect().bottom, keysTop);
+  const off = foot.getBoundingClientRect().bottom - target;
   if (Math.abs(off) >= 1) area.scrollTop += off;
+  // For the readout: where the jump took the foot, and how far it has moved the list in all.
+  const last = onScreenKeyboard.lastFit;
+  const before = last && last.field === field.id && onScreenKeyboard.settling ? last.moved : 0;
+  onScreenKeyboard.lastFit = { target: Math.round(target), moved: before + Math.round(off), field: field.id };
 }
 
 if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {
   window.visualViewport.addEventListener("resize", () => noteKeyboard());
   // `#575 mobile-keyboard-compose`. Safari pans the page up over its keyboard by scrolling the visual
-  // viewport, after the resize, which changes what the keyboard covers (`keyboardInset`) and nothing else.
+  // viewport, after the resize: in the jump's moment (`#610`), the jump is made again to the new top.
   window.visualViewport.addEventListener("scroll", () => noteKeyboard());
 } else if (typeof window.addEventListener === "function") {
   window.addEventListener("resize", () => noteKeyboard());
 }
+// `#610 mobile-keyboard-compose`. Safari also scrolls the list itself, or the document, to show the focused box
+// as its keyboard comes up. In the jump's moment that is the browser's, not the reader's (theirs begins
+// with a touch), and the jump is made again; after it, a scroll is nobody's business here.
+const settleOnScroll = () => {
+  if (onScreenKeyboard.settling && onScreenKeyboard.fitted) settleKeyboardFit(onScreenKeyboard.fitted);
+};
+for (const id of ["scroll-area", "side-scroll"]) leftEl(id).addEventListener("scroll", settleOnScroll, { passive: true });
+if (typeof window.addEventListener === "function") window.addEventListener("scroll", settleOnScroll, { passive: true });
+for (const type of ["touchstart", "pointerdown", "wheel"]) {
+  document.addEventListener(type, () => noteKeyboardReader(), { capture: true, passive: true });
+}
+
+// --- the keyboard's numbers, on screen -----------------------------------------------------------------
+//
+// `#610 mobile-keyboard-compose`. Where a phone's keyboard leaves the message box depends on numbers only the
+// phone has: what its browser says the window, the visual viewport and its pan are, and where the box and
+// its list are drawn. No phone is driven where this page is tested, so Settings › Screen and keys ›
+// Typing › "Keyboard layout debug" draws them over the top of the page, live, for a screenshot to carry
+// back. Off by default, kept on this device alone.
+
+const KEYBOARD_DEBUG_KEY = "vibe-talk.voice.keyboard-debug";
+
+/** Whether the readout is drawn; see `applyKeyboardDebug`. */
+let keyboardDebug = false;
+/** The readout's own redraw while it is drawn, for what moves with no event of the page's: its timer, or 0. */
+let keyboardDebugTimer = 0;
+
+/** Redraw the readout every half second while it is drawn, rescheduling itself as the page's polls do. */
+function tickKeyboardDebug() {
+  keyboardDebugTimer = 0;
+  if (!keyboardDebug) return;
+  renderKeyboardDebug();
+  keyboardDebugTimer = Number(setTimeout(tickKeyboardDebug, 500));
+}
+
+/** What was stored. ABSENT MEANS OFF. */
+function storedKeyboardDebug() {
+  try {
+    return localStorage.getItem(KEYBOARD_DEBUG_KEY) === "1";
+  } catch (_error) {
+    return false;
+  }
+}
+
+/** The reader's choice, kept on this device. @param {boolean} on */
+function applyKeyboardDebug(on) {
+  try {
+    if (on) localStorage.setItem(KEYBOARD_DEBUG_KEY, "1");
+    else localStorage.removeItem(KEYBOARD_DEBUG_KEY);
+  } catch (_error) {
+    // A browser that refuses storage still draws it for this session.
+  }
+  showKeyboardDebug(on);
+}
+
+/** Draw the readout and its switch, and keep it redrawn while it is drawn. @param {boolean} on */
+function showKeyboardDebug(on) {
+  keyboardDebug = Boolean(on);
+  el("keyboard-debug").checked = keyboardDebug;
+  if (keyboardDebug && !keyboardDebugTimer) keyboardDebugTimer = Number(setTimeout(tickKeyboardDebug, 500));
+  if (!keyboardDebug && keyboardDebugTimer) {
+    clearTimeout(keyboardDebugTimer);
+    keyboardDebugTimer = 0;
+  }
+  renderKeyboardDebug();
+}
+
+/**
+ * Draw the readout, where it is on: one line each for the window, the visual viewport, the box and its
+ * list, and the last jump, in CSS pixels as the page reads them. Moved down to the visual viewport's top
+ * in the document (`pageTop`), since Safari's pan, and any scroll of the document it makes, leave the
+ * layout viewport's top, where the readout is placed, above the screen.
+ */
+function renderKeyboardDebug() {
+  const readout = leftEl("keyboard-debug-readout");
+  if (!readout) return;
+  if (!keyboardDebug) {
+    if (!readout.hidden) readout.hidden = true;
+    return;
+  }
+  const n = (value) => (typeof value === "number" && Number.isFinite(value) ? String(Math.round(value)) : "-");
+  const viewport = window.visualViewport;
+  const field = document.activeElement;
+  const box = field && KEYBOARD_FIT_PARTS[field.id] ? field : leftEl("channel-compose-text");
+  // The foot and the list as the jump measures them while the keyboard is up; the box and the list it is
+  // in otherwise, so the numbers before the keyboard are there to compare.
+  const where = composerFit(box);
+  const area = where ? where.area : ["scroll-area", "side-scroll"].map((id) => leftEl(id)).find((list) => nodeWithin(list, box));
+  const rect = (node) => (node && node.getClientRects().length ? node.getBoundingClientRect() : null);
+  const boxRect = rect(box);
+  const footRect = where ? rect(where.foot) : boxRect;
+  const areaRect = rect(area);
+  const top = viewport ? Number(viewport.offsetTop) || 0 : 0;
+  const keysTop = viewport ? top + (Number(viewport.height) || 0) : window.innerHeight;
+  const last = onScreenKeyboard.lastFit;
+  readout.textContent = [
+    `keyboard ${document.documentElement.getAttribute("data-keyboard") || "-"}  box ${box ? box.id : "-"}` +
+      `${field === box ? " (focus)" : ""}  settling ${onScreenKeyboard.settling ? "yes" : "no"}` +
+      `  reader moved ${onScreenKeyboard.readerMoved ? "yes" : "no"}`,
+    `innerHeight ${n(window.innerHeight)}  clientHeight ${n(document.documentElement.clientHeight)}` +
+      `  scrollY ${n(window.scrollY)}`,
+    viewport
+      ? `visualViewport height ${n(viewport.height)}  offsetTop ${n(top)}  pageTop ${n(viewport.pageTop)}` +
+        `  scale ${typeof viewport.scale === "number" ? viewport.scale.toFixed(2) : "-"}`
+      : "visualViewport none",
+    `keys top ${n(keysTop)}  box top ${n(boxRect && boxRect.top)} bottom ${n(boxRect && boxRect.bottom)}` +
+      `  foot ${where && where.foot !== box ? where.foot.id : "box"} ${n(footRect && footRect.bottom)}` +
+      `  foot - keys ${n(footRect ? footRect.bottom - keysTop : undefined)}`,
+    `list ${area ? area.id : "-"} top ${n(areaRect && areaRect.top)} bottom ${n(areaRect && areaRect.bottom)}` +
+      `  scrollTop ${n(area && area.scrollTop)} of ${n(area && area.scrollHeight - area.clientHeight)}` +
+      `  room ${n(onScreenKeyboard.inset)}`,
+    last ? `last jump ${last.field}: target ${last.target}, list moved ${last.moved} in all` : "last jump none",
+  ].join("\n");
+  // The document's own scroll too, where Safari scrolls it to show the field: `pageTop` is both.
+  const pageTop = viewport && typeof viewport.pageTop === "number" ? viewport.pageTop : top + (window.scrollY || 0);
+  readout.style.transform = pageTop ? `translateY(${Math.round(pageTop)}px)` : "";
+  if (readout.hidden) readout.hidden = false;
+}
+
+el("keyboard-debug").addEventListener("change", () => applyKeyboardDebug(el("keyboard-debug").checked));
+showKeyboardDebug(storedKeyboardDebug());
 if (navigator.virtualKeyboard && typeof navigator.virtualKeyboard.addEventListener === "function") {
   navigator.virtualKeyboard.addEventListener("geometrychange", () => noteKeyboard());
 }

@@ -2247,6 +2247,16 @@
                         Enter to send
                       </label>
                       <p id="enter-sends-hint" class="hint" aria-live="polite"></p>
+                      <!--
+                        `#610 mobile-keyboard-compose`. Where a phone's keyboard leaves the message box depends on
+                        numbers only the phone has. This draws them over the top of the page, live, for a
+                        screenshot. OFF by default, and kept on this device alone.
+                      -->
+                      <label class="toggle">
+                        <input id="keyboard-debug" type="checkbox" aria-describedby="keyboard-debug-hint" />
+                        Keyboard layout debug
+                      </label>
+                      <p id="keyboard-debug-hint" class="hint">Shows the sizes this page measures for a phone's keyboard and the message box over the top of the page, for a screenshot when the box is not where it should be.</p>
                     </div>
                   </section>
 
@@ -4007,6 +4017,14 @@
       -->
       <p id="thread-select-note" hidden></p>
     </footer>
+
+    <!--
+      `#610 mobile-keyboard-compose`. The numbers a phone's keyboard leaves the page with, drawn live over the top
+      of the page while Settings › Screen and keys › Typing › "Keyboard layout debug" is on (off as
+      served), so a screenshot from the phone shows where the box was taken and why. Written by
+      `renderKeyboardDebug` in web/voice.js; it takes no touch, and a screen reader skips it.
+    -->
+    <pre id="keyboard-debug-readout" aria-hidden="true" hidden></pre>
 
     <!-- The generated wire-contract validators first: voice.js checks what it receives with them. -->
     <script src="/contract.js"></script>

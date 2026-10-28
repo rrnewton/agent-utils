@@ -4825,6 +4825,11 @@ const TUNING_BANDS = {
     "lower takes a browser's toolbar sliding away, or a hardware keyboard's accessory strip, for a keyboard " +
     "and hides the bars under a reader who is not typing on the screen; higher misses a landscape phone's " +
     "keyboard, which leaves well under half of a 393px screen (#429 keyboard-hides-bar)"],
+  KEYBOARD_SETTLE_MS: [500, 3000,
+    "how long the jump to the keyboard's top is made again as the browser goes on moving the viewport " +
+    "(#610 mobile-keyboard-compose): under half a second Safari's keyboard is still animating up and its pan " +
+    "over the field comes after the jump, leaving the box off the keys; past a few seconds a page that " +
+    "moves the list by itself (a message arriving) is taken back to the box long after the keyboard settled"],
   BACK_TRAVERSAL_MS: [500, 10000,
     "how long the page waits for its own going-back through the history to land: shorter takes a " +
     "busy phone's ordinary traversal for one that never came and stops going back, leaving entries the " +
@@ -25459,38 +25464,199 @@ test("MOBILE KEYBOARD COMPOSE: the new line is never noted as a paste, so the ne
   assert.equal(enter.defaulted, false, "the Enter that sent also typed a new line");
 });
 
-test("MOBILE KEYBOARD COMPOSE: what the keyboard covers of the layout viewport is the composer's room, on Safari and on Chrome", async () => {
+/**
+ * `#610 mobile-keyboard-compose`. The channel's box laid out as a phone lays it out with the keyboard coming up,
+ * in the layout viewport's coordinates: the stylesheet saying the composer is laid out for the keyboard
+ * (`--keyboard-fit`), #scroll-area ending at `listBottom()` (the layout's foot where Safari leaves the
+ * layout alone, the keyboard's top where Chrome resizes it), and the box at the list's very end with the
+ * list scrolled to `END_TOP`, under however much room (`--keyboard-inset`) the composer keeps below it.
+ * The list scrolls freely between none and that end plus the room, as a browser's does; the box's
+ * Send and state line are not drawn (Enter sends, nothing to say).
+ */
+const END_TOP = 1000;
+const BOX_PX = 80;
+function phoneComposer(page, listBottom) {
+  page.sayStyle({ "--keyboard-fit": "on" });
+  const area = page.el("scroll-area");
+  const box = page.el("channel-compose-text");
+  const room = () => Number.parseFloat(page.documentElement.style.getPropertyValue("--keyboard-inset")) || 0;
+  let top = END_TOP;
+  Object.defineProperty(area, "scrollTop", {
+    configurable: true,
+    get: () => top,
+    set: (value) => { top = Math.max(0, Math.min(Number(value) || 0, END_TOP + room())); },
+  });
+  area.getBoundingClientRect = () => ({ top: 0, bottom: listBottom(), height: listBottom(), left: 0, right: 393, width: 393 });
+  area.getClientRects = () => [{}];
+  box.getClientRects = () => [{}];
+  box.getBoundingClientRect = () => {
+    const bottom = listBottom() - (top - END_TOP);
+    return { top: bottom - BOX_PX, bottom, height: BOX_PX, left: 0, right: 393, width: 393 };
+  };
+  for (const id of ["channel-send", "channel-compose-state"]) page.el(id).getClientRects = () => [];
+  return {
+    area, box, room,
+    /** Where the box's foot is, in the layout viewport's coordinates. */
+    foot: () => box.getBoundingClientRect().bottom,
+    /** The visual viewport's foot: the keyboard's top, with all Safari draws above the keys. */
+    keysTop: () => page.viewport.offsetTop + page.viewport.visual,
+  };
+}
+
+/** The reader's finger on the screen, as the page hears it: a `touchstart` on the document. */
+const touch = (page) => page.documentEvent("touchstart", { type: "touchstart" });
+
+test("MOBILE KEYBOARD COMPOSE, iOS: the visual viewport shrinks and pans, the layout does not: the box lands on the keys as the list's end, and the reader then scrolls freely", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, [message({ id: "1000000000000000001" })]);
-  const box = page.el("channel-compose-text");
-  const inset = () => page.documentElement.style.getPropertyValue("--keyboard-inset");
-
-  // Safari: the visual viewport shrinks and the layout does not, so the keyboard covers the list's foot.
-  await focusOn(page, box);
-  await page.resizeViewport({ visual: 480 });
+  // Safari's layout stays 852px tall with its keyboard up: the list ends at the layout's foot.
+  const phone = phoneComposer(page, () => 852);
+  const atEnd = () => phone.area.scrollTop === END_TOP + phone.room();
+  await focusOn(page, phone.box);
+  // The keyboard, with its suggestion strip and the floating Done control, leaves 472px of the 852.
+  await page.resizeViewport({ visual: 472 });
   assert.equal(keyboardSaid(page), "open");
-  assert.equal(inset(), "372px", "the keyboard over the list's foot was not given to the composer as room");
-  // Safari panning the page up over its keyboard, after the resize, covers that much less.
+  assert.equal(phone.room(), 380, "the composer was not given the room the keyboard covers of its list");
+  assert.equal(phone.foot(), phone.keysTop(), "the box's foot is not on the keyboard's top");
+  assert.ok(atEnd(), "the box on the keys is not the list's end, so going to the foot overshoots it");
+  // Safari pans the visual viewport over the field after its resize: in the jump's moment the box
+  // follows to the new top, and is still the list's end.
   await page.panViewport(200);
-  assert.equal(inset(), "172px", "the pan was not taken off what the keyboard covers");
+  assert.equal(phone.foot(), 672, "the box was left where the pan put it, off the keyboard's top");
+  assert.equal(phone.room(), 180, "the room under the box was not measured from the panned keyboard's top");
+  assert.ok(atEnd(), "after the pan, the box on the keys is not the list's end");
+  // The reader's own scrolling: up to what they answer, with their own pans after; nothing takes them back.
+  await touch(page);
+  const flush = phone.area.scrollTop;
+  phone.area.scrollTop = flush - 300;
+  await phone.area.dispatch("scroll");
+  await page.panViewport(120);
+  await page.panViewport(260);
+  assert.equal(phone.area.scrollTop, flush - 300, "a scroll or a pan after the reader's touch took them back to the box");
+  assert.equal(phone.room(), 180, "the room changed under a reader panning");
+  // Going to the foot (a send, Newest, a keeper holding a reader at the foot) leaves the box on the keys.
+  await page.panViewport(200);
+  phone.area.scrollTop = 1e9;
+  assert.equal(phone.foot(), phone.keysTop(), "going to the list's foot left the box off the keys");
+  // The keyboard's moment over, the reader's place is theirs even with no touch heard: a pan moves nothing.
+  phone.area.scrollTop = flush - 300;
+  page.expireTimers(sourceConstant("KEYBOARD_SETTLE_MS"));
   await page.panViewport(0);
-  await page.resizeViewport({ visual: 852 });
-  assert.equal(inset(), "0px", "the room outlived the keyboard");
-
-  // Chrome on Android resizes the content: the list ends at the keyboard already.
-  await page.resizeViewport({ visual: 520, layout: 520 });
-  assert.equal(keyboardSaid(page), "open");
-  assert.equal(inset(), "0px", "a keyboard that resized the layout was given room again");
-  await page.resizeViewport({ visual: 852, layout: 852 });
-
-  // A focused field with the keyboard up, then the focus gone: no room kept.
-  await page.resizeViewport({ visual: 480 });
-  assert.equal(inset(), "372px");
+  assert.equal(phone.area.scrollTop, flush - 300);
+  // The keyboard growing (an emoji row) with the reader scrolled away: room for it, and they stay put.
+  await page.resizeViewport({ visual: 428 });
+  assert.equal(phone.room(), 424, "the room did not grow with the keyboard");
+  assert.equal(phone.area.scrollTop, flush - 300, "a keyboard growing under a reader who had scrolled took them back");
+  // Gone with the focus.
   await page.moveFocus(null);
   page.expireTimers(0);
   assert.equal(keyboardSaid(page), "closed");
-  assert.equal(inset(), "0px", "the room stayed after the box lost the focus");
+  assert.equal(phone.room(), 0, "the room stayed after the box lost the focus");
+});
+
+test("MOBILE KEYBOARD COMPOSE, iOS: an innerHeight that already leaves out the keyboard still gives the box its room, where #575 gave it none and hid it", async () => {
+  // WebKit sizes `innerHeight` to the keyboard for a page asking for `interactive-widget=resizes-content`,
+  // as this one does, and still lays the page out at the full 852px. `#575` measured the room from
+  // `innerHeight`, got none, and left the box at the end of a list behind the keyboard with no scroll left.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  const phone = phoneComposer(page, () => 852);
+  await focusOn(page, phone.box);
+  await page.resizeViewport({ visual: 472, layout: 472 });
+  assert.equal(keyboardSaid(page), "open");
+  assert.equal(phone.room(), 380, "no room under the box: it stays under the keyboard");
+  assert.equal(phone.foot(), 472, "the box's foot is not on the keyboard's top");
+  assert.ok(phone.foot() - BOX_PX >= 0, "the box's top is off screen");
+});
+
+test("MOBILE KEYBOARD COMPOSE, Android: the layout resizes with the keyboard: no room, the box already on the keys, nothing else moved", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  const phone = phoneComposer(page, () => page.viewport.layout);
+  await focusOn(page, phone.box);
+  await page.resizeViewport({ visual: 516, layout: 516 });
+  assert.equal(keyboardSaid(page), "open");
+  assert.equal(phone.room(), 0, "a keyboard that resized the layout was given room");
+  assert.equal(phone.foot(), 516);
+  assert.equal(phone.area.scrollTop, END_TOP, "the list was moved though the box was on the keys already");
+  // The keyboard growing with the reader where the jump left them: the jump is made again.
+  await page.resizeViewport({ visual: 472, layout: 472 });
+  assert.equal(phone.room(), 0);
+  assert.equal(phone.foot(), 472);
+});
+
+test("MOBILE KEYBOARD COMPOSE: the jump is made again only in its own moment, and a touch ends that moment", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  const phone = phoneComposer(page, () => 852);
+  await focusOn(page, phone.box);
+  await page.resizeViewport({ visual: 472 });
+  assert.equal(phone.foot(), 472);
+  // Safari's late pan, once the moment is over: the reader panning, not the keyboard settling.
+  page.expireTimers(sourceConstant("KEYBOARD_SETTLE_MS"));
+  await page.panViewport(150);
+  assert.equal(phone.foot(), 472, "a pan after the keyboard settled moved the box");
+  // The keyboard changing size with the reader where the jump left them: a new jump, and a new moment.
+  await page.resizeViewport({ visual: 436 });
+  assert.equal(phone.foot(), phone.keysTop(), "the keyboard changed size and the box was left off its top");
+  // The browser scrolling the list in that moment (Safari showing the field), with no touch: made again.
+  phone.area.scrollTop -= 50;
+  await phone.area.dispatch("scroll");
+  assert.equal(phone.foot(), phone.keysTop(), "a scroll of the browser's in the jump's moment left the box off the keys");
+  await touch(page);
+  await page.panViewport(60);
+  assert.notEqual(phone.foot(), phone.keysTop(), "a pan after the reader touched the screen moved the box to the keys");
+  // ...and a scroll after the touch is the reader's: not a cap.
+  const theirs = phone.area.scrollTop - 50;
+  phone.area.scrollTop = theirs;
+  await phone.area.dispatch("scroll");
+  assert.equal(phone.area.scrollTop, theirs, "a scroll after the reader's touch was taken back to the box");
+  // The keyboard going down and coming up again is a new jump, whatever the reader did before.
+  await page.panViewport(0);
+  await page.resizeViewport({ visual: 852 });
+  assert.equal(keyboardSaid(page), "closed");
+  await page.resizeViewport({ visual: 472 });
+  assert.equal(phone.foot(), 472, "a keyboard opened again did not bring the box to its top");
+});
+
+test("MOBILE KEYBOARD COMPOSE: Keyboard layout debug draws the page's numbers over the top of the page, off by default, kept on this device", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  const readout = page.el("keyboard-debug-readout");
+  const toggle = page.el("keyboard-debug");
+  assert.equal(readout.hidden, true, "the readout is drawn as served");
+  assert.equal(toggle.checked, false);
+  const phone = phoneComposer(page, () => 852);
+  readout.getClientRects = () => [{}];
+  toggle.checked = true;
+  await toggle.dispatch("change");
+  assert.equal(readout.hidden, false, "the switch did not draw the readout");
+  assert.equal(store.get("vibe-talk.voice.keyboard-debug"), "1", "the choice was not kept");
+  await focusOn(page, phone.box);
+  await page.resizeViewport({ visual: 472, layout: 472 });
+  await page.panViewport(100);
+  const text = readout.textContent;
+  for (const said of ["keyboard open", "innerHeight 472", "visualViewport height 472  offsetTop 100", "keys top 572",
+    "box top 492 bottom 572", "foot - keys 0", "room 280",
+    "last jump channel-compose-text: target 572, list moved 280 in all"]) {
+    assert.ok(text.includes(said), `the readout does not say "${said}":\n${text}`);
+  }
+  assert.equal(readout.style.transform, "translateY(100px)", "the readout was left above the panned screen");
+  toggle.checked = false;
+  await toggle.dispatch("change");
+  assert.equal(readout.hidden, true);
+  assert.equal(store.has("vibe-talk.voice.keyboard-debug"), false);
+  // Markup: out of the reader's way and a screen reader's, and nothing positioned outside the scrollers'
+  // containment (`position: absolute` against the layout viewport, which never scrolls).
+  assert.match(HTML, /<pre id="keyboard-debug-readout" aria-hidden="true" hidden><\/pre>/);
+  assert.match(cssBlock("#keyboard-debug-readout"), /pointer-events:\s*none/);
+  assert.match(cssBlock("#keyboard-debug-readout"), /position:\s*absolute/);
 });
 
 test("MOBILE KEYBOARD COMPOSE: with the keyboard up, the box's foot is on it, Send goes only while the keyboard's key sends, and the new-line key comes only then", () => {
