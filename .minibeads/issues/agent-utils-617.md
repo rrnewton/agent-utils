@@ -1,13 +1,14 @@
 ---
 title: 'cold-load-first-paint: a cold load waits ten seconds on the provider, then says Refresh failed over fresh messages'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - cache
 created_at: 2026-10-28T08:07:45.838789749+00:00
-updated_at: 2026-10-28T08:07:45.838789749+00:00
+updated_at: 2026-10-28T09:42:13.686149026+00:00
+closed_at: 2026-10-28T09:42:13.686148876+00:00
 ---
 
 # Description
