@@ -21,12 +21,15 @@ from two_column_browser import Desk
 WIDTH, HEIGHT = 393, 852
 
 
+Json = dict[str, object]
+
+
 class TickApi(ReplyColumnsApi):
     def __init__(self) -> None:
         super().__init__()
         self.release = threading.Event()
 
-    def post(self, path, body):
+    def post(self, path: str, body: Json) -> tuple[int, Json]:
         if path.endswith("/reply/outcome"):
             if not self.release.is_set():
                 return 202, {"state": "posting", "posted": 0, "parts": 1,

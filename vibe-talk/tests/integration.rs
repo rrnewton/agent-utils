@@ -186,6 +186,9 @@ mod send_dedupe;
 #[path = "send_double_check.rs"]
 mod send_double_check;
 
+#[path = "send_double_check_page.rs"]
+mod send_double_check_page;
+
 #[path = "send_log.rs"]
 mod send_log;
 

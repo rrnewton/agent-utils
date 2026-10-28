@@ -910,6 +910,11 @@ class FakeElement {
     if (this.hasClass("elided")) {
       return this.children.length ? LINE_PX : 0;
     }
+    // `#621 send-double-check`: the two ticks are inline in the status line (9px, inline-flex
+    // in web/voice.css), so they take no line of their own; their glyphs count in the line's text.
+    if (this.hasClass("send-tick")) {
+      return 0;
+    }
     if (this.hasClass("clamped")) {
       return Math.min(this.contentHeight(), CLAMP_LINES * LINE_PX);
     }
@@ -3963,7 +3968,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           ? page.outcomeResponse(path, options)
           : json(404, { error: "post_unknown", detail: "this server has no record of that post" });
       }
-      if (/\/reply$/.test(String(path))) {
+      if (/\/reply(\?|$)/.test(String(path))) {
         page.repliesPosted.push({
           path: String(path),
           method: options && options.method,
@@ -38047,7 +38052,7 @@ test("removing the selected channel cannot carry its thread or composer draft in
   page.el("channel-compose-text").value = "a new message for the remaining channel";
   await page.el("channel-send").click();
   assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), { text: "a new message for the remaining channel" });
-  assert.equal(page.repliesPosted[0].path, `/api/v1/channels/${other.id}/reply`);
+  assert.equal(page.repliesPosted[0].path, `/api/v1/channels/${other.id}/reply?ack=accepted`);
   await page.el("remove-channel").click();
   await page.settle();
   assert.equal(page.el("discord-channel").value, "");
@@ -46360,7 +46365,7 @@ function postedAsSent(page) {
   page.replyResponse = async (path, options) => {
     const body = JSON.parse(options.body);
     sent += 1;
-    const channel = decodeURIComponent(/\/channels\/([^/]+)\/reply$/.exec(String(path))[1]);
+    const channel = decodeURIComponent(/\/channels\/([^/]+)\/reply(\?|$)/.exec(String(path))[1]);
     return json(200, {
       posted: message({ id: `92770000000000000${String(sent).padStart(2, "0")}`, channel_id: channel,
         content: body.text, ...(body.thread_id ? { thread: { id: body.thread_id, root_message_id: null,
@@ -85553,7 +85558,7 @@ test("`#448 send-dedupe`: a slow send says which part is being posted while its 
   page.el("channel-compose-text").setValue("part one. part two. part three");
   const sent = page.el("channel-send").click();
   await page.settle();
-  assert.match(outgoingRows(page)[0].text(), /^You.*Sending…$/, "the row claimed progress before any was known");
+  assert.match(outgoingRows(page)[0].text(), /^You.*Sending…✓✓$/, "the row claimed progress before any was known");
   assert.equal(page.expireTimers(OUTGOING_PROGRESS_MS), 1, "no ask of how far it has got was armed");
   await page.settle();
   assert.match(outgoingRows(page)[0].text(), /Posting part 1 of 3…/);
