@@ -38,7 +38,10 @@
 //! [`crate::slack::budget`]); with serving on, a `side` or `counts` read gives up at the first rate
 //! limit (the cache answers it) and fails once the stand-in wait has passed with nothing to answer
 //! from, and a `side` read of a live-fed channel's thread list is answered from the cache in
-//! between upstream reads of it (`#614`, `crate::ops`). Otherwise
+//! between upstream reads of it (`#614`, `crate::ops`); and with serving on, the page's reads of a
+//! view's newest end or of what changed since a cursor are answered from the cache first when it
+//! holds anything of the view, the read upstream behind the answer (`#622 cache-first-reads`,
+//! [`crate::cache_first::eligible`]). Otherwise
 //! NOTHING reads it to decide what a caller may see or do, which read is made, whether one is
 //! shared or kept, or how fresh an answer must be: it is written to the access log and counted in
 //! the upstream profile, and that is all. So a client that lies about

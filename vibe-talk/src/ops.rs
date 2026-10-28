@@ -648,6 +648,7 @@ fn spawn_timeline_refresh(
             return;
         }
         let fetch_began = std::time::Instant::now();
+        let began = view_read_began(&state);
         let fill = state.message_cache.begin_for(caller, &channel);
         let mut page = match state.chat.fetch_timeline(&channel, &request).await {
             Ok(page) => page,
@@ -678,6 +679,7 @@ fn spawn_timeline_refresh(
         if let Some(fill) = fill {
             fill.offer_timeline(&request, crate::cache::observe::TimelineRead::Newest, &page);
         }
+        note_view_read(&state, &channel, &request, began);
         publish_serve_corrections(&state, &channel, served).await;
         // What the page is about to draw is what it will ask to hear, as in `timeline`.
         let noise = crate::noise::filter_for(&state, &channel).await;
@@ -902,6 +904,35 @@ pub fn window_limit(state: &AppState, limit: Option<u16>) -> u16 {
     state
         .effective_limit(limit)
         .min(crate::discord::http::DISCORD_MAX_LIMIT)
+}
+
+/// One message of an allowlisted channel as the message cache holds it whole, stamped as a fetched
+/// one is, for a caller a page may be answered from the cache for; `None` when the cache does not
+/// hold it (or may not answer this caller), and the caller reads it upstream. `#622
+/// cache-first-reads`; see [`crate::cache::sink::Sink::held_messages`].
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] for a channel outside the allowlist.
+pub async fn held_message(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    message_id: &str,
+    thread: Option<&str>,
+) -> Result<Option<Message>, OpError> {
+    let channel = allowed(state, channel_id).await?;
+    if !may_serve(state, caller) {
+        return Ok(None);
+    }
+    let mut held: Vec<Message> = state
+        .message_cache
+        .held_messages(&channel.id, thread, &[message_id.to_owned()])
+        .await
+        .into_values()
+        .collect();
+    stamp(state, &mut held);
+    Ok(held.pop())
 }
 
 /// One message in full, by id, within the recent window. Read scope.
@@ -1427,7 +1458,7 @@ pub async fn timeline(
         .map_err(|_| OpError::CursorMismatch)?
         .flatten();
     // Before the fetch, not after: see `ReadAhead::remember`.
-    let fetch_began = std::time::Instant::now();
+    let mut fetch_began = std::time::Instant::now();
     let timeline_read = if request.before.is_some() {
         crate::cache::observe::TimelineRead::Before
     } else if resumed.is_some() {
@@ -1523,6 +1554,7 @@ pub async fn timeline(
                     // Nothing remembered for speech from a served page, as for a served
                     // window: its head may be hours old, and the copies a real read fetched
                     // stand until the refresh banks its own.
+                    crate::cache_first::note(crate::cache_first::Source::Cache);
                     return Ok((channel, page));
                 }
                 ServeOutcome::NotServed(not_served) => shadow = not_served,
@@ -1536,6 +1568,7 @@ pub async fn timeline(
     // `#614 timeline-read-failures`: the thread list and All's counts read of a live-fed channel,
     // from the cache, while an upstream read of the view answered lately or is running.
     if let Some(held) = live_fed_answer(state, caller, &channel.id, request).await {
+        crate::cache_first::note(crate::cache_first::Source::LiveFed);
         return stood_in(state, channel, request, held).await;
     }
     // A step back from a served page offers each provider page it reads as it reads it.
@@ -1545,7 +1578,7 @@ pub async fn timeline(
         .flatten();
     // When the read began, on this server's clock: the page's version. `#473
     // replication-c7-server-versions`.
-    let began_ms = crate::store::now_ms();
+    let mut began_ms = crate::store::now_ms();
     // `#603 server-side-search`: All takes the replies of a thread the cache holds whole from
     // there, for a caller that may be answered from the cache at all; see `crate::held_replies`.
     let held: Option<std::sync::Arc<dyn crate::held_replies::HeldReplies>> =
@@ -1557,14 +1590,17 @@ pub async fn timeline(
     // cache's newest page holds.
     let stand_in = request.before.is_none() && may_serve(state, caller);
     let (mut page, position) = match (served_below.as_ref(), stand_in) {
-        (Some(below), _) => (
-            crate::held_replies::scope(
-                held,
-                step_back_from_served(state, caller, &channel.id, request, below),
+        (Some(below), _) => {
+            crate::cache_first::note(crate::cache_first::Source::Upstream);
+            (
+                crate::held_replies::scope(
+                    held,
+                    step_back_from_served(state, caller, &channel.id, request, below),
+                )
+                .await?,
+                None,
             )
-            .await?,
-            None,
-        ),
+        }
         (None, stand_in) => {
             let read = UpstreamTimeline {
                 state: state.clone(),
@@ -1580,12 +1616,29 @@ pub async fn timeline(
                 // Off the request's task, so that it runs on, and still fills the cache, after the
                 // request has been answered from the cache.
                 match read_or_stand_in(state, &channel.id, request, read).await? {
-                    Answered::Upstream(answer) => *answer,
+                    Answered::Upstream(answer) => {
+                        crate::cache_first::note(crate::cache_first::Source::Upstream);
+                        *answer
+                    }
+                    // `#622 cache-first-reads`: versioned as of when that read began.
+                    Answered::Landed(landed) => {
+                        crate::cache_first::note(crate::cache_first::Source::Landed);
+                        let crate::cache_first::LandedRead {
+                            page,
+                            position,
+                            began_ms: landed_ms,
+                            fetch_began: landed_began,
+                        } = *landed;
+                        began_ms = landed_ms;
+                        fetch_began = landed_began;
+                        (page, position)
+                    }
                     Answered::StandIn(page) => {
                         return stood_in(state, channel, request, page).await;
                     }
                 }
             } else {
+                crate::cache_first::note(crate::cache_first::Source::Upstream);
                 read.run().await?
             }
         }
@@ -1663,7 +1716,9 @@ pub fn stand_in_after(config: &crate::config::Config) -> std::time::Duration {
 /// How long a page's read on entering a view (`reason=enter`, a newest page) waits on upstream
 /// before the cache stands in for it, when that is shorter than [`stand_in_after`]. `#617
 /// cold-load-first-paint`: on a cold load of Slack's All, which the cache never serves at once, the
-/// owner watched "Loading messages…" for the whole fallback while the cache held the page.
+/// owner watched "Loading messages…" for the whole fallback while the cache held the page. Since
+/// `#622 cache-first-reads` a page entering a view the cache holds anything of is answered from it at
+/// once; this wait is left for one whose view the cache held nothing of when the read began.
 pub const FIRST_PAINT_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
 
 /// How long `request` waits on upstream before the cache stands in for it: [`FIRST_PAINT_WAIT`]
@@ -1715,6 +1770,7 @@ impl UpstreamTimeline {
             fill,
             timeline_read,
         } = self;
+        let began = view_read_began(&state);
         let mut backend = request.clone();
         let (page, position) = crate::held_replies::scope(held, async {
             Ok::<_, OpError>(match resumed {
@@ -1740,7 +1796,38 @@ impl UpstreamTimeline {
         if let Some(fill) = fill {
             fill.offer_timeline(&request, timeline_read, &page);
         }
+        note_view_read(&state, &channel, &request, began);
         Ok((page, position))
+    }
+}
+
+/// When an upstream read of a view begins, for [`note_view_read`]: the message cache's clock, which
+/// dates what it holds, and the read-behind memory's generation.
+fn view_read_began(state: &AppState) -> (i64, u64) {
+    (
+        state
+            .message_cache
+            .cache()
+            .map_or_else(crate::store::now_ms, |cache| cache.now_ms()),
+        state.landed.generation(),
+    )
+}
+
+/// Note that an upstream read of `request`'s view, begun at `began` ([`view_read_began`]),
+/// answered: what an answer from the cache first is dated by (`#622 cache-first-reads`). Not a step
+/// back, which says nothing of the newest end.
+fn note_view_read(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    (began_ms, generation): (i64, u64),
+) {
+    if request.before.is_none() {
+        state.landed.note_read(
+            RefreshKey::view(channel.clone(), request.view, request.thread_id.as_deref()),
+            began_ms,
+            generation,
+        );
     }
 }
 
@@ -1748,8 +1835,12 @@ impl UpstreamTimeline {
 enum Answered {
     /// By upstream, as ever.
     Upstream(Box<UpstreamAnswer>),
-    /// By the cache, upstream having failed or kept it waiting: what it held, and why.
+    /// By the cache, upstream having failed or kept it waiting, or first, with upstream read
+    /// behind it (`#622 cache-first-reads`): what it held, and why.
     StandIn(StoodIn),
+    /// By an upstream read begun behind an earlier answer from the cache, kept for the reads
+    /// after it. `#622 cache-first-reads`.
+    Landed(Box<crate::cache_first::LandedRead>),
 }
 
 /// What the cache answered a read with in upstream's place.
@@ -1758,7 +1849,17 @@ struct StoodIn {
     /// Why upstream did not answer, for the page; `None` for a live-fed channel's read answered
     /// from the cache while upstream was read lately ([`live_fed_answer`]), which is no failure.
     why: Option<&'static str>,
+    /// Whether the page is told how old the copy is (`as_of`): for a failure, and for an answer
+    /// from the cache first (`#622 cache-first-reads`), dated by the later of the cache's latest
+    /// listing and the latest upstream read of the view that answered. Not for a live-fed
+    /// channel's thread list between upstream reads of it ([`live_fed_answer`]).
+    dated: bool,
 }
+
+/// What a page answered from the cache first says in `refresh_failed`: nothing failed, but as for
+/// a failure the page lets it answer for nothing it lacks and reads again soon, by when the read
+/// begun behind it has usually landed. `#622 cache-first-reads`.
+const CACHE_FIRST: &str = "Answered from this server's copy while the chat service is read.";
 
 /// How long after an upstream read of a live-fed channel's thread list answered the next is begun
 /// behind a side read ([`live_fed_answer`]). `#614 timeline-read-failures`.
@@ -1807,7 +1908,11 @@ async fn live_fed_answer(
     {
         spawn_thread_list_refresh(state, caller, channel, request);
     }
-    Some(StoodIn { held, why: None })
+    Some(StoodIn {
+        held,
+        why: None,
+        dated: false,
+    })
 }
 
 /// Read `request`'s thread list upstream, newest, on a task of its own, unless a read of it is
@@ -1842,9 +1947,11 @@ fn spawn_thread_list_refresh(
                 .message_cache
                 .cache()
                 .map_or_else(crate::store::now_ms, |cache| cache.now_ms());
+            let began = view_read_began(&state);
             let Ok(page) = state.chat.fetch_timeline(&channel, &newest).await else {
                 return;
             };
+            note_view_read(&state, &channel, &newest, began);
             if let Some(fill) = fill {
                 fill.offer_timeline(&newest, crate::cache::observe::TimelineRead::Newest, &page);
             }
@@ -1972,13 +2079,54 @@ async fn read_or_stand_in(
     request: &crate::threads::TimelineRequest,
     read: UpstreamTimeline,
 ) -> Result<Answered, OpError> {
+    let key = flight_key(channel, request);
+    // `#622 cache-first-reads`: a page's read of a view the cache has listed the newest end of is
+    // answered from it at once, with the read upstream behind the answer; the next read of the
+    // view from the same cursor takes how that read ended, once it has. Asked of the cache first
+    // either way, so a scope it has since blocked (or a route or account that changed) hands out
+    // nothing a read before that brought.
+    if crate::cache_first::eligible(request) {
+        if let Some(held) = held_for(state, channel, request).await.filter(|held| {
+            held.checked_ms.is_some()
+                && crate::cache_first::answers(request, held.next_before.as_deref())
+        }) {
+            match state.landed.take(&key, request.after.as_deref()) {
+                Some(crate::cache_first::LandedAnswer::Page(landed)) => {
+                    return Ok(Answered::Landed(landed));
+                }
+                Some(crate::cache_first::LandedAnswer::Refused(error)) => return Err(error),
+                None => {}
+            }
+            match state.message_cache.claim_refresh(key.clone()) {
+                Some(claim) => spawn_behind_cache_first(
+                    state,
+                    channel,
+                    request,
+                    read,
+                    claim,
+                    key,
+                    held.messages.clone(),
+                ),
+                // One already running (a served page's refresh, an earlier answer's read, a read
+                // that waited): that one fills the cache. Only the read behind an answer from the
+                // cache lands for the next read; after the others the next read reads again, as it
+                // did before.
+                None => drop(read),
+            }
+            crate::cache_first::note(crate::cache_first::Source::CacheFirst);
+            return Ok(Answered::StandIn(StoodIn {
+                held,
+                why: Some(CACHE_FIRST),
+                dated: true,
+            }));
+        }
+    }
     let deadline = tokio::time::Instant::now() + stand_in_wait(state, request);
     // One read upstream of a view at a time, whoever asks (single-flight): a read that finds one
     // already under way waits for it to end, within the same wait, and is answered from the cache
     // if it has not. Under a provider that is rate-limiting or slow, the page's polls, other tabs
     // and the counts reads of All used to add a read each beside the one still waiting, on the
     // budget that was already spent.
-    let key = flight_key(channel, request);
     let claim = loop {
         if let Some(claim) = state.message_cache.claim_refresh(key.clone()) {
             break Some(claim);
@@ -1986,9 +2134,11 @@ async fn read_or_stand_in(
         if tokio::time::Instant::now() >= deadline {
             if let Some(held) = held_for(state, channel, request).await {
                 log_stand_in(request, "busy", None);
+                crate::cache_first::note(crate::cache_first::Source::StandIn);
                 return Ok(Answered::StandIn(StoodIn {
                     held,
                     why: Some("The chat service is still answering an earlier read."),
+                    dated: true,
                 }));
             }
             if fails_fast() {
@@ -2022,9 +2172,11 @@ async fn read_or_stand_in(
         Err(_) => {
             if let Some(held) = held_for(state, channel, request).await {
                 log_stand_in(request, "slow", None);
+                crate::cache_first::note(crate::cache_first::Source::StandIn);
                 return Ok(Answered::StandIn(StoodIn {
                     held,
                     why: Some("The chat service did not answer in time."),
+                    dated: true,
                 }));
             }
             if fails_fast() {
@@ -2051,15 +2203,108 @@ async fn read_or_stand_in(
             match held_for(state, channel, request).await {
                 Some(held) => {
                     log_stand_in(request, "failed", Some(&error));
+                    crate::cache_first::note(crate::cache_first::Source::StandIn);
                     Ok(Answered::StandIn(StoodIn {
                         held,
                         why: Some(why),
+                        dated: true,
                     }))
                 }
                 None => Err(error),
             }
         }
     }
+}
+
+/// Read `read` upstream behind a page answered from the cache first, under `claim`, and keep its
+/// answer for the page's next read of the view from the same cursor (`crate::cache_first::Landed`);
+/// then put right by live event what was `served` that the read proved edited or deleted, as a
+/// served page's refresh does ([`publish_serve_corrections`]). Under the request's reason, giving
+/// up at the first rate limit: nobody waits on it, and live ingestion keeps the cache current
+/// meanwhile. `#622 cache-first-reads`.
+fn spawn_behind_cache_first(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    read: UpstreamTimeline,
+    claim: RefreshClaim,
+    key: RefreshKey,
+    served: Vec<Message>,
+) {
+    let reason = crate::read_reason::ReadReason::current();
+    let (state, channel, request) = (state.clone(), channel.clone(), request.clone());
+    // As the request's own read would have been versioned: from before it began.
+    let began_ms = crate::store::now_ms();
+    let fetch_began = std::time::Instant::now();
+    let generation = state.landed.generation();
+    drop(tokio::spawn(reason.scope(crate::read_reason::hurry(
+        true,
+        async move {
+            let _claim = claim;
+            let noted_ms = state
+                .message_cache
+                .cache()
+                .map_or_else(crate::store::now_ms, |cache| cache.now_ms());
+            match read.run().await {
+                Ok((page, position)) => {
+                    note_upstream_read(&state.message_cache, &channel, &request, &page, noted_ms);
+                    state.landed.keep(
+                        key,
+                        request.after.clone(),
+                        generation,
+                        crate::cache_first::LandedAnswer::Page(Box::new(
+                            crate::cache_first::LandedRead {
+                                page,
+                                position,
+                                began_ms,
+                                fetch_began,
+                            },
+                        )),
+                    );
+                    publish_serve_corrections(&state, &channel, served).await;
+                }
+                Err(error) if stand_in_for(&error).is_none() => {
+                    // An expired cursor or an access answer: the next read answers with it, as it
+                    // would have read it itself, where the page learns to read the newest page or
+                    // that the channel is gone. Never hidden behind the cache for good.
+                    tracing::info!(
+                        consumer = "cache_first",
+                        view = ?request.view,
+                        forward = request.after.is_some(),
+                        error = error.code(),
+                        "the read behind a page answered from the message cache was refused; the \
+                         next read answers with the refusal"
+                    );
+                    if channel_blocked(&state, &channel, &served).await {
+                        for was in served {
+                            state.live.publish_correction(
+                                &channel,
+                                crate::live::LiveKind::Delete,
+                                was.clone(),
+                                &was,
+                            );
+                        }
+                    }
+                    state.landed.keep(
+                        key,
+                        request.after.clone(),
+                        generation,
+                        crate::cache_first::LandedAnswer::Refused(error),
+                    );
+                }
+                Err(error) => {
+                    tracing::info!(
+                        consumer = "cache_first",
+                        view = ?request.view,
+                        forward = request.after.is_some(),
+                        error = error.code(),
+                        "the read behind a page answered from the message cache failed; the next \
+                         read is answered from the cache again, dated by the last read that answered"
+                    );
+                }
+            }
+        },
+    ))));
 }
 
 /// Whether this read fails once [`stand_in_after`] has passed with nothing to stand in with,
@@ -2157,7 +2402,19 @@ async fn stood_in(
     stood: StoodIn,
 ) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
     use crate::timeline_forward as forward;
-    let StoodIn { held, why } = stood;
+    let StoodIn { held, why, dated } = stood;
+    // `#622 cache-first-reads`: the copy is as new as the latest upstream read of the view that
+    // answered, when that is later than the cache's latest listing of the view's newest end (a
+    // catch-up read lists nothing, but brings everything that changed).
+    let read_ms = state.landed.read_ms(&crate::cache::sink::RefreshKey::view(
+        channel.id.clone(),
+        request.view,
+        request.thread_id.as_deref(),
+    ));
+    let checked_ms = match (held.checked_ms, read_ms) {
+        (Some(checked), Some(read)) => Some(checked.max(read)),
+        (checked, read) => checked.or(read),
+    };
     let thread = request.thread_id.as_deref();
     // `#614 timeline-read-failures`: a thread list has no messages to step back from; its next
     // page back is read upstream, from the newest, as a page with no cursor reads it.
@@ -2192,11 +2449,9 @@ async fn stood_in(
         next_before,
         notice: held.notice,
         // A failure says how old the copy is. An answer beside a live feed is as new as the feed.
-        as_of: why.and_then(|_| {
-            held.checked_ms
-                .or(oldest_seen)
-                .map(crate::clock::iso_from_ms)
-        }),
+        as_of: dated
+            .then(|| checked_ms.or(oldest_seen).map(crate::clock::iso_from_ms))
+            .flatten(),
         refresh_failed: why.map(str::to_owned),
         ..crate::threads::TimelinePage::default()
     };

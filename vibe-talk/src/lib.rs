@@ -52,6 +52,7 @@ pub mod auth;
 pub mod backfill;
 pub mod bridge_dial;
 pub mod cache;
+pub mod cache_first;
 pub mod chain;
 pub mod chat;
 pub mod client_settings;

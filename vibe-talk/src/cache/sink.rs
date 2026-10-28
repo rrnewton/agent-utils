@@ -2301,6 +2301,69 @@ impl Sink {
         })
     }
 
+    /// The messages of `channel` among `ids` that the cache holds whole, by id, for speech
+    /// preparation (`#622 cache-first-reads`): each carrying the observation that set it,
+    /// unstamped and unmarked as the cache holds it. In a thread, only its root and its replies.
+    ///
+    /// Under the gates [`Self::stale_timeline`] keeps, which are not about freshness: serving on,
+    /// the channel routed, its provider's account checked against the file in this process (again
+    /// after the read), the message's scope not blocked, and no text a push brought that no read
+    /// has proven whole. What the cache holds of a message is what the page shows of it: live
+    /// ingestion and the relist bring its edits and deletions.
+    pub async fn held_messages(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        ids: &[String],
+    ) -> HashMap<String, Message> {
+        if !self.serve_enabled() || ids.is_empty() {
+            return HashMap::new();
+        }
+        let route_of = |sink: &Self| {
+            let routes = sink.state.routes();
+            routes
+                .fills
+                .get(channel)
+                .filter(|route| sink.verification(&route.key) == Verification::Verified)
+                .map(|route| route.key.clone())
+        };
+        let (Some(key), Some(cache)) = (route_of(self), self.cache()) else {
+            return HashMap::new();
+        };
+        let chan = ChanKey::new(key.clone(), channel.as_str());
+        let (ids, thread) = (ids.to_vec(), thread.map(str::to_owned));
+        let found = tokio::task::spawn_blocking(move || {
+            let mut found = HashMap::new();
+            for id in ids {
+                let Some(Some(row)) = cache.message(&chan, &MessageId(id.clone())).served() else {
+                    continue;
+                };
+                let in_thread = thread.as_deref().is_none_or(|thread| {
+                    row.message.id.as_str() == thread
+                        || row
+                            .message
+                            .thread
+                            .as_ref()
+                            .is_some_and(|held| held.id == thread)
+                });
+                if row.content_partial || !in_thread {
+                    continue;
+                }
+                let mut message = row.message;
+                message.observed_ms = Some(row.observed_ms);
+                found.insert(id, message);
+            }
+            found
+        })
+        .await
+        .unwrap_or_default();
+        // Checked again after the read, as a serve is.
+        if route_of(self).is_none_or(|again| again != key) {
+            return HashMap::new();
+        }
+        found
+    }
+
     /// `channel` as the cache names it, under the provider the latest routes give it: for a
     /// caller reading the cache back beside the sink (a served answer's corrections).
     #[must_use]

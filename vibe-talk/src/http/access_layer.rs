@@ -38,13 +38,15 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
     );
     let started = Instant::now();
     let private_response = path == "/mcp" || path.starts_with("/api/");
-    let (mut response, failed) = crate::upstream_profile::noting_failures(async {
-        match read_reason {
-            Some(reason) => reason.scope(next.run(request)).await,
-            None => next.run(request).await,
-        }
-    })
-    .await;
+    // `#622 cache-first-reads`: where the request's read was answered from, for its line.
+    let ((mut response, failed), served_from) =
+        crate::cache_first::noting(crate::upstream_profile::noting_failures(async {
+            match read_reason {
+                Some(reason) => reason.scope(next.run(request)).await,
+                None => next.run(request).await,
+            }
+        }))
+        .await;
     // One policy at the edge covers successful bodies, authentication failures, and future API
     // routes alike. This matters especially for an installed app: adding an installable manifest
     // must never grow into browser-managed offline storage of chat text or bearer credentials.
@@ -58,6 +60,7 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
         &path,
         credential,
         read_reason,
+        served_from,
         response.status().as_u16(),
         started.elapsed().as_millis(),
     );

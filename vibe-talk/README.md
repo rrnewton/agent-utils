@@ -4692,6 +4692,42 @@ next poll (45 s); while that read is out its pill says "Showing messages from HH
 refreshing…", and it says "Refresh failed" only for a copy older than two minutes, without the
 warning colour. A younger copy is simply "Updated HH:MM".
 
+**Cache first** (`#622 cache-first-reads`). The owner, 2026-10-28: "I expect that there's really no
+situation where my client directly cares about upstream slack at all. I just get a fast view of the
+server." With `serve = true`, a page's read of a view's newest end, or of what changed since a
+cursor (reasons `enter`, `poll`, `live`, `mutation`, `visible`, `reset`, `replay`, `pull`,
+`expired`, `side`), that the serve rule does not answer is answered from the cache at once whenever
+the cache has listed the view's newest end at least once: Main, All (Slack's put together from Main
+and the replies the cache holds of each thread), one thread, and Slack's thread list. The page
+carries `refresh_failed` (saying it is the server's copy while the provider is read) and no
+`settled_below_ms`, as a stand-in does, so the page lands the rows, removes nothing by their
+absence and reads again 3 s and 10 s later. Its `as_of` is when the copy was last brought up to
+date: the later of the cache's latest listing of the view's newest end and the latest upstream read
+of the view that answered, so the pill says "Updated" while reads behind succeed and "Refresh
+failed" once they have failed for two minutes. The read upstream it stands for begins behind the
+answer, one per view at a time (a read already running is not doubled), giving up at the first rate
+limit, and fills the cache; rows it proves edited or deleted are put right on the page by live
+event. How it ended is kept for 15 s (`LANDED_KEPT`) for the one next read of the same view from the
+same cursor, the page's own soon read: the provider's page, which proves what it lacks and moves
+the page's cursors and cover; or a failure the cache may not hide (an expired cursor, an access
+answer), which that read answers with as it would have read it itself. So a cold load costs one
+round trip to this server, and the provider's page lands a few seconds later. Upstream goes first,
+with the waits above, for a view the cache has never listed, "Older threads…" with no way back
+known, the reads that place a live message's thread (`place`, `reply-place`: they ask the provider
+what this server does not know), All's `counts` read (the page counts it done only when it is not
+the server's copy and asks again five minutes later, so answered first it would read All upstream
+every five minutes for good), a step back into older history, a channel narrowed to one Slack
+thread, and the server's own reads. The access line of every request says where its read was
+answered from (`served_from`: `cache` by the serve rule, `cache-first`, `landed`, `live-fed`,
+`upstream`, `stand-in`; for speech preparation `held` or `fetched`) beside its `millis`.
+
+**Read aloud from the cache** (`#622`). Speech preparation (`POST /speech/prepare`) and a message's
+`/speak` take a message the cache holds whole (no text a push brought that no read proved) before
+fetching it, for the write scope with `serve = true`, under the serve rule's gates other than
+freshness; the thirty-second read-ahead memory still goes first. Its log line counts `cache_hits`
+beside `recent_hits` and `fetches`. Live, 2026-10-28, before this: one threaded message the page had
+drawn more than thirty seconds earlier took 9 s from tap to sound, all of it the Slack fetch.
+
 **Slack calls, once a minute** (`#614`). One INFO line (`consumer="slack_calls"`) says what Slack
 was sent since the last one: `sent`, `limited` (answers that were a rate limit) and `refused`
 (requests failed as one without being sent), and `by_method` and `by_caller`

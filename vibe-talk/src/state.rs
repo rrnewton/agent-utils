@@ -89,6 +89,10 @@ pub struct AppState {
     /// them again, and the provider warm-up that preparation starts without waiting for it.
     /// `#191 read-aloud-first-lag`; see [`crate::read_ahead`].
     pub read_ahead: Arc<crate::read_ahead::ReadAhead>,
+    /// Upstream timeline reads that answered after their request had been answered from the
+    /// message cache, for the page's next read of the same view. `#622 cache-first-reads`; see
+    /// [`crate::cache_first`].
+    pub landed: Arc<crate::cache_first::Landed>,
     /// The letters standing in for the long ids and hashes in channel text.
     ///
     /// Here rather than per request because the point of a letter is that it means the same account

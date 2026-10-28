@@ -1951,15 +1951,30 @@ pub async fn speak(
     // the split can be read off a real deployment against real messages rather than guessed at
     // from a local run against fakes where both round trips are free.
     let began = std::time::Instant::now();
-    let (_channel, message) = ops::message_by_id_scoped(
+    // `#622 cache-first-reads`: from the message cache when it holds the message whole.
+    let message = match ops::held_message(
         &state,
         caller,
         &channel_id,
         &message_id,
-        query.limit,
         query.thread_id.as_deref(),
     )
-    .await?;
+    .await?
+    {
+        Some(message) => message,
+        None => {
+            ops::message_by_id_scoped(
+                &state,
+                caller,
+                &channel_id,
+                &message_id,
+                query.limit,
+                query.thread_id.as_deref(),
+            )
+            .await?
+            .1
+        }
+    };
     let looked_up_ms = began.elapsed().as_millis();
     // WHAT IS SENT IS NOT THE RAW MESSAGE. Markdown, hashes, snowflakes and ISO timestamps are all
     // noise when spoken — the voice said "asterisk asterisk deploy asterisk asterisk" and spelled
@@ -4127,6 +4142,7 @@ pub async fn purge_storage(
     state.live.history().clear();
     // Not durable, so not in the list below, but channel text all the same.
     state.read_ahead.clear();
+    state.landed.clear();
     state.live.recent().clear();
     state.recent_view_shadow.clear();
     // `#208 persistent-cache`. The message cache file is not in the store, and is erased with it:
@@ -5555,6 +5571,12 @@ pub async fn prepare_speech(
         preparation_began,
     )
     .await?;
+    // `#622 cache-first-reads`: for the access line.
+    crate::cache_first::note(if found.fetches == 0 {
+        crate::cache_first::Source::Held
+    } else {
+        crate::cache_first::Source::Fetched
+    });
     let normalizing = std::time::Instant::now();
     let now = jiff::Timestamp::now().as_millisecond();
     let markup = crate::render::markup_for(&state.config, &channel);
@@ -5585,6 +5607,7 @@ pub async fn prepare_speech(
         ids = request.ids.len(),
         threaded = thread.is_some(),
         recent_hits = found.hits,
+        cache_hits = found.cache_hits,
         fetches = found.fetches,
         joined_fetch = found.joined,
         resolved = resolved.len(),

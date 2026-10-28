@@ -502,6 +502,9 @@ pub struct Found {
     pub messages: HashMap<String, Message>,
     /// How many distinct ids were answered from [`ReadAhead`] without a fetch.
     pub hits: usize,
+    /// How many distinct ids were answered from the message cache without a fetch. `#622
+    /// cache-first-reads`.
+    pub cache_hits: usize,
     /// How many chat fetches this preparation made: one per window, one per thread message, or
     /// one per lookup of several and one per message it did not see.
     pub fetches: usize,
@@ -513,8 +516,14 @@ pub struct Found {
     pub fetch: Duration,
 }
 
-/// Find `ids` of `channel` for speech: from what was fetched recently, and fetch only what is
-/// missing.
+/// Find `ids` of `channel` for speech: from what was fetched recently, then from the message
+/// cache, and fetch only what is missing.
+///
+/// `#622 cache-first-reads`: the cache is asked before anything is fetched, for a caller a page
+/// may be answered from the cache for (the write scope, with serving on), under the cache's own
+/// gates ([`crate::cache::sink::Sink::held_messages`]). Live 2026-10-28, one threaded message the
+/// page had drawn from the cache more than thirty seconds before: one fetch, 9 s from tap to sound.
+/// Recent memory goes first: it is the copy the page was handed by a read of the provider.
 ///
 /// Without a thread, the missing ids cost one window fetch, shared with any other preparation of
 /// the same channel that has just made one at least as wide. An id that is not in the window is
@@ -548,6 +557,28 @@ pub async fn messages_for_speech(
         ..Found::default()
     };
     found.hits = found.messages.len();
+    if caller == crate::auth::Scope::Write && state.message_cache.serve_enabled() {
+        let wanted: Vec<String> = ids
+            .iter()
+            .filter(|id| !found.messages.contains_key(*id))
+            .cloned()
+            .collect();
+        let mut held = state
+            .message_cache
+            .held_messages(&channel.id, thread, &wanted)
+            .await;
+        if !held.is_empty() {
+            // Prepared as a fetched message is, so speech reads the same body the page drew.
+            let mut messages: Vec<Message> = held.drain().map(|(_, message)| message).collect();
+            ops::stamp(state, &mut messages);
+            found.cache_hits = messages.len();
+            found.messages.extend(
+                messages
+                    .into_iter()
+                    .map(|message| (message.id.0.clone(), message)),
+            );
+        }
+    }
     found.lookup = looking.elapsed();
     let mut seen = HashSet::new();
     let missing: Vec<String> = ids
