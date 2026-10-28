@@ -1,13 +1,14 @@
 ---
 title: 'history-settings-and-limits: per-channel history mode and progress in Settings, a prioritize-now bump, provider rate limits honoured by the crawler, and a smaller cache file'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - cache
 created_at: 2026-10-28T01:21:01.017660682+00:00
-updated_at: 2026-10-28T01:21:01.017660682+00:00
+updated_at: 2026-10-28T03:08:51.618070303+00:00
+closed_at: 2026-10-28T03:08:51.618070143+00:00
 ---
 
 # Description
