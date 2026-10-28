@@ -1,6 +1,6 @@
 ---
 title: 'mb-upgrade: run minibeads 0.29.0, whose ready and blocked honour closed blockers'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-631: parent-child
 created_at: 2026-10-28T14:02:59.895249585+00:00
-updated_at: 2026-10-28T14:20:57.103365969+00:00
+updated_at: 2026-10-28T20:24:06.775697778+00:00
+closed_at: 2026-10-28T20:24:06.775697638+00:00
 ---
 
 # Description
