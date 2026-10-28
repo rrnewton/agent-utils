@@ -5418,9 +5418,9 @@ struct ApprovalRelay {
     follower: Option<crate::headless::events::Follower>,
     next_look: Instant,
     warned: bool,
-    /// Prompts asked and not yet posted: ID, the event's data, when the relay saw it.
+    /// Prompts asked and still unposted: ID, the event's data, when the relay saw it.
     held: Vec<(String, Value, Instant)>,
-    /// IDs of prompts posted and not yet decided.
+    /// IDs of prompts posted and still undecided.
     posted: BTreeSet<String>,
 }
 
