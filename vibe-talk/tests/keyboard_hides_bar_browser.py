@@ -37,6 +37,17 @@ gone (the keyboard's own key sends) and a new-line key in the box's corner, whos
 keeps the focus, after which the keyboard's Enter sends both lines once; with Enter to send off, Send stays
 as the last thing on the keys' top and Enter is a new line.
 
+`#610 mobile-keyboard-compose`, Safari's way at 390x664 by touch (`ios_walk`): the layout keeps its full height
+and only the visual viewport shrinks and pans, as WebKit does, played to the page by a stand-in
+`window.visualViewport` (and `innerHeight`) installed before the page loads. Chromium has no iOS keyboard,
+so the stand-in is the keyboard: its 330px visual viewport is what iOS leaves over the keys, the
+suggestion strip and the floating Done control. The keyboard up: the box's foot on the visual viewport's
+foot, and on it again after Safari's pan, as the list's end; the reader's wheel then scrolls the list up and
+back down to it, and a later pan moves nothing; with `innerHeight` already leaving out the keyboard (WebKit,
+for this page's `interactive-widget=resizes-content`) the box still lands on the keys, where #575 left it
+under them at the end of a list that would not scroll. Playwright's WebKit is no better a stand-in here:
+it draws no keyboard and pans no visual viewport either.
+
 At 1280x800 with a mouse, the box focused and the window 336px shorter: both bars still drawn, since the
 stylesheet takes them away only where the pointer is coarse. No page error and no sideways scroll at any
 step.
@@ -67,6 +78,53 @@ PHONE = (393, 852)
 # `#575 mobile-keyboard-compose`: the owner's Android phone, whose screenshot this walk was written from.
 ANDROID = (412, 915)
 DESK = (1280, 800)
+# `#610 mobile-keyboard-compose`: an iPhone's Safari with its toolbars, and the visual viewport its keyboard leaves
+# (the keys, the suggestion strip and the floating Done control taken off the 664px).
+IPHONE = (390, 664)
+IOS_VISUAL_PX = 330
+# The most the list keeps under the composer at its very end (its own padding), as on Android: a reader sent
+# to the foot has the box that far over the keys.
+END_PADDING_PX = 12
+# How far Safari pans the visual viewport down over the focused field after its keyboard comes up.
+IOS_PAN_PX = 200
+# How long the page goes on making its jump as the viewport moves (`KEYBOARD_SETTLE_MS` in web/voice.js),
+# and a little over.
+SETTLE_WAIT_MS = 1500
+
+# Safari's keyboard, played to the page: a visual viewport that shrinks and pans over a layout that keeps
+# its height. `window.__iosKeyboard(height, offsetTop, innerHeight)` brings it up (innerHeight left as
+# the browser has it unless given), `window.__iosPan(offsetTop)` pans, `window.__iosClose()` takes it away;
+# each tells the page as Safari does, by `resize` or `scroll` on the visual viewport.
+IOS_VIEWPORT_JS = """(() => {
+    const real = window.visualViewport;
+    const own = Object.getOwnPropertyDescriptor(window, 'innerHeight')
+        || Object.getOwnPropertyDescriptor(Window.prototype, 'innerHeight');
+    const events = new EventTarget();
+    const sim = {height: null, offsetTop: 0, inner: null};
+    const fake = {
+        get width() { return real.width; },
+        get height() { return sim.height === null ? real.height : sim.height; },
+        get offsetTop() { return sim.offsetTop; },
+        get offsetLeft() { return 0; },
+        get pageTop() { return window.scrollY + sim.offsetTop; },
+        get pageLeft() { return window.scrollX; },
+        get scale() { return real.scale; },
+        addEventListener: (type, fn, options) => events.addEventListener(type, fn, options),
+        removeEventListener: (type, fn, options) => events.removeEventListener(type, fn, options),
+    };
+    Object.defineProperty(window, 'visualViewport', {configurable: true, get: () => fake});
+    Object.defineProperty(window, 'innerHeight', {configurable: true,
+        get: () => (sim.inner === null ? own.get.call(window) : sim.inner)});
+    window.__iosKeyboard = (height, offsetTop = 0, inner = null) => {
+        Object.assign(sim, {height, offsetTop, inner});
+        events.dispatchEvent(new Event('resize'));
+    };
+    window.__iosPan = (offsetTop) => { sim.offsetTop = offsetTop; events.dispatchEvent(new Event('scroll')); };
+    window.__iosClose = () => {
+        Object.assign(sim, {height: null, offsetTop: 0, inner: null});
+        events.dispatchEvent(new Event('resize'));
+    };
+})();"""
 # An on-screen keyboard's height on a phone this size, with its suggestion strip.
 KEYBOARD_PX = 336
 # How near the foot of the list a reader at its foot is kept: the page's own slack (`BOTTOM_SLACK_PX`).
@@ -122,6 +180,8 @@ def main() -> int:
     with sync_playwright() as playwright:
         report.append(walk(playwright.chromium, args, "phone", *PHONE, touch=True))
         report.append(walk(playwright.chromium, args, "android", *ANDROID, touch=True, walker=compose_walk))
+        report.append(walk(playwright.chromium, args, "ios", *IPHONE, touch=True, walker=ios_walk,
+                           init_script=IOS_VIEWPORT_JS))
         report.append(walk(playwright.chromium, args, "desk", *DESK, touch=False))
     for line in report:
         print(line)
@@ -140,7 +200,7 @@ def number(found: Json, *path: str) -> float:
 
 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, *, touch: bool,
-         walker: Callable[[Desk, ReplyColumnsApi], None] | None = None) -> str:
+         walker: Callable[[Desk, ReplyColumnsApi], None] | None = None, init_script: str | None = None) -> str:
     api = ReplyColumnsApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
@@ -153,6 +213,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 viewport={"width": width, "height": height}, color_scheme="dark", has_touch=touch, is_mobile=touch)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
+            if init_script is not None:
+                page.add_init_script(init_script)
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, f"keyboard-bar-{label}", width, height)
@@ -346,9 +408,12 @@ def scrolled_up_walk(desk: Desk) -> None:
     to_foot(desk)
     page.tap("#channel-compose-text")
     keyboard(desk, True)
-    page.evaluate("() => { document.getElementById('scroll-area').scrollTop -= 600; }")
-    desk.settled()
+    # By the reader's own hand (`#610`: a scroll no touch, press or wheel began is no reader's, and in the
+    # keyboard's first moment the page takes it for the browser's own and makes its jump again).
+    before = float(page.evaluate("() => document.getElementById('scroll-area').scrollTop"))
+    wheel(desk, -600)
     top = float(page.evaluate("() => document.getElementById('scroll-area').scrollTop"))
+    desk.check(top < before - 300, f"the reader's wheel did not scroll the list up: {before} -> {top}")
     page.set_viewport_size({"width": desk.width, "height": desk.height - KEYBOARD_PX - 44})
     desk.wait_for(f"() => window.visualViewport.height === {desk.height - KEYBOARD_PX - 44}", "the keyboard did not grow")
     desk.settled()
@@ -488,6 +553,136 @@ def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     desk.notes.append(f"in a thread with the keyboard up the box's foot is {abs(wasted):.0f}px from the keys, Send gone, "
                       "the corner key's new line and Enter sending both lines once; with Enter to send off Send stays "
                       "on the keys' top")
+
+
+def ios_place(desk: Desk) -> Json:
+    """Where the box, its list and the visual viewport are, and how far the list is scrolled."""
+    found = desk.page.evaluate("""() => {
+        const v = window.visualViewport, area = document.getElementById('scroll-area');
+        const box = document.getElementById('channel-compose-text').getBoundingClientRect();
+        const list = area.getBoundingClientRect();
+        return {said: document.documentElement.getAttribute('data-keyboard'), top: v.offsetTop,
+            keys: v.offsetTop + v.height, boxTop: box.top, boxBottom: box.bottom, listBottom: list.bottom,
+            scroll: area.scrollTop, furthest: area.scrollHeight - area.clientHeight,
+            room: getComputedStyle(document.documentElement).getPropertyValue('--keyboard-inset').trim(),
+            bar: document.getElementById('control-bar').getClientRects().length > 0,
+            active: document.activeElement ? document.activeElement.id : null};
+    }""")
+    assert isinstance(found, dict)
+    return found
+
+
+def ios_flush(desk: Desk, found: Json, when: str, *, above: float = 0) -> None:
+    """The box whole in the visual viewport, its foot on the viewport's foot: the keyboard's top, with the
+    suggestion strip and the floating control above the keys. `above`: how far over the keys it may stop,
+    for the list's end, which keeps the list's own padding under the composer (as on Android)."""
+    desk.check(found["said"] == "open", f"{when}: the page did not hear the keyboard: {found}")
+    gap = number(found, "keys") - number(found, "boxBottom")
+    desk.check(-1 <= gap <= above + 1,
+               f"{when}: the box's foot is {number(found, 'boxBottom') - number(found, 'keys'):.0f}px from the "
+               f"keyboard's top: {found}")
+    desk.check(number(found, "boxTop") >= number(found, "top"), f"{when}: the box's top is above the screen: {found}")
+
+
+def wheel(desk: Desk, dy: float) -> None:
+    """The reader's own scroll of the list, by a wheel over it (Chromium has no touch scroll to drive)."""
+    desk.page.mouse.move(desk.width / 2, 120)
+    desk.page.mouse.wheel(0, dy)
+    desk.page.wait_for_timeout(300)
+    desk.settled()
+
+
+def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
+    """`#610 mobile-keyboard-compose`. The owner, 2026-10-27, on an iPhone: the jump to the keyboard's top "scrolls
+    so that the ENTIRE message box is hidden", and "if I try to scroll down to correct the bug or expose
+    the send button it won't scroll further at all. We made it a hard maximum." Safari's keyboard as
+    WebKit has it: the layout keeps its height, the visual viewport shrinks, then pans over the field."""
+    page = desk.page
+    to_foot(desk)
+    page.tap("#channel-compose-text")
+    desk.settled()
+    found = ios_place(desk)
+    desk.check(found["said"] != "open" and found["bar"] is True, f"focused, no keyboard yet: {found}")
+
+    # The keyboard up, `innerHeight` left at the layout's height: the box on the keys.
+    page.evaluate(f"() => window.__iosKeyboard({IOS_VISUAL_PX})")
+    desk.settled()
+    found = ios_place(desk)
+    ios_flush(desk, found, "keyboard up")
+    desk.check(found["bar"] is False, f"keyboard up: the control bar is still drawn: {found}")
+    desk.check(number(found, "listBottom") > number(found, "keys") + 100,
+               f"keyboard up: the layout shrank, so this is not Safari's way: {found}")
+    desk.shot("1-ios-keyboard-up")
+    # Safari's pan over the field, straight after: the box follows to the new top.
+    page.evaluate(f"() => window.__iosPan({IOS_PAN_PX})")
+    desk.settled()
+    found = ios_place(desk)
+    ios_flush(desk, found, "panned")
+    flush_scroll = number(found, "scroll")
+    room = found["room"]
+    desk.shot("2-ios-panned")
+
+    # The reader scrolls up to read, and a pan of theirs after it moves nothing.
+    wheel(desk, -300)
+    up = ios_place(desk)
+    desk.check(number(up, "scroll") < flush_scroll - 100, f"the reader could not scroll up from the box: {up}")
+    page.evaluate("() => window.__iosPan(80)")
+    desk.settled()
+    page.wait_for_timeout(SETTLE_WAIT_MS)
+    after = ios_place(desk)
+    desk.check(abs(number(after, "scroll") - number(up, "scroll")) <= 1,
+               f"a pan after the reader scrolled took them back to the box: {up} -> {after}")
+    desk.check(after["room"] == room, f"the room under the box changed as the viewport panned: {room} -> {after}")
+    # Back down: the list's end is the box on the keys, as wherever the page goes to the foot (a send).
+    page.evaluate(f"() => window.__iosPan({IOS_PAN_PX})")
+    wheel(desk, 2000)
+    down = ios_place(desk)
+    desk.check(number(down, "scroll") >= number(down, "furthest") - 1, f"the reader's wheel did not reach the end: {down}")
+    ios_flush(desk, down, "scrolled back to the end", above=END_PADDING_PX)
+    page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop -= 400; a.scrollTop = a.scrollHeight; }")
+    desk.settled()
+    ios_flush(desk, ios_place(desk), "sent to the foot by the page", above=END_PADDING_PX)
+    desk.shot("3-ios-back-at-the-end")
+    # A message sent with the keyboard's own key: the page goes to the newest, and the box stays on the keys.
+    before = len(posted(api))
+    page.keyboard.type("from the phone")
+    page.keyboard.press("Enter")
+    for _ in range(50):
+        if len(posted(api)) > before:
+            break
+        page.wait_for_timeout(100)
+    desk.check(posted(api)[before:] == ["from the phone"], f"the keyboard's Enter did not send: {posted(api)[before:]}")
+    page.wait_for_timeout(500)
+    desk.settled()
+    ios_flush(desk, ios_place(desk), "after a send", above=END_PADDING_PX)
+    desk.shot("4-ios-after-send")
+    page.evaluate("() => window.__iosClose()")
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    desk.settled()
+    desk.check(ios_place(desk)["said"] == "closed", "the keyboard closed and the page still lays itself out for it")
+
+    # `innerHeight` already leaving out the keyboard, as WebKit reports it for this page's
+    # `interactive-widget=resizes-content`, with the page still laid out at full height.
+    to_foot(desk)
+    page.tap("#channel-compose-text")
+    desk.settled()
+    page.evaluate(f"() => window.__iosKeyboard({IOS_VISUAL_PX}, 0, {IOS_VISUAL_PX})")
+    desk.settled()
+    found = ios_place(desk)
+    ios_flush(desk, found, "innerHeight without the keyboard")
+    desk.shot("5-ios-short-innerheight")
+    # A pan once the keyboard has settled is the reader's: the box is not moved.
+    page.wait_for_timeout(SETTLE_WAIT_MS)
+    before = number(ios_place(desk), "scroll")
+    page.evaluate("() => window.__iosPan(150)")
+    desk.settled()
+    desk.check(abs(number(ios_place(desk), "scroll") - before) <= 1, "a pan after the keyboard settled moved the list")
+    page.evaluate("() => window.__iosClose()")
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    desk.settled()
+    desk.notes.append(f"Safari's way: the box's foot on the visual viewport's foot as the keyboard comes up and after a "
+                      f"{IOS_PAN_PX}px pan, with {room} of room, as the list's end; the reader's wheel goes up and back down "
+                      "to it, and a pan after that moves nothing; with innerHeight leaving out the keyboard it lands on the keys too")
 
 
 def desk_walk(desk: Desk) -> None:

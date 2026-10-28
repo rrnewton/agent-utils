@@ -1603,6 +1603,30 @@ a.search-hit-link {
   display: none;
 }
 
+/* `#610 mobile-keyboard-compose`. The keyboard's numbers, for a screenshot from a phone (Settings › Typing ›
+   Keyboard layout debug): over the top of everything, taking no touch. Placed against the layout viewport,
+   as the document never scrolls (absolute, not fixed: nothing here escapes a scroller's containment), and
+   moved down by web/voice.js as far as Safari pans the visual viewport off that viewport's top. */
+#keyboard-debug-readout {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2147483647;
+  margin: 0;
+  padding: 0.25rem 0.4rem;
+  background: rgb(0 0 0 / 0.8);
+  color: #8f8;
+  font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+#keyboard-debug-readout[hidden] {
+  display: none;
+}
+
 /* ---------------------------------------------------------------------------------- reply -- */
 /*
  * `#410 inline-reply-editor`. The reply's box: the label and who it answers, the box, the `#185
