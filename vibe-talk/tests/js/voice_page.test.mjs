@@ -50812,8 +50812,9 @@ test("URL writes each link under Links as its whole address and back as its name
   assert.deepStrictEqual(linkWords(page), ADDRESSES.slice(1));
   await tapKind(page, "file");
 
-  // The text finds a message by an address it holds, and URL only says how its link is written.
-  await search(page, "vibe-talk");
+  // The text finds a message by a word only its address holds — "blob" is in no label and no other
+  // message — and URL only says how its link is written.
+  await search(page, "blob");
   await page.settle();
   assert.deepStrictEqual(linkWords(page), [README], "the text did not find the README by its address under URL");
   await chip.click();

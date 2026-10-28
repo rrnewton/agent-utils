@@ -19,7 +19,7 @@ than a phone is wide. At each size:
   the first unmatched line stands under the row: nothing of it, or of any row, drawn between or
   around the pills -> URL pressed: each link written as its whole address, wrapped inside the list at
   its slashes, the longest on more than one line and none wider than the list -> the page reloaded:
-  URL still on -> "vibe-talk" typed, a word only in an address: that message's link alone, as its
+  URL still on -> "deep" typed, a word only in an address: that message's link alone, as its
   address; URL pressed again: the same link, as its label, and the device's choice forgotten. No
   horizontal overflow and no page error at any step.
 
@@ -311,20 +311,21 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int) ->
     check(state["buttons"][0]["pressed"] == "true", f"{label}: URL did not outlast a reload")
     links_written(state, label, True, "after the reload")
 
-    # A word only an address holds still finds its message, and URL only changes how it is written.
-    page.fill("#search-field", "vibe-talk")
+    # A word only an address holds ("deep", in no label and no message's words) still finds its message,
+    # and URL only changes how it is written.
+    page.fill("#search-field", "deep")
     until(page, "() => [...document.querySelectorAll('#discord-log > li:not(.search-hidden) .row-link')]"
                 ".filter((a) => a.getClientRects().length).length === 1",
-          f"{label}: 'vibe-talk' did not leave the one message whose address holds it")
+          f"{label}: 'deep' did not leave the one message whose address holds it")
     state = page.evaluate(STATE_JS)
-    check([link["text"] for link in state["links"]] == [LINKS[0][0]],
+    check([link["text"] for link in state["links"]] == [LINKS[2][0]],
           f"{label}: the search under URL shows {[link['text'] for link in state['links']]}")
     shot(page, shots, f"{label}-link-url-chip-searched")
     press(page, "#link-raw", touch)
     until(page, "() => document.getElementById('link-raw').getAttribute('aria-pressed') === 'false'",
           f"{label}: pressing URL again did not turn it off")
     state = page.evaluate(STATE_JS)
-    check([link["text"] for link in state["links"]] == [LINKS[0][1]],
+    check([link["text"] for link in state["links"]] == [LINKS[2][1]],
           f"{label}: URL off under the search shows {[link['text'] for link in state['links']]}")
     check(state["stored"] is None, f"{label}: URL off was not forgotten: {state['stored']!r}")
     return f"{len(LINKS)} links, labels and addresses, kept over a reload, nothing under the row"

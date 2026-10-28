@@ -8446,7 +8446,9 @@ function linkList(links, raw) {
  * too long for a line anywhere. The breaks are empty elements, so the text is the address exactly.
  */
 function rawAddressInto(anchor, href) {
-  for (const part of href.split(/(?<=[/?&#=])/)) {
+  // Matched rather than split on a lookbehind, which Safari before 16.4 cannot parse at all: one such
+  // pattern anywhere in this file would stop the whole page there.
+  for (const part of href.match(/[^/?&#=]*[/?&#=]?/g).filter(Boolean)) {
     if (anchor.firstChild) anchor.append(document.createElement("wbr"));
     anchor.append(document.createTextNode(part));
   }
@@ -59406,9 +59408,13 @@ function applySyncedSetting(key) {
         renderLinkKinds();
         break;
       case LINK_RAW_KEY:
-        linksRaw = storedLinksRaw();
-        renderLinkKinds();
-        if (searchOpen && linksOnly) eachColumn(renderScrollTools);
+        // As a press here does: the reader's message kept where it is while every link's height
+        // changes under it.
+        keepingFilterPlace(() => {
+          linksRaw = storedLinksRaw();
+          renderLinkKinds();
+          if (searchOpen && linksOnly) eachColumn(renderScrollTools);
+        });
         break;
       case THREADS_UNPACKED_KEY:
         // Not `setUnpackMode`: that is the reader's press, which also gives every thread of the

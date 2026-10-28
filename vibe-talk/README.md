@@ -7367,8 +7367,10 @@ live stream, a post's answer and the pins — and sends it beside the text as `c
    `widgets@v1.0...v1.1` for a comparison, `widgets@v1.2.0` for a release, `widgets run 123456`
    for a run of Actions and `widgets:render.rs#L10` for lines of a file. A `README.md`, in any
    case, is named by its folder instead (`#620 link-url-chip`): `vibe-talk/README.md`, or
-   `widgets/README.md` at the repository's root, since every README's own name is the same. The
-   repository's owner is left out. The link still goes to the same address, and a pointer resting on the label shows it.
+   `widgets/README.md` at the repository's root, since every README's own name is the same. A
+   folder is named only at `main`, `master` or a whole commit id: under a branch such as
+   `user/topic` the address cannot say whether `topic` is the folder or the end of the branch's
+   name, and the README is `widgets:README.md`. The repository's owner is left out. The link still goes to the same address, and a pointer resting on the label shows it.
    A link its writer named keeps its name, code is never relabelled, and any other address — other
    hosts, and GitHub pages with no short form — is drawn as written. So is any address a browser
    would open somewhere other than its label says: one whose path holds a `.` or `..` segment

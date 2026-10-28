@@ -243,8 +243,9 @@ impl SearchText {
     /// indexes under it with `+hard` after it. `render-2`: single newlines soft, `•` lines items,
     /// glued tables repaired (`markdown-tables-render`). `render-3`: a line end at each block's
     /// edge and each `<br>`, and only web links' addresses, as the page reads a body (`#604
-    /// server-side-search`).
-    pub const VERSION: &'static str = "render-3";
+    /// server-side-search`). `render-4`: a README link labelled by its folder (`#620
+    /// link-url-chip`).
+    pub const VERSION: &'static str = "render-4";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -4904,6 +4905,10 @@ mod search_text_tests {
             false,
         ),
         (
+            "the notes: https://github.com/octo/widgets/blob/main/docs/README.md",
+            false,
+        ),
+        (
             "[a label](https://example.test/a?b=1&c=<2>) and <https://example.test/x|angled>",
             false,
         ),
@@ -4932,6 +4937,10 @@ mod search_text_tests {
         (
             "render-3",
             "14cbd7449b2eb88272ed7283375d0846bfbe7e06075c5f9c5447c940c74b29e0",
+        ),
+        (
+            "render-4",
+            "e71d6f3dadae6759ba0a1337712afa3711f92a6e875e7eff62578e4e610de1d9",
         ),
     ];
 

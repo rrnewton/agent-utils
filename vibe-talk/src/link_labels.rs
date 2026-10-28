@@ -41,7 +41,7 @@
 //! | `/actions/runs/ID` | `REPO run ID` | REPO run ID |
 //! | `/actions/runs/ID/job/J`, `/attempts/N` | `REPO run ID (job)`, `(attempt N)` | a job in REPO run ID, attempt N of REPO run ID |
 //! | `/blob/REF/…/FILE`, with `#L10` or `#L10-L20` | `REPO:FILE`, with the same fragment | REPO file FILE, line 10, lines 10 to 20 |
-//! | `/blob/REF/…/DIR/README.md`, `/blob/REF/README.md` | `DIR/README.md`, `REPO/README.md` | the README of DIR, the README of REPO |
+//! | `/blob/REF/…/DIR/README.md` under `main`, `master` or a whole commit id; `/blob/REF/README.md` | `DIR/README.md`; `REPO/README.md` | the README of DIR; the README of REPO |
 //!
 //! Anything else is left as it is written: another host, a repository's own page, a user's page, a
 //! gist, `/tree/REF/PATH` — where a branch name with a slash in it cannot be told from a
@@ -471,7 +471,7 @@ fn written(
             if !plain_name(file) {
                 return None;
             }
-            let name = match readme_folder(repo, last) {
+            let name = match readme_folder(repo, first, last) {
                 Some(folder) => format!("{folder}/{file}"),
                 None => format!("{repo}:{file}"),
             };
@@ -483,28 +483,35 @@ fn written(
     })
 }
 
-/// The folder a README names, when the file at `path` (the ref's first segment already taken off)
+/// The folder a README names, when the file at `path` (after `ref_start`, the ref's first segment)
 /// is one: the directory it is in, or `repo` for one at the repository's root. `None` for any other
-/// file, and for a directory whose name a label may not show, which is then labelled as any file
-/// is. `#620 link-url-chip`.
+/// file, for a directory whose name a label may not show, and for a folder that might be part of the
+/// ref, each of which is then labelled as any file is. `#620 link-url-chip`.
 ///
 /// The owner, looking at a list of links every one of which read `REPO:README.md`: "let's simply
 /// render them using the name of the directory, including the readme instead of the readme
 /// itself." A README says nothing of itself; the folder it introduces is what tells one from
 /// another. Any case of `README.md` counts, and the file's name is kept as written.
 ///
-/// The ref is read as one segment, as it is for every file: a branch named `user/topic` puts
-/// `topic` where the folder goes, which no address can tell apart from a folder named `topic`.
-fn readme_folder<'p>(repo: &'p str, path: &'p str) -> Option<&'p str> {
+/// A label is never wrong about its address, and an address cannot say where a ref with a slash in
+/// it ends: `/blob/user/topic/README.md` is the root README on branch `user/topic` as much as the
+/// README of folder `topic` on branch `user` — the reason `/tree/REF/PATH` has no label. So a folder
+/// is named only under a ref no folder can be part of: a whole commit id, or `main` or `master`,
+/// which git cannot hold beside a `main/…` branch. Under any other, a README in a folder is
+/// `REPO:README.md`, as every file is, which is true whatever the ref. One at the root is always
+/// `REPO/README.md`: a blob has a path, so the ref cannot have taken its last segment.
+fn readme_folder<'p>(repo: &'p str, ref_start: &str, path: &'p str) -> Option<&'p str> {
     let mut parts = path.rsplit('/');
     let file = parts.next()?;
     if !file.eq_ignore_ascii_case("README.md") {
         return None;
     }
-    match parts.next() {
-        Some(folder) => plain_name(folder).then_some(folder),
-        None => Some(repo),
-    }
+    let Some(folder) = parts.next() else {
+        return Some(repo);
+    };
+    let settled = matches!(ref_start, "main" | "master")
+        || (matches!(ref_start.len(), 40 | 64) && commit_id(ref_start));
+    (settled && plain_name(folder)).then_some(folder)
 }
 
 /// How a voice says the page of `route`: what it is, in words, with nothing a listener would have
@@ -561,7 +568,7 @@ fn said(route: &Route, repo: &str, captures: &[String], fragment: Option<&str>) 
         ),
         Shape::File => {
             let file = last.rsplit('/').next()?;
-            let page = match readme_folder(&repo, last) {
+            let page = match readme_folder(&repo, first, last) {
                 Some(folder) => format!("the README of {}", folder.replace('_', " ")),
                 None => format!("{repo} file {file}"),
             };
@@ -1034,6 +1041,45 @@ mod tests {
                 "widgets:NOTREADME.md",
             ),
         ]);
+        // Under a ref that might hold a slash, the folder might be part of it: `user/topic` is a
+        // branch as much as `topic` is a folder. Labelled as any file is, which is true either way.
+        labels(&[
+            (
+                format!("{REPO}/blob/user/topic/README.md"),
+                "widgets:README.md",
+            ),
+            (
+                format!("{REPO}/blob/feature/docs/README.md"),
+                "widgets:README.md",
+            ),
+            (
+                format!("{REPO}/blob/v1.0/docs/README.md"),
+                "widgets:README.md",
+            ),
+            // A short commit id is a name a branch may have; a whole one is settled.
+            (
+                format!("{REPO}/blob/abc1234/docs/README.md"),
+                "widgets:README.md",
+            ),
+            (
+                format!("{REPO}/blob/master/docs/README.md"),
+                "docs/README.md",
+            ),
+            // A SHA-256 repository's commit id, 64 hex digits.
+            (
+                format!("{REPO}/blob/{SHA}{}/docs/README.md", &SHA[..24]),
+                "docs/README.md",
+            ),
+            // At the root there is no folder for the ref to have taken.
+            (
+                format!("{REPO}/blob/feature/README.md"),
+                "widgets/README.md",
+            ),
+        ]);
+        assert_eq!(
+            spoken_label(&format!("{REPO}/blob/user/topic/README.md")).as_deref(),
+            Some("widgets file README.md")
+        );
         // A folder a label may not show is never copied into one: the README is labelled as any
         // other file is, which is true of it.
         labels(&[
