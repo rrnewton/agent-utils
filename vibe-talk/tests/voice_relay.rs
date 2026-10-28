@@ -288,6 +288,7 @@ async fn read_aloud_reaches_a_bridge_through_another_servers_relay() {
 
 #[tokio::test]
 async fn a_close_passes_through_with_its_code_and_reason() {
+    let capture = vibe_talk::testing::LogCapture::start();
     let (upstream, _seen) = bridge().await;
     let base = server(&upstream).await;
     let url = ws(&base, "/api/v1/voice-socket?mode=voice");
@@ -313,4 +314,29 @@ async fn a_close_passes_through_with_its_code_and_reason() {
     let frame = closed.expect("the bridge's close frame, not an empty one");
     assert_eq!(frame.code, CloseCode::Library(4000));
     assert_eq!(frame.reason.as_str(), "bridge said goodbye");
+    // `#649 voice-agent-tools` (f): the relay's line says who ended the socket and with what code,
+    // and how much each side sent, so a run of reconnects can be told apart.
+    let logged = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let text = capture.text();
+            if text.contains("voice relay: socket closed") {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the relay logged the close");
+    let line = logged
+        .lines()
+        .find(|line| line.contains("voice relay: socket closed"))
+        .expect("the line");
+    for field in [
+        "ended=\"bridge_close\"",
+        "code=4000",
+        "from_client=1",
+        "from_bridge=1",
+    ] {
+        assert!(line.contains(field), "{field}: {line}");
+    }
 }

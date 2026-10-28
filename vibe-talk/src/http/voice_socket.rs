@@ -263,8 +263,19 @@ pub async fn relay(
                 )
                 .await;
                 tracing::info!(caller = ?caller, "voice relay: socket open");
-                pump(client, bridge).await;
-                tracing::info!(caller = ?caller, "voice relay: socket closed");
+                let opened = tokio::time::Instant::now();
+                let ended = pump(client, bridge).await;
+                // `#649 voice-agent-tools` (f): who ended it and how, so a run of reconnects in a
+                // moving car reads as the page closing, the network dropping, or the bridge.
+                tracing::info!(
+                    caller = ?caller,
+                    ended = ended.how.as_str(),
+                    code = ended.code.map_or(-1, i32::from),
+                    secs = opened.elapsed().as_secs(),
+                    from_client = ended.from_client,
+                    from_bridge = ended.from_bridge,
+                    "voice relay: socket closed"
+                );
                 drop(permit);
             }
             Err(error) => {
@@ -316,10 +327,56 @@ fn accept_key(headers: &HeaderMap) -> Option<HeaderValue> {
     HeaderValue::from_str(&accept).ok()
 }
 
+/// How a relayed socket ended. `#649 voice-agent-tools` (f).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndedBy {
+    /// The client (the page) sent a close frame: a hang up, a page going away (1001), or a
+    /// reconnect closing its old socket.
+    ClientClose,
+    /// The client's connection ended with no close frame, or failed: a network drop, as on a phone
+    /// changing networks, or a page killed.
+    ClientGone,
+    /// The client sent nothing, not even a pong, for [`CLIENT_SILENCE`].
+    ClientSilent,
+    /// The bridge sent a close frame.
+    BridgeClose,
+    /// The bridge's connection ended with no close frame, or failed.
+    BridgeGone,
+}
+
+impl EndedBy {
+    /// The word the log uses.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientClose => "client_close",
+            Self::ClientGone => "client_gone",
+            Self::ClientSilent => "client_silent",
+            Self::BridgeClose => "bridge_close",
+            Self::BridgeGone => "bridge_gone",
+        }
+    }
+}
+
+/// How a relayed socket ended, the close code when a close frame said one, and how many text and
+/// binary frames each side sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ended {
+    /// Who ended it.
+    pub how: EndedBy,
+    /// The close frame's code, when one came.
+    pub code: Option<u16>,
+    /// Text and binary frames the client sent.
+    pub from_client: u64,
+    /// Text and binary frames the bridge sent.
+    pub from_bridge: u64,
+}
+
 /// Copy frames both ways until either side closes, fails, or the client goes silent; then close
-/// both. A close frame is passed on with its code and reason; pings and pongs are each hop's own
-/// (tungstenite answers a ping itself), and the relay keeps its own watch on the client.
-async fn pump<C, B>(client: C, bridge: B)
+/// both, and say which it was ([`Ended`]). A close frame is passed on with its code and reason;
+/// pings and pongs are each hop's own (tungstenite answers a ping itself), and the relay keeps its
+/// own watch on the client.
+async fn pump<C, B>(client: C, bridge: B) -> Ended
 where
     C: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
@@ -332,35 +389,43 @@ where
     let (mut bridge_tx, mut bridge_rx) = bridge.split();
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
     let mut heard = tokio::time::Instant::now();
-    loop {
+    let (mut from_client, mut from_bridge) = (0_u64, 0_u64);
+    let code_of = |frame: &Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>| {
+        frame.as_ref().map(|frame| u16::from(frame.code))
+    };
+    let (how, code) = loop {
         tokio::select! {
             message = client_rx.next() => {
-                let Some(Ok(message)) = message else { break };
+                let Some(Ok(message)) = message else { break (EndedBy::ClientGone, None) };
                 heard = tokio::time::Instant::now();
                 match message {
                     Message::Text(_) | Message::Binary(_) => {
+                        from_client += 1;
                         if bridge_tx.send(message).await.is_err() {
-                            break;
+                            break (EndedBy::BridgeGone, None);
                         }
                     }
                     Message::Close(frame) => {
+                        let code = code_of(&frame);
                         let _ = bridge_tx.send(Message::Close(frame)).await;
-                        break;
+                        break (EndedBy::ClientClose, code);
                     }
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
             }
             message = bridge_rx.next() => {
-                let Some(Ok(message)) = message else { break };
+                let Some(Ok(message)) = message else { break (EndedBy::BridgeGone, None) };
                 match message {
                     Message::Text(_) | Message::Binary(_) => {
+                        from_bridge += 1;
                         if client_tx.send(message).await.is_err() {
-                            break;
+                            break (EndedBy::ClientGone, None);
                         }
                     }
                     Message::Close(frame) => {
+                        let code = code_of(&frame);
                         let _ = client_tx.send(Message::Close(frame)).await;
-                        break;
+                        break (EndedBy::BridgeClose, code);
                     }
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
@@ -368,16 +433,22 @@ where
             _ = ping.tick() => {
                 if heard.elapsed() >= CLIENT_SILENCE {
                     tracing::info!("voice relay: the client went silent; closing both sides");
-                    break;
+                    break (EndedBy::ClientSilent, None);
                 }
                 if client_tx.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
-                    break;
+                    break (EndedBy::ClientGone, None);
                 }
             }
         }
-    }
+    };
     let _ = client_tx.close().await;
     let _ = bridge_tx.close().await;
+    Ended {
+        how,
+        code,
+        from_client,
+        from_bridge,
+    }
 }
 
 #[cfg(test)]
