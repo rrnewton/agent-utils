@@ -34,6 +34,7 @@ use crate::status_state::read_process_identity;
 type Result<T> = std::result::Result<T, String>;
 
 /// Record coordinator recovery evidence for the named slot.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn recover_unbound_owner(
     root: Option<&Path>,
     machine_override: Option<&str>,
