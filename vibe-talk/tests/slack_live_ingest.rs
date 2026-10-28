@@ -2412,39 +2412,25 @@ mod measure {
         assert_eq!(status, StatusCode::CONFLICT, "nothing would read it");
     }
 
-    /// Rate limits: Slack's `Retry-After` is waited out inside a read; a read that fails in a way
-    /// that may pass holds every backfill read of the provider, doubling from 30 seconds; a rate
-    /// limit longer than that holds it for as long as Slack asked; and a 429 answered to the
-    /// page's own read holds the backfill too. The fake returns the 429s with their headers.
+    /// Rate limits. A read that fails in a way that may pass holds every backfill read of the
+    /// provider, doubling from 30 seconds, and a success resets it. Slack's `Retry-After` is waited
+    /// out inside a read, and ANY rate limit on a read route, the backfill's or the page's own,
+    /// keeps the backfill off the provider for five quiet minutes however short the wait Slack
+    /// asked for (the live instance's route answered `Retry-After: 1` until the page's reads gave
+    /// up); a longer `Retry-After` holds it for as long as Slack asked. The diagnostics say how
+    /// hard the limits press. The fake returns the 429s with their headers.
     #[tokio::test]
-    async fn the_backfill_honours_retry_after_and_backs_off_exponentially() {
-        // Two hundred messages a minute apart: each channel's walk takes four reads of 50, so some
-        // channel always has a read due.
+    async fn the_backfill_backs_off_and_yields_the_route_while_slack_rate_limits_it() {
+        let pace = |state: &AppState| state.live.history().pace("slack").expect("a pace");
+        use vibe_talk::history_control::HoldReason;
+
+        // Exponential backoff on a 5xx. Two hundred messages a minute apart: each channel's walk
+        // takes four reads of 50, so some channel always has a read due.
         let fake = Fake::start(histories(&[CH, OTHER, THIRD], 200, 60), 100).await;
         let table = with_channels(&[OTHER, THIRD], "\n[message_cache]\nbackfill = \"recent\"\n");
-        let (state, clock, _dir) = cached(&fake, "rate-limits", &table).await;
+        let (state, clock, _dir) = cached(&fake, "backoff", &table).await;
         let mut backfill = Backfill::new();
-        let pace = |state: &AppState| state.live.history().pace("slack").expect("a pace");
-
-        // Two 429s with Retry-After 1, waited out inside the read, which then succeeds.
-        fake.with(|fake| {
-            fake.rate_limit_many
-                .insert("conversations.history".to_owned(), (1, 2));
-        });
-        let started = std::time::Instant::now();
         assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Read);
-        assert!(started.elapsed() >= Duration::from_secs(2), "both waits were taken");
-        assert!(fake.calls("conversations.history") >= 3, "two 429s, then the page");
-        assert_eq!(
-            fake.with(|fake| fake.rate_limit_many["conversations.history"].1),
-            0,
-            "both 429s were spent"
-        );
-        assert_eq!(pace(&state).failures, 0);
-        // The hold Slack's last 429 asked for has passed by now.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // A 503: that channel waits, and so does every other channel of the provider.
         fake.with(|fake| {
             fake.http_fail
                 .insert("conversations.history".to_owned(), (503, "busy".to_owned()));
@@ -2452,7 +2438,7 @@ mod measure {
         assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Failed);
         let first = pace(&state);
         assert_eq!(first.failures, 1);
-        assert_eq!(first.held_because, Some(vibe_talk::history_control::HoldReason::UpstreamError));
+        assert_eq!(first.held_because, Some(HoldReason::UpstreamError));
         assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Held);
         clock.advance(29_000);
         assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Held);
@@ -2473,9 +2459,44 @@ mod measure {
         assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Read);
         assert_eq!(pace(&state).failures, 0, "a success resets the backoff");
 
+        // Two 429s with Retry-After 1, waited out inside the read, which then succeeds; and then
+        // the backfill stays off the route although Slack asked for one second.
+        let fake = Fake::start(histories(&[CH, OTHER], 200, 60), 100).await;
+        let table = with_channels(&[OTHER], "\n[message_cache]\nbackfill = \"recent\"\n");
+        let (state, clock, _dir) = cached(&fake, "rate-limit-short", &table).await;
+        let mut backfill = Backfill::new();
+        fake.with(|fake| {
+            fake.rate_limit_many
+                .insert("conversations.history".to_owned(), (1, 2));
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Read);
+        assert!(started.elapsed() >= Duration::from_secs(2), "both waits were taken");
+        assert!(fake.calls("conversations.history") >= 3, "two 429s, then the page");
+        assert_eq!(
+            fake.with(|fake| fake.rate_limit_many["conversations.history"].1),
+            0,
+            "both 429s were spent"
+        );
+        assert_eq!(pace(&state).failures, 0, "the read succeeded");
+        let calls = fake.calls("conversations.history");
+        clock.advance(10_000);
+        assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Held);
+        let held = pace(&state);
+        assert_eq!(held.held_because, Some(HoldReason::ProviderSignal));
+        let wall = jiff::Timestamp::now().as_millisecond();
+        let left = held.held_until_ms.expect("held") - wall;
+        assert!(left > 280_000 && left <= 300_000, "five quiet minutes, not one second: {left}");
+        assert_eq!(fake.calls("conversations.history"), calls, "the backfill sent nothing");
+        let report = vibe_talk::backfill::history(&state).expect("a report");
+        let pressure = &report.pressure["slack"];
+        assert_eq!(pressure.limited_last_10_min, 2);
+        assert_eq!(pressure.routes["conversations.history"].limited_last_10_min, 2);
+        assert!(pressure.crawl_hold_s.is_some_and(|s| s > 280), "{pressure:?}");
+
         // A 429 asking for longer than the client's budget is not waited inside the read: the
         // provider's backfill holds for as long as Slack asked, past the first backoff.
-        let fake = Fake::start(histories(&[CH, OTHER], 40, 60), 100).await;
+        let fake = Fake::start(histories(&[CH, OTHER], 200, 60), 100).await;
         let table = with_channels(&[OTHER], "\n[message_cache]\nbackfill = \"recent\"\n");
         let (state, clock, _dir) = cached(&fake, "rate-limit-long", &table).await;
         let mut backfill = Backfill::new();
@@ -2486,7 +2507,7 @@ mod measure {
         assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Failed);
         assert_eq!(fake.calls("conversations.history"), 1, "not sent again inside the read");
         let held = pace(&state);
-        assert_eq!(held.held_because, Some(vibe_talk::history_control::HoldReason::RateLimited));
+        assert_eq!(held.held_because, Some(HoldReason::RateLimited));
         let wall = jiff::Timestamp::now().as_millisecond();
         let until = held.held_until_ms.expect("held");
         assert!((until - wall) > 85_000 && (until - wall) <= 91_000, "{}", until - wall);
@@ -2506,11 +2527,10 @@ mod measure {
         assert!(read.is_err(), "the page's read was refused");
         let mut backfill = Backfill::new();
         assert_eq!(backfill.step(&state, LIMIT, Duration::ZERO).await, BackfillStep::Held);
-        assert_eq!(
-            pace(&state).held_because,
-            Some(vibe_talk::history_control::HoldReason::ProviderSignal)
-        );
+        assert_eq!(pace(&state).held_because, Some(HoldReason::ProviderSignal));
         assert_eq!(fake.calls("conversations.history"), 1, "the backfill sent nothing");
+        let (_, body) = call(&state, "GET", &format!("/api/v1/channels/{CH}/history"), READ_TOKEN, None).await;
+        assert_eq!(body["held_reason"], "provider_signal", "{body}");
     }
 
     #[tokio::test]

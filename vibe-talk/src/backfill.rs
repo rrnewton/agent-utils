@@ -82,8 +82,13 @@
 //!   provider asked and an exponential backoff, from [`BACKOFF_FIRST`] doubling to [`BACKOFF_CAP`];
 //!   the next read that succeeds resets it;
 //! * **what the provider said to anyone** holds it too ([`crate::chat::ChatClient::crawl_hold`]):
-//!   a rate limit answered to the page's own read, Discord's whole-token limit, or a count of
-//!   401, 403 and 429 answers nearing Discord's invalid-request ban.
+//!   any rate limit on a read route the backfill uses, whoever's request it answered, holds it
+//!   for [`crate::chat::CRAWL_QUIET_AFTER_LIMIT`] (five minutes) after the latest, however short
+//!   the `Retry-After`; so does a reported quota at its last request or two
+//!   (`X-RateLimit-Remaining`), until the bucket resets; and so do Discord's whole-token limit
+//!   and a count of 401, 403 and 429 answers nearing its invalid-request ban. The backfill yields
+//!   the route entirely while it is under pressure, so the reads a person is waiting on have it.
+//!   The diagnostics' `cache_history.pressure` says how hard each provider is pressing.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
@@ -1311,6 +1316,10 @@ pub struct HistoryReport {
     /// Where each provider's backfill pace stands, by key, once the backfill has stepped. `#602
     /// history-settings-and-limits`.
     pub providers: BTreeMap<String, PaceReport>,
+    /// How hard each provider's rate limits are pressing, by key: the rate limits it answered in
+    /// the last ten minutes, by route, whoever asked, and how long the backfill holds off for
+    /// them. `#602 history-settings-and-limits`.
+    pub pressure: BTreeMap<String, crate::chat::RateLimitPressure>,
     /// Each cached channel.
     pub channels: Vec<ChannelHistory>,
 }
@@ -1472,6 +1481,12 @@ pub fn history(state: &AppState) -> Option<HistoryReport> {
         channel.queue_position = control.position(&id);
     }
     report.providers = control.paces();
+    report.pressure = state
+        .providers
+        .entries()
+        .iter()
+        .filter_map(|entry| Some((entry.key.clone(), entry.client.rate_limit_pressure()?)))
+        .collect();
     // A channel walked whole on a server set to `recent` waits for room too.
     if report.paused.is_none()
         && report.channels.iter().any(|channel| channel.mode == "full")
@@ -1516,6 +1531,7 @@ pub fn history_of(
         paused,
         bytes_per_message: (messages > 0).then(|| bytes / messages),
         providers: BTreeMap::new(),
+        pressure: BTreeMap::new(),
         channels: channels
             .into_iter()
             .map(|channel| ChannelHistory {

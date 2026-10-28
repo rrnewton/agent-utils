@@ -1930,6 +1930,10 @@ impl ChatClient for HttpDiscordClient {
         self.limiter.crawl_hold()
     }
 
+    fn rate_limit_pressure(&self) -> Option<crate::chat::RateLimitPressure> {
+        Some(self.limiter.pressure())
+    }
+
     async fn clear_upstream_through(
         &self,
         channel: &ChannelId,

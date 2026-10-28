@@ -137,6 +137,11 @@ pub const INVALID_REQUEST_REFUSE_AT: usize = DISCORD_INVALID_REQUEST_LIMIT / 2;
 /// limit. A server reading normally makes a handful an hour.
 pub const INVALID_REQUEST_CRAWL_CEILING: usize = 250;
 
+/// An `X-RateLimit-Remaining` at or below which background crawling holds off until the bucket
+/// resets: the last request or two of a window are left to reads a person is waiting on. `#602
+/// history-settings-and-limits`.
+pub const LOW_REMAINING: u64 = 1;
+
 /// HTTP headers, matched without regard to case, independent of any HTTP client.
 ///
 /// Small on purpose: this module has to be usable by the in-memory fake, which has no HTTP client
@@ -323,10 +328,27 @@ struct LimiterState {
     global_gate: Option<Instant>,
     /// When each invalid request inside [`INVALID_REQUEST_WINDOW`] was answered, oldest first.
     invalid: std::collections::VecDeque<Instant>,
+    /// Each rate limit of the caller's own (not shared-scope) inside
+    /// [`crate::chat::PRESSURE_WINDOW`], with its route, oldest first. `#602
+    /// history-settings-and-limits`.
+    limited: std::collections::VecDeque<(Instant, String)>,
+    /// Per route, the remaining quota a success last reported, and until when a low one (at or
+    /// below [`LOW_REMAINING`]) holds crawling.
+    quota: BTreeMap<String, (u64, Option<Instant>)>,
     stats: LimiterStats,
 }
 
 impl LimiterState {
+    fn prune_limited(&mut self, now: Instant) {
+        while self
+            .limited
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= crate::chat::PRESSURE_WINDOW)
+        {
+            self.limited.pop_front();
+        }
+    }
+
     fn prune_invalid(&mut self, now: Instant) {
         while self
             .invalid
@@ -422,10 +444,50 @@ impl RateLimiter {
             .map(|gate| gate.saturating_duration_since(now))
             .filter(|wait| !wait.is_zero());
         let invalid = state.invalid_wait(now, INVALID_REQUEST_CRAWL_CEILING);
-        match (global, invalid) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
+        // A rate limit of the caller's own on any route lately: crawling stays off for a quiet
+        // spell after it, however short a wait Discord asked for.
+        state.prune_limited(now);
+        let quiet = state.limited.back().map(|(at, _)| {
+            (*at + crate::chat::CRAWL_QUIET_AFTER_LIMIT).saturating_duration_since(now)
+        });
+        let low = state
+            .quota
+            .values()
+            .filter_map(|(_, until)| until.map(|until| until.saturating_duration_since(now)))
+            .max();
+        [global, invalid, quiet, low]
+            .into_iter()
+            .flatten()
+            .filter(|wait| !wait.is_zero())
+            .max()
+    }
+
+    /// How hard Discord's rate limits are pressing, for the diagnostics. `#602
+    /// history-settings-and-limits`.
+    #[must_use]
+    pub fn pressure(&self) -> crate::chat::RateLimitPressure {
+        let crawl_hold_s = self.crawl_hold().map(|wait| wait.as_secs().max(1));
+        let mut state = self.lock();
+        let now = Instant::now();
+        state.prune_limited(now);
+        state.prune_invalid(now);
+        let mut report = crate::chat::RateLimitPressure {
+            limited_last_10_min: u32::try_from(state.limited.len()).unwrap_or(u32::MAX),
+            crawl_hold_s,
+            invalid_last_10_min: Some(u32::try_from(state.invalid.len()).unwrap_or(u32::MAX)),
+            ..crate::chat::RateLimitPressure::default()
+        };
+        for (at, route) in &state.limited {
+            let entry = report.routes.entry(route.clone()).or_default();
+            entry.limited_last_10_min = entry.limited_last_10_min.saturating_add(1);
+            entry.last_limited_s_ago = Some(now.saturating_duration_since(*at).as_secs());
         }
+        for (route, (remaining, until)) in &state.quota {
+            if until.is_some_and(|until| until > now) {
+                report.routes.entry(route.clone()).or_default().remaining = Some(*remaining);
+            }
+        }
+        report
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LimiterState> {
@@ -486,6 +548,17 @@ impl RateLimiter {
     fn observe_success(&self, route: &str, headers: &Headers) {
         let mut state = self.lock();
         Self::learn_bucket(&mut state, route, headers.get("x-ratelimit-bucket"));
+        if let Some(remaining) = headers.number("x-ratelimit-remaining") {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let left = remaining.max(0.0) as u64;
+            let until = (left <= LOW_REMAINING).then(|| {
+                Instant::now()
+                    + headers
+                        .number("x-ratelimit-reset-after")
+                        .map_or(crate::chat::CRAWL_QUIET_AFTER_LIMIT, seconds_to_duration)
+            });
+            state.quota.insert(route.to_owned(), (left, until));
+        }
         if let Some(reset_after) = exhausted_for(headers) {
             let key = Self::effective_key(&state, route);
             Self::shut(&mut state, key, Instant::now() + reset_after);
@@ -569,6 +642,10 @@ impl RateLimiter {
                         .is_some_and(|scope| scope.eq_ignore_ascii_case("shared"))
                     {
                         self.note_invalid();
+                        let mut state = self.lock();
+                        let now = Instant::now();
+                        state.prune_limited(now);
+                        state.limited.push_back((now, route.clone()));
                     }
                     self.observe_limit(&route, &limit);
                     let wait = limit.retry_after.max(MIN_RETRY_WAIT);
@@ -1119,9 +1196,58 @@ mod tests {
                 }))
             })
             .await;
+        // The quiet spell after any rate limit of the caller's own outlasts the 20 s asked for.
         let hold = limiter.crawl_hold().expect("held");
-        assert_eq!(hold, Duration::from_secs(20));
-        tokio::time::advance(Duration::from_secs(21)).await;
+        assert_eq!(hold, crate::chat::CRAWL_QUIET_AFTER_LIMIT);
+        tokio::time::advance(crate::chat::CRAWL_QUIET_AFTER_LIMIT).await;
+        assert_eq!(limiter.crawl_hold(), None);
+    }
+
+    /// `#602 history-settings-and-limits`: after any 429 of the caller's own, crawling stays off
+    /// for the quiet spell however short a wait Discord asked for; a shared-scope 429 does not
+    /// start one; a success reporting the bucket's last request holds crawling until it resets;
+    /// and the pressure report says so by route.
+    #[tokio::test(start_paused = true)]
+    async fn crawling_yields_a_bucket_under_pressure() {
+        let limiter = RateLimiter::with_policy(RetryPolicy {
+            max_attempts: 1,
+            max_total_wait: Duration::from_secs(5),
+        });
+        let _ = limiter
+            .run("GET", URL, || async {
+                Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(Duration::from_millis(500), "shared")))
+            })
+            .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(limiter.crawl_hold(), None, "a resource's own limit does not hold crawling");
+        let _ = limiter
+            .run("GET", URL, || async {
+                Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(Duration::from_millis(500), "user")))
+            })
+            .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let hold = limiter.crawl_hold().expect("held after a 429 of our own");
+        assert_eq!(hold, crate::chat::CRAWL_QUIET_AFTER_LIMIT - Duration::from_secs(1));
+        let pressure = limiter.pressure();
+        assert_eq!(pressure.limited_last_10_min, 1);
+        assert_eq!(pressure.routes[&route_key("GET", URL)].limited_last_10_min, 1);
+        assert_eq!(pressure.invalid_last_10_min, Some(1));
+        tokio::time::advance(crate::chat::CRAWL_QUIET_AFTER_LIMIT).await;
+        assert_eq!(limiter.crawl_hold(), None);
+        // The bucket's last request: crawling waits for the reset.
+        let low = Headers::new()
+            .with("x-ratelimit-remaining", "1")
+            .with("x-ratelimit-reset-after", "3.5");
+        limiter
+            .run("GET", OTHER, || {
+                let low = low.clone();
+                async move { Ok::<_, DiscordError>(Attempt::Done("ok", low)) }
+            })
+            .await
+            .expect("sent");
+        assert_eq!(limiter.crawl_hold(), Some(Duration::from_millis(3500)));
+        assert_eq!(limiter.pressure().routes[&route_key("GET", OTHER)].remaining, Some(1));
+        tokio::time::advance(Duration::from_secs(4)).await;
         assert_eq!(limiter.crawl_hold(), None);
     }
 }

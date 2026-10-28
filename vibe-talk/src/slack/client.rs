@@ -34,6 +34,52 @@ const MAX_RATE_LIMIT_ATTEMPTS: u32 = 5;
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// The floor on one retry wait, so "retry now" is never spent in the same millisecond.
 const MIN_RETRY_WAIT: Duration = Duration::from_millis(50);
+
+/// The methods background crawling reads: a rate limit on either holds it off. `#602
+/// history-settings-and-limits`.
+const CRAWL_METHODS: [&str; 2] = ["conversations.history", "conversations.replies"];
+
+/// An `X-RateLimit-Remaining` at or below which crawling holds off until the reset.
+const LOW_REMAINING: u64 = 2;
+
+/// What Slack has said lately of one method's rate limit. `#602 history-settings-and-limits`.
+#[derive(Debug, Default)]
+struct MethodPressure {
+    /// When it answered a rate limit, inside [`crate::chat::PRESSURE_WINDOW`], oldest first.
+    limited: std::collections::VecDeque<tokio::time::Instant>,
+    /// The end of the latest `Retry-After`.
+    retry_until: Option<tokio::time::Instant>,
+    /// The remaining quota last reported, and until when a low one holds crawling.
+    remaining: Option<u64>,
+    low_until: Option<tokio::time::Instant>,
+}
+
+impl MethodPressure {
+    fn prune(&mut self, now: tokio::time::Instant) {
+        while self
+            .limited
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= crate::chat::PRESSURE_WINDOW)
+        {
+            self.limited.pop_front();
+        }
+    }
+
+    /// Until when crawling holds off this method: the latest `Retry-After`, a quiet spell after
+    /// the latest rate limit, and a low reported quota's reset, whichever is latest.
+    fn hold_until(&mut self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        self.prune(now);
+        let quiet = self
+            .limited
+            .back()
+            .map(|at| *at + crate::chat::CRAWL_QUIET_AFTER_LIMIT);
+        [self.retry_until, quiet, self.low_until]
+            .into_iter()
+            .flatten()
+            .filter(|until| *until > now)
+            .max()
+    }
+}
 /// The largest `Retry-After` believed, in seconds; anything larger blows the budget anyway.
 const MAX_PARSED_RETRY_AFTER_SECONDS: f64 = 3600.0;
 /// Most authors whose `users.info` answer is remembered.
@@ -164,10 +210,10 @@ pub struct HttpSlackClient {
     /// The `users.conversations` pages the channel browser read, by cursor, so searches typed one
     /// after another walk the same listing without asking Slack again. `#371 channel-search-hash`.
     pub(super) directory_pages: crate::directory::Kept<String, Value>,
-    /// Until when Slack last asked this client to wait (a 429's `Retry-After`, or an
-    /// `ok:false ratelimited`), whichever request it answered: background crawling holds off
-    /// until then ([`ChatClient::crawl_hold`]). `#602 history-settings-and-limits`.
-    limited_until: Mutex<Option<tokio::time::Instant>>,
+    /// What Slack has said lately of each method's rate limit, whichever request it answered:
+    /// what background crawling holds off for ([`ChatClient::crawl_hold`]) and the diagnostics
+    /// report. `#602 history-settings-and-limits`.
+    pressure: Mutex<HashMap<String, MethodPressure>>,
     /// The threads the first parts of long posts just went into or started, by conversation and
     /// root `ts`, and when: proven to be there by Slack's own answer to that part, so the rest of
     /// the post goes in without reading the thread first. `#448 send-dedupe`; see
@@ -243,7 +289,7 @@ impl HttpSlackClient {
             post_limit: config.post_limit(),
             shim_profile: None,
             directory_pages: crate::directory::Kept::default(),
-            limited_until: Mutex::new(None),
+            pressure: Mutex::new(HashMap::new()),
             posted_roots: Mutex::new(HashMap::new()),
             op_keys_returned: std::sync::atomic::AtomicBool::new(false),
         })
@@ -327,7 +373,7 @@ impl HttpSlackClient {
             match answer? {
                 Outcome::Done(value) => return Ok(value),
                 Outcome::Limited(retry_after) => {
-                    self.note_limited(retry_after);
+                    self.note_limited(method, retry_after);
                     let wait = retry_after.max(MIN_RETRY_WAIT);
                     // A wait longer than what is left is refused BEFORE it is taken: parking a
                     // caller and then failing anyway is the worst of both.
@@ -352,15 +398,51 @@ impl HttpSlackClient {
         }
     }
 
-    /// Remember that Slack asked for `retry_after`, for [`ChatClient::crawl_hold`].
-    fn note_limited(&self, retry_after: Duration) {
-        let until = tokio::time::Instant::now() + retry_after.max(MIN_RETRY_WAIT);
-        let mut limited = self
-            .limited_until
+    fn pressure(&self) -> std::sync::MutexGuard<'_, HashMap<String, MethodPressure>> {
+        self.pressure
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if limited.is_none_or(|at| until > at) {
-            *limited = Some(until);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Remember that Slack rate-limited `method`, asking for `retry_after`.
+    fn note_limited(&self, method: &str, retry_after: Duration) {
+        let now = tokio::time::Instant::now();
+        let mut pressure = self.pressure();
+        let entry = pressure.entry(method.to_owned()).or_default();
+        entry.prune(now);
+        entry.limited.push_back(now);
+        let until = now + retry_after.max(MIN_RETRY_WAIT);
+        if entry.retry_until.is_none_or(|at| until > at) {
+            entry.retry_until = Some(until);
+        }
+    }
+
+    /// Remember the quota a response reported for `method`, when Slack (or a bridge in front of
+    /// it) sends `X-RateLimit-Remaining`: a low one holds crawling until its reset.
+    fn note_quota(&self, method: &str, headers: &reqwest::header::HeaderMap) {
+        let number = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        };
+        let Some(remaining) = number("x-ratelimit-remaining") else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let mut pressure = self.pressure();
+        let entry = pressure.entry(method.to_owned()).or_default();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let left = remaining as u64;
+        entry.remaining = Some(left);
+        if left <= LOW_REMAINING {
+            let reset = number("x-ratelimit-reset-after")
+                .map(|seconds| Duration::from_secs_f64(seconds.min(MAX_PARSED_RETRY_AFTER_SECONDS)))
+                .unwrap_or(crate::chat::CRAWL_QUIET_AFTER_LIMIT);
+            entry.low_until = Some(now + reset);
+        } else {
+            entry.low_until = None;
         }
     }
 
@@ -381,6 +463,7 @@ impl HttpSlackClient {
             .await
             .map_err(|e| ChatError::Transport(self.redact(&e.to_string())))?;
         let status = response.status();
+        self.note_quota(method, response.headers());
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -1141,13 +1224,46 @@ impl ChatClient for HttpSlackClient {
     }
 
     fn crawl_hold(&self) -> Option<Duration> {
-        let limited = *self
-            .limited_until
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        limited
-            .map(|until| until.saturating_duration_since(tokio::time::Instant::now()))
+        let now = tokio::time::Instant::now();
+        let mut pressure = self.pressure();
+        let mut latest: Option<tokio::time::Instant> = None;
+        for method in CRAWL_METHODS {
+            if let Some(until) = pressure.get_mut(method).and_then(|entry| entry.hold_until(now)) {
+                latest = Some(latest.map_or(until, |at| at.max(until)));
+            }
+        }
+        latest
+            .map(|until| until.saturating_duration_since(now))
             .filter(|wait| !wait.is_zero())
+    }
+
+    fn rate_limit_pressure(&self) -> Option<crate::chat::RateLimitPressure> {
+        let now = tokio::time::Instant::now();
+        let mut report = crate::chat::RateLimitPressure::default();
+        {
+            let mut pressure = self.pressure();
+            for (method, entry) in pressure.iter_mut() {
+                entry.prune(now);
+                if entry.limited.is_empty() && entry.remaining.is_none() {
+                    continue;
+                }
+                let count = u32::try_from(entry.limited.len()).unwrap_or(u32::MAX);
+                report.limited_last_10_min = report.limited_last_10_min.saturating_add(count);
+                report.routes.insert(
+                    method.clone(),
+                    crate::chat::RoutePressure {
+                        limited_last_10_min: count,
+                        last_limited_s_ago: entry
+                            .limited
+                            .back()
+                            .map(|at| now.saturating_duration_since(*at).as_secs()),
+                        remaining: entry.remaining,
+                    },
+                );
+            }
+        }
+        report.crawl_hold_s = self.crawl_hold().map(|wait| wait.as_secs().max(1));
+        Some(report)
     }
 
     async fn clear_upstream_through(

@@ -1946,6 +1946,10 @@ impl ChatClient for ProfiledClient {
         self.inner.crawl_hold()
     }
 
+    fn rate_limit_pressure(&self) -> Option<crate::chat::RateLimitPressure> {
+        self.inner.rate_limit_pressure()
+    }
+
     async fn clear_upstream_through(
         &self,
         channel: &ChannelId,
