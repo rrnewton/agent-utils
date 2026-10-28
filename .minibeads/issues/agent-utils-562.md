@@ -323,3 +323,23 @@ failures were load flakes only (repository-infrastructure 149,
 scroll-stability browser, wrkslots shards 519 + 518 passed
 alone). Upstream commits shared no files; rebased and pushed
 without a second gate.
+
+[muse watermelon] Slice 32 landed (5fe6a7dc): `wrkslotsd
+read-handoff`, the seventh writer slice, reproduces the
+coordinator handoff-read mutation (coordinator capture,
+publication-bound artifact resolution with legacy projection,
+the `handoff-read` retirement-queue event, and the
+already-queued outcome) in one lock phase behind the
+fixture-only writer guard. Adversarial review found the
+unbound sidecar, weak absent-storage and legacy
+classification, malformed-history tolerance, and unresolved
+legacy paths; all fixed. Known divergences: the two-phase
+display race rechecks cannot fire in one lock phase, the
+intent writer binds to the current record owner, and the
+cleanup-journal classification beside a seal stays
+approximated. Differential: 6 passed in this slice's file
+(56 across the writer files). Gate 43 failures were load
+flakes only (repository-infrastructure 149, cross agentctl
+777, wrkslots shards 522 + 521 passed alone). Upstream
+commits shared no files; rebased and pushed without a
+second gate.
