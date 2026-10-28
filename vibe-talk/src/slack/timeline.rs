@@ -10,11 +10,13 @@
 //!   that bound says so in the page's notice.
 //! * **Thread** — one thread's messages, after `conversations.replies` has confirmed the thread
 //!   exists in this conversation.
-//! * **Flat** — the Main page plus the replies of the threads rooted on it, at most
-//!   [`FLAT_MAX_THREADS`] threads and the newest [`FLAT_MAX_REPLIES`] replies of each, merged
-//!   oldest first. A notice states the bound whenever it applied. Only the threads whose root
-//!   moved since the last Flat read are read again, and only from their newest reply held; every
-//!   thread is read in full at least every [`FLAT_RECONCILE`] (`HttpSlackClient::flat_replies`).
+//! * **Flat** — the Main page plus the replies of every thread rooted on it, merged oldest
+//!   first: a thread the server's own copy holds whole ([`crate::held_replies`], `#603
+//!   server-side-search`) costs no call, and every other is read upstream, the newest
+//!   [`FLAT_MAX_REPLIES`] replies of it. A notice says how many threads that bound left replies
+//!   out of. Only the threads whose root moved since the last Flat read are read again, and only
+//!   from their newest reply held; every thread is read in full at least every
+//!   [`FLAT_RECONCILE`] (`HttpSlackClient::flat_replies`).
 //!
 //! Cursors are opaque, bound to the channel, view and thread they were issued for, and carry a
 //! Slack `ts` (or, for the thread list, an activity instant and a root) as their boundary.
@@ -39,9 +41,11 @@ use crate::threads::{ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest
 pub const MAX_TIMELINE_LIMIT: u16 = 100;
 /// Pages of history the thread list scans for roots.
 pub const THREAD_SCAN_PAGES: usize = 10;
-/// Threads whose replies one Flat page includes.
-pub const FLAT_MAX_THREADS: usize = 10;
-/// Newest replies of each thread one Flat page includes.
+/// Threads whose replies the window of a conversation's newest messages reads
+/// (`HttpSlackClient::recent`). A Flat page reads every thread rooted on it.
+pub const RECENT_MAX_THREADS: usize = 10;
+/// Newest replies of each thread one Flat page reads upstream. A thread the server's own copy
+/// holds whole is brought entire.
 pub const FLAT_MAX_REPLIES: usize = 50;
 /// How long the replies a Flat read remembers for a thread are trusted before the thread is read
 /// in full again, unless the client was built with another period: the page's
@@ -360,6 +364,27 @@ struct RawPage {
     raws: Vec<Raw>,
     has_more: bool,
     next_before: Option<String>,
+}
+
+/// Where one thread's replies on a Flat page came from.
+enum Replies {
+    /// The server's own copy, whole: messages, not yet in the page.
+    Held(Vec<Message>),
+    /// Read upstream: what the root counts, and the newest replies read.
+    Upstream(u64, Vec<Raw>),
+}
+
+/// What a root just read from history says of its thread, for the server's own copy to be
+/// judged against; `None` for a root that names no latest reply, whose count alone is never
+/// trusted (`HttpSlackClient::flat_replies` holds nothing for it either).
+fn root_says(root: &Raw) -> Option<crate::held_replies::RootSays> {
+    Some(crate::held_replies::RootSays {
+        thread_id: root.ts.clone(),
+        root_id: ids::micros_message_id(root.micros)?,
+        root_ms: root.micros.div_euclid(1_000),
+        reply_count: root.reply_count(),
+        latest_reply: ids::micros_message_id(root.latest_reply_micros()?)?,
+    })
 }
 
 impl HttpSlackClient {
@@ -713,7 +738,11 @@ impl HttpSlackClient {
         .encode()
     }
 
-    /// The Main page plus the replies of the threads rooted on it, bounded.
+    /// The Main page plus the replies of every thread rooted on it (`#603 server-side-search`):
+    /// Slack's history lists top-level messages only, and each thread's replies are a read of
+    /// their own, so a thread the server's own copy holds whole as its root describes it is taken
+    /// from there ([`crate::held_replies`]) and named in the page's `held`, and every other is read
+    /// upstream, at most four at once.
     async fn flat(
         &self,
         channel: &ChannelId,
@@ -731,34 +760,72 @@ impl HttpSlackClient {
             .filter(|raw| raw.is_thread_root())
             .collect();
         roots.sort_by_key(|root| std::cmp::Reverse(root.activity_micros()));
-        let bounded = roots.len() > FLAT_MAX_THREADS
-            || roots
-                .iter()
-                .take(FLAT_MAX_THREADS)
-                .any(|root| root.reply_count() > FLAT_MAX_REPLIES as u64);
+        let source = crate::held_replies::current();
         let reads: Vec<_> = roots
             .iter()
-            .take(FLAT_MAX_THREADS)
-            .map(|root| self.flat_replies(conversation, root))
+            .map(|root| {
+                let source = source.clone();
+                async move {
+                    // A thread longer than an upstream read brings is read upstream too, so that
+                    // All holds the same newest replies of it whichever way they come.
+                    let says = (root.reply_count() <= FLAT_MAX_REPLIES as u64)
+                        .then(|| root_says(root))
+                        .flatten();
+                    if let (Some(source), Some(says)) = (source, says) {
+                        if let Some(held) = source.whole(channel, &says).await {
+                            return Ok(Replies::Held(held));
+                        }
+                    }
+                    let read = self.flat_replies(conversation, root).await?;
+                    Ok::<_, ChatError>(Replies::Upstream(root.reply_count(), read))
+                }
+            })
             .collect();
-        let replies: Vec<Vec<Raw>> = stream::iter(reads).buffered(4).try_collect().await?;
+        let replies: Vec<Replies> = stream::iter(reads).buffered(4).try_collect().await?;
         let mut raws = page.raws;
-        raws.extend(replies.into_iter().flatten());
+        let mut held = Vec::new();
+        let mut cut = 0_usize;
+        for read in replies {
+            match read {
+                Replies::Held(messages) => held.extend(messages),
+                Replies::Upstream(count, read) => {
+                    cut += usize::from(count > FLAT_MAX_REPLIES as u64);
+                    raws.extend(read);
+                }
+            }
+        }
         raws.sort_by_key(|raw| raw.micros);
         raws.dedup_by_key(|raw| raw.micros);
+        let mut messages = self.messages(channel, &raws).await;
+        let read: std::collections::HashSet<MessageId> =
+            messages.iter().map(|message| message.id.clone()).collect();
+        held.retain(|message| !read.contains(&message.id));
+        let held_ids: Vec<MessageId> = held.iter().map(|message| message.id.clone()).collect();
+        messages.extend(held);
+        // Every Slack message id is its own `ts` in microseconds, so ids sort as times do.
+        messages.sort_by_key(|message| {
+            ids::ts_from_message_id(&message.id).and_then(|ts| ids::ts_micros(&ts))
+        });
         Ok(TimelinePage {
-            messages: self.messages(channel, &raws).await,
+            messages,
             has_threads: self.is_threaded(conversation),
             has_more: page.has_more,
             next_before: page.next_before,
-            notice: bounded.then(|| {
-                // In threads and messages, not pages: `#578 search-status-clarity`.
+            notice: (cut > 0).then(|| {
+                // In threads and messages, not pages: `#578 search-status-clarity`. The opening
+                // words are the ones the page recognises (`BOUNDED_ALL_NOTICE`).
+                let threads = if cut == 1 {
+                    "1 thread here has".to_owned()
+                } else {
+                    format!("{cut} threads here have")
+                };
                 format!(
-                    "Some threads' replies are not in All: it brings the replies of the \
-                     {FLAT_MAX_THREADS} most active threads among each {limit} top-level messages, \
-                     and the newest {FLAT_MAX_REPLIES} of each; open a thread to read all of it."
+                    "Some threads' replies are not in All: {threads} more than \
+                     {FLAT_MAX_REPLIES} replies, and All brings the newest {FLAT_MAX_REPLIES} \
+                     of each; open a thread to read all of it."
                 )
             }),
+            held: held_ids,
             ..TimelinePage::default()
         })
     }
@@ -768,7 +835,7 @@ impl HttpSlackClient {
     ///
     /// The conversation's newest `limit` messages from history, as before, and the replies Flat
     /// holds ([`Self::flat_replies`]) for the threads rooted on them whose latest reply falls inside
-    /// that stretch, at most [`FLAT_MAX_THREADS`] of them, the most recently active first, merged
+    /// that stretch, at most [`RECENT_MAX_THREADS`] of them, the most recently active first, merged
     /// and cut to the newest `limit`. A thread whose latest reply is older than the oldest message
     /// read has no reply in the window and costs nothing; one whose root has not changed since Flat
     /// last read it costs no call either, one with new replies one call, and one Flat holds nothing
@@ -811,7 +878,7 @@ impl HttpSlackClient {
         let reads: Vec<_> =
             roots
                 .iter()
-                .take(FLAT_MAX_THREADS)
+                .take(RECENT_MAX_THREADS)
                 .map(|root| async move {
                     (root.ts.clone(), self.flat_replies(conversation, root).await)
                 })

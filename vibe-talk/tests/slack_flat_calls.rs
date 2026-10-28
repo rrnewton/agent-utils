@@ -1457,3 +1457,62 @@ async fn a_flat_read_that_cannot_hold_its_copy_still_drops_an_older_one() {
     );
     assert_eq!(next.threads(), [root.clone(), root.clone()]);
 }
+
+/// `#603 server-side-search`: All reads the replies of every thread rooted on its page, not the
+/// ten most active, and says how many threads it brought only the newest replies of.
+#[tokio::test]
+async fn a_flat_read_reads_every_thread_on_its_page_and_counts_the_long_ones() {
+    let mut state = FakeState::default();
+    let mut list = Vec::new();
+    for i in 0..25_i64 {
+        let at = ts(i * 10, 0);
+        let mut message = profiled(&at, "UADA00001", "Ada", &format!("message {i}"));
+        // Every message the root of a thread: two replies, or sixty for message 0.
+        let count = if i == 0 { 60 } else { 2 };
+        let replies: Vec<(String, String)> = (0..count)
+            .map(|r| (reply_ts(i, r), format!("reply {r} to {i}")))
+            .collect();
+        thread(&mut state, CH, &mut message, &replies);
+        list.push(message);
+    }
+    state.history.insert(CH.to_owned(), list);
+    let fake = Fake::start(state, 100).await;
+    let client = fake.client();
+    let page = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                view: TimelineView::Flat,
+                thread_id: None,
+                before: None,
+                after: None,
+                limit: 50,
+            },
+        )
+        .await
+        .expect("flat");
+    assert_eq!(
+        page.messages.len(),
+        25 + 24 * 2 + 50,
+        "every thread's replies, the long one's newest fifty"
+    );
+    let mut threads: Vec<String> = fake
+        .requests("conversations.replies")
+        .iter()
+        .map(|params| params["ts"].clone())
+        .collect();
+    threads.sort();
+    threads.dedup();
+    assert_eq!(threads.len(), 25, "every thread on the page was read");
+    assert_eq!(
+        page.notice.as_deref(),
+        Some(
+            "Some threads' replies are not in All: 1 thread here has more than 50 replies, and \
+             All brings the newest 50 of each; open a thread to read all of it."
+        )
+    );
+    assert!(
+        page.held.is_empty(),
+        "nothing is taken from a cache this client has none of"
+    );
+}

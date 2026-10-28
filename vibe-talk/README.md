@@ -357,9 +357,15 @@ while it was out. It still brings the replies the page did not hold, which is wh
 but not one that a read of its thread sent after it no longer found: that reply was removed upstream,
 and would stay in the thread until the next full read.
 
-**Slack's All brings the replies of at most ten threads per page**, the ten most recently active
-among its messages, and says so in its notice. A thread past those ten is on the page with its count
-but none of its replies, which says nothing about them: the replies the page already holds for it
+**Slack's All brings the replies of every thread on its page** (`#603 server-side-search`). Slack's
+history lists top-level messages only, and each thread's replies cost a read of their own, so a
+thread the server's message cache already holds whole (exactly as many replies as its root counts,
+ending on the latest reply the root names, listed by reads in the last two hours) is taken from the
+cache at no call, for a write-scope caller with serving on, and every other thread is read upstream:
+its newest 50 replies. A notice counts the threads longer than that. (Until `#603` All read the
+replies of at most ten threads per page, the ten most recently active, and a server from before it
+still does.) A thread whose replies a page leaves out is on the page with its count but not all of
+its replies, which says nothing about them: the replies the page already holds for it
 stay held, counted and drawn, and its count says **N new** for any it has never held — on a device
 that never read it, such as a fresh one, that is every reply it has. Nothing brings those replies
 while nothing new happens in the thread; opening it reads it (it is never drawn from All with its
@@ -1681,8 +1687,9 @@ listed twice; past ten files the rest are counted on one more line.
   for; reads follow the cursor and stop at a fixed page budget. A walk never skips a message to
   stay inside that budget: it returns a shorter page, or none, and the next read continues from
   where it stopped. The thread list scans the newest 10 pages of history and says so when it
-  stopped there; the flat view includes replies for at most 10 threads per page and the newest
-  50 replies of each, and says so when either bound applied.
+  stopped there; the flat view includes the replies of every thread on its page, the newest 50 of
+  each it reads upstream (a thread the message cache holds whole comes from there, entire), and
+  says how many threads that bound left replies out of.
 * **The flat view rereads only threads that moved.** A thread root reports its reply count and
   latest reply, so a flat read reuses the replies the server already holds for a thread whose
   root has not changed (no call), and reads only the newer replies of one that has (one call,

@@ -756,7 +756,12 @@ async fn the_flat_view_merges_replies_of_the_roots_on_the_page_and_states_its_bo
         "a broadcast reply appears once"
     );
     let notice = page.notice.expect("the busy thread exceeded the bound");
-    assert!(notice.contains("10") && notice.contains("50"), "{notice}");
+    // `#603 server-side-search`: every thread on the page is read; only the busy one's length
+    // bounds it.
+    assert!(
+        notice.contains("1 thread here has more than 50 replies"),
+        "{notice}"
+    );
 
     let (state, _, _) = threaded_fixture(3);
     let small = Fake::start(state, 20).await;

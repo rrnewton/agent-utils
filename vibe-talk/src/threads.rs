@@ -394,6 +394,12 @@ pub struct TimelinePage {
     /// nothing. The replication model's rule 4. `#473 replication-c7-server-versions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_below_ms: Option<i64>,
+    /// Messages of this page taken from the server's own copy rather than read upstream: the
+    /// replies of threads the message cache held whole ([`crate::held_replies`], `#603
+    /// server-side-search`). Never sent: it keeps the read from being offered back to the cache
+    /// as having seen them.
+    #[serde(skip)]
+    pub held: Vec<crate::model::MessageId>,
 }
 
 impl TimelinePage {

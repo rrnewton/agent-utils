@@ -597,6 +597,25 @@ impl Fill {
         page: &TimelinePage,
     ) -> bool {
         let observed_ms = self.observed(page.as_of.as_deref());
+        // What the page took from the cache itself, the read did not see (`#603
+        // server-side-search`): offering it back would vouch for it as of now.
+        let read_only;
+        let page = if page.held.is_empty() {
+            page
+        } else {
+            let held: HashSet<&MessageId> = page.held.iter().collect();
+            read_only = TimelinePage {
+                messages: page
+                    .messages
+                    .iter()
+                    .filter(|message| !held.contains(&message.id))
+                    .cloned()
+                    .collect(),
+                held: Vec::new(),
+                ..page.clone()
+            };
+            &read_only
+        };
         let observations = observe::timeline(self.shape, request, read, page, observed_ms);
         self.offer(observations)
     }

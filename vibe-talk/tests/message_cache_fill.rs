@@ -1023,6 +1023,184 @@ async fn a_bounded_slack_flat_page_never_tombstones_a_reply_nor_claims_a_thread(
     );
 }
 
+/// `#603 server-side-search`: All reads the replies of every thread rooted on the page, and takes
+/// a thread the cache holds whole from there, for a write-scope caller with serving on, at no
+/// call. The page never offers what it took back to the cache as seen: those rows keep the
+/// observation the thread read gave them.
+#[tokio::test]
+async fn all_takes_a_thread_the_cache_holds_whole_from_there_and_never_offers_it_back() {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut history = Vec::new();
+    let mut threads = Vec::new();
+    // Twelve threads: more than All once read replies for.
+    for k in 0..12_i64 {
+        let root_ts = slack_fake::ts(k * 100, 0);
+        let mut root = slack_fake::profiled(&root_ts, "UADA00001", "Ada", &format!("topic {k}"));
+        let replies: Vec<(String, String)> = (1..=3)
+            .map(|j| (slack_fake::ts(k * 100 + j, 0), format!("reply {j} to {k}")))
+            .collect();
+        slack_fake::thread(&mut fixture, SLACK_CH, &mut root, &replies);
+        history.push(root);
+        threads.push((root_ts, replies));
+    }
+    fixture.history.insert(SLACK_CH.to_owned(), history);
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-slack-held");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    state.message_cache.set_serve(true);
+    let cache = state.message_cache.cache().expect("installed");
+
+    // Thread 4 read whole: the cache now holds it, under a claim reaching its first reply.
+    let (held_root, held_replies) = &threads[4];
+    get(
+        &state,
+        &format!(
+            "/api/v1/channels/{SLACK_CH}/timeline?view=thread&thread_id={held_root}&limit=100"
+        ),
+    )
+    .await;
+    assert!(cache.quiesce_blocking(WAIT));
+    let first_reply = slack_id(&held_replies[0].0);
+    let observed = |cache: &MessageCache| {
+        cache
+            .message(&slack_chan(), &first_reply)
+            .served()
+            .expect("a read")
+            .expect("held")
+            .observed_ms
+    };
+    let seen_by_thread_read = observed(&cache);
+
+    clock.advance(5 * MINUTE);
+    let before = fake.requests("conversations.replies").len();
+    let flat = get(
+        &state,
+        &format!("/api/v1/channels/{SLACK_CH}/timeline?view=flat&limit=50"),
+    )
+    .await;
+    let asked: Vec<String> = fake.requests("conversations.replies")[before..]
+        .iter()
+        .filter_map(|params| params.get("ts").cloned())
+        .collect();
+    assert!(
+        !asked.contains(held_root),
+        "the thread the cache holds whole was read upstream: {asked:?}"
+    );
+    assert_eq!(
+        asked.len(),
+        11,
+        "every other thread is read, not ten: {asked:?}"
+    );
+    let ids: Vec<String> = flat["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| m["id"].as_str().expect("id").to_owned())
+        .collect();
+    assert_eq!(ids.len(), 12 * 4, "every root and every reply: {flat}");
+    for (_, replies) in &threads {
+        for (reply, _) in replies {
+            assert!(ids.contains(&slack_id(reply).0), "{reply} missing");
+        }
+    }
+    assert!(flat["notice"].is_null(), "nothing was left out: {flat}");
+    let mut sorted = ids.clone();
+    sorted.sort_by_key(|id| vibe_talk::slack::ts_from_message_id(&MessageId(id.clone())));
+    assert_eq!(
+        ids, sorted,
+        "oldest first, the held replies in their places"
+    );
+    assert!(cache.quiesce_blocking(WAIT));
+    assert_eq!(
+        observed(&cache),
+        seen_by_thread_read,
+        "a reply the page took from the cache was offered back as seen"
+    );
+    let copy = flat["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == serde_json::json!(first_reply.0))
+        .expect("the held reply");
+    assert_eq!(
+        copy["observed_ms"],
+        serde_json::json!(seen_by_thread_read),
+        "a held copy is as new as the read that put it there, not this one"
+    );
+    assert!(
+        flat["observed_ms"].as_i64().expect("the page's version") <= seen_by_thread_read,
+        "the page claims every copy is newer than it is"
+    );
+
+    // A read-scope caller is never answered from the cache: it reads that thread upstream.
+    let before = fake.requests("conversations.replies").len();
+    let status = call_as(
+        &state,
+        &format!("/api/v1/channels/{SLACK_CH}/timeline?view=flat&limit=50"),
+        testing::READ_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let asked: Vec<String> = fake.requests("conversations.replies")[before..]
+        .iter()
+        .filter_map(|params| params.get("ts").cloned())
+        .collect();
+    assert!(asked.contains(held_root), "{asked:?}");
+
+    // Whether the next Flat read took the reply from the cache: a copy that carries the cache's
+    // observation of it, where one this read fetched (upstream, or the provider's own memory of
+    // the thread) carries the page's.
+    let took = |state: &AppState| {
+        let state = state.clone();
+        let cache = Arc::clone(&cache);
+        let first_reply = first_reply.clone();
+        async move {
+            assert!(cache.quiesce_blocking(WAIT));
+            let before = observed(&cache);
+            let page = get(
+                &state,
+                &format!("/api/v1/channels/{SLACK_CH}/timeline?view=flat&limit=50"),
+            )
+            .await;
+            let copy = page["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .find(|m| m["id"] == serde_json::json!(first_reply.0))
+                .expect("the reply")["observed_ms"]
+                .as_i64();
+            copy == Some(before)
+        }
+    };
+    // Fifteen minutes on from the thread read, the copy is no longer trusted: as long as Flat's
+    // own memory of a thread is.
+    clock.advance(11 * MINUTE);
+    assert!(
+        !took(&state).await,
+        "a copy listed sixteen minutes ago was trusted"
+    );
+    // Read again, the thread is trusted again...
+    get(
+        &state,
+        &format!(
+            "/api/v1/channels/{SLACK_CH}/timeline?view=thread&thread_id={held_root}&limit=100"
+        ),
+    )
+    .await;
+    clock.advance(MINUTE);
+    assert!(
+        took(&state).await,
+        "the thread read again was not taken from the cache"
+    );
+    // ...until an offer for the channel is dropped, which may have been an edit.
+    cache.mark_suspect(&slack_chan());
+    assert!(
+        !took(&state).await,
+        "a suspect channel's thread was taken from the cache"
+    );
+}
+
 #[tokio::test]
 async fn an_empty_page_claims_nothing_and_a_walk_from_since_claims_its_span() {
     let clock = ManualClock::at(T0 + HOUR);

@@ -23949,8 +23949,9 @@ function emptyCanon(channel = "") {
     // than anything read of it (`noteReplyGaps`). Absent is "not known yet".
     replyGaps: new Map(),
     // ...and the threads whose gap is not known because All's newest page carried their root and
-    // none of their replies, saying it leaves some out (Slack's ten threads): All reaching such a
-    // root says nothing of its replies' age (`noteReplyGaps`).
+    // none of their replies, saying it leaves some out (Slack's threads past fifty replies, and before
+    // `#603 server-side-search` past its ten threads a page): All reaching such a root says nothing of
+    // its replies' age (`noteReplyGaps`).
     passedOver: new Set(),
     // ...and by thread id, the gap Done on the root set for a thread whose gap was not known
     // (`settleUnknownReplies`), until a read sets one of its own (a read that only lowers it leaves
@@ -26719,14 +26720,14 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
  * stream brings a reply a poll late, and none in a thread rooted before the newest page of history
  * (`#307 slack-reply-live`). All does not answer for that thread, so it is read too
  * (`threadOutrunsStore`). Nor for one whose older replies All's page did not bring — Slack's brings
- * those of ten threads, and the newest fifty of each: drawn from All, it showed its root and none
- * of them, until the poll (`storeLacksReplies`).
+ * the newest fifty of each thread it reads upstream (and once read only ten threads a page): drawn
+ * from All, it showed its root and not all of them, until the poll (`storeLacksReplies`).
  *
  * SO IS MAIN, and always from where All starts: every message posted to the channel itself, thread
  * roots included, is a row of All. `#220 view-switch-instant`. Main is covered wherever All is, and
  * drawn by hiding All's thread replies — on switching to it and on reopening the page in it — with
  * no read. The roots keep their reply counts: their thread records, and the summaries, are the
- * store's. Not All's notice, which can be about All alone ("replies for at most ten threads"): Main's
+ * store's. Not All's notice, which can be about All alone ("the newest 50 of each"): Main's
  * own read says Main's. And a Main the store covers already is as current as All when All's newest
  * page is the later read, since that page answered for every Main row in it. Either way Main has no
  * cursor of its own to walk back on, and `fromAll` says so: its first step back is its own read
@@ -28587,8 +28588,9 @@ function foldReadState(payload, view) {
  * is missing), and by a count that has dropped below it (old replies were deleted, or brought). What
  * a count says beyond the gap is new (`unseenReplies`).
  *
- * NOT FOR A THREAD ALL'S PAGE CARRIES NONE OF, when it says it leaves some out. Slack's All brings
- * the replies of at most ten threads per page (`allPageAnswersFor`); a root among the rest is on the
+ * NOT FOR A THREAD ALL'S PAGE CARRIES NONE OF, when it says it leaves some out. Slack's All brought
+ * the replies of at most ten threads per page until `#603 server-side-search`, and a server from
+ * before it still does (`allPageAnswersFor`); a root among the rest is on the
  * page with its count and nothing of its thread, and setting its gap from that made the whole count
  * old — an unread answer the store held, or a new one only Main's count knew of, stopped counting
  * after a look at All. So such a page only lowers a gap it knows, as Main's does, unless the root's

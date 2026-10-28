@@ -98,6 +98,11 @@ fn chan_row(
         .optional()
 }
 
+/// The latest drop of an offer for `chan` the file records. `#603 server-side-search`.
+pub(crate) fn dropped_ms(connection: &Connection, chan: &ChanKey) -> rusqlite::Result<Option<i64>> {
+    Ok(chan_row(connection, chan)?.and_then(|(_, dropped)| dropped))
+}
+
 /// Whether anything held of `chan` is in doubt after the latest drop of an offer for it, the
 /// file's or `memory`'s: a row observed no later, or a head whose scope's newest end was last read
 /// no later. Nothing held is nothing in doubt.
@@ -435,6 +440,19 @@ pub(crate) fn head(
         return Ok(None);
     };
     Ok(head_by_id(connection, id, scope_key)?.map(|record| record.head))
+}
+
+/// A scope's head, with what the file records of the latest read of its newest end. `#603
+/// server-side-search`.
+pub(crate) fn head_record(
+    connection: &Connection,
+    chan: &ChanKey,
+    scope_key: &str,
+) -> rusqlite::Result<Option<HeadRecord>> {
+    match chan_id(connection, chan)? {
+        Some(id) => head_by_id(connection, id, scope_key),
+        None => Ok(None),
+    }
 }
 
 /// A scope's head, with what the file records of the latest read of its newest end.

@@ -1519,28 +1519,36 @@ pub async fn timeline(
     // When the read began, on this server's clock: the page's version. `#473
     // replication-c7-server-versions`.
     let began_ms = crate::store::now_ms();
-    let (mut page, position) = match (served_below.as_ref(), resumed) {
-        (Some(below), _) => (
-            step_back_from_served(state, caller, &channel.id, request, below).await?,
-            None,
-        ),
-        (None, Some(Forward::Native(own))) => {
-            backend.after = Some(own);
-            (
-                state.chat.fetch_timeline(&channel.id, &backend).await?,
+    // `#603 server-side-search`: All takes the replies of a thread the cache holds whole from
+    // there, for a caller that may be answered from the cache at all; see `crate::held_replies`.
+    let held: Option<std::sync::Arc<dyn crate::held_replies::HeldReplies>> =
+        (request.view == crate::threads::TimelineView::Flat && may_serve(state, caller))
+            .then(|| std::sync::Arc::clone(&state.message_cache) as _);
+    let (mut page, position) = crate::held_replies::scope(held, async {
+        Ok::<_, OpError>(match (served_below.as_ref(), resumed) {
+            (Some(below), _) => (
+                step_back_from_served(state, caller, &channel.id, request, below).await?,
                 None,
-            )
-        }
-        (None, Some(Forward::Generic(since))) => {
-            backend.after = None;
-            let read = state
-                .chat
-                .fetch_timeline_since(&channel.id, &backend, &since)
-                .await?;
-            (read.page, Some(read.position))
-        }
-        (None, None) => (state.chat.fetch_timeline(&channel.id, request).await?, None),
-    };
+            ),
+            (None, Some(Forward::Native(own))) => {
+                backend.after = Some(own);
+                (
+                    state.chat.fetch_timeline(&channel.id, &backend).await?,
+                    None,
+                )
+            }
+            (None, Some(Forward::Generic(since))) => {
+                backend.after = None;
+                let read = state
+                    .chat
+                    .fetch_timeline_since(&channel.id, &backend, &since)
+                    .await?;
+                (read.page, Some(read.position))
+            }
+            (None, None) => (state.chat.fetch_timeline(&channel.id, request).await?, None),
+        })
+    })
+    .await?;
     if let Some(shadow) = shadow {
         shadow.compare(Upstream::of(&page.messages, page.has_more));
     }
@@ -1581,9 +1589,24 @@ pub async fn timeline(
     }
     // `#191 read-aloud-first-lag`: what the page is about to draw is what it will ask to hear.
     // A delta carries only what changed, which is exactly what has to replace an older copy.
-    state
-        .read_ahead
-        .remember(&channel.id, thread, &page.messages, fetch_began);
+    // Not what the page took from the cache (`#603 server-side-search`): as for a served page,
+    // nothing is remembered for speech that this read did not fetch.
+    if page.held.is_empty() {
+        state
+            .read_ahead
+            .remember(&channel.id, thread, &page.messages, fetch_began);
+    } else {
+        let held: std::collections::HashSet<&MessageId> = page.held.iter().collect();
+        let fetched: Vec<Message> = page
+            .messages
+            .iter()
+            .filter(|message| !held.contains(&message.id))
+            .cloned()
+            .collect();
+        state
+            .read_ahead
+            .remember(&channel.id, thread, &fetched, fetch_began);
+    }
     for gone in page.delta.iter().flat_map(|delta| &delta.deleted) {
         state.read_ahead.forget(&channel.id, gone);
     }
@@ -1665,7 +1688,6 @@ fn version_page(page: &mut crate::threads::TimelinePage, began_ms: i64, newest: 
         .as_deref()
         .and_then(crate::clock::instant_ms)
         .map_or(began_ms, |complete| complete.min(began_ms));
-    page.observed_ms = Some(observed);
     page.settled_below_ms = newest.then(|| observed - crate::cache::coverage::SETTLE_MS);
     let roots = page
         .threads
@@ -1675,6 +1697,17 @@ fn version_page(page: &mut crate::threads::TimelinePage, began_ms: i64, newest: 
     for message in page.messages.iter_mut().chain(roots) {
         message.observed_ms.get_or_insert(observed);
     }
+    // `#603 server-side-search`: replies taken from the cache carry the observations that put
+    // them there, so the page as a whole is no newer than its oldest such copy. Its own copies
+    // keep this read's version, stamped above.
+    let held: std::collections::HashSet<&MessageId> = page.held.iter().collect();
+    page.observed_ms = Some(
+        page.messages
+            .iter()
+            .filter(|message| held.contains(&message.id))
+            .filter_map(|message| message.observed_ms)
+            .fold(observed, i64::min),
+    );
 }
 
 /// One speakable line per recent message, and what was left out of it.

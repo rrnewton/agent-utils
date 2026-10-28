@@ -124,6 +124,7 @@ mod checkpoint;
 pub mod coverage;
 pub mod file;
 pub mod grant;
+mod held;
 pub mod lifecycle;
 pub mod marker;
 pub mod merge;
@@ -155,7 +156,7 @@ pub use sink::{
     ServedAnswer, Shadowed, Sink,
 };
 
-use crate::model::{ChannelId, MessageId};
+use crate::model::{ChannelId, Message, MessageId};
 
 /// The most bytes of queued observations the writer's queue holds before offers are dropped.
 pub const QUEUE_BYTES: usize = 32 * 1024 * 1024;
@@ -2319,6 +2320,46 @@ impl MessageCache {
             let mut outcome = search::test_rows(rows, more, request);
             outcome.horizon = coverage::horizon(&intervals, head.as_ref(), cutoff_ms);
             Ok(outcome)
+        })
+    }
+
+    /// The replies of one thread, oldest first, when the copy held is the thread `root` (just read
+    /// upstream) describes, and its claims were listed within `fresh_ms` and after the latest
+    /// offer dropped for the channel, this process's or one the file records: see [`held`].
+    /// `Served(None)` when it is not. Blocked while the thread's scope is. `#603
+    /// server-side-search`.
+    #[must_use]
+    pub fn whole_thread(
+        &self,
+        chan: &ChanKey,
+        root: &crate::held_replies::RootSays,
+        fresh_ms: i64,
+    ) -> Read<Option<Vec<Message>>> {
+        let now_ms = self.now_ms();
+        let cutoff_ms = self.shared.limits.cutoff_ms(&chan.channel_id, now_ms);
+        let memory_dropped_ms = self.last_drop_ms(chan);
+        let scope_key = Scope::Thread(root.thread_id.clone()).key();
+        let want = usize::try_from(root.reply_count)
+            .unwrap_or(usize::MAX)
+            .saturating_add(2);
+        self.read_scope(chan, &scope_key, |connection| {
+            let snapshot = connection.unchecked_transaction()?;
+            let rows = reader::newest(&snapshot, chan, &scope_key, want)?;
+            let intervals = reader::coverage(&snapshot, chan, &scope_key)?;
+            let head = reader::head_record(&snapshot, chan, &scope_key)?;
+            let dropped_ms = reader::dropped_ms(&snapshot, chan)?.max(memory_dropped_ms);
+            snapshot.finish()?;
+            Ok(held::whole(
+                held::Snapshot {
+                    rows,
+                    intervals: &intervals,
+                    head,
+                    cutoff_ms,
+                    dropped_ms,
+                    fresh_after_ms: now_ms.saturating_sub(fresh_ms),
+                },
+                root,
+            ))
         })
     }
 

@@ -1486,7 +1486,8 @@ fn coverage_stays_out_of_the_unsettled_band_until_a_later_read_settles_it() {
 
 #[test]
 fn a_bounded_flat_page_never_deletes_a_reply_or_stamps_a_thread() {
-    // Slack's "All" view: Main plus the replies of at most ten threads, the newest fifty of each.
+    // Slack's "All" view: Main plus the replies of its threads, the newest fifty of each read upstream
+    // (before `#603 server-side-search`, of at most ten threads a page; a page from then still bounds).
     let fx = Fixture::new("cache-flat");
     let roots: Vec<Message> = (0..11)
         .map(|i| {

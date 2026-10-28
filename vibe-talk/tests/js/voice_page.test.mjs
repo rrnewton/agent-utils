@@ -65953,6 +65953,20 @@ test("`#578 search-status-clarity`: All says its top-level messages and, of thei
     "and every reply in 2 of their 3 threads. None match.");
 });
 
+test("`#603 server-side-search`: All's notice of threads longer than it brings is read as its bound, and said in threads", async () => {
+  // The server reads every thread on All's page now, and names only threads past fifty replies.
+  const notice = "Some threads' replies are not in All: 1 thread here has more than 50 replies, and All brings " +
+    "the newest 50 of each; open a thread to read all of it.";
+  const bounded = newPage();
+  threadsHistory(bounded, { threads: 3, replies: 2, size: 50 });
+  allLeavingOut(bounded, [historyThread(1)], notice);
+  await signIn(bounded);
+  await showDiscord(bounded, bounded.messages);
+  assert.equal(channelSummaryText(bounded), "lead team — back to the first message; 1 thread here has replies not loaded");
+  assert.equal(bounded.el("timeline-notice").textContent,
+    "1 thread here has replies All has not loaded; open a thread to read all of it.");
+});
+
 test("`#578 search-status-clarity`: rows saved on this device claim no stretch until a read checks them", async () => {
   const first = newPage();
   const all = searchHistory(first, { threads: true, pages: 3 });
