@@ -247,6 +247,19 @@ pub const DEFAULT_MESSAGE_CACHE_REWALK_HOT_MINUTES: u32 = 60;
 pub const DEFAULT_MESSAGE_CACHE_REWALK_RECENT_HOURS: u32 = 24;
 /// Default `[message_cache] full_reads_per_minute`: the deep walk's pace, per provider.
 pub const DEFAULT_MESSAGE_CACHE_FULL_READS_PER_MINUTE: u32 = 6;
+/// Default `[[providers]] backfill_reads_per_minute` for a Slack provider: 20, two fifths of the
+/// 50 a minute Slack's tier 3 grants `conversations.history` and `conversations.replies` per
+/// workspace, so the page's own reads, the relist and the poller keep the rest. `#602
+/// history-settings-and-limits`; the README's rate-limit section cites the policy.
+pub const DEFAULT_SLACK_BACKFILL_READS_PER_MINUTE: u32 = 20;
+/// Default `[[providers]] backfill_reads_per_minute` for a Discord-protocol provider: 30, one read
+/// every two seconds, far inside Discord's 50 requests a second per bot and the few a second its
+/// per-channel buckets allow, and inside a Google Chat space's 15 reads a second shared by every
+/// app in it. `#602 history-settings-and-limits`.
+pub const DEFAULT_DISCORD_BACKFILL_READS_PER_MINUTE: u32 = 30;
+/// The most `[[providers]] backfill_reads_per_minute` may be: Slack's tier 3 floor.
+pub const MAX_BACKFILL_READS_PER_MINUTE: u32 = 50;
+
 /// Default `[message_cache] full_cycle_hours`: how soon after one walk of a channel's whole
 /// history began the next begins. Well inside the week within which every held row must be read
 /// again or erased ([`crate::cache::REVALIDATE_WITHIN_MS`]).
@@ -1027,6 +1040,13 @@ pub struct ProviderConfig {
     /// makes with that in front of them, not a thing that happens because they upgraded. Refused
     /// below [`crate::live::MIN_POLL_SECONDS`].
     pub live_poll_seconds: u64,
+    /// The most reads the message cache's backfill makes of this provider in any minute, all its
+    /// walks together: 1 to [`MAX_BACKFILL_READS_PER_MINUTE`], by default
+    /// [`DEFAULT_SLACK_BACKFILL_READS_PER_MINUTE`] or [`DEFAULT_DISCORD_BACKFILL_READS_PER_MINUTE`]
+    /// by kind. A ceiling under the provider's published limits; the provider's own signals
+    /// (`Retry-After`, a rate limit answered to any request) slow it further. `#602
+    /// history-settings-and-limits`.
+    pub backfill_reads_per_minute: u32,
     /// The accounts the coding agents post as at this provider, `coding_agent_user_ids`, when the
     /// operator has named them. `#323 slack-system-bots`.
     ///
@@ -1537,6 +1557,7 @@ struct FileProvider {
     coding_agent_user_ids: Option<Vec<String>>,
     request_timeout_seconds: Option<u64>,
     live_poll_seconds: Option<u64>,
+    backfill_reads_per_minute: Option<i64>,
     channel_registration: Option<bool>,
     max_post_chars: Option<usize>,
     max_post_bytes: Option<usize>,
@@ -3534,6 +3555,7 @@ fn legacy_discord_provider<'e>(
         key: LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
         name: provider_name,
         live_poll_seconds,
+        backfill_reads_per_minute: DEFAULT_DISCORD_BACKFILL_READS_PER_MINUTE,
         coding_agent_user_ids,
         kind: ProviderKind::Discord(discord),
     }))
@@ -3837,6 +3859,7 @@ fn provider_entry<'e>(
     validate_request_timeout(&field("request_timeout_seconds"), request_timeout_seconds)?;
     let live_poll_seconds = entry.live_poll_seconds.unwrap_or(0);
     validate_poll_seconds(&field("live_poll_seconds"), live_poll_seconds)?;
+    let entry_backfill_reads = entry.backfill_reads_per_minute;
     let coding_agent_user_ids =
         coding_agent_ids(&field("coding_agent_user_ids"), entry.coding_agent_user_ids)?;
     let refuse = |name: &str, kind: &str| ConfigError::Invalid {
@@ -3993,10 +4016,29 @@ fn provider_entry<'e>(
             })
         }
     };
+    let default_reads = match &kind {
+        ProviderKind::Slack(_) => DEFAULT_SLACK_BACKFILL_READS_PER_MINUTE,
+        ProviderKind::Discord(_) => DEFAULT_DISCORD_BACKFILL_READS_PER_MINUTE,
+    };
+    let backfill_reads_per_minute = match entry_backfill_reads {
+        Some(value) => match u32::try_from(value) {
+            Ok(reads) if (1..=MAX_BACKFILL_READS_PER_MINUTE).contains(&reads) => reads,
+            _ => {
+                return Err(ConfigError::Invalid {
+                    field: field("backfill_reads_per_minute"),
+                    detail: format!(
+                        "must be 1 to {MAX_BACKFILL_READS_PER_MINUTE} reads a minute; got {value}"
+                    ),
+                })
+            }
+        },
+        None => default_reads,
+    };
     Ok(ProviderConfig {
         key,
         name,
         live_poll_seconds,
+        backfill_reads_per_minute,
         coding_agent_user_ids,
         kind,
     })

@@ -3969,6 +3969,16 @@ taking the file back too. **Take a copy of `storage.path` before an upgrade.** R
 is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
 the server stopped, newest first; each step's note below says how.
 
+**Step 23 (`#602 history-settings-and-limits`)** only adds the `history_modes` table, each
+channel's own history mode chosen in Settings › Channels, so with the server stopped it can be
+undone in place, every channel then following `[message_cache] backfill` again:
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE history_modes; PRAGMA user_version = 22;'
+```
+
+Run that only on a file at version 23, and only when the build being returned to predates the step.
+
 **Step 22 (`#549 own-read-stored`)** adds the `own_decided` table, which of the owner's own
 messages have had their first read state decided, and the `dismissals.own` column, which says a
 Done mark was written by "Mark my own messages as read" rather than by the reader, so the two are

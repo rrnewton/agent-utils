@@ -448,6 +448,10 @@ pub struct LiveHub {
     /// `#232 upstream-mark-read`. Fed on every publish, never waited on: see
     /// [`crate::upstream_clear`].
     upstream_clear: std::sync::Arc<crate::upstream_clear::Candidates>,
+    /// The owner's per-channel say over the backfill: each channel's own history mode, and the
+    /// channels to read next. `#602 history-settings-and-limits`; see
+    /// [`crate::history_control`]. Here beside `rewalk_wanted`, the backfill's other input.
+    history: std::sync::Arc<crate::history_control::HistoryControl>,
     /// Every message published for the first time, for its first read state to be decided. `#549
     /// own-read-stored`. Fed under the feed lock, never waited on: see [`crate::own_read`].
     own_sightings: std::sync::Arc<crate::own_read::Sightings>,
@@ -524,6 +528,7 @@ impl LiveHub {
             hinted: Mutex::new(BTreeMap::new()),
             hint_generation,
             upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
+            history: std::sync::Arc::default(),
             own_sightings: std::sync::Arc::default(),
             recent,
             cache: std::sync::OnceLock::new(),
@@ -595,6 +600,12 @@ impl LiveHub {
     #[must_use]
     pub fn upstream_clear(&self) -> &std::sync::Arc<crate::upstream_clear::Candidates> {
         &self.upstream_clear
+    }
+
+    /// The owner's per-channel say over the backfill. `#602 history-settings-and-limits`.
+    #[must_use]
+    pub fn history(&self) -> &std::sync::Arc<crate::history_control::HistoryControl> {
+        &self.history
     }
 
     /// The messages waiting for their first read state. `#549 own-read-stored`.

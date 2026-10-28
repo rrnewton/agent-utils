@@ -394,6 +394,18 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/upstream-clear",
             get(api::upstream_clear).put(api::set_upstream_clear),
         )
+        // `#602 history-settings-and-limits`. How much of the channel's history the message cache
+        // holds and how its walk is going (READ scope); its own history mode (WRITE scope); and
+        // "read this one next", which search's "Search further back" calls (WRITE scope). NO MCP
+        // TOOL for any of the writes: how much the server reads of the owner's channels is his.
+        .route(
+            "/api/v1/channels/{channel_id}/history",
+            get(api::channel_history).put(api::set_channel_history),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/history/prioritize",
+            post(api::prioritize_channel_history).delete(api::cancel_channel_history_priority),
+        )
         // `#253 upstream-clear-polish`: Settings' "Mark read now".
         .route(
             "/api/v1/channels/{channel_id}/upstream-clear/now",

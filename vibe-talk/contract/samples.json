@@ -64,6 +64,43 @@
       }
     }
   ],
+  "ChannelHistoryState": [
+    {
+      "channel_id": "C0000MAIN1",
+      "complete": false,
+      "cycle_pages": 0,
+      "messages": 0,
+      "mode": "recent",
+      "now_ms": 1790000000000,
+      "server_mode": "recent",
+      "settable": true,
+      "walking": false
+    },
+    {
+      "channel_id": "C0000MAIN1",
+      "complete": false,
+      "complete_ms": 1780000000000,
+      "cycle_pages": 140,
+      "days_per_hour": 18.2,
+      "eta_s": 5400,
+      "held_reason": "rate_limited",
+      "held_until_ms": 1790000030000,
+      "messages": 12400,
+      "mode": "full",
+      "mode_override": "full",
+      "newest_ms": 1789999000000,
+      "now_ms": 1790000000000,
+      "oldest_ms": 1760000000000,
+      "pages_per_hour": 240.5,
+      "queue_position": 0,
+      "reached_ms": 1760000000000,
+      "reads_last_minute": 7,
+      "reads_per_minute": 20,
+      "server_mode": "recent",
+      "settable": true,
+      "walking": true
+    }
+  ],
   "ClientConfigResponse": [
     {
       "app_name": "vibe-talk at work",
@@ -461,6 +498,17 @@
         "timestamp": "2026-09-25T12:00:00+00:00"
       },
       "serial": 3
+    }
+  ],
+  "HistoryModeRequest": [
+    {
+      "mode": "recent"
+    },
+    {
+      "mode": "full"
+    },
+    {
+      "mode": "default"
     }
   ],
   "LiveDeleteEvent": [

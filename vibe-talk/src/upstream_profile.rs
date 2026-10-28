@@ -1942,6 +1942,10 @@ impl ChatClient for ProfiledClient {
         self.inner.supports_upstream_clear()
     }
 
+    fn crawl_hold(&self) -> Option<std::time::Duration> {
+        self.inner.crawl_hold()
+    }
+
     async fn clear_upstream_through(
         &self,
         channel: &ChannelId,

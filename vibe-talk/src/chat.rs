@@ -1434,6 +1434,17 @@ pub trait ChatClient: Send + Sync {
         false
     }
 
+    /// How long background crawling of this provider (the message cache's backfill) should hold
+    /// off before its next request, by what the provider itself has signalled: a rate limit it
+    /// answered recently, wherever the request came from, or a count of rejected requests nearing
+    /// a ban. `None` when nothing says to. `#602 history-settings-and-limits`.
+    ///
+    /// Advice for a crawler that can wait, never a refusal: a request the owner is waiting on
+    /// goes ahead, within the client's own bounded waits.
+    fn crawl_hold(&self) -> Option<Duration> {
+        None
+    }
+
     /// Move the provider's read cursor through `through`, or in a dry run report where it would
     /// move. `#232 upstream-mark-read`.
     ///

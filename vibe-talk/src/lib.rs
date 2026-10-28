@@ -65,6 +65,7 @@ pub mod discord;
 pub mod egress;
 pub mod elevenlabs;
 pub mod heading;
+pub mod history_control;
 pub mod http;
 pub mod link_labels;
 pub mod live;

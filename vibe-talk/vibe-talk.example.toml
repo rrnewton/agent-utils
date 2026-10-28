@@ -122,8 +122,8 @@ max_count_scan = 500
 # attaches and receives nothing until you set this.
 #
 # Off by default on purpose. Every tick is ONE Discord request PER CHANNEL, forever, whether or
-# not anybody is looking; this server does not yet honour `Retry-After`, and a 429 from Discord
-# reaches the caller as HTTP 502. Under 5 seconds is refused outright rather than clamped.
+# not anybody is looking. A 429 is waited out as Discord asks, within a bounded budget, but waiting
+# is not extra quota. Under 5 seconds is refused outright rather than clamped.
 # 30 is a reasonable place to start. Environment: VIBE_TALK_LIVE_POLL_SECONDS
 live_poll_seconds = 0
 
@@ -172,6 +172,10 @@ live_poll_seconds = 0
 # coding_agent_user_ids = ["U0AGENT0001"]   # the bots your coding agents post as; see above. A
 #                                           # Slack app's posts: the id Settings' Who is who shows
 # live_poll_seconds = 30
+# backfill_reads_per_minute = 20 # 1 to 50: the most reads the message cache's backfill makes of
+#                                # this provider a minute, all walks together. Default 20 for
+#                                # Slack, 30 for "discord"; Retry-After and other rate limits the
+#                                # provider answers slow it further (#602 history-settings-and-limits)
 # channel_registration = true    # accept pasted Slack links in the app
 # registered_channels_writable = false
 # channel_discovery = true

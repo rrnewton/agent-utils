@@ -23,6 +23,7 @@ use vibe_talk::contract::{
     UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame, VoicePostPrefix,
     VoicePromptSettings, VoiceSend, VoiceSettings,
 };
+use vibe_talk::contract::{ChannelHistoryState, HistoryModeChoice, HistoryModeRequest};
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Heading, Message, MessageId, Reaction, UserId};
@@ -1128,6 +1129,64 @@ fn samples() -> Value {
         "MessageCacheRequest": [
             to(&MessageCacheRequest { enabled: false }),
             to(&MessageCacheRequest { enabled: true }),
+        ],
+        // `#602 history-settings-and-limits`: a channel following a recent server with nothing
+        // walked, and one of its own full mode, prioritized, part way back, its provider holding
+        // off after a rate limit, so every optional field is seen present and absent.
+        "ChannelHistoryState": [
+            to(&ChannelHistoryState {
+                channel_id: "C0000MAIN1".into(),
+                server_mode: "recent",
+                mode_override: None,
+                mode: "recent",
+                settable: true,
+                messages: 0,
+                oldest_ms: None,
+                newest_ms: None,
+                walking: false,
+                reached_ms: None,
+                complete: false,
+                complete_ms: None,
+                cycle_pages: 0,
+                pages_per_hour: None,
+                days_per_hour: None,
+                eta_s: None,
+                queue_position: None,
+                held_until_ms: None,
+                held_reason: None,
+                reads_per_minute: None,
+                reads_last_minute: None,
+                now_ms: 1_790_000_000_000,
+            }),
+            to(&ChannelHistoryState {
+                channel_id: "C0000MAIN1".into(),
+                server_mode: "recent",
+                mode_override: Some(vibe_talk::store::HistoryMode::Full),
+                mode: "full",
+                settable: true,
+                messages: 12_400,
+                oldest_ms: Some(1_760_000_000_000),
+                newest_ms: Some(1_789_999_000_000),
+                walking: true,
+                reached_ms: Some(1_760_000_000_000),
+                complete: false,
+                complete_ms: Some(1_780_000_000_000),
+                cycle_pages: 140,
+                pages_per_hour: Some(240.5),
+                days_per_hour: Some(18.2),
+                eta_s: Some(5_400),
+                queue_position: Some(0),
+                held_until_ms: Some(1_790_000_030_000),
+                held_reason: Some(vibe_talk::history_control::HoldReason::RateLimited),
+                reads_per_minute: Some(20),
+                reads_last_minute: Some(7),
+                now_ms: 1_790_000_000_000,
+            }),
+        ],
+        "HistoryModeRequest": [
+            to(&HistoryModeRequest { mode: HistoryModeChoice::Recent }),
+            to(&HistoryModeRequest { mode: HistoryModeChoice::Full }),
+            to(&HistoryModeRequest { mode: HistoryModeChoice::Default }),
         ],
         "VibeTalkV1ClientFrame": [
             to(&VibeTalkV1ClientFrame::AudioStart),

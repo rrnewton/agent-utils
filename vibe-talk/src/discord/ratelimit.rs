@@ -57,6 +57,22 @@
 //! outstanding `retry_after` — see [`super::DiscordError::retry_after`] — so the outer backoff can
 //! be longer than Discord asked for but never shorter.
 //!
+//! # Invalid requests are counted, and never allowed near Discord's ban
+//!
+//! Discord bans an IP address from its API for a while once it has made **10,000 invalid requests
+//! in 10 minutes**, an invalid request being one answered **401, 403 or 429** (a 429 with
+//! `X-RateLimit-Scope: shared` excepted: that limit is a resource's, not the caller's). Its own
+//! documentation asks a client that could reach that rate to track it
+//! (<https://discord.com/developers/docs/topics/rate-limits#invalid-request-limit-aka-cloudflare-bans>).
+//! [`RateLimiter`] counts every such answer over a sliding [`INVALID_REQUEST_WINDOW`], and:
+//!
+//! * from [`INVALID_REQUEST_CRAWL_CEILING`] on, it tells background crawling to hold off
+//!   ([`RateLimiter::crawl_hold`]): a crawler has no business adding to a count that is rising;
+//! * from [`INVALID_REQUEST_REFUSE_AT`] on, half of Discord's limit, it sends nothing at all and
+//!   answers every request as rate-limited until the count has fallen, so that no burst of 401s
+//!   from a revoked token, nor a loop of 403s, can carry this server to the ban. `#602
+//!   history-settings-and-limits`.
+//!
 //! # Tested against a fake, and only against a fake
 //!
 //! Everything here is exercised by [`super::fake::FakeDiscord`], which shares this engine, and by
@@ -106,6 +122,20 @@ pub const MIN_RETRY_WAIT: Duration = Duration::from_millis(50);
 /// A ceiling on parsing, not a policy: it keeps a malformed or hostile float out of [`Duration`]
 /// arithmetic. Anything this large blows the budget and fails loudly anyway.
 pub const MAX_PARSED_RETRY_AFTER_SECONDS: f64 = 3600.0;
+
+/// How far back invalid requests are counted: Discord's own window for its invalid-request ban.
+pub const INVALID_REQUEST_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// Discord's invalid-request ban: this many 401, 403 or 429 answers inside
+/// [`INVALID_REQUEST_WINDOW`] restricts the address for a while.
+pub const DISCORD_INVALID_REQUEST_LIMIT: usize = 10_000;
+
+/// Invalid requests inside the window at which nothing more is sent: half of Discord's limit.
+pub const INVALID_REQUEST_REFUSE_AT: usize = DISCORD_INVALID_REQUEST_LIMIT / 2;
+
+/// Invalid requests inside the window at which background crawling holds off: 2.5 % of Discord's
+/// limit. A server reading normally makes a handful an hour.
+pub const INVALID_REQUEST_CRAWL_CEILING: usize = 250;
 
 /// HTTP headers, matched without regard to case, independent of any HTTP client.
 ///
@@ -199,6 +229,11 @@ pub struct LimiterStats {
     pub retries: u64,
     /// Rejections observed, including ones that later cleared.
     pub rejections: u64,
+    /// Invalid requests (401, 403, and 429 not of the shared scope) ever observed.
+    pub invalid: u64,
+    /// Requests refused here, unsent, because the invalid-request count stood at
+    /// [`INVALID_REQUEST_REFUSE_AT`].
+    pub refused_invalid: u64,
 }
 
 /// Turn Discord's float seconds into a duration, refusing to believe nonsense.
@@ -286,7 +321,34 @@ struct LimiterState {
     gates: BTreeMap<String, Instant>,
     /// The whole-token gate. A global limit is not one route's problem.
     global_gate: Option<Instant>,
+    /// When each invalid request inside [`INVALID_REQUEST_WINDOW`] was answered, oldest first.
+    invalid: std::collections::VecDeque<Instant>,
     stats: LimiterStats,
+}
+
+impl LimiterState {
+    fn prune_invalid(&mut self, now: Instant) {
+        while self
+            .invalid
+            .front()
+            .is_some_and(|&at| now.saturating_duration_since(at) >= INVALID_REQUEST_WINDOW)
+        {
+            self.invalid.pop_front();
+        }
+    }
+
+    /// How long until fewer than `ceiling` invalid requests are inside the window; `None` when
+    /// fewer already are.
+    fn invalid_wait(&mut self, now: Instant, ceiling: usize) -> Option<Duration> {
+        self.prune_invalid(now);
+        let len = self.invalid.len();
+        if len < ceiling.max(1) {
+            return None;
+        }
+        // The count falls below the ceiling once the (len - ceiling + 1) oldest have left.
+        let leaving = self.invalid.get(len - ceiling.max(1))?;
+        Some((*leaving + INVALID_REQUEST_WINDOW).saturating_duration_since(now))
+    }
 }
 
 /// Discord's rate limits, obeyed: bucket state plus the bounded wait-and-retry around a request.
@@ -326,6 +388,44 @@ impl RateLimiter {
     #[must_use]
     pub fn stats(&self) -> LimiterStats {
         self.lock().stats
+    }
+
+    /// Invalid requests (401, 403, and 429 not of the shared scope) answered inside the last
+    /// [`INVALID_REQUEST_WINDOW`].
+    #[must_use]
+    pub fn invalid_requests(&self) -> usize {
+        let mut state = self.lock();
+        state.prune_invalid(Instant::now());
+        state.invalid.len()
+    }
+
+    /// Record one answer that Discord counts toward its invalid-request ban. Exposed for clients
+    /// whose requests do not all go through [`RateLimiter::run`].
+    pub fn note_invalid(&self) {
+        let mut state = self.lock();
+        let now = Instant::now();
+        state.prune_invalid(now);
+        state.invalid.push_back(now);
+        state.stats.invalid += 1;
+    }
+
+    /// How long background crawling should hold off before its next request, by what Discord has
+    /// said: a whole-token limit still in force, or an invalid-request count at
+    /// [`INVALID_REQUEST_CRAWL_CEILING`]. `None` when nothing says to. `#602
+    /// history-settings-and-limits`.
+    #[must_use]
+    pub fn crawl_hold(&self) -> Option<Duration> {
+        let mut state = self.lock();
+        let now = Instant::now();
+        let global = state
+            .global_gate
+            .map(|gate| gate.saturating_duration_since(now))
+            .filter(|wait| !wait.is_zero());
+        let invalid = state.invalid_wait(now, INVALID_REQUEST_CRAWL_CEILING);
+        match (global, invalid) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LimiterState> {
@@ -431,14 +531,45 @@ impl RateLimiter {
                 tokio::time::sleep(gate).await;
                 waited += gate;
             }
+            // Never toward Discord's invalid-request ban: at half of it, nothing more is sent.
+            let refuse = self
+                .lock()
+                .invalid_wait(Instant::now(), INVALID_REQUEST_REFUSE_AT);
+            if let Some(wait) = refuse {
+                self.lock().stats.refused_invalid += 1;
+                tracing::warn!(
+                    route = %route,
+                    wait_ms = wait.as_millis(),
+                    "refusing a chat request unsent: the provider has answered too many requests \
+                     401, 403 or 429 in the last ten minutes, and more would risk its ban"
+                );
+                return Err(self.exhausted(&route, attempts, waited, wait, true));
+            }
             attempts += 1;
-            match attempt().await? {
+            let answer = match attempt().await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    if matches!(error.cause(), ChatError::Status { status: 401 | 403, .. }) {
+                        self.note_invalid();
+                    }
+                    return Err(error);
+                }
+            };
+            match answer {
                 Attempt::Done(value, headers) => {
                     self.observe_success(&route, &headers);
                     return Ok(value);
                 }
                 Attempt::Limited(limit) => {
                     global = limit.global;
+                    // A shared-scope 429 is a resource's limit, and Discord does not count it.
+                    if !limit
+                        .scope
+                        .as_deref()
+                        .is_some_and(|scope| scope.eq_ignore_ascii_case("shared"))
+                    {
+                        self.note_invalid();
+                    }
                     self.observe_limit(&route, &limit);
                     let wait = limit.retry_after.max(MIN_RETRY_WAIT);
                     if attempts >= self.policy.max_attempts || waited + wait > budget {
@@ -873,5 +1004,124 @@ mod tests {
             "retrying a 404 four times helps nobody and costs four requests"
         );
         assert!(matches!(error, DiscordError::Status { status: 404, .. }));
+    }
+
+    fn scoped(retry_after: Duration, scope: &str) -> RateLimit {
+        RateLimit {
+            retry_after,
+            global: false,
+            bucket: None,
+            scope: Some(scope.to_owned()),
+        }
+    }
+
+    /// `#602 history-settings-and-limits`: what Discord counts toward its invalid-request ban is
+    /// counted here: 401, 403 and a 429 of the caller's own scope, and not a shared-scope 429, a
+    /// 404 or a success.
+    #[tokio::test(start_paused = true)]
+    async fn invalid_requests_are_counted_as_discord_counts_them() {
+        let limiter = RateLimiter::with_policy(RetryPolicy {
+            max_attempts: 1,
+            max_total_wait: Duration::from_secs(5),
+        });
+        for status in [401_u16, 403, 404] {
+            let _ = limiter
+                .run("GET", URL, || async move {
+                    Err::<Attempt<&str>, _>(DiscordError::Status {
+                        status,
+                        body: String::new(),
+                    })
+                })
+                .await;
+        }
+        assert_eq!(limiter.invalid_requests(), 2, "401 and 403 count; 404 does not");
+        let _ = limiter
+            .run("GET", OTHER, || async {
+                Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(
+                    Duration::from_millis(10),
+                    "shared",
+                )))
+            })
+            .await;
+        assert_eq!(limiter.invalid_requests(), 2, "a shared-scope 429 is not counted");
+        let _ = limiter
+            .run("GET", OTHER, || async {
+                Ok::<_, DiscordError>(Attempt::<&str>::Limited(scoped(
+                    Duration::from_millis(10),
+                    "user",
+                )))
+            })
+            .await;
+        assert_eq!(limiter.invalid_requests(), 3);
+        tokio::time::advance(INVALID_REQUEST_WINDOW).await;
+        assert_eq!(limiter.invalid_requests(), 0, "the window slides");
+        assert_eq!(limiter.stats().invalid, 3);
+    }
+
+    /// Crawling holds off from [`INVALID_REQUEST_CRAWL_CEILING`] on, and at
+    /// [`INVALID_REQUEST_REFUSE_AT`] nothing is sent until the count has fallen: the request is
+    /// answered as rate-limited, with how long until it may go.
+    #[tokio::test(start_paused = true)]
+    async fn the_invalid_request_count_never_reaches_discords_ban() {
+        let limiter = RateLimiter::new();
+        assert_eq!(limiter.crawl_hold(), None);
+        for _ in 0..INVALID_REQUEST_CRAWL_CEILING {
+            limiter.note_invalid();
+        }
+        let hold = limiter.crawl_hold().expect("crawling holds off at the ceiling");
+        assert!(hold <= INVALID_REQUEST_WINDOW && hold > Duration::ZERO);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in INVALID_REQUEST_CRAWL_CEILING..INVALID_REQUEST_REFUSE_AT {
+            limiter.note_invalid();
+        }
+        let calls = AtomicU32::new(0);
+        let error = limiter
+            .run("GET", URL, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, DiscordError>(Attempt::Done("ok", Headers::new()))
+            })
+            .await
+            .expect_err("refused at half of Discord's limit");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing was sent");
+        let DiscordError::RateLimited(detail) = error else {
+            panic!("a refusal reads as a rate limit: {error:?}");
+        };
+        // The count falls below the line once the oldest leaves, nine minutes on: the first 250
+        // were noted a minute before the rest.
+        assert_eq!(detail.retry_after, INVALID_REQUEST_WINDOW - Duration::from_secs(60));
+        assert_eq!(limiter.stats().refused_invalid, 1);
+        tokio::time::advance(INVALID_REQUEST_WINDOW).await;
+        let value = limiter
+            .run("GET", URL, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, DiscordError>(Attempt::Done("ok", Headers::new()))
+            })
+            .await
+            .expect("sent again once the count fell");
+        assert_eq!(value, "ok");
+        assert_eq!(limiter.crawl_hold(), None);
+    }
+
+    /// A whole-token limit in force holds crawling off for what is left of it.
+    #[tokio::test(start_paused = true)]
+    async fn a_global_limit_holds_crawling_off() {
+        let limiter = RateLimiter::with_policy(RetryPolicy {
+            max_attempts: 1,
+            max_total_wait: Duration::from_secs(60),
+        });
+        let _ = limiter
+            .run("GET", URL, || async {
+                Ok::<_, DiscordError>(Attempt::<&str>::Limited(RateLimit {
+                    retry_after: Duration::from_secs(20),
+                    global: true,
+                    bucket: None,
+                    scope: Some("global".to_owned()),
+                }))
+            })
+            .await;
+        let hold = limiter.crawl_hold().expect("held");
+        assert_eq!(hold, Duration::from_secs(20));
+        tokio::time::advance(Duration::from_secs(21)).await;
+        assert_eq!(limiter.crawl_hold(), None);
     }
 }

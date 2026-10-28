@@ -164,6 +164,10 @@ pub struct HttpSlackClient {
     /// The `users.conversations` pages the channel browser read, by cursor, so searches typed one
     /// after another walk the same listing without asking Slack again. `#371 channel-search-hash`.
     pub(super) directory_pages: crate::directory::Kept<String, Value>,
+    /// Until when Slack last asked this client to wait (a 429's `Retry-After`, or an
+    /// `ok:false ratelimited`), whichever request it answered: background crawling holds off
+    /// until then ([`ChatClient::crawl_hold`]). `#602 history-settings-and-limits`.
+    limited_until: Mutex<Option<tokio::time::Instant>>,
     /// The threads the first parts of long posts just went into or started, by conversation and
     /// root `ts`, and when: proven to be there by Slack's own answer to that part, so the rest of
     /// the post goes in without reading the thread first. `#448 send-dedupe`; see
@@ -239,6 +243,7 @@ impl HttpSlackClient {
             post_limit: config.post_limit(),
             shim_profile: None,
             directory_pages: crate::directory::Kept::default(),
+            limited_until: Mutex::new(None),
             posted_roots: Mutex::new(HashMap::new()),
             op_keys_returned: std::sync::atomic::AtomicBool::new(false),
         })
@@ -322,6 +327,7 @@ impl HttpSlackClient {
             match answer? {
                 Outcome::Done(value) => return Ok(value),
                 Outcome::Limited(retry_after) => {
+                    self.note_limited(retry_after);
                     let wait = retry_after.max(MIN_RETRY_WAIT);
                     // A wait longer than what is left is refused BEFORE it is taken: parking a
                     // caller and then failing anyway is the worst of both.
@@ -343,6 +349,18 @@ impl HttpSlackClient {
                     waited += wait;
                 }
             }
+        }
+    }
+
+    /// Remember that Slack asked for `retry_after`, for [`ChatClient::crawl_hold`].
+    fn note_limited(&self, retry_after: Duration) {
+        let until = tokio::time::Instant::now() + retry_after.max(MIN_RETRY_WAIT);
+        let mut limited = self
+            .limited_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if limited.is_none_or(|at| until > at) {
+            *limited = Some(until);
         }
     }
 
@@ -1120,6 +1138,16 @@ impl ChatClient for HttpSlackClient {
     /// slack-clear-unread`.
     fn supports_upstream_clear(&self) -> bool {
         self.upstream_clear
+    }
+
+    fn crawl_hold(&self) -> Option<Duration> {
+        let limited = *self
+            .limited_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        limited
+            .map(|until| until.saturating_duration_since(tokio::time::Instant::now()))
+            .filter(|wait| !wait.is_zero())
     }
 
     async fn clear_upstream_through(

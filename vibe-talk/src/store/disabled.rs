@@ -19,6 +19,7 @@ use super::{
     SummaryKey, TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
     UpstreamClearSetting,
 };
+use super::{HistoryMode, HistoryModeSetting};
 use crate::model::{ChannelId, MessageId};
 use crate::voice_agent::OwnerPrompt;
 
@@ -354,6 +355,21 @@ impl StateStore for DisabledStore {
         &self,
         _: &ChannelId,
         _: &UpstreamClearAttempt,
+    ) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn history_modes(&self) -> Result<Vec<HistoryModeSetting>, StoreError> {
+        // A refusal, as for upstream-clear: a choice this server would forget at the next
+        // restart is not offered.
+        refuse()
+    }
+
+    async fn set_history_mode(
+        &self,
+        _: &ChannelId,
+        _: Option<HistoryMode>,
+        _: i64,
     ) -> Result<(), StoreError> {
         refuse()
     }

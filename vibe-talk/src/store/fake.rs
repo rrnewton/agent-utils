@@ -33,6 +33,7 @@ use super::{
     UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting, MAX_PINS_PER_CHANNEL,
     MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
+use super::{HistoryMode, HistoryModeSetting};
 use crate::model::{ChannelId, MessageId};
 use crate::voice_agent::OwnerPrompt;
 
@@ -102,6 +103,8 @@ struct State {
     pin_revisions: BTreeMap<String, i64>,
     /// Channel to its upstream-clear setting. `#232 upstream-mark-read`.
     upstream_clear: BTreeMap<String, UpstreamClearSetting>,
+    /// Channel to its own history mode. `#602 history-settings-and-limits`.
+    history_modes: BTreeMap<String, HistoryModeSetting>,
     /// Channel to its bookmark, cleared ones included, as the real table keeps a row for a cleared
     /// bookmark so its revision goes on growing. `#240 reading-bookmark`.
     bookmarks: BTreeMap<String, Bookmark>,
@@ -1503,6 +1506,38 @@ impl StateStore for FakeStore {
         Ok(())
     }
 
+    async fn history_modes(&self) -> Result<Vec<HistoryModeSetting>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state.history_modes.values().cloned().collect())
+    }
+
+    async fn set_history_mode(
+        &self,
+        channel: &ChannelId,
+        mode: Option<HistoryMode>,
+        at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        match mode {
+            Some(mode) => {
+                state.history_modes.insert(
+                    channel.as_str().to_owned(),
+                    HistoryModeSetting {
+                        channel: channel.clone(),
+                        mode,
+                        updated_ms: at_ms,
+                    },
+                );
+            }
+            None => {
+                state.history_modes.remove(channel.as_str());
+            }
+        }
+        Ok(())
+    }
+
     async fn thread_hues(
         &self,
         channel: &ChannelId,
@@ -1625,6 +1660,7 @@ impl StateStore for FakeStore {
         state.thread_hues.clear();
         state.thread_hue_tombstones.clear();
         state.upstream_clear.clear();
+        state.history_modes.clear();
         state.conversations.clear();
         state.marks.clear();
         state.read_epochs.clear();
