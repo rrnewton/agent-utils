@@ -1539,8 +1539,19 @@ pub async fn timeline(
                 ServeOutcome::Served(answer) => {
                     let ServedAnswer { view, pending } = *answer;
                     let (raw, as_of) = served_messages(&view);
-                    let next_before =
-                        crate::timeline_served::encode(&channel.id, request.view, thread, &raw)?;
+                    // `#650 cache-first-older-reads`: no way back when the file proves nothing
+                    // older exists.
+                    let reaches_start = crate::cache::below::reaches_start(
+                        &view.coverage,
+                        &view.rows,
+                        view.rows.len() >= usize::from(request.limit.max(1)),
+                        request.view == crate::threads::TimelineView::Thread,
+                    );
+                    let next_before = (!reaches_start)
+                        .then(|| {
+                            crate::timeline_served::encode(&channel.id, request.view, thread, &raw)
+                        })
+                        .transpose()?;
                     if let Some(claim) = claim {
                         spawn_timeline_refresh(
                             state.clone(),
@@ -1562,11 +1573,16 @@ pub async fn timeline(
                             .head_checked_ms
                             .or(view.head.map(|head| head.head_listed_ms)),
                         settled_below_ms: view.head.map(|head| head.unsettled_from_ms),
-                        // Never a claim that the scope's start is here: the cache's coverage
-                        // is clipped at its age limit, so older history upstream is unknown
-                        // to it. The step back says, from the provider's own pages.
-                        has_more: true,
-                        next_before: Some(next_before),
+                        // A claim that the scope's start is here only when the file's claims
+                        // reach it from the oldest message (`crate::cache::below`): a claim is
+                        // clipped at the cache's age limit, so with one, older history upstream
+                        // is unknown to it, and the step back says, from the provider's own
+                        // pages. `#650 cache-first-older-reads`: a page held whole from its start
+                        // said there was more, the page at the top of its short list stepped back
+                        // after every poll, and each step walked the provider to learn there was
+                        // nothing.
+                        has_more: next_before.is_some(),
+                        next_before,
                         as_of,
                         ..crate::threads::TimelinePage::default()
                     };
@@ -1619,6 +1635,10 @@ pub async fn timeline(
     let stand_in = request.before.is_none() && may_serve(state, caller);
     let (mut page, position) = match (served_below.as_ref(), stand_in) {
         (Some(below), _) => {
+            if let Some(page) = older_from_cache(state, caller, &channel, request, below).await? {
+                crate::cache_first::note(crate::cache_first::Source::Older);
+                return Ok((channel, page));
+            }
             crate::cache_first::note(crate::cache_first::Source::Upstream);
             (
                 crate::held_replies::scope(
@@ -2447,8 +2467,11 @@ async fn stood_in(
     // `#614 timeline-read-failures`: a thread list has no messages to step back from; its next
     // page back is read upstream, from the newest, as a page with no cursor reads it.
     let list = request.view == crate::threads::TimelineView::Threads;
+    // `#650 cache-first-older-reads`: nor a page the file holds from the view's start.
     let next_before = if list {
         held.next_before
+    } else if held.reaches_start {
+        None
     } else {
         Some(crate::timeline_served::encode(
             &channel.id,
@@ -2499,6 +2522,134 @@ async fn stood_in(
         }
     }
     Ok((channel, page))
+}
+
+/// How long after the claims a step back answered from the file rests on were listed the step is
+/// read upstream behind the answer ([`older_from_cache`]): within it, what the file holds of the
+/// stretch is as fresh as the period Slack's own memory of a thread's replies is trusted for
+/// (fifteen minutes, as the cache's held threads). `#650 cache-first-older-reads`.
+pub const OLDER_REFRESH_AFTER_MS: i64 = 15 * 60 * 1000;
+
+/// One step back from a page answered from the cache, answered from the file when its claims prove
+/// the step whole (`crate::cache::below`): at once, with no read upstream before the answer. `None`
+/// when they do not, and the step reads upstream as before ([`step_back_from_served`]). `#650
+/// cache-first-older-reads`.
+///
+/// After `#622 cache-first-reads` every newest page the page read came from the cache with this
+/// server's own cursor, so every step back walked the provider from its newest page, 2.6 s and once
+/// 21 s, though the cache holds the channel's whole history. The answer is the scope's newest
+/// messages below the page's oldest, as old as the oldest claim it rests on, with this server's
+/// cursor again when more is older and none when the file proves nothing is. Slack's All is put
+/// together as its stand-in is, and says so as the stand-in does (`refresh_failed`), so the page
+/// takes nothing out for its absence from the replies.
+///
+/// The provider's step is read behind the answer ([`spawn_behind_older`]) only when it could
+/// correct something and the walk can reach it: the claims were listed more than
+/// [`OLDER_REFRESH_AFTER_MS`] ago, the page's oldest message is within the walk's
+/// [`crate::timeline_served::WALK_PAGES`] pages of the newest end, and no such read of the view is
+/// running already; giving up at the first rate limit, under the request's reason.
+async fn older_from_cache(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelInfo,
+    request: &crate::threads::TimelineRequest,
+    below: &crate::timeline_served::Below,
+) -> Result<Option<crate::threads::TimelinePage>, OpError> {
+    if !may_serve(state, caller) {
+        return Ok(None);
+    }
+    let Some(oldest) = below.oldest() else {
+        return Ok(None);
+    };
+    let limit = usize::from(request.limit.max(1));
+    let ask = Ask::Timeline {
+        view: request.view,
+        thread: request.thread_id.clone(),
+        limit,
+    };
+    let reach = crate::timeline_served::WALK_PAGES.saturating_mul(limit);
+    let Some(held) = state
+        .message_cache
+        .held_below(&channel.id, &ask, oldest, reach)
+        .await
+    else {
+        return Ok(None);
+    };
+    let now_ms = state
+        .message_cache
+        .cache()
+        .map_or_else(crate::store::now_ms, |cache| cache.now_ms());
+    if held.newer < reach && now_ms - held.listed_ms > OLDER_REFRESH_AFTER_MS {
+        spawn_behind_older(state, caller, &channel.id, request, below, &held.messages);
+    }
+    let thread = request.thread_id.as_deref();
+    let next_before = held
+        .has_more
+        .then(|| crate::timeline_served::encode(&channel.id, request.view, thread, &held.messages))
+        .transpose()?;
+    let mut page = crate::threads::TimelinePage {
+        messages: held.messages,
+        has_threads: held.has_threads,
+        observed_ms: Some(held.listed_ms),
+        has_more: next_before.is_some(),
+        next_before,
+        as_of: (!held.whole).then(|| crate::clock::iso_from_ms(held.listed_ms)),
+        refresh_failed: (!held.whole).then(|| CACHE_FIRST.to_owned()),
+        ..crate::threads::TimelinePage::default()
+    };
+    let noise = crate::noise::filter_for(state, &channel.id).await;
+    stamp(state, &mut page.messages);
+    noise.mark(&mut page.messages);
+    Ok(Some(page))
+}
+
+/// Read a step back from a served page upstream ([`step_back_from_served`]) behind an answer from
+/// the file ([`older_from_cache`]), one per view at a time, giving up at the first rate limit:
+/// each provider page it reads fills the cache, and what was `served` that it proved edited or
+/// deleted is put right by live event ([`publish_serve_corrections`]). `#650
+/// cache-first-older-reads`.
+fn spawn_behind_older(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    below: &crate::timeline_served::Below,
+    served: &[Message],
+) {
+    let Some(claim) = state
+        .message_cache
+        .claim_refresh(RefreshKey::timeline_backward(
+            channel.clone(),
+            request.view,
+            request.thread_id.as_deref(),
+        ))
+    else {
+        return;
+    };
+    let reason = crate::read_reason::ReadReason::current();
+    let (state, channel, request, below) = (
+        state.clone(),
+        channel.clone(),
+        request.clone(),
+        below.clone(),
+    );
+    let served = served.to_vec();
+    drop(tokio::spawn(reason.scope(crate::read_reason::hurry(
+        true,
+        async move {
+            let _claim = claim;
+            match step_back_from_served(&state, caller, &channel, &request, &below).await {
+                Ok(_) => publish_serve_corrections(&state, &channel, served).await,
+                Err(error) => tracing::info!(
+                    consumer = "cache_older",
+                    view = ?request.view,
+                    error = error.code(),
+                    "the step back read behind a page answered from the message cache failed; the \
+                     next step is answered from the cache again"
+                ),
+            }
+        },
+    ))));
 }
 
 /// One step back from a timeline page answered from the cache (`#510 cache-serve-every-read`):

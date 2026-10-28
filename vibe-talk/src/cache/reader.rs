@@ -217,6 +217,39 @@ fn span(
     rows
 }
 
+/// A scope's newest `limit` messages created before `at_ms`, or at it and not the message `id`,
+/// oldest first. `#650 cache-first-older-reads`.
+fn below(
+    connection: &Connection,
+    chan: &ChanKey,
+    chan_id: i64,
+    scope_key: &str,
+    (at_ms, id): (i64, &str),
+    limit: usize,
+) -> rusqlite::Result<Vec<CachedMessage>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {MESSAGE_COLUMNS}, s.vouched_ms
+         FROM message_scope s JOIN message m ON m.row_id = s.row_id
+         WHERE s.chan = ?1 AND s.scope_key = ?2
+           AND (s.created_ms < ?3 OR (s.created_ms = ?3 AND m.message_id != ?4))
+         ORDER BY s.created_ms DESC, m.numeric_id DESC, m.message_id DESC LIMIT ?5"
+    ))?;
+    let mut rows = statement
+        .query_map(
+            params![
+                chan_id,
+                scope_key,
+                at_ms,
+                id,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| scoped(&chan.channel_id, row),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.reverse();
+    Ok(rows)
+}
+
 /// What a shadow evaluation reads, in ONE read transaction: every part of it is of the same
 /// moment, so a batch the writer commits meanwhile is either wholly in it or not at all.
 pub(crate) fn shadow_view(
@@ -271,6 +304,25 @@ pub(crate) fn shadow_view(
                     (*from_ms, until_ms.unwrap_or(i64::MAX)),
                     *limit,
                 )?,
+                home: None,
+                has_threads,
+                dropped_ms,
+            }
+        }
+        Query::Below {
+            scope,
+            at_ms,
+            id,
+            limit,
+        } => {
+            let key = scope.key();
+            let head = head_by_id(&snapshot, chan_id, &key)?;
+            View {
+                head: head.map(|record| record.head),
+                head_checked_ms: head.map(|record| record.checked_ms),
+                head_checked_from_ms: head.and_then(|record| record.checked_from_ms),
+                coverage: coverage_by_id(&snapshot, chan_id, &key)?,
+                rows: below(&snapshot, chan, chan_id, &key, (*at_ms, id), *limit)?,
                 home: None,
                 has_threads,
                 dropped_ms,

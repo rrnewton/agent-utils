@@ -297,6 +297,19 @@ pub enum Query {
         /// How many messages.
         limit: usize,
     },
+    /// A scope's head, its coverage, and its newest `limit` messages older than a page's oldest:
+    /// created before `at_ms`, or at it and not the message `id`. A step back from a page answered
+    /// from the cache. `#650 cache-first-older-reads`.
+    Below {
+        /// The scope.
+        scope: Scope,
+        /// Provider time of the page's oldest message.
+        at_ms: i64,
+        /// That message's id.
+        id: String,
+        /// How many messages.
+        limit: usize,
+    },
 }
 
 impl Query {
@@ -304,7 +317,9 @@ impl Query {
     #[must_use]
     pub fn scope(&self) -> Option<&Scope> {
         match self {
-            Self::Newest { scope, .. } | Self::Span { scope, .. } => Some(scope),
+            Self::Newest { scope, .. } | Self::Span { scope, .. } | Self::Below { scope, .. } => {
+                Some(scope)
+            }
             Self::Message { .. } => None,
         }
     }

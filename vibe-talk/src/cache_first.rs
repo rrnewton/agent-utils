@@ -30,11 +30,15 @@
 //! and cover are). A failure the cache may not hide (an expired cursor, an access answer) is kept
 //! the same way and is that next read's answer, so the page learns of it as it did before.
 //!
-//! Slack goes first only for what the cache has never listed, with the fallback as before; for
-//! the reads that exist to ask the provider what this server does not know: placing a live
-//! message's thread (`place`, `reply-place`) and All's counts read (`counts`, which the page
-//! repeats every five minutes until a read it trusts lands); and for a step back into older
-//! history.
+//! Slack goes first only for what the cache has never listed, with the fallback as before; and
+//! for the reads that exist to ask the provider what this server does not know: placing a live
+//! message's thread (`place`, `reply-place`).
+//!
+//! `#650 cache-first-older-reads`: All's counts read (`counts`) is answered the same way; the page
+//! asks once more ten seconds after such an answer, which takes the read that landed behind it, so
+//! a read it trusts still ends its asking. A step back from a page answered from the cache is
+//! answered from the file when its claims prove the step whole (`crate::ops`), and a page the file
+//! holds from the view's start says there is nothing older (`crate::cache::below`).
 //!
 //! # Seeing it in the log
 //!
@@ -57,14 +61,15 @@ use crate::timeline_forward::GenericPosition;
 pub const LANDED_KEPT: Duration = Duration::from_secs(15);
 
 /// Whether a timeline read is answered from the cache first when it holds anything of the view:
-/// the page's own reads of a view's newest end, or of what changed since a cursor. Not a step back
-/// (`before`); not the reads that ask the provider what this server does not know, where to place
-/// a live message (`place`, `reply-place`), nor All's counts read (`counts`): the page counts a
-/// counts read done only when it is not the server's copy, and asks again five minutes later, by
-/// when what landed behind it is long gone, so answered first it would read All upstream every
-/// five minutes for good; not the server's own reads (naming, a tool, the live poller), which keep
-/// their own rules. "Older threads…" (`threads`) only when the cache's answer knows the way back
-/// ([`answers`]).
+/// the page's own reads of a view's newest end, or of what changed since a cursor, including the
+/// newest page a step back reads for its cursor (`older`, `search`) and All's counts read
+/// (`counts`, `#650 cache-first-older-reads`: the page counts a counts read done only when it is
+/// not the server's copy, so it asks once more soon after one, and takes what landed behind it).
+/// Not a step back itself (`before`), which `crate::ops` answers from the file when it can; not
+/// the reads that ask the provider what this server does not know, where to place a live message
+/// (`place`, `reply-place`); not the server's own reads (naming, a tool, the live poller), which
+/// keep their own rules. "Older threads…" (`threads`) only when the cache's answer knows the way
+/// back ([`answers`]).
 #[must_use]
 pub fn eligible(request: &TimelineRequest) -> bool {
     use ReadReason as R;
@@ -82,6 +87,9 @@ pub fn eligible(request: &TimelineRequest) -> bool {
                 | R::Expired
                 | R::Side
                 | R::Threads
+                | R::Older
+                | R::Search
+                | R::Counts
         )
 }
 
@@ -106,6 +114,10 @@ pub enum Source {
     LiveFed,
     /// An upstream read begun behind an earlier answer from the cache ([`Landed`]).
     Landed,
+    /// The cache, for a step back from a page it answered, its claims proving the step whole,
+    /// with the provider's step read behind it when it could correct anything. `#650
+    /// cache-first-older-reads` (`crate::ops`).
+    Older,
     /// The provider, read for this request.
     Upstream,
     /// The cache, after the provider failed the read or kept it waiting (`#611`).
@@ -125,6 +137,7 @@ impl Source {
             Self::CacheFirst => "cache-first",
             Self::LiveFed => "live-fed",
             Self::Landed => "landed",
+            Self::Older => "cache-older",
             Self::Upstream => "upstream",
             Self::StandIn => "stand-in",
             Self::Held => "held",

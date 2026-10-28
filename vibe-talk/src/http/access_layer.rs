@@ -26,6 +26,7 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
     let method = request.method().to_string();
     let path = request.uri().path().to_owned();
     let read_reason = ReadReason::of_query_string(request.uri().query());
+    let shape = access::ReadShape::of_query_string(request.uri().query());
     // Classified here and dropped immediately; the header value itself is never held, formatted,
     // or passed on.
     let credential = Credential::classify_request(
@@ -60,6 +61,7 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
         &path,
         credential,
         read_reason,
+        shape,
         served_from,
         response.status().as_u16(),
         started.elapsed().as_millis(),
