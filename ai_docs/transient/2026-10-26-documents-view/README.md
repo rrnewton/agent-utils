@@ -1,9 +1,10 @@
 # documents-view: a third major view for the documents agents link in chat (design)
 
 [muse watermelon] Final design, written 2026-10-26 and revised 2026-10-28 to the owner's
-decisions of 2026-10-28 (09:01–09:35 ET). Nothing here is implemented yet: no Documents page,
-no document index, no fetcher. The server side (`documents-index-server`) is authorised to
-start before the client; the client (`documents-view-client`) waits for
+decisions of 2026-10-28 (09:01–09:35 ET). Status at this revision: the server side
+(`#628 documents-index-server`) is implemented with the fold index, fetch APIs and list
+API; the Documents page is not built. The server side (`documents-index-server`) was
+authorised to start before the client; the client (`documents-view-client`) waits for
 `#624 voice-page-modularity`. `#544 documents-view-design`.
 
 ## The ask
@@ -174,7 +175,7 @@ Other facts that shape the design:
 
 The fold, B and C serve the same page API, so the backing can change without the page noticing:
 
-- `GET /api/v1/documents?before=&limit=&channel=` returns rows in mention order.
+- `GET /api/v1/documents?before_ms=&limit=&channel=&since_revision=` returns rows in mention order, or the delta since a fold revision.
 - `POST /api/v1/documents/fetch` fetches one document; `POST /api/v1/documents/fetch-recent`
   fetches the most recent 10–20 unfetched.
 - `GET /api/v1/documents/{key}` returns metadata, content when fetched, the outline, and mentions.
@@ -445,7 +446,7 @@ document(..., created_ms, created_by, modified_ms, modified_by, metadata_source,
   phone and the desk agree. It is the same record that holds the resume position.
 
 **Sort orders in the Documents view.** The **default is order of mention in chat (owner
-2026-10-28)**: the list is a feed, oldest mention first, newest at the bottom, and it starts
+2026-10-28)**: the list is a feed ordered by each document's latest mention, newest at the bottom, and it starts
 scrolled to the bottom like a message feed (unlike Claude/Muse artifact lists). A sort
 control beside the filters offers the alternatives:
 
@@ -880,9 +881,10 @@ reader crosses a section boundary.
     chat (`untrusted.rs`). A document saying "ignore your instructions" is a document, not an
     instruction.
 11. **Non-Markdown documents.** GitHub Pages sites (HTML), PDFs, Google Docs and code files. The MVP
-    lists only Markdown and plain text. A `.json` or source-file link stays a link. Google Docs can
-    export Markdown, but only with Google OAuth for the owner's account. One link in 12 days does
-    not justify that yet.
+    lists Markdown and other GitHub files (a `.json` row shows its source); in-document links
+    to code files still open on GitHub. Google Docs can export Markdown, but only with Google
+    OAuth for the owner's account. One link in 12 days does not justify that yet, so its kind
+    is reserved and not yet recognised.
 
 ## Phased plan
 
@@ -904,6 +906,8 @@ No page changes beyond what an API test needs.
 - **Fetch on demand:** one document, and "recent N" (the most recent 10–20 unfetched);
   a **bounded server document cache**; a **freshness-check API**; and the **list API**
   (mention order, fetched/unfetched state, metadata).
+- The detail API returns raw source plus a heading outline; server-rendered sanitized
+  HTML and the numbered section tree are added with the reader in Phase 1b.
 - Tests with a fake provider and fake GitHub, including a `..` escape attempt, a branch
   name with a slash, and a document link in a message over 16 KiB.
 

@@ -763,7 +763,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&elevenlabs),
         config.elevenlabs.clone(),
     );
-    let documents = vibe_talk::documents::service_from_config(&config.documents);
+    let documents = vibe_talk::documents::service_for(&config);
     let live_limit = config.chat.default_fetch_limit;
     // remote-ops-audit W5: at most one thread-naming read per channel per this many seconds.
     let thread_names = Arc::new(vibe_talk::summarize::threads::ThreadNames::with_interval(
@@ -871,6 +871,27 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => tracing::warn!(%error, "could not restore the send log's settled posts"),
     }
     state.refresh_routes();
+    // `#628 documents-index-server`. Rebuild the fold from the cache when it
+    // starts empty (a first run, or a fold file that could not be read):
+    // startup work on the blocking pool, never the read path.
+    if state.documents.index.is_empty() {
+        if let Some(cache) = state.message_cache.cache() {
+            let chans: Vec<vibe_talk::cache::ChanKey> = state
+                .all_channels()
+                .iter()
+                .filter_map(|c| state.message_cache.chan_key(&c.id))
+                .collect();
+            if !chans.is_empty() {
+                let index = Arc::clone(&state.documents.index);
+                tokio::task::spawn_blocking(move || {
+                    let folded = vibe_talk::documents::rebuild_from_cache(&index, &cache, &chans);
+                    if folded > 0 {
+                        tracing::info!(folded, "documents index rebuilt from the message cache");
+                    }
+                });
+            }
+        }
+    }
     // `#331 resume-on-websocket`. The first hello, in the background so a slow bridge never holds
     // the server's start; client-config asks again when this answer is old.
     if vibe_talk::voice_bridge::needed(&state.config) {

@@ -449,6 +449,19 @@ enabled = true
 # speech_hold_dbfs = -42
 # speech_hold_cap_seconds = 20
 
+[documents]
+# Linked documents (#628 documents-index-server): messages cached by this server are folded
+# into a document index (existence only; nothing is fetched until a reader asks). The fold
+# persists beside [storage] path as documents-index.json unless index_path names another
+# absolute path. Fetched copies live in a bounded in-memory cache.
+# github_token_file = "/run/secrets/github-documents-token"
+# github_raw_base = "https://raw.githubusercontent.com"
+# paste_url_prefixes = ["https://paste.example/"]
+# paste_command = ["paste-cli", "show", "--", "{}"]
+# max_cached_documents = 100
+# max_cached_bytes = 16777216
+# index_path = "/var/lib/vibe-talk/documents-index.json"
+
 [storage]
 # Durable state: the app's conversation transcript, how far you have read in each channel,
 # and the cached summaries below. No channel's messages are kept here: the optional message cache

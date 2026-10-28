@@ -123,7 +123,7 @@ fn inventory() -> Vec<Route> {
             Json(r#"{"limit":5}"#),
         ),
         route("GET", "/api/v1/documents/{key}", Read, Nothing),
-        route("GET", "/api/v1/documents/{key}/freshness", Read, Nothing),
+        route("GET", "/api/v1/documents/{key}/freshness", Write, Nothing),
         route("GET", "/api/v1/channels", Read, Nothing),
         route(
             "GET",

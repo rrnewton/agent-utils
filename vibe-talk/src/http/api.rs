@@ -4255,6 +4255,9 @@ pub async fn purge_storage(
         }
     }
     state.post_gate.forget_sends();
+    // `#628 documents-index-server`. The fold and its fetched copies go too.
+    state.documents.index.clear();
+    state.documents.clear_cache();
     // `#511 voice-explicit-send-only`. What the user said lately is part of that record too.
     state.send_intent.forget();
     // `#512 voice-recap-private-stack`. So is a recap waiting for the bridge's fetch.
@@ -7352,10 +7355,11 @@ pub async fn fetch_recent_documents(
 }
 
 /// `GET /api/v1/documents/{key}/freshness` — whether the source holds a newer
-/// version than the cached one. READ scope; best effort.
+/// version than the cached one. WRITE scope: checking spends the deployment's
+/// credentials (and may run the paste command), as fetching does. Best effort.
 pub async fn document_freshness(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    _scope: WriteScope,
     Path(key): Path<String>,
 ) -> Result<Response, ApiError> {
     if state.documents.index.get(&key).is_none() {

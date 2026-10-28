@@ -2111,13 +2111,20 @@ fn documents_config(file: FileDocuments) -> Result<DocumentsConfig, ConfigError>
         }
     };
     if !file.paste_command.is_empty() {
-        let joined = file.paste_command.join(" ");
-        let dashdash = joined.find("--");
-        let placeholder = joined.find("{}");
+        // A standalone `--` argument must precede the argument holding `{}`.
+        let placeholder = file.paste_command.iter().position(|arg| arg.contains("{}"));
+        let dashdash = file.paste_command.iter().position(|arg| arg == "--");
         if placeholder.is_none() || dashdash.is_none_or(|d| placeholder.is_some_and(|p| d > p)) {
             return Err(invalid(
                 "paste_command",
-                "must contain {} for the paste id with -- before it".to_owned(),
+                "must contain {} for the paste id with a standalone -- argument before it"
+                    .to_owned(),
+            ));
+        }
+        if file.paste_url_prefixes.is_empty() {
+            return Err(invalid(
+                "paste_command",
+                "names a fetcher but no paste_url_prefixes recognise any paste".to_owned(),
             ));
         }
     }

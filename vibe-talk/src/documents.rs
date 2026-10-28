@@ -262,22 +262,8 @@ pub fn recognize_url(
         ));
     }
     if host.eq_ignore_ascii_case("docs.google.com") {
-        if let [doc, d, id, ..] = segments.as_slice() {
-            if *doc == "document" && *d == "d" && valid_name(id) {
-                return Some(mk(
-                    DocKind::GoogleDoc,
-                    format!("gdoc:{id}"),
-                    Locator {
-                        url: address.to_owned(),
-                        owner: None,
-                        repo: None,
-                        ref_name: None,
-                        path: (*id).to_owned(),
-                    },
-                    (*id).to_owned(),
-                ));
-            }
-        }
+        // A reserved kind, not yet recognised: Google Docs joins the kind set
+        // when its fetcher does, so no permanently unfetchable rows appear.
         return None;
     }
     for prefix in paste_prefixes {
@@ -308,10 +294,37 @@ pub fn recognize_url(
     None
 }
 
+/// `text` with fenced and inline code removed: code is never a document link.
+fn without_code(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fenced = false;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if !fenced {
+            out.push_str(line);
+        }
+    }
+    let mut cleaned = String::with_capacity(out.len());
+    let mut inline = false;
+    for ch in out.chars() {
+        if ch == '`' {
+            inline = !inline;
+        } else if !inline {
+            cleaned.push(ch);
+        }
+    }
+    cleaned
+}
+
 /// Every document link in `text`: Markdown links, Slack `<url|label>` links and
 /// bare addresses, deduplicated by key (first label wins).
 #[must_use]
 pub fn recognize(text: &str, paste_prefixes: &[String]) -> Vec<Recognized> {
+    let owned = without_code(text);
+    let text = owned.as_str();
     let mut found: Vec<Recognized> = Vec::new();
     let push = |rec: Recognized, found: &mut Vec<Recognized>| {
         if let Some(old) = found.iter_mut().find(|r| r.key == rec.key) {
@@ -476,10 +489,12 @@ impl Index {
     #[must_use]
     pub fn changes_since(&self, revision: u64) -> (Vec<Entry>, Vec<String>, bool, u64) {
         let fold = self.fold.read().unwrap_or_else(|p| p.into_inner());
-        let truncated = fold
-            .changes
-            .front()
-            .is_some_and(|c| c.revision > revision + 1);
+        // A caller ahead of this fold (a restart lost it) must resync whole.
+        let truncated = revision > fold.revision
+            || fold
+                .changes
+                .front()
+                .is_some_and(|c| c.revision > revision + 1);
         let mut latest: HashMap<String, bool> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
         for change in fold.changes.iter().filter(|c| c.revision > revision) {
@@ -520,10 +535,25 @@ impl Index {
     }
 
     fn persist(&self, fold: &Fold) {
+        // Called only when a mutation changed the fold. Written beside the
+        // target and renamed over it, so a crash never leaves half a fold.
         if let Some(path) = &self.persist_path {
             if let Ok(text) = serde_json::to_string(fold) {
-                let _ = std::fs::write(path, text);
+                let tmp = path.with_extension("json.tmp");
+                if std::fs::write(&tmp, text).is_ok() {
+                    let _ = std::fs::rename(&tmp, path);
+                }
             }
+        }
+    }
+
+    /// Record that `key`'s fetched state changed (fetch, refresh, eviction):
+    /// a sync-visible change at a new revision, with the fold itself unchanged.
+    pub fn touch(&self, key: &str) {
+        let mut fold = self.fold.write().unwrap_or_else(|p| p.into_inner());
+        if fold.docs.contains_key(key) {
+            Self::bump(&mut fold, &[key.to_owned()]);
+            self.persist(&fold);
         }
     }
 
@@ -553,9 +583,6 @@ impl Index {
                 label: rec.label.clone(),
                 mentions: Vec::new(),
             });
-            if entry.label.is_none() {
-                entry.label = rec.label.clone();
-            }
             entry.mentions.push(Mention {
                 channel_id: channel_id.to_owned(),
                 message_id: message_id.to_owned(),
@@ -567,6 +594,7 @@ impl Index {
             entry
                 .mentions
                 .sort_by_key(|m| m.posted_ms.unwrap_or(i64::MIN));
+            entry.label = entry.mentions.iter().find_map(|m| m.label.clone());
         }
         if !keys.is_empty() {
             fold.by_message.insert(slot, keys.clone());
@@ -577,7 +605,9 @@ impl Index {
             }
         }
         Self::bump(&mut fold, &affected);
-        self.persist(&fold);
+        if !affected.is_empty() {
+            self.persist(&fold);
+        }
     }
 
     fn remove_slot(&self, fold: &mut Fold, slot: &str) {
@@ -587,6 +617,9 @@ impl Index {
                     entry
                         .mentions
                         .retain(|m| message_slot(&m.channel_id, &m.message_id) != slot);
+                    // The label names the row until fetch: it is the first
+                    // surviving mention's label, never a deleted one's.
+                    entry.label = entry.mentions.iter().find_map(|m| m.label.clone());
                     entry.mentions.is_empty()
                 });
                 if empty {
@@ -818,7 +851,7 @@ impl GithubFetcher {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
-        let response = request
+        let mut response = request
             .send()
             .await
             .map_err(|e| FetchError::Failed(e.to_string()))?;
@@ -833,17 +866,48 @@ impl GithubFetcher {
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let content = response
-            .text()
+        // Streamed with the cap enforced as it arrives, never buffered whole.
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| FetchError::Failed(e.to_string()))?;
-        if content.len() > MAX_DOCUMENT_BYTES {
-            return Err(FetchError::Failed("document over 1 MiB".to_owned()));
+            .map_err(|e| FetchError::Failed(e.to_string()))?
+        {
+            if bytes.len() + chunk.len() > MAX_DOCUMENT_BYTES {
+                return Err(FetchError::Failed("document over 1 MiB".to_owned()));
+            }
+            bytes.extend_from_slice(&chunk);
         }
+        let content = String::from_utf8_lossy(&bytes).into_owned();
         Ok(FetchedRaw {
             version: etag.or_else(|| Some(version_of(&content))),
             content,
         })
+    }
+
+    async fn etag(&self, entry: &Entry) -> Result<Option<String>, FetchError> {
+        let url = self.url(entry)?;
+        let mut request = self.client.get(&url).header("user-agent", "vibe-talk");
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| FetchError::Failed(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(FetchError::Failed(format!(
+                "GitHub answered {}",
+                response.status()
+            )));
+        }
+        // Headers only: the body is dropped unread, so a freshness check
+        // costs a round trip, not a download.
+        Ok(response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned))
     }
 }
 
@@ -857,7 +921,10 @@ impl Fetcher for GithubFetcher {
     }
 
     async fn current_version(&self, entry: &Entry) -> Result<Option<String>, FetchError> {
-        Ok(self.fetch(entry).await?.version)
+        match entry.kind {
+            DocKind::GithubMarkdown | DocKind::GithubFile => self.etag(entry).await,
+            kind => Err(FetchError::Unsupported(kind.as_str())),
+        }
     }
 }
 
@@ -888,25 +955,48 @@ impl Fetcher for PasteFetcher {
             .iter()
             .map(|a| a.replace("{}", &entry.locator.path))
             .collect();
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            tokio::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .output(),
-        )
-        .await
-        .map_err(|_| FetchError::Failed("paste command timed out".to_owned()))?
-        .map_err(|e| FetchError::Failed(e.to_string()))?;
-        if !output.status.success() {
+        // Stdout is read with the cap enforced as it arrives, never whole.
+        use tokio::io::AsyncReadExt as _;
+        let mut child = tokio::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| FetchError::Failed(e.to_string()))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| FetchError::Failed("paste command gave no stdout".to_owned()))?;
+        let mut bytes: Vec<u8> = Vec::new();
+        let reading = async {
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = stdout
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| FetchError::Failed(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                if bytes.len() + n > MAX_DOCUMENT_BYTES {
+                    return Err(FetchError::Failed("document over 1 MiB".to_owned()));
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            child
+                .wait()
+                .await
+                .map_err(|e| FetchError::Failed(e.to_string()))
+        };
+        let status = tokio::time::timeout(std::time::Duration::from_secs(15), reading)
+            .await
+            .map_err(|_| FetchError::Failed("paste command timed out".to_owned()))??;
+        if !status.success() {
             return Err(FetchError::Failed(format!(
-                "paste command answered {}",
-                output.status
+                "paste command answered {status}"
             )));
         }
-        if output.stdout.len() > MAX_DOCUMENT_BYTES {
-            return Err(FetchError::Failed("document over 1 MiB".to_owned()));
-        }
-        let content = String::from_utf8_lossy(&output.stdout).into_owned();
+        let content = String::from_utf8_lossy(&bytes).into_owned();
         let version = Some(version_of(&content));
         Ok(FetchedRaw { content, version })
     }
@@ -968,8 +1058,15 @@ struct CacheState {
 pub fn service_from_config(config: &crate::config::DocumentsConfig) -> Arc<Service> {
     let index = match &config.index_path {
         Some(path) => Arc::new(
-            Index::load(config.paste_url_prefixes.clone(), path.clone())
-                .unwrap_or_else(|_| Index::new(config.paste_url_prefixes.clone())),
+            match Index::load(config.paste_url_prefixes.clone(), path.clone()) {
+                Ok(index) => index,
+                Err(error) => {
+                    // A fold that cannot be read is rebuilt from the cache at
+                    // startup; say so rather than discard it silently.
+                    tracing::warn!(%error, "documents index not loaded; rebuilding from the message cache");
+                    Index::new(config.paste_url_prefixes.clone())
+                }
+            },
         ),
         None => Arc::new(Index::new(config.paste_url_prefixes.clone())),
     };
@@ -992,6 +1089,52 @@ pub fn service_from_config(config: &crate::config::DocumentsConfig) -> Arc<Servi
         config.max_cached_documents,
         config.max_cached_bytes,
     ))
+}
+
+/// The service for a whole server configuration: the fold persists beside
+/// the store unless `[documents] index_path` names another place.
+#[must_use]
+pub fn service_for(config: &crate::config::Config) -> Arc<Service> {
+    let mut documents = config.documents.clone();
+    if documents.index_path.is_none() {
+        documents.index_path = config
+            .storage
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.join("documents-index.json")));
+    }
+    service_from_config(&documents)
+}
+
+/// Rebuild the fold from what the message cache already holds, at startup:
+/// each listed channel's newest rows in both scopes, folded in. Startup work
+/// only; the read path never scans. Returns how many messages were folded.
+#[must_use]
+pub fn rebuild_from_cache(
+    index: &Index,
+    cache: &crate::cache::MessageCache,
+    chans: &[crate::cache::ChanKey],
+) -> usize {
+    let mut folded = 0;
+    for chan in chans {
+        for scope in [crate::cache::Scope::Main, crate::cache::Scope::Flat] {
+            if let crate::cache::Read::Served(rows) = cache.newest(chan, &scope, 5_000) {
+                for row in rows {
+                    let m = &row.message;
+                    index.apply_message(
+                        m.channel_id.as_str(),
+                        m.id.as_str(),
+                        Some(row.created_ms),
+                        &m.author,
+                        m.reply_thread(),
+                        &m.content,
+                    );
+                    folded += 1;
+                }
+            }
+        }
+    }
+    folded
 }
 
 /// The documents service: the fold index plus the bounded fetched cache.
@@ -1064,22 +1207,42 @@ impl Service {
     }
 
     fn put(&self, fetched: Fetched) {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(old) = cache.docs.remove(&fetched.key) {
-            cache.bytes = cache.bytes.saturating_sub(old.content.len());
-            cache.order.retain(|k| k != &fetched.key);
-        }
-        cache.bytes += fetched.content.len();
-        cache.order.push_back(fetched.key.clone());
-        cache.docs.insert(fetched.key.clone(), fetched);
-        while cache.docs.len() > cache.max_entries || cache.bytes > cache.max_bytes {
-            let Some(key) = cache.order.pop_front() else {
-                break;
-            };
+        let key = fetched.key.clone();
+        let mut evicted = Vec::new();
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(old) = cache.docs.remove(&key) {
                 cache.bytes = cache.bytes.saturating_sub(old.content.len());
+                cache.order.retain(|k| k != &key);
+            }
+            cache.bytes += fetched.content.len();
+            cache.order.push_back(key.clone());
+            cache.docs.insert(key.clone(), fetched);
+            while cache.docs.len() > cache.max_entries || cache.bytes > cache.max_bytes {
+                let Some(old_key) = cache.order.pop_front() else {
+                    break;
+                };
+                if let Some(old) = cache.docs.remove(&old_key) {
+                    cache.bytes = cache.bytes.saturating_sub(old.content.len());
+                    evicted.push(old_key);
+                }
             }
         }
+        // Fetched state is part of the synced record: say it changed.
+        self.index.touch(&key);
+        for old_key in evicted {
+            if old_key != key {
+                self.index.touch(&old_key);
+            }
+        }
+    }
+
+    /// Drop every fetched copy (a storage purge).
+    pub fn clear_cache(&self) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.docs.clear();
+        cache.order.clear();
+        cache.bytes = 0;
     }
 
     /// Fetch one document and cache it: the "sync this item" operation.
@@ -1090,6 +1253,11 @@ impl Service {
     ///
     /// [`FetchError`] when no fetcher serves its kind or the source fails.
     pub async fn fetch_one(&self, key: &str) -> Result<Fetched, FetchError> {
+        // Content never outlives its last mention: an unindexed key has no
+        // cached copy to return, whatever the cache still holds.
+        if self.index.get(key).is_none() {
+            return Err(FetchError::Failed(format!("unknown document {key}")));
+        }
         if let Some(cached) = self.cached(key) {
             return Ok(cached);
         }
@@ -1230,15 +1398,68 @@ mod tests {
     }
 
     #[test]
-    fn recognises_pastes_and_google_docs_as_kinds() {
+    fn recognises_pastes_and_reserves_google_docs() {
         let rec = recognize(
             "<https://paste.example/Ab12|a paste> https://docs.google.com/document/d/DocId123/edit",
             &prefixes(),
         );
-        assert_eq!(rec.len(), 2);
+        // Google Docs is a reserved kind with no fetcher yet: no row appears.
+        assert_eq!(rec.len(), 1);
         assert_eq!(rec[0].kind, DocKind::Paste);
         assert_eq!(rec[0].key, "paste:Ab12");
-        assert_eq!(rec[1].kind, DocKind::GoogleDoc);
+        assert_eq!(DocKind::GoogleDoc.as_str(), "google_doc");
+    }
+
+    #[test]
+    fn slash_branch_and_code_spans_and_long_messages() {
+        // The first segment after blob/ is the ref as written; a branch with a
+        // slash still keys and fetches as written (the fetcher reassembles it).
+        let rec = recognize_url(
+            "https://github.com/o/r/blob/feature/x/docs/a.md",
+            None,
+            &prefixes(),
+        )
+        .expect("recognised");
+        assert_eq!(rec.locator.ref_name.as_deref(), Some("feature"));
+        assert_eq!(rec.locator.path, "x/docs/a.md");
+        // Code never becomes a document.
+        assert!(
+            recognize(
+                "`https://github.com/o/r/blob/main/a.md`\n```\nhttps://github.com/o/r/blob/main/b.md\n```",
+                &prefixes()
+            )
+            .is_empty()
+        );
+        // A link past 16 KiB of prose is still recognised from the source text.
+        let mut text = "x".repeat(20_000);
+        text.push_str(" https://github.com/o/r/blob/main/big.md");
+        assert_eq!(recognize(&text, &prefixes()).len(), 1);
+    }
+
+    #[test]
+    fn fold_persists_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("documents-index-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("index.json");
+        let index = Index::load(prefixes(), path.clone()).expect("load");
+        index.apply_message(
+            "c",
+            "m1",
+            Some(1),
+            "a",
+            None,
+            "https://github.com/o/r/blob/main/a.md",
+        );
+        let reloaded = Index::load(prefixes(), path.clone()).expect("reload");
+        assert_eq!(reloaded.len(), 1);
+        assert!(reloaded.revision() >= 1);
+        let (changed, deleted, truncated, _) = reloaded.changes_since(0);
+        assert_eq!(changed.len(), 1);
+        assert!(deleted.is_empty() && !truncated);
+        // A caller ahead of the fold must resync whole.
+        let (_, _, truncated, _) = reloaded.changes_since(999);
+        assert!(truncated);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

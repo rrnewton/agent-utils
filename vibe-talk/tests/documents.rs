@@ -252,7 +252,10 @@ async fn fetch_recent_and_freshness_and_since_sync() {
     // A newer version at the source is reported, not swapped in.
     github.put(KEY, "# Real Title v2\n", "v2");
     let uri = format!("/api/v1/documents/{}/freshness", encoded(KEY));
-    let (status, body) = call(&app, "GET", &uri, Some(READ_TOKEN), None).await;
+    // Checking spends credentials, so a read token may not ask.
+    let (status, _) = call(&app, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = call(&app, "GET", &uri, Some(WRITE_TOKEN), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["update_available"], true);
     assert_eq!(body["version"], "v1");
@@ -349,6 +352,42 @@ async fn cache_fills_fold_the_index() {
             .is_none(),
         "a read-scope caller has no fill, so it can fold nothing in"
     );
+}
+
+#[tokio::test]
+async fn paste_documents_fetch_through_the_command_source() {
+    let index = Arc::new(Index::new(vec!["https://paste.example/".to_owned()]));
+    index.apply_message(
+        READ_CHANNEL,
+        "1000000000000000009",
+        Some(9),
+        "agent",
+        None,
+        "<https://paste.example/Ab12|notes>",
+    );
+    let service = Service::new(
+        index,
+        Arc::new(vibe_talk::documents::PasteFetcher::new(vec![
+            "/bin/echo".to_owned(),
+            "--".to_owned(),
+            "{}".to_owned(),
+        ])),
+        10,
+        1 << 20,
+    );
+    let fetched = service.fetch_one("paste:Ab12").await.expect("paste fetch");
+    assert!(fetched.content.contains("Ab12"), "{fetched:?}");
+    // Removing its last mention removes the document, and its content with it.
+    service
+        .index
+        .remove_message(READ_CHANNEL, "1000000000000000009");
+    assert!(service.index.get("paste:Ab12").is_none());
+    assert!(
+        service.fetch_one("paste:Ab12").await.is_err(),
+        "content never outlives its last mention"
+    );
+    service.index.remove_channel(READ_CHANNEL);
+    assert!(service.index.is_empty());
 }
 
 #[tokio::test]

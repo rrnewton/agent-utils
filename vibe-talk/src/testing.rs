@@ -365,7 +365,7 @@ fn state_pieces_with(
     // As `main` builds them: the message cache's handle first, attached to the hub before anything
     // can publish. `#208 persistent-cache`.
     let message_cache = Arc::new(crate::cache::Sink::off());
-    let documents = crate::documents::service_from_config(&config.documents);
+    let documents = crate::documents::service_for(&config);
     message_cache.set_documents(Arc::clone(&documents.index));
     let live = Arc::new(crate::live::LiveHub::new());
     live.attach_cache(Arc::clone(&message_cache));
