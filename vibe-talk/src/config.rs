@@ -1012,6 +1012,9 @@ pub struct SlackSettings {
     /// where a message's permalink lives, for the page's "Open in Slack" link. `#408
     /// copy-upstream-link`; see [`crate::slack::SlackConfig::workspace_url`].
     pub workspace_url: Option<String>,
+    /// The most requests of each Web API method sent a minute, where the operator set one. `#617
+    /// cold-load-first-paint`.
+    pub calls_per_minute: std::collections::BTreeMap<String, u32>,
 }
 
 /// How one provider is reached.
@@ -1554,6 +1557,8 @@ struct FileProvider {
     guild_id: Option<String>,
     // Slack providers only: the workspace's own address, for a message's permalink.
     workspace_url: Option<String>,
+    // Slack providers only: the most requests of each Web API method a minute.
+    calls_per_minute: Option<std::collections::BTreeMap<String, u32>>,
     coding_agent_user_ids: Option<Vec<String>>,
     request_timeout_seconds: Option<u64>,
     live_poll_seconds: Option<u64>,
@@ -3894,6 +3899,9 @@ fn provider_entry<'e>(
             if entry.workspace_url.is_some() {
                 return Err(refuse("workspace_url", "discord"));
             }
+            if entry.calls_per_minute.is_some() {
+                return Err(refuse("calls_per_minute", "discord"));
+            }
             ProviderKind::Discord(discord_protocol(
                 &format!("providers.{key}"),
                 name.clone(),
@@ -3992,6 +4000,23 @@ fn provider_entry<'e>(
                 "Slack keeps",
             ));
             validate_post_size(&format!("providers.{key}"), post_size, ceiling)?;
+            let calls_per_minute = entry.calls_per_minute.unwrap_or_default();
+            for (method, n) in &calls_per_minute {
+                if !method.contains('.') || method.chars().any(char::is_whitespace) {
+                    return Err(ConfigError::Invalid {
+                        field: field("calls_per_minute"),
+                        detail: format!(
+                            "{method:?} is not a Slack Web API method (conversations.history)"
+                        ),
+                    });
+                }
+                if !(1..=1000).contains(n) {
+                    return Err(ConfigError::Invalid {
+                        field: field("calls_per_minute"),
+                        detail: format!("{method} = {n}: choose 1 to 1000 requests a minute"),
+                    });
+                }
+            }
             ProviderKind::Slack(SlackSettings {
                 api_base,
                 token,
@@ -4007,6 +4032,7 @@ fn provider_entry<'e>(
                 max_post_chars: post_size.chars,
                 max_post_bytes: post_size.bytes,
                 workspace_url,
+                calls_per_minute,
             })
         }
         other => {
@@ -4276,6 +4302,53 @@ provider = "slack"
                     "live_poll_seconds = 15\nworkspace_url = \"acme.slack.com\"",
                 ),
                 "providers.slack.workspace_url",
+            ),
+        ] {
+            let refused = Config::from_toml_and_env(&bad, &env(&[])).expect_err("refused");
+            match refused {
+                ConfigError::Invalid { field: named, .. } => assert_eq!(named, field),
+                other => panic!("{other:?} is not the refusal of {field}"),
+            }
+        }
+    }
+
+    /// `#617 cold-load-first-paint`: a Slack provider's ceilings per method load, and a value out
+    /// of range, a name that is no method, or the key on a Discord-protocol provider is refused.
+    #[test]
+    fn a_slack_provider_s_calls_per_minute_load_and_bad_ones_are_refused() {
+        let text = MULTI.replace(
+            "live_poll_seconds = 15",
+            "live_poll_seconds = 15\ncalls_per_minute = { \"conversations.history\" = 12 }",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid");
+        let ProviderKind::Slack(slack) = &cfg.provider("slack").expect("slack").kind else {
+            panic!("slack is a Slack provider");
+        };
+        assert_eq!(
+            slack.calls_per_minute.get("conversations.history"),
+            Some(&12)
+        );
+        for (bad, field) in [
+            (
+                MULTI.replace(
+                    "live_poll_seconds = 15",
+                    "live_poll_seconds = 15\ncalls_per_minute = { \"conversations.history\" = 0 }",
+                ),
+                "providers.slack.calls_per_minute",
+            ),
+            (
+                MULTI.replace(
+                    "live_poll_seconds = 15",
+                    "live_poll_seconds = 15\ncalls_per_minute = { history = 10 }",
+                ),
+                "providers.slack.calls_per_minute",
+            ),
+            (
+                MULTI.replace(
+                    "thread_api = \"off\"",
+                    "thread_api = \"off\"\ncalls_per_minute = { \"conversations.history\" = 10 }",
+                ),
+                "providers.gchat.calls_per_minute",
             ),
         ] {
             let refused = Config::from_toml_and_env(&bad, &env(&[])).expect_err("refused");

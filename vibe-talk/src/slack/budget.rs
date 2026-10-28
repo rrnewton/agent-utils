@@ -76,6 +76,21 @@ impl Priority {
     }
 }
 
+impl Priority {
+    /// How many requests of a method with `ceiling` a minute may have been sent in the last minute,
+    /// by everyone, for a request at this priority to go: the whole ceiling for a person's request
+    /// and live work, three quarters for naming and summaries, half for crawl work. So what
+    /// keeps the page current always has room the rest cannot take.
+    #[must_use]
+    pub fn share(self, ceiling: usize) -> usize {
+        match self {
+            Self::Interactive | Self::Live => ceiling,
+            Self::Background => (ceiling * 3 / 4).max(1),
+            Self::Crawl => (ceiling / 2).max(1),
+        }
+    }
+}
+
 /// The requests sent per method in the last [`WINDOW`], by priority.
 #[derive(Debug, Default)]
 pub struct Sent {
@@ -121,6 +136,25 @@ impl Sent {
     pub fn admits(&mut self, method: &str, priority: Priority, now: Instant) -> bool {
         priority != Priority::Crawl
             || self.above(method, priority, CRAWL_YIELD_AT, now).0 < CRAWL_YIELD_AT
+    }
+
+    /// How long until a request of `method` at `priority` fits under `ceiling` requests a minute
+    /// ([`Priority::share`]): `None` when it fits now.
+    pub fn ceiling_wait(
+        &mut self,
+        method: &str,
+        priority: Priority,
+        ceiling: usize,
+        now: Instant,
+    ) -> Option<Duration> {
+        let share = priority.share(ceiling);
+        let sent = self.window(method, now);
+        if sent.len() < share {
+            return None;
+        }
+        // Once this one has left the window, `share - 1` remain.
+        let (leaving, _) = sent[sent.len() - share];
+        Some((leaving + WINDOW).saturating_duration_since(now)).filter(|wait| !wait.is_zero())
     }
 
     /// Count one request of `method` at `priority`, sent now.
@@ -290,6 +324,48 @@ mod tests {
         assert!(Priority::Interactive > Priority::Live);
         assert!(Priority::Live > Priority::Background);
         assert!(Priority::Background > Priority::Crawl);
+    }
+
+    #[test]
+    fn a_ceiling_keeps_room_for_a_person_and_live_work_over_naming_and_crawl() {
+        const METHOD: &str = "conversations.history";
+        let now = Instant::now();
+        let mut sent = Sent::default();
+        for _ in 0..10 {
+            sent.record(METHOD, Priority::Interactive, now);
+        }
+        // Half of twenty sent: crawl work waits, everyone else goes.
+        assert!(sent
+            .ceiling_wait(METHOD, Priority::Crawl, 20, now)
+            .is_some_and(|wait| wait <= WINDOW));
+        for priority in [Priority::Background, Priority::Live, Priority::Interactive] {
+            assert_eq!(
+                sent.ceiling_wait(METHOD, priority, 20, now),
+                None,
+                "{priority:?}"
+            );
+        }
+        for _ in 0..5 {
+            sent.record(METHOD, Priority::Live, now);
+        }
+        // Fifteen: naming waits too.
+        assert!(sent
+            .ceiling_wait(METHOD, Priority::Background, 20, now)
+            .is_some());
+        assert_eq!(sent.ceiling_wait(METHOD, Priority::Live, 20, now), None);
+        let later = now + Duration::from_secs(10);
+        for _ in 0..5 {
+            sent.record(METHOD, Priority::Interactive, later);
+        }
+        // Twenty: a person waits for the oldest to leave the minute, fifty seconds on.
+        assert_eq!(
+            sent.ceiling_wait(METHOD, Priority::Interactive, 20, later),
+            Some(Duration::from_secs(50))
+        );
+        assert_eq!(
+            sent.ceiling_wait(METHOD, Priority::Interactive, 20, now + WINDOW),
+            None
+        );
     }
 
     #[test]

@@ -184,6 +184,10 @@ live_poll_seconds = 0
 #                                # own auth.test answer is used when it reports one
 # max_post_bytes = 4000          # the most one post may hold, counted after & < > are escaped;
 #                                # Slack itself: 39,000 characters unless set, a bridge: 4,000 bytes
+# calls_per_minute = { "conversations.history" = 20, "conversations.replies" = 20 }
+#                                # the most requests of each method a minute, all readers together;
+#                                # unset, none. Leaves room for other clients of the same token
+#                                # (#617 cold-load-first-paint)
 
 [auth]
 # Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.

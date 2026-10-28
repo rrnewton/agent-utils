@@ -637,7 +637,10 @@ fn spawn_timeline_refresh(
     served: Vec<Message>,
     pending: PendingServe,
 ) {
-    drop(tokio::spawn(async move {
+    // `#617 cold-load-first-paint`: under the reason of the read it stands behind, which a spawned
+    // task does not inherit; it was counted as untagged.
+    let reason = crate::read_reason::ReadReason::current();
+    drop(tokio::spawn(reason.scope(async move {
         let _claim = claim;
         // The channel may have been taken off the list since it was served: then nothing is
         // read for it at all, as if the serve's request had never made one.
@@ -698,7 +701,7 @@ fn spawn_timeline_refresh(
             &page.messages,
             fetch_began,
         );
-    }));
+    })));
 }
 
 /// Refresh one served window upstream (`#384 cache-serve`): [`read_window`]'s own read,
@@ -712,7 +715,10 @@ fn spawn_window_refresh(
     claim: RefreshClaim,
     pending: PendingServe,
 ) {
-    drop(tokio::spawn(async move {
+    // `#617 cold-load-first-paint`: under the reason of the read it stands behind, which a spawned
+    // task does not inherit; it was counted as untagged.
+    let reason = crate::read_reason::ReadReason::current();
+    drop(tokio::spawn(reason.scope(async move {
         let _claim = claim;
         if allowed(&state, channel.as_str()).await.is_err() {
             return;
@@ -750,7 +756,7 @@ fn spawn_window_refresh(
         state
             .read_ahead
             .remember(&channel, None, &messages, fetch_began);
-    }));
+    })));
 }
 
 /// [`messages_for`]. With `look_further`, a read for one message ([`Wants::Message`]) that the
@@ -1654,6 +1660,28 @@ pub fn stand_in_after(config: &crate::config::Config) -> std::time::Duration {
     ))
 }
 
+/// How long a page's read on entering a view (`reason=enter`, a newest page) waits on upstream
+/// before the cache stands in for it, when that is shorter than [`stand_in_after`]. `#617
+/// cold-load-first-paint`: on a cold load of Slack's All, which the cache never serves at once, the
+/// owner watched "Loading messages…" for the whole fallback while the cache held the page.
+pub const FIRST_PAINT_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// How long `request` waits on upstream before the cache stands in for it: [`FIRST_PAINT_WAIT`]
+/// for a page entering a view, [`stand_in_after`] for every other read.
+fn stand_in_wait(
+    state: &AppState,
+    request: &crate::threads::TimelineRequest,
+) -> std::time::Duration {
+    let wait = stand_in_after(&state.config);
+    if request.after.is_none()
+        && crate::read_reason::ReadReason::current() == crate::read_reason::ReadReason::Enter
+    {
+        wait.min(FIRST_PAINT_WAIT)
+    } else {
+        wait
+    }
+}
+
 /// One upstream timeline read, with what it offers the cache and compares when it lands: owned,
 /// so that it can run on a task of its own and outlive the request that began it.
 struct UpstreamTimeline {
@@ -1732,15 +1760,15 @@ struct StoodIn {
     why: Option<&'static str>,
 }
 
-/// How long a live-fed channel's thread list is answered from the cache after an upstream read of
-/// it answered ([`live_fed_answer`]). `#614 timeline-read-failures`.
+/// How long after an upstream read of a live-fed channel's thread list answered the next is begun
+/// behind a side read ([`live_fed_answer`]). `#614 timeline-read-failures`.
 pub const LIVE_FED_UPSTREAM_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// The cache's answer to the right column's read of a live-fed channel's thread list
 /// (`reason=side`, newest or catch-up), while an upstream read of the list answered within
-/// [`LIVE_FED_UPSTREAM_EVERY`] (or one is running, and one answered within
-/// [`UPSTREAM_LIST_KEPT`]): `None` when the read should go upstream. `#614
-/// timeline-read-failures`.
+/// [`UPSTREAM_LIST_KEPT`]: `None` when the read should go upstream. Past
+/// [`LIVE_FED_UPSTREAM_EVERY`] it begins the next upstream read of the list behind the answer, one
+/// at a time, for the reads after it. `#614 timeline-read-failures`.
 ///
 /// The thread list scanned up to ten pages of Slack's history on every read, once a minute per tab
 /// and channel: most of what kept Slack's `conversations.history` limit spent, for what live
@@ -1748,6 +1776,10 @@ pub const LIVE_FED_UPSTREAM_EVERY: std::time::Duration = std::time::Duration::fr
 /// happen; so in between upstream reads the list is the latest upstream list brought up to date
 /// from the cache ([`held_for`]), with that list's own way back and notice. Never a failure
 /// (`refresh_failed` is absent). "Older threads…" (`reason=threads`) still reads upstream.
+///
+/// `#617 cold-load-first-paint`: every fifth minute the side read itself went upstream and, the
+/// scan taking longer than [`stand_in_after`], was answered by the stand-in after exactly that
+/// long: all fifteen reads slower than ten seconds in the half hour after `#614` was deployed.
 async fn live_fed_answer(
     state: &AppState,
     caller: crate::auth::Scope,
@@ -1764,22 +1796,61 @@ async fn live_fed_answer(
         return None;
     }
     let key = RefreshKey::view(channel.clone(), request.view, None);
-    let lately = state
+    state
+        .message_cache
+        .upstream_read_within(&key, UPSTREAM_LIST_KEPT)?;
+    let held = held_for(state, channel, request).await?;
+    if state
         .message_cache
         .upstream_read_within(&key, LIVE_FED_UPSTREAM_EVERY)
-        .is_some();
-    let running = state
-        .message_cache
-        .refresh_running(&flight_key(channel, request))
-        && state
-            .message_cache
-            .upstream_read_within(&key, UPSTREAM_LIST_KEPT)
-            .is_some();
-    if !lately && !running {
-        return None;
+        .is_none()
+    {
+        spawn_thread_list_refresh(state, caller, channel, request);
     }
-    let held = held_for(state, channel, request).await?;
     Some(StoodIn { held, why: None })
+}
+
+/// Read `request`'s thread list upstream, newest, on a task of its own, unless a read of it is
+/// already running: offered to the cache and remembered for [`held_for`] as any upstream list is.
+/// Under the request's reason, giving up at the first rate limit. `#617 cold-load-first-paint`.
+fn spawn_thread_list_refresh(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+) {
+    let newest = crate::threads::TimelineRequest {
+        after: None,
+        before: None,
+        ..request.clone()
+    };
+    let Some(claim) = state
+        .message_cache
+        .claim_refresh(flight_key(channel, &newest))
+    else {
+        return;
+    };
+    let reason = crate::read_reason::ReadReason::current();
+    // Begun before the read, as every fill is.
+    let fill = state.message_cache.begin_for(caller, channel);
+    let (state, channel) = (state.clone(), channel.clone());
+    drop(tokio::spawn(reason.scope(crate::read_reason::hurry(
+        true,
+        async move {
+            let _claim = claim;
+            let began_ms = state
+                .message_cache
+                .cache()
+                .map_or_else(crate::store::now_ms, |cache| cache.now_ms());
+            let Ok(page) = state.chat.fetch_timeline(&channel, &newest).await else {
+                return;
+            };
+            if let Some(fill) = fill {
+                fill.offer_timeline(&newest, crate::cache::observe::TimelineRead::Newest, &page);
+            }
+            note_upstream_read(&state.message_cache, &channel, &newest, &page, began_ms);
+        },
+    ))));
 }
 
 /// What the cache would answer `request` with in upstream's place
@@ -1901,7 +1972,7 @@ async fn read_or_stand_in(
     request: &crate::threads::TimelineRequest,
     read: UpstreamTimeline,
 ) -> Result<Answered, OpError> {
-    let deadline = tokio::time::Instant::now() + stand_in_after(&state.config);
+    let deadline = tokio::time::Instant::now() + stand_in_wait(state, request);
     // One read upstream of a view at a time, whoever asks (single-flight): a read that finds one
     // already under way waits for it to end, within the same wait, and is answered from the cache
     // if it has not. Under a provider that is rate-limiting or slow, the page's polls, other tabs

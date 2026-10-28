@@ -17,8 +17,9 @@
 //! A stream that says it lost records asks for its channels' relist at once
 //! ([`crate::live::LiveHub::request_relist`]).
 //!
-//! What it costs: one newest-page read per channel per interval, plus one per recently active
-//! thread, one channel at a time. A read that fails is left for the next pass.
+//! What it costs: one newest-page read per watched channel per interval (of [`RELIST_LIMIT`]
+//! rows; a channel nobody watches every [`RELIST_UNWATCHED_EVERY`]th interval), plus one per
+//! recently active thread, one channel at a time. A read that fails is left for the next pass.
 //!
 //! # The backfill
 //!
@@ -49,6 +50,16 @@ pub const RELIST_WAKE: Duration = Duration::from_secs(1);
 /// the read to count as a deletion: a provider, or a bridge in front of it, may take a moment to
 /// list a message it has just accepted.
 pub const RELIST_SETTLE: Duration = Duration::from_secs(30);
+
+/// The most rows a relist read asks for (`#617 cold-load-first-paint`): one page of a bridge that
+/// answers twenty rows a call, the row past the page that says whether there is more included.
+/// The edits and deletions the relist exists for are of the newest messages; a page of fifty, three
+/// calls through such a bridge, made the relist the largest spender of Slack's history allowance.
+pub const RELIST_LIMIT: u16 = 19;
+/// A channel nobody is watching (no live stream open on it, [`crate::live::LiveHub::is_watched`])
+/// is relisted on every this many passes, not every pass: its edits reach a reader at the next read
+/// of it anyway. `#617 cold-load-first-paint`.
+pub const RELIST_UNWATCHED_EVERY: u32 = 10;
 
 /// How a relist reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,19 +242,30 @@ pub async fn relist_once(
 /// Relist every channel a provider's stream feeds every `interval`, and any channel asked for
 /// early as soon as it is asked for. Never returns; spawned by `main` when `[ingest]
 /// relist_seconds` is set.
+///
+/// Each read asks for at most [`RELIST_LIMIT`] rows, and a channel nobody is watching is relisted on
+/// every [`RELIST_UNWATCHED_EVERY`]th pass only. `#617 cold-load-first-paint`.
 pub async fn relist_forever(state: AppState, interval: Duration, limit: u16, threads: usize) {
     let options = RelistOptions {
-        limit,
+        limit: limit.min(RELIST_LIMIT),
         threads,
         interval,
         settle: RELIST_SETTLE,
     };
     let mut next = tokio::time::Instant::now() + interval;
+    let mut passes: u32 = 0;
     loop {
         let wanted = state.live.take_relist_requests();
         let now_ms = jiff::Timestamp::now().as_millisecond();
         if tokio::time::Instant::now() >= next {
-            relist_once(&state, None, options, now_ms).await;
+            let every = passes % RELIST_UNWATCHED_EVERY == 0;
+            passes = passes.wrapping_add(1);
+            let watched: BTreeSet<ChannelId> = relisted_channels(&state)
+                .into_iter()
+                .map(|channel| channel.id)
+                .filter(|channel| state.live.is_watched(channel))
+                .collect();
+            relist_once(&state, (!every).then_some(&watched), options, now_ms).await;
             next = tokio::time::Instant::now() + interval;
         } else if !wanted.is_empty() {
             relist_once(&state, Some(&wanted), options, now_ms).await;
