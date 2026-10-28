@@ -241,8 +241,10 @@ pub struct SearchText {
 impl SearchText {
     /// The label of the rules this indexes by, under the soft single-newline rule; the hard rule
     /// indexes under it with `+hard` after it. `render-2`: single newlines soft, `•` lines items,
-    /// glued tables repaired (`markdown-tables-render`).
-    pub const VERSION: &'static str = "render-2";
+    /// glued tables repaired (`markdown-tables-render`). `render-3`: a line end at each block's
+    /// edge and each `<br>`, and only web links' addresses, as the page reads a body (`#604
+    /// server-side-search`).
+    pub const VERSION: &'static str = "render-3";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -303,12 +305,32 @@ impl crate::cache::SearchTextSource for SearchText {
     }
 }
 
-/// The text content of sanitized HTML, as a browser reads it, and the address of every link in
-/// it.
+/// The elements whose edges are line ends when a body is read as text: the page's `TEXT_BLOCKS`
+/// (`renderedText` in `web/voice.js`), so that two blocks with nothing between them in the HTML
+/// are two words to the server as they are to the page. `#604 server-side-search`.
+const TEXT_BLOCKS: &[&str] = &[
+    "blockquote",
+    "div",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "hr",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "table",
+    "tr",
+    "ul",
+];
+
+/// The text content of sanitized HTML, read as the page reads a drawn body (`renderedText`): every
+/// text node, entities decoded, a line end at each edge of a block element and at each `<br>`;
+/// and the address of every web link in it, as the page's `anchorsIn` lists them.
 ///
 /// Only for what [`SANITIZER`] wrote: well-formed tags, attribute values in double quotes, and
-/// text whose only markup characters are entities. A tag adds nothing to the text, because the
-/// HTML puts a newline after every block element itself.
+/// text whose only markup characters are entities.
 fn text_content(html: &str) -> crate::cache::Rendered {
     let mut text = String::with_capacity(html.len());
     let mut hrefs = Vec::new();
@@ -331,13 +353,68 @@ fn text_content(html: &str) -> crate::cache::Rendered {
             rest = "";
             break;
         };
-        if let Some(href) = anchor_href(&tag[..close]) {
-            hrefs.push(href);
+        let inside = &tag[..close];
+        if let Some(href) = anchor_href(inside) {
+            // Only a web address is a link the page lists (`HTTP_ADDRESS`).
+            let lower = href.to_ascii_lowercase();
+            if lower.starts_with("http://") || lower.starts_with("https://") {
+                hrefs.push(href);
+            }
+        }
+        let name = inside
+            .trim_start_matches('/')
+            .split(|c: char| c.is_ascii_whitespace() || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name == "br" || TEXT_BLOCKS.contains(&name.as_str()) {
+            text.push('\n');
         }
         rest = &tag[close + 1..];
     }
     push_decoded(&mut text, rest);
-    crate::cache::Rendered { text, hrefs }
+    crate::cache::Rendered {
+        text: page_lines(&text),
+        hrefs,
+    }
+}
+
+/// `renderedText`'s last step: spaces and tabs before a line end, and every white space after it,
+/// become that one line end, and the whole is trimmed.
+fn page_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ' ' || c == '\t' || c == '\n' {
+            // A run of spaces and tabs, perhaps ending in a line end.
+            let mut run = String::from(c);
+            let mut newline = c == '\n';
+            while !newline {
+                match chars.peek() {
+                    Some(&next @ (' ' | '\t')) => {
+                        run.push(next);
+                        chars.next();
+                    }
+                    Some('\n') => {
+                        chars.next();
+                        newline = true;
+                    }
+                    _ => break,
+                }
+            }
+            if newline {
+                while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                    chars.next();
+                }
+                out.push('\n');
+            } else {
+                out.push_str(&run);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().to_owned()
 }
 
 /// The decoded `href` of an opening `<a …>` tag, given what lies between its angle brackets.
@@ -4754,7 +4831,7 @@ mod search_text_tests {
         let body = format!("Fixed **wid**gets in {pull} and [the notes](https://example.test/notes?a=1&b=2) _today_");
         let drawn = SearchText::drawn(&body, Markup::Discord, false);
         assert_eq!(
-            drawn.text, "Fixed widgets in widgets#12 and the notes today\n",
+            drawn.text, "Fixed widgets in widgets#12 and the notes today",
             "{drawn:?}"
         );
         assert_eq!(
@@ -4762,17 +4839,21 @@ mod search_text_tests {
             [pull, "https://example.test/notes?a=1&b=2"],
             "addresses are decoded, in order"
         );
-        let text = build("Ada", &body, &drawn);
+        let text = build("Ada", &drawn);
         for needle in [
+            "ada",
             "widgets",
             "widgets#12",
             "the notes today",
             pull,
             "https://example.test/notes?a=1&b=2",
-            "**wid**gets",
         ] {
             assert!(text.contains(needle), "{needle:?} missing from {text:?}");
         }
+        assert!(
+            !text.contains("**"),
+            "the Markdown source is not what the page searches"
+        );
     }
 
     #[test]
@@ -4782,12 +4863,12 @@ mod search_text_tests {
         let key = &config.providers[0].key;
         let mut message = crate::cache::fixtures::message("1", "u", "a *b* <&> c", 5);
         let discord = source.rendered(key, &message);
-        assert_eq!(discord.text, "a b <&> c\n");
+        assert_eq!(discord.text, "a b <&> c");
         assert!(discord.hrefs.is_empty());
         assert_eq!(
             SearchText::drawn("a *b* c <https://x.test/|label>", Markup::Slack, false),
             crate::cache::Rendered {
-                text: "a b c label\n".to_owned(),
+                text: "a b c label".to_owned(),
                 hrefs: vec!["https://x.test/".to_owned()],
             }
         );
@@ -4800,6 +4881,18 @@ mod search_text_tests {
             "just words"
         );
         assert_eq!(source.version(), SearchText::VERSION);
+    }
+
+    #[test]
+    fn blocks_and_breaks_are_line_ends_and_only_web_links_are_listed_as_the_page_reads_them() {
+        // `#604 server-side-search`: the page's `renderedText` and `anchorsIn`.
+        let read = super::text_content(
+            "<ul><li>one</li><li>two</li></ul><p>three<br>four</p>\
+             <p><a href=\"mailto:a@b.test\">mail</a> <a href=\"https://x.test/a?b=1&amp;c=2\">x</a></p>",
+        );
+        assert_eq!(read.text, "one\ntwo\nthree\nfour\nmail x");
+        assert_eq!(read.hrefs, ["https://x.test/a?b=1&c=2"]);
+        assert_eq!(super::page_lines("  a \t\n \n b  "), "a\nb");
     }
 
     /// Bodies of every shape the renderer treats differently, in every markup.
@@ -4835,6 +4928,10 @@ mod search_text_tests {
         (
             "render-2",
             "30ddda09e4cbb6fdbe5b174699e7015aebc3474454a1871f1db9f5be4189eb34",
+        ),
+        (
+            "render-3",
+            "14cbd7449b2eb88272ed7283375d0846bfbe7e06075c5f9c5447c940c74b29e0",
         ),
     ];
 

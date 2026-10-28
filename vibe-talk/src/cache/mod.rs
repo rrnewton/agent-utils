@@ -2306,21 +2306,61 @@ impl MessageCache {
             .cutoff_ms(&chan.channel_id, self.now_ms());
         let scope_key = request.view.horizon_scope().key();
         let memory_dropped_ms = self.last_drop_ms(chan);
+        // `#604 server-side-search`: the index drives only while every row's text is folded as the
+        // query is, and only for terms every match must hold that are rare in the channel.
+        let required = if self.search_text_current() && !request.query.is_empty() {
+            search::required_terms(request.query)
+        } else {
+            Vec::new()
+        };
         self.read_scope(chan, &scope_key, |connection| {
             let snapshot = connection.unchecked_transaction()?;
-            let (rows, more) = reader::search_rows(
-                &snapshot,
-                chan,
-                request.view.scope_sql(),
-                request.below_ms,
-                request.budget,
-            )?;
+            let indexed = match reader::chan_id(&snapshot, chan)? {
+                Some(id) if !required.is_empty() => {
+                    search::choose(&snapshot, id, &required)? == search::Path::Index
+                }
+                _ => false,
+            };
+            let (rows, more) = if indexed {
+                let patterns: Vec<String> = required
+                    .iter()
+                    .map(|term| search::like_pattern(term))
+                    .collect();
+                reader::search_candidates(
+                    &snapshot,
+                    chan,
+                    request.view.scope_sql(),
+                    request.below_ms,
+                    &patterns,
+                    request.budget,
+                )?
+            } else {
+                reader::search_rows(
+                    &snapshot,
+                    chan,
+                    request.view.scope_sql(),
+                    request.below_ms,
+                    request.budget,
+                )?
+            };
             let intervals = reader::coverage(&snapshot, chan, &scope_key)?;
             let head = reader::head(&snapshot, chan, &scope_key)?;
             let dropped_ms = reader::dropped_ms(&snapshot, chan)?.max(memory_dropped_ms);
-            snapshot.finish()?;
             let mut outcome = search::test_rows(rows, more, request);
+            if indexed {
+                // The index offered no row whose term lies past the cap, so the rows it may have
+                // missed one in are counted over the whole stretch searched, not only those tested.
+                outcome.capped = reader::capped_rows(
+                    &snapshot,
+                    chan,
+                    request.view.scope_sql(),
+                    outcome.resume_below_ms.unwrap_or(i64::MIN),
+                    request.below_ms,
+                )?;
+            }
+            snapshot.finish()?;
             outcome.horizon = coverage::horizon(&intervals, head.as_ref(), cutoff_ms);
+            outcome.indexed = indexed;
             Ok((outcome, dropped_ms))
         })
         .map(|(mut outcome, dropped_ms)| {
@@ -2599,7 +2639,7 @@ fn open_inner(path: &Path, shared: &Arc<Shared>) -> Result<Inner, CacheError> {
         file::restrict(member);
     }
     let current = writer::search_text_version(&connection)
-        .is_some_and(|version| version == shared.search_text.version());
+        .is_some_and(|version| version == search_text::stored_version(shared.search_text.as_ref()));
     shared.search_text_current.store(current, Ordering::SeqCst);
     let readers = reader::Readers::open(path)?;
     let (tx, rx) = mpsc::channel::<Envelope>();

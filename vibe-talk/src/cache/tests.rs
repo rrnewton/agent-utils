@@ -1949,6 +1949,20 @@ fn search_text_is_rebuilt_when_the_rendering_rules_change() {
         ),
     );
     assert_eq!(labelled, 1_200);
+    // `#604 server-side-search`: a rebuild that rewrote rows ends by building the index afresh,
+    // and says so by clearing its note; the index then holds each row's new text once.
+    assert_eq!(
+        sql_count(
+            &cache,
+            "SELECT COUNT(*) FROM meta WHERE key = 'search_text_rebuild_changed'"
+        ),
+        0
+    );
+    let unique = sql_count(
+        &cache,
+        "SELECT COUNT(*) FROM message_fts WHERE search_text LIKE '%widgets#123%'",
+    );
+    assert_eq!(unique, 1_200);
     drop(dir);
 }
 
@@ -3231,6 +3245,103 @@ fn a_cache_search_matches_with_the_shared_language_and_says_how_far_back_it_look
     let empty = search("  ", SearchView::Main, 10, 100);
     assert!(empty.hits.is_empty());
     assert_eq!(empty.searched_back_to_ms(i64::MAX), None);
+}
+
+#[test]
+fn a_cache_search_takes_rare_terms_from_the_index_once_every_text_is_folded() {
+    // `#604 server-side-search`: the folded column and the LIKE path over the trigram index.
+    use super::search::{SearchRequest, SearchView};
+    let fx = Fixture::new("cache-search-index");
+    let first = T0 + 400 * STEP;
+    fx.clock.set(first);
+    let mut rows: Vec<Message> = (1..=300).map(m).collect();
+    rows[10].content = "Meet the ZEBRAcrossing at the Café".to_owned();
+    rows[200].content = "zebracrossing again".to_owned();
+    rows[50].content = "Η ΟΔΟΣ of the kingfisher, see C:\\path\\to\\nest".to_owned();
+    // Longer than the column keeps: "quokka" lies past the cap.
+    rows[120].content = format!("{} quokka", "filler ".repeat(1_400));
+    fx.list(rows, first, Some(newest_proof(ListStart::At(T0 + STEP))));
+    let day = |d: crate::search_query::Day| d.start_ms_at_offset(0);
+    let search = |query: &str| {
+        let query = crate::search_query::parse(query);
+        let request = SearchRequest {
+            query: &query,
+            view: SearchView::Main,
+            below_ms: i64::MAX,
+            limit: 50,
+            budget: 1_000,
+            day_start_ms: &day,
+        };
+        fx.cache
+            .search(&fx.chan, &request)
+            .served()
+            .expect("served")
+    };
+    let hit_ids = |hits: &[CachedMessage]| -> Vec<String> {
+        hits.iter().map(|h| h.message.id.0.clone()).collect()
+    };
+    fx.cache.maintain(Maintenance::RebuildSearchText);
+    assert!(fx.cache.quiesce_blocking(Duration::from_secs(30)));
+    assert!(fx.cache.search_text_current());
+    let folded = sql_count(
+        &fx.cache,
+        "SELECT COUNT(*) FROM message WHERE search_text = 'ada meet the zebracrossing at the cafe'",
+    );
+    assert_eq!(
+        folded, 1,
+        "the column is the folded haystack, raw content left out"
+    );
+
+    // Rare terms: the index offers the candidates, and only those are tested.
+    let rare = search("ZEBRACROSSING");
+    assert!(rare.indexed);
+    assert_eq!(hit_ids(&rare.hits), ids(&["m201", "m11"]));
+    assert_eq!((rare.examined, rare.resume_below_ms), (2, None));
+    assert_eq!(
+        rare.searched_back_to_ms(i64::MAX),
+        Some(T0 + STEP),
+        "every row vouched for"
+    );
+    let both = search("cafe zebra -again");
+    assert!(both.indexed, "a word and a minus: the word drives");
+    assert_eq!(hit_ids(&both.hits), ids(&["m11"]));
+
+    // What the index cannot drive scans, with the same answers.
+    let common = search("body");
+    assert!(!common.indexed, "a term in most rows");
+    assert_eq!(
+        (common.hits.len(), common.examined),
+        (50, 50),
+        "stopped at its limit"
+    );
+    let short = search("ca zebracrossing");
+    assert!(short.indexed, "the short term is left to the match");
+    assert_eq!(hit_ids(&short.hits), ids(&["m11"]));
+    let either = search("zebracrossing OR nothinglikeit");
+    assert!(!either.indexed, "no term every match must hold");
+    assert_eq!(hit_ids(&either.hits), ids(&["m201", "m11"]));
+    let wild = search("zebra%");
+    assert!(!wild.indexed, "a LIKE wildcard in the term");
+    assert!(wild.hits.is_empty());
+
+    // Greek with its final sigma, a phrase with a space, a backslash, several terms at once.
+    for query in [
+        "οδος",
+        "\"the kingfisher\"",
+        "path\\to",
+        "kingfisher οδοσ \"c:\\path\"",
+    ] {
+        let found = search(query);
+        assert!(found.indexed, "{query}: not driven by the index");
+        assert_eq!(hit_ids(&found.hits), ids(&["m51"]), "{query}");
+    }
+    // A term past the cap is found by neither path, and the index path says a row may hide one.
+    let capped = search("quokka");
+    assert!(capped.indexed && capped.hits.is_empty());
+    assert_eq!(
+        capped.capped, 1,
+        "the capped row in the stretch is counted, though never tested"
+    );
 }
 
 #[test]

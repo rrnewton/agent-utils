@@ -80,7 +80,7 @@ impl Readers {
 }
 
 /// The interned id of a channel, if it has one.
-fn chan_id(connection: &Connection, chan: &ChanKey) -> rusqlite::Result<Option<i64>> {
+pub(crate) fn chan_id(connection: &Connection, chan: &ChanKey) -> rusqlite::Result<Option<i64>> {
     Ok(chan_row(connection, chan)?.map(|(id, _)| id))
 }
 
@@ -379,6 +379,95 @@ pub(crate) fn search_rows(
     rows.extend(select("m.created_ms = ?2", i64::MAX, last_ms)?);
     let more = !select("m.created_ms < ?2", 1, last_ms)?.is_empty();
     Ok((rows, more))
+}
+
+/// [`search_rows`] driven by the full-text index (`#604 server-side-search`): only the rows whose
+/// folded `search_text` holds every one of `patterns` (`LIKE`, which the trigram index answers
+/// without positions), newest first, `budget` of them and the rest of the last one's millisecond;
+/// and whether older such rows remain. Every row a query whose required terms are these patterns
+/// could match is among them, so a continuation below the last skips nothing.
+pub(crate) fn search_candidates(
+    connection: &Connection,
+    chan: &ChanKey,
+    scope_sql: &str,
+    below_ms: i64,
+    patterns: &[String],
+    budget: usize,
+) -> rusqlite::Result<(Vec<SearchRow>, bool)> {
+    let Some(chan_id) = chan_id(connection, chan)? else {
+        return Ok((Vec::new(), false));
+    };
+    let likes = (0..patterns.len())
+        .map(|n| format!("search_text LIKE ?{}", n + 4))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let select = |condition: &str, limit: i64, upper_ms: i64| -> rusqlite::Result<Vec<SearchRow>> {
+        let mut statement = connection.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS}, m.search_text, m.thread_id IS NOT NULL AND m.is_root = 0
+             FROM (SELECT rowid AS r FROM message_fts WHERE {likes}) AS f
+             CROSS JOIN message AS m ON m.row_id = f.r
+             WHERE m.chan = ?1 AND {condition}
+               AND EXISTS (SELECT 1 FROM message_scope s
+                           WHERE s.row_id = m.row_id AND s.chan = ?1 AND ({scope_sql}))
+             ORDER BY m.created_ms DESC, m.numeric_id DESC, m.message_id DESC LIMIT ?3"
+        ))?;
+        let mut values: Vec<rusqlite::types::Value> =
+            vec![chan_id.into(), upper_ms.into(), limit.into()];
+        values.extend(
+            patterns
+                .iter()
+                .map(|p| rusqlite::types::Value::from(p.clone())),
+        );
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok(SearchRow {
+                    message: cached(&chan.channel_id, row)?,
+                    search_text: row.get(10)?,
+                    in_thread: row.get(11)?,
+                })
+            })?
+            .collect();
+        rows
+    };
+    let limit = i64::try_from(budget).unwrap_or(i64::MAX);
+    let mut rows = select("m.created_ms < ?2", limit, below_ms)?;
+    let Some(last_ms) = rows.last().map(|r| r.message.created_ms) else {
+        let more = budget == 0 && !select("m.created_ms < ?2", 1, below_ms)?.is_empty();
+        return Ok((rows, more));
+    };
+    rows.retain(|r| r.message.created_ms != last_ms);
+    rows.extend(select("m.created_ms = ?2", i64::MAX, last_ms)?);
+    let more = !select("m.created_ms < ?2", 1, last_ms)?.is_empty();
+    Ok((rows, more))
+}
+
+/// How many rows of `chan` in the scopes `scope_sql` selects, created in `[from_ms, below_ms)`,
+/// hold a `search_text` cut at its cap: the rows an index-driven search may have missed a term in,
+/// past the cap, without testing them (`#604 server-side-search`). The length of the column's
+/// bytes, which SQLite reads from the record without loading the text.
+pub(crate) fn capped_rows(
+    connection: &Connection,
+    chan: &ChanKey,
+    scope_sql: &str,
+    from_ms: i64,
+    below_ms: i64,
+) -> rusqlite::Result<usize> {
+    let Some(chan_id) = chan_id(connection, chan)? else {
+        return Ok(0);
+    };
+    let floor = i64::try_from(super::search_text::MAX_BYTES).unwrap_or(i64::MAX) - 4;
+    let count: i64 = connection.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM message m
+             WHERE m.chan = ?1 AND m.created_ms >= ?2 AND m.created_ms < ?3
+               AND length(CAST(m.search_text AS BLOB)) >= ?4
+               AND EXISTS (SELECT 1 FROM message_scope s
+                           WHERE s.row_id = m.row_id AND s.chan = ?1 AND ({scope_sql}))"
+        ),
+        params![chan_id, from_ms, below_ms, floor],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count).unwrap_or(0))
 }
 
 pub(crate) fn tombstoned(

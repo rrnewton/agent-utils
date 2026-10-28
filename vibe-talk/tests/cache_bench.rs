@@ -1034,3 +1034,156 @@ fn measure_layout_and_compression_options() {
         eprintln!("(set VIBE_TALK_LAYOUT_DIR to keep the files for the filesystem step)");
     }
 }
+
+// ---- `#604 server-side-search`: the folded search text, rebuilt on a live store ---------------
+
+/// The column as it was before `#604`: the raw content beside the drawn text, as the old rules
+/// indexed both. Built by today's rules from a rendering that holds both, so its size is the old
+/// column's, folded.
+struct OldShape;
+
+impl SearchTextSource for OldShape {
+    fn version(&self) -> String {
+        "old-shape".to_owned()
+    }
+
+    fn rendered(&self, provider_key: &str, message: &Message) -> Rendered {
+        let drawn = DrawnText.rendered(provider_key, message);
+        Rendered {
+            text: format!("{}\n{}", message.content, drawn.text),
+            hrefs: drawn.hrefs,
+        }
+    }
+}
+
+/// `#604 server-side-search`. What deploying the folded search text costs a live store: 20,000
+/// messages shaped like the live one's under the old column (raw content and drawn text), then the
+/// file reopened under the new rules, whose writer rebuilds every row's text in the background.
+/// Says the rebuild's wall time from the reopen, the bytes in use before and after, and the
+/// column's and the index's share.
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn measure_folded_search_text_rebuild() {
+    let rows_per_channel: u64 = 5_000;
+    let dir = vibe_talk::testing::TempDir::new("fold-rebuild");
+    let home = dir.path().join("cache");
+    std::fs::create_dir_all(&home).expect("cache dir");
+    std::fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("0700");
+    let path = home.join("fold.sqlite3");
+    let limits = Limits {
+        max_bytes: 8 * 1024 * 1024 * 1024,
+        ..Limits::default()
+    };
+    let keys: Vec<ChanKey> = (0..4).map(|c| ChanKey::new("p", format!("C{c}"))).collect();
+    {
+        let cache = reopen(&path, limits.clone(), Some(Arc::new(OldShape)));
+        cache.retain_only(routes(&keys));
+        let words = corpus();
+        let now = vibe_talk::cache::wall_ms();
+        for (c, chan) in keys.iter().enumerate() {
+            let mut i = 0;
+            while i < rows_per_channel {
+                let batch: Vec<Incoming> = (i..(i + 100).min(rows_per_channel))
+                    .map(|n| {
+                        let created =
+                            now - i64::try_from(rows_per_channel - n).unwrap_or(0) * 60_000;
+                        let id = n + u64::try_from(c).unwrap_or(0) * 1_000_000;
+                        let thread = (n % 3 == 0).then_some(n / 15);
+                        let scope = thread.map_or(Scope::Main, |t| Scope::Thread(format!("t{t}")));
+                        Incoming::new(
+                            layout_message(id, &chan.channel_id, &words, created, thread),
+                            scope,
+                        )
+                    })
+                    .collect();
+                let stamp = cache.stamp(chan);
+                cache.offer(
+                    chan.clone(),
+                    stamp,
+                    Observation::Listing(Listing {
+                        scope: Scope::Main,
+                        rows: batch,
+                        observed_ms: now,
+                        proof: None,
+                    }),
+                );
+                i += 100;
+                if i % 2_000 == 0 {
+                    assert!(cache.barrier_blocking(Duration::from_secs(120)));
+                }
+            }
+        }
+        assert!(cache.barrier_blocking(Duration::from_secs(600)));
+        cache.maintain(Maintenance::RebuildSearchText);
+        assert!(cache.quiesce_blocking(Duration::from_secs(600)));
+        assert!(cache.search_text_current());
+    }
+    let report = |when: &str| {
+        let c = reader(&path);
+        let (objects, total) = objects(&c);
+        let column: i64 = c
+            .query_row(
+                "SELECT SUM(LENGTH(CAST(search_text AS BLOB))) FROM message",
+                [],
+                |r| r.get(0),
+            )
+            .expect("column");
+        let index: i64 = objects
+            .iter()
+            .filter(|(name, _)| name.starts_with("message_fts"))
+            .map(|(_, bytes)| bytes)
+            .sum();
+        eprintln!(
+            "[load {}] [fold] {when}: {:.1} MB in use ({:.1} MB of pages), search_text {:.1} MB ({} B a message), \
+             index {:.1} MB",
+            load(),
+            mb(used_bytes(&path)),
+            mb(u64::try_from(total).unwrap_or(0)),
+            mb(u64::try_from(column).unwrap_or(0)),
+            column / 20_000,
+            mb(u64::try_from(index).unwrap_or(0)),
+        );
+    };
+    report("old column");
+    let reopened = Instant::now();
+    let cache = reopen(&path, limits, Some(Arc::new(DrawnText)));
+    cache.retain_only(routes(&keys));
+    let deadline = Instant::now() + Duration::from_secs(1_200);
+    while !cache.search_text_current() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let rebuilt = reopened.elapsed();
+    assert!(cache.search_text_current(), "the rebuild did not finish");
+    assert!(cache.quiesce_blocking(Duration::from_secs(600)));
+    eprintln!(
+        "[load {}] [fold] rebuild of 20,000 rows from the reopen: {:.2} s (quiet after {:.2} s)",
+        load(),
+        rebuilt.as_secs_f64(),
+        reopened.elapsed().as_secs_f64()
+    );
+    report("folded column, as the rebuild leaves it");
+    let merging = Instant::now();
+    cache.maintain(Maintenance::Weekly);
+    cache.maintain(Maintenance::Hourly);
+    assert!(cache.quiesce_blocking(Duration::from_secs(600)));
+    eprintln!(
+        "[load {}] [fold] the weekly merge and the hourly pass after it: {:.2} s",
+        load(),
+        merging.elapsed().as_secs_f64()
+    );
+    drop(cache);
+    report("folded column, after the weekly merge");
+    // The index built afresh, alone: the one transaction the end of the rebuild holds the writer for.
+    let c = Connection::open(&path).expect("open");
+    let afresh = Instant::now();
+    c.execute_batch("INSERT INTO message_fts (message_fts) VALUES ('rebuild')")
+        .expect("rebuild");
+    eprintln!(
+        "[load {}] [fold] the index built afresh from 20,000 folded rows, one transaction: {:.2} s",
+        load(),
+        afresh.elapsed().as_secs_f64()
+    );
+    drop(c);
+    drop(dir);
+}

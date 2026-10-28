@@ -34,7 +34,8 @@
 //!   on at every commit, so a tombstone or an edit takes the old text out of the index's pages
 //!   in place. A bulk deletion (an erase or age pass large enough to pay for it, eviction, a
 //!   rebuild of `search_text`) turns it off INSIDE its own transaction, deletes by marker, turns
-//!   it back on before committing, and records the compaction it owes in the same transaction;
+//!   it back on before committing, and records the compaction it owes in the same transaction (a
+//!   rebuild that rewrote rows also builds the index afresh as it ends: see `rebuild_step`);
 //!   the compaction is tracked to its end through the index's structure record
 //!   ([`super::structure`]).
 //! - **The log is checkpointed off this thread.** SQLite's automatic checkpoint is off; the
@@ -2214,7 +2215,7 @@ impl Writer<'_> {
 
     fn search_text(&self, provider_key: &str, message: &crate::model::Message) -> String {
         let rendered = self.shared.search_text.rendered(provider_key, message);
-        super::search_text::build(&message.author, &message.content, &rendered)
+        super::search_text::build(&message.author, &rendered)
     }
 
     /// A reply the file did not hold proves its root has at least one reply. `#470 replication-c8-root-count`.
@@ -3240,7 +3241,7 @@ impl Writer<'_> {
     /// the step's own transaction, as eviction does: the old text of a row being re-rendered is
     /// nothing anyone asked to forget, and a compaction follows to give the space back.
     fn rebuild_step(&mut self) -> rusqlite::Result<()> {
-        let version = self.shared.search_text.version();
+        let version = super::search_text::stored_version(self.shared.search_text.as_ref());
         let source = Arc::clone(&self.shared.search_text);
         let deadline = self.pace_rebuild.deadline(Instant::now());
         let (done, changed) = self.transaction(|w| {
@@ -3286,7 +3287,7 @@ impl Writer<'_> {
             let mut changed = 0;
             for (row_id, provider_key, message, stored) in &rows {
                 let rendered = source.rendered(provider_key, message);
-                let text = super::search_text::build(&message.author, &message.content, &rendered);
+                let text = super::search_text::build(&message.author, &rendered);
                 if &text != stored {
                     w.hot.row_update_search.execute(params![row_id, text])?;
                     changed += 1;
@@ -3304,11 +3305,51 @@ impl Writer<'_> {
                      ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                     [],
                 )?;
+                // Remembered across steps, and restarts, for the end of the rebuild below.
+                w.conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('search_text_rebuild_changed', '1')
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
                 w.owe_compaction();
             }
             let reached_end =
                 examined == rows.len() && i64::try_from(rows.len()).unwrap_or(0) < REBUILD_PICK;
             if reached_end {
+                // A rebuild that rewrote rows deleted their old entries by marker, and under
+                // `detail = none` (cache schema 5) the markers and what they shadow outlive the
+                // compaction and even an `optimize`: 20,000 rewritten rows left the index at 27 MB
+                // where it is 10 MB built afresh. So the index is built afresh from the column,
+                // once, at the end (`#604 server-side-search`; tests/cache_bench.rs measures it).
+                // Deleting in place instead (`secure-delete` on) costs about forty times as long.
+                let rewrote: bool = w.conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM meta WHERE key = 'search_text_rebuild_changed')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if rewrote {
+                    let afresh = Instant::now();
+                    w.conn.execute(
+                        "INSERT INTO message_fts (message_fts) VALUES ('rebuild')",
+                        [],
+                    )?;
+                    w.conn.execute(
+                        "DELETE FROM meta WHERE key = 'search_text_rebuild_changed'",
+                        [],
+                    )?;
+                    // The index is fresh: no marker is left for a compaction to drop.
+                    w.conn
+                        .execute("DELETE FROM meta WHERE key = 'compaction_due'", [])?;
+                    if w.work.compact.is_none() {
+                        w.work.compact_due = false;
+                        w.work.compact_again = false;
+                    }
+                    tracing::info!(
+                        took_ms = u64::try_from(afresh.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "the message cache's search index was built afresh after its search text \
+                         was rebuilt"
+                    );
+                }
                 w.conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('search_text_version', ?1)
                      ON CONFLICT (key) DO UPDATE SET value = excluded.value",

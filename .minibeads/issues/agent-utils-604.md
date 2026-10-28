@@ -1,6 +1,6 @@
 ---
 title: 'server-side-search: a folded search_text and a detail=none trigram index'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-521: parent-child
 created_at: 2026-10-28T01:27:51.414020675+00:00
-updated_at: 2026-10-28T01:27:51.414020675+00:00
+updated_at: 2026-10-28T05:15:16.950538407+00:00
+closed_at: 2026-10-28T05:15:16.950538267+00:00
 ---
 
 # Description

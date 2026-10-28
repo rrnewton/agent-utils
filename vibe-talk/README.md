@@ -4814,6 +4814,23 @@ from the rows in place, with no refetch: about 3.5 s for those 20,000 messages, 
 build first opens the file. Older builds still use the file. The pages the old index held are
 returned to the filesystem by the writer's hourly incremental vacuum.
 
+**The search text is the page's haystack, folded** (`#604 server-side-search`): the author, the text
+the message draws (a line end at each block's edge, as the page reads it) and its web links'
+addresses, case, accents and runs of white space folded exactly as the page and the query fold them,
+and no Markdown source. On the same 20,000 messages the column goes from 1,830 to 897 bytes a
+message, the index from 12.0 to 9.5 MB and the file's bytes in use from 78.5 to 68.2 MB
+(`measure_folded_search_text_rebuild`). A search whose terms every match must hold are rare in the
+channel now asks the index for the rows whose text holds them all (`LIKE`, which the trigram index
+answers without positions) and tests only those; anything else, and every search while the column is
+being rebuilt, scans. A build with the new rules rebuilds the column in the background as it opens
+the file: about 11 s for those 20,000 messages, in steps between batches, then the index built afresh
+from the column in one transaction (1.5 s; rewriting rows deletes their old entries by marker, and
+under `detail = none` those outlive the compaction, leaving the index at 27 MB; #613
+fts-marker-residue). Older builds rebuild it back to their own rules, by marker and without that last
+step, so after a rollback the index stays larger until a build with these rules opens the file again;
+answers are right throughout. A search driven by the index counts every capped row in the stretch it
+searched (`capped`), since the index never offers one whose term lies past the cap.
+
 The other cheap ways, measured on the same corpus:
 
 | Way | Saves | Taken |

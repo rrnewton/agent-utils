@@ -1,18 +1,19 @@
 //! `search_text`: what the full-text index holds for one message.
 //!
-//! The page searches what a row SAYS: its author, the text it draws (emphasis removed, link
+//! The page searches what a message SAYS: its author, the text it draws (emphasis removed, link
 //! labels such as `widgets#123`), and the addresses its links go to. The index chooses the
 //! candidates, so it has to contain every one of those; re-matching in Rust cannot recover a
-//! message the index never offered. So the column is
+//! message the index never offered. So the column is the page's haystack, folded as the page folds
+//! it (`#604 server-side-search`):
 //!
 //! ```text
-//! lowercase(author + "\n" + content + "\n" + rendered text + "\n" + link addresses, one a line)
+//! fold(author + "\n" + drawn text + "\n" + link addresses, one a line)
 //! ```
 //!
-//! with the rendered text left out when it is the content exactly: every substring of it is
-//! already there.
-//!
-//! capped at [`MAX_BYTES`]. How a body is rendered belongs to `crate::render`, which this module
+//! [`crate::search_query::fold`] drops case, accents and the difference between runs of white
+//! space, so the column, the query and the page's copy all compare the same way, and a trigram of
+//! a folded term is a trigram of every message holding it. The raw content is not in it: the page
+//! never searches Markdown source, so the server does not either. Capped at [`MAX_BYTES`]. How a body is rendered belongs to `crate::render`, which this module
 //! does not depend on: the rendering comes in through [`SearchTextSource`], so the store can be
 //! built and tested before the renderer is wired to it, and a renderer change is a new
 //! [`SearchTextSource::version`] that the writer rebuilds the column for, in the background.
@@ -42,6 +43,21 @@ pub trait SearchTextSource: Send + Sync {
     fn rendered(&self, provider_key: &str, message: &Message) -> Rendered;
 }
 
+/// What the rules of [`build`] are called, beside the renderer's and the fold's in
+/// [`stored_version`]: `haystack-1`, the page's haystack folded, with no raw content.
+pub const BUILD_VERSION: &str = "haystack-1";
+
+/// The version a file's `search_text` is stamped with: the renderer's rules, this module's and the
+/// fold's. A change to any of them rebuilds the column in the background.
+#[must_use]
+pub fn stored_version(source: &dyn SearchTextSource) -> String {
+    format!(
+        "{}/{BUILD_VERSION}/{}",
+        source.version(),
+        crate::search_query::FOLD_VERSION
+    )
+}
+
 /// The rendering before `crate::render` is wired in: the body exactly as written, and no links.
 /// Every word of the content is still indexed; what it lacks is link labels and addresses that
 /// appear only in the drawn form.
@@ -61,24 +77,13 @@ impl SearchTextSource for PlainText {
     }
 }
 
-/// Build the `search_text` column for one message from its rendering.
+/// Build the `search_text` column for one message from its author and its rendering.
 #[must_use]
-pub fn build(author: &str, content: &str, rendered: &Rendered) -> String {
-    let mut text = String::with_capacity(author.len() + content.len() * 2 + 16);
-    text.push_str(author);
-    text.push('\n');
-    text.push_str(content);
-    // The drawn text is very often the content itself; once is enough for every substring of
-    // it to match, and the index is the larger half of the file.
-    if rendered.text != content {
-        text.push('\n');
-        text.push_str(&rendered.text);
-    }
-    for href in &rendered.hrefs {
-        text.push('\n');
-        text.push_str(href);
-    }
-    cap(text.to_lowercase())
+pub fn build(author: &str, rendered: &Rendered) -> String {
+    let haystack = crate::search_query::haystack(author, &rendered.text, &rendered.hrefs);
+    cap(crate::search_query::fold(&haystack)
+        .trim_matches(' ')
+        .to_owned())
 }
 
 /// Cut to at most [`MAX_BYTES`], at a character boundary.
@@ -105,44 +110,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_source_the_page_searches_is_in_the_text_lowercased() {
+    fn the_column_is_the_pages_haystack_folded_and_not_the_markdown_source() {
         let rendered = Rendered {
-            text: "Fixed widgets#123 Today".to_owned(),
+            text: "Fixed widgets#123 Today\nat the Café".to_owned(),
             hrefs: vec!["https://Example.test/Issue/123".to_owned()],
         };
-        let text = build("Ada Lovelace", "Fixed **[#123](x)** today", &rendered);
-        for needle in [
-            "ada lovelace",
-            "**[#123](x)**",
-            "widgets#123",
-            "https://example.test/issue/123",
-        ] {
-            assert!(text.contains(needle), "{needle:?} missing from {text:?}");
-        }
-        assert_eq!(text, text.to_lowercase());
+        let text = build("Ada Lovelace", &rendered);
+        assert_eq!(
+            text,
+            "ada lovelace fixed widgets#123 today at the cafe https://example.test/issue/123"
+        );
+        assert_eq!(
+            text,
+            crate::search_query::fold(&text),
+            "folding it again changes nothing"
+        );
+        let raw = build(
+            "a",
+            &Rendered {
+                text: "bold".to_owned(),
+                hrefs: Vec::new(),
+            },
+        );
+        assert!(!raw.contains("**"), "the source's marks are no part of it");
     }
 
     #[test]
     fn the_text_is_capped_at_a_character_boundary() {
-        let long = "é".repeat(MAX_BYTES);
-        let text = build("a", &long, &Rendered::default());
+        let long = Rendered {
+            text: "é".repeat(MAX_BYTES),
+            hrefs: Vec::new(),
+        };
+        let text = build("a", &long);
         assert!(text.len() <= MAX_BYTES);
         assert!(text.len() > MAX_BYTES - 4);
         assert!(was_capped(&text));
-        assert!(!was_capped(&build("a", "short", &Rendered::default())));
+        let short = Rendered {
+            text: "short".to_owned(),
+            hrefs: Vec::new(),
+        };
+        assert!(!was_capped(&build("a", &short)));
     }
 
     #[test]
-    fn a_rendering_identical_to_the_content_is_not_indexed_twice() {
-        let same = build(
-            "a",
-            "hello",
-            &Rendered {
-                text: "hello".to_owned(),
-                hrefs: Vec::new(),
-            },
+    fn the_stored_version_names_the_renderer_the_haystack_and_the_fold() {
+        assert_eq!(
+            stored_version(&PlainText),
+            format!("plain-1/haystack-1/{}", crate::search_query::FOLD_VERSION)
         );
-        assert_eq!(same, "a\nhello");
     }
 
     #[test]

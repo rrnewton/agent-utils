@@ -17,19 +17,22 @@
 //! Search terms are never logged, and an FTS error is reported by result code only: SQLite's
 //! FTS syntax errors quote the query.
 //!
-//! [`MessageCache::search`](super::MessageCache::search) is the first caller (`#521
-//! server-side-search`), reachable from no route yet: it scans newest first and matches every row
-//! with the shared language of [`crate::search_query`], case- and accent-insensitively. It does not
-//! use the index yet. The stored `search_text` is lower-cased but not folded, so a trigram of
-//! `cafe` does not find "café"; the index can drive once the column is rebuilt folded (a new
-//! [`super::search_text::SearchTextSource`] version), and until then a scan is the only path that
-//! keeps the language's promise.
+//! [`MessageCache::search`](super::MessageCache::search) (`#521 server-side-search`, reached by
+//! the `/search` routes, `#605`) matches every candidate with the shared language of
+//! [`crate::search_query`], case- and accent-insensitively. Since `#604` the stored `search_text` is
+//! the page's haystack folded the same way, so a trigram of a folded term is a trigram of every
+//! message holding it, and the index can drive: when every row's text is folded
+//! ([`super::MessageCache::search_text_current`]) and the query has terms every match must hold
+//! ([`required_terms`]) that [`choose`] finds rare in the channel, the candidates are the rows whose
+//! text holds them all (`LIKE`, which the trigram index answers without positions, `detail = none`
+//! since cache schema 5), and only those are tested. Otherwise, and while the column is being
+//! rebuilt, the newest-first scan tests every row.
 
 use rusqlite::{params, Connection, OptionalExtension as _};
 
 use super::coverage::Horizon;
 use super::rows::{CachedMessage, Scope};
-use crate::search_query::{Day, Query, Subject};
+use crate::search_query::{Day, Node, Query, Subject};
 
 /// Rare terms: the index first. Bind `:q`, `:chan`, `:from_ms`, `:before_ms`, `:limit`.
 pub const RARE_SQL: &str = "
@@ -101,6 +104,39 @@ pub fn fts_query(terms: &[String]) -> String {
         }
     }
     grams.join(" AND ")
+}
+
+/// The folded terms every message matching `query` must hold, that the index can be asked for
+/// (`#604 server-side-search`): the query's own word or phrase, or those among its top-level AND,
+/// each of three characters or more (a trigram index has nothing for a shorter one) and without
+/// `%` or `_`, which `LIKE` would read as wildcards. Empty when there is none: the search scans.
+#[must_use]
+pub fn required_terms(query: &Query) -> Vec<String> {
+    let indexable = |term: &String| term.chars().count() >= 3 && !term.contains(['%', '_']);
+    let terms: Vec<String> = match query.root() {
+        Some(Node::Word(term) | Node::Phrase(term)) => vec![term.clone()],
+        Some(Node::And(children)) => children
+            .iter()
+            .filter_map(|child| match child {
+                Node::Word(term) | Node::Phrase(term) => Some(term.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for term in terms.into_iter().filter(indexable) {
+        if !out.contains(&term) {
+            out.push(term);
+        }
+    }
+    out
+}
+
+/// The `LIKE` pattern for a folded term: anywhere in `search_text`.
+#[must_use]
+pub fn like_pattern(term: &str) -> String {
+    format!("%{term}%")
 }
 
 /// Which query shape a search takes.
@@ -235,11 +271,16 @@ pub struct SearchOutcome {
     /// reached the oldest row the view holds.
     pub resume_below_ms: Option<i64>,
     /// Rows whose `search_text` was cut at its cap: a term only past the cap is not found in them.
+    /// Of the rows tested on a scan; of every row in the stretch searched when the index drove,
+    /// which offers none whose term lies past the cap.
     pub capped: usize,
     /// Rows held only as a pushed snippet, not yet read whole: matched on the snippet.
     pub partial: usize,
     /// The view's horizon, when its claims reach the head.
     pub horizon: Option<Horizon>,
+    /// Whether the full-text index chose the candidates (`#604 server-side-search`): every row the
+    /// query could match was among them, so `examined` counts candidates, not every row.
+    pub indexed: bool,
     /// Matching rows left out of `hits` because a serve would not hand them out (`#605
     /// server-side-search`): a reply whose thread is in doubt or being erased, a row not seen since
     /// the latest offer dropped for the channel, or a text only a push brought.
@@ -340,6 +381,7 @@ pub(crate) fn test_rows(
         capped: 0,
         partial: 0,
         horizon: None,
+        indexed: false,
         withheld: 0,
     };
     if request.query.is_empty() || request.limit == 0 || request.budget == 0 {
@@ -359,17 +401,16 @@ pub(crate) fn test_rows(
         outcome.capped += usize::from(super::search_text::was_capped(&row.search_text));
         outcome.partial += usize::from(row.message.content_partial);
         let message = &row.message.message;
-        // The server has no drawn form of a cached row yet: the haystack is `search_text`, which
-        // also holds the raw content (a parity gap with the page, design section 3, closed when
-        // the column is rebuilt from the page's haystack), and a link is approximated as "://"
-        // anywhere in it.
+        // The haystack is `search_text`, the page's haystack folded (`#604`), which keeps no
+        // separate list of links: a link is a web address anywhere in it, as the page lists only
+        // web links (`anchorsIn`). Text that spells one without linking it counts too.
         let subject = Subject::new(
             &row.search_text,
             &message.author,
             message.author_id.as_str(),
             created_ms,
             row.in_thread,
-            row.search_text.contains("://"),
+            row.search_text.contains("http://") || row.search_text.contains("https://"),
         );
         if request.query.matches(&subject, request.day_start_ms) {
             outcome.hits.push(row.message);
@@ -451,6 +492,22 @@ mod tests {
             Path::Scan,
             "no trigram in it"
         );
+    }
+
+    #[test]
+    fn the_terms_every_match_must_hold_are_the_ones_the_index_is_asked_for() {
+        let terms = |q: &str| required_terms(&crate::search_query::parse(q));
+        assert_eq!(terms("Café Zebra"), ["cafe", "zebra"]);
+        assert_eq!(terms("\"hand off\" -x from:ada"), ["hand off"]);
+        assert_eq!(
+            terms("ca zebra zebra"),
+            ["zebra"],
+            "too short, and once each"
+        );
+        assert!(terms("a OR b").is_empty() && terms("zebra OR quokka").is_empty());
+        assert!(terms("-zebra").is_empty());
+        assert!(terms("50%_off").is_empty(), "LIKE wildcards");
+        assert_eq!(like_pattern("zebra"), "%zebra%");
     }
 
     #[test]
