@@ -448,6 +448,47 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Salvage and remove one exact unregistered agent worktree (writer; fixture registries only until cutover)
+    RecoverOwnerlessAgentWorktree {
+        /// Direct child of the managed agent directory
+        path: String,
+        /// Source repository that registered the worktree
+        #[arg(long, value_name = "PATH", required = true)]
+        repository: String,
+        /// Exact worktree HEAD
+        #[arg(long, value_name = "SHA", required = true)]
+        head: String,
+        /// Branch the worktree has checked out
+        #[arg(long, value_name = "BRANCH", conflicts_with = "detached")]
+        branch: Option<String>,
+        /// The worktree has a detached HEAD contained in a remote branch
+        #[arg(long)]
+        detached: bool,
+        /// Remote name recorded for the worktree
+        #[arg(long, value_name = "REMOTE", required = true)]
+        remote: String,
+        /// SHA-256 of the remote's single fetch URL
+        #[arg(long, value_name = "SHA256", required = true)]
+        remote_url_sha256: String,
+        /// Exact HANDOFF.md digest after the coordinator has read it
+        #[arg(long, value_name = "SHA256")]
+        handoff_sha256: Option<String>,
+        /// Apply instead of planning
+        #[arg(long = "apply")]
+        apply_mode: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID (required with --apply)
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
     Create {
         /// New slot name
@@ -1265,6 +1306,49 @@ pub fn run() -> u8 {
                             }
                         }
                     }
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverOwnerlessAgentWorktree {
+            path,
+            repository,
+            head,
+            branch,
+            detached,
+            remote,
+            remote_url_sha256,
+            handoff_sha256,
+            apply_mode,
+            coordinator_authorized,
+            coordinator_pid,
+            root,
+            machine,
+        } => {
+            match crate::recover_ownerless_write::recover_ownerless_agent_worktree(
+                root.as_deref(),
+                machine.as_deref(),
+                &path,
+                &repository,
+                &head,
+                branch.as_deref(),
+                detached,
+                &remote,
+                &remote_url_sha256,
+                handoff_sha256.as_deref(),
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
                     eprintln!("wrkslotsd: {error}");
                     return 1;
                 }

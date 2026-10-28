@@ -5031,6 +5031,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
         names,
         BTreeSet::from([
             "adopt",
+            "recover-ownerless-agent-worktree",
             "recover-absent-agent-row",
             "recover-absent-validate-rows",
             "recover-absent-agent-rows",
