@@ -1,12 +1,13 @@
 ---
 title: 'mobile-keyboard-compose: iOS hides the message box; flush scroll must not cap later scrolling'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-28T04:03:27.328833450+00:00
-updated_at: 2026-10-28T04:03:27.328833450+00:00
+updated_at: 2026-10-28T05:34:11.510343722+00:00
+closed_at: 2026-10-28T05:34:11.510343612+00:00
 ---
 
 # Description
