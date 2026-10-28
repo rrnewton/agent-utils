@@ -458,3 +458,10 @@ instructed.
 - Differential: `py/wrkslots/tests/test_recover_unbound_write_rust.py`, 4 tests with full scrubbed payload comparison, a stale recorded HEAD genuinely refreshed per-root, and no-event assertions on refusals.
 - Gate 56: infra and vibe-talk screenshots pass on solo rerun; wrkslots shards pass except the three remove tests blocked on this host by the same-device foreign descriptor (#618 residual, passing in a PID namespace, 15/15 remove+recover tests); agentctl timing flakes remain load-related in an untouched crate. `wrkslotsd` 90 package tests pass; clippy/mypy clean.
 - Next in #562: the remaining recover family (recover-absent rows, ownerless-agent recovery, the main `recover`), then the opt-in edition switch.
+
+### Slice 39 landed: `recover-absent-agent-row(s)` outcomes (fixture-guarded)
+
+- Commits: `046bce36` (commands + differential), `9739ff79` (apply flag id), `8ef408bf` (review fixes), rebased over unrelated commits with no shared files.
+- Rust covers the non-destructive outcomes: already-recovered recognition bound to the exact archived record and its recovery event (revision continuity, evidence keys), interrupted-journal would-resume with the journal validated as the exact durable plan, other-journal refusals, generation/record-digest validation, still-has-physical-storage refusal, and the 128-row batch JSON shell including Python's planned/resume row line and batch-level recovery-required state errors. The destructive census-and-salvage proof path (host/process/systemd censuses, submodule salvage, rescue-ref pushes, registration removal) refuses explicitly as Python-owned once storage is proven absent.
+- Differential: `py/wrkslots/tests/test_recover_absent_write_rust.py`, 9 tests. Gate 58: wrkslots shards pass on solo rerun (554 + 554), infra passes alone; remaining host-only failures are #651 part 2 (standalone under /tmp) and the stuck pidns-init lifecycle test. `wrkslotsd` 90 package tests pass; clippy/mypy clean.
+- Next in #562: `recover-absent-validate-rows`, the ownerless-agent recovery family, and the main `recover`, then the opt-in edition switch.
