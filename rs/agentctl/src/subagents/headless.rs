@@ -548,11 +548,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 
     /// The chat bridge's form of a headless send (#594 headless-slack-trial): enqueue under the
-    /// agent's lifecycle `lock`, release it, wake the wrapper briefly, and wait as a send does.
-    /// The wake is made outside the lock, which the wrapper takes when it records a new harness.
-    /// It succeeds only once the model has started the input; until then it fails as `Pending`,
-    /// so the bridge keeps the request pending, retries it, and its stall alarm covers a wrapper
-    /// that is down. An input set aside as possibly submitted fails as such.
+    /// agent's lifecycle `lock`, release it, wake the wrapper briefly, and look at the queue once,
+    /// without waiting for the model. The wake is made outside the lock, which the wrapper takes
+    /// when it records a new harness. It succeeds only once the model has started the input;
+    /// until then it fails as `Pending`, so the bridge keeps the request pending, looks for the
+    /// start every 250 milliseconds (#601 headless-second-reaction), and its stall alarm covers
+    /// a wrapper that is down. Not waiting here keeps a busy model from holding up the bridge's
+    /// other requests and replies. An input set aside as possibly submitted fails as such.
     pub(super) fn send_headless_for_chat(
         &self,
         lock: super::LifecycleLock,
@@ -570,14 +572,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )?;
         drop(lock);
         let blocked = self.wake_within(&record.name, CHAT_WAKE_TIMEOUT);
-        let wait = if blocked.is_some() {
-            Duration::ZERO
-        } else {
-            options.ready_timeout.min(Duration::from_secs(10))
-        };
         let result = queue_result(
             id.clone(),
-            settle(&queue_root, std::slice::from_ref(&id), wait),
+            settle(&queue_root, std::slice::from_ref(&id), Duration::ZERO),
             blocked,
         );
         let undelivered = |state: &str| agent::UndeliveredMessage {
@@ -590,7 +587,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             artifact: queue_root.clone(),
         };
         match result.outcome {
-            agent::QueueOutcome::Delivered => Ok(result),
+            // Success means the model started the input: its entry is in `processed/`. An input
+            // set aside untyped (cancelled or expired) settles too, and one caught in the rename
+            // of a hand-back reads as absent for an instant; the model started neither, so the
+            // bridge reads them from the queue later and gives them no receipt yet (#601
+            // headless-second-reaction).
+            agent::QueueOutcome::Delivered if result.delivered.contains(&id) => Ok(result),
+            agent::QueueOutcome::Delivered if !result.cancelled.is_empty() => Err(
+                AgentError::Pending(undelivered("set it aside untyped (cancelled or expired)")),
+            ),
             agent::QueueOutcome::PossiblySubmitted => Err(AgentError::PossiblySubmitted(
                 undelivered("set it aside as possibly submitted"),
             )),
@@ -624,6 +629,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             settle(&queue_root, &ids, Duration::ZERO),
             blocked,
         ))
+    }
+
+    /// The agent's registry directory, which holds its queue and control socket.
+    #[cfg(test)]
+    pub(crate) fn agent_directory(&self, agent_name: &str) -> std::path::PathBuf {
+        self.directory(agent_name).expect("agent directory")
     }
 
     /// A headless queue entry's state as the chat bridge reads it: an input written to the

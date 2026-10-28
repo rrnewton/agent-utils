@@ -154,8 +154,10 @@ listing. These operations read the provider and create no outbound post intent.
 
 The bridge marks each accepted request's chat message in two stages. The
 **acknowledgement** goes on once the request is durably admitted; the
-**receipt** goes on once the request's prompt is verified in the agent's pane,
-as described under "Initialize and run". A **rejection** marks an eligible human
+**receipt** goes on once the agent admits the request as input: for a pane
+agent, once the request's prompt is verified in the agent's pane, as described
+under "Initialize and run"; for a headless agent, once its model starts the
+prompt (see "A headless coordinator"). A **rejection** marks an eligible human
 message that the bridge refuses, including a sender who was never allowed or
 whose grant expired or was revoked. agentctl shares these defaults with the
 bundled Slack provider: 👀 for acknowledgement (Slack `eyes`), ✅ for receipt
@@ -1494,9 +1496,25 @@ to the model. With `--deliver-while-working` the prompt is urgent and arrives
 between tool calls in the current turn. Without it, the prompt waits for the
 turn to end. A pass wakes the wrapper but does not drain the queue itself.
 Delivery state comes from the queue alone. A request stays `pending` until the
-model starts its prompt, and the retries every 10 seconds then record it
-`delivered`. While the wrapper is down, its `delivery.error` says so and the
-stall alarm lists it. A headless request gets no receipt reaction. The bridge never reads a screen, so the prompt gives
+model starts its prompt, and is recorded `delivered` within a quarter second
+of that, as described below. While the wrapper is down, its `delivery.error` says so and the
+stall alarm lists it.
+
+A headless request earns its receipt reaction (✅ by default) when the
+model starts its prompt, which is when the agent admits it as input: the
+wrapper moves the queue entry to `processed/` only when Claude Code reports
+that it started that input. Queuing it earns nothing. An urgent prompt starts
+between tool calls of the running turn, and one that waits starts with the next
+turn; either way the receipt follows the start, not the queuing. The pass looks
+at the queue for started prompts every 250 milliseconds while any request waits
+for its model, and records the request `delivered` once the receipt is saved,
+so a `chat run` that stops in between saves it again when it restarts, and the
+first pass after a restart settles every request whose prompt the model started
+meanwhile. A prompt the wrapper hands back before the model starts it, as when
+the turn is interrupted, waits in the queue again and earns its receipt only
+when the model does start it. A prompt the queue sets aside untyped, because
+it was cancelled or expired, earns none: the request is `delivery_uncertain`
+and `chat status` gives its stage as `cancelled`. The bridge never reads a screen, so the prompt gives
 no marker lines. It names the `chat reply` command as the only way to reply,
 whether or not `--offer-reply-command` is given, and the same command and
 reply ID send every reply. Reply reminders and `--stale-composer-clear-after`
@@ -1714,9 +1732,17 @@ whose prompts are not recorded as typed; and `typed_not_replied`, the rest. A
 reply counts as sent once its own record says so, even if the service stopped
 before it advanced the request's count of sent replies. Its `requests` array
 lists every retained request, oldest admission first, with `key`, `phase`,
-`admitted_at_millis`, `ack_completed_at_millis`, `delivered_at_millis`,
+`stage`, `admitted_at_millis`, `ack_completed_at_millis`,
+`delivery_started_at_millis`, `delivered_at_millis`,
 `first_reply_sent_at_millis`, `replies_captured`, `replies_sent`,
-`replies_closed`, `age_seconds`, and `reason`. `first_reply_sent_at_millis` is
+`replies_closed`, `age_seconds`, and `reason`. `stage` says how far the request
+has come, for a pane agent and a headless one alike: `admitted` (the bridge
+holds it; the acknowledgement), `queued` (its prompt was handed to the agent
+and has not arrived), `started` (the agent admitted it: a headless model started
+the prompt, or the pane showed it typed; the receipt), `replied` (a reply was
+sent), or, for a prompt that never arrived for certain, `cancelled` (the queue
+set it aside untyped) or `uncertain`. The `stages` object counts the requests
+in each stage, and `chat inspect` gives the same `stage`. `first_reply_sent_at_millis` is
 null while no reply is sent or when the first reply's record cannot be read,
 `replies_closed` says whether the request is closed, and `age_seconds` and
 `reason` are null once the prompt is recorded as typed. Like the rest of
