@@ -207,6 +207,9 @@ pub struct HttpSlackClient {
     /// Calls since the last minute's report, by method and read reason. `#614
     /// timeline-read-failures`; see [`super::budget::Tally`].
     tally: Mutex<super::budget::Tally>,
+    /// The most requests of each method sent a minute ([`super::budget::Priority::share`]).
+    /// `#617 cold-load-first-paint`; see [`Self::with_calls_per_minute`].
+    calls_per_minute: HashMap<String, usize>,
     /// How long those replies are trusted before a Flat read reads their thread in full again.
     pub(super) flat_reconcile: Duration,
     /// Where the live poller stands in each thread of each conversation it polls, so each of its
@@ -299,6 +302,7 @@ impl HttpSlackClient {
             thread_scan_epoch: std::sync::atomic::AtomicU64::new(0),
             sent: Mutex::default(),
             tally: Mutex::default(),
+            calls_per_minute: HashMap::new(),
             flat_reconcile: super::timeline::FLAT_RECONCILE,
             live_threads: Mutex::new(HashMap::new()),
             post_limit: config.post_limit(),
@@ -337,6 +341,21 @@ impl HttpSlackClient {
     #[must_use]
     pub fn with_flat_reconcile(mut self, period: Duration) -> Self {
         self.flat_reconcile = period;
+        self
+    }
+
+    /// The most requests of each method this client sends a minute, all its readers together
+    /// (`[[providers]] calls_per_minute`); a method with none has no ceiling of its own. `#617
+    /// cold-load-first-paint`: another client of the same token (a bridge, a command-line client)
+    /// was refused for a day while this server spent the allowance.
+    #[must_use]
+    pub fn with_calls_per_minute(
+        mut self,
+        ceilings: &std::collections::BTreeMap<String, u32>,
+    ) -> Self {
+        for (method, n) in ceilings {
+            self.calls_per_minute.insert(method.clone(), *n as usize);
+        }
         self
     }
 
@@ -488,16 +507,38 @@ impl HttpSlackClient {
             tokio::time::sleep(wait).await;
             *waited += wait;
         }
-        let now = tokio::time::Instant::now();
-        let mut sent = self
-            .sent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !sent.admits(method, priority, now) {
-            return Some(refusal(*waited, Duration::ZERO));
+        // `#617 cold-load-first-paint`: within the method's ceiling, by priority. A person's request
+        // and live work wait for room within their budget; naming, crawl work and a read the cache
+        // stands in for are refused at once.
+        let ceiling = self.calls_per_minute.get(method).copied();
+        loop {
+            let wait = {
+                let now = tokio::time::Instant::now();
+                let mut sent = self
+                    .sent
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match ceiling.and_then(|ceiling| sent.ceiling_wait(method, priority, ceiling, now))
+                {
+                    Some(wait) => wait,
+                    None if !sent.admits(method, priority, now) => {
+                        return Some(refusal(*waited, Duration::ZERO));
+                    }
+                    None => {
+                        sent.record(method, priority, now);
+                        return None;
+                    }
+                }
+            };
+            if priority <= super::budget::Priority::Background
+                || patience == Patience::BestEffort
+                || *waited + wait > RATE_LIMIT_BUDGET
+            {
+                return Some(refusal(*waited, wait));
+            }
+            tokio::time::sleep(wait).await;
+            *waited += wait;
         }
-        sent.record(method, priority, now);
-        None
     }
 
     /// Count one call in the minute's tally, and write the minute's report when it is due.
@@ -1362,7 +1403,10 @@ impl ChatClient for HttpSlackClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for method in CRAWL_METHODS {
-            if let Some(wait) = sent.crawl_wait(method, now) {
+            let ceiling = self.calls_per_minute.get(method).and_then(|ceiling| {
+                sent.ceiling_wait(method, super::budget::Priority::Crawl, *ceiling, now)
+            });
+            if let Some(wait) = sent.crawl_wait(method, now).max(ceiling) {
                 let until = now + wait;
                 latest = Some(latest.map_or(until, |at| at.max(until)));
             }

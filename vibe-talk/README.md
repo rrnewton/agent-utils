@@ -2642,6 +2642,18 @@ or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`
 also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
 
+Slack providers also take `calls_per_minute` (`#617 cold-load-first-paint`), a table of the most
+requests of each Web API method this server sends a minute, all its readers together, 1 to 1000
+each; a method with no entry (and every method, unset) has no ceiling of its own. Where another
+client shares the token, such as a bridge or a command-line client, set it well under Slack's tier
+3 floor of about fifty a minute so that client keeps headroom, for example
+`calls_per_minute = { "conversations.history" = 20, "conversations.replies" = 20 }`: one was refused
+for a day while this server spent the allowance. Within it a person's request and live work (the live poller,
+relist, the probe) may use the whole ceiling and wait for room within their 30 s budget; thread
+naming and summaries stop at three quarters and crawl work (backfill, the shadow's check) at half,
+refused rather than waiting; and a read the message cache stands in for is refused at once, so the
+cache answers it.
+
 A Slack provider measures a message as Slack is sent it, after `&`, `<` and `>` become `&amp;`,
 `&lt;` and `&gt;`. Pointed at Slack itself it takes 39,000 characters unless configured, a margin
 under the 40,000 past which Slack truncates, and refuses a `max_post_chars` above 40,000. Pointed
@@ -4660,13 +4672,25 @@ lacks, and a `refresh_failed` counts read does not count as having read the repl
 outran.
 
 With the channel live-fed (its provider polled, or ingestion on) and `serve = true`, the thread
-list's `side` read is answered that way while an upstream read of the list answered within five
-minutes (`LIVE_FED_UPSTREAM_EVERY`) or one is running, without `refresh_failed`; otherwise it goes
-upstream, the stand-in behind it. The thread list used to scan up to ten pages of
+list's `side` read is answered that way at once, without `refresh_failed`, while an upstream read
+of the list answered within 30 minutes; past five minutes (`LIVE_FED_UPSTREAM_EVERY`) it also
+begins the next upstream read of the list behind the answer, one at a time, for the reads after it
+(`#617 cold-load-first-paint`: it used to make the side read itself go upstream and wait the whole
+fallback for the scan). With no such read yet (after a restart) it goes upstream, the stand-in
+behind it. The thread list used to scan up to ten pages of
 `conversations.history` on every read, once a minute for each tab and channel: most of what kept
 Slack's history limit spent, for what live ingestion had already delivered. "Older threads…"
 (`reason=threads`) and All's `counts` read, which is sent because the page lacks replies the counts
 promise, still go upstream.
+
+**A cold load** (`#617 cold-load-first-paint`). A page's read on entering a view (`reason=enter`,
+a newest page) waits 1.5 s on the provider (`FIRST_PAINT_WAIT`), not `timeline_fallback_ms`,
+before the cache stands in for it: on Slack's All, which the cache never serves at once, a cold
+load used to show "Loading messages…" for the whole fallback while the cache held the page. After
+a page from the server's own copy the page reads again 3 s later, then 10 s, rather than at the
+next poll (45 s); while that read is out its pill says "Showing messages from HH:MM ·
+refreshing…", and it says "Refresh failed" only for a copy older than two minutes, without the
+warning colour. A younger copy is simply "Updated HH:MM".
 
 **Slack calls, once a minute** (`#614`). One INFO line (`consumer="slack_calls"`) says what Slack
 was sent since the last one: `sent`, `limited` (answers that were a rate limit) and `refused`
@@ -5856,7 +5880,11 @@ from inside the read's span as a live deletion. A message created in the 30 seco
 read is never taken for a deleted one, since a provider may not list it yet, nor is anything
 outside the read's own messages when the provider says it answered from an older copy; the margin
 assumes the host's clock is within 30 seconds of the provider's. Its reads are counted under the
-read reason `relist`. Two changes it does not publish: the last reaction removed from a message (a
+read reason `relist`. `#617 cold-load-first-paint`: each read asks for at most 19 rows (one page of
+a bridge that answers twenty a call), since the edits and deletions it exists for are of the newest
+messages, and a channel nobody has a live stream open on is relisted on every tenth pass only; a
+page of fifty for every channel every 90 s had made it the largest spender of Slack's history
+allowance. Two changes it does not publish: the last reaction removed from a message (a
 read reports no reactions the same way whether there are none or it cannot say), and a stream
 record that arrives after a read has already cached a later edit of its message, whose older text
 goes out until the next relist.

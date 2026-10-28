@@ -25209,7 +25209,10 @@ function staleWords(state, atMs, refreshing, noun = "messages") {
   const at = stamp(atMs);
   if (state === "saved") return refreshing ? `Saved ${at} · refreshing…` : `Showing ${noun} saved ${at}`;
   if (state === "offline") return `Offline · showing ${noun} saved ${at}`;
-  if (state === "failed") return `Refresh failed · showing ${noun} from ${at}`;
+  // `#617 cold-load-first-paint`: not while a read that may bring them up to date is out.
+  if (state === "failed") {
+    return refreshing ? `Showing ${noun} from ${at} · refreshing…` : `Refresh failed · showing ${noun} from ${at}`;
+  }
   if (state === "slow") {
     return `${sentenceStart(chatServiceOf(el("discord-channel").value))} is slow to answer · showing ${noun} from ${at}`;
   }
@@ -29626,11 +29629,40 @@ function isCursorRefusal(error) {
     (error.status === 400 && error.code === "cursor_mismatch"));
 }
 
-/** A read landed: say how fresh the rows are — now, or as of what the server could vouch for. */
+/**
+ * `#617 cold-load-first-paint`. After a page the server answered from its own copy, the next reads
+ * come this soon, one after the other, rather than at the next poll, forty-five seconds on: the read
+ * upstream it stood in for runs on, and has usually landed by then.
+ */
+const STAND_IN_RETRY_MS = [3000, 10000];
+/** How many of `STAND_IN_RETRY_MS` the reads since the last current one have taken. */
+let standInRetries = 0;
+/** Whether the next poll armed should come after the next of `STAND_IN_RETRY_MS`. */
+let standInRetryWanted = false;
+
+/**
+ * A read landed: say how fresh the rows are — now, or as of what the server could vouch for.
+ *
+ * `#617 cold-load-first-paint`: a page from the server's own copy says "Refresh failed" only when
+ * that copy is older than `STALE_AS_OF_MS`; a younger one is as current as the pill says ("Updated"
+ * at the copy's time). Either way the next read comes soon (`STAND_IN_RETRY_MS`).
+ */
 function noteFreshRead(payload) {
   const asOf = staleAsOf(payload);
   channelFreshAt = asOf === null ? Date.now() : asOf;
-  setChannelFreshness(refreshFailed(payload) ? "failed" : asOf === null ? "fresh" : "slow");
+  const failed = refreshFailed(payload);
+  if (failed) {
+    standInRetryWanted = standInRetries < STAND_IN_RETRY_MS.length;
+    // A poll already armed comes forward; one armed after this read takes it up as it is armed.
+    if (standInRetryWanted && discordPollTimer !== null) {
+      scheduleDiscordPoll(Math.max(0, discordPollDueAt - Date.now()));
+    }
+  } else {
+    standInRetries = 0;
+    standInRetryWanted = false;
+  }
+  const old = Date.now() - channelFreshAt > STALE_AS_OF_MS;
+  setChannelFreshness(failed ? (old ? "failed" : "fresh") : asOf === null ? "fresh" : "slow");
   // `#206 pin-message`. Every landed read, delta included, says what revision the pins are at.
   notePinsRevision(payload.pins_revision);
   // `#240 reading-bookmark`. ...and where the bookmark is, which another device may have moved.
@@ -53946,6 +53978,11 @@ function stopDiscordPolling() {
  */
 function scheduleDiscordPoll(delay = DISCORD_POLL_MS) {
   stopDiscordPolling();
+  if (standInRetryWanted) {
+    delay = Math.min(delay, STAND_IN_RETRY_MS[standInRetries]);
+    standInRetries += 1;
+    standInRetryWanted = false;
+  }
   discordPollDueAt = Date.now() + delay;
   if (document.hidden) {
     discordPollPaused = true;

@@ -190,6 +190,7 @@ impl ChatRouter {
                         max_post_bytes: slack.max_post_bytes,
                         workspace_url: slack.workspace_url.clone(),
                     })?
+                    .with_calls_per_minute(&slack.calls_per_minute)
                     .with_shim_profile(profile.provider(&provider.key, &provider.name)),
                 ),
             };

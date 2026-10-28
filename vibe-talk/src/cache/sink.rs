@@ -1602,6 +1602,14 @@ impl Sink {
             .map(|(_, list)| list.clone())
     }
 
+    /// Make every remembered upstream list `by` older. For tests of what happens as one ages.
+    #[doc(hidden)]
+    pub fn age_upstream_reads(&self, by: Duration) {
+        for (at, _) in lock(&self.state.upstream_reads).values_mut() {
+            *at = at.checked_sub(by).unwrap_or(*at);
+        }
+    }
+
     /// Whether the cache holds `thread` of `channel` blocked: access to it in doubt or lost, or an
     /// erase of it pending. `#614 timeline-read-failures`.
     #[must_use]

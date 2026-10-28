@@ -2004,3 +2004,89 @@ async fn with_serving_off_a_side_read_still_waits_out_a_short_rate_limit() {
         "sent again after the Retry-After"
     );
 }
+
+// --- `#617 cold-load-first-paint` ---------------------------------------------------------------
+
+#[tokio::test]
+async fn a_page_entering_a_view_is_answered_from_the_cache_after_the_first_paint_wait() {
+    let d = deployment("first-paint").await;
+    forward_cursor(&d).await;
+    // Too old to serve at once: the read goes upstream, behind a provider that does not answer.
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let held = d.chat.hold_next_timeline();
+    let began = std::time::Instant::now();
+    let body = tokio::time::timeout(
+        vibe_talk::ops::FIRST_PAINT_WAIT + Duration::from_secs(3),
+        ok(
+            &d.state,
+            &path(READ_CHANNEL, "/timeline?view=main&limit=50&reason=enter"),
+            WRITE_TOKEN,
+        ),
+    )
+    .await
+    .expect("the first paint came from the cache, not after the whole fallback");
+    let first_message = began.elapsed();
+    assert!(
+        first_message >= vibe_talk::ops::FIRST_PAINT_WAIT,
+        "the provider was given its time first: {first_message:?}"
+    );
+    assert!(
+        first_message < vibe_talk::ops::stand_in_after(&d.state.config),
+        "{first_message:?}"
+    );
+    assert_eq!(texts(&body).len(), 12, "{body}");
+    assert!(body["refresh_failed"].is_string(), "{body}");
+    held.entered.await.expect("the read reached the provider");
+    held.release.send(()).expect("the read runs on");
+}
+
+#[tokio::test]
+async fn a_live_fed_side_read_past_the_interval_is_answered_at_once_and_refreshes_behind() {
+    // `#617 cold-load-first-paint`: every fifth minute the side read went upstream itself and
+    // waited the whole fallback for a scan slower than it.
+    let (state, fake, _clock, _dir) = slack_threads_deployment("side-refresh-behind", true).await;
+    state.message_cache.set_serve(true);
+    let list = path(SLACK_CH, "/timeline?view=threads&limit=50&reason=side");
+    ok(&state, &list, WRITE_TOKEN).await;
+    settled(&state).await;
+    state
+        .message_cache
+        .age_upstream_reads(vibe_talk::ops::LIVE_FED_UPSTREAM_EVERY + Duration::from_secs(1));
+    fake.with(|fixture| fixture.delay = Some(Duration::from_secs(3)));
+    let history = fake.calls("conversations.history");
+    let began = std::time::Instant::now();
+    let body = ok(&state, &list, WRITE_TOKEN).await;
+    assert!(began.elapsed() < AT_ONCE, "{:?}", began.elapsed());
+    assert_eq!(thread_ids(&body).len(), 2, "{body}");
+    assert!(body.get("refresh_failed").is_none(), "{body}");
+    // The read behind it, once, however many side reads come meanwhile.
+    ok(&state, &list, WRITE_TOKEN).await;
+    tokio::time::timeout(WAIT, async {
+        while fake.calls("conversations.history") == history {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("an upstream read of the list began behind the answer");
+    fake.with(|fixture| fixture.delay = None);
+    tokio::time::timeout(WAIT, async {
+        while state
+            .message_cache
+            .upstream_read_within(
+                &RefreshKey::view(ChannelId(SLACK_CH.to_owned()), TimelineView::Threads, None),
+                vibe_talk::ops::LIVE_FED_UPSTREAM_EVERY,
+            )
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the read behind it landed and was remembered");
+    assert_eq!(
+        fake.calls("conversations.history"),
+        history + 1,
+        "one read behind both answers"
+    );
+}

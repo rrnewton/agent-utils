@@ -4947,10 +4947,16 @@ a.search-hit-link {
 }
 
 #channel-freshness[data-state="offline"],
-#channel-freshness[data-state="failed"],
 #channel-freshness[data-state="slow"] {
   color: var(--warn);
   border-color: currentColor;
+}
+
+/* `#617 cold-load-first-paint`. A refresh that failed while the rows are still shown is said, not
+   alarmed: the owner, 2026-10-28, of an orange "Refresh failed" pill over messages a minute old.
+   The pill's own colours, its text a step quieter. */
+#channel-freshness[data-state="failed"] {
+  opacity: 0.85;
 }
 
 /* The pill's bottom edge, measured from the top of the list's cell; #scroll-area's own top padding is
@@ -9255,7 +9261,6 @@ li.discord-message[data-root-continuation] > .thread-replies {
 }
 
 #side-freshness[data-state="offline"],
-#side-freshness[data-state="failed"],
 #side-freshness[data-state="slow"] {
   color: var(--warn);
 }

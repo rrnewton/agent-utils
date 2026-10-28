@@ -86805,7 +86805,8 @@ test("`#611 timeline-read-failures`: a channel read the server fails ends its lo
 test("`#611 timeline-read-failures`: a page the server answered from its own copy lands, and the pill says it could not refresh", async () => {
   const page = await threadPage("main");
   const standard = page.timeline;
-  const asOf = new Date(Date.now() - 5 * 60_000).toISOString();
+  // Older than two minutes by the page's clock: `#617 cold-load-first-paint` keeps a younger copy quiet.
+  const asOf = new Date(page.clock() - 5 * 60_000).toISOString();
   page.timeline = async (path, options) => {
     const response = await standard(path, options);
     const { delta: _delta, ...newest } = JSON.parse(await response.text());
@@ -86823,9 +86824,11 @@ test("`#611 timeline-read-failures`: a page the server answered from its own cop
   assert.equal(freshness(page).getAttribute("data-state"), "failed");
   assert.match(freshness(page).textContent, /^Refresh failed · showing messages from \d{2}:\d{2}$/);
 
-  // The next read the service answers says the rows are current again.
+  // The next read the service answers says the rows are current again: armed for three seconds
+  // on, not the next poll (`#617 cold-load-first-paint`).
   page.timeline = standard;
-  await reReadChannel(page);
+  assert.ok(page.expireTimers(3000) > 0, "no soon read was armed");
+  await page.settle();
   assert.equal(freshness(page).getAttribute("data-state"), "fresh");
 });
 
@@ -86855,3 +86858,38 @@ for (const failed of [true, false]) {
     }
   });
 }
+
+// --- `#617 cold-load-first-paint` ------------------------------------------------------------------
+
+/** Answer every channel read from the server's own copy, as of `ageMs` ago, until put back. */
+function answeredFromCopy(page, ageMs) {
+  const standard = page.timeline;
+  const asOf = new Date(page.clock() - ageMs).toISOString();
+  page.timeline = async (path, options) => {
+    const response = await standard(path, options);
+    const { delta: _delta, ...newest } = JSON.parse(await response.text());
+    return json(200, { ...newest, as_of: asOf, refresh_failed: "The chat service did not answer in time." });
+  };
+  return standard;
+}
+
+test("`#617 cold-load-first-paint`: a page from the server's own copy a minute old says nothing failed", async () => {
+  const page = await threadPage("main");
+  answeredFromCopy(page, 60_000);
+  await reReadChannel(page);
+  assert.notEqual(freshness(page).getAttribute("data-state"), "failed");
+  assert.doesNotMatch(freshness(page).textContent, /failed/i, freshness(page).textContent);
+});
+
+test("`#617 cold-load-first-paint`: after a page from the server's own copy the next read comes in seconds, not at the next poll", async () => {
+  const page = await threadPage("main");
+  const standard = answeredFromCopy(page, 5 * 60_000);
+  await reReadChannel(page);
+  assert.equal(freshness(page).getAttribute("data-state"), "failed");
+  page.timeline = standard;
+  const reads = page.timelineCalls.length;
+  assert.ok(page.expireTimers(3000) > 0, "no read was armed within three seconds");
+  await page.settle();
+  assert.ok(page.timelineCalls.length > reads, "the soon read was not sent");
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh", freshness(page).textContent);
+});
