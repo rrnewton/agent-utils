@@ -1,10 +1,11 @@
 ---
 title: 'voice-agent-tools: answer the voice agent''s read tools from the cache, keep every spoken turn''s text, cumulative recap, pace and channel controls'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-10-28T14:03:59.096441886+00:00
-updated_at: 2026-10-28T14:03:59.096441886+00:00
+updated_at: 2026-10-28T19:51:45.222989365+00:00
+closed_at: 2026-10-28T19:51:45.222989255+00:00
 ---
 
 # Description
