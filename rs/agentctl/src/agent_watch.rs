@@ -65,6 +65,30 @@ const NOTICE_READY_SECONDS: u64 = 10;
 
 type Result<T> = std::result::Result<T, AgentError>;
 
+/// Write one line of the watcher's log to standard error, opening with the UTC time it was
+/// written (`2026-10-28T17:26:00Z`), so a journal or a redirected log says when each line
+/// happened and how long an outage lasted.
+fn log(message: impl std::fmt::Display) {
+    eprintln!(
+        "{} agentctl watch-agents: {message}",
+        log_stamp(SystemTime::now())
+    );
+}
+
+fn log_stamp(at: SystemTime) -> String {
+    let ms = u64::try_from(
+        at.duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    format!(
+        "{}T{}",
+        crate::inbox::utc_date(ms),
+        crate::inbox::utc_clock(ms)
+    )
+}
+
 fn fail(message: impl Into<String>) -> AgentError {
     AgentError::Delivery(message.into())
 }
@@ -508,7 +532,12 @@ fn screen_hash(screen: Option<&str>) -> u64 {
 struct Episode {
     kind: EpisodeKind,
     since: f64,
+    /// The episode's notice was durably queued for its recipient. A notice that is only owed
+    /// (waiting in `pending`, or in a batch whose send has not succeeded) does not count.
     notified: bool,
+    /// When that notice was queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notified_at: Option<f64>,
     /// For `child-done`, the hash of the verdict line: a different verdict is a new turn,
     /// and so a new episode, even when no working pass was seen between the two.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -625,6 +654,9 @@ struct PendingNotice {
     /// For `turn-queued` under `--auto-deliver`, what interrupting the turn did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivery: Option<String>,
+    /// For `child-done`, sent alone: failed sends so far, and when the next may be tried.
+    #[serde(default, skip_serializing_if = "Retry::is_clear")]
+    retry: Retry,
 }
 
 impl PendingNotice {
@@ -638,6 +670,41 @@ impl PendingNotice {
     }
 }
 
+/// The longest wait between two tries of one failed send.
+const MAX_RETRY_SECONDS: f64 = 1800.0;
+
+/// Failed sends of one message, and when it may be tried again: the pass interval after the
+/// first failure, doubling with each further one up to [`MAX_RETRY_SECONDS`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+struct Retry {
+    #[serde(default)]
+    failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl Retry {
+    fn is_clear(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn waiting(&self, now: f64) -> bool {
+        self.at.is_some_and(|at| now < at)
+    }
+
+    /// Record a failed send at `now` and return the seconds until the next try.
+    fn failed(&mut self, now: f64, error: &str, options: &WatchAgentsOptions) -> f64 {
+        let base = options.interval.as_secs_f64().max(1.0);
+        let delay = (base * 2f64.powi(self.failures.min(16) as i32)).min(MAX_RETRY_SECONDS);
+        self.failures += 1;
+        self.at = Some(now + delay);
+        self.error = Some(error.to_owned());
+        delay
+    }
+}
+
 /// A batch of notices whose send was attempted; retried under the same message ID, so a
 /// crash after queueing cannot send it twice.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -647,6 +714,36 @@ struct InflightBatch {
     /// Who the batch is for, when not the coordinator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recipient: Option<String>,
+    #[serde(default, skip_serializing_if = "Retry::is_clear")]
+    retry: Retry,
+    /// How many times the batch moved to a fresh queue ID after repeated failures.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    generation: u32,
+}
+
+/// Batches a recipient may have unconfirmed at once. A second one lets notices past a batch
+/// whose own queue ID is stuck; more would only pile up while the recipient itself is failing,
+/// to arrive as that many messages at once when it recovers.
+const BATCHES_PER_RECIPIENT: usize = 2;
+
+/// Failed sends after which a batch moves to a fresh queue ID, so an ID that can never deliver
+/// (stuck crossing the queue's injection barrier, or every requeue of it in the failed set) does
+/// not keep its notices from the recipient for ever. If the old entry was delivered after all,
+/// the notices are read twice, a lesser harm than never.
+const REBATCH_AFTER_FAILURES: u32 = 4;
+
+/// The queue ID of a batch: derived from its notices, its recipient, and its generation, so a
+/// watcher killed between queueing a batch and persisting that fact re-derives the same ID after
+/// a restart and the recipient's queue recognises it as sent.
+fn batch_id(keys: &[String], recipient: Option<&str>, generation: u32) -> String {
+    let mut text = match recipient {
+        None => keys.join("\n"),
+        Some(recipient) => format!("{recipient}\n{}", keys.join("\n")),
+    };
+    if generation > 0 {
+        text.push_str(&format!("\ngeneration {generation}"));
+    }
+    format!("agent-watch-{:016x}", stable_hash(&text))
 }
 
 /// The persisted watcher state.
@@ -654,7 +751,15 @@ struct InflightBatch {
 struct WatchState {
     agents: BTreeMap<String, AgentMemory>,
     pending: Vec<PendingNotice>,
+    /// The one batch in flight, as builds before #669 watch-notice-delivery kept it. Read and
+    /// moved into `batches`; written as a copy of the oldest batch, so an older build run on
+    /// this state retries that batch under its own ID instead of queueing its notices again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     inflight: Option<InflightBatch>,
+    /// Every batch whose send was attempted and is still unconfirmed. Each is retried on its own
+    /// schedule, so one that cannot be delivered holds up no other notice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    batches: Vec<InflightBatch>,
     /// When the coordinator was last sent a batch.
     last_notice_at: Option<f64>,
     /// When each other recipient was last sent a batch.
@@ -1329,6 +1434,28 @@ fn withdraw_pending(state: &mut WatchState, agent: &str, episode: &Episode) {
     });
 }
 
+/// Whether a notice of `kind` about `agent` is owed: made, and still waiting to be queued for anyone.
+fn owes_notice(state: &WatchState, agent: &str, kind: EpisodeKind) -> bool {
+    state
+        .pending
+        .iter()
+        .any(|notice| notice.agent == agent && notice.kind == kind)
+}
+
+/// Record that `notice` was durably queued: the agent's episode of that kind is reported. Only
+/// here does an episode become `notified`, so the report's `reported` means delivered.
+fn mark_notified(state: &mut WatchState, notice: &PendingNotice, now: f64) {
+    if let Some(episode) = state
+        .agents
+        .get_mut(&notice.agent)
+        .and_then(|memory| memory.episode.as_mut())
+        .filter(|episode| episode.kind == notice.kind)
+    {
+        episode.notified = true;
+        episode.notified_at = Some(now);
+    }
+}
+
 /// The landing-queue holders still waiting on `agent`, as `NAME (NOTE)`, read when its finish
 /// becomes a notice. A `BLOCKED` verdict names nobody. Nothing is released here: the holds are
 /// marked released only once the notice naming them is queued for the coordinator. A queue
@@ -1352,7 +1479,7 @@ fn waiting_holders(options: &WatchAgentsOptions, agent: &str, verdict: &str) -> 
             })
             .collect(),
         Err(error) => {
-            eprintln!("agentctl watch-agents: landing queue: {error}");
+            log(format_args!("landing queue: {error}"));
             Vec::new()
         }
     }
@@ -1373,6 +1500,7 @@ fn held_row(
         "since": episode.since,
         "age_seconds": now - episode.since,
         "reported": episode.notified,
+        "owed": false,
         "due": now - episode.since >= episode_window(episode, options),
         "detail": detail,
     })
@@ -1696,9 +1824,10 @@ fn update_episode(
             ..,
         )) = found
         {
+            let owed = owes_notice(state, &observation.name, kind);
             if let Some(cleared) = memory
                 .episode
-                .take_if(|episode| !(episode.notified && episode.kind == kind))
+                .take_if(|episode| !((episode.notified || owed) && episode.kind == kind))
             {
                 withdraw_pending(state, &observation.name, &cleared);
             }
@@ -1769,12 +1898,17 @@ fn update_episode(
             _ => now,
         },
     };
-    let notified =
-        matches!(&memory.episode, Some(episode) if episode.kind == kind && episode.notified);
+    let notified_at = memory
+        .episode
+        .as_ref()
+        .filter(|episode| episode.kind == kind && episode.notified)
+        .map(|episode| episode.notified_at);
+    let notified = notified_at.is_some();
     let episode = Episode {
         kind,
         since,
         notified,
+        notified_at: notified_at.flatten(),
         turn,
         window,
     };
@@ -1782,9 +1916,12 @@ fn update_episode(
     memory.episode = Some(episode);
     let age = now - since;
     // A check-only pass reports what is due without consuming the episode's one
-    // report: nothing is queued and `notified` is left alone.
-    if due && !notified && !options.check_only {
-        let notice = PendingNotice {
+    // report: nothing is queued and `notified` is left alone. The episode owes at most one
+    // notice, whatever its clock has done since that notice was made: `notified` is set only
+    // once a send of it succeeds ([`mark_notified`]), so until then a later pass must not owe
+    // a second.
+    if due && !notified && !options.check_only && !owes_notice(state, &observation.name, kind) {
+        state.pending.push(PendingNotice {
             agent: observation.name.clone(),
             kind,
             since,
@@ -1800,21 +1937,8 @@ fn update_episode(
                 .filter(|recipient| *recipient != options.coordinator),
             redirected: false,
             delivery: None,
-        };
-        if !state
-            .pending
-            .iter()
-            .any(|pending| pending.key() == notice.key())
-            && !state
-                .inflight
-                .as_ref()
-                .is_some_and(|batch| batch.keys.contains(&notice.key()))
-        {
-            state.pending.push(notice);
-        }
-        if let Some(episode) = &mut memory.episode {
-            episode.notified = true;
-        }
+            retry: Retry::default(),
+        });
     }
     let row = memory.episode.as_ref().map(|episode| {
         json!({
@@ -1824,6 +1948,7 @@ fn update_episode(
             "since": episode.since,
             "age_seconds": age,
             "reported": episode.notified,
+            "owed": false,
             "due": due,
             "detail": detail,
         })
@@ -1832,9 +1957,11 @@ fn update_episode(
     row
 }
 
-/// Send the pending notices, one message per recipient, as the rate limit allows. Returns the
-/// report row of the first batch, with any later batches of the same pass under `more`; on
-/// failure the batch stays in flight and is retried next pass.
+/// Send the pending notices other than finishes, as the rate limit allows. Every batch whose
+/// earlier send failed is tried again once its own backoff has passed, and the notices in no
+/// batch go out in a new batch per recipient, so a batch that cannot be delivered holds up no
+/// other notice, not even a later one for the same recipient. Returns the report row of the
+/// first send, with any later sends of the same pass under `more`; with nothing sent, why.
 fn flush_notices(
     state: &mut WatchState,
     notifier: &mut dyn Notifier,
@@ -1844,17 +1971,51 @@ fn flush_notices(
     if options.check_only {
         return json!({"sent": false, "reason": "check only", "waiting": state.pending.len()});
     }
-    let mut first = flush_batch(state, notifier, now, options);
-    let mut more = Vec::new();
-    let mut last = first.clone();
-    while last["sent"] == true || last["redirected"] == true {
-        last = flush_batch(state, notifier, now, options);
-        if last["sent"] == true || last["reason"] != "nothing to report" {
-            more.push(last.clone());
-        }
+    let mut rows = Vec::new();
+    let retries: Vec<String> = state
+        .batches
+        .iter()
+        .filter(|batch| !batch.retry.waiting(now))
+        .map(|batch| batch.message_id.clone())
+        .collect();
+    for message_id in retries {
+        rows.extend(send_batch(state, notifier, &message_id, now, options));
     }
-    if !more.is_empty() {
-        first["more"] = json!(more);
+    // Each new batch takes every unbatched notice for its recipient, and a notice changes
+    // recipient at most once (a manager's failed batch is redirected to the coordinator), so
+    // this ends.
+    while let Some(message_id) = open_batch(state, now, options) {
+        rows.extend(send_batch(state, notifier, &message_id, now, options));
+    }
+    if rows.is_empty() {
+        let batched: Vec<&String> = state
+            .batches
+            .iter()
+            .flat_map(|batch| batch.keys.iter())
+            .collect();
+        if state.pending.iter().any(|notice| {
+            notice.kind != EpisodeKind::ChildDone && !batched.contains(&&notice.key())
+        }) {
+            return json!({"sent": false, "reason": "rate limited", "waiting": state.pending.len()});
+        }
+        if let Some(retry_at) = state
+            .batches
+            .iter()
+            .filter_map(|batch| batch.retry.at)
+            .reduce(f64::min)
+        {
+            return json!({
+                "sent": false,
+                "reason": "waiting to retry a failed send",
+                "retry_in_seconds": (retry_at - now).max(0.0),
+                "waiting": state.pending.len(),
+            });
+        }
+        return json!({"sent": false, "reason": "nothing to report"});
+    }
+    let mut first = rows.remove(0);
+    if !rows.is_empty() {
+        first["more"] = json!(rows);
     }
     first
 }
@@ -1873,59 +2034,78 @@ fn rate_limited(
     last.is_some_and(|last| now - last < options.min_notice_interval.as_secs_f64())
 }
 
-/// Send one batch: the one in flight, else every pending notice for the first recipient, in
-/// the order notices became due, whose rate limit allows a message.
-fn flush_batch(
+/// Start a batch of every pending notice, other than finishes, that is in no batch yet and is
+/// for the first recipient, in the order notices became due, whose rate limit allows a message
+/// and that has fewer than [`BATCHES_PER_RECIPIENT`] batches unconfirmed. Returns its message
+/// ID, or `None` when no recipient may be sent one now.
+fn open_batch(state: &mut WatchState, now: f64, options: &WatchAgentsOptions) -> Option<String> {
+    let batched: Vec<String> = state
+        .batches
+        .iter()
+        .flat_map(|batch| batch.keys.iter().cloned())
+        .collect();
+    let open = |notice: &PendingNotice| {
+        notice.kind != EpisodeKind::ChildDone && !batched.contains(&notice.key())
+    };
+    let mut recipients: Vec<Option<String>> = Vec::new();
+    for notice in state.pending.iter().filter(|notice| open(notice)) {
+        if !recipients.contains(&notice.recipient) {
+            recipients.push(notice.recipient.clone());
+        }
+    }
+    let unconfirmed = |recipient: &Option<String>| {
+        state
+            .batches
+            .iter()
+            .filter(|batch| batch.recipient == *recipient)
+            .count()
+    };
+    let recipient = recipients.into_iter().find(|recipient| {
+        !rate_limited(state, recipient.as_deref(), now, options)
+            && unconfirmed(recipient) < BATCHES_PER_RECIPIENT
+    })?;
+    let keys: Vec<String> = state
+        .pending
+        .iter()
+        .filter(|notice| open(notice) && notice.recipient == recipient)
+        .map(PendingNotice::key)
+        .collect();
+    let message_id = batch_id(&keys, recipient.as_deref(), 0);
+    state.batches.push(InflightBatch {
+        message_id: message_id.clone(),
+        keys,
+        recipient,
+        retry: Retry::default(),
+        generation: 0,
+    });
+    Some(message_id)
+}
+
+/// Send the batch `message_id` and return its report row, or `None` when every notice in it
+/// was withdrawn since it was made (the batch is dropped). On success its notices are
+/// delivered and their episodes reported; on failure it stays, to be tried again after its
+/// backoff, unless it was for a manager, whose notices go to the coordinator instead.
+fn send_batch(
     state: &mut WatchState,
     notifier: &mut dyn Notifier,
+    message_id: &str,
     now: f64,
     options: &WatchAgentsOptions,
-) -> Value {
-    let batched = |notice: &PendingNotice| notice.kind != EpisodeKind::ChildDone;
-    if state.inflight.is_none() {
-        if !state.pending.iter().any(batched) {
-            return json!({"sent": false, "reason": "nothing to report"});
-        }
-        let mut recipients: Vec<Option<String>> = Vec::new();
-        for notice in state.pending.iter().filter(|notice| batched(notice)) {
-            if !recipients.contains(&notice.recipient) {
-                recipients.push(notice.recipient.clone());
-            }
-        }
-        let Some(recipient) = recipients
-            .into_iter()
-            .find(|recipient| !rate_limited(state, recipient.as_deref(), now, options))
-        else {
-            return json!({"sent": false, "reason": "rate limited", "waiting": state.pending.len()});
-        };
-        // The batch ID is derived from the notices themselves, so a watcher killed
-        // between queueing a batch and persisting that fact re-derives the same ID
-        // after a restart and the recipient's queue recognises it as sent.
-        let keys: Vec<String> = state
-            .pending
-            .iter()
-            .filter(|notice| batched(notice) && notice.recipient == recipient)
-            .map(PendingNotice::key)
-            .collect();
-        let digest = match recipient.as_deref() {
-            None => stable_hash(&keys.join("\n")),
-            Some(recipient) => stable_hash(&format!("{recipient}\n{}", keys.join("\n"))),
-        };
-        state.inflight = Some(InflightBatch {
-            message_id: format!("agent-watch-{digest:016x}"),
-            keys,
-            recipient,
-        });
-    }
-    let batch = state.inflight.clone().expect("batch prepared");
-    let notices: Vec<&PendingNotice> = state
+) -> Option<Value> {
+    let index = state
+        .batches
+        .iter()
+        .position(|batch| batch.message_id == message_id)?;
+    let batch = state.batches[index].clone();
+    let notices: Vec<PendingNotice> = state
         .pending
         .iter()
         .filter(|notice| batch.keys.contains(&notice.key()))
+        .cloned()
         .collect();
     if notices.is_empty() {
-        state.inflight = None;
-        return json!({"sent": false, "reason": "nothing to report"});
+        state.batches.remove(index);
+        return None;
     }
     let lines = notices
         .iter()
@@ -1939,10 +2119,13 @@ fn flush_batch(
     let recipient = batch.recipient.as_deref().unwrap_or(&options.coordinator);
     match notifier.notify(recipient, &text, &batch.message_id) {
         Ok(outcome) => {
+            for notice in &notices {
+                mark_notified(state, notice, now);
+            }
             state
                 .pending
                 .retain(|notice| !batch.keys.contains(&notice.key()));
-            state.inflight = None;
+            state.batches.remove(index);
             match batch.recipient.as_deref() {
                 None => state.last_notice_at = Some(now),
                 Some(other) => {
@@ -1953,7 +2136,10 @@ fn flush_batch(
             if let Some(other) = batch.recipient.as_deref() {
                 row["recipient"] = json!(other);
             }
-            row
+            if batch.retry.failures > 0 {
+                row["failures_before"] = json!(batch.retry.failures);
+            }
+            Some(row)
         }
         Err(error) => {
             // A manager that could not take its batch (stopped, renamed, paused since) must not
@@ -1967,25 +2153,42 @@ fn flush_batch(
                         notice.redirected = true;
                     }
                 }
-                state.inflight = None;
-                return json!({
+                state.batches.remove(index);
+                return Some(json!({
                     "sent": false,
                     "message_id": batch.message_id,
                     "recipient": manager,
                     "reason": format!("{error}; its notices go to the coordinator instead"),
                     "redirected": true,
                     "waiting": state.pending.len(),
-                });
+                }));
             }
-            json!({"sent": false, "message_id": batch.message_id, "reason": error.to_string(), "waiting": state.pending.len()})
+            let reason = error.to_string();
+            let kept = &mut state.batches[index];
+            let delay = kept.retry.failed(now, &reason, options);
+            let mut row = json!({
+                "sent": false,
+                "message_id": batch.message_id,
+                "reason": reason,
+                "failures": kept.retry.failures,
+                "retry_in_seconds": delay,
+                "waiting": state.pending.len(),
+            });
+            if kept.retry.failures % REBATCH_AFTER_FAILURES == 0 {
+                kept.generation += 1;
+                kept.message_id = batch_id(&kept.keys, kept.recipient.as_deref(), kept.generation);
+                row["next_message_id"] = json!(kept.message_id);
+            }
+            Some(row)
         }
     }
 }
 
 /// Send each finished child's notice as a message of its own, every pass: a finish is not
-/// batched with other kinds, held by the rate limit, or counted against it. Each message ID is
-/// derived from its notice, so a retry after a failure or a restart is recognised by the
-/// coordinator's queue instead of delivered twice. Returns one report row per notice tried.
+/// batched with other kinds, held by the rate limit, or counted against it. A failed send is
+/// tried again after its own backoff. Each message ID is derived from its notice, so a retry
+/// after a failure or a restart is recognised by the coordinator's queue instead of delivered
+/// twice. Returns one report row per notice tried.
 fn flush_child_done(
     state: &mut WatchState,
     notifier: &mut dyn Notifier,
@@ -1998,7 +2201,7 @@ fn flush_child_done(
     let due: Vec<PendingNotice> = state
         .pending
         .iter()
-        .filter(|notice| notice.kind == EpisodeKind::ChildDone)
+        .filter(|notice| notice.kind == EpisodeKind::ChildDone && !notice.retry.waiting(now))
         .cloned()
         .collect();
     let mut rows = Vec::new();
@@ -2039,6 +2242,7 @@ fn flush_child_done(
         }
         match sent {
             Ok(outcome) => {
+                mark_notified(state, &notice, now);
                 state.pending.retain(|pending| pending.key() != key);
                 // The holders this notice named have now been told about; a later finish of
                 // the same agent must not name them again.
@@ -2048,17 +2252,83 @@ fn flush_child_done(
                     if let Err(error) =
                         crate::landing_queue::release_after(path, &notice.agent, &key, now)
                     {
-                        eprintln!("agentctl watch-agents: landing queue: {error}");
+                        log(format_args!("landing queue: {error}"));
                     }
                 }
                 rows.push(json!({"agent": notice.agent, "sent": true, "message_id": message_id, "outcome": outcome, "next": notice.next}));
             }
             Err(error) => {
-                rows.push(json!({"agent": notice.agent, "sent": false, "message_id": message_id, "reason": error.to_string()}));
+                let reason = error.to_string();
+                let mut row = json!({"agent": notice.agent, "sent": false, "message_id": message_id, "reason": reason});
+                if let Some(pending) = state
+                    .pending
+                    .iter_mut()
+                    .find(|pending| pending.key() == key)
+                {
+                    row["retry_in_seconds"] = json!(pending.retry.failed(now, &reason, options));
+                    row["failures"] = json!(pending.retry.failures);
+                }
+                rows.push(row);
             }
         }
     }
     rows
+}
+
+/// Whom to tell about `agent` this pass, `None` for the coordinator: its nearest reachable
+/// manager, as the probe found it, unless that manager cannot act on a notice now
+/// ([`takes_notices`]), in which case the walk goes on up the managed_by chain, each step being
+/// the skipped manager's own nearest reachable manager. A cycle, or a skipped manager this pass
+/// did not observe, ends at the coordinator.
+fn recipient_for(
+    state: &WatchState,
+    observations: &[Observation],
+    agent: &str,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Option<String> {
+    let nearest = |name: &str| {
+        observations
+            .iter()
+            .find(|row| row.name == name)
+            .and_then(|row| row.recipient.clone())
+            .filter(|recipient| *recipient != options.coordinator)
+    };
+    let mut seen = vec![agent.to_owned()];
+    let mut recipient = nearest(agent);
+    while let Some(manager) = recipient {
+        if seen.contains(&manager) {
+            return None;
+        }
+        if state
+            .agents
+            .get(&manager)
+            .is_none_or(|memory| takes_notices(memory, now, options))
+        {
+            return Some(manager);
+        }
+        recipient = nearest(&manager);
+        seen.push(manager);
+    }
+    None
+}
+
+/// Whether a manager can read a notice about one of its agents. One the watcher is itself
+/// reporting at an approval prompt, unreachable, stopped by a harness failure, or inside a turn
+/// its input waits behind cannot: the notice would sit in its queue unread. An idle manager,
+/// with or without a verdict, still takes them, since a queued message starts its next turn and
+/// it may be waiting on the very agents the notices are about.
+fn takes_notices(memory: &AgentMemory, now: f64, options: &WatchAgentsOptions) -> bool {
+    let Some(episode) = memory.episode.as_ref() else {
+        return true;
+    };
+    match episode.kind {
+        EpisodeKind::ApprovalPrompt
+        | EpisodeKind::Dead
+        | EpisodeKind::TurnQueued
+        | EpisodeKind::Stuck(_) => now - episode.since < episode_window(episode, options),
+        _ => true,
+    }
 }
 
 /// Who is told about a notice: the agent's nearest reachable manager, as the pass decided it,
@@ -2075,6 +2345,17 @@ fn watch_agents_once(
     now: f64,
     options: &WatchAgentsOptions,
 ) -> Value {
+    // A state written before batches were tracked one by one holds at most one, and a newer
+    // state holds a copy of its oldest batch there.
+    if let Some(batch) = state.inflight.take() {
+        if !state
+            .batches
+            .iter()
+            .any(|known| known.message_id == batch.message_id)
+        {
+            state.batches.push(batch);
+        }
+    }
     let (observations, probe_error) = match probe.observe() {
         Ok(observations) => (observations, Value::Null),
         Err(error) => (Vec::new(), json!(error.to_string())),
@@ -2107,7 +2388,8 @@ fn watch_agents_once(
                 || memory.episode.as_ref().is_some_and(|episode| {
                     !(episode.kind == EpisodeKind::ChildDone
                         && episode.notified
-                        && now - episode.since > FINISHED_MEMORY_SECONDS)
+                        && now - episode.notified_at.unwrap_or(episode.since)
+                            > FINISHED_MEMORY_SECONDS)
                 })
         });
     }
@@ -2158,29 +2440,42 @@ fn watch_agents_once(
                 recipient: None,
                 redirected: false,
                 delivery: Some(outcome),
+                retry: Retry::default(),
             });
         }
     }
     // Whom to tell is decided again each pass from the latest observation, so a notice still
-    // waiting does not go to a manager that has since stopped, paused or lost the agent.
+    // waiting does not go to a manager that has since stopped, paused, lost the agent, or
+    // stopped taking notices.
     let in_flight: Vec<String> = state
-        .inflight
-        .as_ref()
-        .map(|batch| batch.keys.clone())
-        .unwrap_or_default();
-    for notice in &mut state.pending {
+        .batches
+        .iter()
+        .flat_map(|batch| batch.keys.iter().cloned())
+        .collect();
+    let mut routes: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for notice in &state.pending {
         // An auto-interrupt is the coordinator's news, whoever manages the agent.
+        if notice.redirected
+            || notice.kind == EpisodeKind::AutoInterrupt
+            || in_flight.contains(&notice.key())
+            || routes.contains_key(&notice.agent)
+        {
+            continue;
+        }
+        if observations.iter().any(|row| row.name == notice.agent) {
+            let route = recipient_for(state, &observations, &notice.agent, now, options);
+            routes.insert(notice.agent.clone(), route);
+        }
+    }
+    for notice in &mut state.pending {
         if notice.redirected
             || notice.kind == EpisodeKind::AutoInterrupt
             || in_flight.contains(&notice.key())
         {
             continue;
         }
-        if let Some(observation) = observations.iter().find(|row| row.name == notice.agent) {
-            notice.recipient = observation
-                .recipient
-                .clone()
-                .filter(|recipient| *recipient != options.coordinator);
+        if let Some(route) = routes.get(&notice.agent) {
+            notice.recipient = route.clone();
         }
     }
     // A recipient's last send matters only while it can still rate-limit the next one.
@@ -2191,6 +2486,23 @@ fn watch_agents_once(
     let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
     let child_done = flush_child_done(state, notifier, now, options);
     let notice = flush_notices(state, notifier, now, options);
+    // The episode rows were made before this pass's sends: `reported` means delivered, so it is
+    // read again now, and `owed` names a notice made but still waiting to be queued.
+    for row in &mut episodes {
+        let (Some(agent), Some(kind)) = (row["agent"].as_str(), row["kind"].as_str()) else {
+            continue;
+        };
+        let agent = agent.to_owned();
+        if let Some(episode) = state
+            .agents
+            .get(&agent)
+            .and_then(|memory| memory.episode.as_ref())
+            .filter(|episode| episode.kind.as_str() == kind)
+        {
+            row["reported"] = json!(episode.notified);
+            row["owed"] = json!(owes_notice(state, &agent, episode.kind));
+        }
+    }
     // Agents whose view is scrolled up cannot be judged stalled or idle; say which, and do
     // not call the pass ok, so a quiet report is not read as a clean bill.
     let scrolled: Vec<Value> = observations
@@ -2402,7 +2714,7 @@ pub fn watch_agents(
                 match notifier.follow_observed_session(name) {
                     Ok(changed) => session_follows.push(json!({"agent":name,"changed":changed})),
                     Err(error) => {
-                        eprintln!("agentctl watch-agents: {name} session follow: {error}");
+                        log(format_args!("{name} session follow: {error}"));
                         session_follows.push(json!({"agent":name,"error":error.to_string()}));
                     }
                 }
@@ -2414,36 +2726,63 @@ pub fn watch_agents(
             report["recovery"] = recover_due(&report, notifier, now, options)?;
         }
         if let Some(error) = report["probe_error"].as_str() {
-            eprintln!("agentctl watch-agents: {error}");
+            log(error);
         }
         if let Some(names) = report["unchecked"]
             .as_array()
             .filter(|names| !names.is_empty())
         {
             let names: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
-            eprintln!(
-                "agentctl watch-agents: the pass budget ran out before {} agent(s) were checked: {}",
+            log(format_args!(
+                "the pass budget ran out before {} agent(s) were checked: {}",
                 names.len(),
                 names.join(", ")
-            );
+            ));
         }
         for row in report["episodes"].as_array().into_iter().flatten() {
-            if row["reported"] == true {
-                eprintln!(
-                    "agentctl watch-agents: {} {}: {}",
-                    row["agent"].as_str().unwrap_or("?"),
-                    row["kind"].as_str().unwrap_or("?"),
-                    row["detail"].as_str().unwrap_or("")
-                );
+            // A notice made but still waiting to be queued says so, so the log never reads as
+            // delivered what is still owed.
+            let state = if row["reported"] == true {
+                ""
+            } else if row["owed"] == true {
+                " (notice owed, still undelivered)"
+            } else {
+                continue;
+            };
+            log(format_args!(
+                "{} {}: {}{state}",
+                row["agent"].as_str().unwrap_or("?"),
+                row["kind"].as_str().unwrap_or("?"),
+                row["detail"].as_str().unwrap_or("")
+            ));
+        }
+        let notice = &report["notice"];
+        let sends = std::iter::once(notice)
+            .chain(notice["more"].as_array().into_iter().flatten())
+            .chain(report["child_done"].as_array().into_iter().flatten());
+        for row in sends.filter(|row| row["sent"] == false && row["message_id"].is_string()) {
+            let mut line = format!(
+                "notice {} not delivered: {}",
+                row["message_id"].as_str().unwrap_or("?"),
+                row["reason"].as_str().unwrap_or("?")
+            );
+            if let Some(delay) = row["retry_in_seconds"].as_f64() {
+                line.push_str(&format!(
+                    "; failure {}, next try in {} s",
+                    row["failures"].as_u64().unwrap_or(0),
+                    delay.round()
+                ));
             }
+            log(line);
         }
         if let Some((state_path, report_path)) = paths.as_ref() {
+            state.inflight = state.batches.first().cloned();
             let state_value =
                 serde_json::to_value(&state).map_err(|error| fail(error.to_string()))?;
             if let Err(error) = write_json_file(state_path, &state_value)
                 .and_then(|()| write_json_file(report_path, &report))
             {
-                eprintln!("agentctl watch-agents: {error}");
+                log(error);
             }
         }
         if options.once {
@@ -2542,7 +2881,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
 
     fn progress(&self, line: &str) {
         if self.verbose {
-            eprintln!("agentctl watch-agents: {line}");
+            log(line);
         }
     }
 
@@ -3294,6 +3633,8 @@ mod tests {
         sent: Vec<(String, String, String)>,
         attempts: Vec<String>,
         fail_attempts: usize,
+        /// Every send whose text contains one of these fails, however often it is tried.
+        fail_containing: Vec<String>,
         urgent: Vec<String>,
         interrupted: Vec<String>,
         press_nothing: bool,
@@ -3324,6 +3665,15 @@ mod tests {
 
         fn notify(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
             self.attempts.push(message_id.to_owned());
+            if self
+                .fail_containing
+                .iter()
+                .any(|part| text.contains(part.as_str()))
+            {
+                return Err(fail(
+                    "the notice is still in flight in the coordinator's queue; will recheck",
+                ));
+            }
             if self.fail_attempts > 0 {
                 self.fail_attempts -= 1;
                 return Err(fail("coordinator unreachable"));
@@ -3416,7 +3766,8 @@ mod tests {
             vec![
                 managed("worker-a", Some("lieutenant")),
                 managed("worker-b", Some("lieutenant")),
-                managed("lieutenant", None),
+                // At work, so it can act on its workers' notices.
+                observation("lieutenant", "working", Some("◆ dispatching the workers\n")),
                 // A recipient that names the coordinator is the coordinator's batch.
                 managed("loner", Some("coordinator")),
             ]
@@ -3434,7 +3785,7 @@ mod tests {
             .collect();
         assert!(to["lieutenant"].contains("worker-a") && to["lieutenant"].contains("worker-b"));
         assert!(!to["lieutenant"].contains("loner"));
-        assert!(to["coordinator"].contains("- lieutenant:") && to["coordinator"].contains("loner"));
+        assert!(to["coordinator"].contains("loner") && !to["coordinator"].contains("worker-"));
         assert_ne!(notifier.sent[0].2, notifier.sent[1].2, "distinct batch IDs");
         assert_eq!(due["notice"]["more"][0]["sent"], true, "{due}");
         assert_eq!(state.last_notice_by.get("lieutenant"), Some(&300.0));
@@ -3470,7 +3821,7 @@ mod tests {
             notifier.sent[0].0, "coordinator",
             "the coordinator heard instead"
         );
-        assert!(state.inflight.is_none() && state.pending.is_empty());
+        assert!(state.batches.is_empty() && state.pending.is_empty());
         assert_eq!(due["notice"]["redirected"], true, "{due}");
         // The redirected notice stays with the coordinator; nothing is resent to anyone.
         pass(&mut probe, &mut notifier, &mut state, 400.0, &options);
@@ -4614,6 +4965,421 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    // ---- #669 watch-notice-delivery: delivery accounting, retries, routing -----------------
+
+    #[test]
+    fn a_notice_counts_as_reported_only_once_queued_and_a_failed_send_backs_off() {
+        let options = options();
+        let rounds = (0..8)
+            .map(|_| vec![observation("worker", "idle", Some(PROMPT_SCREEN))])
+            .collect();
+        let mut probe = ScriptedProbe(rounds);
+        let mut notifier = RecordingNotifier {
+            fail_attempts: 3,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let failed = pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+        assert_eq!(notifier.attempts.len(), 1, "{failed}");
+        assert_eq!(
+            failed["episodes"][0]["reported"], false,
+            "a failed send is not a report: {failed}"
+        );
+        assert_eq!(failed["episodes"][0]["owed"], true, "{failed}");
+        assert_eq!(failed["notice"]["retry_in_seconds"], 60.0, "{failed}");
+        assert!(!state.agents["worker"].episode.as_ref().unwrap().notified);
+        // Each further failure doubles the wait: tries at 360 and 480, then 720.
+        for (at, attempts) in [(330.0, 1), (360.0, 2), (420.0, 2), (480.0, 3), (700.0, 3)] {
+            let report = pass(&mut probe, &mut notifier, &mut state, at, &options);
+            assert_eq!(notifier.attempts.len(), attempts, "at {at}: {report}");
+            assert_eq!(
+                report["episodes"][0]["reported"], false,
+                "at {at}: {report}"
+            );
+        }
+        let delivered = pass(&mut probe, &mut notifier, &mut state, 720.0, &options);
+        assert_eq!(notifier.sent.len(), 1, "{delivered}");
+        assert_eq!(delivered["notice"]["failures_before"], 3, "{delivered}");
+        assert!(notifier
+            .attempts
+            .iter()
+            .all(|id| *id == notifier.attempts[0]));
+        assert_eq!(delivered["episodes"][0]["reported"], true, "{delivered}");
+        assert_eq!(delivered["episodes"][0]["owed"], false, "{delivered}");
+        assert!(state.pending.is_empty() && state.batches.is_empty());
+        pass(&mut probe, &mut notifier, &mut state, 780.0, &options);
+        assert_eq!(
+            notifier.attempts.len(),
+            4,
+            "a delivered episode is not reported again"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_cannot_be_delivered_holds_up_no_later_notice() {
+        let options = options();
+        let one = || observation("one", "idle", Some(PROMPT_SCREEN));
+        let two = || observation("two", "idle", Some(PROMPT_SCREEN));
+        let mut probe = ScriptedProbe(vec![
+            vec![one()],
+            vec![one()],
+            vec![one(), two()],
+            vec![one(), two()],
+        ]);
+        let mut notifier = RecordingNotifier {
+            fail_containing: vec!["- one:".to_owned()],
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+        assert_eq!(state.batches.len(), 1, "the failed batch is kept");
+        pass(&mut probe, &mut notifier, &mut state, 360.0, &options);
+        // `two` came due at 660, while `one`'s batch still could not be delivered.
+        let report = pass(&mut probe, &mut notifier, &mut state, 660.0, &options);
+        assert_eq!(notifier.sent.len(), 1, "{report}");
+        let (to, text, _) = &notifier.sent[0];
+        assert_eq!(to, "coordinator");
+        assert!(
+            text.contains("- two:") && !text.contains("- one:"),
+            "{text}"
+        );
+        let rows = report["episodes"].as_array().unwrap();
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row["agent"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row("two")["reported"], true, "{report}");
+        assert_eq!(row("one")["reported"], false, "{report}");
+        assert_eq!(row("one")["owed"], true, "{report}");
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.batches.len(), 1);
+    }
+
+    #[test]
+    fn a_manager_that_cannot_read_a_notice_passes_it_up_the_chain() {
+        // worker -> lieutenant -> captain -> the coordinator. Returns who heard about `worker`.
+        let route = |lieutenant: &str, captain: &str| -> String {
+            let mut options = options();
+            options.idle = Duration::from_secs(60);
+            let round = || {
+                vec![
+                    Observation {
+                        recipient: Some("lieutenant".to_owned()),
+                        ..observation("worker", "idle", Some(PROMPT_SCREEN))
+                    },
+                    Observation {
+                        recipient: Some("captain".to_owned()),
+                        ..observation("lieutenant", "idle", Some(lieutenant))
+                    },
+                    observation(
+                        "captain",
+                        if captain == PROMPT_SCREEN {
+                            "idle"
+                        } else {
+                            "working"
+                        },
+                        Some(captain),
+                    ),
+                ]
+            };
+            let mut probe = ScriptedProbe(vec![round(), round()]);
+            let mut notifier = RecordingNotifier::default();
+            let mut state = WatchState::default();
+            pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+            let report = pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+            let heard: Vec<&String> = notifier
+                .sent
+                .iter()
+                .filter(|(_, text, _)| text.contains("- worker:"))
+                .map(|(to, ..)| to)
+                .collect();
+            assert_eq!(heard.len(), 1, "{report}");
+            heard[0].clone()
+        };
+        let working = "◆ dispatching the workers\n";
+        assert_eq!(
+            route(working, working),
+            "lieutenant",
+            "a working manager hears"
+        );
+        assert_eq!(
+            route(IDLE_SCREEN, working),
+            "lieutenant",
+            "a manager idle without a verdict may be waiting on the worker"
+        );
+        assert_eq!(
+            route(DONE_SCREEN, working),
+            "lieutenant",
+            "a manager that ended its turn with a verdict may be waiting on the worker too"
+        );
+        assert_eq!(
+            route(PROMPT_SCREEN, working),
+            "captain",
+            "a manager stuck at a prompt cannot read the notice"
+        );
+        assert_eq!(
+            route(PROMPT_SCREEN, PROMPT_SCREEN),
+            "coordinator",
+            "past every manager that cannot read it, the coordinator"
+        );
+    }
+
+    #[test]
+    fn an_owed_notice_is_not_owed_twice_when_its_episode_clock_moves() {
+        let mut options = options();
+        options.idle = Duration::from_secs(60);
+        options.min_notice_interval = Duration::from_secs(600);
+        let moved = "◆ finished the thing, and said a little more\n❯\n";
+        let mut probe = ScriptedProbe(vec![
+            vec![observation("asker", "idle", Some(PROMPT_SCREEN))],
+            vec![
+                observation("asker", "idle", Some(PROMPT_SCREEN)),
+                observation("idler", "idle", Some(IDLE_SCREEN)),
+            ],
+            vec![
+                observation("asker", "idle", Some(PROMPT_SCREEN)),
+                observation("idler", "idle", Some(IDLE_SCREEN)),
+            ],
+            vec![
+                observation("asker", "idle", Some(PROMPT_SCREEN)),
+                observation("idler", "idle", Some(moved)),
+            ],
+            vec![
+                observation("asker", "idle", Some(PROMPT_SCREEN)),
+                observation("idler", "idle", Some(moved)),
+            ],
+            vec![
+                observation("asker", "idle", Some(PROMPT_SCREEN)),
+                observation("idler", "idle", Some(moved)),
+            ],
+            vec![
+                observation("asker", "idle", Some(PROMPT_SCREEN)),
+                observation("idler", "idle", Some(moved)),
+            ],
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        // `asker` is sent at 300, which opens the rate-limit window to 900.
+        pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
+        // `idler` comes due at 360 and waits; its screen moves at 420, so its clock moves, and
+        // it comes due again at 480, all inside the window.
+        pass(&mut probe, &mut notifier, &mut state, 360.0, &options);
+        pass(&mut probe, &mut notifier, &mut state, 420.0, &options);
+        pass(&mut probe, &mut notifier, &mut state, 480.0, &options);
+        pass(&mut probe, &mut notifier, &mut state, 600.0, &options);
+        assert_eq!(state.pending.len(), 1, "{:?}", state.pending);
+        pass(&mut probe, &mut notifier, &mut state, 900.0, &options);
+        assert_eq!(notifier.sent.len(), 2);
+        assert_eq!(
+            notifier.sent[1].1.matches("- idler:").count(),
+            1,
+            "{}",
+            notifier.sent[1].1
+        );
+    }
+
+    #[test]
+    fn a_batch_in_flight_in_an_older_state_file_is_retried_under_its_id() {
+        let options = options();
+        let state_json = json!({
+            "agents": {"worker": {"episode": {"kind": "approval-prompt", "since": 0.0, "notified": true},
+                                  "screen_hash": 0, "screen_changed_at": 0.0}},
+            "pending": [{"agent": "worker", "kind": "approval-prompt", "since": 0.0,
+                         "detail": "Would you like to run the following command?"}],
+            "inflight": {"message_id": "agent-watch-0123456789abcdef", "keys": ["worker:approval-prompt:0"]},
+            "last_notice_at": null,
+        });
+        let mut state: WatchState = serde_json::from_value(state_json).unwrap();
+        let mut probe = ScriptedProbe(vec![vec![observation(
+            "worker",
+            "idle",
+            Some(PROMPT_SCREEN),
+        )]]);
+        let mut notifier = RecordingNotifier::default();
+        pass(&mut probe, &mut notifier, &mut state, 400.0, &options);
+        assert_eq!(
+            notifier.attempts,
+            vec!["agent-watch-0123456789abcdef".to_owned()]
+        );
+        assert!(state.pending.is_empty() && state.batches.is_empty() && state.inflight.is_none());
+        let saved = serde_json::to_value(&state).unwrap();
+        assert!(saved.get("inflight").is_none(), "{saved}");
+    }
+
+    #[test]
+    fn a_recipient_that_is_down_collects_later_notices_into_one_batch() {
+        let options = options();
+        let names = ["a", "b", "c", "d"];
+        // Agent N first shows its prompt at pass N, so one more comes due every pass.
+        let rounds: Vec<Vec<Observation>> = (0..40)
+            .map(|index| {
+                names
+                    .iter()
+                    .take((index + 1).min(names.len()))
+                    .map(|name| observation(name, "idle", Some(PROMPT_SCREEN)))
+                    .collect()
+            })
+            .collect();
+        let mut probe = ScriptedProbe(rounds);
+        let mut notifier = RecordingNotifier {
+            fail_attempts: usize::MAX,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        for index in 0..4 {
+            pass(
+                &mut probe,
+                &mut notifier,
+                &mut state,
+                300.0 * index as f64,
+                &options,
+            );
+        }
+        for index in 4..8 {
+            pass(
+                &mut probe,
+                &mut notifier,
+                &mut state,
+                300.0 * index as f64,
+                &options,
+            );
+            assert!(
+                state.batches.len() <= BATCHES_PER_RECIPIENT,
+                "{:?}",
+                state.batches
+            );
+        }
+        // The recipient recovers: each batch arrives once its backoff is over, and the
+        // notices held back meanwhile go out together.
+        notifier.fail_attempts = 0;
+        for index in 8..30 {
+            pass(
+                &mut probe,
+                &mut notifier,
+                &mut state,
+                300.0 * index as f64,
+                &options,
+            );
+        }
+        assert!(
+            notifier.sent.len() <= BATCHES_PER_RECIPIENT + 1,
+            "{:?}",
+            notifier.sent
+        );
+        for name in names {
+            let told = notifier
+                .sent
+                .iter()
+                .filter(|(_, text, _)| text.contains(&format!("- {name}:")))
+                .count();
+            assert_eq!(told, 1, "{name}: {:?}", notifier.sent);
+        }
+        assert!(state.pending.is_empty() && state.batches.is_empty());
+    }
+
+    #[test]
+    fn a_batch_whose_queue_id_never_delivers_moves_to_a_fresh_one() {
+        let options = options();
+        let rounds = (0..8)
+            .map(|_| vec![observation("worker", "idle", Some(PROMPT_SCREEN))])
+            .collect();
+        let mut probe = ScriptedProbe(rounds);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        // The first ID is stuck in the recipient's queue; any other ID is accepted.
+        let stuck = batch_id(&["worker:approval-prompt:0".to_owned()], None, 0);
+        struct StuckId<'a>(&'a mut RecordingNotifier, String);
+        impl Notifier for StuckId<'_> {
+            fn notify(&mut self, to: &str, text: &str, message_id: &str) -> Result<String> {
+                if message_id == self.1 {
+                    self.0.attempts.push(message_id.to_owned());
+                    return Err(fail("the notice is still in flight; will recheck"));
+                }
+                self.0.notify(to, text, message_id)
+            }
+        }
+        let mut wrapped = StuckId(&mut notifier, stuck.clone());
+        // Failures at 300, 360, 480 and 720; the next try, at 1200, uses a fresh ID.
+        for at in [300.0, 360.0, 480.0, 720.0, 1_200.0] {
+            watch_agents_once(&mut probe, &mut wrapped, &mut state, at, &options);
+        }
+        assert_eq!(
+            notifier.attempts[..4],
+            [stuck.clone(), stuck.clone(), stuck.clone(), stuck.clone()]
+        );
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.attempts);
+        assert_ne!(notifier.sent[0].2, stuck);
+        assert!(state.pending.is_empty() && state.batches.is_empty());
+        assert!(state.agents["worker"].episode.as_ref().unwrap().notified);
+    }
+
+    #[test]
+    fn a_check_only_pass_keeps_an_older_state_files_batch() {
+        let mut options = options();
+        options.check_only = true;
+        let mut state: WatchState = serde_json::from_value(json!({
+            "agents": {},
+            "pending": [{"agent": "worker", "kind": "approval-prompt", "since": 0.0, "detail": "x"}],
+            "inflight": {"message_id": "agent-watch-0123456789abcdef", "keys": ["worker:approval-prompt:0"]},
+            "last_notice_at": null,
+        }))
+        .unwrap();
+        let mut probe = ScriptedProbe(vec![vec![]]);
+        let mut notifier = RecordingNotifier::default();
+        pass(&mut probe, &mut notifier, &mut state, 400.0, &options);
+        assert!(notifier.attempts.is_empty());
+        assert_eq!(state.batches.len(), 1);
+        assert_eq!(state.batches[0].message_id, "agent-watch-0123456789abcdef");
+    }
+
+    #[test]
+    fn a_late_delivered_finish_is_remembered_an_hour_from_its_delivery() {
+        let options = options();
+        let mut notifier = RecordingNotifier {
+            fail_attempts: 6,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let finished = || vec![observation("finisher", "idle", Some(DONE_SCREEN))];
+        // Fails at 0, 60, 180, 420, 900 and 1860; delivered at 3660.
+        for at in [0.0, 60.0, 180.0, 420.0, 900.0, 1_860.0, 3_660.0] {
+            let mut probe = ScriptedProbe(vec![finished()]);
+            pass(&mut probe, &mut notifier, &mut state, at, &options);
+        }
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.attempts);
+        // Absent for a pass soon after, more than an hour after it finished: still remembered,
+        // so its return is not a second finish.
+        pass(
+            &mut ScriptedProbe(vec![vec![]]),
+            &mut notifier,
+            &mut state,
+            3_720.0,
+            &options,
+        );
+        assert!(state.agents.contains_key("finisher"));
+        pass(
+            &mut ScriptedProbe(vec![finished()]),
+            &mut notifier,
+            &mut state,
+            3_780.0,
+            &options,
+        );
+        assert_eq!(notifier.sent.len(), 1);
+    }
+
+    #[test]
+    fn log_lines_open_with_the_utc_time() {
+        let at = UNIX_EPOCH + Duration::from_millis(1_793_208_360_500);
+        assert_eq!(log_stamp(at), "2026-10-28T17:26:00Z");
     }
 
     // ---- #570 agent-progress-monitoring: what "working" means -------------------------------
