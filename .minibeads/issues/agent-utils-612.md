@@ -1,11 +1,12 @@
 ---
 title: 'view-stability: whatever the reader is looking at never jumps away when a thread re-sorts'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-viewstab
 created_at: 2026-10-28T04:17:34.797939752+00:00
-updated_at: 2026-10-28T04:17:34.797939752+00:00
+updated_at: 2026-10-28T05:41:12.866615629+00:00
+closed_at: 2026-10-28T05:41:12.866615489+00:00
 ---
 
 # Description
