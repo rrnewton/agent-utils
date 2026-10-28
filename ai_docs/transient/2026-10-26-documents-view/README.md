@@ -1,7 +1,10 @@
 # documents-view: a third major view for the documents agents link in chat (design)
 
-[opus 5.5] Design and planning only, written 2026-10-26 for the owner to read before anything is
-built. Nothing here is implemented. `#544 documents-view-design`.
+[muse watermelon] Final design, written 2026-10-26 and revised 2026-10-28 to the owner's
+decisions of 2026-10-28 (09:01–09:35 ET). Nothing here is implemented yet: no Documents page,
+no document index, no fetcher. The server side (`documents-index-server`) is authorised to
+start before the client; the client (`documents-view-client`) waits for
+`#624 voice-page-modularity`. `#544 documents-view-design`.
 
 ## The ask
 
@@ -52,18 +55,26 @@ client-side rendering.
    - navigating hundreds of blocks: the flat block timeline does not scale, and the § navigator
      section proposes numbered sections and a focus-plus-context row;
    - read-aloud that survives a locked phone in a car.
-4. **Recommendation: start with design A+, then B, then C.**
-   - **A+ (the MVP):** the documents list is built on demand from the message cache, which is
-     already cross-channel and already filled only by the owner's reads. Fetched documents are
-     kept in a bounded cache, not a new durable index. The MVP is the three-way switcher, GitHub
-     Markdown, the list, the reader and Read with the hierarchical navigator.
-   - **B (a durable document index):** only when a deployment needs documents without a message
-     cache, or versions that survive restarts.
+4. **Decision (owner 2026-10-28): lazy registration, incremental fold index.** Every message
+   with a link that is recognised as a document registers that document candidate in the
+   index (existence only). Nothing is fetched eagerly. The document index is a pure function:
+   a fold over all messages in the cache, maintained incrementally (cached), never a linear
+   scan on the critical path. It caches the fold result (document key → mentions:
+   when/where), not document contents. Fetched contents live in a separate bounded server
+   cache. Default sort is order of mention in chat. This replaces the earlier A+ on-demand
+   scan (see § Decision log).
+   - **MVP (server first):** `documents-index-server`: the fold index, GitHub (and paste)
+     recognition, fetch-on-demand (one document, and "recent N"), a bounded document cache,
+     a freshness check, and the list API. No page changes beyond what an API test needs.
+   - **Client (after `#624 voice-page-modularity`):** `documents-view-client`: the three-way
+     view button, the single-column Documents list, the reader and Read with the hierarchical
+     navigator, written in the new module structure.
+   - **B (durable versions):** only when a deployment needs versions that survive restarts
+     beyond a rebuild of the fold from the message cache.
    - **C (logbook):** when that storage layer exists.
 
    Render on the server, cache the result per version, and send the page sanitized HTML and an
-   outline. The MVP is about 12–17 lane-days, one to two weeks elapsed with two paired lanes
-   (§ Phased plan), more than the switcher alone suggests.
+   outline.
 
 ## Findings
 
@@ -152,7 +163,7 @@ Other facts that shape the design:
 |---|---|---|
 | Recognize a document address | `link_labels.rs`: a host and route table with strict, never-decoded parsing. The renderer consults it only for a link whose text is its own address, and 198 of 202 document links carry a label. | a `documents` route set, run on every link and on the source text itself, and a canonical document key |
 | Mark a link so the page can take the tap | `#543 in-app-message-links` (in flight): the renderer marks message permalinks with an attribute, and the page decides whether to make the tap a jump | the same, for document links |
-| Find every document link across channels | the message cache: every message's text with a trigram full-text index, filled only by write-scope and server-owned reads | a query over it (design A+) |
+| Find every document link across channels | the message cache: every message's text with a trigram full-text index, filled only by write-scope and server-owned reads | the incremental fold over it (never a read-path scan) |
 | Render Markdown safely | `render.rs` pipeline; the ammonia allowlist is the security boundary; server highlighting (`#531`) | a document profile with its own sanitizer settings (listed below) |
 | Read text aloud | blocks cut from the parsed tree (`render::source_blocks`); `speakable.rs`, a line-by-line stripper over each block's text (code blocks over three lines named, tables announced, addresses said as pages, times made relative); browser and server read-aloud backends; the read strip with Pace, Previous and Next, the `#380` block timeline, and media keys (`#434`) | document bounds for the blocks, a numbered section tree, the hierarchical navigator, a resume position |
 | Jump with Back | `#423 back-key-consistency` places, `#304` history entries, `#462 webapp-deep-links` (`?v=…&m=…`) | a `docs` view and a `d=` parameter |
@@ -161,12 +172,14 @@ Other facts that shape the design:
 
 ## Alternative designs
 
-A+, B and C serve the same page API, so the backing can change without the page noticing:
+The fold, B and C serve the same page API, so the backing can change without the page noticing:
 
-- `GET /api/v1/documents?before=&limit=&channel=` returns cards.
-- `GET /api/v1/documents/{key}` returns metadata, HTML, the outline, mentions, and "changed since
-  linked".
-- `GET /api/v1/documents/{key}/speech?section=N` returns speakable chunks.
+- `GET /api/v1/documents?before=&limit=&channel=` returns rows in mention order.
+- `POST /api/v1/documents/fetch` fetches one document; `POST /api/v1/documents/fetch-recent`
+  fetches the most recent 10–20 unfetched.
+- `GET /api/v1/documents/{key}` returns metadata, content when fetched, the outline, and mentions.
+- `GET /api/v1/documents/{key}/freshness` reports whether a newer version exists.
+- `GET /api/v1/documents/{key}/speech?section=N` returns speakable chunks (client phase).
 
 ### A. A thin reader on what the page already holds
 
@@ -182,30 +195,39 @@ document calls a fetch-and-render endpoint.
   - No dedupe across channels.
   - Every phone re-derives the list.
 
-### A+. The list from the message cache, documents in a bounded cache (recommended MVP)
+### A+. Superseded: on-demand scan over the message cache
 
-The server answers the list endpoint by querying the message cache:
+The original MVP answered the list endpoint by scanning the message cache on demand
+(trigram candidates, then grouping). **The owner rejected this on 2026-10-28** (see
+§ Decision log): a scan on the read path is the wrong architecture, however briefly it is
+cached. It is kept here only as the rejected alternative.
 
-1. The trigram index finds rows holding a document host.
-2. `documents::recognize` parses each address in the text, not the rendered HTML, so a body over
-   16 KiB, which the renderer draws as plain text, is still read.
-3. Rows are grouped by document key, newest mention first.
+### The fold index (decided, owner 2026-10-28)
 
-Fetched documents (raw source, rendered HTML, outline, version id, ETag) live in a cache bounded by
-bytes, which a restart may empty. A conditional request revalidates them cheaply.
+The document index is a **pure function: a fold over all messages in the cache**,
+maintained incrementally and cached. It is never a linear scan on the critical path.
 
-- **Cost:** medium. See Phase 1.
-- **For:**
-  - It answers the real question, across channels, with dedupe and titles.
-  - It adds no new durable index. The message cache's existing rules hold: only the owner's reads
-    fill it; a tombstone or an aged-out row removes the mention; the owner's off switch and the
-    storage purge erase it.
-  - One fetch serves every phone.
-- **Against:**
-  - It gives nothing where the message cache is off. That is the Google Chat deployment today.
-  - Versions and resume positions keyed by version need the GitHub history on demand, or the page's
-    own memory.
-  - The list query does work proportional to the candidate rows, cached briefly.
+- Every message that enters the cache (write-scope and server-owned reads, live pushes,
+  backfill) is folded in at that moment: `documents::recognize` parses each address in the
+  source text (not the rendered HTML, so a body over 16 KiB is still read), and each
+  recognised document registers a **candidate (existence only)**. No content is fetched.
+- An edit replaces that message's mentions; a deletion (or tombstone, age-out, channel
+  leaving the list, purge) removes them. A document whose last mention goes leaves the list.
+- The fold result is `document key → mentions (when/where: provider, channel, message,
+  thread, posted time, author, label)`, kept in memory and persisted or rebuilt from the
+  cache at startup. The list endpoint reads only this fold result: O(documents), never
+  O(messages).
+- Read-scope reads never fold anything in, exactly as they never fill the message cache:
+  a voice agent's read can neither add a mention nor cause a fetch.
+- Fetched documents (raw source, version id, ETag) live in a **separate bounded server
+  cache** (entries and bytes), which a restart may empty. The index never caches contents.
+- **Lazy, not eager (owner 2026-10-28).** Registration is existence only. Eager fetch on
+  every mention may come later; the MVP fetches on demand (one tap, or "Fetch recent").
+
+- **For:** it answers the real question across channels with dedupe; the read path is
+  O(1) per document; only the owner's reads fill it.
+- **Against:** it gives nothing where the message cache is off, and a restart without a
+  persisted fold pays one rebuild from the cache (startup work, not read-path work).
 
 ### B. A durable document index
 
@@ -228,7 +250,7 @@ version(doc_key, version_id, fetched_ms, bytes, raw, html, outline, section_stru
 
 - **Storage:** its own SQLite file beside the store, `0600`, bounded by age and size, with its own
   off switch.
-- **Erasure, which B must get right and A+ inherits:**
+- **Erasure, which B must get right and the fold index inherits:**
   - A document is erased when its last mention goes: the message was tombstoned or aged out, or
     its channel left the server's list.
   - The storage purge and the off switch erase everything.
@@ -237,7 +259,7 @@ version(doc_key, version_id, fetched_ms, bytes, raw, html, outline, section_stru
   - Fetched content never outlives every message that justified fetching it.
 - **No read-token path.** A read with the read token writes nothing, as with the message cache. So
   a voice agent's read can neither add mentions nor cause a fetch with the owner's credentials.
-- **Cost:** A+ plus about a week: the store, its lifecycle and erasure, the backfill, migrations,
+- **Cost:** the fold plus about a week: the store, its lifecycle and erasure, the backfill, migrations,
   and tests on the scale of the message cache's own.
 - **For:**
   - It works without a message cache.
@@ -312,12 +334,19 @@ The **document render profile** differs from the chat profile:
    That is worth doing only if the owner's documents start to carry figures; 1 of 50 does today.
 7. **Front matter** is dropped from the body, and its `title:` is used as the title.
 
-## Recommendation
+## Recommendation (as decided 2026-10-28)
 
-**Build A+ first.** Its MVP covers the GitHub half of the owner's documents and the whole UI.
-Pastes follow as the second source. Build B only when a deployment needs documents without a
-message cache, or durable versions. Keep the document key and the page API stable, so A+ → B → C is
-a change of backing, not of the page.
+**Build the fold index first, server side only (`documents-index-server`), then the client
+(`documents-view-client`) after `#624 voice-page-modularity`.** Pastes are recognised from
+the start through the configured command source; Google Docs is a later kind. Build B only
+when a deployment needs documents without a message cache, or durable versions. Keep the
+document key and the page API stable, so fold → B → C is a change of backing, not of the page.
+
+**No per-document privacy gating in the MVP (owner 2026-10-28).** There is no special notion
+of a private document: anything on this server may also go to the voice agent, as chat does.
+The earlier owner-only / no-read-token design is therefore not an MVP rule; document
+endpoints take the ordinary scopes (write to fetch, read to list), and a future privacy
+decision is a new issue, not a silent change here.
 
 Specific choices:
 
@@ -331,17 +360,16 @@ Specific choices:
   Splitting `blob/REF/PATH` is not syntactic: a branch name may hold a slash, and `link_labels.rs`
   declines to guess. The fetcher resolves the longest prefix that is a real ref through the API,
   once per address, and caches the answer. A link to a branch that is later archived names a ref
-  that no longer exists. The card says so, and offers the copy fetched while the branch existed.
-- **Show the newest version, and say when it changed.** The card and the reader show
-  "updated 2 h after it was linked". For a branch link, the reader offers "as linked": the version
-  current when the message was posted, found from the commit history up to that time. Agents keep
-  editing reports after they link them, and the newest version is usually what the owner wants.
-  Question 2 asks.
+  that no longer exists. The row says so, and offers the copy fetched while the branch existed.
+- **Show the cached version, and say when it changed.** The row and the reader show
+  "updated 2 h after it was linked". Opening is instant from the cache; a freshness check
+  offers "New version available" (owner 2026-10-28). For a branch link, the reader later
+  offers "as linked": the version current when the message was posted (phase 2).
 - **Least-privilege GitHub credentials.** A fine-grained token with Contents: read on chosen
   repositories, read from a secret file. It is not the `gh` CLI's own OAuth token, which can read
   every repository the owner can. Use conditional requests (a `304 Not Modified` does not count
   against GitHub's rate limit) and one batched GraphQL query for refresh.
-- **Owner-only access, and no model sees a document in the MVP.** See the access-control issue.
+- **No per-document privacy gating in the MVP (owner 2026-10-28).** See § Recommendation.
 - **The paste source is a configured command, not code that names a service.**
   - An operator adds a source with a URL pattern and an argv template. The template must put `--`
     before the placeholder.
@@ -352,9 +380,9 @@ Specific choices:
 
   That keeps internal services out of this public repository, and serves any other paste-like
   service the same way.
-- **One list across every channel on the server's list, newest mention first,** with a channel
-  filter chip. A card says "linked 3×". The owner asks "what did my agents produce", not "what was
-  posted here".
+- **One list across every channel on the server's list, in mention order (newest at the
+  bottom),** with a channel filter chip. A row says "linked 3×". The owner asks "what did my
+  agents produce", not "what was posted here".
 
 ### Document metadata and sort orders
 
@@ -408,68 +436,91 @@ How each field is obtained:
 document(..., created_ms, created_by, modified_ms, modified_by, metadata_source, metadata_checked_ms)
 ```
 
-- In A+, the bounded document cache holds it. Losing it on a restart costs one batched query plus
-  one request per document for the creation date, so the creation dates are the one thing worth
-  keeping in a small table even in A+.
+- With the fold index, the bounded document cache holds it once the document is fetched.
+  Unfetched candidates carry no source metadata: only URL/file name and mention data. Losing
+  it on a restart costs one batched query plus one request per fetched document.
 - In B, the store holds it.
 - **Last read is owner state, not document state.** "Opened or listened to, when, and how far" is a
   small record per document. It goes in the owner store, beside read marks and bookmarks, so the
   phone and the desk agree. It is the same record that holds the resume position.
 
-**Sort orders in the Documents view.** A sort control beside the filters offers:
+**Sort orders in the Documents view.** The **default is order of mention in chat (owner
+2026-10-28)**: the list is a feed, oldest mention first, newest at the bottom, and it starts
+scrolled to the bottom like a message feed (unlike Claude/Muse artifact lists). A sort
+control beside the filters offers the alternatives:
 
 | Sort | Meaning | Documents without the field |
 |---|---|---|
-| **Newest mention** (default) | the latest time anyone linked it | — (every card has one) |
+| **Mention order** (default) | order of mention in chat, newest at the bottom | — (every row has one) |
 | **First linked** | when it first appeared in chat | — |
-| **Last modified** | newest commit or modification at the source | sorted by first linked, after the dated cards, and marked "no source date" |
+| **Last modified** | newest commit or modification at the source | sorted by first linked, after the dated rows, and marked "no source date" |
 | **First committed** | creation at the source | the same |
-| **Last read** | your most recent open or listen | unread cards last, newest mention first |
+| **Last read** | your most recent open or listen | unread rows last, newest mention first |
 
-The card shows the date the sort is by, so the order explains itself. For example:
+The row shows the date the sort is by, so the order explains itself. For example:
 "modified 2 h ago · created 9 Oct".
 
-Paged results sorted by a source date need every candidate's metadata. A+ fetches it in batches
-for the documents in the cache's window, at most a few hundred in this sample's rate (about ten a
-day). It does not fetch it one page at a time.
+Paged results sorted by a source date need fetched metadata, so they order the fetched
+subset by that date and keep unfetched rows in mention order after them, marked as above.
+Nothing is fetched merely to sort: sorting never causes a fetch (lazy, owner 2026-10-28).
 
 ## UI
 
-### Three major views, and the interim switcher
+### Three major views, and the view button
 
-Today `#view-switch` is a two-state switch (`aria-checked`, labelled Voice or Channel). In the
-interim it becomes a **button showing the current view's name**, which opens a three-item menu:
-**Voice**, **Channel**, **Documents**. The menu is built like the existing pickers, as a list of
-radio items with the current one checked. It needs no new layout, and fits whichever
-`channel-bars-layout` option the owner picks later: there it becomes one of the major-view tabs.
+Today `#view-switch` is a two-state switch (`aria-checked`, labelled Voice or Channel). It
+becomes a **view button (owner 2026-10-28)**: a button that does a three-way toggle like
+the other three-way buttons in the app, and can also pop up the list of options. With
+limited attention, tapping the same spot once or twice rotates to the next view
+(Voice → Channel → Documents → Voice); a long press (decided by recommendation, owner
+2026-10-28) opens the picker menu (**Voice**, **Channel**, **Documents**, current checked).
+It fits whichever `channel-bars-layout` option is picked later: there it becomes one of
+the major-view tabs.
 
-- **Keyboard:** Ctrl+0 is the call's view (`#525`) and Ctrl+1 to Ctrl+4 are the channel's views
-  (`#281`). Ctrl+5 for Documents is the natural next chord. The README says Chromium hands Ctrl+1
-  to Ctrl+8 to the page. Ask before taking it (question 7).
+- **Keyboard: Ctrl+5 for Documents is fine (owner 2026-10-28).** Ctrl+0 is the call's view
+  (`#525`) and Ctrl+1 to Ctrl+4 are the channel's views (`#281`).
 - **Deep links:** `?v=docs` opens the list and `?v=docs&d=<key>` opens a document (percent-encoded
   key, never the fragment, as `#462` requires). The `#423` places gain "documents list" and
   "document D at section S".
 
 ### The list
 
-The list reuses the thread list's card styles:
+**Single column to start (owner 2026-10-28)**, like the Claude and Muse artifact lists the
+owner cited: a search box, then rows — not thread cards, and not a two-column tile grid
+(that was tried in discussion and superseded the same morning). Each row is an artifact
+row in the per-artifact type-icon style of those lists:
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ Replication model: what the page, the server and …      │  ← first heading, else link label, else file name
-│ repo-a:ai_docs/…/replication-model.md  · paste           │  ← source, as link_labels would label it
-│ agent-name · #channel › thread name · 3h · linked 3×     │  ← newest mention
-│ 4,100 words · ~27 min · updated 1h after linked     ● 40%│  ← reading time, version note, read progress
+│ [icon] Replication model: what the page, the …          │  ← fetched: real title
+│        repo-a:ai_docs/…/replication-model.md · Edited 2h │
+├──────────────────────────────────────────────────────────┤
+│ [icon] replication-model.md                    (dimmed) │  ← unfetched: URL/file name only
+│        github · linked 3× · #channel · 3h               │
 └──────────────────────────────────────────────────────────┘
 ```
 
-- **Sort:** newest mention (default), first linked, last modified, first committed, or last read
-  (§ Document metadata and sort orders).
+- **Type icon (extensible).** The icon follows the document **kind**, and the kind set is a
+  field designed to grow: GitHub Markdown, other GitHub files, pastes today; Google Docs
+  later (a new kind + icon, no list redesign). Kind icons echo `link_labels`-style source
+  labelling.
+- **Sort:** mention order by default (newest at the bottom; the list **starts scrolled to
+  the bottom** like a message feed, owner 2026-10-28), then first linked, last modified,
+  first committed, or last read (§ Document metadata and sort orders).
 - **Filters:** search over titles and sources, a channel chip, and "unread". Unread means never
   opened. Partly read shows the progress.
-- **Not fetched yet** (credentials missing, a fetch failed, a host with no fetcher): the card stays,
-  titled by its link label, with the reason in words, and tapping it opens the original. A failure
-  is visible, not dropped, as with failed summaries.
+- **Unfetched rows are dimmed (owner 2026-10-28).** Only the URL/file name is known, so the
+  row is titled by its link label or file name and drawn dimmed. **One tap fetches one**
+  document; a **"Fetch recent" button at the bottom fetches the most recent 10–20**
+  unfetched documents. Once fetched, the row is undimmed with full metadata including the
+  real document title. Lazy population is fine.
+- **Fetch failed** (credentials missing, a fetch failed, a host with no fetcher): the row
+  stays dimmed, titled by its link label, with the reason in words, and tapping it retries
+  (decided by recommendation, owner 2026-10-28); the original link stays reachable from the
+  reader's menu. A failure is visible, not dropped, as with failed summaries.
+- **Opening a cached document is instant (owner 2026-10-28).** An async freshness check
+  runs on open (best effort); if a newer version exists, a **"New version available" chip**
+  at the top offers the update on tap — content is never swapped under the reader.
 - **The Links filter in the channel view stays.** It answers "what was linked here". The documents
   view answers "what documents exist".
 
@@ -660,9 +711,9 @@ the path to the reading position:
 - But the fine boxes become far too small to tap as soon as the document is more than a few
   dozen blocks, unless the current box is magnified.
 
-### Recommendation: a focus-plus-context row over the block row
+### Decision: a focus-plus-context row over the block row (owner 2026-10-28)
 
-Combine the three:
+**Go with this combination (owner 2026-10-28).** Combine the three:
 
 - **The bottom row is today's `#380` row**, limited to the current leaf section, or to a virtual
   part of it (below). Narrow placeholders at either edge carry the previous and next section's
@@ -670,24 +721,34 @@ Combine the three:
 - **Above it, a context row** shows the siblings at the level above as compact numbered boxes. The
   current one is expanded to hold its own children as nested boxes (idiom 3, applied only where the
   reader is). This is a fisheye: everything is reachable, and only the current part takes room.
+  **Peer sections that do not fit are compressed into ranges** ("6 … 15", as drawn below);
+  scrollable strips are deferred as future work on overflow/compression.
 - **On a desk, the algorithm may add one more context row** (idiom 2) when the tree is deep enough
-  to need it.
+  to need it. **At most 2 rows on a phone, up to 3 on desktop (owner 2026-10-28).**
 - **Anything above the rows shown** becomes a breadcrumb line ("3 Storage core › 3.3"). Tapping it
   opens the contents drawer.
+
+**Bottom-row boundary marks, not full nested boxes (owner leaning, decided by
+recommendation, owner 2026-10-28).** The top row shows where we are in an arbitrary tree;
+the bottom row visualises jumping chunk to chunk and crossing boundaries between
+branches. Rather than drawing full nested boxes in the bottom row, the bottom row carries
+**visual section-boundary marks with labels at the points where the linear block sequence
+crosses into the next section, optionally shading the next section's blocks** until the
+crossing. The marks are labels, not targets: tapping still moves by block or by the edge
+placeholders.
 
 ```
 phone (about 360 px)
 3 Storage core › 3.3 Relative links and refs
  1  2 ┌3──────────────────────┐ 4  5  6 … 15
- ▕▕ ▕▕ │3.1 │3.2 │▐3.3▌│ 3.4 │ ▕▕ ▕▕ ▕▕   ▕▕       ← context row
-▕3.2▏▕██▕██▕▓▓▕██▕░░▕░░▕░░▕░░▕░░▕░░▕░░▕▕3.4▏         ← block row, placeholders at the edges
+ ▕▕ ▕▕ │3.1 │3.2 │▐3.3▌│ 3.4 │ ▕▕ ▕▕ ▕▕   ▕▕       ← context row (peers compressed: 6 … 15)
+▕3.2▏▕██▕██▕▓▓▕██▕░░▕░░│3.4▕░░▕░░▕▕3.4▏         ← block row, │3.4 boundary mark + shading
 ◀ Prev            3.3 ¶ 4 of 11             Next ▶
 
 desk (about 720 px): the same, plus a third row when the leaf was split into parts
 ```
 
-On a phone that is two rows, against today's one. If the owner holds the strip to one row, the
-context row becomes the breadcrumb line alone, which is idiom 1.
+On a phone that is two rows, against today's one.
 
 ### The algorithm
 
@@ -764,15 +825,16 @@ reader crosses a section boundary.
 ## The challenging issues
 
 1. **A confused deputy with the owner's credentials.** Anyone who can post in a watched channel
-   can link any document the owner's token can read. The server will fetch it as the owner. That
-   is harmless only if everything that can see the result is the owner's.
-   - The read token is the one pasted into the voice agent, which a third party hosts. So
-     **document endpoints must not accept the read token**. They require the write scope, or a new
-     documents scope. The cost: a phone paired with only the read token sees no documents.
-   - **Nothing reachable with the read token may cause a fetch** or record a mention. A+ gets this
-     from the message cache, which read-token reads never fill. B must keep the same rule.
-   - The voice agent gets no document tool until the owner decides otherwise.
+   can link any document the owner's token can read. The server will fetch it as the owner.
+   **The owner set no per-document privacy gating for the MVP (2026-10-28):** anything on
+   this server may also go to the voice agent, as chat does. The residual bounds are:
+   - Fetching spends credentials, so fetch endpoints require the write scope, as every
+     credential-spending route here does; listing takes the read scope.
+   - **Nothing a read-scope read sees is folded in or fetched:** read-scope reads never fill
+     the message cache, so they never register a mention. The fold inherits that rule, and
+     B must keep it.
    - A least-privilege GitHub token narrows what a stranger's link can reach.
+   A future privacy decision can add gating without changing the key or the list API.
 2. **Where private text goes when it is read aloud.** The device voice keeps it on the phone. A
    self-hosted speech stack keeps it on the owner's machines. A commercial voice API receives the
    whole document. Chat messages already take that path when read aloud through a vendor; a
@@ -794,10 +856,10 @@ reader crosses a section boundary.
    filter, not only in the renderer. The alternative is a sandboxed `<iframe srcdoc>`. It isolates
    ids and styles completely, but makes theming, text size, follow-along highlighting and position
    restoring cross-frame problems. Prefer the prefix, and keep the iframe as the fallback.
-6. **Completeness of the list.** The list is only as complete as what the server has seen. In A+ it
-   is the message cache's window (`max_days`, 90 by default) on the deployments that run one. A
-   message over 16 KiB must still be scanned, which is why recognition reads the source text and
-   not the rendered body. The view must say what it covers, in words.
+6. **Completeness of the list.** The list is only as complete as what the server has seen. With
+   the fold it is the message cache's window (`max_days`, 90 by default) on the deployments
+   that run one. Recognition reads the source text at fold time, not the rendered body, so a
+   message over 16 KiB still registers. The view must say what it covers, in words.
 7. **Length on a phone.** A 317 KB document renders to about 350 KB of HTML, with tables. Section
    rendering and `content-visibility` keep layout cheap, at the price of pixel positions (see
    the reader). The offline copy needs IndexedDB: the saved-messages `localStorage` budget is about
@@ -824,63 +886,68 @@ reader crosses a section boundary.
 
 ## Phased plan
 
-Each phase is shippable on its own and keeps the owner able to say stop. Estimates are lane-days of
-one agent, rough, and include tests and browser walks. For scale, the message cache that A+ reads
-is about 29,000 lines.
+Each phase is shippable on its own and keeps the owner able to say stop. The owner
+authorised the server side to start early; **the client side waits for the big global
+modularity refactor (`#624 voice-page-modularity`) rather than adding to the large page
+file (owner 2026-10-28).**
 
-**Phase 1, MVP (A+): switcher, GitHub Markdown, list, reader, Read.** Two paired lanes, about
-5–7 lane-days on the server and 7–10 on the page (the navigator is about 2 of those), so one to
-two weeks elapsed.
+**Phase 1a, server (`documents-index-server`, start now): the fold index and fetch APIs.**
+No page changes beyond what an API test needs.
 
-- **Server:**
-  - `documents::recognize` and the document key for `github.com/OWNER/REPO/blob/REF/PATH.md`
-    (and `.markdown`, `raw.githubusercontent.com`), with ref resolution;
-  - the list endpoint over the message cache;
-  - the GitHub fetcher, with a token from a file, conditional requests and a byte-bounded cache;
-  - the document render profile and its sanitizer allowlist: bounds, prefixed anchors, links,
-    relative links, outline;
-  - blocks under document bounds, the numbered section tree, and speech per block at speak time;
-  - the endpoints, owner scope only;
-  - tests, including a fixture repository with relative links, a `..` escape attempt, a branch name
-    with a slash, a heading that collides with a page id, and a document link in a message over
-    16 KiB.
-- **Page:**
-  - the three-way view picker, and the `docs` view and `d=` deep link;
-  - the Documents pane: cards, filters, the "covers …" line;
-  - the reader: header, body, contents drawer, Linked in…, anchor positions, Back through `#423`;
-  - document links in messages open in-app (on top of `#543`);
-  - Read with the device voice, and the hierarchical navigator: context row, block row, section
-    numbers;
-  - browser walks at 393×852 and on a desk.
+- `documents::recognize` and the canonical document key for GitHub Markdown
+  (`github.com/OWNER/REPO/blob/REF/PATH.md`, `.markdown`, `raw.githubusercontent.com`),
+  other GitHub files, and pastes via the configured command source; kinds extensible
+  (Google Docs later).
+- The **incremental fold index**: folded in as messages are cached (live, backfill,
+  edit, delete), persisted or rebuilt from the cache at startup, never a scan on the
+  read path. Lazy registration (existence only).
+- **Fetch on demand:** one document, and "recent N" (the most recent 10–20 unfetched);
+  a **bounded server document cache**; a **freshness-check API**; and the **list API**
+  (mention order, fetched/unfetched state, metadata).
+- Tests with a fake provider and fake GitHub, including a `..` escape attempt, a branch
+  name with a slash, and a document link in a message over 16 KiB.
 
-**Phase 2: pastes, versions, the car copy.** About 3–5 lane-days on each side.
+**Phase 1b, client (`documents-view-client`, blocked by `#624 voice-page-modularity` and
+by Phase 1a): the page, in the new module structure.**
 
-- The **command source**, configured on the internal deployment for the paste service.
-- **Versions:** "updated since linked", "as linked" for branch links, and the batched background
-  refresh.
-- **Offline copy:** the newest N documents, with their HTML and outline in IndexedDB, tied to the
-  token like the saved messages. Opening a document saved for the car works with no signal.
+- The view button (tap cycles Voice → Channel → Documents; long press opens the picker)
+  and Ctrl+5; the `docs` view and `d=` deep link.
+- The single-column Documents list: search box, type-icon rows, dimmed unfetched rows,
+  "Fetch recent", starts scrolled to the bottom.
+- The reader: header, body, contents drawer, Linked in…, the "New version available"
+  chip, anchor positions, Back through `#423`; document links in messages open in-app.
+- Read with the device voice, and the hierarchical navigator: focus+context row over the
+  block row (2 rows max on phone, 3 on desktop, peers compressed into ranges, boundary
+  marks in the bottom row), section numbers.
+- Browser walks at 393×852 and on a desk.
+
+**Phase 2: versions, metadata, the car copy.**
+
+- **Versions:** "updated since linked", "as linked" for branch links, and the batched
+  background refresh.
+- **Offline copy:** the newest N documents, with their HTML and outline in IndexedDB.
+  N: decided by recommendation (owner 2026-10-28) — the newest 20, bounded by bytes.
 - **Resume positions and last read**, in the owner store.
-- **Source metadata:** git first-commit and last-modified dates, the paste metadata command, and
-  the sort orders that use them. Phase 1 sorts by mention time only.
+- **Source metadata:** git first-commit and last-modified dates, the paste metadata
+  command, and the sort orders that use them.
 
-**Phase 3: listening in the car.** About 2–4 lane-days.
+**Phase 3: listening in the car.**
 
-- The server-synthesized read (with its keeper element and media keys) verified and hardened for a
-  long document with the screen locked, through the deployment's chosen speech service.
-- The steering wheel's next and previous track step a section, as a setting.
+- The server-synthesized read verified and hardened for a long document with the screen
+  locked, through the deployment's chosen speech service.
+- The steering wheel's next and previous track step a section, as a setting (default on
+  in the documents reader: decided by recommendation, owner 2026-10-28).
 - An optional image proxy, if documents have started carrying figures.
 
-**Phase B, only if needed: the durable index.** About a week more. It covers deployments without a
-message cache and keeps versions across restarts, with the erasure rules above.
+**Phase B, only if needed: durable versions.** It covers deployments without a message
+cache and keeps versions across restarts, with the erasure rules above.
 
 **Phase 4: with logbook (design C).** Gated on that milestone.
 
 - Documents as a fact source.
-- Abstracts on cards through the summary ladder.
-- A `documents` capability for research.
-- Optionally a "Discuss" button that gives the voice agent the document as fenced context, with the
-  owner's privacy answer from question 3.
+- Abstracts on rows through the summary ladder.
+- A `documents` capability for research and the voice agent (no privacy gating was set in
+  the MVP; see § Recommendation).
 
 ## Related work
 
@@ -912,34 +979,84 @@ Public systems only.
   relative links and images resolved inside the repository at the viewed ref, and sanitized output.
   The document render profile follows them.
 
-## Questions for the owner
+## Questions for the owner — as decided 2026-10-28
 
-1. **Scope of the list.** One list across every channel on the server (recommended, with a channel
-   filter), or per channel like the other views? Documents linked by anyone, or only by agents and
-   you? Which default sort: newest mention (recommended), last modified, or first committed?
-2. **Which version.** Show the newest version with "updated after it was linked" (recommended),
-   or the version current when it was linked?
-3. **What Read means, and which voice may hear a private document.** Plain read-aloud by section
-   (recommended for now)? Or the conversational agent reading it and taking questions about it
-   (phase 4)? And for private documents: device voice only, your self-hosted speech stack, or the
-   commercial voice API too?
-4. **Who may see documents.** Owner surfaces only, with no read-token access and no voice-agent
-   tool for now (recommended)?
-5. **The car copy.** Keep the newest N documents on the phone for offline reading? That is private
-   text at rest in the browser profile, as saved messages already are. If yes, how many?
-6. **The paste service.** May the internal deployment's server run the paste service's CLI as
-   you, on the server host, to fetch linked pastes?
-7. **The switcher.** Is the three-item picker on today's toggle the right interim? Or should
-   documents wait for the bottom-bar redesign (`channel-bars-layout`)? Is Ctrl+5 acceptable for
-   Documents?
-8. **Coverage.** A+ needs the message cache, so the Google Chat deployment would get no documents
-   until it runs one, or until B. Is turning the cache on there acceptable? Which repositories
-   should the least-privilege GitHub token read?
-9. **Other sources.** Is Google Docs worth Google OAuth on the server (one link in 12 days)? Should
-   GitHub issue and pull-request descriptions count as documents? Should links to code files inside
-   a document (109 to `.json` in the sample) open on GitHub (recommended), or in the reader as
-   highlighted code?
-10. **The navigator.** Is the focus-plus-context row over the block row right, at two rows on a
-    phone? Or do you prefer idiom 1 (one row, with a breadcrumb) or idiom 2 (stacked rows)? Should
-    sections be numbered when the author did not number them? Should the steering wheel's next
-    track step a section in the documents reader?
+Owner answers are marked **(owner 2026-10-28)**. Anything the owner did not mention was
+decided by the design's recommendation, marked **decided by recommendation (owner
+2026-10-28)** under the owner's closing instruction: "Any questions I haven't mentioned,
+I'll take your recommendation on."
+
+1. **Scope of the list.** One list across every channel, with a channel filter; documents
+   linked by anyone (decided by recommendation, owner 2026-10-28 — the findings show
+   agents post nearly all of them anyway). **Default sort: order of mention in chat
+   (owner 2026-10-28)**, newest at the bottom. The Documents UI may be used rarely but
+   sometimes heavily (owner 2026-10-28): no per-view throttling beyond the fetch bounds.
+2. **Which version.** Show the cached version instantly; check freshness on open and
+   offer **"New version available"** on tap rather than swapping content (owner
+   2026-10-28). "As linked" stays a phase-2 reader option (decided by recommendation).
+3. **What Read means, and which voice.** Plain read-aloud by section for the MVP
+   (decided by recommendation). **No per-document privacy gating (owner 2026-10-28):**
+   anything on this server may go to the voice agent, so speech routing follows the
+   deployment's ordinary read-aloud choice. Conversational Q&A over a document is phase 4.
+4. **Who may see documents.** No special gating in the MVP (owner 2026-10-28). Document
+   endpoints take the ordinary scopes; fetching spends credentials, so fetch requires the
+   write scope, as every credential-spending route here does (decided by recommendation).
+5. **The car copy.** Yes: newest 20 documents, bounded by bytes, in IndexedDB (decided by
+   recommendation, owner 2026-10-28). Phase 2.
+6. **The paste service.** Yes, as the configured command source of § Recommendation:
+   argv template, `--` before the id, no shell (decided by recommendation, owner
+   2026-10-28 — consistent with lazy fetch: the command runs only on demand).
+7. **The switcher.** The view **button**: tap cycles the three views, long press opens
+   the picker (owner 2026-10-28; long press decided by recommendation). **Ctrl+5 is fine
+   (owner 2026-10-28).** The client waits for `#624 voice-page-modularity` (owner
+   2026-10-28), so there is no interim switcher to throw away.
+8. **Coverage.** The fold needs the message cache; a deployment without one gets an empty
+   list that says so, and turning its cache on is the operator's standing choice, not
+   this feature's (decided by recommendation). The GitHub token is the least-privilege
+   file token of § Recommendation; its repository list is deployment configuration.
+9. **Other sources.** Google Docs later as a new kind (owner 2026-10-28: type set
+   extensible, Google Docs "to be added in the future"); no OAuth in the MVP. GitHub
+   issue/PR bodies are not documents in the MVP, and in-document code-file links open on
+   GitHub (decided by recommendation).
+10. **The navigator.** **Focus+context row over the block row (owner 2026-10-28)**, max
+    2 rows on phone, up to 3 on desktop, peers compressed into ranges, scrollable strips
+    deferred. Bottom row: **section-boundary marks with labels, optionally shading the
+    next section** (owner leaning; decided by recommendation). Sections are numbered
+    when the author did not (decided by recommendation — the navigator needs stable
+    addresses). The steering wheel's next track steps a section in the documents reader,
+    default on (decided by recommendation).
+
+## Decision log
+
+- **2026-10-26** — design written (`#544 documents-view-design`): findings, A/A+/B/C,
+  recommendation A+, ten owner questions. Nothing built.
+- **2026-10-28 09:01–09:35 ET** — owner review (thread 336). Decisions:
+  - Plan approved; Documents may be used rarely but sometimes heavily.
+  - **Lazy over eager:** every recognised document link registers a candidate
+    (existence only); no eager fetch.
+  - **Ctrl+5 is fine.** The view picker is a **button**: tap cycles the three views,
+    and it can also pop up the list.
+  - **Single-column** artifact rows with per-artifact type icons (superseding a
+    two-column tile note minutes earlier); kind set extensible, Google Docs later.
+    Not thread cards.
+  - **Scrubber: the recommended focus+context combination**; max 2 rows on phone, up
+    to 3 on desktop; peers compressed into ranges ("6 … 15"); scrollable strips deferred.
+  - Bottom-row nested boxes left leaning: boundary marks (adopted by recommendation).
+  - **No private-document notion** in the MVP.
+  - **A+'s on-demand scan rejected.** The index is a **pure fold over cached messages**,
+    maintained incrementally, caching `document key → mentions`, never a scan on the
+    read path. Default sort: **mention order**; list starts **scrolled to the bottom**.
+  - **Unfetched rows dimmed**; one tap fetches one; **"Fetch recent"** (bottom, most
+    recent 10–20). Fetched rows show full metadata and the real title. Bounded server
+    cache of fetched contents is fine; lazy population is fine.
+  - **Updates best effort:** open is instant from cache; async freshness check; a
+    **"New version available" chip** (tap to update), never a silent swap.
+  - Noted without action: "Slack turns file names into links." → "That part sure seems
+    dumb. Oh well." (The strict host/route recogniser already ignores them.)
+  - Closing: unanswered questions take the design's recommendation; stage the
+    implementation task after `#624 voice-page-modularity`; **server side may start
+    early; client waits for the refactor.**
+- **2026-10-28** — this revision makes the doc consistent with the above. `#544
+  documents-view-design` was already closed on 2026-10-26; this final design is the
+  record it pointed at. Implementation is staged as `documents-index-server` (now)
+  and `documents-view-client` (blocked by `#624 voice-page-modularity`).
