@@ -54672,6 +54672,44 @@ _FIND_PERMISSION_RE = re.compile(
 _GREP_PERMISSION_RE = re.compile(
     r"^/usr/bin/grep: /proc/(?P<pid>[0-9]+)/maps: Permission denied$"
 )
+_FIND_LONG_PATH_RE = re.compile(
+    r"^/usr/bin/find: '/proc/(?P<pid>[0-9]+)/fd/(?P<fd>[0-9]+)': "
+    r"File name too long$"
+)
+
+
+def _target_devices(targets: Mapping[Path, str]) -> frozenset[int]:
+    devices: set[int] = set()
+    for target in targets:
+        try:
+            devices.add(os.stat(target).st_dev)
+        except OSError:
+            continue
+    return frozenset(devices)
+
+
+def _long_path_diagnostic_is_foreign(
+    line: str, target_devices: AbstractSet[int]
+) -> bool:
+    """Whether a find ENAMETOOLONG line names a descriptor outside every target.
+
+    #651: the same device proof as #618's readlink fallback, applied to
+    the find census's stderr.  Stat follows the descriptor even when
+    its target name is too long to read back; a device different from
+    every census target's device proves the descriptor lies outside
+    all of them.  A same-device descriptor, or a failed stat, proves
+    nothing and the diagnostic keeps refusing.
+    """
+
+    match = _FIND_LONG_PATH_RE.fullmatch(line)
+    if match is None or not target_devices:
+        return False
+    descriptor = Path("/proc") / match.group("pid") / "fd" / match.group("fd")
+    try:
+        observed = os.stat(descriptor)
+    except OSError:
+        return False
+    return observed.st_dev not in target_devices
 
 
 def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
@@ -54838,6 +54876,8 @@ def _allow_only_vanished_process_diagnostics(
     returncode: int,
     stderr: bytes,
     processes: Mapping[int, _AbsentProcessObservation],
+    *,
+    target_devices: AbstractSet[int] = frozenset(),
 ) -> None:
     if returncode == 0 and not stderr:
         return
@@ -54859,6 +54899,10 @@ def _allow_only_vanished_process_diagnostics(
     changed_diagnostic: str | None = None
     motion: list[_ProcessEvidenceChanged] = []
     for line in lines:
+        if program == "find" and _long_path_diagnostic_is_foreign(
+            line, target_devices
+        ):
+            continue
         match = pattern.fullmatch(line)
         process = processes.get(int(match.group("pid"))) if match else None
         if process is None:
@@ -54899,6 +54943,8 @@ def _same_uid_indeterminate_processes(
     returncode: int,
     stderr: bytes,
     processes: Mapping[int, _AbsentProcessObservation],
+    *,
+    target_devices: AbstractSet[int] = frozenset(),
 ) -> tuple[_AbsentProcessObservation, ...]:
     """Return stable protected PIDs that require fresh privileged evidence."""
 
@@ -54925,6 +54971,10 @@ def _same_uid_indeterminate_processes(
     changed_diagnostic: str | None = None
     motion: list[_ProcessEvidenceChanged] = []
     for line in lines:
+        if program == "find" and _long_path_diagnostic_is_foreign(
+            line, target_devices
+        ):
+            continue
         missing = missing_pattern.fullmatch(line)
         if missing is not None:
             process = processes.get(int(missing.group("pid")))
@@ -55072,7 +55122,10 @@ def _absent_validate_find_matches(
         returncode, stdout, stderr = _run_root_owned_command(
             Path("/usr/bin/find"), arguments, budget=budget
         )
-        _allow_only_vanished_process_diagnostics("find", returncode, stderr, batch_processes)
+        _allow_only_vanished_process_diagnostics(
+            "find", returncode, stderr, batch_processes,
+            target_devices=_target_devices(targets),
+        )
         chunks.append(stdout)
     return _parse_find_path_matches(
         b"".join(chunks), observed_by_pid, targets, census="privileged"
@@ -55115,7 +55168,10 @@ def _absent_validate_maps_matches(
         )
         if returncode not in {0, 1, 2}:
             raise Refusal(f"privileged grep census refused with exit {returncode}")
-        _allow_only_vanished_process_diagnostics("grep", returncode, stderr, batch_processes)
+        _allow_only_vanished_process_diagnostics(
+            "grep", returncode, stderr, batch_processes,
+            target_devices=_target_devices(targets),
+        )
         chunks.append(stdout)
     return _parse_maps_path_matches(
         b"".join(chunks), observed_by_pid, targets, census="privileged"
@@ -55301,7 +55357,8 @@ def _same_uid_batched_path_matches(
             Path("/usr/bin/find"), arguments, budget=budget
         )
         for process in _same_uid_indeterminate_processes(
-            "find", returncode, stderr, batch_processes
+            "find", returncode, stderr, batch_processes,
+            target_devices=_target_devices(targets),
         ):
             indeterminate[process.pid] = process
         find_chunks.append(stdout)
@@ -55338,7 +55395,8 @@ def _same_uid_batched_path_matches(
                 budget=budget,
             )
             for process in _same_uid_indeterminate_processes(
-                "grep", returncode, stderr, batch_processes
+                "grep", returncode, stderr, batch_processes,
+                target_devices=_target_devices(targets),
             ):
                 indeterminate[process.pid] = process
             maps_chunks.append(stdout)
@@ -55609,6 +55667,7 @@ def _batch_link_matches(
         rc, stdout, stderr = _run_root_owned_command(Path("/usr/bin/find"), arguments, budget=budget)
         _allow_only_vanished_process_diagnostics(
             "find", rc, stderr, {pid: observed[pid] for pid in pids},
+            target_devices=_target_devices(targets),
         )
         matches.extend(_parse_find_path_matches(stdout, observed, targets, census="privileged"))
     return tuple(matches)
@@ -55897,6 +55956,7 @@ def _privileged_inode_matches(
             try:
                 _allow_only_vanished_process_diagnostics(
                     "find", rc, stderr, {pid: observed[pid] for pid in batch_pids},
+                    target_devices=_target_devices(targets),
                 )
             except Refusal:
                 # An observed disconnected cwd can defeat followed stat while

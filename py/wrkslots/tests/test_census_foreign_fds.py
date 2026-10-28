@@ -148,3 +148,86 @@ def test_fresh_use_refuses_unreadable_same_device_descriptor(
     finally:
         holder.kill()
         holder.wait()
+
+
+def _fd_holder(path: Path) -> tuple[subprocess.Popen[str], int]:
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import os, sys, time\n"
+            "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
+            "print(fd, flush=True)\n"
+            "time.sleep(60)\n",
+            str(path),
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, text=True,
+    )
+    assert proc.stdout is not None
+    return proc, int(proc.stdout.readline())
+
+
+def _long_path_line(pid: int, fd: int) -> bytes:
+    return f"/usr/bin/find: '/proc/{pid}/fd/{fd}': File name too long\n".encode("ascii")
+
+
+def test_find_long_path_diagnostic_on_foreign_device_is_dropped(
+    tmp_path: Path,
+) -> None:
+    shm = Path("/dev/shm")
+    if not shm.is_dir() or os.stat(shm).st_dev == os.stat(tmp_path).st_dev:
+        pytest.skip("no second filesystem device available")
+    held = tmp_path / "held.txt"
+    held.write_text("x\n")
+    holder, fd = _fd_holder(held)
+    try:
+        line = _long_path_line(holder.pid, fd)
+        devices = frozenset({os.stat(shm).st_dev})
+        assert cli._long_path_diagnostic_is_foreign(line.decode().strip(), devices)
+        assert (
+            cli._same_uid_indeterminate_processes(
+                "find", 1, line, {}, target_devices=devices
+            )
+            == ()
+        )
+        cli._allow_only_vanished_process_diagnostics(
+            "find", 1, line, {}, target_devices=devices
+        )
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_find_long_path_diagnostic_on_target_device_still_refuses(
+    tmp_path: Path,
+) -> None:
+    held = tmp_path / "held.txt"
+    held.write_text("x\n")
+    holder, fd = _fd_holder(held)
+    try:
+        line = _long_path_line(holder.pid, fd)
+        devices = frozenset({os.stat(tmp_path).st_dev})
+        assert not cli._long_path_diagnostic_is_foreign(line.decode().strip(), devices)
+        with pytest.raises(cli.Refusal, match="produced diagnostics"):
+            cli._same_uid_indeterminate_processes(
+                "find", 1, line, {}, target_devices=devices
+            )
+        with pytest.raises(cli.Refusal, match="produced diagnostics"):
+            cli._allow_only_vanished_process_diagnostics(
+                "find", 1, line, {}, target_devices=devices
+            )
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_find_long_path_diagnostic_with_failed_stat_still_refuses(
+    tmp_path: Path,
+) -> None:
+    line = _long_path_line(99999999, 3)
+    devices = frozenset({os.stat(tmp_path).st_dev})
+    assert not cli._long_path_diagnostic_is_foreign(line.decode().strip(), devices)
+    with pytest.raises(cli.Refusal, match="produced diagnostics"):
+        cli._same_uid_indeterminate_processes(
+            "find", 1, line, {}, target_devices=devices
+        )
