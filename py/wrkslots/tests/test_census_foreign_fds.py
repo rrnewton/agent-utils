@@ -131,9 +131,10 @@ def test_link_target_foreign_device_is_not_use(
     held.write_text("x\n")
     device = os.stat(held).st_dev
     monkeypatch.setattr(os, "readlink", _readlink_fails_on_fd(os.readlink))
-    assert cli._link_target(_fd_link(tmp_path, held), slot_device=device + 4096) is None
+    link = _fd_link(tmp_path, held)
+    assert cli._link_target(link, slot_device=device + 4096) is None
     with pytest.raises(cli.Refusal, match="process use is indeterminate"):
-        cli._link_target(_fd_link(tmp_path, held), slot_device=device)
+        cli._link_target(link, slot_device=device)
 
 
 def test_fresh_use_refuses_unreadable_same_device_descriptor(
