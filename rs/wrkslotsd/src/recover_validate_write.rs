@@ -65,16 +65,26 @@ fn read_input(cfg: &Cfg, raw_path: &Path) -> Result<(String, Vec<Row>)> {
     } else {
         cfg.root.join(raw_path)
     };
-    let metadata = std::fs::symlink_metadata(&path)
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
         .map_err(|error| format!("cannot read absent-validation-row input: {error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot read absent-validation-row input: {error}"))?;
+    if !metadata.is_file() {
         return Err("absent-validation-row input is not a regular file".to_string());
     }
-    if metadata.len() > 1024 * 1024 {
+    let mut contents = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut contents)
+        .map_err(|error| format!("cannot read absent-validation-row input: {error}"))?;
+    if contents.len() > 1024 * 1024 {
         return Err("absent-validation-row input is too large".to_string());
     }
-    let contents = std::fs::read(&path)
-        .map_err(|error| format!("cannot read absent-validation-row input: {error}"))?;
     let input_sha256 = format!("{:x}", Sha256::digest(&contents));
     let raw: Value = serde_json::from_slice(&contents)
         .map_err(|error| format!("absent-validation-row input is not valid JSON: {error}"))?;
@@ -149,7 +159,7 @@ fn recovery_matches(
     cfg: &Cfg,
     selected: &str,
     archived: &Value,
-    archives_revision: i64,
+    _archives_revision: i64,
     row: &Row,
 ) -> bool {
     let Some(archive_id) = archived.get("archive_id").and_then(Value::as_str) else {
@@ -171,9 +181,6 @@ fn recovery_matches(
             && payload.get("action").and_then(Value::as_str)
                 == Some("absent-validation-row-recovered")
             && payload.get("slot").and_then(Value::as_str) == Some(row.slot.as_str())
-            && payload.get("revision").and_then(Value::as_i64) == Some(archives_revision)
-            && payload.get("previous_revision").and_then(Value::as_i64)
-                == Some(archives_revision - 1)
             && record.get("archive_id").and_then(Value::as_str) == Some(archive_id)
             && record.get("slot").and_then(Value::as_str) == Some(row.slot.as_str())
             && record.get("machine").and_then(Value::as_str) == Some(selected)
@@ -186,6 +193,85 @@ fn recovery_matches(
                 == Some(row.record_sha256.as_str())
             && evidence.get("validation_outcome").and_then(Value::as_str) == Some("unknown")
     })
+}
+
+fn refusal_payload(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    input: &Path,
+    message: &str,
+) -> Option<Value> {
+    // Python emits the outcome payload (recovered rows marked,
+    // the rest refused with the message) before re-raising.
+    let (cfg, selected) = load_cfg(root, machine_override).ok()?;
+    let (_sha, rows) = read_input(&cfg, input).ok()?;
+    let archives = crate::recover_absent_write::archives_document(&cfg, &selected).ok()?;
+    let archives_revision = archives
+        .get("revision")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let archive_records = archives
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out: Vec<Value> = Vec::new();
+    for row in &rows {
+        let matching: Vec<&Value> = archive_records
+            .iter()
+            .filter(|item| item.get("slot").and_then(Value::as_str) == Some(row.slot.as_str()))
+            .collect();
+        let exact = matching.len() == 1
+            && matching[0].get("machine").and_then(Value::as_str) == Some(selected.as_str())
+            && matching[0].get("generation").and_then(Value::as_i64) == Some(row.generation)
+            && matching[0].get("slot_type").and_then(Value::as_str) == Some("validate")
+            && matching[0].get("physical_storage").and_then(Value::as_str) == Some("removed")
+            && recovery_matches(&cfg, &selected, matching[0], archives_revision, row);
+        out.push(if exact {
+            json!({
+                "machine": row.machine,
+                "slot": row.slot,
+                "generation": row.generation,
+                "outcome": "already-recovered",
+                "detail": "exact archive already exists",
+            })
+        } else {
+            json!({
+                "machine": row.machine,
+                "slot": row.slot,
+                "generation": row.generation,
+                "outcome": "refused",
+                "detail": message,
+            })
+        });
+    }
+    Some(json!({"schema": 1, "rows": out}))
+}
+
+/// Recover absent validation rows named by the input file. On
+/// refusal, also returns the outcome payload Python prints first.
+pub(crate) fn recover_absent_validate_rows_wrapped(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    input: &Path,
+    apply: bool,
+    coordinator_authorized: bool,
+    coordinator_pid: Option<i64>,
+) -> (Option<Value>, Result<Value>) {
+    match recover_absent_validate_rows(
+        root,
+        machine_override,
+        input,
+        apply,
+        coordinator_authorized,
+        coordinator_pid,
+    ) {
+        Ok(value) => (None, Ok(value)),
+        Err(message) => (
+            refusal_payload(root, machine_override, input, &message),
+            Err(message),
+        ),
+    }
 }
 
 /// Recover absent validation rows named by the input file.
@@ -232,8 +318,21 @@ pub(crate) fn recover_absent_validate_rows(
         }
         if let Some(name) = names.first().and_then(Value::as_str) {
             let path: PathBuf = cfg.control.join(name);
-            let text = std::fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read recovery journal: {error}"))?;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // An event-pending journal with no file on disk:
+                    // Python falls back to the pending mapping; the
+                    // kind/input judgement cannot be made here.
+                    return Err(format!(
+                        "another interrupted mutation is recorded in {}; run wrkslots recover",
+                        path.display()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!("cannot read recovery journal: {error}"));
+                }
+            };
             let raw: Value = serde_json::from_str(&text)
                 .map_err(|error| format!("cannot read recovery journal: {error}"))?;
             if raw.get("kind").and_then(Value::as_str) != Some("recover-absent-validate-rows") {
@@ -255,15 +354,7 @@ pub(crate) fn recover_absent_validate_rows(
     }
     validate_global(root, &cfg)?;
     let active = active_document(root, &cfg, &selected)?;
-    let archives_path = cfg.control.join(format!("ARCHIVED.{selected}.json"));
-    let archives: Value = if archives_path.exists() {
-        let text = std::fs::read_to_string(&archives_path)
-            .map_err(|error| format!("cannot read archive state: {error}"))?;
-        serde_json::from_str(&text)
-            .map_err(|error| format!("cannot read archive state: {error}"))?
-    } else {
-        json!({"schema": 2, "machine": selected, "revision": 0, "records": []})
-    };
+    let archives = crate::recover_absent_write::archives_document(&cfg, &selected)?;
     let archives_revision = archives
         .get("revision")
         .and_then(Value::as_i64)
@@ -329,7 +420,6 @@ pub(crate) fn recover_absent_validate_rows(
                     .unwrap_or_default();
                 paths.push(cfg.root.join(raw_path));
             }
-            paths.sort();
             paths.dedup();
             for path in &paths {
                 if path.exists() || path.is_symlink() {

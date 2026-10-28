@@ -313,3 +313,66 @@ def test_validate_rows_refuses_without_fixture_attestation(tmp_path: Path) -> No
     result = _rust(rust_root, _input_file(rust_root, [_row(sha)]), fixture=False)
     assert result.returncode == 1
     assert "fixture-only" in result.stderr
+
+
+def _archive_another(root: Path, record: dict[str, object], sha: str) -> None:
+    config = wrkslots_cli._load_config(str(root), None)
+    record2 = dict(record)
+    record2["slot"] = "slot-b"
+    record2["agent"] = "validate-slot-b"
+    record2["checkouts"] = [
+        dict(record["checkouts"][0], path="worktrees/validate/slot-b/repo")
+    ]
+    record_obj = wrkslots_cli._record_from_obj(record2, "fixture record b")
+    item = wrkslots_cli.AbsentValidateRow(MACHINE, "slot-b", 1, sha)
+    entry2 = wrkslots_cli._absent_validate_archive_entry(
+        record_obj, item, "2026-10-26T03:00:00Z"
+    )
+    archive_path = root / "worktrees" / f"ARCHIVED.{MACHINE}.json"
+    document = json.loads(archive_path.read_text())
+    wrkslots_cli._write_event_file(
+        config,
+        MACHINE,
+        "archive-state-recorded",
+        {
+            "action": "removed",
+            "slot": "slot-b",
+            "previous_revision": 4,
+            "revision": 5,
+            "record": entry2,
+            "evidence": {},
+        },
+    )
+    document["records"].append(entry2)
+    document["revision"] = 5
+    archive_path.write_text(json.dumps(document))
+
+
+def test_validate_rows_recovered_before_later_archive_matches(
+    tmp_path: Path,
+) -> None:
+    rust_root, record = _fixture(tmp_path / "rust")
+    oracle_root, oracle_record = _fixture(tmp_path / "oracle")
+    rust_sha = _record_sha(rust_root)
+    oracle_sha = _record_sha(oracle_root)
+    _mark_recovered(rust_root, record, rust_sha)
+    _mark_recovered(oracle_root, oracle_record, oracle_sha)
+    _archive_another(rust_root, record, rust_sha)
+    _archive_another(oracle_root, oracle_record, oracle_sha)
+    expected = _python(oracle_root, _input_file(oracle_root, [_row(oracle_sha)]))
+    result = _rust(rust_root, _input_file(rust_root, [_row(rust_sha)]))
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected
+
+
+def test_validate_rows_refusal_prints_outcome_payload(tmp_path: Path) -> None:
+    rust_root, _record = _fixture(tmp_path / "rust")
+    for root in (rust_root,):
+        (root / "worktrees" / f"ACTIVE.{MACHINE}.json").write_text(
+            json.dumps({"schema": 2, "machine": MACHINE, "revision": 7, "slots": []})
+        )
+    result = _rust(rust_root, _input_file(rust_root, [_row(EMPTY_SHA)]))
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["rows"][0]["outcome"] == "refused"
+    assert "neither active nor an exact prior" in payload["rows"][0]["detail"]

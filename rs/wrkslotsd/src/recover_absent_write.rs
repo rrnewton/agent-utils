@@ -45,7 +45,50 @@ fn is_digest(value: &str) -> bool {
             .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
 }
 
-fn archives_document(cfg: &Cfg, selected: &str) -> Result<Value> {
+pub(crate) fn archives_document(cfg: &Cfg, selected: &str) -> Result<Value> {
+    // When an event log exists, both state files are derived from
+    // it (a snapshot may lag a crash); otherwise read the snapshot.
+    if let Ok(events) = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), selected)
+    {
+        if !events.is_empty() {
+            let mut records: Vec<Value> = Vec::new();
+            let mut revision: i64 = 0;
+            for event in &events {
+                let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+                match event.get("kind").and_then(Value::as_str) {
+                    Some("state-imported") => {
+                        if let Some(archive) = payload.get("archive") {
+                            records = archive
+                                .get("records")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            revision = archive
+                                .get("revision")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(revision);
+                        }
+                    }
+                    Some("archive-state-recorded") => {
+                        if let Some(record) = payload.get("record") {
+                            records.push(record.clone());
+                        }
+                        revision = payload
+                            .get("revision")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(revision);
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(json!({
+                "schema": 2,
+                "machine": selected,
+                "revision": revision,
+                "records": records,
+            }));
+        }
+    }
     let path = cfg.control.join(format!("ARCHIVED.{selected}.json"));
     if !path.exists() {
         return Ok(json!({"schema": 2, "machine": selected, "revision": 0, "records": []}));
@@ -59,7 +102,7 @@ fn recovery_matches(
     cfg: &Cfg,
     selected: &str,
     archived: &Value,
-    archives_revision: i64,
+    _archives_revision: i64,
     slot: &str,
     generation: i64,
     sha: &str,
@@ -82,9 +125,6 @@ fn recovery_matches(
         event.get("kind").and_then(Value::as_str) == Some("archive-state-recorded")
             && payload.get("action").and_then(Value::as_str) == Some("absent-agent-row-recovered")
             && payload.get("slot").and_then(Value::as_str) == Some(slot)
-            && payload.get("revision").and_then(Value::as_i64) == Some(archives_revision)
-            && payload.get("previous_revision").and_then(Value::as_i64)
-                == Some(archives_revision - 1)
             && record.get("archive_id").and_then(Value::as_str) == Some(archive_id)
             && record.get("slot").and_then(Value::as_str) == Some(slot)
             && record.get("machine").and_then(Value::as_str) == Some(selected)

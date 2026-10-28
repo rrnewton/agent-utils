@@ -1195,14 +1195,16 @@ pub fn run() -> u8 {
             root,
             machine,
         } => {
-            match crate::recover_validate_write::recover_absent_validate_rows(
-                root.as_deref(),
-                machine.as_deref(),
-                &input,
-                apply_mode,
-                coordinator_authorized,
-                coordinator_pid,
-            ) {
+            let (refusal, result) =
+                crate::recover_validate_write::recover_absent_validate_rows_wrapped(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &input,
+                    apply_mode,
+                    coordinator_authorized,
+                    coordinator_pid,
+                );
+            match result {
                 Ok(value) => {
                     if format == "json" {
                         println!(
@@ -1233,6 +1235,36 @@ pub fn run() -> u8 {
                     return 0;
                 }
                 Err(error) => {
+                    if let Some(value) = refusal {
+                        if format == "json" {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&value).unwrap_or_default()
+                            );
+                        } else if let Some(rows) =
+                            value.get("rows").and_then(|rows| rows.as_array())
+                        {
+                            for row in rows {
+                                println!(
+                                    "ROW machine={} slot={} generation={} outcome={} detail={}",
+                                    row.get("machine")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default(),
+                                    row.get("slot").and_then(|v| v.as_str()).unwrap_or_default(),
+                                    row.get("generation")
+                                        .and_then(|v| v.as_i64())
+                                        .unwrap_or_default(),
+                                    row.get("outcome")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default(),
+                                    serde_json::to_string(
+                                        &row.get("detail").cloned().unwrap_or_default()
+                                    )
+                                    .unwrap_or_default(),
+                                );
+                            }
+                        }
+                    }
                     eprintln!("wrkslotsd: {error}");
                     return 1;
                 }
