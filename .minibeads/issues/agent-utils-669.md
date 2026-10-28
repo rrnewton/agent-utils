@@ -1,13 +1,14 @@
 ---
 title: 'watch-notice-delivery: watch-agents notices go undelivered behind a stuck batch, marked reported before delivery, and sent to finished managers'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 - watch-agents
 created_at: 2026-10-28T18:04:09.716143504+00:00
-updated_at: 2026-10-28T18:04:09.716143504+00:00
+updated_at: 2026-10-28T20:16:45.650332482+00:00
+closed_at: 2026-10-28T20:16:45.650332342+00:00
 ---
 
 # Description
