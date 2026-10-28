@@ -218,6 +218,41 @@ pub struct Config {
     /// left alone for a week, where one the configuration turned off is erased at once. See
     /// [`crate::cache::lifecycle`].
     pub message_cache: Option<MessageCacheConfig>,
+    /// The `[documents]` table. `#628 documents-index-server`.
+    pub documents: DocumentsConfig,
+}
+
+/// `[documents]`: the linked-document index and its fetchers. `#628 documents-index-server`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentsConfig {
+    /// File holding the least-privilege GitHub token, when private repos are fetched.
+    pub github_token_file: Option<PathBuf>,
+    /// Raw-content base for GitHub fetches (a fake in tests).
+    pub github_raw_base: Option<String>,
+    /// URL prefixes under which a paste id names a document.
+    pub paste_url_prefixes: Vec<String>,
+    /// Argv template fetching a paste, `{}` for the id, `--` before it.
+    pub paste_command: Vec<String>,
+    /// Ceiling on cached fetched documents, by count.
+    pub max_cached_documents: usize,
+    /// Ceiling on cached fetched documents, by total content bytes.
+    pub max_cached_bytes: usize,
+    /// Where the fold index persists; beside the store by default when one exists.
+    pub index_path: Option<PathBuf>,
+}
+
+impl Default for DocumentsConfig {
+    fn default() -> Self {
+        Self {
+            github_token_file: None,
+            github_raw_base: None,
+            paste_url_prefixes: Vec::new(),
+            paste_command: Vec::new(),
+            max_cached_documents: crate::documents::DEFAULT_MAX_CACHED,
+            max_cached_bytes: crate::documents::DEFAULT_MAX_CACHED_BYTES,
+            index_path: None,
+        }
+    }
 }
 
 /// Default `[message_cache] max_days`: how long a cached message is kept, from when it was
@@ -1453,6 +1488,23 @@ struct FileConfig {
     replay: FileReplay,
     /// `#208 persistent-cache`. `None` when the table is absent, which is not `enabled = false`.
     message_cache: Option<FileMessageCache>,
+    #[serde(default)]
+    documents: FileDocuments,
+}
+
+/// `[documents]` as written. `#628 documents-index-server`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileDocuments {
+    github_token_file: Option<String>,
+    github_raw_base: Option<String>,
+    #[serde(default)]
+    paste_url_prefixes: Vec<String>,
+    #[serde(default)]
+    paste_command: Vec<String>,
+    max_cached_documents: Option<i64>,
+    max_cached_bytes: Option<i64>,
+    index_path: Option<String>,
 }
 
 /// `[message_cache]` as written. Integers are read wide so that an out-of-range value is refused
@@ -2032,8 +2084,75 @@ impl Config {
             summaries,
             replay,
             message_cache,
+            documents: documents_config(file.documents)?,
         })
     }
+}
+
+/// Resolve and check `[documents]`. `#628 documents-index-server`.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the field to fix.
+fn documents_config(file: FileDocuments) -> Result<DocumentsConfig, ConfigError> {
+    let invalid = |field: &str, detail: String| ConfigError::Invalid {
+        field: format!("documents.{field}"),
+        detail,
+    };
+    let defaults = DocumentsConfig::default();
+    let path = |field: &str, value: Option<String>| -> Result<Option<PathBuf>, ConfigError> {
+        match value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()) {
+            None => Ok(None),
+            Some(v) if PathBuf::from(&v).is_absolute() => Ok(Some(PathBuf::from(v))),
+            Some(v) => Err(invalid(
+                field,
+                format!("{v} is relative; give an absolute path"),
+            )),
+        }
+    };
+    if !file.paste_command.is_empty() {
+        let joined = file.paste_command.join(" ");
+        let dashdash = joined.find("--");
+        let placeholder = joined.find("{}");
+        if placeholder.is_none() || dashdash.is_none_or(|d| placeholder.is_some_and(|p| d > p)) {
+            return Err(invalid(
+                "paste_command",
+                "must contain {} for the paste id with -- before it".to_owned(),
+            ));
+        }
+    }
+    let ranged = |field: &str, value: Option<i64>, default: usize| -> Result<usize, ConfigError> {
+        match value {
+            None => Ok(default),
+            Some(v) if v >= 1 && v <= 1_000_000_000 => {
+                usize::try_from(v).map_err(|_| invalid(field, "too large".to_owned()))
+            }
+            Some(v) => Err(invalid(
+                field,
+                format!("{v} is out of range; give at least 1"),
+            )),
+        }
+    };
+    Ok(DocumentsConfig {
+        github_token_file: path("github_token_file", file.github_token_file)?,
+        github_raw_base: file
+            .github_raw_base
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty()),
+        paste_url_prefixes: file.paste_url_prefixes,
+        paste_command: file.paste_command,
+        max_cached_documents: ranged(
+            "max_cached_documents",
+            file.max_cached_documents,
+            defaults.max_cached_documents,
+        )?,
+        max_cached_bytes: ranged(
+            "max_cached_bytes",
+            file.max_cached_bytes,
+            defaults.max_cached_bytes,
+        )?,
+        index_path: path("index_path", file.index_path)?,
+    })
 }
 
 /// Resolve and check `[wit]`. `#552 wit-tts-provider`.

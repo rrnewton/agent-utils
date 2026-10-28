@@ -103,6 +103,27 @@ fn inventory() -> Vec<Route> {
         route("GET", "/style.css", Public, Nothing),
         route("GET", "/manifest.webmanifest", Public, Nothing),
         route("GET", "/icons/{name}", Public, Nothing),
+        // `#628 documents-index-server`.
+        route(
+            "GET",
+            "/api/v1/documents",
+            Read,
+            Query("?limit=5", "?limit=soon"),
+        ),
+        route(
+            "POST",
+            "/api/v1/documents/fetch",
+            Write,
+            Json(r#"{"key":"github:octo/widgets@main:docs/report.md"}"#),
+        ),
+        route(
+            "POST",
+            "/api/v1/documents/fetch-recent",
+            Write,
+            Json(r#"{"limit":5}"#),
+        ),
+        route("GET", "/api/v1/documents/{key}", Read, Nothing),
+        route("GET", "/api/v1/documents/{key}/freshness", Read, Nothing),
         route("GET", "/api/v1/channels", Read, Nothing),
         route(
             "GET",

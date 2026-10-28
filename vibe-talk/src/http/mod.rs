@@ -182,6 +182,19 @@ fn routes(state: AppState) -> Router {
         .route("/style.css", get(assets::serve))
         .route("/manifest.webmanifest", get(assets::serve))
         .route("/icons/{name}", get(assets::serve))
+        // `#628 documents-index-server`. READ to list/read/check, WRITE to fetch
+        // (fetching spends credentials). No MCP tool.
+        .route("/api/v1/documents", get(api::list_documents))
+        .route("/api/v1/documents/fetch", post(api::fetch_document))
+        .route(
+            "/api/v1/documents/fetch-recent",
+            post(api::fetch_recent_documents),
+        )
+        .route("/api/v1/documents/{key}", get(api::get_document))
+        .route(
+            "/api/v1/documents/{key}/freshness",
+            get(api::document_freshness),
+        )
         .route("/api/v1/channels", get(api::list_channels))
         // `#190 voice-agent-tools`. READ scope: every listed channel's last few hours in one call,
         // the route behind the `recent_activity` tool. It reads what `/digest` reads, once per

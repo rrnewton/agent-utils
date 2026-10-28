@@ -180,6 +180,9 @@ pub struct AppState {
     /// The live pairing codes, as hashes, and the failed redemptions per client. `#369
     /// pairing-link`; see [`crate::pairing`]. In memory only: a restart burns every code.
     pub pairing: Arc<crate::pairing::Pairing>,
+    /// The linked-document fold index and its bounded fetched cache.
+    /// `#628 documents-index-server`; see [`crate::documents`].
+    pub documents: Arc<crate::documents::Service>,
 }
 
 fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo {

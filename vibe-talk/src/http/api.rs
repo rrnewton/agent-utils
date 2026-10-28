@@ -7137,3 +7137,234 @@ pub async fn show_channel(
     unhide_configured_channel(&state, &configured.id).await?;
     Ok(channel_list_answer(&state, configured).await)
 }
+
+/// One document row of `GET /api/v1/documents`. `#628 documents-index-server`.
+#[derive(Serialize)]
+pub struct DocumentRow {
+    /// Canonical document key.
+    pub key: String,
+    /// Document kind: `github_markdown`, `github_file`, `paste`, `google_doc`.
+    pub kind: &'static str,
+    /// The address as linked.
+    pub url: String,
+    /// Last path segment.
+    pub file_name: String,
+    /// Real title when fetched, else the link label, else the file name.
+    pub title: String,
+    /// Whether a fetched copy is in the bounded server cache.
+    pub fetched: bool,
+    /// Cached content version, when fetched.
+    pub version: Option<String>,
+    /// When the cached copy was fetched, in Unix milliseconds.
+    pub fetched_ms: Option<i64>,
+    /// How many messages link this document.
+    pub mention_count: usize,
+    /// First mention, in Unix milliseconds, when known.
+    pub first_mentioned_ms: Option<i64>,
+    /// Latest mention, in Unix milliseconds, when known.
+    pub last_mentioned_ms: Option<i64>,
+    /// Every mention, oldest first.
+    pub mentions: Vec<crate::documents::Mention>,
+}
+
+fn document_row(state: &AppState, entry: &crate::documents::Entry) -> DocumentRow {
+    let cached = state.documents.cached(&entry.key);
+    DocumentRow {
+        key: entry.key.clone(),
+        kind: entry.kind.as_str(),
+        url: entry.locator.url.clone(),
+        file_name: entry.file_name.clone(),
+        title: cached
+            .as_ref()
+            .map_or_else(|| entry.display_name().to_owned(), |c| c.title.clone()),
+        fetched: cached.is_some(),
+        version: cached.as_ref().map(|c| c.version.clone()),
+        fetched_ms: cached.as_ref().map(|c| c.fetched_ms),
+        mention_count: entry.mentions.len(),
+        first_mentioned_ms: entry.first_mentioned_ms(),
+        last_mentioned_ms: entry.last_mentioned_ms(),
+        mentions: entry.mentions.clone(),
+    }
+}
+
+/// Query of `GET /api/v1/documents`.
+#[derive(Deserialize)]
+pub struct DocumentsQuery {
+    /// At most this many rows (default 100, at most 500).
+    pub limit: Option<usize>,
+    /// Only documents last mentioned before this Unix millisecond.
+    pub before_ms: Option<i64>,
+    /// Only documents mentioned in this channel.
+    pub channel: Option<String>,
+    /// Sync cursor: return only what changed since this fold revision.
+    pub since_revision: Option<u64>,
+}
+
+/// `GET /api/v1/documents` — the fold, in mention order (newest last).
+/// READ scope; the read path reads only the cached fold, never a scan.
+/// The payload is the same record the page keeps locally: its `revision`
+/// versions it, and `since_revision` syncs newer state onto the local copy.
+/// More state only enriches the local view; HTTP answers stay `no-store`
+/// like every `/api/` answer (`#223`), so the local copy is the page's.
+pub async fn list_documents(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Query(query): Query<DocumentsQuery>,
+) -> Result<Response, ApiError> {
+    let revision = state.documents.index.revision();
+    let body = if let Some(since) = query.since_revision {
+        let (changed, deleted, truncated, current) = state.documents.index.changes_since(since);
+        serde_json::json!({
+            "revision": current,
+            "changed": changed.iter().map(|e| document_row(&state, e)).collect::<Vec<_>>(),
+            "deleted": deleted,
+            "truncated": truncated,
+            "total": state.documents.index.len(),
+        })
+    } else {
+        let limit = query.limit.unwrap_or(100).clamp(1, 500);
+        let mut entries = state.documents.index.list();
+        if let Some(channel) = &query.channel {
+            entries.retain(|e| e.mentions.iter().any(|m| &m.channel_id == channel));
+        }
+        if let Some(before) = query.before_ms {
+            entries.retain(|e| e.last_mentioned_ms().is_some_and(|ms| ms < before));
+        }
+        let total = entries.len();
+        let start = total.saturating_sub(limit);
+        let documents: Vec<DocumentRow> = entries[start..]
+            .iter()
+            .map(|e| document_row(&state, e))
+            .collect();
+        serde_json::json!({
+            "documents": documents,
+            "total": total,
+            "revision": revision,
+        })
+    };
+    Ok(Json(body).into_response())
+}
+
+/// `GET /api/v1/documents/{key}` — one document, with content when fetched.
+/// READ scope. The key is percent-decoded by the router.
+pub async fn get_document(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(key): Path<String>,
+) -> Result<Response, ApiError> {
+    let entry = state.documents.index.get(&key).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_document",
+            "no such document",
+        )
+    })?;
+    let cached = state.documents.cached(&key);
+    Ok(Json(serde_json::json!({
+        "document": document_row(&state, &entry),
+        "content": cached.as_ref().map(|c| c.content.clone()),
+        "outline": cached.as_ref().map(|c| c.outline.clone()).unwrap_or_default(),
+    }))
+    .into_response())
+}
+
+/// Body of the document fetch routes.
+#[derive(Deserialize)]
+pub struct FetchDocumentBody {
+    /// Document key to fetch.
+    pub key: Option<String>,
+    /// How many recent unfetched documents to fetch (fetch-recent; 1 to 20).
+    pub limit: Option<usize>,
+    /// Replace a cached copy with the newest version (the update chip's tap).
+    /// Without it, fetching a cached document is idempotent and returns it.
+    pub refresh: Option<bool>,
+}
+
+fn fetch_error(error: crate::documents::FetchError) -> ApiError {
+    match error {
+        crate::documents::FetchError::Unsupported(kind) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "document_not_fetchable",
+            format!("no fetcher for {kind} documents yet"),
+        ),
+        crate::documents::FetchError::Failed(detail) => {
+            ApiError::new(StatusCode::BAD_GATEWAY, "document_fetch_failed", detail)
+        }
+    }
+}
+
+/// `POST /api/v1/documents/fetch` — fetch one document on demand.
+/// WRITE scope: fetching spends the deployment's credentials.
+pub async fn fetch_document(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(body): Json<FetchDocumentBody>,
+) -> Result<Response, ApiError> {
+    let key = body
+        .key
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("give a document key"))?;
+    if state.documents.index.get(&key).is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_document",
+            "no such document",
+        ));
+    }
+    let fetched = if body.refresh.unwrap_or(false) {
+        state.documents.fetch_one_refresh(&key).await
+    } else {
+        state.documents.fetch_one(&key).await
+    }
+    .map_err(fetch_error)?;
+    Ok(Json(serde_json::json!({
+        "fetched": [{
+            "key": fetched.key,
+            "title": fetched.title,
+            "version": fetched.version,
+            "fetched_ms": fetched.fetched_ms,
+        }],
+    }))
+    .into_response())
+}
+
+/// `POST /api/v1/documents/fetch-recent` — fetch the most recent unfetched
+/// documents (at most 20). WRITE scope, as [`fetch_document`].
+pub async fn fetch_recent_documents(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(body): Json<FetchDocumentBody>,
+) -> Result<Response, ApiError> {
+    let fetched = state
+        .documents
+        .fetch_recent(body.limit.unwrap_or(crate::documents::MAX_FETCH_RECENT))
+        .await;
+    let rows: Vec<_> = fetched
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "key": f.key, "title": f.title, "version": f.version,
+                "fetched_ms": f.fetched_ms,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "fetched": rows })).into_response())
+}
+
+/// `GET /api/v1/documents/{key}/freshness` — whether the source holds a newer
+/// version than the cached one. READ scope; best effort.
+pub async fn document_freshness(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(key): Path<String>,
+) -> Result<Response, ApiError> {
+    if state.documents.index.get(&key).is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_document",
+            "no such document",
+        ));
+    }
+    let freshness = state.documents.freshness(&key).await.map_err(fetch_error)?;
+    Ok(Json(freshness).into_response())
+}

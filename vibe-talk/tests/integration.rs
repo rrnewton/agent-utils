@@ -60,6 +60,9 @@ mod contract;
 #[path = "diagnostics.rs"]
 mod diagnostics;
 
+#[path = "documents.rs"]
+mod documents;
+
 #[path = "elevenlabs_mock.rs"]
 mod elevenlabs_mock;
 

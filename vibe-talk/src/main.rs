@@ -763,6 +763,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&elevenlabs),
         config.elevenlabs.clone(),
     );
+    let documents = vibe_talk::documents::service_from_config(&config.documents);
     let live_limit = config.chat.default_fetch_limit;
     // remote-ops-audit W5: at most one thread-naming read per channel per this many seconds.
     let thread_names = Arc::new(vibe_talk::summarize::threads::ThreadNames::with_interval(
@@ -786,6 +787,7 @@ async fn main() -> anyhow::Result<()> {
         voice_health_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         voice_end_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         pairing: Arc::new(vibe_talk::pairing::Pairing::new()),
+        documents,
         headings: Arc::new(vibe_talk::heading::HeadingTags::new()),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
         voice_tickets: Arc::new(vibe_talk::voice_tickets::VoiceTickets::new()),
@@ -813,6 +815,10 @@ async fn main() -> anyhow::Result<()> {
     state
         .message_cache
         .attach_summaries(vibe_talk::cache::orphans::Summaries::of(&state));
+    // `#628 documents-index-server`: every queued cache fill folds into the index.
+    state
+        .message_cache
+        .set_documents(Arc::clone(&state.documents.index));
     // `#208 persistent-cache`. The `[message_cache]` table and the owner's switch beside the store
     // decide whether a cache file is opened, left, or erased. After the summaries are attached, so
     // a cache opened here is followed from its first erase, and before the sink is armed below.

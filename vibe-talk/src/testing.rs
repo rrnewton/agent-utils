@@ -365,6 +365,8 @@ fn state_pieces_with(
     // As `main` builds them: the message cache's handle first, attached to the hub before anything
     // can publish. `#208 persistent-cache`.
     let message_cache = Arc::new(crate::cache::Sink::off());
+    let documents = crate::documents::service_from_config(&config.documents);
+    message_cache.set_documents(Arc::clone(&documents.index));
     let live = Arc::new(crate::live::LiveHub::new());
     live.attach_cache(Arc::clone(&message_cache));
     // As `main` attaches it: the poller colours threads as it meets them. `#427 server-thread-hues`.
@@ -392,6 +394,7 @@ fn state_pieces_with(
         voice_health_budget: Arc::new(crate::voice_health::LogBudget::new()),
         voice_end_budget: Arc::new(crate::voice_health::LogBudget::new()),
         pairing: Arc::new(crate::pairing::Pairing::new()),
+        documents,
         headings: Arc::new(crate::heading::HeadingTags::new()),
         speech_tickets: Arc::new(crate::speech_tickets::SpeechTickets::new()),
         voice_tickets: Arc::new(crate::voice_tickets::VoiceTickets::new()),

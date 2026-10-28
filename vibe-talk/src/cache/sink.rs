@@ -238,6 +238,8 @@ struct State {
     /// diagnostics name beside a message its comparison found different. Memory only. `#497
     /// cache-shadow-missing-row`.
     arrivals: Arc<Arrivals>,
+    /// The document fold index fed as messages are cached. `#628 documents-index-server`.
+    documents: RwLock<Option<Arc<crate::documents::Index>>>,
 }
 
 /// What the shadow has counted since the process started, and how many of its evaluations have
@@ -562,6 +564,50 @@ pub struct Fill {
     recent_via_flat: bool,
     rows: bool,
     arrivals: Weak<Arrivals>,
+    documents: Option<Arc<crate::documents::Index>>,
+}
+
+/// Fold one queued observation into the document index. `#628 documents-index-server`.
+fn fold_documents(
+    index: &crate::documents::Index,
+    channel_id: &ChannelId,
+    observation: &Observation,
+) {
+    fn fold_incoming(index: &crate::documents::Index, incoming: &super::Incoming) {
+        let m = &incoming.message;
+        index.apply_message(
+            m.channel_id.as_str(),
+            m.id.as_str(),
+            m.created_ms(),
+            &m.author,
+            m.reply_thread(),
+            &m.content,
+        );
+    }
+    match observation {
+        Observation::Listing(listing) => {
+            for row in &listing.rows {
+                fold_incoming(index, row);
+            }
+        }
+        Observation::Rows { rows, .. } => {
+            for row in rows {
+                fold_incoming(index, row);
+            }
+        }
+        Observation::Deleted { ids, .. } => {
+            for id in ids {
+                index.remove_message(channel_id.as_str(), id.as_str());
+            }
+        }
+        Observation::Push { push, .. } => match push {
+            super::Push::Upsert { message, .. } => fold_incoming(index, message),
+            super::Push::Delete { id, .. } => {
+                index.remove_message(channel_id.as_str(), id.as_str());
+            }
+        },
+        Observation::Threads { .. } | Observation::Frontier(_) => {}
+    }
 }
 
 impl Fill {
@@ -806,8 +852,14 @@ impl Fill {
                         Arrivals::noted(&observation, self.grant.label(), offered_ms),
                     )
                 });
+                // The observation is cloned for the fold only when one is attached:
+                // what was queued is what the fold sees. `#628 documents-index-server`.
+                let for_fold = self.documents.as_ref().map(|_| observation.clone());
                 if let Offered::Queued(_) = cache.offer(self.chan.clone(), self.stamp, observation)
                 {
+                    if let (Some(index), Some(observation)) = (&self.documents, &for_fold) {
+                        fold_documents(index, &self.channel, observation);
+                    }
                     if let Some((arrivals, noted)) = noted {
                         arrivals.record(&self.chan, noted);
                     }
@@ -1814,7 +1866,23 @@ impl Sink {
             recent_via_flat: route.recent_via_flat,
             rows,
             arrivals: Arc::downgrade(&self.state.arrivals),
+            documents: self
+                .state
+                .documents
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         })
+    }
+
+    /// Feed the document fold index from every fill this sink queues.
+    /// `#628 documents-index-server`.
+    pub fn set_documents(&self, index: Arc<crate::documents::Index>) {
+        *self
+            .state
+            .documents
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(index);
     }
 
     /// [`Sink::begin`] under the grant a request's caller holds: none at read scope.
