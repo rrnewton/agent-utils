@@ -100,6 +100,16 @@ pub(crate) fn recover_unbound_owner(
         ));
     }
     assert_caller(&coordinator, "coordinator")?;
+    let slot_type = record
+        .get("slot_type")
+        .and_then(Value::as_str)
+        .unwrap_or("agent")
+        .to_string();
+    if slot_type != "agent" {
+        return Err(format!(
+            "recover-unbound-owner for slot type '{slot_type}' stays with the Python edition for now"
+        ));
+    }
     if !record
         .get("owner")
         .cloned()

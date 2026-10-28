@@ -84,10 +84,16 @@ def _fixture(base: Path, owner: dict[str, object] | None) -> Path:
     head = _repo(upstream)
     _git(upstream, "remote", "add", "origin", str(upstream))
     _git(upstream, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    checkout_path = root / "worktrees" / "slot-a" / "repo"
     _git(
         upstream, "worktree", "add", "-q", "-b", "suite/work",
-        str(root / "worktrees" / "slot-a" / "repo"), "HEAD",
+        str(checkout_path), "HEAD",
     )
+    (checkout_path / "file.txt").write_text("two\n")
+    _git(checkout_path, "add", "file.txt")
+    _git(checkout_path, "commit", "-q", "-m", "two")
+    _git(checkout_path, "push", "-q", "origin", "HEAD:suite/work")
+    _git(upstream, "merge", "-q", "--ff-only", "suite/work")
     record: dict[str, object] = {
         "slot": "slot-a",
         "agent": "agent-slot-a",
@@ -218,6 +224,11 @@ def test_recover_unbound_matches_python(tmp_path: Path) -> None:
     assert json.loads(result.stdout)["outcome"] == "recorded coordinator recovery evidence"
     assert _active(rust_root) == _active(oracle_root)
     assert _events(rust_root) == _events(oracle_root)
+    for root in (rust_root, oracle_root):
+        doc = json.loads((root / "worktrees" / "ACTIVE.node-a.json").read_text())
+        refreshed = doc["slots"][0]["checkouts"][0]["head"]
+        live = _git(root / "worktrees" / "slot-a" / "repo", "rev-parse", "HEAD")
+        assert refreshed == live
 
 
 def test_recover_unbound_historical_owner_refuses(tmp_path: Path) -> None:
@@ -229,6 +240,7 @@ def test_recover_unbound_historical_owner_refuses(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "has a historical owner" in result.stderr
     assert _active(rust_root)["revision"] == 7
+    assert _events(rust_root) == []
 
 
 def test_recover_unbound_refuses_without_fixture_attestation(tmp_path: Path) -> None:
@@ -237,3 +249,17 @@ def test_recover_unbound_refuses_without_fixture_attestation(tmp_path: Path) -> 
     assert result.returncode == 1
     assert "fixture-only" in result.stderr
     assert _active(rust_root)["revision"] == 7
+    assert _events(rust_root) == []
+
+
+def test_recover_unbound_validate_type_refuses_python_scope(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust", None)
+    active_path = rust_root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(active_path.read_text())
+    document["slots"][0]["slot_type"] = "validate"
+    document["slots"][0]["checkouts"][0]["path"] = "worktrees/validate/slot-a/repo"
+    active_path.write_text(json.dumps(document))
+    result = _rust(rust_root)
+    assert result.returncode == 1
+    assert _active(rust_root)["revision"] == 7
+    assert _events(rust_root) == []
