@@ -424,6 +424,30 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Recover absent validation rows named by a JSON input file (writer; fixture registries only until cutover)
+    RecoverAbsentValidateRows {
+        /// JSON input file with the exact rows to recover
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+        /// Apply instead of planning
+        #[arg(long = "apply")]
+        apply_mode: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID (required with --apply)
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Output format: text or json
+        #[arg(long, value_name = "FORMAT", default_value = "text")]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
     Create {
         /// New slot name
@@ -1155,6 +1179,58 @@ pub fn run() -> u8 {
                         serde_json::to_string_pretty(&value).unwrap_or_default()
                     );
                     return if refused > 0 { 1 } else { 0 };
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverAbsentValidateRows {
+            input,
+            apply_mode,
+            coordinator_authorized,
+            coordinator_pid,
+            format,
+            root,
+            machine,
+        } => {
+            match crate::recover_validate_write::recover_absent_validate_rows(
+                root.as_deref(),
+                machine.as_deref(),
+                &input,
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+            ) {
+                Ok(value) => {
+                    if format == "json" {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                    } else if let Some(rows) = value.get("rows").and_then(|rows| rows.as_array()) {
+                        for row in rows {
+                            println!(
+                                "ROW machine={} slot={} generation={} outcome={} detail={}",
+                                row.get("machine")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default(),
+                                row.get("slot").and_then(|v| v.as_str()).unwrap_or_default(),
+                                row.get("generation")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or_default(),
+                                row.get("outcome")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default(),
+                                serde_json::to_string(
+                                    &row.get("detail").cloned().unwrap_or_default()
+                                )
+                                .unwrap_or_default(),
+                            );
+                        }
+                    }
+                    return 0;
                 }
                 Err(error) => {
                     eprintln!("wrkslotsd: {error}");

@@ -346,6 +346,7 @@
         "py/wrkslots/tests/test_record_holds_rust.py",
         "py/wrkslots/tests/test_recover_absent_write_rust.py",
         "py/wrkslots/tests/test_recover_unbound_write_rust.py",
+        "py/wrkslots/tests/test_recover_validate_write_rust.py",
         "py/wrkslots/tests/test_release_write_rust.py",
         "py/wrkslots/tests/test_remove_write_rust.py",
         "py/wrkslots/tests/test_scoped_journal_episodes.py",
