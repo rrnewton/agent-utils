@@ -212,7 +212,7 @@ const ALL_CHANNELS = "*";
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings" | "own-read-apply" | "own-read-undo" | "page-update"
  *   | "pair-confirm" | "pair-dismiss" | "pair-submit"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-on-device" | "read-prev" | "read-speed" | "read-speed-down" | "read-speed-up" | "read-steer-grip" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-on-device" | "read-prev" | "read-section-next" | "read-section-prev" | "read-speed" | "read-speed-down" | "read-speed-up" | "read-steer-grip" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-newline" | "reply-send"
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
@@ -39558,7 +39558,10 @@ function showReadingPosition() {
   renderReadSteer();
 }
 
-/** The steering strip: Previous, "k of n", Next, while a read of several parts is playing (`#537`: no Pause). */
+/**
+ * The steering strip, while a read of several parts is playing (`#537`: no Pause): since `#627
+ * scrubber-thumb-arrows` the fat Previous and Next section, "k of n", the thin Previous and Next block.
+ */
 function renderReadSteer() {
   const strip = el("read-steer");
   if (!strip) return;
@@ -39577,6 +39580,8 @@ function renderReadSteer() {
   if (position === "") return;
   el("read-steer-count").textContent = position;
   el("read-next").disabled = nowPlaying.segment + 1 >= nowPlaying.segments.length;
+  const at = nowPlaying.segment;
+  el("read-section-next").disabled = !readSectionStarts(nowPlaying).some((start) => start > at);
   if (wasHidden) placeReadSteer();
 }
 
@@ -39812,6 +39817,51 @@ function stepReading(delta) {
   if (playing === null || !playing.segments) return false;
   if (delta > 0 && playing.segment + 1 >= playing.segments.length) return false;
   return jumpReading(playing.segment + delta);
+}
+
+/**
+ * `#627 scrubber-thumb-arrows`. Where each SECTION of a read begins, as indices into its segments, in
+ * order, the first always 0: the owner's "big jumps between chapters", beside the blocks' small ones.
+ *
+ * A section is a message of the row, or a heading of one and what follows it up to the next. A read
+ * with neither (one message, no headings: most of them) would leave the fat arrows nothing to do, so
+ * there the section is the message's next level down: a drawn block whole, its pieces
+ * (`#486 read-aloud-pieces`) together and a run of list items together. Only the kinds and pieces the
+ * blocks were prepared as are read, so a row scrolled away or drawn again steers the same.
+ *
+ * @param {{segments: Array<{part: number, block: number | null}>, blocks?: Array<Array<{kind?: string, piece?: number}> | null> | null}} playing
+ * @returns {number[]}
+ */
+function readSectionStarts(playing) {
+  const { segments } = playing;
+  const listedOf = (segment) => (segment.block === null ? null
+    : (playing.blocks && playing.blocks[segment.part] && playing.blocks[segment.part][segment.block]) || null);
+  const continues = (listed) => listed !== null && Number.isInteger(listed.piece) && Number(listed.piece) > 0;
+  const startsWhere = (begins) => segments.flatMap((segment, index) =>
+    (index === 0 || begins(listedOf(segment), listedOf(segments[index - 1]), segment, segments[index - 1]) ? [index] : []));
+  const chapters = startsWhere((listed, _before, segment, previous) => segment.part !== previous.part
+    || listed === null || (listed.kind === "heading" && !continues(listed)));
+  if (chapters.length > 1) return chapters;
+  return startsWhere((listed, before) => listed === null
+    || (!continues(listed) && !(listed.kind === "item" && before !== null && before.kind === "item")));
+}
+
+/**
+ * `#627 scrubber-thumb-arrows`. Previous (-1) or Next (+1) section. Previous goes to where the section
+ * being read began, and from its first block to where the one before began, as a player's Previous
+ * chapter does; on the first section it starts it again, as Previous on the first block does.
+ */
+function stepSection(delta) {
+  const playing = nowPlaying;
+  if (playing === null || !playing.segments) return false;
+  const starts = readSectionStarts(playing);
+  const at = playing.segment;
+  if (delta > 0) {
+    const next = starts.find((start) => start > at);
+    return next === undefined ? false : jumpReading(next);
+  }
+  const before = starts.filter((start) => start < at);
+  return jumpReading(before.length > 0 ? before[before.length - 1] : 0);
 }
 
 /**
@@ -59938,6 +59988,8 @@ el("read-speed-box").addEventListener("keydown", (event) => {
 // `#376 read-aloud-blocks`. Through the blocks of the read in progress.
 el("read-prev").addEventListener("click", () => { stepReading(-1); });
 el("read-next").addEventListener("click", () => { stepReading(1); });
+el("read-section-prev").addEventListener("click", () => { stepSection(-1); });
+el("read-section-next").addEventListener("click", () => { stepSection(1); });
 
 // `#442 read-strip-order`. The strip moved on a desk, by its grip: pointer, keys, double-click home.
 el("read-steer-grip").addEventListener("pointerdown", onReadGripDown);

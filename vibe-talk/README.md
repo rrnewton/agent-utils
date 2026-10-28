@@ -895,14 +895,20 @@ says (`chars`, in the prepare answer) at the voice's speaking rate, measured fro
 that arrived whole. It uses the CSS Custom Highlight API and changes nothing in the drawn body; a
 browser without the API lights the block alone.
 
-Under Previous and Next the strip draws the read as a **timeline of its blocks**
+Under the arrows the strip draws the read as a **timeline of its blocks**
 (`#380 read-aloud-timeline`), the longer ones wider: the blocks heard tinted, the one being read
 filled. A tap on one reads from there. Widths follow the square root of how long each block is, and
 none is more than twice the mean, so one long block cannot take most of the line
 (`read-chunk-balance`). The pieces of one block stand closer together than two blocks do.
 
-The strip reads Previous, `k of n` and Next, in that order on screen and for Tab
-(`#442 read-strip-order`); it has no Pause or Stop of its own (`#537 scrub-bar-no-play-pause`). While
+The strip's controls are four arrows around the count (`#627 scrubber-thumb-arrows`): fat
+Previous and Next **section**, `k of n`, thin Previous and Next **block**, all pointing along the
+timeline, each a 44px target, in that order on screen and for Tab (`#442 read-strip-order`). A section
+is a message of the row, or a heading and what follows it up to the next; a message with neither steps
+by its paragraphs, lists (all their items) and quotes whole, a long paragraph's pieces together.
+Previous section goes to where the section being read began, and from its first block to the section
+before. The media keys still step a block. It has no Pause or Stop of its own
+(`#537 scrub-bar-no-play-pause`). While
 a read plays, the bar's Read button is its Pause (Resume while held), with Stop beside it, also in the
 slim row kept while the on-screen keyboard is up. Stop ends the read and leaves reading mode in one
 tap. On a desk the strip can be moved off what
@@ -911,7 +917,7 @@ steps). It stays inside the window and is remembered on that device; a double-cl
 Home, puts it back on the chips row. On a phone it stays docked.
 
 On a phone the strip of a read playing is a **full-width row on the dock**
-(`scrubber-full-width`): it stands directly on the bottom row (Pace, Stop, Pause), the list ends at its
+(`scrubber-full-width`), its arrows together at the right edge under the thumb: it stands directly on the bottom row (Pace, Stop, Pause), the list ends at its
 top edge, and the bar's second row (the gear, the pickers, the Voice/Channel switch) and the floating
 chips are hidden, so the list gets their room. Paused, the chips come back on the strip, and the
 second row stays hidden, so a pause or a resume never resizes the list's frame or moves the strip.

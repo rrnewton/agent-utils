@@ -11,12 +11,17 @@ pause and play move through it, and the boundaries between blocks are heard with
 no gap (measured, at 412x915, 393x852 and on a desk), and the Read button and the media keys are one
 state — pausing by either holds the position, resuming by the other carries on from the held block.
 
-`#442 read-strip-order` and `#537 scrub-bar-no-play-pause`: the strip reads Previous, k of n, Next,
+`#442 read-strip-order` and `#537 scrub-bar-no-play-pause`: the strip reads its arrows and k of n,
 and no Pause or Stop of its own, in one line, in the same order on screen as in the markup and for
 Tab, at 393x852, 375x812 and on a desk (where the grip that moves it comes first). While a read plays
 the bar's Read is its Pause with Stop on its left, also in the keyboard-up slim row (`#429`). The
 bar's Stop ends the read and leaves reading mode. On a desk the strip is dragged by its grip and a
 double-click on the grip docks it.
+
+`#627 scrubber-thumb-arrows`: the arrows read fat Previous and Next section, k of n, thin Previous and
+Next block, each a 44px target; on a phone they stand together at the strip's right edge, under the
+right thumb. The fat arrows jump between the message's sections: with no headings, its paragraphs,
+its list whole, its quote and its code block.
 
 `#451 read-strip-followups`: on a desk a one-block read started with s outside reading mode — which
 draws no strip — is paused and stopped from the bar, the mode never entered. (The moved strip held in
@@ -176,7 +181,22 @@ STRIP_LAYOUT = """() => {
 }"""
 
 # `#537 scrub-bar-no-play-pause`: no Pause or Stop on the strip; the bar under the list has both.
-STRIP_ORDER = ["read-prev", "read-steer-count", "read-next"]
+# `#627 scrubber-thumb-arrows`: the fat section arrows, the count, the thin block arrows.
+STRIP_ORDER = ["read-section-prev", "read-section-next", "read-steer-count", "read-prev", "read-next"]
+
+# `#627 scrubber-thumb-arrows`. The arrows' boxes, and the strip's inner right edge (its box less its
+# padding and border), where on a phone the group stands.
+ARROW_LAYOUT = """() => {
+  const strip = document.getElementById('read-steer');
+  const box = strip.getBoundingClientRect();
+  const style = getComputedStyle(strip);
+  const inner = box.right - parseFloat(style.paddingRight) - parseFloat(style.borderRightWidth);
+  const arrows = ['read-section-prev', 'read-section-next', 'read-prev', 'read-next'].map((id) => {
+    const b = document.getElementById(id).getBoundingClientRect();
+    return { id, left: b.left, right: b.right, width: b.width, height: b.height };
+  });
+  return { stripLeft: box.left, stripWidth: box.width, inner, arrows };
+}"""
 
 # The bar's Read (Pause while a read plays) and the Stop on its left: drawn, side by side, in one row,
 # Read keeping the edge under the thumb.
@@ -734,13 +754,26 @@ def main() -> int:
                 return layout
 
             def check_strip_order(page: Page, where: str, desk: bool = False) -> None:
-                # `#442 read-strip-order`, `#537`: Previous, k of n, Next and nothing else, in one line, the
+                # `#442 read-strip-order`, `#537`, `#627`: the four arrows and k of n alone, in one line, the
                 # markup's order on screen. The grip that moves it is drawn on a desk only.
                 layout = page.evaluate(STRIP_LAYOUT)
                 want = (["read-steer-grip"] if desk else []) + STRIP_ORDER
                 check(layout["dom"] == want, f"the strip's markup at {where} is {layout['dom']}")
                 check(layout["seen"] == want, f"the strip at {where} reads {layout['seen']} left to right")
                 check(layout["spread"] <= 2, f"the strip wraps at {where}: its controls stray {layout['spread']:.1f}px")
+                arrows = page.evaluate(ARROW_LAYOUT)
+                for arrow in arrows["arrows"]:
+                    check(arrow["width"] >= 44 and arrow["height"] >= 44,
+                          f"{arrow['id']} is a {arrow['width']:.0f}x{arrow['height']:.0f}px target at {where}, under 44px")
+                if not desk:
+                    # `#627`: on a phone the group stands packed at the right edge, the left of the row
+                    # empty (spread to both edges, the fat Previous stood at the left edge).
+                    last, first = arrows["arrows"][-1], arrows["arrows"][0]
+                    check(abs(arrows["inner"] - last["right"]) <= 1,
+                          f"the thin Next stands {arrows['inner'] - last['right']:.1f}px off the strip's right edge at {where}")
+                    check(first["left"] - arrows["stripLeft"] >= arrows["stripWidth"] / 4,
+                          f"the fat Previous stands {first['left'] - arrows['stripLeft']:.1f}px from the strip's left edge"
+                          f" of {arrows['stripWidth']:.0f}px at {where}: the arrows are not together on the right")
 
             def check_bar_stop(page: Page, where: str, tallest: float = 44) -> BarLayout:
                 # A phone's target is 44px at least; a desk's row is 2.25rem (36px) throughout.
@@ -963,6 +996,18 @@ def main() -> int:
                 press(page, "#read-next", False)
                 wait_position(page, "5 of 7")
                 check_strip_order(page, "a desk", desk=True)
+                # `#627 scrubber-thumb-arrows`: the sections here are the paragraph, the list whole, the
+                # quote, the code block and the last paragraph (blocks 1, 2-4, 5, 6, 7).
+                press(page, "#read-section-next", False)
+                wait_position(page, "6 of 7")
+                press(page, "#read-section-prev", False)
+                wait_position(page, "5 of 7")
+                press(page, "#read-section-prev", False)
+                wait_position(page, "2 of 7")
+                check(lit_element(page) == "li:the retry budget landed",
+                      f"Previous section did not go to the list's first item: {lit_element(page)!r}")
+                press(page, "#read-section-next", False)
+                wait_position(page, "5 of 7")
                 bar_desk = check_bar_stop(page, "a desk", 36)
                 # The narrowest desk, where the dock is tightest: still Pause with Stop beside it.
                 page.set_viewport_size({"width": 900, "height": 800})
@@ -974,8 +1019,8 @@ def main() -> int:
                 page.set_viewport_size({"width": 1280, "height": 800})
                 time.sleep(0.3)
                 # Tab meets them as they are seen (the count is not a stop).
-                page.focus("#read-prev")
-                for wanted in ("read-next",):
+                page.focus("#read-section-prev")
+                for wanted in ("read-section-next", "read-prev", "read-next"):
                     page.keyboard.press("Tab")
                     focused = page.evaluate("() => document.activeElement.id")
                     check(focused == wanted, f"Tab from the strip reached {focused!r}, not {wanted!r}")
@@ -1019,7 +1064,13 @@ def main() -> int:
                 bar393 = check_bar_stop(page, "393x852")
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / "9-phone-393.png"))
+                # `#627`: by thumb, the fat Next to the list, the thin Next a block on, the fat
+                # Previous back to the list's start.
+                press(page, "#read-section-next", True)
+                wait_position(page, "2 of 7")
                 press(page, "#read-next", True)
+                wait_position(page, "3 of 7")
+                press(page, "#read-section-prev", True)
                 wait_position(page, "2 of 7")
                 press(page, "#read-aloud", True)
                 wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
@@ -1178,7 +1229,8 @@ def main() -> int:
               f" {underruns} underrun(s) inside a block, the host late with the audio."
               f" On a phone the strip stands full width on the bottom row, playing, held and stopped at 393x852 and"
               f" 412x915 in both schemes ({'; '.join(grown)}); on a desk it stands on the chips row, {gap_desk:.1f}px"
-              " off it. Strip order Previous, k of n, Next, no"
+              " off it. Strip order fat Previous and Next section, k of n, thin Previous and Next block (44px targets, at the"
+              " right edge on a phone; section jumps walked on a desk and at 393), no"
               f" Pause or Stop, in one line at 393, 375 and on a desk; the bar's Pause and Stop {bar375['readWidth']:.0f}px and"
               f" {bar375['stopWidth']:.0f}px wide at 375 ({slim['readWidth']:.0f}/{slim['stopWidth']:.0f}px in the"
               f" keyboard-up row), {bar393['readWidth']:.0f}/{bar393['stopWidth']:.0f}px at 393,"

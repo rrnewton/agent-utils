@@ -6943,6 +6943,30 @@ a.search-hit-link {
   opacity: 0.45;
 }
 
+/* `#627 scrubber-thumb-arrows`. Four arrows where the words were: the fat pair steps a section, the
+   thin pair a block, all pointing along the timeline under them. The thin glyph is a hairline, and its
+   target is still a 44px square: a thin arrow is a fine step, not a small button. */
+.read-steer-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.75rem;
+  padding: 0;
+}
+
+.read-steer-arrow svg {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.read-steer-arrow[data-weight="fat"] {
+  background: color-mix(in srgb, var(--warn) 32%, var(--panel));
+}
+
+.read-steer-arrow[data-weight="thin"] svg {
+  width: 1.6rem;
+}
+
 #read-steer-count {
   min-width: 3rem;
   font-size: 0.9rem;
@@ -6963,8 +6987,9 @@ a.search-hit-link {
  *
  *   * THE STRIP IS A ROW, edge to edge, standing on the dock: on the bottom row (Pace, Stop, Pause)
  *     with nothing between. Its insets are the safe area's, so the curve of a phone's corners keeps
- *     clear of Previous and Next. Previous and Next go to the two edges, under the thumbs, with the
- *     count between, and the timeline takes the whole width under them.
+ *     clear of the arrows. `#627 scrubber-thumb-arrows`: the four arrows and the count stand together
+ *     at the RIGHT edge, under the right thumb (they used to go to the two edges), and the timeline
+ *     takes the whole width under them.
  *   * THE LIST ENDS AT ITS TOP EDGE. #screen-main keeps the strip's measured height
  *     (`--read-steer-height`) under the list, so no message scrolls under the strip and the lists'
  *     feet keep no room for it besides (`--read-steer-clearance` is nothing inside). The chips, the
@@ -6991,7 +7016,7 @@ a.search-hit-link {
     width: auto;
     max-width: none;
     margin-inline: 0;
-    justify-content: space-between;
+    justify-content: flex-end;
     padding: 0.35rem calc(0.6rem + env(safe-area-inset-right)) 0.35rem
       calc(0.6rem + env(safe-area-inset-left));
     border-width: 1px 0 0;
