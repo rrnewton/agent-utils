@@ -5034,6 +5034,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "create",
             "ensure-states",
             "explain",
+            "finish",
             "heartbeat",
             "hold",
             "unhold",

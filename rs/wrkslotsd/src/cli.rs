@@ -370,6 +370,32 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Record a slot's finish handoff in its active record (writer; fixture registries only until cutover)
+    Finish {
+        /// Active slot whose work is finished
+        slot: String,
+        /// Recorded agent name
+        #[arg(long, value_name = "NAME")]
+        agent: String,
+        /// Recorded live owner PID
+        #[arg(long, value_name = "PID")]
+        owner_pid: i64,
+        /// Current slot generation; refuses stale callers
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Command and result evidence (repeatable, at least one)
+        #[arg(long, value_name = "TEXT", required = true)]
+        validation: Vec<String>,
+        /// Known limitation to retain (repeatable)
+        #[arg(long, value_name = "TEXT")]
+        limitation: Vec<String>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Bootstrap the selected machine's shard pair and event log (writer; fixture registries only until cutover)
     EnsureStates {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -906,6 +932,39 @@ pub fn run() -> u8 {
                 &representation,
                 task_scope_unit.as_deref(),
                 task_scope_invocation_id.as_deref(),
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::Finish {
+            slot,
+            agent,
+            owner_pid,
+            expected_generation,
+            validation,
+            limitation,
+            root,
+            machine,
+        } => {
+            match crate::finish_write::finish_slot(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                &agent,
+                owner_pid,
+                expected_generation,
+                &validation,
+                &limitation,
             ) {
                 Ok(value) => {
                     println!(

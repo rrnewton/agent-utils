@@ -52,6 +52,7 @@ mod create_write;
 mod doctor_state;
 mod ensure_states;
 mod evidence;
+mod finish_write;
 mod git_storage_state;
 mod global_state;
 mod handoff_state;
