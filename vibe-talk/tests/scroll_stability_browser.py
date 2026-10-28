@@ -59,6 +59,14 @@ and last, at the desk, sampled at every frame for 2.5 s: a card highlighted by a
 screen off Main, and the mouse going on over another card to the dock leaves Main still; coming back to
 rest on the highlighted card, the card the glide follows, brings its root on screen.
 
+and then, `#612 view-stability`, on a fresh page with eight more threads, at 393x852 by touch and at 1280x800: the
+thread list halfway up, and a reply arriving in another thread, moving its card to the foot -- the card just
+above the screen, the card half off its top, a card in the middle of the screen, a card below it -- and a message
+posted to the channel. The card the reader is on, the first shown whole that is not the one answered, sampled at
+every frame, and every card on screen above the one that moved, may not move by more than a pixel, and the reader
+is never taken to the foot. Before, the cards held the reader by the card half off the top and followed it to
+the foot: the card being read went 1496px at 393x852 and 722px at the desk.
+
 No horizontal overflow and no page error at any step. Pass --screenshots DIR to keep a PNG of each stage;
 --web-root DIR to run the walk against another copy of the page.
 """
@@ -84,6 +92,11 @@ if TYPE_CHECKING:
 
 # (label, width, height, touch): a desk in two columns with a mouse, and a phone in one by touch.
 SIZES = (("desk-1280", 1280, 800, False), ("phone-412", 412, 915, True))
+# `#612 view-stability`: the thread list with a reply arriving in another thread while the reader is mid-list, on a
+# fresh page each, at the owner's phone's size by touch and at the desk.
+RESORT_SIZES = (("phone-393", 393, 852, True), ("desk-1280", 1280, 800, False))
+# How many threads the re-sort walk adds, so that the thread list runs well past the foot of the screen.
+RESORT_EXTRA_THREADS = 8
 
 FILLER = ("The overnight run is still going; the integration shard was retried and passed, and the artifact "
           "upload waited on the cache for most of an hour. ")
@@ -149,6 +162,30 @@ WATCH_JS = """(listId) => {
     tick();
 }"""
 UNWATCH_JS = "() => { const watch = window.__scrollWatch; watch.on = false; return watch.samples; }"
+
+# `#612 view-stability`. Every card of the thread list that shows in its scroller: its id, its offset from the top of
+# the scroller, and whether it shows whole.
+CARDS_ON_SCREEN_JS = """() => {
+    const area = document.getElementById('side-scroll');
+    const top = area.getBoundingClientRect().top;
+    const foot = top + area.clientHeight;
+    return [...document.querySelectorAll('#side-cards > li[data-card]')].filter((row) => row.getClientRects().length)
+        .map((row) => { const box = row.getBoundingClientRect(); return [row.getAttribute('data-id'), box.top - top, box.bottom - top,
+                                                                         box.top >= top - 1 && box.bottom <= foot + 1]; })
+        .filter(([, at, bottom]) => bottom > 0 && at < foot - top).map(([id, at, , whole]) => [id, at, whole]);
+}"""
+
+# The offset of card `id` from the top of the thread list's scroller, sampled at every frame until UNWATCH_JS:
+# a jump that snaps back between two measurements shows here. NaN for a frame it is not drawn in.
+WATCH_CARD_JS = """(id) => {
+    const area = document.getElementById('side-scroll');
+    const at = () => { const row = document.querySelector(`#side-cards > li[data-id='${id}']`);
+        return row ? row.getBoundingClientRect().top - area.getBoundingClientRect().top : NaN; };
+    const watch = {samples: [], on: true};
+    window.__scrollWatch = watch;
+    const tick = () => { if (!watch.on) return; watch.samples.push(at()); requestAnimationFrame(tick); };
+    tick();
+}"""
 
 # `#472 gate-flake-hardening`. How many of the page's channel reads are on the wire: sent, and not yet
 # read to their last byte. On a phone the thread list's first open sends its first read of the threads,
@@ -329,6 +366,30 @@ class StabilityApi(FakeApi):
             self.messages.append(row)
         return row
 
+    def add_thread(self) -> str:
+        """A new thread at the foot of the thread list: a root and two replies, summed up as the others are."""
+        with self.lock:
+            root_index = self.next_index
+            thread_id = f"spaces/A/threads/x{root_index}"
+            root = said(root_index, f"Message {200 + root_index}. Another thread starts here. {FILLER}",
+                        "human" if root_index % 2 else "coder")
+            root["thread"] = thread_record(thread_id, root_index, 2, True)
+            self.messages.append(root)
+            self.next_index += 1
+            last = root
+            for turn in range(2):
+                index = self.next_index
+                self.next_index += 1
+                last = said(index, f"Reply {200 + index} in x{root_index}. {FILLER * (1 + turn)}",
+                            "human" if index % 2 else "coder")
+                last["thread"] = thread_record(thread_id, root_index, 2, False)
+                self.messages.append(last)
+            self.threads.append({
+                "id": thread_id, "root": root, "title": "Thread", "reply_count": 2, "reply_count_exact": True,
+                "updated_at": last["timestamp"], "display_name": f"thread-{200 + root_index}", "summary": SUMMARY,
+            })
+        return thread_id
+
     def edit(self, index: int, text: str) -> Json:
         """Message `200 + index`, edited to `text`."""
         with self.lock:
@@ -408,6 +469,8 @@ def main() -> int:
     with sync_playwright() as playwright:
         for label, width, height, touch in SIZES:
             report.append(walk(playwright.chromium, args, label, width, height, touch))
+        for label, width, height, touch in RESORT_SIZES:
+            report.append(walk(playwright.chromium, args, label, width, height, touch, resort=True))
     for line in report:
         print(line)
     return 0
@@ -497,9 +560,13 @@ class Reader:
         self.check(wide <= 0, f"the page scrolls sideways by {wide}px")
 
 
-def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, touch: bool) -> str:
-    """One reader at one size, against a fresh fake API and a fresh browser profile."""
+def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, touch: bool,
+         resort: bool = False) -> str:
+    """One reader at one size, against a fresh fake API and a fresh browser profile: every walk below, or with
+    `resort` the thread list's alone (`resort_walk`), over more threads."""
     api = StabilityApi()
+    for _ in range(RESORT_EXTRA_THREADS if resort else 0):
+        api.add_thread()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -524,6 +591,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             reader = Reader(page, api, args.screenshots, label, touch)
             page.add_init_script(READS_JS)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
+            if resort:
+                resort_walk(reader)
+                reader.check(not errors, f"the page threw: {errors}")
+                context.close()
+                return f"{version} at {width}x{height}, the thread list: " + "; ".join(reader.notes)
             open_main(reader)
             main_walk(reader)
             if not touch:
@@ -1096,6 +1168,108 @@ def view_keys_walk(reader: Reader) -> None:
     main_held(reader, "Ctrl+4 from the thread list")
     reader.check(reader.gap("side-scroll") <= 1, "after Ctrl+4 the cards left their foot")
     reader.notes.append("Ctrl+4 from it brought two columns with the cards at their foot, and nothing moved Main after")
+
+
+def resort_walk(reader: Reader) -> None:
+    """`#612 view-stability`. The owner, 2026-10-27: "I was in threaded view reading a message and it jumped off the
+    screen. It was probably bc of some new message causing a thread to jump to the bottom. But we should ALWAYS
+    prioritize view stability." The thread list, the reader halfway up it, and replies arriving in other threads,
+    each moving its thread's card to the foot: the card just above the screen; the card half off its top, which
+    the reader was held by before and taken after to the foot (755px at 393x852); a card in the middle of the
+    screen; a card below it. Then a message posted to the channel. The card the reader is on -- the first shown
+    whole that is not the one answered -- is sampled at every frame and may not move by more than a pixel, nor
+    any card on screen above the one that moved; the reader is never taken to the foot."""
+    page, api = reader.page, reader.api
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    reader.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0", "the channel did not open")
+    page.select_option("#thread-select", "threads")
+    reader.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
+                    f" && document.querySelectorAll('#side-cards > li[data-card]').length >= {len(api.threads)}",
+                    "the thread list did not show every thread")
+    reader.quiet(800)
+
+    def mid_list() -> list[tuple[str, float, bool]]:
+        page.evaluate("() => { const area = document.getElementById('side-scroll');"
+                      " area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5); }")
+        reader.quiet(300)
+        return [(str(card), float(at), bool(whole)) for card, at, whole in page.evaluate(CARDS_ON_SCREEN_JS)]
+
+    def order() -> list[str]:
+        return [str(card) for card in page.evaluate(
+            "() => [...document.querySelectorAll('#side-cards > li[data-card]')].map((row) => row.getAttribute('data-id'))")]
+
+    def answer(target: str | None, why: str, cards: list[tuple[str, float, bool]], kept: list[str]) -> None:
+        """A reply into `target`'s thread, or a message to the channel with None; the cards `kept` must stay."""
+        reader.check(reader.gap("side-scroll") > 200, f"{why}: the thread list is at its foot, so this proves nothing")
+        watched = next(card for card, _, whole in cards if whole and card != target)
+        reader.check(watched in kept, f"{why}: the card the reader is on is not among those kept")
+        page.evaluate(WATCH_CARD_JS, watched)
+        reads = api.timeline_requests()
+        message = api.add(f"A reply arriving while the reader is up the thread list. {FILLER}", target)
+        api.push("message", {"message": message}, str(message["id"]))
+        if target is not None:
+            reader.wait_for(f"() => {{ const cards = document.querySelectorAll('#side-cards > li[data-card]');"
+                            f" return cards[cards.length - 1].getAttribute('data-id') === '{target}'; }}",
+                            f"{why}: its card never moved to the foot")
+        # And the read the message asks for, sent and answered, so what it changes is drawn before the check.
+        deadline = time.monotonic() + 10
+        while api.timeline_requests() <= reads and time.monotonic() < deadline:
+            page.wait_for_timeout(25)
+        reader.check(api.timeline_requests() > reads, f"{why}: the page never read the channel behind the message")
+        reader.wait_for("() => window.__timelineReads === 0", f"{why}: the read behind the message never came back")
+        reader.quiet(1200)
+        samples = page.evaluate(UNWATCH_JS)
+        before = dict((card, at) for card, at, _ in cards)
+        reader.check(len(samples) > 10, f"{why}: only {len(samples)} frames were sampled")
+        for at in samples:
+            reader.check(abs(float(at) - before[watched]) <= STILL_PX,
+                         f"{why} moved the card the reader was on, {watched}, from {before[watched]:.1f}px to {float(at):.1f}px")
+        now = dict((card, at) for card, at, _ in page.evaluate(CARDS_ON_SCREEN_JS))
+        for card in kept:
+            reader.check(card in now and abs(float(now[card]) - before[card]) <= STILL_PX,
+                         f"{why} moved card {card} on screen from {before[card]:.1f}px to "
+                         f"{float(now[card]) if card in now else float('nan'):.1f}px")
+        reader.check(reader.gap("side-scroll") > 1, f"{why} took the reader to the foot of the thread list")
+
+    # The card just above the screen.
+    cards = mid_list()
+    above = order()[order().index(cards[0][0]) - 1]
+    answer(above, "a reply moving the card above the screen to the foot", cards, [card for card, _, _ in cards])
+    reader.shot("7-resort-above")
+    # The card half off the top of the screen.
+    cards = mid_list()
+    page.evaluate("([id, at]) => { const area = document.getElementById('side-scroll');"
+                  " const row = document.querySelector(`#side-cards > li[data-id='${id}']`);"
+                  " area.scrollTop += Math.round(at + row.getBoundingClientRect().height / 2); }",
+                  [cards[0][0], cards[0][1]])
+    reader.quiet(300)
+    cards = [(str(card), float(at), bool(whole)) for card, at, whole in page.evaluate(CARDS_ON_SCREEN_JS)]
+    reader.check(cards[0][1] < 0 and len(cards) >= 3, "the first card on screen is not half off its top")
+    half = cards[0][0]
+    answer(half, "a reply moving the card half off the top to the foot", cards, [card for card, _, _ in cards[1:]])
+    # A card in the middle of the screen: the cards above it stay, and those under it close up.
+    cards = mid_list()
+    shown = [card for card, _, whole in cards if whole]
+    reader.check(len(shown) >= 2, "fewer than two cards show whole, so this proves nothing")
+    middle = shown[1]
+    ids = [card for card, _, _ in cards]
+    answer(middle, "a reply moving a card in the middle of the screen to the foot", cards, ids[:ids.index(middle)])
+    # A card below the screen, short of the foot.
+    cards = mid_list()
+    later = order()[order().index(cards[-1][0]) + 1:-1]
+    reader.check(bool(later), "no card between the screen and the foot, so this proves nothing")
+    answer(later[0], "a reply moving a card below the screen to the foot", cards, [card for card, _, _ in cards])
+    # A message to the channel, in no thread.
+    cards = mid_list()
+    answer(None, "a message posted to the channel", cards, [card for card, _, _ in cards])
+    reader.shot("8-resort-done")
+    reader.overflow()
+    reader.notes.append("halfway up the thread list, replies moving the card above the screen, the card half off its "
+                        "top, a card mid-screen and a card below it to the foot, and a channel message, left the card "
+                        "the reader was on still at every frame and the reader off the foot")
 
 
 if __name__ == "__main__":
