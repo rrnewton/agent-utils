@@ -275,6 +275,39 @@ impl EndedBy {
     }
 }
 
+/// The kind of audio device a call's capture or playback used, as the page classified it from
+/// the labels the browser reported. `#619 voice-bluetooth-output`. Kinds only, never a label:
+/// a device name is the owner's, and this record is content-free by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioRoute {
+    /// A Bluetooth headset (HFP/SCO, BLE or A2DP as the browser labelled it).
+    Bluetooth,
+    /// A wired headset or headphones.
+    WiredHeadset,
+    /// The phone's loudspeaker.
+    Speakerphone,
+    /// The phone's earpiece.
+    Earpiece,
+    /// A USB audio device.
+    Usb,
+    /// A device the page could not classify further.
+    Other,
+}
+
+impl AudioRoute {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bluetooth => "bluetooth",
+            Self::WiredHeadset => "wired_headset",
+            Self::Speakerphone => "speakerphone",
+            Self::Earpiece => "earpiece",
+            Self::Usb => "usb",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// One page's record of how a call that opened ended: `POST /api/v1/voice-end`. The field set IS
 /// the allowlist, as for [`HealthReport`]: closed enums, a flag and integers, and one capped line of
 /// the voice service's own words — nothing said in the call.
@@ -335,6 +368,14 @@ pub struct EndReport {
     /// ...and how many of them went at the cap, with the microphone still loud.
     #[serde(default)]
     pub speech_hold_capped: Option<u32>,
+    /// `#619 voice-bluetooth-output`. The kind of device the call captured from, as the page
+    /// classified the browser's reported label; absent on a page that predates it, and on a
+    /// typed call, which captured nothing.
+    #[serde(default)]
+    pub audio_input: Option<AudioRoute>,
+    /// `#619 voice-bluetooth-output`. The kind of device the call played to, on the same terms.
+    #[serde(default)]
+    pub audio_output: Option<AudioRoute>,
     /// The voice service's own words: its close reason, or its `error`. At most
     /// [`MAX_CLOSE_REASON_CHARS`], with no control characters.
     #[serde(default)]
@@ -423,10 +464,20 @@ impl EndReport {
                 number(self.speech_hold_capped)
             )
         });
+        // `#619 voice-bluetooth-output`. Only on a call that captured, so every other call's
+        // line reads as it did.
+        let route = match (self.audio_input, self.audio_output) {
+            (None, None) => String::new(),
+            (input, output) => format!(
+                " audio_input={} audio_output={}",
+                input.map_or("-", AudioRoute::as_str),
+                output.map_or("-", AudioRoute::as_str)
+            ),
+        };
         format!(
             "protocol={} chat={} ended_by={} close_code={} since_open_ms={} turns={} visibility={} \
              queued_audio_ms={} last_text_ms={} last_audio_end_ms={} last_interrupt_ms={} \
-             reconnects={}{holds} close_reason={}",
+             reconnects={}{holds}{route} close_reason={}",
             self.protocol.as_str(),
             self.chat,
             self.ended_by.as_str(),
@@ -606,6 +657,8 @@ mod tests {
             speech_holds: None,
             speech_hold_max_ms: None,
             speech_hold_capped: None,
+            audio_input: None,
+            audio_output: None,
             close_reason: Some("interrupt boundary timed out; reconnect".to_owned()),
         }
     }
@@ -635,6 +688,35 @@ mod tests {
             ..end()
         };
         assert!(absurd.validate().is_err());
+    }
+
+    #[test]
+    fn a_call_that_captured_says_the_kinds_of_its_audio_devices_and_no_more() {
+        // `#619 voice-bluetooth-output`. Kinds only, before the service's reason, and nothing
+        // at all on a call that captured nothing.
+        let routed = EndReport {
+            audio_input: Some(AudioRoute::Bluetooth),
+            audio_output: Some(AudioRoute::Bluetooth),
+            ..end()
+        };
+        routed.validate().expect("valid");
+        assert!(
+            routed.log_fields().contains(" audio_input=bluetooth audio_output=bluetooth close_reason="),
+            "{}",
+            routed.log_fields()
+        );
+        assert!(!end().log_fields().contains("audio_input"));
+        let parsed: EndReport = serde_json::from_value(serde_json::json!({
+            "protocol": "vibe-talk-v1", "chat": false, "ended_by": "hang_up",
+            "since_open_ms": 1000, "turns": 1, "audio_input": "bluetooth",
+        }))
+        .expect("a route kind reads");
+        assert_eq!(parsed.audio_input, Some(AudioRoute::Bluetooth));
+        assert!(serde_json::from_value::<EndReport>(serde_json::json!({
+            "protocol": "vibe-talk-v1", "chat": false, "ended_by": "hang_up",
+            "since_open_ms": 1000, "turns": 1, "audio_input": "AirPods Pro",
+        }))
+        .is_err(), "a device LABEL must never be accepted into this record");
     }
 
     #[test]

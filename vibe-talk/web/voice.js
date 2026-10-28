@@ -19061,6 +19061,287 @@ function micSettingsChanged() {
       `(private browsing does this). ${when}`;
 }
 
+// --- audio devices: `#619 voice-bluetooth-output` -------------------------------------------------
+//
+// WHY A CALL COULD PLAY ON THE PHONE SPEAKER WITH AIRPODS CONNECTED (diagnosed 2026-10-28 from
+// Chromium source, media/base/android/java/src/org/chromium/media/):
+//
+// Music (Spotify, and this page's read-aloud) plays in MODE_NORMAL, where Android routes media
+// audio to A2DP — the AirPods. A voice call is different: opening capture makes Chromium enter
+// MODE_IN_COMMUNICATION (`AudioManagerAndroid.setCommunicationAudioModeOn`), where ONE paired
+// communication device carries both directions. Which device that is comes from the CAPTURE
+// device the page asked for: with no `deviceId`, Chromium's default communication-device choice
+// (`CommunicationDeviceSelector.DeviceHelpers.selectDefaultDevice`) prefers wired, then USB,
+// then Bluetooth, then the SPEAKERPHONE — so a headset Chrome does not see as an available
+// communication device (an A2DP-only connection, or the built-in microphone chosen by default)
+// leaves the call on the speaker even though music reaches the headset. The fix available to a
+// page is therefore on the INPUT side: ask for the Bluetooth/headset capture device explicitly,
+// and Chromium selects the paired Bluetooth communication device for playback too.
+//
+// Output selection proper (`HTMLMediaElement.setSinkId`, `AudioContext.setSinkId`,
+// `selectAudioOutput`) is desktop-Chromium only: MDN's browser-compat data lists
+// `HTMLMediaElement.setSinkId` as unsupported on Chrome for Android, so on the phone there is
+// no output picker to offer — the picker below is hidden where neither form exists, and the
+// call's output follows the communication route its input chose. Read-aloud deliberately
+// keeps NO sink: it stays a media playback, on A2DP like music, and never enters communication
+// mode. Echo cancellation stays ON by default (`#264 voice-send-approval`): it is part of why
+// Chromium treats this capture as a call, and the speakerphone/car cases keep it.
+
+const AUDIO_DEVICES_KEY = "vibe-talk.voice.audio-devices";
+
+/** The route of the call in progress, for the readout and the call-end record; null between calls. */
+// eslint-disable-next-line prefer-const -- reassigned at every call start and end.
+let callAudioRoute = null;
+
+/** What was stored: `{inputId, outputId}`, each "" for System default. Anything else is ignored. */
+function storedAudioDevicePrefs() {
+  let stored = null;
+  try {
+    stored = JSON.parse(localStorage.getItem(AUDIO_DEVICES_KEY) || "null");
+  } catch (_error) {
+    stored = null;
+  }
+  const prefs = { inputId: "", outputId: "" };
+  if (stored && typeof stored === "object") {
+    if (typeof stored.inputId === "string") prefs.inputId = stored.inputId;
+    if (typeof stored.outputId === "string") prefs.outputId = stored.outputId;
+  }
+  return prefs;
+}
+
+function persistAudioDevicePrefs(prefs) {
+  const encoded = JSON.stringify(prefs);
+  try {
+    localStorage.setItem(AUDIO_DEVICES_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+  return localStorage.getItem(AUDIO_DEVICES_KEY) === encoded;
+}
+
+/** The Settings selects' word, falling back to storage before they exist. */
+function audioDevicePrefs() {
+  const prefs = storedAudioDevicePrefs();
+  const input = document.getElementById("audio-input-device");
+  const output = document.getElementById("audio-output-device");
+  if (input) prefs.inputId = input.value || "";
+  if (output) prefs.outputId = output.value || "";
+  return prefs;
+}
+
+/**
+ * The kind of one device, from the label the browser reports: the closed set the call-end
+ * record carries (`AudioRoute` in src/voice_health.rs). Bluetooth is matched FIRST, because a
+ * Bluetooth headset's label also says "headset".
+ */
+function classifyAudioDevice(label) {
+  const words = String(label || "").toLowerCase();
+  if (/bluetooth|airpods|hands[ -]?free|\bhfp\b|\bsco\b|\bble\b/.test(words)) return "bluetooth";
+  if (/usb/.test(words)) return "usb";
+  if (/speaker/.test(words)) return "speakerphone";
+  if (/earpiece|receiver/.test(words)) return "earpiece";
+  if (/headset|headphone|earbud|earphone|microphone|\bmic\b/.test(words)) return "wired_headset";
+  return "other";
+}
+
+/**
+ * The capture device a call should open, from `devices` (an `enumerateDevices()` list):
+ * the reader's stored choice when it is still there; else a Bluetooth/headset input, so the
+ * call's communication route follows the headset; else the browser's "communications" device;
+ * else null, meaning keep the stream the default constraints already opened.
+ */
+function pickCallInput(devices, prefs) {
+  const inputs = (devices || []).filter((d) => d && d.kind === "audioinput" && d.deviceId);
+  if (prefs.inputId) {
+    const chosen = inputs.find((d) => d.deviceId === prefs.inputId);
+    if (chosen) return chosen;
+  }
+  return inputs.find((d) => classifyAudioDevice(d.label) === "bluetooth")
+    || inputs.find((d) => d.deviceId === "communications" || /communications/.test(String(d.label || "").toLowerCase()))
+    || null;
+}
+
+/** Whether this browser lets a page choose an output at all, in either form. */
+function outputSinkSupported() {
+  if (typeof HTMLMediaElement !== "undefined" && HTMLMediaElement.prototype
+    && "setSinkId" in HTMLMediaElement.prototype) return true;
+  const Context = window.AudioContext || window.webkitAudioContext;
+  return Boolean(Context && Context.prototype && "setSinkId" in Context.prototype);
+}
+
+/**
+ * Open the call's microphone: the default constraints first (which is also what grants the
+ * permission that lets `enumerateDevices` name anything), then — when a better capture device
+ * is present — once more with that device named exactly. `session.stream`'s callers see only
+ * the final stream; the first is stopped before the second opens.
+ */
+async function openCallMicrophone(mic) {
+  let stream = await navigator.mediaDevices.getUserMedia(audioConstraints(mic));
+  callAudioRoute = { inputKind: "other", outputKind: "other", inputLabel: "", outputLabel: "", sink: "" };
+  const trackOf = (s) => (s && typeof s.getTracks === "function" ? s.getTracks()[0] : null);
+  const noteTrack = (s) => {
+    const track = trackOf(s);
+    const settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
+    const label = (track && typeof track.label === "string" && track.label)
+      || (typeof settings.label === "string" ? settings.label : "");
+    callAudioRoute.inputKind = classifyAudioDevice(label);
+    callAudioRoute.inputLabel = label;
+    callAudioRoute.outputKind = callAudioRoute.inputKind;
+  };
+  noteTrack(stream);
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== "function") return stream;
+  let devices = null;
+  try {
+    devices = await navigator.mediaDevices.enumerateDevices();
+  } catch (_error) {
+    return stream;
+  }
+  const chosen = pickCallInput(devices, audioDevicePrefs());
+  const current = trackOf(stream);
+  const currentId = current && typeof current.getSettings === "function"
+    ? current.getSettings().deviceId : undefined;
+  if (!chosen || chosen.deviceId === currentId) return stream;
+  for (const track of stream.getTracks()) track.stop();
+  const constraints = audioConstraints(mic);
+  constraints.audio.deviceId = { exact: chosen.deviceId };
+  stream = await navigator.mediaDevices.getUserMedia(constraints);
+  noteTrack(stream);
+  if (!callAudioRoute.inputLabel) callAudioRoute.inputLabel = chosen.label || "";
+  callAudioRoute.inputKind = classifyAudioDevice(callAudioRoute.inputLabel);
+  callAudioRoute.outputKind = callAudioRoute.inputKind;
+  return stream;
+}
+
+/**
+ * Aim the call's playback where the reader chose, where the browser allows it at all. On
+ * Android Chrome neither sink API exists, so this does nothing there BY DESIGN: the output
+ * follows the communication route `openCallMicrophone` set up. Read-aloud never comes here.
+ */
+async function applyCallOutput(context) {
+  if (!context || typeof context.setSinkId !== "function") return;
+  const prefs = audioDevicePrefs();
+  if (!prefs.outputId) return;
+  try {
+    await context.setSinkId(prefs.outputId);
+    if (callAudioRoute) {
+      callAudioRoute.sink = String(context.sinkId || prefs.outputId);
+    }
+  } catch (_error) {
+    // The chosen output went away between Settings and the call: the default carries it.
+  }
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const chosen = (devices || []).find((d) => d.deviceId === prefs.outputId);
+    if (chosen && callAudioRoute) {
+      callAudioRoute.outputKind = classifyAudioDevice(chosen.label);
+      callAudioRoute.outputLabel = chosen.label || "";
+    }
+  } catch (_error) {
+    // No list, no kind: the readout says the sink id instead.
+  }
+}
+
+/** Fill the Settings device selects from what the browser can name right now. */
+async function refreshAudioDeviceSelects() {
+  const input = document.getElementById("audio-input-device");
+  const output = document.getElementById("audio-output-device");
+  const outputField = document.getElementById("audio-output-field");
+  if (outputField) outputField.hidden = !outputSinkSupported();
+  if (!input && !output) return;
+  const prefs = storedAudioDevicePrefs();
+  let devices = [];
+  if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === "function") {
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } catch (_error) {
+      devices = [];
+    }
+  }
+  const fill = (select, kind, chosenId) => {
+    if (!select) return;
+    const listed = devices.filter((d) => d && d.kind === kind);
+    select.replaceChildren();
+    const system = document.createElement("option");
+    system.value = "";
+    system.textContent = "System default";
+    select.append(system);
+    listed.forEach((device, at) => {
+      const option = document.createElement("option");
+      option.value = device.deviceId;
+      option.textContent = device.label || `${kind === "audioinput" ? "Microphone" : "Output"} ${at + 1}`;
+      select.append(option);
+    });
+    if (chosenId && !listed.some((d) => d.deviceId === chosenId)) {
+      const gone = document.createElement("option");
+      gone.value = chosenId;
+      gone.textContent = "Chosen device (not connected now)";
+      select.append(gone);
+    }
+    select.value = chosenId;
+  };
+  fill(input, "audioinput", prefs.inputId);
+  fill(output, "audiooutput", prefs.outputId);
+}
+
+function audioDevicesChanged() {
+  const saved = persistAudioDevicePrefs(audioDevicePrefs());
+  const when = session.stream
+    ? "The call in progress keeps the devices it opened with — hang up and start again to apply it."
+    : "It applies the next time you start talking.";
+  el("audio-devices-state").textContent = saved
+    ? `Saved. ${when}`
+    : `This browser refused to store the choice, so it will be forgotten when you reload. ${when}`;
+  renderAudioRouteReadout();
+}
+
+/**
+ * The opt-in readout (`#619`): the chosen devices, and the route the browser REPORTS — the
+ * open track's own settings and the context's sink — so one screenshot shows whether Chrome
+ * took the call to the headset or left it on the speaker. Labels live here only; the server
+ * record carries kinds, never names.
+ */
+async function renderAudioRouteReadout() {
+  const box = document.getElementById("audio-route-readout");
+  const toggle = document.getElementById("audio-route-toggle");
+  if (!box || !toggle) return;
+  box.hidden = !toggle.checked;
+  if (!toggle.checked) return;
+  const prefs = audioDevicePrefs();
+  const lines = [];
+  let devices = [];
+  if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === "function") {
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } catch (_error) {
+      devices = [];
+    }
+  }
+  const nameOf = (id, kind) => {
+    if (!id) return "System default";
+    const found = devices.find((d) => d.deviceId === id && d.kind === kind);
+    return found ? (found.label || found.deviceId) : `${id} (not connected now)`;
+  };
+  lines.push(`Microphone choice: ${nameOf(prefs.inputId, "audioinput")}`);
+  lines.push(outputSinkSupported()
+    ? `Speaker choice: ${nameOf(prefs.outputId, "audiooutput")}`
+    : "Speaker choice: this browser cannot choose an output (on Android the call follows the microphone's route)");
+  const inputs = devices.filter((d) => d.kind === "audioinput");
+  lines.push(`Microphones the browser lists: ${inputs.length
+    ? inputs.map((d) => `${d.label || d.deviceId} [${classifyAudioDevice(d.label)}]`).join("; ")
+    : "none yet — start a call once so the browser may name them"}`);
+  if (session.stream) {
+    const track = session.stream.getTracks()[0];
+    const settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
+    lines.push(`This call's microphone: ${settings.label || (track && track.label) || settings.deviceId || "browser did not say"} [${callAudioRoute ? callAudioRoute.inputKind : "other"}]`);
+  } else {
+    lines.push("This call's microphone: no call is open");
+  }
+  if (session.audio) {
+    lines.push(`This call's speaker: ${session.audio.sinkId ? `sink ${session.audio.sinkId}` : "the route the microphone chose (browser does not report a speaker)"}`);
+  }
+  box.textContent = lines.join("\n");
+}
+
 // --- the control bar ------------------------------------------------------------------------
 //
 // `#58 control-bar`. The strip carrying the gear and the Voice/Discord switch, and — from `#59
@@ -20572,6 +20853,13 @@ function postCallEnd(endedBy, code, reason = "") {
     body.speech_hold_max_ms = Math.min(CALL_SPAN_MAX_MS, Math.round(session.speechHoldMaxMs));
     body.speech_hold_capped = Math.min(SPEECH_HOLDS_MAX, session.speechHoldCapped);
   }
+  // `#619 voice-bluetooth-output`. Kinds only, never a device label: the record is content-free.
+  // An unclassifiable route says nothing, exactly as a call that captured nothing does.
+  if (callAudioRoute && !health.chat
+    && (callAudioRoute.inputKind !== "other" || callAudioRoute.outputKind !== "other")) {
+    body.audio_input = callAudioRoute.inputKind;
+    body.audio_output = callAudioRoute.outputKind;
+  }
   session.speechHolds = 0;
   session.speechHoldMaxMs = 0;
   session.speechHoldCapped = 0;
@@ -20797,7 +21085,7 @@ async function openConversation(options) {
     // Read HERE, at the moment the stream opens — which is why a toggle flipped mid-call cannot
     // reach this one, and why `micSettingsChanged` says so out loud.
     const mic = micSettings();
-    session.stream = await navigator.mediaDevices.getUserMedia(audioConstraints(mic));
+    session.stream = await openCallMicrophone(mic);
     // `#264 voice-send-approval`: a spoken yes is taken only with echo cancellation on, as opened.
     session.echoCancellation = mic.echoCancellation === true && !echoCancellationRefused(session.stream);
     if (!session.echoCancellation) {
@@ -20807,6 +21095,9 @@ async function openConversation(options) {
     }
     session.audio = new (window.AudioContext || window.webkitAudioContext)();
     await session.audio.resume(); // iOS starts it suspended until a gesture.
+    await applyCallOutput(session.audio);
+    refreshAudioDeviceSelects();
+    renderAudioRouteReadout();
     markStartup("microphone_ready");
   }
 
@@ -23204,6 +23495,7 @@ function teardown() {
   session.source = null;
   session.stream = null;
   session.audio = null;
+  callAudioRoute = null;
   session.socket = null;
   session.connected = false;
   session.protocol = "unknown";
@@ -59184,6 +59476,18 @@ const restoredMicSettings = storedMicSettings();
 for (const [id, key] of MIC_TOGGLES) {
   /** @type {HTMLInputElement} */ (el(id)).checked = restoredMicSettings[key];
   el(id).addEventListener("change", micSettingsChanged);
+}
+
+// `#619 voice-bluetooth-output`. The device selects carry the live truth, as the toggles do.
+refreshAudioDeviceSelects();
+el("audio-input-device").addEventListener("change", audioDevicesChanged);
+el("audio-output-device").addEventListener("change", audioDevicesChanged);
+el("audio-route-toggle").addEventListener("change", renderAudioRouteReadout);
+if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    refreshAudioDeviceSelects();
+    renderAudioRouteReadout();
+  });
 }
 
 // `#58 control-bar`. Where the reader last put the bar, restored before the first screen is drawn

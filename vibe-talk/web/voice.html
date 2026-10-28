@@ -1454,6 +1454,22 @@
                         Automatic gain control
                       </label>
                       <p id="mic-settings-state" class="hint" aria-live="polite"></p>
+                      <label for="audio-input-device">Microphone device</label>
+                      <select id="audio-input-device">
+                        <option value="">System default</option>
+                      </select>
+                      <div id="audio-output-field">
+                        <label for="audio-output-device">Speaker device</label>
+                        <select id="audio-output-device">
+                          <option value="">System default</option>
+                        </select>
+                      </div>
+                      <p id="audio-devices-state" class="hint" aria-live="polite"></p>
+                      <label class="toggle">
+                        <input id="audio-route-toggle" type="checkbox" />
+                        Show audio route
+                      </label>
+                      <p id="audio-route-readout" class="hint" hidden></p>
                     </div>
                   </section>
 

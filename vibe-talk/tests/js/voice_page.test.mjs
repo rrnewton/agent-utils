@@ -2887,6 +2887,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       },
     },
     mediaDevices: {
+      // `#619 voice-bluetooth-output`. The devices `enumerateDevices` names; empty unless a
+      // test stocks it, so every older test sees the browser this fixture has always modelled.
+      enumerateDevices: async () => (page.audioDevices || []).map((d) => ({ ...d })),
       getUserMedia: async (constraints) => {
         // Rebuilt in THIS realm, key for key. The page's object is made inside the vm context, so
         // its prototype is that context's `Object` and `deepStrictEqual` rejects it against an
@@ -2902,9 +2905,17 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           },
         };
         // `#264 voice-send-approval`: what the browser says it applied, when a test says so.
-        if (typeof page.appliedEchoCancellation === "boolean") {
-          track.getSettings = () => ({ echoCancellation: page.appliedEchoCancellation });
-        }
+        // `#619 voice-bluetooth-output`: and which device it opened, from the constraint.
+        const wanted = constraints && constraints.audio && constraints.audio.deviceId;
+        const wantedId = typeof wanted === "string" ? wanted : wanted && wanted.exact;
+        const opened = (page.audioDevices || []).find((d) => d.deviceId === wantedId);
+        track.getSettings = () => ({
+          ...(typeof page.appliedEchoCancellation === "boolean"
+            ? { echoCancellation: page.appliedEchoCancellation } : {}),
+          ...(wantedId ? { deviceId: wantedId } : {}),
+          ...(opened && opened.label ? { label: opened.label } : {}),
+        });
+        if (opened && opened.label) track.label = opened.label;
         page.tracks.push(track);
         return { getTracks: () => [track] };
       },
@@ -22956,6 +22967,77 @@ test("a corrupt stored setting falls back to today's behaviour rather than to no
   assert.deepStrictEqual(page.micRequests, [
     { audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } },
   ]);
+});
+
+test("`#619 voice-bluetooth-output`: with a Bluetooth microphone listed, the call opens it, not the default", async () => {
+  const page = newPage();
+  page.audioDevices = [
+    { kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" },
+    { kind: "audioinput", deviceId: "airpods", label: "AirPods Pro Bluetooth" },
+    { kind: "audiooutput", deviceId: "airpods-out", label: "AirPods Pro Bluetooth" },
+  ];
+  await startTalking(page);
+  assert.equal(page.micRequests.length, 2, "the call did not reopen on the headset");
+  assert.deepStrictEqual(page.micRequests[1].audio.deviceId, { exact: "airpods" });
+  assert.equal(page.micRequests[1].audio.echoCancellation, true, "echo cancellation was dropped");
+  assert.equal(page.tracks[0].stops, 1, "the default stream was left open");
+});
+
+test("`#619 voice-bluetooth-output`: a stored microphone choice wins, and survives a reload", async () => {
+  const first = newPage();
+  first.audioDevices = [
+    { kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" },
+    { kind: "audioinput", deviceId: "usb", label: "USB headset microphone" },
+  ];
+  await first.pure("refreshAudioDeviceSelects")();
+  first.el("audio-input-device").value = "usb";
+  await first.el("audio-input-device").dispatch("change");
+  const second = newPage(first.storage);
+  second.audioDevices = first.audioDevices;
+  await startTalking(second);
+  assert.deepStrictEqual(second.micRequests.at(-1).audio.deviceId, { exact: "usb" });
+});
+
+test("`#619 voice-bluetooth-output`: a chosen device that is gone falls back, and the readout says so", async () => {
+  const store = new Map([["vibe-talk.voice.audio-devices", JSON.stringify({ inputId: "gone", outputId: "" })]]);
+  const page = newPage(store);
+  page.audioDevices = [{ kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" }];
+  await startTalking(page);
+  assert.equal(page.micRequests.length, 1, "a missing choice reopened the microphone anyway");
+  page.el("audio-route-toggle").checked = true;
+  await page.pure("renderAudioRouteReadout")();
+  assert.match(page.el("audio-route-readout").textContent, /not connected now/);
+  assert.match(page.el("audio-route-readout").textContent, /Built-in microphone/);
+});
+
+test("`#619 voice-bluetooth-output`: the call-end record carries device kinds, never labels", async () => {
+  const page = newPage();
+  page.audioDevices = [
+    { kind: "audioinput", deviceId: "builtin", label: "Built-in microphone" },
+    { kind: "audioinput", deviceId: "airpods", label: "AirPods Pro Bluetooth" },
+  ];
+  await startTalking(page);
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.endPosts.length, 1);
+  assert.equal(page.endPosts[0].audio_input, "bluetooth");
+  assert.equal(page.endPosts[0].audio_output, "bluetooth");
+  assert.ok(!JSON.stringify(page.endPosts).includes("AirPods"), "a device label reached the server");
+});
+
+test("`#619 voice-bluetooth-output`: output choice applies by setSinkId where supported, and read-aloud is never aimed", async () => {
+  const page = newPage();
+  const sinks = [];
+  const context = { setSinkId: async (id) => { sinks.push(id); }, sinkId: "" };
+  const store = new Map([["vibe-talk.voice.audio-devices", JSON.stringify({ inputId: "", outputId: "desk" })]]);
+  const chosen = newPage(store);
+  chosen.audioDevices = [{ kind: "audiooutput", deviceId: "desk", label: "USB speaker" }];
+  await chosen.pure("refreshAudioDeviceSelects")();
+  await chosen.pure("applyCallOutput")(context);
+  assert.deepStrictEqual(sinks, ["desk"]);
+  page.enableStreamedAudio();
+  assert.equal(typeof page.pure("readAloudAudioContext")().setSinkId, "undefined",
+    "read-aloud gained a sink: it must keep the music route");
 });
 
 test("a browser that THROWS on write is caught, not left as a rejected promise", async () => {
