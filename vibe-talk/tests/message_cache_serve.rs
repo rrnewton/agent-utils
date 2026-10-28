@@ -1618,3 +1618,389 @@ async fn a_slow_provider_is_answered_from_the_cache_one_read_at_a_time_and_its_r
     settled(&d.state).await;
     assert_eq!(d.chat.timeline_reads(), reads + 1);
 }
+
+// --- `#614 timeline-read-failures`: side and counts reads under Slack's rate limits -------------
+
+/// A Slack channel of six messages a minute apart, the second and fourth the roots of threads
+/// (two replies and one), filled into a cache read by `clock` through a read of Main and of each
+/// thread. `live_poll` makes the channel live-fed (its provider is polled; no poller runs here).
+async fn slack_threads_deployment(
+    tag: &str,
+    live_poll: bool,
+) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut history: Vec<Value> = (0..6)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut history[1],
+        &[
+            (slack_fake::ts(70, 0), "first reply".to_owned()),
+            (slack_fake::ts(80, 0), "second reply".to_owned()),
+        ],
+    );
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut history[3],
+        &[(slack_fake::ts(200, 0), "only reply".to_owned())],
+    );
+    fixture.history.insert(SLACK_CH.to_owned(), history);
+    let fake = slack_fake::Fake::start(fixture, 10).await;
+    let dir = TempDir::new(tag);
+    let clock = ManualClock::at(slack_ms(3_600));
+    let text = format!(
+        r#"
+[auth]
+read_token = "{READ_TOKEN}"
+write_token = "{WRITE_TOKEN}"
+
+[[providers]]
+key = "{SLACK}"
+kind = "slack"
+api_base = "{base}"
+token = "{token}"
+{poll}
+
+[[channels]]
+id = "{SLACK_CH}"
+label = "team"
+writable = true
+"#,
+        base = fake.base,
+        token = slack_fake::TOKEN,
+        poll = if live_poll {
+            "live_poll_seconds = 30"
+        } else {
+            ""
+        },
+    );
+    let (mut state, _discord, _store) = testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    for root in [60, 180] {
+        ok(
+            &state,
+            &path(
+                SLACK_CH,
+                &format!(
+                    "/timeline?view=thread&thread_id={}&limit=50",
+                    slack_fake::ts(root, 0)
+                ),
+            ),
+            WRITE_TOKEN,
+        )
+        .await;
+    }
+    settled(&state).await;
+    (state, fake, clock, dir)
+}
+
+/// The thread ids a thread list answer carries, oldest activity first.
+fn thread_ids(body: &Value) -> Vec<String> {
+    body["threads"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a thread list: {body}"))
+        .iter()
+        .map(|thread| thread["id"].as_str().expect("an id").to_owned())
+        .collect()
+}
+
+/// Every request of `method` from now on answered 429 with a thirty-second `Retry-After`.
+fn rate_limit(fake: &slack_fake::Fake, method: &str) {
+    fake.with(|state| {
+        state
+            .rate_limit_many
+            .insert(method.to_owned(), (30, usize::MAX));
+    });
+}
+
+#[tokio::test]
+async fn a_side_read_under_a_rate_limited_history_is_answered_from_the_cache_at_once() {
+    let (state, fake, _clock, _dir) = slack_threads_deployment("side-rate-limited", false).await;
+    state.message_cache.set_serve(true);
+    rate_limit(&fake, "conversations.history");
+    rate_limit(&fake, "conversations.replies");
+    let history = fake.calls("conversations.history");
+    let capture = vibe_talk::testing::LogCapture::start();
+
+    // The right column's thread list: it used to wait out Slack's thirty-second budget and answer
+    // 502 after 16-47 s, since the cache would not stand in for a thread list at all.
+    let began = std::time::Instant::now();
+    let body = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=threads&limit=50&reason=side"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert!(
+        began.elapsed() < AT_ONCE * 5,
+        "answered at the first rate limit, not after the budget: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(
+        thread_ids(&body),
+        [slack_fake::ts(60, 0), slack_fake::ts(180, 0)],
+        "both threads, the latest activity last: {body}"
+    );
+    let first = &body["threads"][1];
+    assert_eq!(first["reply_count"], 1, "{body}");
+    assert_eq!(first["root"]["content"], "message 3", "{body}");
+    assert_eq!(first["title"], "message 3", "{body}");
+    assert!(
+        body["refresh_failed"]
+            .as_str()
+            .is_some_and(|why| why.contains("limiting")),
+        "{body}"
+    );
+    assert!(body["next_before"].is_null(), "{body}");
+    assert_eq!(
+        fake.calls("conversations.history"),
+        history + 1,
+        "one request, answered 429, and no retry"
+    );
+
+    // Again, with Slack's Retry-After still running: nothing is sent into it.
+    let body = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=threads&limit=50&reason=side"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(thread_ids(&body).len(), 2, "{body}");
+    assert_eq!(fake.calls("conversations.history"), history + 1);
+
+    // The side column's thread, and All's counts read, the same way.
+    let replies = fake.calls("conversations.replies");
+    let began = std::time::Instant::now();
+    let body = ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!(
+                "/timeline?view=thread&thread_id={}&limit=50&reason=side",
+                slack_fake::ts(60, 0)
+            ),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(
+        texts(&body),
+        ["message 1", "first reply", "second reply"],
+        "{body}"
+    );
+    assert!(body["refresh_failed"].is_string(), "{body}");
+    let body = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=flat&limit=50&reason=counts"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert!(
+        texts(&body).contains(&"only reply".to_owned()),
+        "All from the cache, replies included: {body}"
+    );
+    assert!(body["refresh_failed"].is_string(), "{body}");
+    assert!(began.elapsed() < AT_ONCE * 5, "{:?}", began.elapsed());
+    assert!(
+        fake.calls("conversations.replies") <= replies + 1,
+        "at most the one request Slack refused"
+    );
+    let text = capture.text();
+    assert!(
+        !text.contains("server error"),
+        "no 5xx was answered: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_side_read_the_cache_cannot_answer_fails_fast_under_a_rate_limit() {
+    // No thread in the channel: nothing to put a thread list together from.
+    let (state, fake, _clock, _dir) = slack_deployment("side-nothing-held").await;
+    state.message_cache.set_serve(true);
+    rate_limit(&fake, "conversations.history");
+    let began = std::time::Instant::now();
+    let (status, body) = call(
+        &state,
+        &path(SLACK_CH, "/timeline?view=threads&limit=50&reason=side"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        began.elapsed() < AT_ONCE * 5,
+        "failed at the first rate limit: {:?}",
+        began.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_side_read_the_cache_cannot_answer_fails_once_the_wait_has_passed() {
+    // All's counts read of a provider whose All the cache never puts together, behind a provider
+    // that does not answer: it fails when the stand-in wait runs out, not when the provider
+    // answers, and its read runs on.
+    let d = deployment("side-slow-nothing").await;
+    d.state.message_cache.set_serve(true);
+    let held = d.chat.hold_next_timeline();
+    let wait = vibe_talk::ops::stand_in_after(&d.state.config);
+    let began = std::time::Instant::now();
+    let (status, body) = tokio::time::timeout(
+        wait + Duration::from_secs(5),
+        call(
+            &d.state,
+            &path(READ_CHANNEL, "/timeline?view=flat&limit=50&reason=counts"),
+            WRITE_TOKEN,
+        ),
+    )
+    .await
+    .expect("answered once the wait ran out");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(began.elapsed() >= wait, "the provider was given its time");
+    held.entered.await.expect("the read reached the provider");
+    held.release.send(()).expect("the read is still waiting");
+}
+
+#[tokio::test]
+async fn a_live_fed_channel_s_side_thread_list_spends_no_slack_call_between_upstream_reads() {
+    let (state, fake, clock, _dir) = slack_threads_deployment("side-live-fed", true).await;
+    state.message_cache.set_serve(true);
+    let list = |extra: &str| {
+        path(
+            SLACK_CH,
+            &format!("/timeline?view=threads&limit=1&reason=side{extra}"),
+        )
+    };
+
+    // The first thread list goes upstream, and answers: one card, and the way back to the other.
+    let history = fake.calls("conversations.history");
+    let body = ok(&state, &list(""), WRITE_TOKEN).await;
+    assert_eq!(thread_ids(&body), [slack_fake::ts(180, 0)], "{body}");
+    assert!(body.get("refresh_failed").is_none(), "{body}");
+    assert_eq!(body["has_more"], true, "{body}");
+    let way_back = body["next_before"].as_str().expect("a way back").to_owned();
+    assert!(
+        fake.calls("conversations.history") > history,
+        "read upstream"
+    );
+    settled(&state).await;
+
+    // A reply arrives in the other thread after that read, and reaches the cache (here through a
+    // read of its thread; live ingestion brings it the same way).
+    clock.advance(200 * SECOND);
+    fake.with(|fixture| {
+        slack_fake::add_reply(
+            fixture,
+            SLACK_CH,
+            &slack_fake::ts(60, 0),
+            &slack_fake::ts(3_700, 0),
+            "news",
+        );
+    });
+    ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!(
+                "/timeline?view=thread&thread_id={}&limit=50",
+                slack_fake::ts(60, 0)
+            ),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+
+    // The next thread lists, newest and catch-up, are the cache's: no Slack call, no failure, the
+    // thread that just moved is the latest, and the upstream list's own way back still stands.
+    let (history, replies) = (
+        fake.calls("conversations.history"),
+        fake.calls("conversations.replies"),
+    );
+    let body = ok(&state, &list(""), WRITE_TOKEN).await;
+    assert_eq!(
+        thread_ids(&body),
+        [slack_fake::ts(180, 0), slack_fake::ts(60, 0)],
+        "{body}"
+    );
+    assert!(body.get("refresh_failed").is_none(), "{body}");
+    assert_eq!(body["has_more"], true, "{body}");
+    assert_eq!(body["next_before"], way_back.as_str(), "{body}");
+    let after = body["next_after"]
+        .as_str()
+        .expect("a forward cursor")
+        .to_owned();
+    let body = ok(
+        &state,
+        &list(&format!("&after={}", url_encode(&after))),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(thread_ids(&body).len(), 2, "{body}");
+    assert_eq!(fake.calls("conversations.history"), history);
+    assert_eq!(fake.calls("conversations.replies"), replies);
+
+    // "Older threads…" reads upstream, on that way back.
+    let body = ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!(
+                "/timeline?view=threads&limit=1&reason=threads&before={}",
+                url_encode(&way_back)
+            ),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(thread_ids(&body), [slack_fake::ts(60, 0)], "{body}");
+
+    // All's counts read is not the thread list: it goes upstream, for the replies the counts
+    // say the page lacks.
+    let history = fake.calls("conversations.history");
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=flat&limit=50&reason=counts"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert!(fake.calls("conversations.history") > history);
+}
+
+#[tokio::test]
+async fn with_serving_off_a_side_read_still_waits_out_a_short_rate_limit() {
+    // Nothing would stand in for it, so it is not hurried: it waits, as every read did.
+    let (state, fake, _clock, _dir) = slack_threads_deployment("side-serve-off", false).await;
+    fake.with(|fixture| {
+        fixture.rate_limit_once = Some(("conversations.history".to_owned(), 1));
+    });
+    let history = fake.calls("conversations.history");
+    let body = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=threads&limit=50&reason=side"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(thread_ids(&body).len(), 2, "{body}");
+    assert!(body.get("refresh_failed").is_none(), "{body}");
+    assert!(
+        fake.calls("conversations.history") >= history + 2,
+        "sent again after the Retry-After"
+    );
+}

@@ -2430,7 +2430,10 @@ async fn poll_state_loop(
     cursors: &mut BTreeMap<ChannelId, Option<u64>>,
     ticks: Option<u32>,
 ) {
-    poll_loop_with_channels(
+    // `#614 timeline-read-failures`: its reads say what they are for, so the minute's Slack call
+    // line and the upstream profile can tell them apart, and Slack's shared budget gives them
+    // live work's place.
+    let polling = poll_loop_with_channels(
         chat,
         state.live.as_ref(),
         || {
@@ -2450,8 +2453,10 @@ async fn poll_state_loop(
             ticks,
             hints: Some((state.live.as_ref(), provider_key)),
         },
-    )
-    .await;
+    );
+    crate::read_reason::ReadReason::LivePoll
+        .scope(polling)
+        .await;
 }
 
 /// The body of the static-channel polling tests, with the cursors handed in and a tick budget.

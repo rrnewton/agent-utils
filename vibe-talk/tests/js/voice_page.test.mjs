@@ -86828,3 +86828,30 @@ test("`#611 timeline-read-failures`: a page the server answered from its own cop
   await reReadChannel(page);
   assert.equal(freshness(page).getAttribute("data-state"), "fresh");
 });
+
+// --- `#614 timeline-read-failures` -----------------------------------------------------------------
+
+for (const failed of [true, false]) {
+  test(`\`#614 timeline-read-failures\`: a thread list ${failed ? "from the server's own copy keeps" : "the provider answered takes away"} a card it lacks`, async () => {
+    const page = await threadPage("main");
+    await page.el("channel-view-threads").click();
+    await page.settle();
+    const standard = page.timeline;
+    assert.match(page.el("thread-list").text(), /Second discussion/, "the premise is two cards");
+    page.timeline = async (path, options) => {
+      const response = await standard(path, options);
+      if (new URL(path, "http://fixture.test").searchParams.get("view") !== "threads") return response;
+      const { delta: _delta, ...newest } = JSON.parse(await response.text());
+      const threads = (newest.threads || []).filter((thread) => thread.title !== "Second discussion");
+      return json(200, { ...newest, threads, has_more: false, next_before: null,
+        ...(failed ? { refresh_failed: "The chat service is limiting how fast it can be read." } : {}) });
+    };
+    await reReadChannel(page);
+    assert.match(page.el("thread-list").text(), /First discussion/);
+    if (failed) {
+      assert.match(page.el("thread-list").text(), /Second discussion/, "a card the server's copy lacks was taken away");
+    } else {
+      assert.doesNotMatch(page.el("thread-list").text(), /Second discussion/, "the negative control: a full list removes");
+    }
+  });
+}

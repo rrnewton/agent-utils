@@ -24213,7 +24213,9 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   const covered = channelCanon.views.has(viewKey(view, thread));
   const taken = view === "threads" ? [] : (payload.messages || []).filter(fold.takes);
   if (view === "threads") {
-    mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => true);
+    // `#614 timeline-read-failures`: a thread list from the server's own copy answers for no card
+    // it lacks either.
+    mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => !failed);
   } else {
     const inPage = view === "flat" ? allPageAnswersFor(payload.messages || [], Boolean(payload.notice))
       : (message) => inView(message, view, thread);
@@ -27677,7 +27679,8 @@ async function refreshThreadDirectory() {
     } else {
       foldTimelinePage(payload, false, "threads", null);
       // The way back from the newest page, for "Older threads…" over the cards. `#281 view-keys`.
-      noteNewestThreadPage(channel, payload);
+      // Not from the server's own copy when it has none: the way back already known still holds.
+      if (!refreshFailed(payload) || payload.next_before) noteNewestThreadPage(channel, payload);
     }
     noteThreadListLanded(channel);
     // `#528 thread-card-markdown-and-cap`: kept, so a reload draws the names it brought at once.
@@ -28884,7 +28887,9 @@ async function readAllForCounts(channel) {
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}&reason=counts`,
       { signal }));
-    countsAllReadFor.set(channel, outrun);
+    // `#614 timeline-read-failures`: the server's own copy, the chat service having failed or kept
+    // it waiting, may lack the very replies the counts outran: the next counts read asks again.
+    if (!refreshFailed(payload)) countsAllReadFor.set(channel, outrun);
     const current = channelCanon === read.canon && read.canon.channel === channel &&
       String(el("discord-channel").value) === channel;
     const number = sentNumberOf(payload);

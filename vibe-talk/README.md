@@ -2189,10 +2189,14 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   [Bulk and time-range reads](#bulk-and-time-range-reads)) carries the reason of the reads it
   stands in for, native or emulated: a catch-up's head read and its read of several channels are
   `recent`, the head read checked beside the probe is `probe`, and speech preparation's lookup by
-  id is `speech`. A word the page does not send is `other`; a read nobody gave a reason for (the
-  live poller's, its head read included) is `untagged`. **Attribution only:** nothing in the
-  server or the page decides anything by the reason — no read is shared, skipped, kept or made
-  fresher because of it.
+  id is `speech`. The live poller's reads, its head read included, are `live-poll` (`#614
+  timeline-read-failures`; they used to be `untagged`). A word the page does not send is `other`;
+  a read nobody gave a reason for (a send's, for one) is `untagged`. **Mostly attribution:** what
+  a caller may see is never decided by the reason. What is: Slack's shared budget places a read
+  by it, `backfill` gives up at the first rate limit, and with serving on the page's `side` and
+  `counts` reads give up at the first rate limit and fail fast, and a `side` read of a live-fed
+  thread list may be answered from the message cache
+  ([The message cache](#the-message-cache), `#614`).
 * **Outcomes** are `ok`, `transport`, `rate_limited`, `unauthorized` (401), `forbidden` (403),
   `not_found` (404), `client_error` (another 4xx), `server_error` (5xx), `unexpected_status`,
   `shape` (an answer this server could not read), `refused` (this server said no before asking),
@@ -4630,7 +4634,7 @@ fails (rate-limited, unreachable, or an error of its own), or has not answered w
 `timeline_fallback_ms` (ten seconds unless set), the cache answers in its place with whatever it
 holds of the view's newest page, however old: Main, one thread, a bridge's All, and Slack's All
 put together from Main and the newest replies the cache holds of each thread rooted on it. Never
-the thread list, which the cache does not keep, and never a step back. Such a page carries
+a step back. Such a page carries
 `refresh_failed` (a sentence saying why), `as_of` (when the scope's newest end was last read) and
 no `settled_below_ms`, so the page lands the rows, proves nothing gone by their absence, and says
 "Refresh failed · showing messages from HH:MM". A slow read upstream is not abandoned: it runs on
@@ -4640,12 +4644,43 @@ nothing for fails as upstream failed. Each stand-in logs one WARN line (`timelin
 A newest page whose refresh is already running for an earlier serve is served too, without a
 second read upstream: that refresh corrects it.
 
+**The right column and All's counts** (`#614 timeline-read-failures`). The page's `side` reads (the
+thread list beside Main, and the side column's thread) and its `counts` read of All are made again
+by the page itself, and nobody waits on them. With `serve = true` they give up at the first Slack
+rate limit, and send nothing into a `Retry-After` already running, so the cache answers them at
+once; one the cache cannot answer fails once `timeline_fallback_ms` has passed instead of waiting
+out the provider (its read runs on and fills the cache). With serving off they wait as every read
+does. Slack's thread list is stood in for too: the latest thread list read upstream (at most 30
+minutes old) brought up to date with the cache's thread records, which every reply live ingestion
+delivers moves forward: a thread with a reply since is the cache's copy, and a thread only the
+cache lists is added only when its activity came after that read began. It carries that list's
+`next_before` and notice, so "Older threads…" goes on from where it ended; from the cache alone it
+has no way back. The page takes a `refresh_failed` thread list's cards without removing any it
+lacks, and a `refresh_failed` counts read does not count as having read the replies the counts
+outran.
+
+With the channel live-fed (its provider polled, or ingestion on) and `serve = true`, the thread
+list's `side` read is answered that way while an upstream read of the list answered within five
+minutes (`LIVE_FED_UPSTREAM_EVERY`) or one is running, without `refresh_failed`; otherwise it goes
+upstream, the stand-in behind it. The thread list used to scan up to ten pages of
+`conversations.history` on every read, once a minute for each tab and channel: most of what kept
+Slack's history limit spent, for what live ingestion had already delivered. "Older threads…"
+(`reason=threads`) and All's `counts` read, which is sent because the page lacks replies the counts
+promise, still go upstream.
+
+**Slack calls, once a minute** (`#614`). One INFO line (`consumer="slack_calls"`) says what Slack
+was sent since the last one: `sent`, `limited` (answers that were a rate limit) and `refused`
+(requests failed as one without being sent), and `by_method` and `by_caller`
+(`conversations.history:side=12,live-poll=6,poll=3; …`, by read reason). It is written by the
+first call a minute or more after the last line, so a quiet minute writes none, and `window_s`
+says how long it covers. The live poller's reads say `live-poll`.
+
 **One Slack budget, shared by priority** (`#611 timeline-read-failures`, `vibe_talk::slack::budget`).
 Slack limits each Web API method per workspace (`conversations.history` and `conversations.replies`
 are tier 3, about fifty a minute), and every reader spends the same allowance. Every request is
 counted against its method over the last minute, with its priority, from its read reason: a
 person's request (the page's reads, a send, speech, a voice agent's tools, and anything untagged)
-first, then live work (relist, the probe), then thread naming and summaries, then backfill and the
+first, then live work (the live poller, relist, the probe), then thread naming and summaries, then backfill and the
 shadow's check. Once Slack has answered a method with a `Retry-After`, nobody sends it again before
 that runs out: every request waits within its own budget, except crawl work, which fails at once and
 is tried again later. Backfill holds off a method while everyone else has sent 25 of it in the last
