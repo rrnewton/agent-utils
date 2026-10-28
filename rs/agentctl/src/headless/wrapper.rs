@@ -26,6 +26,10 @@
 //! and the rest go through the queue's standard recovery, which never replays a guess. When the
 //! harness exits unexpectedly it is restarted with `--resume SESSION`, with backoff, up to a
 //! limit; then the wrapper exits nonzero and its supervisor decides.
+//!
+//! Permission prompts are held for the owner's answer and denied when none comes in time
+//! ([`super::approval`], `#671 headless-approval-surface`); a call the harness or a hook refused
+//! is logged with its full refusal text.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -49,6 +53,7 @@ use fs2::FileExt;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use super::approval::{self, Decision};
 use super::claude::{self, InputState, Signal};
 use super::control;
 use super::events::{self, EventWriter};
@@ -93,6 +98,15 @@ pub struct WrapperConfig {
     pub config_directory: Option<PathBuf>,
     /// Lines of each tool result kept, masked, in its `tool.completed` event (0 keeps none).
     pub tool_preview_lines: usize,
+    /// Hold the harness's permission prompts for the owner's answer ([`super::approval`]);
+    /// false runs it with `--permission-prompts none`, which denies them at once.
+    pub approvals: bool,
+    /// How long a permission prompt waits for the owner before it is denied.
+    pub approval_timeout: Duration,
+    /// Refuse an answer from a process in the harness's control group, not only from its
+    /// process tree ([`approval::peer_refusal`]). Off only where everything shares one group,
+    /// as in tests.
+    pub approval_cgroup_check: bool,
 }
 
 impl WrapperConfig {
@@ -113,6 +127,9 @@ impl WrapperConfig {
             stop_timeout: Duration::from_secs(60),
             config_directory: claude::config_directory(),
             tool_preview_lines: claude::PREVIEW_LINES,
+            approvals: true,
+            approval_timeout: approval::DEFAULT_TIMEOUT,
+            approval_cgroup_check: true,
         }
     }
 
@@ -208,6 +225,34 @@ impl Drop for Harness {
     }
 }
 
+/// A permission prompt the harness waits on.
+#[derive(Debug)]
+struct PendingApproval {
+    id: String,
+    request_id: String,
+    tool: String,
+    summary: String,
+    detail: String,
+    complete: bool,
+    reason: String,
+    reason_type: String,
+    blocked_path: Option<String>,
+    input: Value,
+    tool_use_id: String,
+    asked_at: Instant,
+    deadline: Instant,
+    causation: Option<String>,
+}
+
+/// How long the queued chat message that carried an accepted answer is looked for, to be taken
+/// as consumed instead of typed.
+const CONSUME_WINDOW: Duration = Duration::from_secs(600);
+/// Longest reason an approver may give with a denial, in bytes.
+const ANSWER_REASON_BYTES: usize = 500;
+
+/// One tool call in flight: its tool, summary, start, and the reply it sends, if any.
+type ToolCall = (String, String, Instant, Option<ReplyCall>);
+
 enum Message {
     Line(u64, String),
     Eof(u64),
@@ -243,7 +288,13 @@ struct Wrapper {
     turn_started: Option<Instant>,
     current: Option<Written>,
     started_inputs: HashMap<String, String>,
-    tools: HashMap<String, (String, Instant, Option<ReplyCall>)>,
+    tools: HashMap<String, ToolCall>,
+    /// Permission prompts waiting for the owner, oldest first.
+    approvals: Vec<PendingApproval>,
+    /// Queued chat messages that carried an accepted answer: queue ID to approval ID.
+    consume: HashMap<String, (String, Instant)>,
+    /// Refusals of this turn's tool calls, by call ID, for its `permission.denied` events.
+    denials: HashMap<String, Value>,
     pending_controls: HashMap<String, SyncSender<Value>>,
     next_request: u64,
     interrupt_requested: bool,
@@ -289,7 +340,10 @@ impl Wrapper {
         } else {
             argv.extend(["--session-id".to_owned(), self.config.session.clone()]);
         }
-        argv.extend(claude::effective_arguments(&self.config.arguments));
+        argv.extend(claude::effective_arguments(
+            &self.config.arguments,
+            self.config.approvals,
+        ));
         let mut command = Command::new(&self.config.command[0]);
         command
             .args(&argv)
@@ -460,6 +514,7 @@ impl Wrapper {
     }
 
     fn maybe_deliver(&mut self) -> Result<()> {
+        self.consume_answers()?;
         if self.current.is_some()
             || self.stopping.is_some()
             || self.held
@@ -490,6 +545,10 @@ impl Wrapper {
             return Ok(false);
         }
         let queue_id = queue::message_id_from_path(path)?;
+        if self.consume.contains_key(&queue_id) {
+            self.consume_item(path, &queue_id)?;
+            return Ok(false);
+        }
         let filename = path.file_name().expect("queued path has a file name");
         let inflight = self.directories.inflight.join(filename);
         transition(path, &inflight)?;
@@ -735,8 +794,10 @@ impl Wrapper {
                     summary,
                     reply,
                 } => {
-                    self.tools
-                        .insert(id.clone(), (tool.clone(), Instant::now(), reply));
+                    self.tools.insert(
+                        id.clone(),
+                        (tool.clone(), summary.clone(), Instant::now(), reply),
+                    );
                     self.emit(
                         "tool.started",
                         causation,
@@ -749,13 +810,12 @@ impl Wrapper {
                     bytes,
                     mut preview,
                     lines,
+                    denial,
                 } => {
-                    let (tool, began, reply) = self
-                        .tools
-                        .remove(&id)
-                        .map_or((String::new(), None, None), |(tool, began, reply)| {
-                            (tool, Some(began), reply)
-                        });
+                    let (tool, summary, began, reply) = self.tools.remove(&id).map_or(
+                        (String::new(), String::new(), None, None),
+                        |(tool, summary, began, reply)| (tool, summary, Some(began), reply),
+                    );
                     let duration_ms = began.map(|began| began.elapsed().as_millis() as u64);
                     // A file's contents are not output worth previewing, and may be anything.
                     if tool == "Read" {
@@ -767,6 +827,15 @@ impl Wrapper {
                                           "duration_ms": duration_ms});
                     if !preview.is_empty() {
                         data["preview"] = json!(preview);
+                    }
+                    if let Some(denial) = denial {
+                        // The whole refusal, not a preview line: it is why the call never ran.
+                        let denied = json!({"source": denial.source, "reason": denial.reason});
+                        data["summary"] = json!(summary);
+                        data["denied"] = denied.clone();
+                        if self.denials.len() < 256 {
+                            self.denials.insert(id.clone(), denied);
+                        }
                     }
                     self.emit("tool.completed", causation, data)?;
                     if let Some(call) = reply.filter(|_| ok) {
@@ -796,13 +865,18 @@ impl Wrapper {
                     cost_usd,
                     denials,
                 } => {
-                    for (tool, summary) in denials {
-                        self.emit(
-                            "permission.denied",
-                            causation,
-                            json!({"tool": tool, "summary": summary}),
-                        )?;
+                    for (tool, summary, id) in denials {
+                        let mut data = json!({"tool": tool, "summary": summary});
+                        if !id.is_empty() {
+                            data["tool_use_id"] = json!(id);
+                        }
+                        if let Some(denied) = self.denials.get(&id) {
+                            data["source"] = denied["source"].clone();
+                            data["reason"] = denied["reason"].clone();
+                        }
+                        self.emit("permission.denied", causation, data)?;
                     }
+                    self.denials.clear();
                     let outcome = match subtype.as_str() {
                         "success" => "completed",
                         "error_during_execution" if self.interrupt_requested => "interrupted",
@@ -811,6 +885,10 @@ impl Wrapper {
                     let wall = self
                         .turn_started
                         .map(|began| began.elapsed().as_millis() as u64);
+                    // The harness asks nothing more of a finished turn.
+                    while !self.approvals.is_empty() {
+                        self.settle_approval(0, "cancelled", "turn-end", None)?;
+                    }
                     self.emit(
                         "turn.completed",
                         causation,
@@ -838,6 +916,28 @@ impl Wrapper {
                         "compact.completed",
                         causation,
                         json!({"trigger": trigger, "pre_tokens": pre_tokens, "post_tokens": post_tokens}),
+                    )?;
+                }
+                Signal::PermissionRequest(request) => self.permission_request(request)?,
+                Signal::PermissionCancelled { request_id } => {
+                    if let Some(index) = self
+                        .approvals
+                        .iter()
+                        .position(|pending| pending.request_id == request_id)
+                    {
+                        self.settle_approval(index, "cancelled", "harness", None)?;
+                    }
+                }
+                Signal::UnknownControlRequest {
+                    request_id,
+                    subtype,
+                } => {
+                    let error = format!("the headless wrapper does not serve {subtype:?} requests");
+                    self.write_harness(claude::control_error_line(&request_id, &error));
+                    self.emit(
+                        "error",
+                        causation,
+                        json!({"class": "unsupported_control_request", "message": error}),
                     )?;
                 }
                 Signal::ControlResponse { request_id, body } => {
@@ -872,7 +972,25 @@ impl Wrapper {
                 "last_seq": self.writer.next_seq().saturating_sub(1),
                 "stopping": self.stopping,
                 "held": self.held,
+                "approvals_pending": self.approvals.len(),
             }),
+            "approvals" => json!({
+                "ok": true,
+                "approvals": self.approvals.iter().map(|pending| json!({
+                    "id": pending.id,
+                    "tool": pending.tool,
+                    "summary": pending.summary,
+                    "detail": pending.detail,
+                    "complete": pending.complete,
+                    "reason": pending.reason,
+                    "reason_type": pending.reason_type,
+                    "blocked_path": pending.blocked_path,
+                    "tool_use_id": pending.tool_use_id,
+                    "waiting_s": pending.asked_at.elapsed().as_secs(),
+                    "remaining_s": pending.deadline.saturating_duration_since(Instant::now()).as_secs(),
+                })).collect::<Vec<_>>(),
+            }),
+            "approval" => self.approval_answer(&request.body, request.peer)?,
             "interrupt" => {
                 let input = self
                     .harness
@@ -922,6 +1040,323 @@ impl Wrapper {
             other => json!({"ok": false, "error": format!("unknown op {other:?}")}),
         };
         let _ = request.reply.try_send(answer);
+        Ok(())
+    }
+
+    /// Hand one line to the harness's writer thread; false when its input is closed.
+    fn write_harness(&self, line: String) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|harness| harness.input.as_ref())
+            .is_some_and(|input| input.send(line.into_bytes()).is_ok())
+    }
+
+    /// Hold a permission prompt for the owner's answer and log it.
+    fn permission_request(&mut self, request: claude::PermissionRequest) -> Result<()> {
+        let causation = self.turn_causation.clone();
+        if !claude::asks_wrapper(&self.config.arguments, self.config.approvals) {
+            // Not asked for; answer at once, as `--permission-prompts none` would.
+            let message = "This headless session takes no approvals, so the call was denied.";
+            self.write_harness(claude::permission_answer_line(
+                &request.request_id,
+                false,
+                &Value::Null,
+                message,
+            ));
+            return Ok(());
+        }
+        let id = approval::approval_id(self.writer.next_seq());
+        let timeout = self.config.approval_timeout;
+        self.emit(
+            "approval.requested",
+            causation.as_deref(),
+            json!({
+                "id": id,
+                "tool": request.tool,
+                "summary": request.summary,
+                "detail": request.detail,
+                "complete": request.complete,
+                "reason": request.reason,
+                "reason_type": request.reason_type,
+                "blocked_path": request.blocked_path,
+                "tool_use_id": request.tool_use_id,
+                "timeout_s": timeout.as_secs(),
+            }),
+        )?;
+        let now = Instant::now();
+        self.approvals.push(PendingApproval {
+            id,
+            request_id: request.request_id,
+            tool: request.tool,
+            summary: request.summary,
+            detail: request.detail,
+            complete: request.complete,
+            reason: request.reason,
+            reason_type: request.reason_type,
+            blocked_path: request.blocked_path,
+            input: request.input,
+            tool_use_id: request.tool_use_id,
+            asked_at: now,
+            deadline: now + timeout,
+            causation,
+        });
+        Ok(())
+    }
+
+    /// Answer pending prompt `index` and log the decision: `approved`, `denied` (with the message
+    /// the model reads), or `cancelled` (the harness withdrew it or is gone; nothing is sent).
+    fn settle_approval(
+        &mut self,
+        index: usize,
+        decision: &str,
+        by: &str,
+        reason: Option<&str>,
+    ) -> Result<Value> {
+        let pending = self.approvals.remove(index);
+        let timeout = self.config.approval_timeout.as_secs();
+        let message = match (decision, by) {
+            ("denied", "timeout") => format!(
+                "Denied: this call needed the owner's approval (approval {}), and no answer came within {timeout} s. Ask the owner in chat if it is still needed.",
+                pending.id
+            ),
+            ("denied", by) => {
+                let place = if by.starts_with("console:") {
+                    "at the console"
+                } else {
+                    "in chat"
+                };
+                match reason {
+                    Some(reason) => format!(
+                        "The owner denied this call {place} (approval {}): {reason}",
+                        pending.id
+                    ),
+                    None => format!("The owner denied this call {place} (approval {}).", pending.id),
+                }
+            }
+            _ => String::new(),
+        };
+        if decision != "cancelled" {
+            let allow = decision == "approved";
+            let line = claude::permission_answer_line(
+                &pending.request_id,
+                allow,
+                &pending.input,
+                &message,
+            );
+            if !self.write_harness(line) {
+                self.emit(
+                    "error",
+                    pending.causation.as_deref(),
+                    json!({"class": "approval_answer", "message": "the harness input is closed; the answer was not delivered", "id": pending.id}),
+                )?;
+            }
+        }
+        let data = json!({
+            "id": pending.id,
+            "decision": decision,
+            "by": by,
+            "reason": reason,
+            "tool": pending.tool,
+            "summary": pending.summary,
+            "tool_use_id": pending.tool_use_id,
+            "waited_ms": pending.asked_at.elapsed().as_millis() as u64,
+            "timeout_s": timeout,
+        });
+        self.emit(
+            "approval.decided",
+            pending.causation.as_deref(),
+            data.clone(),
+        )?;
+        Ok(data)
+    }
+
+    /// The `approval` control request: an answer from a bridge's verified owner (`by:
+    /// chat:SENDER`, naming the prompt's ID) or the owner at a terminal (`console:USER`), never
+    /// from the agent itself. An answer not taken is logged as `approval.refused`, which a
+    /// bridge posts back to its channel.
+    fn approval_answer(&mut self, body: &Value, peer: Option<u32>) -> Result<Value> {
+        let by = body["by"].as_str().unwrap_or_default().to_owned();
+        let id = body["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        let decision_text = body["decision"].as_str().unwrap_or_default().to_owned();
+        let refuse = |wrapper: &mut Self, class: &str, error: String| -> Result<Value> {
+            wrapper.emit(
+                "approval.refused",
+                None,
+                json!({"id": id, "decision": decision_text, "by": by, "peer_pid": peer,
+                       "class": class, "message": error}),
+            )?;
+            Ok(json!({"ok": false, "class": class, "error": error,
+                      "pending": wrapper.approvals.iter().map(|p| p.id.clone()).collect::<Vec<_>>()}))
+        };
+        let Some(decision) = body["decision"].as_str().and_then(Decision::parse) else {
+            return refuse(
+                self,
+                "invalid",
+                "decision must be approve or deny".to_owned(),
+            );
+        };
+        if !approval::valid_by(&by) {
+            return refuse(
+                self,
+                "invalid",
+                "by must name the approver as chat:SENDER or console:USER".to_owned(),
+            );
+        }
+        let harness = self.harness.as_ref().map(|harness| harness.child.id());
+        if let Some(error) = approval::peer_refusal(
+            peer,
+            harness,
+            &self.config.agent,
+            self.config.approval_cgroup_check,
+        ) {
+            return refuse(self, "refused", error);
+        }
+        let queue_id = body["queue_id"]
+            .as_str()
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            })
+            .map(str::to_owned);
+        if let Some((approval, _)) = queue_id.as_ref().and_then(|id| self.consume.get(id)) {
+            // The same chat message offered again (its bridge restarted before queuing it).
+            return Ok(json!({"ok": true, "already": true, "approval": {"id": approval}}));
+        }
+        let chat = by.starts_with("chat:");
+        let pending: Vec<String> = self.approvals.iter().map(|p| p.id.clone()).collect();
+        let index = match &id {
+            Some(id) => self.approvals.iter().position(|pending| &pending.id == id),
+            // In chat a bare answer could meet a prompt the owner has not been shown yet.
+            None if chat => {
+                return refuse(
+                    self,
+                    "invalid",
+                    "an answer in chat must name the approval ID, as in `approve a12`".to_owned(),
+                );
+            }
+            None if pending.len() == 1 => Some(0),
+            None if pending.len() > 1 => {
+                return refuse(
+                    self,
+                    "ambiguous",
+                    format!(
+                        "{} approvals are pending ({}); name one",
+                        pending.len(),
+                        pending.join(", ")
+                    ),
+                );
+            }
+            None => None,
+        };
+        let Some(index) = index else {
+            let error = match (&id, pending.is_empty()) {
+                (Some(id), true) => {
+                    format!("approval {id} is not waiting (answered, timed out or withdrawn); no approval is pending")
+                }
+                (Some(id), false) => format!(
+                    "approval {id} is not waiting (answered, timed out or withdrawn); pending: {}",
+                    pending.join(", ")
+                ),
+                (None, _) => "no approval is pending".to_owned(),
+            };
+            return refuse(self, "not_pending", error);
+        };
+        if chat && decision == Decision::Approve && !self.approvals[index].complete {
+            let pending_id = self.approvals[index].id.clone();
+            return refuse(
+                self,
+                "incomplete",
+                format!(
+                    "approval {pending_id}'s call could not be shown whole (cut or credential-like words masked), so only the console can approve it: agentctl approve {} {pending_id}",
+                    self.config.agent
+                ),
+            );
+        }
+        let reason = body["reason"]
+            .as_str()
+            .map(|reason| events::excerpt(&claude::denial_text(reason), ANSWER_REASON_BYTES))
+            .filter(|reason| !reason.trim().is_empty());
+        let decided = match decision {
+            Decision::Approve => "approved",
+            Decision::Deny => "denied",
+        };
+        let data = self.settle_approval(index, decided, &by, reason.as_deref())?;
+        if let Some(queue_id) = queue_id {
+            if let Some(id) = data["id"].as_str() {
+                self.consume
+                    .insert(queue_id, (id.to_owned(), Instant::now()));
+            }
+            self.rescan = true;
+        }
+        Ok(json!({"ok": true, "approval": data}))
+    }
+
+    /// Deny every prompt whose owner did not answer in time.
+    fn check_approval_deadlines(&mut self) -> Result<()> {
+        let now = Instant::now();
+        while let Some(index) = self
+            .approvals
+            .iter()
+            .position(|pending| now >= pending.deadline)
+        {
+            self.settle_approval(index, "denied", "timeout", None)?;
+        }
+        Ok(())
+    }
+
+    /// Take each queued chat message that carried an accepted answer out of the queue as
+    /// processed (`consumed: approval`), without typing it: the harness already has the answer.
+    /// [`Self::deliver`] does the same for one that arrives between this look and its own.
+    fn consume_answers(&mut self) -> Result<()> {
+        self.consume
+            .retain(|_, (_, at)| at.elapsed() < CONSUME_WINDOW);
+        if self.consume.is_empty() {
+            return Ok(());
+        }
+        for path in pending_in_queue_order(&self.directories)? {
+            let Ok(queue_id) = queue::message_id_from_path(&path) else {
+                continue;
+            };
+            if !self.consume.contains_key(&queue_id) {
+                continue;
+            }
+            let lock = lock_delivery(&self.queue_root, self.queue_identity, &Blocking)?;
+            if path.exists() {
+                self.consume_item(&path, &queue_id)?;
+            }
+            drop(lock);
+        }
+        Ok(())
+    }
+
+    /// Move the queued item at `path` to `processed/` as consumed by the answer it carried, and
+    /// log it. The caller holds the delivery lock.
+    fn consume_item(&mut self, path: &Path, queue_id: &str) -> Result<()> {
+        let Some((approval_id, _)) = self.consume.remove(queue_id) else {
+            return Ok(());
+        };
+        let Ok(mut document) = queue::load_message(path) else {
+            return Ok(());
+        };
+        document.insert("delivery_state".to_owned(), json!("processed"));
+        document.insert("started_at".to_owned(), json!(unix_seconds()));
+        document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
+        document.insert("consumed".to_owned(), json!("approval"));
+        document.insert("approval_id".to_owned(), json!(approval_id));
+        atomic_json(path, &Value::Object(document))?;
+        let filename = path.file_name().expect("queued path has a file name");
+        transition(path, &self.directories.processed.join(filename))?;
+        self.emit(
+            "input.consumed",
+            Some(queue_id),
+            json!({"queue_id": queue_id, "as": "approval", "approval_id": approval_id}),
+        )?;
         Ok(())
     }
 
@@ -1007,6 +1442,10 @@ impl Wrapper {
         if self.busy && self.stopping.is_none() {
             self.restart_notice = true;
         }
+        while !self.approvals.is_empty() {
+            self.settle_approval(0, "cancelled", "harness-exit", None)?;
+        }
+        self.denials.clear();
         self.interrupt_requested = false;
         self.busy = false;
         self.turn_causation = None;
@@ -1447,6 +1886,9 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
         current: None,
         started_inputs: HashMap::new(),
         tools: HashMap::new(),
+        approvals: Vec::new(),
+        consume: HashMap::new(),
+        denials: HashMap::new(),
         pending_controls: HashMap::new(),
         next_request: 0,
         interrupt_requested: false,
@@ -1475,6 +1917,8 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
             "cwd": wrapper.config.cwd,
             "settings_sha256": settings_digest,
             "pruned_generations": wrapper.writer.pruned(),
+            "approvals": claude::asks_wrapper(&wrapper.config.arguments, wrapper.config.approvals),
+            "approval_timeout_s": wrapper.config.approval_timeout.as_secs(),
         }),
     )?;
     wrapper.recover()?;
@@ -1517,6 +1961,7 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
             }
         }
         wrapper.check_ack_deadline()?;
+        wrapper.check_approval_deadlines()?;
         wrapper.enforce_stop_deadline();
         if wrapper.harness.is_none() && wrapper.stopping.is_some() {
             wrapper.set_status("stopped")?;

@@ -217,6 +217,21 @@ enum Commands {
     /// Interrupt a headless agent's running turn; queued inputs stay queued and run next
     #[command(after_help = "Example: agentctl interrupt coordinator")]
     Interrupt(Named),
+    /// List the permission prompts a headless agent's wrapper holds for the owner's answer, each with its ID, tool, command summary, and seconds waited and left
+    #[command(
+        after_help = "Example: agentctl approvals coordinator\n\nA headless Claude Code agent's permission prompts (a hook's or the auto-mode classifier's \"ask\", a path outside\nthe allowed directories) are held by its wrapper, logged as approval.requested, and posted to the chat channel by a\nbridge serving the agent. Prints {name, approvals: [{id, tool, summary, tool_use_id, waiting_s, remaining_s}]}."
+    )]
+    Approvals(Named),
+    /// Approve a headless agent's held permission prompt as the owner at a terminal: the tool call runs unchanged
+    #[command(
+        after_help = "Examples:\n  agentctl approve coordinator a4182\n  agentctl approve coordinator\n\nWithout ID it answers the only pending prompt (refused when several are pending). The owner can answer the same\nprompt in the chat channel instead, with `approve ID`. Refused unless standard input and output are a terminal and\nAGENTCTL_AGENT is unset, and the wrapper refuses an answer from the agent's own processes. The decision is logged\nas approval.decided with by console:$USER. Prints {name, approval}."
+    )]
+    Approve(ApprovalAnswer),
+    /// Deny a headless agent's held permission prompt as the owner at a terminal: the model reads the denial, with --reason, as the tool's error
+    #[command(
+        after_help = "Examples:\n  agentctl deny coordinator a4182 --reason 'push to the fork instead'\n  agentctl deny coordinator\n\nWithout ID it answers the only pending prompt (refused when several are pending). In the chat channel the owner\nanswers with `deny ID [reason]`. A prompt nobody answers is denied when its timeout ends (run-headless\n--approval-timeout). Same terminal and agent checks as approve. Prints {name, approval}."
+    )]
+    Deny(ApprovalAnswer),
     /// Move a headless agent's session to an interactive Claude Code in a new Herdr tab: wait for the running turn to end (or interrupt it), stop the wrapper, and run `claude --resume SESSION` there
     #[command(
         after_help = "Examples:\n  agentctl takeover coordinator\n  agentctl takeover coordinator --interrupt --workspace wV\n\nThe record is marked taken over before the wrapper is asked to stop, so no supervisor can start\na wrapper until `agentctl handback`; a wrapper started meanwhile exits 0 at once. Deliveries\nare held while the running turn ends, so none starts between that check and the stop. The tab\nruns `agentctl takeover-hold`, which holds the agent's headless lock, refuses to start while any\nprocess runs Claude Code on the session (--resume or --session-id SESSION in its command line),\nruns the interactive Claude Code in its own process group with the terminal, and when it exits\nends whatever is left of that session before it releases the lock. The interactive session gets the record's harness arguments without --permission-prompts, the\nagent's working directory, and the wrapper's CLAUDE_CONFIG_DIR. Inputs sent meanwhile stay\nqueued and run after handback. The event log records lifecycle.takeover and, when the\ninteractive session exits, lifecycle.released."
@@ -474,6 +489,43 @@ struct TakeoverHold {
 }
 
 #[derive(Args)]
+struct ApprovalAnswer {
+    #[command(flatten)]
+    agent: Named,
+    /// The prompt's ID from `agentctl approvals` or the chat post (a<digits>); omitted, the only pending prompt
+    id: Option<String>,
+    /// Why, passed to the model with a denial (at most 500 bytes; deny only)
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+}
+
+/// `agentctl approve` or `agentctl deny` (`#671 headless-approval-surface`).
+fn answer_prompt<A: crate::subagents::ManagedApi + ?Sized>(
+    manager: &crate::subagents::ManagedAgents<'_, A>,
+    value: &ApprovalAnswer,
+    decision: crate::headless::approval::Decision,
+) -> Result<Value, Failure> {
+    if decision == crate::headless::approval::Decision::Approve && value.reason.is_some() {
+        return Err(Failure::Usage(
+            "--reason goes with deny; an approval runs the call unchanged".to_owned(),
+        ));
+    }
+    if let Some(id) = value.id.as_deref() {
+        if !crate::headless::approval::valid_id(id) {
+            return Err(Failure::Usage(format!(
+                "{id:?} is not an approval ID (a<digits>, as `agentctl approvals` lists)"
+            )));
+        }
+    }
+    Ok(manager.headless_answer(
+        &value.agent.name,
+        value.id.as_deref(),
+        decision,
+        value.reason.as_deref(),
+    )?)
+}
+
+#[derive(Args)]
 struct RunHeadless {
     #[command(flatten)]
     agent: Named,
@@ -483,6 +535,15 @@ struct RunHeadless {
     /// Lines of each tool result kept, credential-shaped words masked, as the `preview` of its tool.completed event, at most 8; 0 keeps no output in the log (default: 8)
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(0..=8))]
     tool_preview_lines: Option<u64>,
+    /// Seconds a permission prompt waits for the owner's answer before it is denied, from 10 to 86400 (default: 600)
+    #[arg(long, default_value = "600", value_parser = clap::value_parser!(u64).range(10..=86400), value_name = "SECONDS")]
+    approval_timeout: u64,
+    /// Deny permission prompts at once instead of asking the owner (runs Claude Code with --permission-prompts none)
+    #[arg(long)]
+    no_approvals: bool,
+    /// Accept answers from processes in the harness's own control group (by default refused, so a tool call that left the harness's process tree still cannot answer); for a wrapper that is not run as its own systemd unit
+    #[arg(long)]
+    approval_shared_cgroup: bool,
 }
 
 #[derive(Args)]
@@ -2912,6 +2973,15 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             }
         }
         Commands::Interrupt(value) => manager.headless_control(&value.name, "interrupt")?,
+        Commands::Approvals(value) => manager.headless_approvals(&value.name)?,
+        Commands::Approve(value) => answer_prompt(
+            &manager,
+            &value,
+            crate::headless::approval::Decision::Approve,
+        )?,
+        Commands::Deny(value) => {
+            answer_prompt(&manager, &value, crate::headless::approval::Decision::Deny)?
+        }
         Commands::Compact(value) => manager.compact_headless(&value.name)?,
         Commands::Takeover(value) => manager.takeover_headless(
             &value.agent.name,
@@ -2942,6 +3012,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 &value.agent.name,
                 value.claude_bin.as_deref(),
                 value.tool_preview_lines.map(|lines| lines as usize),
+                Some(crate::subagents::HeadlessApprovals {
+                    enabled: !value.no_approvals,
+                    timeout: Duration::from_secs(value.approval_timeout),
+                    cgroup_check: !value.approval_shared_cgroup,
+                }),
                 terminate,
             )?);
         }
@@ -3486,12 +3561,15 @@ const CLOUD_CAPABILITIES: [&str; 9] = [
 ];
 
 /// What a headless (`harness-wrapper`) agent supports.
-const HEADLESS_CAPABILITIES: [&str; 8] = [
+const HEADLESS_CAPABILITIES: [&str; 11] = [
     "send",
     "drain",
     "status",
     "tail",
     "interrupt",
+    "approvals",
+    "approve",
+    "deny",
     "compact",
     "cancel",
     "stop",

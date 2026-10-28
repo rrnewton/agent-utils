@@ -1171,8 +1171,9 @@ fn classify(
 /// `--turn-minutes` is `turn-queued`, and a log that has not moved is `stalled`, timed from its
 /// last event. Idle: input left queued is `stalled` (the wrapper delivers at once, so this is
 /// due after the dead threshold), a verdict in the last turn's prose is `child-done`, and none
-/// is `idle-no-verdict`, timed from the turn's end. Under `--permission-prompts none` nothing
-/// waits at a prompt, so there is no approval episode.
+/// is `idle-no-verdict`, timed from the turn's end. A permission prompt the wrapper holds for
+/// the owner (`#671 headless-approval-surface`) is an approval episode, timed from its
+/// `approval.requested`; under `--permission-prompts none` nothing waits at a prompt.
 fn classify_headless(
     observation: &Observation,
     view: &crate::headless::watch::View,
@@ -1183,6 +1184,18 @@ fn classify_headless(
     let age = |since: f64| crate::turn_state::format_age((now - since).max(0.0));
     match observation.status.as_str() {
         "working" => {
+            if let Some((id, tool, summary, asked)) = &view.pending_approval {
+                return Some(Finding::timed(
+                    EpisodeKind::ApprovalPrompt,
+                    format!(
+                        "waiting {} for the owner to answer approval {id}: {tool} {summary} (agentctl approve|deny {} {id}, or approve/deny in chat)",
+                        age(*asked),
+                        observation.name
+                    ),
+                    *asked,
+                    None,
+                ));
+            }
             let since = view.busy_since.or(memory.working_since).unwrap_or(now);
             let backlog = &observation.backlog;
             if backlog.waiting > 0 && now - since >= options.turn.as_secs_f64() {
@@ -6244,6 +6257,43 @@ mod tests {
             &options,
         );
         assert!(row.is_none_or(|row| row["due"] == false));
+    }
+
+    #[test]
+    fn a_headless_prompt_waiting_for_the_owner_is_an_approval_episode() {
+        // #671 headless-approval-surface: the wrapper holds the prompt; the coordinator hears
+        // of it after the approval threshold (5 min here), not the stall threshold.
+        let options = options();
+        let mut state = WatchState::default();
+        let waiting = crate::headless::watch::View {
+            busy_since: Some(0.0),
+            pending_approval: Some((
+                "a42".to_owned(),
+                "Bash".to_owned(),
+                "git push origin main".to_owned(),
+                60.0,
+            )),
+            ..view_at(42, 60.0)
+        };
+        let row = update_episode(
+            &mut state,
+            &headless("working", waiting.clone()),
+            300.0,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(row["kind"], "approval-prompt");
+        assert_eq!(row["due"], false);
+        let row =
+            update_episode(&mut state, &headless("working", waiting), 361.0, &options).unwrap();
+        assert_eq!(row["due"], true, "{row}");
+        let detail = row["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(
+                "waiting 5 min for the owner to answer approval a42: Bash git push origin main"
+            ) && detail.contains("agentctl approve|deny lead a42"),
+            "{detail}"
+        );
     }
 
     #[test]

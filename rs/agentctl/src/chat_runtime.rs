@@ -4827,6 +4827,22 @@ pub(crate) trait CoordinatorDelivery {
         let _ = (agent_name, message_id);
         Err("this delivery cannot take a prompt back out of the coordinator's queue".to_owned())
     }
+    /// Offer the text of an owner's message, from verified sender `sender`, to a headless
+    /// agent's approval surface before its prompt `message_id` is queued (`#671
+    /// headless-approval-surface`): `Ok(Some(answer))` when the agent's wrapper took it as the
+    /// answer to a permission prompt, and will take the queued prompt as consumed; `Ok(None)` when
+    /// it is not an answer or nothing it names is pending. A delivery without approvals gives
+    /// `Ok(None)`.
+    fn approval_reply(
+        &self,
+        agent_name: &str,
+        text: &str,
+        sender: &str,
+        message_id: &str,
+    ) -> std::result::Result<Option<Value>, String> {
+        let _ = (agent_name, text, sender, message_id);
+        Ok(None)
+    }
 }
 
 /// The open requests whose prompt has not reached the coordinator, or may not have, among those
@@ -5000,6 +5016,17 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
             &agent::SystemRuntime::default(),
         )
         .map_err(|error| error.to_string())
+    }
+
+    fn approval_reply(
+        &self,
+        agent_name: &str,
+        text: &str,
+        sender: &str,
+        message_id: &str,
+    ) -> std::result::Result<Option<Value>, String> {
+        ManagedAgents::headless_approval_reply(self, agent_name, text, sender, message_id)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -12657,20 +12684,23 @@ pub(crate) fn deliver_request_with(
             },
             Err(error) => Some(error),
         },
-        None => match prompt_screen(state, delivery, agent_name) {
-            Ok(screen) => match guard_typing(state, delivery, Some(&screen)) {
-                Ok(()) => delivery
-                    .submit(
-                        agent_name,
-                        &state.queued_prompt(key, &screen)?,
-                        message_id,
-                        options,
-                    )
-                    .err(),
+        None => {
+            offer_approval_answer(delivery, agent_name, &record);
+            match prompt_screen(state, delivery, agent_name) {
+                Ok(screen) => match guard_typing(state, delivery, Some(&screen)) {
+                    Ok(()) => delivery
+                        .submit(
+                            agent_name,
+                            &state.queued_prompt(key, &screen)?,
+                            message_id,
+                            options,
+                        )
+                        .err(),
+                    Err(error) => Some(error),
+                },
                 Err(error) => Some(error),
-            },
-            Err(error) => Some(error),
-        },
+            }
+        }
     };
 
     if operation_error.is_none() && observed != Some(QueueMessageState::Pending) {
@@ -12717,6 +12747,43 @@ pub(crate) fn deliver_request_with(
             state.set_delivery_phase(key, RequestPhase::Submitting, Some(&detail))?;
             Ok(CoordinatorDeliveryResult::Pending(detail))
         }
+    }
+}
+
+/// Before an owner's message is first queued, offer it to the agent's approval surface (`#671
+/// headless-approval-surface`): one that reads as `approve ID` or `deny ID` answers a headless
+/// agent's held permission prompt, approver `chat:SENDER`, and its wrapper then takes the
+/// queued prompt as consumed. Admission let only the bridge's verified owners' messages become
+/// requests, so the sender here is one of them. The prompt is queued either way, so a request
+/// keeps its usual life (its ✅ when the wrapper takes the prompt). A wrapper that cannot be
+/// asked is logged and the message delivered as usual.
+fn offer_approval_answer(
+    delivery: &dyn CoordinatorDelivery,
+    agent_name: &str,
+    record: &RequestRecord,
+) {
+    let message = &record.message;
+    if crate::headless::approval::parse_reply(&message.text).is_none_or(|reply| reply.id.is_none())
+    {
+        return;
+    }
+    match delivery.approval_reply(
+        agent_name,
+        &message.text,
+        &message.sender_id,
+        &record.delivery_message_id,
+    ) {
+        Ok(Some(answer)) => crate::chat_service::service_log(format_args!(
+            "agentctl: request {} answered approval {} of {agent_name}: {}",
+            record.key,
+            answer["approval"]["id"].as_str().unwrap_or("?"),
+            answer["approval"]["decision"].as_str().unwrap_or("taken"),
+        )),
+        Ok(None) => {}
+        Err(error) => crate::chat_service::service_log(format_args!(
+            "agentctl: request {} reads as an approval answer, but {error}; delivering it as a message",
+            record.key
+        )),
     }
 }
 

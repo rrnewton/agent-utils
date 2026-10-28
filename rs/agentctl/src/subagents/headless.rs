@@ -23,6 +23,17 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 /// and a wrapper that does not answer takes it at its next queue poll.
 const CHAT_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How `run-headless` treats the harness's permission prompts (`#671 headless-approval-surface`).
+#[derive(Clone, Copy, Debug)]
+pub struct HeadlessApprovals {
+    /// Hold them for the owner's answer; false denies them at once.
+    pub enabled: bool,
+    /// How long one waits for the owner before it is denied.
+    pub timeout: Duration,
+    /// Refuse answers from the harness's control group ([`wrapper::WrapperConfig`]).
+    pub cgroup_check: bool,
+}
+
 /// What `start --mode headless` registers.
 #[derive(Clone, Debug, Default)]
 pub struct HeadlessStart {
@@ -362,6 +373,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         agent_name: &str,
         claude_bin: Option<&Path>,
         tool_preview_lines: Option<usize>,
+        approvals: Option<HeadlessApprovals>,
         terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<i32> {
         let record = self.load(agent_name)?;
@@ -395,6 +407,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         config.arguments = record.arguments.clone();
         if let Some(lines) = tool_preview_lines {
             config.tool_preview_lines = lines;
+        }
+        if let Some(approvals) = approvals {
+            config.approvals = approvals.enabled;
+            config.approval_timeout = approvals.timeout;
+            config.approval_cgroup_check = approvals.cgroup_check;
         }
         let hooks = RecordIdentity {
             manager: self,
@@ -467,6 +484,120 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             )));
         }
         Ok(json!({"name": agent_name, "op": op, "answer": answer}))
+    }
+
+    /// Offer an owner's chat message to a headless agent's approval surface (`#671
+    /// headless-approval-surface`). When `text` reads as an answer ([`hl::approval::parse_reply`])
+    /// and the wrapper holds a prompt it names (or the only one, when it names none), the wrapper
+    /// takes the decision with approver `chat:SENDER` and will take the queued prompt
+    /// `message_id` as consumed instead of typing it. `Ok(None)` when the message is not an
+    /// answer, the agent is not headless, or no such prompt is pending: the message is then
+    /// delivered as usual. The bridge calls this only for messages it admitted from its verified
+    /// owners.
+    pub fn headless_approval_reply(
+        &self,
+        agent_name: &str,
+        text: &str,
+        sender: &str,
+        message_id: &str,
+    ) -> Result<Option<Value>> {
+        // A bare answer could meet a prompt the owner has not been shown; it stays a message.
+        let Some(reply) = hl::approval::parse_reply(text).filter(|reply| reply.id.is_some()) else {
+            return Ok(None);
+        };
+        if !self.load(agent_name)?.is_headless() {
+            return Ok(None);
+        }
+        let socket = hcontrol::socket_path(&self.directory(agent_name)?);
+        let body = json!({
+            "op": "approval",
+            "id": reply.id,
+            "decision": reply.decision.as_str(),
+            "reason": reply.reason,
+            "by": format!("chat:{sender}"),
+            "queue_id": message_id,
+        });
+        let answer = hcontrol::request(&socket, &body, CONTROL_TIMEOUT)
+            .map_err(|error| fail(format!("{agent_name}: {error}")))?;
+        match (answer["ok"].as_bool(), answer["class"].as_str()) {
+            (Some(true), _) => Ok(Some(answer)),
+            (_, Some("not_pending")) => Ok(None),
+            _ => Err(fail(format!(
+                "{agent_name}: the wrapper refused the approval answer: {}",
+                answer["error"].as_str().unwrap_or("no reason given")
+            ))),
+        }
+    }
+
+    /// The permission prompts a headless agent's wrapper holds for the owner.
+    pub fn headless_approvals(&self, agent_name: &str) -> Result<Value> {
+        let answer = self.headless_control(agent_name, "approvals")?;
+        Ok(json!({"name": agent_name, "approvals": answer["answer"]["approvals"]}))
+    }
+
+    /// Answer a headless agent's permission prompt as the owner at a terminal (`#671
+    /// headless-approval-surface`; `agentctl approve|deny`). Refused unless standard input and
+    /// output are terminals and the caller is no agent (`AGENTCTL_AGENT` unset), so a lane's
+    /// tool call cannot use it; the wrapper also refuses the agent's own processes.
+    pub fn headless_answer(
+        &self,
+        agent_name: &str,
+        id: Option<&str>,
+        decision: hl::approval::Decision,
+        reason: Option<&str>,
+    ) -> Result<Value> {
+        // SAFETY: isatty only inspects the descriptors.
+        let terminal = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
+        if !terminal {
+            return Err(fail(
+                "approve and deny answer for the owner at a terminal: standard input and output must be a terminal",
+            ));
+        }
+        if let Some(agent) = std::env::var("AGENTCTL_AGENT")
+            .ok()
+            .filter(|agent| !agent.is_empty())
+        {
+            return Err(fail(format!(
+                "approve and deny answer for the owner, not an agent (AGENTCTL_AGENT={agent})"
+            )));
+        }
+        let record = self.load(agent_name)?;
+        if !record.is_headless() {
+            return Err(fail(format!(
+                "{agent_name:?} is not a headless agent (adapter {:?})",
+                record.adapter
+            )));
+        }
+        let user = std::env::var("USER")
+            .ok()
+            .filter(|user| !user.is_empty() && !user.chars().any(char::is_whitespace))
+            // SAFETY: getuid cannot fail.
+            .unwrap_or_else(|| format!("uid{}", unsafe { libc::getuid() }));
+        let body = json!({
+            "op": "approval",
+            "id": id,
+            "decision": decision.as_str(),
+            "reason": reason,
+            "by": format!("console:{user}"),
+        });
+        let socket = hcontrol::socket_path(&self.directory(agent_name)?);
+        let answer = hcontrol::request(&socket, &body, CONTROL_TIMEOUT)
+            .map_err(|error| fail(format!("{agent_name}: {error}")))?;
+        if answer["ok"] != true {
+            return Err(fail(format!(
+                "{agent_name}: the wrapper refused the answer: {}",
+                answer["error"].as_str().unwrap_or("no reason given")
+            )));
+        }
+        Ok(json!({"name": agent_name, "approval": answer["approval"]}))
+    }
+
+    /// The event log directory of a headless agent, or `None` for another kind of agent.
+    pub(crate) fn headless_events_directory(&self, agent_name: &str) -> Result<Option<PathBuf>> {
+        if !self.load(agent_name)?.is_headless() {
+            return Ok(None);
+        }
+        Ok(Some(events::directory(&self.directory(agent_name)?)))
     }
 
     fn wake(&self, agent_name: &str) -> Option<String> {

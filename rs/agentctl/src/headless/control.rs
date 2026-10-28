@@ -3,8 +3,10 @@
 //! A Unix stream socket, mode 0600 in the owner-only agent directory, with no network listener.
 //! Each connection carries one JSON request line and gets one JSON response line. Requests:
 //! `{"op": "wake"}` (look at the queue now), `{"op": "status"}`, `{"op": "interrupt"}` (stop the
-//! running turn), `{"op": "stop"}` (finish cleanly and exit). Every response has `ok`; a refused
-//! request has `ok: false` and `error`.
+//! running turn), `{"op": "stop"}` (finish cleanly and exit), `{"op": "approvals"}` (the pending
+//! permission prompts) and `{"op": "approval", ...}` (answer one: see [`super::approval`]). Every
+//! response has `ok`; a refused request has `ok: false` and `error`. Each request carries the
+//! peer's process ID (`SO_PEERCRED`), which the wrapper checks before it accepts an answer.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -30,6 +32,8 @@ pub struct Request {
     pub body: Value,
     /// Where the main loop sends the response.
     pub reply: SyncSender<Value>,
+    /// The process ID of the connecting peer, when the kernel reported one.
+    pub peer: Option<u32>,
 }
 
 /// The socket path of the agent whose directory is `agent_directory`.
@@ -78,6 +82,7 @@ pub fn serve<T: Send + 'static>(
 fn handle<T>(stream: UnixStream, sink: &Sender<T>, wrap: fn(Request) -> T) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let peer = super::approval::peer_pid(&stream);
     let mut line = String::new();
     {
         let mut reader = BufReader::new(io::Read::take(&stream, MAX_REQUEST));
@@ -86,7 +91,7 @@ fn handle<T>(stream: UnixStream, sink: &Sender<T>, wrap: fn(Request) -> T) -> io
     let response = match serde_json::from_str::<Value>(line.trim()) {
         Ok(body) if body.get("op").and_then(Value::as_str).is_some() => {
             let (reply, answer) = mpsc::sync_channel(1);
-            if sink.send(wrap(Request { body, reply })).is_err() {
+            if sink.send(wrap(Request { body, reply, peer })).is_err() {
                 json!({"ok": false, "error": "the wrapper is shutting down"})
             } else {
                 answer.recv_timeout(ANSWER_WAIT).unwrap_or_else(
@@ -176,6 +181,7 @@ mod tests {
         let server = thread::spawn(move || {
             let request = receiver.recv().unwrap();
             assert_eq!(request.body["op"], "status");
+            assert_eq!(request.peer, Some(std::process::id()));
             request
                 .reply
                 .send(json!({"ok": true, "status": "idle"}))

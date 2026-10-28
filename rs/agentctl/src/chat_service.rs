@@ -3159,6 +3159,21 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
             .withdraw_with_runtime(agent_name, message_id, &self.runtime)
             .map_err(|error| error.to_string())
     }
+
+    fn approval_reply(
+        &self,
+        agent_name: &str,
+        text: &str,
+        sender: &str,
+        message_id: &str,
+    ) -> std::result::Result<Option<Value>, String> {
+        if self.runtime.cancelled() {
+            return Err("chat delivery was cancelled before the approval answer".to_owned());
+        }
+        self.manager
+            .headless_approval_reply(agent_name, text, sender, message_id)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// What a pass's deliveries did in the pane, as `TypingWatch` notes it.
@@ -3310,6 +3325,17 @@ impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
 
     fn withdraw(&self, agent_name: &str, message_id: &str) -> std::result::Result<bool, String> {
         self.delivery.withdraw(agent_name, message_id)
+    }
+
+    fn approval_reply(
+        &self,
+        agent_name: &str,
+        text: &str,
+        sender: &str,
+        message_id: &str,
+    ) -> std::result::Result<Option<Value>, String> {
+        self.delivery
+            .approval_reply(agent_name, text, sender, message_id)
     }
 
     /// A headless agent's model started the prompt: the request earns its ✅ now, as a pane's
@@ -5375,6 +5401,213 @@ fn headless_scan(
     notes.log(&report);
 }
 
+/// Posts a headless agent's permission prompts, and what became of them, to the bridge's first
+/// channel (`#671 headless-approval-surface`). It follows the agent's event log from its end for
+/// `approval.requested` and `approval.decided`, and at start asks the wrapper for the prompts
+/// already waiting, so one raised while `chat run` was down is posted too. The owner answers in
+/// the channel; the answer reaches the wrapper on its way into the queue (see
+/// `chat_runtime::offer_approval_answer`). Posting needs the outbound helper; without one the
+/// relay logs once and the prompts wait for an answer at the console or their timeout.
+///
+/// A prompt is posted only once it has waited [`APPROVAL_POST_DELAY`]: Claude Code also hands
+/// a prompt to the host's own permission hooks, and withdraws it from the wrapper when one of
+/// them settles it, typically within a second, so posting at once would put two messages in
+/// the channel for a call nobody needed to answer. An outcome is posted only for a prompt that
+/// was.
+struct ApprovalRelay {
+    follower: Option<crate::headless::events::Follower>,
+    next_look: Instant,
+    warned: bool,
+    /// Prompts asked and not yet posted: ID, the event's data, when the relay saw it.
+    held: Vec<(String, Value, Instant)>,
+    /// IDs of prompts posted and not yet decided.
+    posted: BTreeSet<String>,
+}
+
+/// How long a permission prompt must stay unanswered before the bridge posts it.
+const APPROVAL_POST_DELAY: Duration = Duration::from_secs(5);
+
+impl ApprovalRelay {
+    fn new<A: ManagedApi + ?Sized>(
+        state: &BridgeState,
+        manager: &ManagedAgents<'_, A>,
+        mut transport: Option<&mut dyn RootMessageTransport>,
+    ) -> Self {
+        let agent = &state.config().agent_name;
+        let follower = match manager.headless_events_directory(agent) {
+            Ok(Some(directory)) => match crate::headless::events::Follower::at_end(&directory) {
+                Ok(follower) => Some(follower),
+                Err(error) => {
+                    service_log(format_args!(
+                        "agentctl: cannot follow {agent}'s event log for approval prompts: {error}"
+                    ));
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: cannot find {agent}'s event log for approval prompts: {error}"
+                ));
+                None
+            }
+        };
+        let mut relay = Self {
+            follower,
+            next_look: Instant::now(),
+            warned: false,
+            held: Vec::new(),
+            posted: BTreeSet::new(),
+        };
+        if relay.follower.is_some() {
+            if let Ok(pending) = manager.headless_approvals(agent) {
+                for approval in pending["approvals"].as_array().into_iter().flatten() {
+                    let mut data = approval.clone();
+                    data["timeout_s"] = approval["remaining_s"].clone();
+                    let text =
+                        crate::headless::approval::request_text(&state.config().agent_label, &data);
+                    relay.post(
+                        state,
+                        reborrow(&mut transport),
+                        &format!("(still waiting) {text}"),
+                    );
+                    if let Some(id) = approval["id"].as_str() {
+                        relay.posted.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+        relay
+    }
+
+    /// Post what the log gained since the last look, at most once each `HEADLESS_WAIT`.
+    fn relay(&mut self, state: &BridgeState, mut transport: Option<&mut dyn RootMessageTransport>) {
+        let now = Instant::now();
+        if now < self.next_look {
+            return;
+        }
+        self.next_look = now + HEADLESS_WAIT;
+        let Some(follower) = self.follower.as_mut() else {
+            return;
+        };
+        let events = match follower.poll() {
+            Ok(events) => events,
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: cannot read the event log for approval prompts: {error}"
+                ));
+                return;
+            }
+        };
+        let label = state.config().agent_label.clone();
+        for event in events {
+            let id = event.data["id"].as_str().unwrap_or_default().to_owned();
+            match event.kind.as_str() {
+                "approval.requested" if !id.is_empty() => {
+                    self.held.push((id, event.data, now));
+                }
+                "approval.refused"
+                    if event.data["by"]
+                        .as_str()
+                        .is_some_and(|by| by.starts_with("chat:"))
+                        || event.data["class"] == "refused" =>
+                {
+                    let text = crate::headless::approval::refused_text(&label, &event.data);
+                    self.post(state, reborrow(&mut transport), &text);
+                }
+                "approval.decided" => {
+                    let before = self.held.len();
+                    self.held.retain(|(held, ..)| *held != id);
+                    if self.held.len() < before {
+                        continue; // settled before anyone needed to see it
+                    }
+                    if self.posted.remove(&id) {
+                        if let Some(text) =
+                            crate::headless::approval::decided_text(&label, &event.data)
+                        {
+                            self.post(state, reborrow(&mut transport), &text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        while let Some(index) = self
+            .held
+            .iter()
+            .position(|(_, _, seen)| now.duration_since(*seen) >= APPROVAL_POST_DELAY)
+        {
+            let (id, data, _) = self.held.remove(index);
+            let text = crate::headless::approval::request_text(&label, &data);
+            self.post(state, reborrow(&mut transport), &text);
+            self.posted.insert(id);
+        }
+    }
+
+    fn post(
+        &mut self,
+        state: &BridgeState,
+        transport: Option<&mut dyn RootMessageTransport>,
+        body: &str,
+    ) {
+        let configuration = state.config();
+        let channel = configuration.channel_ids.first();
+        let (Some(transport), Some(channel), true) =
+            (transport, channel, configuration.outbound_enabled)
+        else {
+            if !std::mem::replace(&mut self.warned, true) {
+                service_log(format_args!(
+                    "agentctl: cannot post approval prompts of {}: the bridge has no outbound helper; answer them with agentctl approve|deny",
+                    configuration.agent_name
+                ));
+            }
+            return;
+        };
+        let request_id = match chat_runtime::random_operation_uuid() {
+            Ok(id) => id,
+            Err(error) => {
+                service_log(format_args!("agentctl: approval post: {error}"));
+                return;
+            }
+        };
+        let submission = RootMessageSubmission {
+            channel_id: channel,
+            body,
+            request_id: &request_id,
+        };
+        if let Err(error) = chat_runtime::validate_root_message_submission(&submission) {
+            service_log(format_args!("agentctl: approval post refused: {error}"));
+            return;
+        }
+        match transport.publish_root(submission) {
+            Ok(message) => service_log(format_args!(
+                "agentctl: posted to {channel} ({message}): {}",
+                crate::headless::events::excerpt(body, 160)
+            )),
+            Err(error) => service_log(format_args!("agentctl: approval post failed: {error}")),
+        }
+    }
+}
+
+/// `transport` again, for one more call.
+fn reborrow<'a>(
+    transport: &'a mut Option<&mut dyn RootMessageTransport>,
+) -> Option<&'a mut dyn RootMessageTransport> {
+    match transport {
+        Some(transport) => Some(&mut **transport),
+        None => None,
+    }
+}
+
+/// The bridge's outbound helper as a root-message transport, if it has one.
+fn outbound(
+    transport: &mut Option<CommandOutboundTransport>,
+) -> Option<&mut dyn RootMessageTransport> {
+    transport
+        .as_mut()
+        .map(|transport| transport as &mut dyn RootMessageTransport)
+}
+
 /// One run of the owner loop for a headless coordinator (#594 headless-slack-trial, the minimal
 /// form of the design note's `HeadlessDelivery`). Its wrapper is the only drainer of its queue,
 /// so a pass enqueues each admitted request (urgent and delivered mid-turn with
@@ -5408,6 +5641,7 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     let mut notes = NoteLog::default();
     let mut starts = StartWatch::default();
     let receipts = stop.ack_queue.as_ref();
+    let mut approvals = ApprovalRelay::new(state, manager, outbound(control.transport));
     let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
     enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
     starts.note(&recovery);
@@ -5429,6 +5663,7 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
     while !stop.is_stopped() {
         health.tick(state);
+        approvals.relay(state, outbound(control.transport));
         take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
         take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
@@ -13769,6 +14004,266 @@ esac
         assert_eq!(herdr.subscriptions.load(AtomicOrdering::SeqCst), 0);
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
+    }
+
+    /// A stand-in for a headless wrapper's approval surface (#671 headless-approval-surface):
+    /// it records every control request and answers `approval` for prompt `a5` (or no ID),
+    /// `approvals` with one pending prompt, and anything else as a wake.
+    fn fake_approval_wrapper(
+        fixture: &crate::subagents::tests::Fixture,
+        agent: &str,
+    ) -> Arc<Mutex<Vec<Value>>> {
+        let directory = fixture.manager().agent_directory(agent);
+        let (sender, receiver) = crate::headless::control::channel();
+        crate::headless::control::serve(
+            &crate::headless::control::socket_path(&directory),
+            sender,
+            |request| request,
+        )
+        .expect("serve the control socket");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        thread::spawn(move || {
+            for request in receiver {
+                recorded
+                    .lock()
+                    .expect("requests")
+                    .push(request.body.clone());
+                let answer = match request.body["op"].as_str() {
+                    Some("approval")
+                        if matches!(request.body["id"].as_str(), Some("a5") | None) =>
+                    {
+                        json!({"ok": true, "approval": {"id": "a5", "decision":
+                            if request.body["decision"] == "approve" { "approved" } else { "denied" }}})
+                    }
+                    Some("approval") => {
+                        json!({"ok": false, "class": "not_pending", "error": "no such approval is pending"})
+                    }
+                    Some("approvals") => json!({"ok": true, "approvals": [
+                        {"id": "a3", "tool": "Bash", "summary": "git push origin main", "remaining_s": 120}]}),
+                    _ => json!({"ok": true}),
+                };
+                let _ = request.reply.send(answer);
+            }
+        });
+        seen
+    }
+
+    /// Admit the owner's message `text`, named `name`, as provider event `sequence`.
+    fn admitted_owner_text(state: &BridgeState, sequence: u64, name: &str, text: &str) -> String {
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new(format!("spaces/example/messages/{name}")).expect("message"),
+            ThreadId::new(format!("spaces/example/threads/{name}")).expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            text,
+            "2026-10-28T19:00:00Z",
+            false,
+        )
+        .expect("inbound message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(format!("cursor-{sequence}")).expect("cursor"),
+            DeliveryId::new(format!("delivery-{sequence}")).expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery batch");
+        state
+            .admit_batch(&batch)
+            .expect("admit request")
+            .new_request_keys
+            .remove(0)
+    }
+
+    #[test]
+    fn an_owner_answer_in_chat_reaches_the_headless_wrapper_before_its_prompt_is_queued() {
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state(&fixture);
+        let seen = fake_approval_wrapper(&fixture, "worker");
+        let manager = fixture.manager();
+        let approvals = |seen: &Arc<Mutex<Vec<Value>>>| -> Vec<Value> {
+            seen.lock()
+                .expect("requests")
+                .iter()
+                .filter(|body| body["op"] == "approval")
+                .cloned()
+                .collect()
+        };
+        let key = admitted_owner_text(&state, 1, "one", "Approve a5.");
+        chat_runtime::deliver_request_with(&state, &manager, &key, DrainOptions::default())
+            .expect("deliver request");
+        let answered = approvals(&seen);
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        assert_eq!(
+            answered[0],
+            json!({"op": "approval", "id": "a5", "decision": "approve", "reason": null,
+                   "by": "chat:users/owner", "queue_id": format!("chat-{key}")})
+        );
+        // The prompt is queued as usual; the wrapper takes it as consumed.
+        let queue = manager.agent_directory("worker").join("queue");
+        assert!(fake_queue_find(&queue, &key).is_some());
+        // Ordinary text is never offered, however it mentions an approval.
+        let other = admitted_owner_text(
+            &state,
+            2,
+            "two",
+            "what is a5 waiting on? approve it if safe",
+        );
+        chat_runtime::deliver_request_with(&state, &manager, &other, DrainOptions::default())
+            .expect("deliver request");
+        assert_eq!(approvals(&seen).len(), 1);
+        // An answer that names no pending prompt is delivered as a message, nothing lost.
+        let stale = admitted_owner_text(&state, 3, "three", "deny a9 too risky");
+        chat_runtime::deliver_request_with(&state, &manager, &stale, DrainOptions::default())
+            .expect("deliver request");
+        let answered = approvals(&seen);
+        assert_eq!(answered.len(), 2);
+        assert_eq!(answered[1]["decision"], "deny");
+        assert_eq!(answered[1]["reason"], "too risky");
+        assert!(fake_queue_find(&queue, &stale).is_some());
+    }
+
+    /// Root messages posted through it, as (channel, body).
+    #[derive(Default)]
+    struct RecordingRoots {
+        posts: Vec<(String, String)>,
+    }
+
+    impl RootMessageTransport for RecordingRoots {
+        fn publish_root(
+            &mut self,
+            submission: RootMessageSubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            self.posts
+                .push((submission.channel_id.to_owned(), submission.body.to_owned()));
+            Ok(format!("spaces/example/messages/post-{}", self.posts.len()))
+        }
+    }
+
+    #[test]
+    fn the_bridge_posts_a_headless_agents_approval_prompts_and_their_outcomes() {
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state(&fixture);
+        let _seen = fake_approval_wrapper(&fixture, "worker");
+        let manager = fixture.manager();
+        let mut roots = RecordingRoots::default();
+        // A prompt already waiting when the bridge starts is posted at once.
+        let mut relay = ApprovalRelay::new(&state, &manager, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        assert_eq!(roots.posts[0].0, "spaces/example");
+        assert_eq!(
+            roots.posts[0].1,
+            "(still waiting) worker wants to run: Bash - reply `approve a3` or `deny a3`; no answer in 2 min denies it.\n```\ngit push origin main\n```"
+        );
+        let events = crate::headless::events::directory(&manager.agent_directory("worker"));
+        let mut writer =
+            crate::headless::events::EventWriter::open(&events, "worker").expect("event log");
+        writer
+            .append(
+                "approval.requested",
+                None,
+                json!({"id": "a9", "tool": "Bash", "summary": "rm -rf build",
+                       "reason": "Refused unless a human agrees: deletes files", "reason_type": "hook",
+                       "timeout_s": 600}),
+            )
+            .expect("append");
+        writer
+            .append("assistant.text", None, json!({"text": "waiting"}))
+            .expect("append");
+        // Not posted at once: the host's own permission hooks may settle it first.
+        relay.relay(&state, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        // Once it has waited, it is posted, and then its outcome.
+        relay.held[0].2 = Instant::now() - APPROVAL_POST_DELAY;
+        relay.next_look = Instant::now();
+        relay.relay(&state, Some(&mut roots));
+        writer
+            .append(
+                "approval.decided",
+                None,
+                json!({"id": "a9", "decision": "approved", "by": "chat:users/owner",
+                       "tool": "Bash", "summary": "rm -rf build"}),
+            )
+            .expect("append");
+        relay.next_look = Instant::now();
+        relay.relay(&state, Some(&mut roots));
+        let bodies: Vec<&str> = roots.posts[1..]
+            .iter()
+            .map(|(_, body)| body.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                "worker wants to run: Bash (reason: Refused unless a human agrees: deletes files) - reply `approve a9` or `deny a9`; no answer in 10 min denies it.\n```\nrm -rf build\n```",
+                "worker: a9 approved in chat - Bash `rm -rf build`",
+            ]
+        );
+        // A prompt the harness withdrew within the delay is never posted, nor its outcome.
+        writer
+            .append(
+                "approval.requested",
+                None,
+                json!({"id": "a11", "tool": "Bash", "summary": "ls", "timeout_s": 600}),
+            )
+            .expect("append");
+        writer
+            .append(
+                "approval.decided",
+                None,
+                json!({"id": "a11", "decision": "cancelled", "by": "harness"}),
+            )
+            .expect("append");
+        relay.next_look = Instant::now();
+        relay.relay(&state, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 3, "{:?}", roots.posts);
+        assert!(relay.held.is_empty());
+        assert_eq!(relay.posted, BTreeSet::from(["a3".to_owned()]));
+        // An answer from chat the wrapper did not take is posted back at once; a console one is
+        // not the channel's business.
+        writer
+            .append(
+                "approval.refused",
+                None,
+                json!({"id": "a9", "decision": "approve", "by": "chat:users/owner",
+                       "class": "not_pending", "message": "approval a9 is not waiting"}),
+            )
+            .expect("append");
+        writer
+            .append(
+                "approval.refused",
+                None,
+                json!({"decision": "approve", "by": "console:owner", "class": "ambiguous", "message": "x"}),
+            )
+            .expect("append");
+        relay.next_look = Instant::now();
+        relay.relay(&state, Some(&mut roots));
+        assert_eq!(roots.posts.len(), 4, "{:?}", roots.posts);
+        assert_eq!(
+            roots.posts[3].1,
+            "worker: `approve a9` was not taken: approval a9 is not waiting"
+        );
+        // Without an outbound helper nothing is posted, and nothing fails.
+        writer
+            .append(
+                "approval.decided",
+                None,
+                json!({"id": "a10", "decision": "denied", "by": "timeout", "timeout_s": 600, "tool": "Bash"}),
+            )
+            .expect("append");
+        writer
+            .append(
+                "approval.requested",
+                None,
+                json!({"id": "a12", "tool": "Bash", "summary": "ls", "timeout_s": 600}),
+            )
+            .expect("append");
+        relay.next_look = Instant::now();
+        relay.relay(&state, None);
+        relay.held[0].2 = Instant::now() - APPROVAL_POST_DELAY;
+        relay.next_look = Instant::now();
+        relay.relay(&state, None);
+        assert_eq!(roots.posts.len(), 4);
+        assert!(relay.warned);
     }
 
     #[test]
