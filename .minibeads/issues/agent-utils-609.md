@@ -1,11 +1,12 @@
 ---
 title: 'sender-header-mandatory: every agentctl send and tick-hub notice names its sender'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: cl-header
 created_at: 2026-10-28T01:40:10.893739540+00:00
-updated_at: 2026-10-28T01:40:10.893739540+00:00
+updated_at: 2026-10-28T02:48:33.432287970+00:00
+closed_at: 2026-10-28T02:48:33.432287739+00:00
 ---
 
 # Description
