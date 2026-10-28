@@ -312,6 +312,7 @@
         "py/wrkslots/tests/test_census_binding_deadline.py",
         "py/wrkslots/tests/test_census_cost.py",
         "py/wrkslots/tests/test_census_explicit_path.py",
+        "py/wrkslots/tests/test_census_foreign_fds.py",
         "py/wrkslots/tests/test_census_key_publication.py",
         "py/wrkslots/tests/test_census_late_fork.py",
         "py/wrkslots/tests/test_census_state_bounds.py",

@@ -345,6 +345,38 @@ fn own_ancestry() -> BTreeSet<i64> {
     result
 }
 
+fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<bool> {
+    // Mirrors the Python census (#618): a readlink failure is proven
+    // foreign only when stat (which follows the descriptor anyway)
+    // lands on a different filesystem device; a same-device target
+    // stays indeterminate rather than failing open.
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::read_link(link) {
+        Ok(target) => Ok(target == slot_path || target.starts_with(slot_path)),
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            match std::fs::metadata(link) {
+                Ok(metadata) => {
+                    if metadata.dev() != slot_device {
+                        Ok(false)
+                    } else {
+                        Err(format!(
+                            "process use is indeterminate because {} failed: {error}",
+                            link.display()
+                        ))
+                    }
+                }
+                Err(_) => Err(format!(
+                    "process use is indeterminate because {} failed: {error}",
+                    link.display()
+                )),
+            }
+        }
+    }
+}
+
 fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot establish the current working directory: {error}"))?;
@@ -355,6 +387,12 @@ fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
             slot_path.display()
         ));
     }
+    let slot_device = {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(slot_path)
+            .map(|metadata| metadata.dev())
+            .unwrap_or(0)
+    };
     let ignored = own_ancestry();
     let entries = std::fs::read_dir("/proc")
         .map_err(|error| format!("process use is indeterminate because /proc failed: {error}"))?;
@@ -371,28 +409,21 @@ fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
         }
         let base = PathBuf::from("/proc").join(&name);
         let mut via: Option<String> = None;
-        if let Ok(target) = std::fs::read_link(base.join("cwd")) {
-            if target == slot_path || target.starts_with(slot_path) {
-                via = Some(format!("working directory {}", target.display()));
-            }
-        }
-        if via.is_none() {
-            if let Ok(target) = std::fs::read_link(base.join("exe")) {
-                if target == slot_path || target.starts_with(slot_path) {
-                    via = Some(format!("executable {}", target.display()));
-                }
+        for (label, link) in [
+            ("working directory", base.join("cwd")),
+            ("executable", base.join("exe")),
+        ] {
+            if link_points_into(&link, slot_path, slot_device)? {
+                via = Some(label.to_string());
+                break;
             }
         }
         if via.is_none() {
             if let Ok(fds) = std::fs::read_dir(base.join("fd")) {
                 for fd in fds.flatten() {
-                    if let Ok(target) = std::fs::read_link(fd.path()) {
-                        let shown = target.to_string_lossy().into_owned();
-                        let target = PathBuf::from(shown.trim_end_matches(" (deleted)"));
-                        if target == slot_path || target.starts_with(slot_path) {
-                            via = Some(format!("descriptor {}", target.display()));
-                            break;
-                        }
+                    if link_points_into(&fd.path(), slot_path, slot_device)? {
+                        via = Some("descriptor".to_string());
+                        break;
                     }
                 }
             }

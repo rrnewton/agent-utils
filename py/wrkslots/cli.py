@@ -39438,12 +39438,19 @@ def _capture_agent_remove_batch_census(
     )
 
 
-def _readable_link_target(path: Path) -> str | None:
+def _readable_link_target(path: Path, slot_device: int | None = None) -> str | None:
     """Return an absolute link target, or None when absent or unreadable.
 
     A link the invoking user may not read is also invisible to lsof run as
     that user, which is what the ordinary check relies on, so it is not
-    evidence either way.  Other failures still refuse.
+    evidence either way.  Other failures still refuse, with one exception:
+    when readlink itself fails (for example ENAMETOOLONG on a foreign
+    process's very long descriptor target) and ``slot_device`` is known,
+    stat follows the descriptor anyway, and a target on a different
+    filesystem device is proven to lie outside the slot, whose slots are
+    separate filesystem images.  A same-device target stays
+    indeterminate: a very long path inside the slot fails readlink the
+    same way, so treating it as unused would fail open (#618).
     """
 
     try:
@@ -39453,6 +39460,13 @@ def _readable_link_target(path: Path) -> str | None:
             errno.ENOENT, errno.ESRCH, errno.EINVAL, errno.EACCES, errno.EPERM,
         ):
             return None
+        if slot_device is not None:
+            try:
+                observed = os.stat(path)
+            except OSError:
+                observed = None
+            if observed is not None and observed.st_dev != slot_device:
+                return None
         raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
     raw = raw.removesuffix(" (deleted)")
     if not raw.startswith("/"):
@@ -39479,6 +39493,10 @@ def _agent_batch_fresh_use(
 
     base = str(slot_path)
     prefix = base + "/"
+    try:
+        slot_device: int | None = os.stat(slot_path).st_dev
+    except OSError:
+        slot_device = None
 
     def within(target: str | None) -> bool:
         return target is not None and (target == base or target.startswith(prefix))
@@ -39531,7 +39549,7 @@ def _agent_batch_fresh_use(
         uses.extend(mount_verdicts.uses(pid_dir))
         if not uses:
             for name in ("cwd", "root", "exe"):
-                target = _readable_link_target(pid_dir / name)
+                target = _readable_link_target(pid_dir / name, slot_device)
                 if within(target):
                     uses.append(f"{name}={target}")
                     break
@@ -39548,7 +39566,7 @@ def _agent_batch_fresh_use(
                     ) from exc
                 descriptors = []
             for descriptor in descriptors:
-                target = _readable_link_target(fd_dir / descriptor)
+                target = _readable_link_target(fd_dir / descriptor, slot_device)
                 if within(target):
                     uses.append(f"fd/{descriptor}={target}")
                     break
