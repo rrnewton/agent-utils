@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import cast
 
 import re
+import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 from wrkslots import cli as wrkslots_cli
@@ -142,6 +145,30 @@ def _pair(tmp_path: Path) -> tuple[Path, Path]:
     return _fixture(tmp_path / "rust"), _fixture(tmp_path / "oracle")
 
 
+@contextmanager
+def _own_fs(tmp_path: Path) -> Iterator[Path]:
+    """A fixture base on a different filesystem device than tmp_path.
+
+    #651: census-sensitive tests must not share the /tmp device with
+    unrelated host processes, whose unreadable descriptors would
+    otherwise refuse the census as indeterminate. Production slots
+    are separate filesystem images; /dev/shm is the test stand-in.
+    Skips with a clear reason when no distinct device is available.
+    """
+    shm = Path("/dev/shm")
+    if not shm.is_dir() or os.stat(shm).st_dev == os.stat(tmp_path).st_dev:
+        pytest.skip(
+            "no distinct-device fixture filesystem available: census tests "
+            "need e.g. /dev/shm on a different device than the pytest tmp dir"
+        )
+    base = shm / f"wrkslots-remove-{os.getpid()}-{tmp_path.name}"
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        yield base
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def _rust_remove(root: Path, *, fixture: bool = True) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fixture:
@@ -223,6 +250,11 @@ def _kinds_and_actions(root: Path) -> list[tuple[str, str]]:
 
 
 def test_remove_matches_python(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        _remove_matches_python(base)
+
+
+def _remove_matches_python(tmp_path: Path) -> None:
     rust_root, oracle_root = _pair(tmp_path)
     assert _python_remove(oracle_root) == 0
     result = _rust_remove(rust_root)
@@ -322,6 +354,11 @@ def _rebuild(root: Path) -> subprocess.CompletedProcess[str]:
 
 
 def test_remove_event_log_replays_through_rust_reader(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        _event_log_replays(base)
+
+
+def _event_log_replays(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     result = _rust_remove(rust_root)
     assert result.returncode == 0, result.stderr
@@ -381,6 +418,11 @@ def test_remove_sidecar_present_refuses_python_scope(tmp_path: Path) -> None:
 
 
 def test_remove_ignored_file_still_removes(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        _ignored_file_still_removes(base)
+
+
+def _ignored_file_still_removes(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     checkout = rust_root / "worktrees" / "slot-a" / "repo"
     (checkout / ".gitignore").write_text("ignored.log\n")
