@@ -58418,6 +58418,7 @@ async function saveToken() {
     );
     return;
   }
+  el("api-token").value = "";
   markSave("Saved ✓", "ok", false);
   setTokenState("token saved in this browser");
   setStatus("ready");
@@ -59111,7 +59112,12 @@ function startSettingsSync() {
 
 // --- wiring ------------------------------------------------------------------------------------
 
-el("api-token").value = token();
+// `#616 composer-no-autofill`. The token field starts EMPTY, even with a token saved, and is emptied again
+// once one is saved. A password field holding the token, in one form with every message box, is what
+// made a phone's password manager take a send for a sign-in and offer to save it (see #signin-form in
+// web/voice.html). The saved token lives in localStorage only.
+// Its own form is never submitted: an Enter in it saves nothing and goes nowhere.
+el("signin-form").addEventListener("submit", (event) => event.preventDefault());
 el("save-token").addEventListener("click", guardQuietly(saveToken));
 el("forget-token").addEventListener("click", forgetToken);
 el("pair-submit").addEventListener("click", guardQuietly(pairFromInput));

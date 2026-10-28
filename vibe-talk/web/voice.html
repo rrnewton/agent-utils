@@ -140,12 +140,22 @@
           <h1>vibe-talk</h1>
           <p class="hint">Server: <code id="signin-server-url"></code></p>
 
+          <!-- `#616 composer-no-autofill`. The sign-in fields' own form, joined by their `form` attribute so the
+               layout is untouched. Nothing else on this page is in a form, and a browser treats every control
+               outside one as ONE form: the write token's password field and every message box were a single
+               login form to Chrome, which on Android hands an inferred submission of it (a fetch done, and the
+               box last typed in gone) to the phone's autofill service, and LastPass offered to save a password
+               after a send. With this form the message boxes' form has no password field. `method="dialog"`
+               outside a dialog submits nowhere, so an Enter here can never put the token in the address, and
+               web/voice.js takes the submit event too. -->
+          <form id="signin-form" method="dialog" autocomplete="off" hidden></form>
+
           <!-- `#369 pairing-link`. Shown when the page was opened from a pairing link. The code is
                redeemed only on the tap, so a link scanner that runs this page cannot spend it. -->
           <div id="pair-offer" class="panel" hidden>
             <p id="pair-offer-text">This pairing link signs this browser in. It works once.</p>
             <label for="pair-transfer">Unused link — copy to the Home Screen app</label>
-            <input id="pair-transfer" type="text" readonly autocomplete="off" />
+            <input id="pair-transfer" type="text" readonly autocomplete="off" form="signin-form" data-lpignore="true" data-1p-ignore="true" data-form-type="other" />
             <div class="row">
               <button id="pair-confirm" type="button">Sign this device in</button>
               <button id="pair-dismiss" class="secondary" type="button">Not now</button>
@@ -153,12 +163,12 @@
           </div>
 
           <label for="pair-input">Pairing link or code (also for the Home Screen app)</label>
-          <input id="pair-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+          <input id="pair-input" type="text" autocomplete="off" form="signin-form" data-lpignore="true" data-1p-ignore="true" data-form-type="other" autocapitalize="off" spellcheck="false"
             placeholder="paste a fresh pairing link" />
           <button id="pair-submit" type="button">Pair this app</button>
 
           <label for="api-token">Write token</label>
-          <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
+          <input id="api-token" type="password" autocomplete="off" form="signin-form" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="paste the token" />
           <div class="row">
             <button id="save-token" type="button">Save token</button>
           </div>
@@ -256,6 +266,7 @@
                 class="search-field"
                 type="search"
                 autocomplete="off"
+                data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                 placeholder="Search loaded messages"
                 aria-label="Search loaded messages; Enter searches older messages"
                 title="Filters the messages loaded here, and searches the server's copy past them. Words match anywhere, in any case and without accents; &quot;a phrase&quot;, OR, -word, from:name, in:thread, in:main, has:link, before: and after: a date. Enter searches older messages, a few pages at a time."
@@ -474,7 +485,7 @@
                   fact after the call, and after a reload (`renderCallRecap` in web/voice.js).
                 -->
                 <p id="call-recap" class="call-recap" role="status" hidden></p>
-                <textarea id="compose-text" rows="3" autocomplete="off" enterkeyhint="send"
+                <textarea id="compose-text" rows="3" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" enterkeyhint="send"
                           placeholder="Message the agent…" aria-label="Message the agent"></textarea>
                 <button id="send-text" type="button"
                         title="Send this to the agent. With no call open it starts a typed conversation, which never opens the microphone.">Send</button>
@@ -612,7 +623,7 @@
               <div id="channel-composer">
                 <!-- No heading line: it read like one more message. The box says where the message
                      goes in its placeholder, and names itself to a screen reader the same way. -->
-                <textarea id="channel-compose-text" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
+                <textarea id="channel-compose-text" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
                 <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
                      so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
                 <button id="channel-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
@@ -647,7 +658,7 @@
                     <label for="reply-text">Your reply</label>
                     <p id="reply-target-meta" class="hint"></p>
                   </div>
-                  <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
+                  <textarea id="reply-text" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="4" placeholder="write a reply"></textarea>
                   <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
                        so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
                   <button id="reply-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
@@ -813,7 +824,7 @@
                 <ol id="side-pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
                 <ol id="side-outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
                 <div id="side-composer">
-                  <textarea id="side-compose-text" rows="3" placeholder="Reply in this thread…" aria-label="Reply in this thread" aria-describedby="side-compose-state"></textarea>
+                  <textarea id="side-compose-text" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="3" placeholder="Reply in this thread…" aria-label="Reply in this thread" aria-describedby="side-compose-state"></textarea>
                   <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
                        so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
                   <button id="side-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
@@ -1223,6 +1234,7 @@
                           id="voice-post-prefix"
                           type="text"
                           autocomplete="off"
+                          data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                           spellcheck="false"
                           aria-describedby="voice-post-prefix-help voice-post-prefix-state"
                         />
@@ -1264,6 +1276,8 @@
                         <label for="voice-instructions">Additional instructions</label>
                         <textarea
                           id="voice-instructions"
+                          autocomplete="off"
+                          data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                           rows="4"
                           placeholder="For example: call me Sam, and keep answers short."
                           aria-describedby="voice-instructions-state"
@@ -1277,6 +1291,8 @@
                           <p class="hint">What the agent may do, read or send, is added after it from your token and the switch above.</p>
                           <textarea
                             id="voice-system-prompt"
+                            autocomplete="off"
+                            data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                             rows="12"
                             spellcheck="false"
                             aria-label="System prompt"
@@ -1411,10 +1427,10 @@
                     </div>
                     <div class="fold-body" id="fold-canned-prompts-body" hidden="until-found">
                       <label for="prompt-summary">Sumry</label>
-                      <textarea id="prompt-summary" rows="3"></textarea>
+                      <textarea id="prompt-summary" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="3"></textarea>
 
                       <label for="prompt-blockers">Blockers — spends coding-agent work</label>
-                      <textarea id="prompt-blockers" rows="4"></textarea>
+                      <textarea id="prompt-blockers" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="4"></textarea>
                       <p id="prompt-state" class="hint" aria-live="polite"></p>
                     </div>
                   </section>
@@ -1535,6 +1551,7 @@
                           type="text"
                           maxlength="200"
                           autocomplete="off"
+                          data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                           enterkeyhint="done"
                           placeholder="Working…"
                           aria-describedby="noise-state"
@@ -1907,6 +1924,7 @@
                         type="text"
                         maxlength="60"
                         autocomplete="off"
+                        data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                         aria-describedby="alias-state"
                       />
                       <p id="alias-state" class="hint" aria-live="polite"></p>
@@ -1935,6 +1953,7 @@
                         inputmode="numeric"
                         maxlength="20"
                         autocomplete="off"
+                        data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                         placeholder="17 to 20 digits"
                         aria-describedby="add-channel-state"
                       />
@@ -1944,6 +1963,7 @@
                         type="text"
                         maxlength="60"
                         autocomplete="off"
+                        data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                         aria-describedby="add-channel-state"
                       />
                       <!--
@@ -1974,6 +1994,7 @@
                         type="search"
                         maxlength="100"
                         autocomplete="off"
+                        data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                         enterkeyhint="search"
                         placeholder="type part of a name"
                         aria-describedby="channel-directory-state"
@@ -3933,7 +3954,7 @@
           <label id="speed-value" for="read-speed-box">Pace</label>
           <div class="pace-stepper">
             <button id="read-speed-down" class="pace-step" type="button" aria-label="Slower: 10 percent less">&minus;</button>
-            <input id="read-speed-box" type="text" inputmode="numeric" autocomplete="off" spellcheck="false"
+            <input id="read-speed-box" type="text" inputmode="numeric" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" spellcheck="false"
                    value="100%" aria-label="reading pace, percent of the agent's own" />
             <button id="read-speed-up" class="pace-step" type="button" aria-label="Faster: 10 percent more">+</button>
           </div>
