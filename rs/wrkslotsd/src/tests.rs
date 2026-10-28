@@ -5031,6 +5031,8 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
         names,
         BTreeSet::from([
             "adopt",
+            "recover-absent-agent-row",
+            "recover-absent-agent-rows",
             "recover-unbound-owner",
             "transfer-owner",
             "create",

@@ -374,6 +374,56 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Recover one exact absent agent row (writer; fixture registries only until cutover)
+    RecoverAbsentAgentRow {
+        /// Slot from SLOT=GENERATION=SHA256
+        slot: String,
+        /// Current slot generation
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Exact source ACTIVE record SHA-256
+        #[arg(long, value_name = "SHA256")]
+        record_sha256: String,
+        /// Apply instead of planning the plan
+        #[arg(long)]
+        apply: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID (required with --apply)
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Recover an explicit bounded batch of absent agent rows (writer; fixture registries only until cutover)
+    RecoverAbsentAgentRows {
+        /// One SLOT=GENERATION=SHA256 row (repeatable)
+        #[arg(long, value_name = "ROW")]
+        row: Vec<String>,
+        /// UTF-8 file with one row per line
+        #[arg(long, value_name = "FILE")]
+        input: Option<PathBuf>,
+        /// Apply instead of planning each plan
+        #[arg(long)]
+        apply: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID (required with --apply)
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
     Create {
         /// New slot name
@@ -1036,6 +1086,75 @@ pub fn run() -> u8 {
                         serde_json::to_string_pretty(&value).unwrap_or_default()
                     );
                     return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverAbsentAgentRow {
+            slot,
+            expected_generation,
+            record_sha256,
+            apply,
+            coordinator_authorized,
+            coordinator_pid,
+            root,
+            machine,
+        } => {
+            match crate::recover_absent_write::recover_absent_agent_row(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                expected_generation,
+                &record_sha256,
+                apply,
+                coordinator_authorized,
+                coordinator_pid,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverAbsentAgentRows {
+            row,
+            input,
+            apply,
+            coordinator_authorized,
+            coordinator_pid,
+            root,
+            machine,
+        } => {
+            match crate::recover_absent_write::recover_absent_agent_rows(
+                root.as_deref(),
+                machine.as_deref(),
+                &row,
+                input.as_deref(),
+                apply,
+                coordinator_authorized,
+                coordinator_pid,
+            ) {
+                Ok(value) => {
+                    let refused = value
+                        .get("counts")
+                        .and_then(|counts| counts.get("refused"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return if refused > 0 { 1 } else { 0 };
                 }
                 Err(error) => {
                     eprintln!("wrkslotsd: {error}");

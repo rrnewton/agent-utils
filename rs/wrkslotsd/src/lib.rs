@@ -68,6 +68,7 @@ mod plan;
 mod policy;
 mod read_handoff_write;
 mod record_holds;
+mod recover_absent_write;
 mod recover_unbound_write;
 mod release_write;
 mod remove_write;
