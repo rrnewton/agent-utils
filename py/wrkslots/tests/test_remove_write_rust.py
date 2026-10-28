@@ -251,6 +251,24 @@ def test_remove_dirty_checkout_refuses_salvage_scope(tmp_path: Path) -> None:
 def test_remove_unpublished_commit_refuses_salvage_scope(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     checkout = rust_root / "worktrees" / "slot-a" / "repo"
+    # Point the checkout at a separate bare remote so a local commit
+    # is genuinely unpublished (the fixture's self-remote shares the
+    # branch ref with the checkout).
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "init", "-q", "--bare", str(bare))
+    _git(checkout, "remote", "add", "pub", str(bare))
+    _git(checkout, "push", "-q", "pub", "HEAD:main", "HEAD:suite/work")
+    _git(checkout, "fetch", "-q", "pub", "+refs/heads/*:refs/remotes/pub/*")
+    active_path = rust_root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(active_path.read_text())
+    record_checkout = document["slots"][0]["checkouts"][0]
+    record_checkout["remote"] = "pub"
+    record_checkout["landed_ref"] = "refs/remotes/pub/main"
+    record_checkout["remote_url_sha256"] = hashlib.sha256(
+        str(bare).encode()
+    ).hexdigest()
+    record_checkout["containing_remote_refs"] = ["refs/remotes/pub/main"]
+    active_path.write_text(json.dumps(document))
     (checkout / "file.txt").write_text("two\n")
     _git(checkout, "add", "file.txt")
     _git(checkout, "commit", "-q", "-m", "two")
@@ -289,3 +307,87 @@ def test_remove_refuses_without_fixture_attestation(tmp_path: Path) -> None:
         (rust_root / "worktrees" / "ACTIVE.node-a.json").read_text()
     )
     assert len(cast(list[object], doc["slots"])) == 1
+
+
+def _rebuild(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
+            "-p", "wrkslotsd", "--", "rebuild",
+            "--events-dir", str(root / "worktrees" / "EVENTS.node-a"),
+            "--index", str(root / "rebuild.sqlite3"),
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+
+
+def test_remove_event_log_replays_through_rust_reader(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    result = _rust_remove(rust_root)
+    assert result.returncode == 0, result.stderr
+    replay = _rebuild(rust_root)
+    assert replay.returncode == 0, replay.stderr
+
+
+def test_remove_liveness_bound_alive_refuses(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    (rust_root / "live.py").write_text(
+        "import sys\n"
+        "print('agent=agent-slot-a rc=1', file=sys.stderr)\n"
+        "sys.exit(1)\n"
+    )
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "reports owner alive" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_liveness_unbound_exit_one_refuses(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    (rust_root / "live.py").write_text(
+        "import sys\n"
+        "print('Traceback (most recent call last):', file=sys.stderr)\n"
+        "print('RuntimeError: boom', file=sys.stderr)\n"
+        "sys.exit(1)\n"
+    )
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "unverifiable" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_liveness_alive_despite_dead_owner_refuses(tmp_path: Path) -> None:
+    # The recorded owner process is dead, but the liveness authority
+    # still reports the agent alive: Python refuses, and so must Rust.
+    rust_root = _fixture(tmp_path / "rust")
+    (rust_root / "live.py").write_text(
+        "import sys\n"
+        "print('agent=agent-slot-a rc=1', file=sys.stderr)\n"
+        "sys.exit(1)\n"
+    )
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_sidecar_present_refuses_python_scope(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    sidecar = rust_root / "worktrees" / "HANDOFF.6.node-a.6.slot-a.1.json"
+    sidecar.write_text("{}\n")
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "sidecar" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_ignored_file_still_removes(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    checkout = rust_root / "worktrees" / "slot-a" / "repo"
+    (checkout / ".gitignore").write_text("ignored.log\n")
+    _git(checkout, "add", ".gitignore")
+    _git(checkout, "commit", "-q", "-m", "ignore")
+    _git(checkout, "push", "-q", "origin", "HEAD:suite/work")
+    (checkout / "ignored.log").write_text("scratch\n")
+    result = _rust_remove(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert not (rust_root / "worktrees" / "slot-a").exists()

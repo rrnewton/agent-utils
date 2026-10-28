@@ -534,7 +534,7 @@ pub(crate) fn cache_globs_for(config: &Value, checkout_name: &str) -> Vec<String
     selected
 }
 
-fn remote_authority(checkout: &Path, remote: &str) -> Result<(String, String)> {
+pub(crate) fn remote_authority(checkout: &Path, remote: &str) -> Result<(String, String)> {
     let push = git_run(
         checkout,
         &[
@@ -655,7 +655,12 @@ fn ref_inventory(checkout: &Path, prefix: &str) -> Result<BTreeMap<String, Strin
     Ok(refs)
 }
 
-fn fetch_remote(checkout: &Path, remote: &str, landed_ref: &str, url: &str) -> Result<()> {
+pub(crate) fn fetch_remote(
+    checkout: &Path,
+    remote: &str,
+    landed_ref: &str,
+    url: &str,
+) -> Result<()> {
     let prefix = format!("refs/remotes/{remote}/");
     if !landed_ref.starts_with(&prefix) {
         return Err(format!("landed ref must be under {prefix}: {landed_ref}"));

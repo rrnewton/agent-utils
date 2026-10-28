@@ -30,8 +30,8 @@ use crate::ensure_states::{
     utc_now,
 };
 use crate::finish_write::{
-    assert_checkout_safe, assert_record_paths, assert_slot_contents, cache_globs_for,
-    record_layout, stored_repository_path,
+    assert_record_paths, assert_slot_contents, cache_globs_for, fetch_remote, record_layout,
+    remote_authority, stored_repository_path,
 };
 use crate::global_state::load_event_chain;
 use crate::heartbeat_write::{assert_caller, release_in_effect};
@@ -105,7 +105,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn heartbeat_expired(record: &Value) -> Result<(bool, bool)> {
+fn heartbeat_expired(record: &Value) -> Result<(bool, bool, i64)> {
     let heartbeat_at = record
         .get("heartbeat_at")
         .and_then(Value::as_str)
@@ -130,7 +130,7 @@ fn heartbeat_expired(record: &Value) -> Result<(bool, bool)> {
         .get("heartbeat_ttl_seconds")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
-    Ok((true, age > ttl))
+    Ok((true, age > ttl, age as i64))
 }
 
 struct Liveness {
@@ -138,13 +138,31 @@ struct Liveness {
     detail: String,
 }
 
-fn liveness_answer(cfg: &Cfg, config: &Value, agent: &str) -> Result<Liveness> {
+fn liveness_answer(cfg: &Cfg, config: &Value, record: &Value) -> Result<Liveness> {
+    // The registered-liveness protocol: exit 0 is dead; exit 1 is alive
+    // only when the whole output is one line binding agent=<agent> and
+    // rc=1; exit 2 is unregistered only for the bound
+    // reason=no-agentctl-record line; anything else is unverifiable.
+    // The command runs with the exact one-subject environment.
+    if config
+        .get("liveness_batch_command")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Ok(Liveness {
+            state: "unverifiable".to_string(),
+            detail: "batch liveness authority stays with the Python edition for now".to_string(),
+        });
+    }
     let Some(raw) = config.get("liveness_command").and_then(Value::as_str) else {
         return Ok(Liveness {
             state: "unverifiable".to_string(),
             detail: "config has no liveness command".to_string(),
         });
     };
+    let agent = record
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let command_path = if Path::new(raw).is_absolute() {
         PathBuf::from(raw)
     } else {
@@ -159,37 +177,140 @@ fn liveness_answer(cfg: &Cfg, config: &Value, agent: &str) -> Result<Liveness> {
         command.arg(agent);
         command
     };
-    command.current_dir(&cfg.root);
+    let slot = record
+        .get("slot")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let slot_type = record
+        .get("slot_type")
+        .and_then(Value::as_str)
+        .unwrap_or("agent");
+    let slot_path = crate::active_state::slot_directory(cfg, slot, slot_type)
+        .unwrap_or_else(|_| cfg.root.join(slot));
+    let owner = record.get("owner").cloned().unwrap_or(Value::Null);
+    let owner_field = |key: &str| -> String {
+        match owner.get(key) {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Number(number)) => number.to_string(),
+            _ => String::new(),
+        }
+    };
+    command
+        .current_dir(&cfg.root)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "WRKSLOTS_PROJECT_ROOT",
+            cfg.root.to_string_lossy().into_owned(),
+        )
+        .env("WRKSLOTS_SLOT", slot)
+        .env("WRKSLOTS_SLOT_TYPE", slot_type)
+        .env(
+            "WRKSLOTS_SLOT_PATH",
+            slot_path.to_string_lossy().into_owned(),
+        )
+        .env("WRKSLOTS_AGENT", agent)
+        .env(
+            "WRKSLOTS_TASK",
+            record
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+        .env(
+            "WRKSLOTS_MACHINE",
+            record
+                .get("machine")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+        .env(
+            "WRKSLOTS_GENERATION",
+            record
+                .get("generation")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                .to_string(),
+        )
+        .env("WRKSLOTS_OWNER_PID", owner_field("pid"))
+        .env("WRKSLOTS_OWNER_START_TICKS", owner_field("start_ticks"))
+        .env("WRKSLOTS_OWNER_BOOT_ID", owner_field("boot_id"))
+        .env("WRKSLOTS_OWNER_CGROUP", owner_field("cgroup_path"));
     let output = match command.output() {
         Ok(output) => output,
         Err(error) => {
             return Ok(Liveness {
                 state: "unverifiable".to_string(),
-                detail: format!("could not run the liveness command: {error}"),
+                detail: format!("registered liveness command could not run: {error}"),
             });
         }
     };
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let detail = stderr
+    let combined_lines: Vec<String> = format!("{stdout}\n{stderr}")
         .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
+        .filter(|line| !line.trim().is_empty())
         .map(|line| line.trim().to_string())
-        .unwrap_or_default();
-    let state = match output.status.code() {
-        Some(0) => "dead",
-        Some(1) => "alive",
-        Some(2) => "unregistered",
-        _ => "unverifiable",
+        .collect();
+    let first = combined_lines
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "no detail".to_string());
+    let bound = |rc: &str, reason: Option<&str>| -> Option<String> {
+        if combined_lines.len() != 1 {
+            return None;
+        }
+        let tokens: Vec<&str> = combined_lines[0].split_whitespace().collect();
+        let agents: Vec<&str> = tokens
+            .iter()
+            .filter(|token| token.starts_with("agent="))
+            .cloned()
+            .collect();
+        if agents != vec![format!("agent={agent}").as_str()] {
+            return None;
+        }
+        let rcs: Vec<&str> = tokens
+            .iter()
+            .filter(|token| token.starts_with("rc="))
+            .cloned()
+            .collect();
+        if rcs != vec![rc] {
+            return None;
+        }
+        if let Some(reason) = reason {
+            let reasons: Vec<&str> = tokens
+                .iter()
+                .filter(|token| token.starts_with("reason="))
+                .cloned()
+                .collect();
+            if reasons != vec![reason] {
+                return None;
+            }
+        }
+        Some(combined_lines[0].clone())
     };
-    let detail = if detail.is_empty() && state == "unverifiable" {
-        format!(
-            "liveness command {} exited {}",
-            command_path.display(),
-            output.status.code().unwrap_or(-1)
-        )
-    } else {
-        detail
+    let (state, detail) = match output.status.code() {
+        Some(0) => ("dead", first),
+        Some(1) => match bound("rc=1", None) {
+            Some(line) => ("alive", line),
+            None => (
+                "unverifiable",
+                "registered liveness command exited 1 without a single output line binding the agent to rc=1"
+                    .to_string(),
+            ),
+        },
+        Some(2) => match bound("rc=2", Some("reason=no-agentctl-record")) {
+            Some(line) => ("unregistered", line),
+            None => ("unverifiable", first),
+        },
+        other => (
+            "unverifiable",
+            format!(
+                "registered liveness command returned unexpected rc {}: {first}",
+                other.unwrap_or(-1)
+            ),
+        ),
     };
     Ok(Liveness {
         state: state.to_string(),
@@ -373,10 +494,23 @@ fn repair_registration(repository: &Path, checkout_path: &Path) -> Result<()> {
             .unwrap_or_else(|_| git_file.to_string_lossy().into_owned())
     );
     let link = admin.join("gitdir");
+    if link.is_symlink() {
+        return Err(format!(
+            "linked-worktree gitdir is a symlink; refusing to repair it: {}",
+            link.display()
+        ));
+    }
     let current = std::fs::read_to_string(&link).unwrap_or_default();
     if current != desired {
-        std::fs::write(&link, &desired)
+        // Atomic replace beside the destination; never write through
+        // a symlink or truncate the existing file in place.
+        let temporary = admin.join(format!(".gitdir.wrkslots-{}", operation_id()?));
+        std::fs::write(&temporary, &desired)
             .map_err(|error| format!("cannot repair linked-worktree gitdir: {error}"))?;
+        if let Err(error) = std::fs::rename(&temporary, &link) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("cannot repair linked-worktree gitdir: {error}"));
+        }
     }
     let listing = git(repository, &["worktree", "list", "--porcelain"])?;
     let absolute = checkout_path
@@ -385,7 +519,8 @@ fn repair_registration(repository: &Path, checkout_path: &Path) -> Result<()> {
     if !listing.lines().any(|line| {
         line.strip_prefix("worktree ")
             .map(|path| {
-                *path.trim() == *absolute.to_string_lossy() || Path::new(path.trim()) == checkout_path
+                *path.trim() == *absolute.to_string_lossy()
+                    || Path::new(path.trim()) == checkout_path
             })
             .unwrap_or(false)
     }) {
@@ -395,6 +530,104 @@ fn repair_registration(repository: &Path, checkout_path: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn salvage_checkout(cfg: &Cfg, checkout: &Value, repository: &Path) -> Result<Value> {
+    // Salvage safety: the reclaim identity checks plus graft/shallow
+    // and index-flag checks, then publication = the HEAD is contained
+    // in at least one remote ref after a scratch-namespace fetch.
+    // Unlike finish, salvage needs neither landed-ref ancestry nor
+    // an ignored-file-free status (the caller checked cleanliness
+    // without --ignored).
+    let name = checkout
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let updated = reclaim_checkout(cfg, checkout, repository)?;
+    let raw_path = checkout
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = cfg.root.join(raw_path);
+    let common_out = git(&path, &["rev-parse", "--git-common-dir"])?;
+    let common = {
+        let raw = common_out.trim();
+        if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            path.join(raw)
+        }
+    };
+    for marker in ["info/grafts", "shallow"] {
+        let candidate = common.join(marker);
+        if candidate.exists() || candidate.is_symlink() {
+            return Err(format!(
+                "checkout {name} uses graft or shallow history: {}",
+                candidate.display()
+            ));
+        }
+    }
+    let assume = git(&path, &["ls-files", "-v"])?;
+    if assume.lines().any(|line| {
+        line.chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase())
+    }) {
+        return Err(format!("checkout {name} has assume-unchanged index state"));
+    }
+    let skip = git(&path, &["ls-files", "-t"])?;
+    if skip.lines().any(|line| line.starts_with("S ")) {
+        return Err(format!("checkout {name} has skip-worktree index state"));
+    }
+    let head = updated
+        .get("head")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let remote = checkout
+        .get("remote")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let landed_ref = checkout
+        .get("landed_ref")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (authority_sha, url) = remote_authority(&path, &remote)?;
+    fetch_remote(&path, &remote, &landed_ref, &url)?;
+    let (after_sha, _after_url) = remote_authority(&path, &remote)?;
+    if after_sha != authority_sha {
+        return Err(format!(
+            "remote {remote:?} changed after authority was captured; preserve the checkout and restore its recorded remote"
+        ));
+    }
+    let refs_output = git(
+        &path,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "--contains",
+            &head,
+            &format!("refs/remotes/{remote}/"),
+        ],
+    )?;
+    let remote_refs: Vec<String> = refs_output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if remote_refs.is_empty() {
+        return Err(format!(
+            "checkout {name} HEAD {head} is not contained in any {remote} ref"
+        ));
+    }
+    let mut result = updated;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("containing_remote_refs".to_string(), json!(remote_refs));
+    }
+    Ok(result)
 }
 
 fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) -> Result<Value> {
@@ -431,9 +664,15 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
             "checkout {name} has uncommitted work; salvage stays with the Python edition for now"
         ));
     }
-    let updated = assert_checkout_safe(cfg, config, checkout, repository).map_err(|error| {
+    let submodules = git(&path, &["submodule", "status", "--recursive"])?;
+    if !submodules.trim().is_empty() {
+        return Err(format!(
+            "checkout {name} has initialized submodules; submodule salvage stays with the Python edition for now"
+        ));
+    }
+    let updated = salvage_checkout(cfg, checkout, repository).map_err(|error| {
         format!(
-            "checkout {name} is not fully published and landed; salvage stays with the Python edition for now: {error}"
+            "checkout {name} is not fully published; salvage stays with the Python edition for now: {error}"
         )
     })?;
     let head = updated
@@ -580,11 +819,41 @@ fn latest_handoff_read(events: &[Value], record: &Value) -> Result<Option<Value>
         {
             continue;
         }
+        let digest = payload
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err("handoff-read event sha256 is not a SHA-256 digest".to_string());
+        }
+        let source = payload.get("source").cloned().unwrap_or(Value::Null);
+        let source_path = payload.get("source_path").cloned().unwrap_or(Value::Null);
+        let source_identity = payload
+            .get("source_identity")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let present = [
+            !source.is_null(),
+            !source_path.is_null(),
+            !source_identity.is_null(),
+        ];
+        if present.iter().any(|flag| *flag) && !present.iter().all(|flag| *flag) {
+            return Err("handoff-read event has incomplete source provenance".to_string());
+        }
+        if present[0] {
+            let source_name = source.as_str().unwrap_or_default();
+            if !matches!(source_name, "write-handoff" | "legacy-slot-file") {
+                return Err("handoff-read event source is invalid".to_string());
+            }
+            if source_identity.get("sha256").and_then(Value::as_str) != Some(digest) {
+                return Err("handoff-read source digest does not match its content".to_string());
+            }
+        }
         latest = Some(json!({
-            "sha256": payload.get("sha256").cloned().unwrap_or(Value::Null),
-            "source": payload.get("source").cloned().unwrap_or(Value::Null),
-            "source_path": payload.get("source_path").cloned().unwrap_or(Value::Null),
-            "source_identity": payload.get("source_identity").cloned().unwrap_or(Value::Null),
+            "sha256": digest,
+            "source": source,
+            "source_path": source_path,
+            "source_identity": source_identity,
             "sequence": event.get("sequence").cloned().unwrap_or(Value::Null),
         }));
     }
@@ -752,7 +1021,7 @@ pub(crate) fn remove_slot(
             ));
         }
     }
-    let (_present, expired) = heartbeat_expired(&record)?;
+    let (_present, expired, heartbeat_age) = heartbeat_expired(&record)?;
     let owner_value = record.get("owner").cloned().unwrap_or(Value::Null);
     let owner_absent = owner_value.is_null();
     let owner_identity: Option<Identity> = if owner_absent {
@@ -768,42 +1037,62 @@ pub(crate) fn remove_slot(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let answer = liveness_answer(&cfg, &config, &agent)?;
-    if release.is_none() && answer.state != "dead" && !owner_gone {
-        if answer.state == "alive" {
+    let answer = liveness_answer(&cfg, &config, &record)?;
+    if release.is_none() {
+        // Both authorities must agree the owner is gone: the exact
+        // recorded process generation dead (or no owner recorded) AND
+        // the registered liveness answer "dead", with the heartbeat
+        // TTL expired. Every other combination refuses.
+        if owner_state == "live" {
             return Err(
                 "owner consent and attested removal stay with the Python edition for now"
                     .to_string(),
             );
         }
-        return Err(format!(
-            "removing slot {slot} requires a proven-dead recorded owner; registered liveness authority reports {}: {}",
-            answer.state, answer.detail
-        ));
+        if answer.state == "alive" {
+            return Err(format!(
+                "registered liveness authority reports owner alive: {}; let the owner finish or stop, then rerun remove after the time-to-live expires",
+                answer.detail
+            ));
+        }
+        if answer.state != "dead" {
+            if answer.state == "unregistered" && owner_state == "dead" && !owner_absent {
+                return Err(
+                    "coordinator-attested removal of an unregistered agent stays with the Python edition for now"
+                        .to_string(),
+                );
+            }
+            return Err(format!(
+                "registered liveness authority is {}: {}; unknown ownership is not a free slot",
+                answer.state, answer.detail
+            ));
+        }
+        if owner_state != "dead" && !owner_absent {
+            return Err(format!(
+                "remove requires a proven-dead recorded owner; owner is {owner_state}: {owner_detail}"
+            ));
+        }
+        if !expired {
+            return Err(format!(
+                "heartbeat for slot {slot} has not expired; wait for its TTL or have the owner stop cleanly"
+            ));
+        }
     }
-    if release.is_none() && answer.state != "dead" && owner_gone {
-        // The recorded owner process is provably dead; the liveness
-        // authority's stale answer does not resurrect it.
-    } else if release.is_none() && !expired && owner_state != "live" {
-        return Err(format!(
-            "heartbeat for slot {slot} has not expired; wait for its TTL or have the owner stop cleanly"
-        ));
-    }
-    if owner_state == "live" && release.is_none() {
-        return Err(
-            "owner consent and attested removal stay with the Python edition for now".to_string(),
-        );
-    }
-    let _ = owner_detail;
+    let _ = owner_gone;
+    let _ = agent;
     let slot_path = slot_directory(&cfg, slot, &slot_type)?;
     assert_slot_contents(&cfg, &record)?;
     // Handoff artifact gates: no uncommitted handoff, and a present
     // artifact must have been read with matching provenance.
-    let sidecar_present = cfg
-        .control
-        .join(format!("HANDOFF.{selected}.{slot}.json"))
-        .exists();
-    if sidecar_present {
+    let sidecar_path = cfg.control.join(format!(
+        "HANDOFF.{}.{}.{}.{}.{}.json",
+        selected.len(),
+        selected,
+        slot.len(),
+        slot,
+        generation
+    ));
+    if sidecar_path.exists() || sidecar_path.is_symlink() {
         return Err("handoff sidecar retirement stays with the Python edition for now".to_string());
     }
     let legacy_handoff = slot_path.join("HANDOFF.md");
@@ -813,15 +1102,13 @@ pub(crate) fn remove_slot(
         );
     }
     let latest_read = latest_handoff_read(&events, &record)?;
-    if record
-        .get("handoff")
-        .cloned()
-        .unwrap_or(Value::Null)
-        .is_null()
-        && latest_read.is_some()
-    {
-        // A recorded read with no artifact left is accepted, as in the
-        // Python flow; nothing further to prove here.
+    if latest_read.is_some() {
+        // No sidecar or legacy artifact is present (both refused
+        // above), yet a read was recorded for one: the artifact
+        // disappeared after it was read.
+        return Err(format!(
+            "slot {slot} handoff artifact disappeared after it was read; restore the exact generation-bound sidecar or legacy HANDOFF.md"
+        ));
     }
     // Salvage gate: every checkout already published and clean.
     let mut salvage: Vec<Value> = Vec::new();
@@ -854,11 +1141,35 @@ pub(crate) fn remove_slot(
     // Use check and registry consistency before any event is written.
     assert_slot_unused(&slot_path, coordinator_pid)?;
     ensure_event_log(root, &cfg, &selected)?;
+    let coordinator_obj = json!({
+        "pid": coordinator.pid,
+        "start_ticks": coordinator.start_ticks,
+        "boot_id": coordinator.boot_id,
+        "host_id": coordinator.host_id,
+        "cgroup_path": coordinator.cgroup_path,
+    });
     append_event(
         &cfg,
         &selected,
         "reclaim-started",
-        json!({"slot": slot, "generation": generation}),
+        json!({
+            "slot": slot,
+            "generation": generation,
+            "actor": coordinator_obj,
+            "runner": coordinator_obj,
+            "handoff_writer": Value::Null,
+            "coordinator_authorized": true,
+            "owner_state": owner_state,
+            "registered_liveness": answer.state,
+            "heartbeat_age_seconds": heartbeat_age,
+            "heartbeat_ttl_seconds": record
+                .get("heartbeat_ttl_seconds")
+                .cloned()
+                .unwrap_or(json!(0)),
+            "validate_complete": false,
+            "live_validate_owner": false,
+            "salvage_archive_root": Value::Null,
+        }),
     )?;
     // Evidence handoff when finish never recorded one.
     let mut current = record.clone();
@@ -1001,6 +1312,7 @@ pub(crate) fn remove_slot(
                 "revision": previous_revision + 1,
                 "previous_record_sha256": previous_digest,
                 "record": refreshed,
+                "evidence": {},
             }),
         )?;
         let mut slots: Vec<Value> = state_now
