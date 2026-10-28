@@ -352,9 +352,14 @@ fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<b
     // stays indeterminate rather than failing open.
     use std::os::unix::fs::MetadataExt as _;
     match std::fs::read_link(link) {
-        Ok(target) => Ok(target == slot_path || target.starts_with(slot_path)),
+        Ok(target) => {
+            let shown = target.to_string_lossy().into_owned();
+            let target = PathBuf::from(shown.trim_end_matches(" (deleted)"));
+            Ok(target == slot_path || target.starts_with(slot_path))
+        }
         Err(error) => {
-            if error.kind() == std::io::ErrorKind::NotFound {
+            // Errnos the Python census treats as no evidence.
+            if matches!(error.raw_os_error(), Some(1 | 2 | 3 | 13 | 22)) {
                 return Ok(false);
             }
             match std::fs::metadata(link) {
@@ -391,7 +396,12 @@ fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
         use std::os::unix::fs::MetadataExt as _;
         std::fs::metadata(slot_path)
             .map(|metadata| metadata.dev())
-            .unwrap_or(0)
+            .map_err(|error| {
+                format!(
+                    "process use is indeterminate because the slot cannot be inspected: {}: {error}",
+                    slot_path.display()
+                )
+            })?
     };
     let ignored = own_ancestry();
     let entries = std::fs::read_dir("/proc")
@@ -1666,4 +1676,34 @@ pub(crate) fn remove_slot(
         "outcome": "removed and archived",
         "archive_id": archive_id,
     }))
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::link_points_into;
+
+    #[test]
+    fn link_points_into_cases() {
+        let base = std::env::temp_dir().join(format!("wrkslots-link-{}", std::process::id()));
+        let slot = base.join("slot");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let device = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&slot).unwrap().dev()
+        };
+        let into = base.join("into");
+        std::os::unix::fs::symlink(&slot, &into).unwrap();
+        assert!(link_points_into(&into, &slot, device).unwrap());
+        let away = base.join("away");
+        std::os::unix::fs::symlink(&outside, &away).unwrap();
+        assert!(!link_points_into(&away, &slot, device).unwrap());
+        assert!(!link_points_into(&base.join("missing"), &slot, device).unwrap());
+        // A regular file is not a link: EINVAL is no evidence.
+        let regular = base.join("regular");
+        std::fs::write(&regular, b"x").unwrap();
+        assert!(!link_points_into(&regular, &slot, device).unwrap());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }

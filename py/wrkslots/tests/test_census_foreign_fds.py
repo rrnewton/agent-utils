@@ -27,7 +27,7 @@ from collections.abc import Callable
 
 def _readlink_fails_on_fd(real: Callable[..., str]) -> Callable[..., str]:
     def fake(path: object, *args: object, **kwargs: object) -> str:
-        if "/fd/" in str(path):
+        if "/fd/" in str(path) or str(path).endswith("/cwd"):
             raise OSError(errno.ENAMETOOLONG, "File name too long", str(path))
         return real(path, *args, **kwargs)
 
@@ -122,6 +122,18 @@ def test_fresh_use_ignores_unreadable_foreign_descriptor(
         holder.kill()
         holder.wait()
         slot.rmdir()
+
+
+def test_link_target_foreign_device_is_not_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    held = tmp_path / "held.txt"
+    held.write_text("x\n")
+    device = os.stat(held).st_dev
+    monkeypatch.setattr(os, "readlink", _readlink_fails_on_fd(os.readlink))
+    assert cli._link_target(_fd_link(tmp_path, held), slot_device=device + 4096) is None
+    with pytest.raises(cli.Refusal, match="process use is indeterminate"):
+        cli._link_target(_fd_link(tmp_path, held), slot_device=device)
 
 
 def test_fresh_use_refuses_unreadable_same_device_descriptor(

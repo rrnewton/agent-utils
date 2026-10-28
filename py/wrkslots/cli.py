@@ -18687,7 +18687,7 @@ def _process_state(identity: ProcessIdentity | None) -> tuple[str, str]:
     return "dead", f"PID {identity.pid} was reused; the recorded generation exited"
 
 
-def _link_target(path: Path) -> Path | None:
+def _link_target(path: Path, slot_device: int | None = None) -> Path | None:
     try:
         raw = os.readlink(path)
     except FileNotFoundError:
@@ -18699,6 +18699,16 @@ def _link_target(path: Path) -> Path | None:
     except OSError as exc:
         if exc.errno == errno.EINVAL:
             return None
+        # Same device proof as _readable_link_target (#618): stat
+        # follows the descriptor, and another filesystem device is
+        # proven outside the slot.
+        if slot_device is not None:
+            try:
+                observed = os.stat(path)
+            except OSError:
+                observed = None
+            if observed is not None and observed.st_dev != slot_device:
+                return None
         raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
     if raw.endswith(" (deleted)"):
         raw = raw[: -len(" (deleted)")]
@@ -18723,9 +18733,14 @@ def _process_uses_slot(
     refuse, and the mount table is always read.
     """
 
+    try:
+        slot_device: int | None = os.stat(slot_path).st_dev
+    except OSError:
+        slot_device = None
+
     def link_target(path: Path) -> Path | None:
         try:
-            return _link_target(path)
+            return _link_target(path, slot_device)
         except Refusal as exc:
             if unreadable_is_no_evidence and isinstance(exc.__cause__, PermissionError):
                 return None
