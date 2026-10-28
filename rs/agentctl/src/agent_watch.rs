@@ -104,8 +104,13 @@ pub struct WatchAgentsOptions {
     pub once: bool,
     /// Report only: send no notice.
     pub check_only: bool,
-    /// How long an approval or permission prompt may hold before it is reported.
+    /// How long an approval or permission prompt may hold before it is reported; zero reports it
+    /// in the pass that first sees it.
     pub approval: Duration,
+    /// How often, between full passes, the watched agents' visible rows are read for a blocked
+    /// agent alone ([`blocked_finding`]); zero, or a period not shorter than `interval`, turns
+    /// the quick check off.
+    pub blocked_check: Duration,
     /// How long an agent may sit idle without a verdict before it is reported.
     pub idle: Duration,
     /// How long an agent may sit idle with a verdict, its screen unchanged, before it is
@@ -267,6 +272,22 @@ impl EpisodeKind {
         }
     }
 
+    /// Whether the agent is blocked until someone acts: at an approval, permission or trust
+    /// prompt, or refused by a guardrail (an unsafe command held for an operator, a safety
+    /// refusal). Such a notice is not held by `--min-notice-interval`, and the quick check
+    /// between passes looks for these alone.
+    #[must_use]
+    pub const fn is_blocked(self) -> bool {
+        matches!(
+            self,
+            Self::ApprovalPrompt
+                | Self::Stuck(
+                    crate::stuck::StuckCause::UnsafeCommand
+                        | crate::stuck::StuckCause::SafetyRefusal
+                )
+        )
+    }
+
     /// Whether a notice of this kind is its detail alone: one line that already says what is
     /// wrong, such as `gate step Y blocked 40 min: ... held by ...`.
     const fn self_describing(self) -> bool {
@@ -385,6 +406,18 @@ use crate::harness::transcript::Activity;
 /// Prompt phrases, lowercased, matched against the bottom of the screen: every harness's
 /// approval, permission and trust phrases ([`crate::harness::approval_patterns`]).
 use crate::harness::approval_patterns;
+
+/// What a screen says about an agent that cannot go on until someone acts: a typed harness
+/// failure ([`crate::stuck::classify`], such as a guardrail refusal or exhausted quota), else an
+/// approval, permission or trust prompt at the bottom ([`approval_prompt_line`]). This is the one
+/// table of blocked-agent patterns: a full pass, the quick check between passes, and any other
+/// reader that alerts on a blocked agent read the screen through it.
+pub(crate) fn blocked_finding(screen: &str) -> Option<(EpisodeKind, String)> {
+    if let Some(cause) = crate::stuck::classify(screen) {
+        return Some((EpisodeKind::Stuck(cause), cause.as_str().to_owned()));
+    }
+    approval_prompt_line(screen).map(|line| (EpisodeKind::ApprovalPrompt, line))
+}
 
 /// The prompt line at the bottom of `screen`, trimmed and bounded, when one is showing.
 pub(crate) fn approval_prompt_line(screen: &str) -> Option<String> {
@@ -595,6 +628,14 @@ struct AgentMemory {
     /// When the watcher last interrupted the agent's turn under the auto-interrupt policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_interrupted_at: Option<f64>,
+    /// Whom the last full pass would tell about the agent, when not the coordinator; the quick
+    /// check between passes, which reads no registry, sends its notices there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route: Option<String>,
+    /// When a notice about this agent being blocked last went out past the rate limit; it may
+    /// do so once per `--min-notice-interval`, so a prompt that comes and goes is not a stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked_noticed_at: Option<f64>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -779,6 +820,12 @@ pub trait Probe {
     /// For each registered agent that senders are waiting to deliver to, its name and the
     /// [`crate::lock_wait::contention`] report. The default sees no waits.
     fn delivery_waits(&mut self) -> Vec<(String, Value)> {
+        Vec::new()
+    }
+    /// The visible rows of each agent the last [`Self::observe`] read a screen for, by name, for
+    /// the quick check between passes. An agent whose rows cannot be read now is left out. The
+    /// default reads none.
+    fn visible_screens(&mut self) -> Vec<(String, String)> {
         Vec::new()
     }
 }
@@ -1072,11 +1119,8 @@ fn classify(
         return classify_headless(observation, view, options, memory, now);
     }
     let screen = observation.screen.as_deref()?;
-    if let Some(cause) = crate::stuck::classify(screen) {
-        return Some(Finding::new(EpisodeKind::Stuck(cause), cause.as_str()));
-    }
-    if let Some(line) = approval_prompt_line(screen) {
-        return Some(Finding::new(EpisodeKind::ApprovalPrompt, line));
+    if let Some((kind, detail)) = blocked_finding(screen) {
+        return Some(Finding::new(kind, detail));
     }
     let turn = crate::turn_state::read_screen(screen);
     // A turn past --turn-minutes with input queued behind it: a harness that submits queued
@@ -2036,7 +2080,8 @@ fn rate_limited(
 
 /// Start a batch of every pending notice, other than finishes, that is in no batch yet and is
 /// for the first recipient, in the order notices became due, whose rate limit allows a message
-/// and that has fewer than [`BATCHES_PER_RECIPIENT`] batches unconfirmed. Returns its message
+/// (or that is owed a notice about a blocked agent, [`EpisodeKind::is_blocked`]) and that has
+/// fewer than [`BATCHES_PER_RECIPIENT`] batches unconfirmed. Returns its message
 /// ID, or `None` when no recipient may be sent one now.
 fn open_batch(state: &mut WatchState, now: f64, options: &WatchAgentsOptions) -> Option<String> {
     let batched: Vec<String> = state
@@ -2060,8 +2105,23 @@ fn open_batch(state: &mut WatchState, now: f64, options: &WatchAgentsOptions) ->
             .filter(|batch| batch.recipient == *recipient)
             .count()
     };
+    // A blocked agent is news at once: its notice, and whatever waits beside it for the same
+    // recipient, goes out without waiting for the rate limit, once per agent per window.
+    let window = options.min_notice_interval.as_secs_f64();
+    let blocked = |recipient: &Option<String>| {
+        state.pending.iter().any(|notice| {
+            open(notice)
+                && notice.recipient == *recipient
+                && notice.kind.is_blocked()
+                && state
+                    .agents
+                    .get(&notice.agent)
+                    .and_then(|memory| memory.blocked_noticed_at)
+                    .is_none_or(|at| now - at >= window)
+        })
+    };
     let recipient = recipients.into_iter().find(|recipient| {
-        !rate_limited(state, recipient.as_deref(), now, options)
+        (!rate_limited(state, recipient.as_deref(), now, options) || blocked(recipient))
             && unconfirmed(recipient) < BATCHES_PER_RECIPIENT
     })?;
     let keys: Vec<String> = state
@@ -2121,6 +2181,11 @@ fn send_batch(
         Ok(outcome) => {
             for notice in &notices {
                 mark_notified(state, notice, now);
+                if notice.kind.is_blocked() {
+                    if let Some(memory) = state.agents.get_mut(&notice.agent) {
+                        memory.blocked_noticed_at = Some(now);
+                    }
+                }
             }
             state
                 .pending
@@ -2452,22 +2517,24 @@ fn watch_agents_once(
         .iter()
         .flat_map(|batch| batch.keys.iter().cloned())
         .collect();
-    let mut routes: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for notice in &state.pending {
-        // An auto-interrupt is the coordinator's news, whoever manages the agent.
-        if notice.redirected
-            || notice.kind == EpisodeKind::AutoInterrupt
-            || in_flight.contains(&notice.key())
-            || routes.contains_key(&notice.agent)
-        {
-            continue;
-        }
-        if observations.iter().any(|row| row.name == notice.agent) {
-            let route = recipient_for(state, &observations, &notice.agent, now, options);
-            routes.insert(notice.agent.clone(), route);
+    let routes: BTreeMap<String, Option<String>> = if probe_error.is_null() {
+        observations
+            .iter()
+            .map(|row| {
+                let route = recipient_for(state, &observations, &row.name, now, options);
+                (row.name.clone(), route)
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    for (name, route) in &routes {
+        if let Some(memory) = state.agents.get_mut(name) {
+            memory.route.clone_from(route);
         }
     }
     for notice in &mut state.pending {
+        // An auto-interrupt is the coordinator's news, whoever manages the agent.
         if notice.redirected
             || notice.kind == EpisodeKind::AutoInterrupt
             || in_flight.contains(&notice.key())
@@ -2548,6 +2615,93 @@ fn watch_agents_once(
             })
             .collect::<Vec<_>>(),
     })
+}
+
+/// The quick check between full passes (#675 watch-blocked-fast-alerts): read only the visible
+/// rows of the agents the last pass read screens for, and start an episode for each that shows
+/// a blocked agent ([`EpisodeKind::is_blocked`], read through [`blocked_finding`]), unless a
+/// full pass already found it blocked or stopped by a typed failure (it read more of the screen).
+/// A notice that is due (at once with a zero threshold, or since, for an episode already begun)
+/// is owed to the recipient the last pass chose and sent now, past the rate limit; batches
+/// waiting to retry are tried too. Screen hashes and every other clock are left alone: the next full pass judges
+/// stalls, idleness and finishes as before, and finds the episode already begun. Returns a
+/// report row, or `None` when nothing was found and nothing sent.
+fn check_blocked(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Option<Value> {
+    let mut found = Vec::new();
+    for (name, screen) in probe.visible_screens() {
+        let Some((kind, detail)) = blocked_finding(&screen).filter(|(kind, _)| kind.is_blocked())
+        else {
+            continue;
+        };
+        let Some(memory) = state.agents.get(&name) else {
+            continue;
+        };
+        let route = memory.route.clone();
+        let (since, due) = match memory.episode.clone() {
+            // Begun already (by a full pass or an earlier quick check): only a notice that came
+            // due since, and is neither sent nor owed, is new.
+            Some(episode) if episode.kind == kind => {
+                if episode.notified
+                    || owes_notice(state, &name, kind)
+                    || now - episode.since < episode_window(&episode, options)
+                {
+                    continue;
+                }
+                (episode.since, true)
+            }
+            // A full pass read more of the screen than these rows: a typed failure or a blocked
+            // condition it found stands.
+            Some(episode)
+                if episode.kind.is_blocked() || matches!(episode.kind, EpisodeKind::Stuck(_)) =>
+            {
+                continue;
+            }
+            other => {
+                if let Some(cleared) = other {
+                    withdraw_pending(state, &name, &cleared);
+                }
+                let episode = Episode {
+                    kind,
+                    since: now,
+                    notified: false,
+                    notified_at: None,
+                    turn: None,
+                    window: None,
+                };
+                let due = episode_window(&episode, options) <= 0.0;
+                if let Some(memory) = state.agents.get_mut(&name) {
+                    memory.episode = Some(episode);
+                }
+                (now, due)
+            }
+        };
+        if due && !owes_notice(state, &name, kind) {
+            state.pending.push(PendingNotice {
+                agent: name.clone(),
+                kind,
+                since,
+                detail: detail.clone(),
+                next: Vec::new(),
+                recipient: route,
+                redirected: false,
+                delivery: None,
+                retry: Retry::default(),
+            });
+        }
+        found.push(json!({"agent": name, "kind": kind.as_str(), "detail": detail, "due": due}));
+    }
+    let retry_due = state.batches.iter().any(|batch| !batch.retry.waiting(now));
+    if found.is_empty() && !retry_due {
+        return None;
+    }
+    let notice = flush_notices(state, notifier, now, options);
+    Some(json!({"checked_at": now, "found": found, "notice": notice}))
 }
 
 /// Report, once per jam, each agent whose senders have waited for its lifecycle lock longer
@@ -2756,30 +2910,9 @@ pub fn watch_agents(
                 row["detail"].as_str().unwrap_or("")
             ));
         }
-        let notice = &report["notice"];
-        let sends = std::iter::once(notice)
-            .chain(notice["more"].as_array().into_iter().flatten())
-            .chain(report["child_done"].as_array().into_iter().flatten());
-        for row in sends.filter(|row| row["sent"] == false && row["message_id"].is_string()) {
-            let mut line = format!(
-                "notice {} not delivered: {}",
-                row["message_id"].as_str().unwrap_or("?"),
-                row["reason"].as_str().unwrap_or("?")
-            );
-            if let Some(delay) = row["retry_in_seconds"].as_f64() {
-                line.push_str(&format!(
-                    "; failure {}, next try in {} s",
-                    row["failures"].as_u64().unwrap_or(0),
-                    delay.round()
-                ));
-            }
-            log(line);
-        }
+        log_failed_sends(&report["notice"], &report["child_done"]);
         if let Some((state_path, report_path)) = paths.as_ref() {
-            state.inflight = state.batches.first().cloned();
-            let state_value =
-                serde_json::to_value(&state).map_err(|error| fail(error.to_string()))?;
-            if let Err(error) = write_json_file(state_path, &state_value)
+            if let Err(error) = save_state(&mut state, state_path)
                 .and_then(|()| write_json_file(report_path, &report))
             {
                 log(error);
@@ -2788,7 +2921,85 @@ pub fn watch_agents(
         if options.once {
             return Ok(report);
         }
-        clock.sleep(options.interval);
+        between_passes(
+            probe,
+            notifier,
+            clock,
+            &mut state,
+            paths.as_ref().map(|(state_path, _)| state_path.as_path()),
+            options,
+        );
+    }
+}
+
+/// Wait out `--interval` until the next full pass, with a quick check for blocked agents
+/// ([`check_blocked`]) every `--blocked-check-seconds` on the way, its state saved to
+/// `state_path` whenever it found or sent something. Returns how many quick checks ran.
+fn between_passes(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    clock: &dyn Clock,
+    state: &mut WatchState,
+    state_path: Option<&Path>,
+    options: &WatchAgentsOptions,
+) -> usize {
+    let step = options.blocked_check.as_secs_f64();
+    // Measured on the clock, so the time the checks take does not push the next pass back.
+    let next_pass = clock.now() + options.interval.as_secs_f64();
+    let mut checks = 0;
+    while !options.check_only && step > 0.0 && next_pass - clock.now() > step {
+        clock.sleep(options.blocked_check);
+        checks += 1;
+        let Some(row) = check_blocked(probe, notifier, state, clock.now(), options) else {
+            continue;
+        };
+        for found in row["found"].as_array().into_iter().flatten() {
+            log(format_args!(
+                "{} {}: {} (quick check)",
+                found["agent"].as_str().unwrap_or("?"),
+                found["kind"].as_str().unwrap_or("?"),
+                found["detail"].as_str().unwrap_or("")
+            ));
+        }
+        log_failed_sends(&row["notice"], &Value::Null);
+        if let Some(path) = state_path {
+            if let Err(error) = save_state(state, path) {
+                log(error);
+            }
+        }
+    }
+    clock.sleep(Duration::from_secs_f64((next_pass - clock.now()).max(0.0)));
+    checks
+}
+
+/// Write the watcher's state, with `inflight` a copy of the oldest unconfirmed batch so an older
+/// build run on it retries that batch under its own ID.
+fn save_state(state: &mut WatchState, path: &Path) -> Result<()> {
+    state.inflight = state.batches.first().cloned();
+    let value = serde_json::to_value(&*state).map_err(|error| fail(error.to_string()))?;
+    write_json_file(path, &value)
+}
+
+/// Log each send in a pass's `notice` row (with its `more`) and `child_done` rows that failed,
+/// with its reason and when it is next tried.
+fn log_failed_sends(notice: &Value, child_done: &Value) {
+    let sends = std::iter::once(notice)
+        .chain(notice["more"].as_array().into_iter().flatten())
+        .chain(child_done.as_array().into_iter().flatten());
+    for row in sends.filter(|row| row["sent"] == false && row["message_id"].is_string()) {
+        let mut line = format!(
+            "notice {} not delivered: {}",
+            row["message_id"].as_str().unwrap_or("?"),
+            row["reason"].as_str().unwrap_or("?")
+        );
+        if let Some(delay) = row["retry_in_seconds"].as_f64() {
+            line.push_str(&format!(
+                "; failure {}, next try in {} s",
+                row["failures"].as_u64().unwrap_or(0),
+                delay.round()
+            ));
+        }
+        log(line);
     }
 }
 
@@ -2845,6 +3056,9 @@ pub struct ManagedProbe<'a, A: ManagedApi + ?Sized> {
     screens: BTreeMap<String, KeptScreen>,
     /// Transcripts read in earlier passes, reread only when they change.
     transcripts: crate::harness::transcript::Cache,
+    /// The agents whose screens the last pass read, for the quick check between passes, in the
+    /// order the next quick check reads them.
+    screened: Vec<String>,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
@@ -2859,6 +3073,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             keep_screens: true,
             screens: BTreeMap::new(),
             transcripts: crate::harness::transcript::Cache::default(),
+            screened: Vec::new(),
         }
     }
 
@@ -3187,6 +3402,33 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
             .collect()
     }
 
+    fn visible_screens(&mut self) -> Vec<(String, String)> {
+        // A fresh view: a snapshotting client would otherwise answer from the last pass.
+        self.client
+            .begin_pass(Some(Instant::now() + PASS_CALL_TIMEOUT));
+        let Ok(manager) = ManagedAgents::new(self.client, &self.registry) else {
+            return Vec::new();
+        };
+        let manager = manager.with_project_workspace_resolved();
+        let client = self.client;
+        let screens = bounded_map(&self.screened, PASS_WORKERS, |name| {
+            // A view scrolled back shows old rows, perhaps an old prompt: it is no evidence.
+            manager
+                .watch_visible(name, SCREEN_LINES)
+                .ok()
+                .filter(|(pane, _)| client.pane_at_bottom(pane))
+                .map(|(_, text)| (name.clone(), text))
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        // Start the next check further along, so a slow server that cuts every check short at
+        // its deadline does not leave the same agents unread each time.
+        let turn = PASS_WORKERS.min(self.screened.len());
+        self.screened.rotate_left(turn);
+        screens
+    }
+
     fn observe(&mut self) -> Result<Vec<Observation>> {
         let started = Instant::now();
         let deadline = self.budget.map(|budget| started + budget);
@@ -3287,6 +3529,11 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
             }
         }
         self.screens = screens;
+        self.screened = observations
+            .iter()
+            .filter(|observation| observation.screen.is_some() && observation.headless.is_none())
+            .map(|observation| observation.name.clone())
+            .collect();
         // A record this build cannot read is watched as unreachable rather than silently
         // dropped: the coordinator should hear about it.
         for row in &rows {
@@ -3516,6 +3763,7 @@ mod tests {
             once: true,
             check_only: false,
             approval: Duration::from_secs(300),
+            blocked_check: Duration::ZERO,
             idle: Duration::from_secs(900),
             child_done: Duration::ZERO,
             stall: Duration::from_secs(1800),
@@ -4363,16 +4611,18 @@ mod tests {
     #[test]
     fn notices_batch_and_wait_out_the_rate_limit() {
         let mut options = options();
+        // Idleness, which waits out the rate limit: a blocked agent would not.
+        options.idle = Duration::from_secs(300);
         options.min_notice_interval = Duration::from_secs(600);
         let pair = || {
             vec![
-                observation("one", "idle", Some(PROMPT_SCREEN)),
-                observation("two", "idle", Some(PROMPT_SCREEN)),
+                observation("one", "idle", Some(IDLE_SCREEN)),
+                observation("two", "idle", Some(IDLE_SCREEN)),
             ]
         };
         let trio = || {
             let mut rows = pair();
-            rows.push(observation("three", "idle", Some(PROMPT_SCREEN)));
+            rows.push(observation("three", "idle", Some(IDLE_SCREEN)));
             rows
         };
         let mut probe = ScriptedProbe(vec![pair(), pair(), trio(), trio(), trio()]);
@@ -4498,13 +4748,15 @@ mod tests {
     #[test]
     fn a_recovered_agent_withdraws_its_unsent_notice() {
         let mut options = options();
+        // Idleness, which waits out the rate limit: a blocked agent would not.
+        options.idle = Duration::from_secs(300);
         options.min_notice_interval = Duration::from_secs(3600);
         // Seed a sent notice so the rate limit holds the next one back.
         let mut probe = ScriptedProbe(vec![
-            vec![observation("first", "idle", Some(PROMPT_SCREEN))],
-            vec![observation("first", "idle", Some(PROMPT_SCREEN))],
-            vec![observation("second", "idle", Some(PROMPT_SCREEN))],
-            vec![observation("second", "idle", Some(PROMPT_SCREEN))],
+            vec![observation("first", "idle", Some(IDLE_SCREEN))],
+            vec![observation("first", "idle", Some(IDLE_SCREEN))],
+            vec![observation("second", "idle", Some(IDLE_SCREEN))],
+            vec![observation("second", "idle", Some(IDLE_SCREEN))],
             vec![observation(
                 "second",
                 "working",
@@ -4661,12 +4913,14 @@ mod tests {
     #[test]
     fn a_finished_child_is_reported_at_once_in_a_message_of_its_own() {
         let mut options = options();
+        // Idleness, which waits out the rate limit: a blocked agent would not.
+        options.idle = Duration::from_secs(300);
         options.min_notice_interval = Duration::from_secs(600);
         let mut notifier = RecordingNotifier::default();
         let mut state = WatchState::default();
-        let asking = || observation("asker", "idle", Some(PROMPT_SCREEN));
+        let asking = || observation("asker", "idle", Some(IDLE_SCREEN));
         let finished = || observation("finisher", "idle", Some(DONE_SCREEN));
-        let late = || observation("late-asker", "idle", Some(PROMPT_SCREEN));
+        let late = || observation("late-asker", "idle", Some(IDLE_SCREEN));
         let mut probe = ScriptedProbe(vec![
             vec![asking()],
             vec![asking()],
@@ -5380,6 +5634,328 @@ mod tests {
     fn log_lines_open_with_the_utc_time() {
         let at = UNIX_EPOCH + Duration::from_millis(1_793_208_360_500);
         assert_eq!(log_stamp(at), "2026-10-28T17:26:00Z");
+    }
+
+    // ---- #675 watch-blocked-fast-alerts: a blocked agent is news at once -------------------
+
+    #[test]
+    fn a_blocked_agent_is_reported_past_the_rate_limit() {
+        let mut options = options();
+        options.approval = Duration::ZERO;
+        options.idle = Duration::from_secs(300);
+        options.min_notice_interval = Duration::from_secs(3600);
+        let refused = include_str!("../testdata/stuck/claude-safety.txt");
+        let idler = || observation("idler", "idle", Some(IDLE_SCREEN));
+        let late = || observation("late-idler", "idle", Some(IDLE_SCREEN));
+        let asker = || observation("asker", "idle", Some(PROMPT_SCREEN));
+        let refusal = || observation("refused", "idle", Some(refused));
+        let mut probe = ScriptedProbe(vec![
+            vec![idler()],
+            vec![idler()],
+            vec![idler(), asker(), late()],
+            vec![idler(), asker(), late(), refusal()],
+            vec![idler(), asker(), late(), refusal()],
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        // `idler` is sent at 300, which opens an hour's rate-limit window.
+        pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
+        // A prompt is reported in the pass that first sees it, inside the window.
+        let asked = pass(&mut probe, &mut notifier, &mut state, 360.0, &options);
+        assert_eq!(notifier.sent.len(), 2, "{asked}");
+        assert!(
+            notifier.sent[1].1.contains("- asker:"),
+            "{}",
+            notifier.sent[1].1
+        );
+        // So is a guardrail refusal.
+        let refusal = pass(&mut probe, &mut notifier, &mut state, 420.0, &options);
+        assert_eq!(notifier.sent.len(), 3, "{refusal}");
+        assert!(
+            notifier.sent[2].1.contains("- refused:"),
+            "{}",
+            notifier.sent[2].1
+        );
+        // Idleness still waits out the window: `late-idler` came due at 660.
+        let held = pass(&mut probe, &mut notifier, &mut state, 780.0, &options);
+        assert_eq!(held["notice"]["reason"], "rate limited", "{held}");
+        assert_eq!(notifier.sent.len(), 3);
+    }
+
+    /// A probe for the quick check: scripted full passes, and scripted visible rows between them.
+    struct QuickProbe {
+        passes: Vec<Vec<Observation>>,
+        visible: Vec<Vec<(String, String)>>,
+    }
+
+    impl Probe for QuickProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(if self.passes.is_empty() {
+                Vec::new()
+            } else {
+                self.passes.remove(0)
+            })
+        }
+        fn visible_screens(&mut self) -> Vec<(String, String)> {
+            if self.visible.is_empty() {
+                Vec::new()
+            } else {
+                self.visible.remove(0)
+            }
+        }
+    }
+
+    #[test]
+    fn the_quick_check_reports_a_prompt_between_passes_and_leaves_other_clocks_alone() {
+        let mut options = options();
+        options.approval = Duration::ZERO;
+        options.interval = Duration::from_secs(900);
+        options.blocked_check = Duration::from_secs(60);
+        options.min_notice_interval = Duration::from_secs(3600);
+        let building = "◆ building the thing\n";
+        let worker = |screen: &str| Observation {
+            recipient: Some("lieutenant".to_owned()),
+            ..observation("worker", "working", Some(screen))
+        };
+        let lieutenant = || observation("lieutenant", "working", Some("◆ dispatching\n"));
+        let idler = || observation("idler", "idle", Some(IDLE_SCREEN));
+        let mut probe = QuickProbe {
+            passes: vec![
+                vec![worker(building), lieutenant(), idler()],
+                vec![worker(PROMPT_SCREEN), lieutenant(), idler()],
+            ],
+            visible: vec![
+                vec![
+                    ("worker".to_owned(), PROMPT_SCREEN.to_owned()),
+                    ("idler".to_owned(), IDLE_SCREEN.to_owned()),
+                ],
+                vec![("worker".to_owned(), PROMPT_SCREEN.to_owned())],
+            ],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        assert!(notifier.sent.is_empty());
+        let quick = check_blocked(&mut probe, &mut notifier, &mut state, 60.0, &options)
+            .expect("the prompt is found");
+        assert_eq!(quick["found"][0]["agent"], "worker", "{quick}");
+        assert_eq!(
+            quick["found"].as_array().unwrap().len(),
+            1,
+            "an idle screen is not blocked"
+        );
+        assert_eq!(notifier.sent.len(), 1, "{quick}");
+        assert_eq!(notifier.sent[0].0, "lieutenant", "the last pass's route");
+        assert!(notifier.sent[0].1.contains("- worker:"));
+        let memory = &state.agents["worker"];
+        assert_eq!(
+            memory.screen_changed_at, 0.0,
+            "the screen clock is the full pass's"
+        );
+        let episode = memory.episode.as_ref().unwrap();
+        assert!(episode.notified && episode.since == 60.0);
+        assert!(
+            state.agents["idler"].episode.as_ref().map(|e| e.kind)
+                != Some(EpisodeKind::ApprovalPrompt)
+        );
+        // The same prompt again is nothing new.
+        assert!(check_blocked(&mut probe, &mut notifier, &mut state, 120.0, &options).is_none());
+        // The next full pass finds the episode begun and reported.
+        let full = watch_agents_once(&mut probe, &mut notifier, &mut state, 900.0, &options);
+        let told = notifier
+            .sent
+            .iter()
+            .filter(|(_, text, _)| text.contains("- worker:"))
+            .count();
+        assert_eq!(told, 1, "{full}");
+        let row = full["episodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["agent"] == "worker")
+            .unwrap()
+            .clone();
+        assert_eq!(row["since"], 60.0, "{row}");
+        assert_eq!(row["reported"], true, "{row}");
+    }
+
+    #[test]
+    fn with_a_threshold_the_quick_check_starts_the_clock_and_sends_when_due() {
+        let mut options = options();
+        options.approval = Duration::from_secs(300);
+        let prompt = || vec![("worker".to_owned(), PROMPT_SCREEN.to_owned())];
+        let mut probe = QuickProbe {
+            passes: vec![vec![observation("worker", "working", Some("◆ building\n"))]],
+            visible: vec![prompt(), prompt(), prompt(), prompt()],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let quick = check_blocked(&mut probe, &mut notifier, &mut state, 60.0, &options).unwrap();
+        assert_eq!(quick["found"][0]["due"], false, "{quick}");
+        assert!(notifier.sent.is_empty() && state.pending.is_empty());
+        assert!(check_blocked(&mut probe, &mut notifier, &mut state, 300.0, &options).is_none());
+        // Due 300 s after the quick check first saw it, without waiting for a full pass.
+        check_blocked(&mut probe, &mut notifier, &mut state, 360.0, &options).unwrap();
+        assert_eq!(notifier.sent.len(), 1);
+        assert!(check_blocked(&mut probe, &mut notifier, &mut state, 420.0, &options).is_none());
+        assert_eq!(notifier.sent.len(), 1);
+    }
+
+    #[test]
+    fn the_quick_check_never_replaces_what_a_full_pass_read_further_up() {
+        let mut options = options();
+        options.approval = Duration::ZERO;
+        let unsafe_command = include_str!("../testdata/stuck/claude-unsafe.txt");
+        let mut probe = QuickProbe {
+            passes: vec![vec![observation("worker", "idle", Some(unsafe_command))]],
+            visible: vec![vec![("worker".to_owned(), PROMPT_SCREEN.to_owned())]],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let kind = state.agents["worker"].episode.as_ref().unwrap().kind;
+        assert!(matches!(kind, EpisodeKind::Stuck(_)), "{kind:?}");
+        let sent = notifier.sent.len();
+        assert!(check_blocked(&mut probe, &mut notifier, &mut state, 60.0, &options).is_none());
+        assert_eq!(state.agents["worker"].episode.as_ref().unwrap().kind, kind);
+        assert_eq!(notifier.sent.len(), sent);
+    }
+
+    #[test]
+    fn a_prompt_that_comes_and_goes_passes_the_rate_limit_once_per_window() {
+        let mut options = options();
+        options.approval = Duration::ZERO;
+        options.min_notice_interval = Duration::from_secs(600);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut sent_at = Vec::new();
+        for step in 0..12 {
+            let at = 60.0 * f64::from(step);
+            let screen = if step % 2 == 0 {
+                PROMPT_SCREEN
+            } else {
+                "◆ approved, working\n"
+            };
+            let status = if step % 2 == 0 { "idle" } else { "working" };
+            let mut probe = ScriptedProbe(vec![vec![observation("worker", status, Some(screen))]]);
+            let before = notifier.sent.len();
+            pass(&mut probe, &mut notifier, &mut state, at, &options);
+            if notifier.sent.len() > before {
+                sent_at.push(at);
+            }
+        }
+        // At 0, then nothing inside the window (each later prompt was withdrawn when answered),
+        // then again once the window is over.
+        assert_eq!(sent_at, vec![0.0, 600.0], "{:?}", notifier.sent);
+    }
+
+    /// A probe whose quick check takes ten seconds of its clock.
+    struct SlowProbe<'a>(&'a SteppedClock);
+
+    impl Probe for SlowProbe<'_> {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(Vec::new())
+        }
+        fn visible_screens(&mut self) -> Vec<(String, String)> {
+            self.0.now.set(self.0.now.get() + 10.0);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn the_time_quick_checks_take_does_not_push_the_next_pass_back() {
+        let mut options = options();
+        options.interval = Duration::from_secs(900);
+        options.blocked_check = Duration::from_secs(60);
+        let clock = SteppedClock {
+            now: std::cell::Cell::new(0.0),
+            slept: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut probe = SlowProbe(&clock);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let checks = between_passes(
+            &mut probe,
+            &mut notifier,
+            &clock,
+            &mut state,
+            None,
+            &options,
+        );
+        assert_eq!(checks, 12);
+        assert_eq!(clock.now(), 900.0);
+    }
+
+    /// A clock that only moves when slept on, and remembers each sleep.
+    struct SteppedClock {
+        now: std::cell::Cell<f64>,
+        slept: std::cell::RefCell<Vec<u64>>,
+    }
+
+    impl Clock for SteppedClock {
+        fn now(&self) -> f64 {
+            self.now.get()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.slept.borrow_mut().push(duration.as_secs());
+            self.now.set(self.now.get() + duration.as_secs_f64());
+        }
+    }
+
+    #[test]
+    fn quick_checks_run_between_full_passes_and_only_when_shorter_than_the_interval() {
+        let mut options = options();
+        options.interval = Duration::from_secs(900);
+        options.blocked_check = Duration::from_secs(60);
+        let clock = SteppedClock {
+            now: std::cell::Cell::new(0.0),
+            slept: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut probe = QuickProbe {
+            passes: Vec::new(),
+            visible: Vec::new(),
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut wait = |options: &WatchAgentsOptions| {
+            clock.slept.borrow_mut().clear();
+            let checks =
+                between_passes(&mut probe, &mut notifier, &clock, &mut state, None, options);
+            (checks, clock.slept.borrow().clone())
+        };
+        let (checks, slept) = wait(&options);
+        assert_eq!(checks, 14);
+        assert_eq!(slept.iter().sum::<u64>(), 900, "{slept:?}");
+        options.blocked_check = Duration::from_secs(900);
+        assert_eq!(
+            wait(&options),
+            (0, vec![900]),
+            "not shorter than the interval: off"
+        );
+        options.blocked_check = Duration::ZERO;
+        assert_eq!(wait(&options), (0, vec![900]), "zero: off");
+        options.blocked_check = Duration::from_secs(60);
+        options.check_only = true;
+        assert_eq!(
+            wait(&options),
+            (0, vec![900]),
+            "a check-only watcher sends nothing between passes"
+        );
+    }
+
+    #[test]
+    fn the_blocked_pattern_table_is_shared() {
+        let refused = include_str!("../testdata/stuck/claude-safety.txt");
+        assert_eq!(
+            blocked_finding(PROMPT_SCREEN).map(|(kind, _)| kind),
+            Some(EpisodeKind::ApprovalPrompt)
+        );
+        assert!(blocked_finding(refused).is_some_and(|(kind, _)| kind.is_blocked()));
+        assert!(blocked_finding(IDLE_SCREEN).is_none());
+        assert!(!EpisodeKind::Stuck(crate::stuck::StuckCause::ApiRateLimit).is_blocked());
     }
 
     // ---- #570 agent-progress-monitoring: what "working" means -------------------------------

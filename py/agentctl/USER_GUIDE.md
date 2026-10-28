@@ -961,7 +961,7 @@ coordinator when a condition holds past its threshold:
 | condition | threshold | meaning |
 |---|---|---|
 | `child-done` | `--child-done-seconds` (default 0: the pass that sees it) | idle or done, work was delivered and drained, and the agent's last reply has a verdict; timed from the last screen change |
-| `approval-prompt` | `--approval-minutes` (default 5) | a harness approval, permission, or trust prompt at the bottom of the screen |
+| `approval-prompt` | `--approval-minutes` (default 0: the pass or quick check that sees it) | a harness approval, permission, or trust prompt at the bottom of the screen |
 | `idle-no-verdict` | `--idle-minutes` (default 5) | idle or done, timed from the last screen change, work was delivered and drained, and the last reply has no verdict |
 | `stalled` | `--stall-minutes` (default 30) | marked working, or idle or done while the screen shows work running (a running turn or background work), timed from the last screen change |
 | `dead` | `--dead-minutes` (default 5) | the record says running but the harness cannot be reached |
@@ -1167,6 +1167,29 @@ a `tool-blocked` one, where a call no process runs for (an MCP tool, a
 sub-agent) counts once nothing moves; `untimed-tool` reports a call that set no
 timeout running past `--untimed-tool-minutes` (default 60). The pass report's
 `activity` lists what each transcript says.
+
+A **blocked** agent is news at once (#675 watch-blocked-fast-alerts): one at a
+harness approval, permission or trust prompt, or refused by a guardrail
+(`unsafe-command`, `safety-refusal`), cannot go on until someone acts, unlike
+one that is merely idle. Its notice is sent in the pass that sees it (with the
+default `--approval-minutes 0`) and is not held by `--min-notice-interval`,
+though each agent passes that limit at most once per interval, so a prompt
+that a person answers and the agent raises again does not become a stream;
+other notices for the same recipient ride along in the same message. Between
+full passes the watcher also takes a quick look every
+`--blocked-check-seconds` (default 60; 0, or a value not below `--interval`,
+turns it off, so with the default `--interval 60` every full pass is the
+look): it reads only the visible rows of each agent whose screen the last
+pass read, skipping a view scrolled back, through the same pattern table the
+full pass uses (the harness approval phrases and the typed failures below).
+It starts an episode for a blocked agent, or sends one already begun that has
+come due, telling the recipient the last pass chose. It never replaces a
+typed failure or blocked condition the full pass found, since that pass read
+further up the screen. A quick look judges nothing else and moves no other
+clock: idleness, stalls and finishes wait for the full pass, which finds the
+episode already begun and reported. So with `--interval 900` a prompt is
+reported within about a minute, not fifteen. A prompt answered and raised
+again before the next full pass is still the same episode.
 
 Typed harness failures are reported immediately as `model-capacity`, `api-rate-limit`,
 `unsafe-command`, `safety-refusal`, `out-of-quota`, or `goal-stalled`. Detection uses
