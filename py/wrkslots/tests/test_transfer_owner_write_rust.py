@@ -202,10 +202,16 @@ def _events(root: Path) -> list[dict[str, object]]:
         event.pop("previous_sha256")
         payload = event.get("payload")
         if isinstance(payload, dict):
+            records: list[dict[str, object]] = []
             record = payload.get("record")
             if isinstance(record, dict):
-                record.pop("heartbeat_at", None)
-                for checkout in cast(list[dict[str, object]], record.get("checkouts", [])):
+                records.append(record)
+            active = payload.get("active")
+            if isinstance(active, dict):
+                records.extend(cast(list[dict[str, object]], active.get("slots", [])))
+            for item in records:
+                item.pop("heartbeat_at", None)
+                for checkout in cast(list[dict[str, object]], item.get("checkouts", [])):
                     checkout["head"] = "HEAD"
                     checkout["start_point"] = "HEAD"
         events.append(event)
