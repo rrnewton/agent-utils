@@ -133,12 +133,12 @@ fn heartbeat_expired(record: &Value) -> Result<(bool, bool, i64)> {
     Ok((true, age > ttl, age as i64))
 }
 
-struct Liveness {
-    state: String,
-    detail: String,
+pub(crate) struct Liveness {
+    pub(crate) state: String,
+    pub(crate) detail: String,
 }
 
-fn liveness_answer(cfg: &Cfg, config: &Value, record: &Value) -> Result<Liveness> {
+pub(crate) fn liveness_answer(cfg: &Cfg, config: &Value, record: &Value) -> Result<Liveness> {
     // The registered-liveness protocol: exit 0 is dead; exit 1 is alive
     // only when the whole output is one line binding agent=<agent> and
     // rc=1; exit 2 is unregistered only for the bound

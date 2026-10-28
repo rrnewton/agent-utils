@@ -348,6 +348,32 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Record coordinator recovery evidence for a slot with no recorded owner (writer; fixture registries only until cutover)
+    RecoverUnboundOwner {
+        /// Active slot with no usable owner lease
+        slot: String,
+        /// Recorded live coordinator PID
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// Current slot generation
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Why owner evidence cannot be recovered
+        #[arg(long, value_name = "TEXT")]
+        recovery_note: String,
+        /// Validation evidence (repeatable)
+        #[arg(long, value_name = "TEXT", required = true)]
+        validation: Vec<String>,
+        /// Known limitation to retain (repeatable)
+        #[arg(long, value_name = "TEXT")]
+        limitation: Vec<String>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
     Create {
         /// New slot name
@@ -970,6 +996,39 @@ pub fn run() -> u8 {
                 &agent,
                 owner_pid,
                 expected_generation,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverUnboundOwner {
+            slot,
+            coordinator_pid,
+            expected_generation,
+            recovery_note,
+            validation,
+            limitation,
+            root,
+            machine,
+        } => {
+            match crate::recover_unbound_write::recover_unbound_owner(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                coordinator_pid,
+                expected_generation,
+                &recovery_note,
+                &validation,
+                &limitation,
             ) {
                 Ok(value) => {
                     println!(
