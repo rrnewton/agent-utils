@@ -217,6 +217,80 @@ fn an_adopted_working_muse_takes_follow_ups_at_any_footer_mode() {
 }
 
 #[test]
+fn an_adopted_muse_whose_pane_reports_no_agent_still_takes_working_follow_ups() {
+    // #697 send-muse-while-working: Herdr has no Muse manifest (#691), so an
+    // adopted Muse pane can report no agent kind at all, and once the harness
+    // re-execs the pinned-process correction no longer names it either. The
+    // record's harness must still drive readiness, or a busy adopted Muse
+    // waits for idle like the other team's coordinator did.
+    let fixture = Fixture::new();
+    fixture.prepare_foreign();
+    fixture
+        .client
+        .custom_reported
+        .store(true, Ordering::Relaxed);
+    *fixture.client.status.lock().unwrap() = Some("idle".to_owned());
+    *fixture.client.muse_editor.lock().unwrap() = Some(MuseEditor::new("YOLO", true, None));
+    let mut options = fixture.adopt_options();
+    options.harness = "muse".to_owned();
+    let manager = fixture.manager();
+    manager.adopt("foreign", options).unwrap();
+    let record_path = fixture.root.join("registry/agents/foreign/agent.json");
+    let mut record = agent::read_private_json(&record_path).unwrap();
+    record
+        .as_object_mut()
+        .unwrap()
+        .insert("anchor_rule".to_owned(), serde_json::Value::Null);
+    agent::atomic_json(&record_path, &record).unwrap();
+    *fixture.client.status.lock().unwrap() = Some("working".to_owned());
+    fixture
+        .client
+        .muse_editor
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .busy = true;
+    // Readiness now reaches the typing stage instead of waiting out the ready
+    // timeout for idle; typing itself still refuses without a process anchor,
+    // pending with nothing typed. (The Fake cannot express a re-exec'd harness
+    // whose shell identity verifies while the foreground pin does not.)
+    let error = manager
+        .send_identified_with_runtime(
+            "foreign",
+            "steer without a reported kind",
+            held(),
+            "steer",
+            &Clock::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("foreground harness process anchor"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains("did not become idle"),
+        "{error}"
+    );
+    no_input(&fixture);
+}
+
+#[test]
+fn a_revived_adopted_muse_on_the_native_adapter_still_verifies_follow_ups() {
+    // #697 send-muse-while-working: revive re-owns an adopted pane under adapter `herdr`;
+    // a Muse record there must keep the verified-composer path or busy sends wait.
+    let fixture = Fixture::new();
+    let manager = start_busy_muse(&fixture, true);
+    let mut record = manager.load("worker").unwrap();
+    record.adapter = "herdr".to_owned();
+    let client = manager.workspace_client(&record);
+    assert!(agent::AgentApi::verifies_muse_followups(&client));
+}
+
+#[test]
 fn a_paste_never_seen_as_the_exact_editor_is_taken_back_out_and_quarantined() {
     // Idle and running turns alike: no Enter is sent, and the paste is cleared out of the editor
     // rather than left there unsubmitted. The prompt is quarantined as possibly submitted, so it

@@ -428,6 +428,11 @@ fn wait_inferred_status(
 }
 
 impl AgentApi for TmuxBackend {
+    fn verifies_muse_followups(&self) -> bool {
+        // Direct-pane tmux transport, as for HerdrClient (#697 send-muse-while-working).
+        true
+    }
+
     fn panes(&self) -> Result<Vec<Pane>> {
         Ok(term_err(Multiplexer::list_panes(self, None))?
             .into_iter()
