@@ -2,3 +2,5 @@
 // no browser. Its public interface. `#624 voice-page-modularity`.
 
 export { MONO_EM, SPACE_EM, WIDE_SCRIPT, glyphEm, monoEm } from "./glyphs.ts";
+export { linkKind } from "./links.ts";
+export type { LinkKind } from "./links.ts";

@@ -1852,6 +1852,9 @@ const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
 const GLYPHS = await moduleForTests("src/foundation/index.ts");
 
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
+  // A page whose MODULES are broken on purpose (`brokenModule`): its prelude, and the legacy script.
+  let prelude = PRELUDE_COMPILED;
+  if (script && typeof script === "object") ({ prelude, script } = script);
   const elements = new Map();
   for (const [id, markup] of PAGE_ELEMENTS) {
     // The tag as the DOM reports an HTML element's, upper-case: `#224 keyboard-shortcuts` decides what
@@ -4733,7 +4736,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   if (arrange) arrange(page);
   vm.createContext(context);
   for (const name of PAGE_SCRIPTS) {
-    if (name === LEGACY_SCRIPT && PRELUDE_COMPILED) PRELUDE_COMPILED.runInContext(context);
+    if (name === LEGACY_SCRIPT && prelude) prelude.runInContext(context);
     const compiled = name === SCRIPT_FILE && script !== SCRIPT ? new vm.Script(script, { filename: name }) : COMPILED.get(name);
     compiled.runInContext(context);
   }
@@ -4796,6 +4799,18 @@ test("`#624 voice-page-modularity`: every page here runs the scripts the shell l
   // A needle that occurs twice is refused unless the control says it means the first of two.
   assert.throws(() => brokenScript("  if (chosen) rememberChosenView(chosen);", ""), /different number of times/);
 });
+
+/**
+ * The page with its MODULES broken on purpose (`#624 voice-page-modularity`): the prelude rebuilt from
+ * module sources with `overlays` patched in (each `{ file, find, replace, count }`, its text required
+ * to occur `count` times, as `brokenScript` requires of web/voice.js), and the legacy script as it is.
+ * What `newPage` takes in place of a script, for a negative control of code that moved out of
+ * voice.js but is still exercised through the whole page.
+ */
+async function brokenModule(overlays) {
+  const built = await legacyPrelude(loadTool("esbuild"), WEB, { minify: false, overlays });
+  return { prelude: new vm.Script(built.code, { filename: "prelude.js" }), script: SCRIPT };
+}
 
 /**
  * Drive the whole happy path: sign in, mint, open the microphone, open the socket.
@@ -50286,7 +50301,7 @@ async function tapKind(page, kind) {
 const shownHrefs = (page, id = "discord-log") => Object.fromEntries(
   unfiltered(page, id).map((li) => [li.getAttribute("data-id"), linkPairs(li).map(([, href]) => href)]));
 
-test("a link's kind is read from its address alone, and every address is of exactly one of the six", () => {
+test("a link's kind is read from its address alone, and every address is of exactly one of the six", async () => {
   const kindOf = newPage().pure("linkKind");
   const cases = {
     pr: [
@@ -50383,12 +50398,14 @@ test("a link's kind is read from its address alone, and every address is of exac
   }
 
   // THE CONTROL: with the pull request's commits read as the pull request, this tells them apart.
-  const control = newPage(new Map(), brokenScript(
-    '      return second === "commits" && COMMIT_ID.test(third) ? "commit" : "pr";', '      return "pr";')).pure("linkKind");
+  // The classifier is a module (`#624 voice-page-modularity`): its controls patch its source.
+  const LINKS = "src/foundation/links.ts";
+  const control = (await moduleForTests("src/foundation/index.ts", { overlays: [{ file: LINKS,
+    find: '      return second === "commits" && COMMIT_ID.test(third) ? "commit" : "pr";', replace: '      return "pr";' }] })).linkKind;
   assert.equal(control(`${REPO}/pull/41/commits/abc1234def`), "pr", "the test cannot see the pull request's commit");
   // ...and with the catch-all taken away, an address no kind claims is of none, which this sees.
-  const unclaimed = newPage(new Map(), brokenScript(
-    '  if (!found) return "other";', '  if (!found) return null;')).pure("linkKind");
+  const unclaimed = (await moduleForTests("src/foundation/index.ts", { overlays: [{ file: LINKS,
+    find: '  if (!found) return "other";', replace: '  if (!found) return null;' }] })).linkKind;
   assert.equal(unclaimed("https://example.com/docs/design.html"), null, "the test cannot see a link left out of every kind");
 });
 
@@ -50679,7 +50696,8 @@ test("Issues, Files and Other take every link the first three do not: the six nu
 
   // THE CONTROL: with the catch-all gone, a link on another host is of no kind — no number counts it,
   // and no button hides it — which this test sees.
-  const control = await run(brokenScript('  if (!found) return "other";', "  if (!found) return null;"));
+  const control = await run(await brokenModule([
+    { file: "src/foundation/links.ts", find: '  if (!found) return "other";', replace: "  if (!found) return null;" }]));
   assert.notEqual(added(kindsCounted(control)), shownLinks(control).length, "the test cannot see a link no kind counts");
   await showOnly(control, []);
   assert.notEqual(control.el("search-count").textContent, "0 of 7 loaded", "the test cannot see a link no button hides");

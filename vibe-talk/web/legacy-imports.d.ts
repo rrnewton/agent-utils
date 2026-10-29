@@ -15,4 +15,5 @@ declare const speechSegments: LegacyImports["speechSegments"];
 declare const SPACE_EM: LegacyImports["SPACE_EM"];
 declare const WIDE_SCRIPT: LegacyImports["WIDE_SCRIPT"];
 declare const glyphEm: LegacyImports["glyphEm"];
+declare const linkKind: LegacyImports["linkKind"];
 declare const monoEm: LegacyImports["monoEm"];
