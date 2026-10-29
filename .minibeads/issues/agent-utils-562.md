@@ -557,3 +557,11 @@ instructed.
 - Coordinator's live run on `main` `f559d7af`: phase 1 read-only comparison identical between editions; phase 2 on disposable slot `rust-trial-2` (`rust-trial-1` was archived, and finished slot names are never reused; the trial script's `SLOT` is now overridable): create, adopt, heartbeat, write-handoff, release, read-handoff, and removal all ran under Rust with Python read-back identical after every step, status clean afterwards, other slots untouched.
 - The default is **not** flipped: the coordinator is asking the owner about a soak period on this harness first. The opt-in `WRKSLOTS_ENGINE=rust` switch remains the way to exercise the Rust edition.
 - Campaign continues with the remaining planned Rust editions for the Python-only read commands `audit` and `unpushed` (the phase-1 known gaps), then M5 (`wrkviz`, `parallel-experiment-runner`) after the flip decision. M3 publishing still waits for the owner's OK.
+
+### Slice 48: unpushed diagnosis reader
+
+- Commits: `b7881d34` (reader), `1f7aaec9` (manifest sort), `adafee73` (CLI surface inventory), landed on `main`.
+- New `wrkslotsd unpushed` command reproducing the Python diagnosis: registry-storage gate (target findings refuse; other slots retained with the oracle's warning texts), per-checkout worktree/branch verification, isolated remote fetch with authority re-check, and PUBLISHED / UNPUSHED-OR-STALE rows with containing refs and two-readings evidence (same-named ref, touched files, diagnostic diff command, null exactly when published).
+- Differential fixture uses a separate bare remote (a source repository acting as its own remote can never be unpushed, since worktree commits move its branch refs directly). Published, unpublished, slot-filter, and branch-changed cases all match Python.
+- Gate 75: the only failures were load timeouts (validation-graph, both wrkslots shards) plus the CLI-surface inventory catching the new subcommand name; each passes alone on the final commit (42 in 22s; 586 and 585 passed solo; full `cargo test -p wrkslotsd` 91 passed).
+- Next: `audit` (slice 49+, the last Python-only read command): registered-row verdicts first, then cache census, unregistered/journal/seal rows, disk state, and gate output.
