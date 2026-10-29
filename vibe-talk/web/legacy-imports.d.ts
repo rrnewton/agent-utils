@@ -22,6 +22,8 @@ declare const sameMessage: LegacyImports["sameMessage"];
 declare const threadOf: LegacyImports["threadOf"];
 declare const timeOf: LegacyImports["timeOf"];
 declare const viewOfKey: LegacyImports["viewOfKey"];
+declare const coverViewOf: LegacyImports["coverViewOf"];
+declare const projectionOf: LegacyImports["projectionOf"];
 declare const allPageAnswersFor: LegacyImports["allPageAnswersFor"];
 declare const exactCount: LegacyImports["exactCount"];
 declare const goneByAbsence: LegacyImports["goneByAbsence"];

@@ -20,6 +20,7 @@ export { readPieces, sentenceEnds, speechSegments } from "../core/speech/index.t
 export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
 export {
   allPageAnswersFor,
+  coverViewOf,
   emptyCanon,
   exactCount,
   goneByAbsence,
@@ -28,6 +29,7 @@ export {
   inViewOf,
   mergeIntoCanon,
   pageCopyNewer,
+  projectionOf,
   refreshFailed,
   sameMessage,
   serverVersions,

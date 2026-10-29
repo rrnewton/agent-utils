@@ -6349,6 +6349,32 @@ test("`#624 voice-page-modularity`: the server's versions decide copies and abse
   assert.equal(answers({ ...t("c", false, 4), id: "c1" }), true, "the scope was not read when the question was asked");
 });
 
+test("`#624 voice-page-modularity`: a view shows the store only from where its own pages reached, from the module alone", () => {
+  const { emptyCanon, coverViewOf, projectionOf } = CHANNELS;
+  const at = (s) => `2026-10-01T00:00:${String(s).padStart(2, "0")}Z`;
+  const m = (id, s, thread) => ({ id, timestamp: at(s), ...(thread ? { thread } : {}) });
+  const canon = emptyCanon("c");
+  canon.messages = [m("1", 1), m("2", 2, { id: "t", is_root: false }), m("3", 3, { id: "t", is_root: true }), m("4", 4)];
+  assert.equal(projectionOf(canon, "main", "main", null), null, "a view no page covered projected rows");
+  // Main's newest page reached back to 3 and says there is more: 1 is below its floor, 2 is not Main's.
+  coverViewOf(canon, "main", "main", [m("3", 3), m("4", 4)], false, true, "");
+  const main = canon.views.get("main");
+  assert.deepStrictEqual([main.floor, main.more, main.live, main.cursor, main.top], [Date.parse(at(3)), true, true, null, Date.parse(at(4))]);
+  assert.deepStrictEqual(projectionOf(canon, "main", "main", null).map((x) => x.id), ["3", "4"]);
+  // A step back to 1 lowers the floor; a refresh that stops short keeps the history already walked back to.
+  coverViewOf(canon, "main", "main", [m("1", 1)], true, true, "");
+  assert.equal(canon.views.get("main").floor, Date.parse(at(1)));
+  coverViewOf(canon, "main", "main", [m("4", 4)], false, true, "");
+  assert.equal(canon.views.get("main").floor, Date.parse(at(1)), "a refresh threw away history walked back to");
+  assert.deepStrictEqual(projectionOf(canon, "main", "main", null).map((x) => x.id), ["1", "3", "4"]);
+  // A newest page with nothing more: the whole view, and Main's own coverage proves nothing of All.
+  coverViewOf(canon, "main", "main", [m("4", 4)], false, false, "a notice");
+  assert.deepStrictEqual([canon.views.get("main").floor, canon.views.get("main").more, canon.views.get("main").notice], [null, false, "a notice"]);
+  assert.equal(projectionOf(canon, "flat", "flat", null), null);
+  coverViewOf(canon, "thread:t", "thread", [m("2", 2), m("3", 3)], false, false, "");
+  assert.deepStrictEqual(projectionOf(canon, "thread:t", "thread", "t").map((x) => x.id), ["2", "3"]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

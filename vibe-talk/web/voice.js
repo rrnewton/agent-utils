@@ -23876,56 +23876,12 @@ function inView(message, view, thread, scope = channelCanon.scope) {
 // `mergeIntoCanon` and `upsertThreadSummary` are web/src/core/channels's, and take the store they
 // fold into (`#624 voice-page-modularity`).
 
-/** Record what one page proved about its view's coverage. `lower` of two floors: null is "unknown". */
+/**
+ * Record what one page proved about its view's coverage (web/src/core/channels `coverViewOf`), for
+ * the current view by default.
+ */
 function coverView(arriving, older, hasMore, notice, view = channelView, thread = selectedThreadId) {
-  const key = viewKey(view, thread);
-  const timeField = view === "threads" ? "updated_at" : "timestamp";
-  const prior = channelCanon.views.get(key);
-  const parsed = arriving.length ? timeOf(arriving[0], timeField) : NaN;
-  const edge = Number.isFinite(parsed) ? parsed : null;
-  const lower = (a, b) => (a === null || b === null ? null : Math.min(a, b));
-  let more = hasMore;
-  let floor = hasMore ? edge : null;
-  // `#578 search-status-clarity`. Where the stretch with no gaps begins when it is not the floor
-  // (`historyReach`), and the newest message any read of the view carried, which says whether the next
-  // newest read joins what is held. All's is its newest top-level message: its pages bring the replies
-  // of a few threads, which say nothing of the top-level messages between.
-  const counted = arriving.filter((item) => view !== "flat" || !threadOf(item) || item.thread.is_root === true ||
-    threadOf(item) === channelCanon.scope).map((item) => timeOf(item, timeField)).filter(Number.isFinite);
-  const pageTop = counted.length ? Math.max(...counted) : null;
-  let top = prior && Number.isFinite(prior.top) ? prior.top : null;
-  let dense = prior && Number.isFinite(prior.dense) ? prior.dense : null;
-  if (hasMore && prior && !older) {
-    // A refresh that stops short keeps the history already walked back to, as the rows do.
-    more = prior.more;
-    floor = prior.more ? lower(prior.floor, edge) : null;
-    // ...but joins it only where it reaches down to the newest message a read before it carried. One
-    // that does not — the page was away while more than a page arrived — leaves messages between that
-    // no read brought, and what is below them is scattered.
-    if (edge !== null && !(top !== null && edge <= top)) dense = edge;
-  } else if (hasMore && prior && older) {
-    // A step back that brought nothing — a page served from the cache whose walk found nothing older
-    // yet — moves nothing: the floor is where the rows are, not "unknown".
-    floor = edge === null ? prior.floor : lower(prior.floor, edge);
-  } else if (!hasMore && !older) {
-    dense = null;
-  }
-  if (pageTop !== null && (top === null || (!older && pageTop > top))) top = pageTop;
-  channelCanon.views.set(key, {
-    floor, more, notice, top, dense,
-    at: older && prior ? prior.at : Date.now(),
-    live: true,
-    cursor: prior ? prior.cursor : null,
-    // `#203 incremental-refresh`. The forward cursor of the last newest read or delta folded for
-    // this view, and when the last newest read landed. In memory only: a cursor saved with the
-    // rows would usually have expired by the time a cold start could use it.
-    newest: prior ? prior.newest || null : null,
-    fullAt: prior ? prior.fullAt || 0 : 0,
-    // `#308 live-reply-in-main`. And where that read was sent in the order of reads (`sentNumberOf`),
-    // which says whether another newest page of the view is older or newer than it. In memory only,
-    // as the order is.
-    fullSent: prior ? prior.fullSent || 0 : 0,
-  });
+  coverViewOf(channelCanon, viewKey(view, thread), view, arriving, older, hasMore, notice);
 }
 
 /**
@@ -24342,15 +24298,12 @@ function foldLiveMessage(message, live = false, replayed = false, read = null) {
   return kept;
 }
 
-/** The current view's rows from the store, or null when no page has covered this view. */
+/**
+ * The current view's rows from the store, or null when no page has covered this view
+ * (web/src/core/channels `projectionOf`).
+ */
 function projectView(view = channelView, thread = selectedThreadId) {
-  const cover = channelCanon.views.get(viewKey(view, thread));
-  if (!cover) return null;
-  const threads = view === "threads";
-  const timeField = threads ? "updated_at" : "timestamp";
-  return channelCanon[threads ? "threads" : "messages"].filter((item) =>
-    (threads || inView(item, view, thread)) &&
-    !(cover.more && cover.floor !== null && timeOf(item, timeField) < cover.floor));
+  return projectionOf(channelCanon, viewKey(view, thread), view, thread);
 }
 
 /** The read state of the rows on screen is the store's read state for those rows. */

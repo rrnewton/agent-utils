@@ -15,3 +15,4 @@ export {
   upsertThreadSummary,
 } from "./fold.ts";
 export type { ServerVersions } from "./fold.ts";
+export { coverViewOf, projectionOf } from "./views.ts";
