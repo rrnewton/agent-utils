@@ -1857,6 +1857,8 @@ const NAVIGATION = await moduleForTests("src/core/navigation/index.ts");
 const SETTINGS = await moduleForTests("src/core/settings/index.ts");
 /** One store per channel and its views' rules (web/src/core/channels). */
 const CHANNELS = await moduleForTests("src/core/channels/index.ts");
+/** What the reader has done to messages, as the page holds it (web/src/core/annotations). */
+const ANNOTATIONS = await moduleForTests("src/core/annotations/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -6692,6 +6694,40 @@ test("`#624 voice-page-modularity`: the channel store's owner opens a channel af
   assert.deepStrictEqual([opened.channel, opened.messages.length], ["42", 0], "a channel opened did not start afresh");
   assert.equal(store.open().channel, "");
   assert.notEqual(createChannelStore().current(), store.current(), "two owners share a store");
+});
+
+test("`#624 voice-page-modularity`: the reading bookmark's owner, from the module alone: a read's word, the owner's move ahead of its write, settling it", () => {
+  const { createBookmarks, sameAnchor, isBookmarkState, anchorOfMessage } = ANNOTATIONS;
+  let epoch = 0;
+  const store = createBookmarks({ bumpEpoch: () => ++epoch });
+  const a = anchorOfMessage({ id: "1", timestamp: "t1", thread: { id: "th" } }, "above");
+  const b = anchorOfMessage({ id: "2", timestamp: "t2" }, "below");
+  assert.deepStrictEqual(a, { message_id: "1", place: "above", timestamp: "t1", thread_id: "th" });
+  assert.deepStrictEqual([sameAnchor(a, a), sameAnchor(a, b), sameAnchor(null, undefined), isBookmarkState({ revision: 1, anchor: null })], [true, false, true, true]);
+  // A read's word is taken while nothing of this page's is on its way.
+  assert.equal(store.note("c", { revision: 3, anchor: a }, 0), true);
+  assert.deepStrictEqual(store.held("c"), { revision: 3, anchor: a, token: null, known: true });
+  assert.equal(store.toSave("c").revision, 3);
+  // The owner's move: at once, before the write; a read meanwhile, or sent before the write settled, is not taken.
+  const move = store.stage("c", b);
+  assert.deepStrictEqual([store.held("c").anchor, store.writing("c"), epoch], [b, true, 1]);
+  assert.equal(store.note("c", { revision: 4, anchor: a }, 5), false, "a read taken while a write was on its way");
+  store.writeEnded("c");
+  assert.deepStrictEqual([store.writing("c"), epoch], [false, 2]);
+  assert.equal(store.note("c", { revision: 4, anchor: a }, 1), false, "a read sent before the write settled was taken");
+  // Settled by the server's answer, still this move's: its revision and its anchor.
+  assert.deepStrictEqual(store.settle(move, { bookmark: { revision: 5, anchor: b } }), { mine: true, before: b, after: b });
+  assert.equal(store.held("c").revision, 5);
+  // A failed write is taken back.
+  const failed = store.stage("c", null);
+  store.writeEnded("c");
+  assert.deepStrictEqual(store.settle(failed, null), { mine: true, before: null, after: b });
+  // A saved copy shows only where nothing newer is held; forgetting the credential forgets them all.
+  store.restoreSaved("c", { revision: 1, anchor: a });
+  assert.equal(store.held("c").revision, 5);
+  store.forget();
+  assert.equal(store.held("c"), null);
+  assert.equal(store.settle(move, null), null, "a write settled after its credential was forgotten");
 });
 
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------

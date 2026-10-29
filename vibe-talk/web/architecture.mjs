@@ -32,6 +32,7 @@ export const PACKAGES = Object.freeze({
   contract: [],
   foundation: [],
   ports: [],
+  "core/annotations": BASE,
   "core/api": BASE,
   "core/channels": BASE,
   "core/navigation": BASE,

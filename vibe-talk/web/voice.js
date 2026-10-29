@@ -32972,23 +32972,13 @@ function dressUnpackedRows() {
 // its message is drawn in a channel with no bookmark (`adoptLegacyMarker`).
 
 /**
- * Each channel's bookmark as this page holds it, by channel id. `revision` is the server's, as it
- * last said; `anchor` is where the line is, null for none, and may be a change the server has not
- * answered yet, which `token` then names; `known` is whether the server has said anything at all.
+ * Each channel's bookmark as this page holds it, and the bookkeeping of this page's writes of it
+ * (web/src/core/annotations `createBookmarks`, `HeldBookmark`), private to its owner; the epoch both
+ * the bookmark's and Done's writes move is this page's (`readStateEpoch`). Here where the maps stood.
  *
- * @typedef {{revision: number, anchor: VibeTalk.BookmarkAnchor | null, token: object | null, known: boolean}} HeldBookmark
- * @type {Map<string, HeldBookmark>}
+ * @typedef {import("./src/core/annotations/index.ts").HeldBookmark} HeldBookmark
  */
-const bookmarks = new Map();
-
-/**
- * Each channel's bookmark writes: how many are on their way, and the `readStateEpoch` the last one
- * settled at. A read sent before that, or while one is on its way, does not speak for the bookmark:
- * it answers for the state before the owner's own act. `readSpeaksFor` is the same rule for Done.
- *
- * @type {Map<string, {pending: number, from: number}>}
- */
-const bookmarkWrites = new Map();
+const bookmarkStore = createBookmarks({ bumpEpoch: () => ++readStateEpoch });
 
 /** The row each column draws the line on, and on which side of it, or null. */
 const bookmarkDrawn = { main: null, side: null };
@@ -33013,7 +33003,7 @@ try {
 
 /** This channel's bookmark as held, or null. */
 function heldBookmark(channel = currentChannelId()) {
-  return bookmarks.get(String(channel)) || null;
+  return bookmarkStore.held(String(channel));
 }
 
 /** Where this channel's line is, or null when it has none. */
@@ -33022,28 +33012,7 @@ function bookmarkAnchor(channel = currentChannelId()) {
   return held ? held.anchor : null;
 }
 
-/** Whether two anchors put the line in the same place. */
-function sameAnchor(a, b) {
-  if (!a || !b) return !a && !b;
-  return String(a.message_id) === String(b.message_id) && a.place === b.place;
-}
-
-/** Whether `value` is a bookmark as the server sends one: a page or to-do read is not decoded whole. */
-function isBookmarkState(value) {
-  if (!value || typeof value !== "object" || typeof value.revision !== "number") return false;
-  const anchor = value.anchor;
-  return anchor === null || (Boolean(anchor) && typeof anchor === "object" && typeof anchor.message_id === "string" &&
-    (anchor.place === "above" || anchor.place === "below") && typeof anchor.timestamp === "string");
-}
-
-/** The anchor for the line just above `message` (`above`), or just below it (`below`). */
-function anchorOfMessage(message, place) {
-  /** @type {VibeTalk.BookmarkAnchor} */
-  const anchor = { message_id: String(message.id), place, timestamp: String(message.timestamp || "") };
-  const thread = threadOf(message);
-  if (thread) anchor.thread_id = thread;
-  return anchor;
-}
+// `sameAnchor`, `isBookmarkState` and `anchorOfMessage` are web/src/core/annotations's.
 
 /** The anchor for the line just above `row` (`above`), or just below it (`below`). */
 function anchorOfRow(row, place) {
@@ -33058,7 +33027,7 @@ function anchorOfRow(row, place) {
  * settles does not speak for it, whichever credential sent the read.
  */
 function forgetBookmarks() {
-  bookmarks.clear();
+  bookmarkStore.forget();
   bookmarkDrawn.main = null;
   bookmarkDrawn.side = null;
   // Nor is a removal of the other credential's put back under this one (`#420 bookmark-clear`).
@@ -33079,12 +33048,7 @@ function noteBookmark(payload) {
   if (!payload || !isBookmarkState(payload.bookmark)) return;
   if (legacyMarker !== null) legacyMarkerReads += 1;
   const channel = String((payload.channel && payload.channel.id) || currentChannelId());
-  const write = bookmarkWrites.get(channel);
-  if (write && (write.pending > 0 || sentEpochOf(payload) < write.from)) return;
-  const said = payload.bookmark;
-  const held = bookmarks.get(channel);
-  const moved = !held || !sameAnchor(held.anchor, said.anchor);
-  bookmarks.set(channel, { revision: said.revision, anchor: said.anchor || null, token: null, known: true });
+  const moved = bookmarkStore.note(channel, payload.bookmark, sentEpochOf(payload));
   if (moved && channel === currentChannelId()) redrawBookmark();
 }
 
@@ -33094,8 +33058,7 @@ function noteBookmark(payload) {
  * on its way. Undefined, and so not saved, while the server has said nothing of it.
  */
 function bookmarkToSave(channel) {
-  const held = heldBookmark(channel);
-  return held && held.known ? { revision: held.revision, anchor: held.anchor } : undefined;
+  return bookmarkStore.toSave(channel);
 }
 
 /**
@@ -33104,9 +33067,7 @@ function bookmarkToSave(channel) {
  * is newer: a read's, or the owner's own move. Not `known`: it is not the server speaking now.
  */
 function restoreSavedBookmark(channel, saved) {
-  const key = String(channel);
-  if (bookmarks.has(key) || !isBookmarkState(saved)) return;
-  bookmarks.set(key, { revision: saved.revision, anchor: saved.anchor || null, token: null, known: false });
+  bookmarkStore.restoreSaved(channel, saved);
 }
 
 /**
@@ -33114,14 +33075,7 @@ function restoreSavedBookmark(channel, saved) {
  * change starts with. Answers the change, for `sendBookmark` to write.
  */
 function stageBookmark(channel, anchor) {
-  const held = bookmarks.get(channel) || { revision: 0, anchor: null, token: null, known: false };
-  const move = { channel, before: held.anchor, anchor, token: {} };
-  bookmarks.set(channel, { ...held, anchor, token: move.token });
-  const write = bookmarkWrites.get(channel) || { pending: 0, from: 0 };
-  write.pending += 1;
-  readStateEpoch += 1;
-  bookmarkWrites.set(channel, write);
-  return move;
+  return bookmarkStore.stage(channel, anchor);
 }
 
 /**
@@ -33145,8 +33099,7 @@ function sendBookmark(move, { conditional = false, after = null, quiet = false }
       if (after && !(await after)) {
         outcome = "cancelled";
       } else {
-        const held = bookmarks.get(channel);
-        const revision = conditional && held ? held.revision : null;
+        const revision = conditional ? bookmarkStore.revision(channel) : null;
         const route = `/api/v1/channels/${encodeURIComponent(channel)}/bookmark`;
         answer = move.anchor
           ? await apiDecoded("BookmarkResponse", route, {
@@ -33165,29 +33118,15 @@ function sendBookmark(move, { conditional = false, after = null, quiet = false }
         problem = error;
       }
     } finally {
-      const write = bookmarkWrites.get(channel);
-      if (write) {
-        write.pending = Math.max(0, write.pending - 1);
-        readStateEpoch += 1;
-        write.from = readStateEpoch;
-      }
+      bookmarkStore.writeEnded(channel);
     }
-    const held = bookmarks.get(channel);
+    // The server's revision taken, and its anchor where the change is still this one's; taken back
+    // where the write failed (`Bookmarks.settle`).
+    const settled = bookmarkStore.settle(move, answer);
     // Gone with the credential that made it (`forgetBookmarks`): nothing to settle, or to say.
-    if (!held) return outcome;
-    const mine = held.token === move.token;
-    const shownBefore = held.anchor;
-    if (answer) {
-      const said = answer.bookmark;
-      bookmarks.set(channel, {
-        revision: said.revision,
-        anchor: mine ? said.anchor || null : held.anchor,
-        token: mine ? null : held.token,
-        known: true,
-      });
-    } else if (mine) {
-      bookmarks.set(channel, { ...held, anchor: move.before, token: null });
-    }
+    if (!settled) return outcome;
+    const { mine } = settled;
+    const shownBefore = settled.before;
     const now = bookmarkAnchor(channel);
     if (!sameAnchor(shownBefore, now) && channel === currentChannelId()) redrawBookmark();
     // Kept with the device's copy of the channel, for a page opened offline.
@@ -33395,8 +33334,7 @@ function adoptLegacyMarker() {
   if (legacyMarker === null) return;
   const channel = currentChannelId();
   const held = heldBookmark(channel);
-  const write = bookmarkWrites.get(channel);
-  if (!held || !held.known || (write && write.pending > 0)) return;
+  if (!held || !held.known || bookmarkStore.writing(channel)) return;
   const row = rowHolding(legacyMarker);
   if (!row) {
     if (legacyMarkerReads >= LEGACY_MARKER_READS) dropLegacyMarker();
