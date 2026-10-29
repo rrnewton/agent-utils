@@ -36,6 +36,8 @@ declare const pageFoldIn: LegacyImports["pageFoldIn"];
 declare const createRemovals: LegacyImports["createRemovals"];
 declare const forgetUnplaced: LegacyImports["forgetUnplaced"];
 declare const foldDeltaIn: LegacyImports["foldDeltaIn"];
+declare const foldLiveIn: LegacyImports["foldLiveIn"];
+declare const namedRecord: LegacyImports["namedRecord"];
 declare const allPageAnswersFor: LegacyImports["allPageAnswersFor"];
 declare const exactCount: LegacyImports["exactCount"];
 declare const goneByAbsence: LegacyImports["goneByAbsence"];

@@ -30,3 +30,5 @@ export { createCopyOrder } from "./order.ts";
 export type { CopyOrder } from "./order.ts";
 export { createRemovals, forgetUnplaced } from "./removals.ts";
 export type { Removals } from "./removals.ts";
+export { foldLiveIn, namedRecord } from "./live.ts";
+export type { LiveFoldDependencies } from "./live.ts";

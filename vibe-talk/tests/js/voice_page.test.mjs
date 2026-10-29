@@ -6570,6 +6570,36 @@ test("`#624 voice-page-modularity`: a delta folded into a store, from the module
   assert.deepStrictEqual(seen.map(([what]) => what), ["read", "gaps", "unchanged"]);
 });
 
+test("`#624 voice-page-modularity`: a live arrival folded into a store, from the module alone", () => {
+  const { emptyCanon, foldLiveIn, createCopyOrder, namedRecord } = CHANNELS;
+  const at = (s) => `2026-10-01T00:00:${String(s).padStart(2, "0")}Z`;
+  const canon = emptyCanon("c");
+  let arrivals = 0;
+  const ledger = createCopyOrder();
+  const deps = { ledger, orderNow: () => 4.5, nextArrival: () => ++arrivals };
+  const root = { id: "r", timestamp: at(1), thread: { id: "t", is_root: true, reply_count: 2, reply_count_exact: true, display_name: "Plans", summary: "s" },
+    reactions: [{ emoji: "x", count: 1 }], edited_timestamp: at(2), upstream_url: "https://example.com/r" };
+  canon.messages = [root];
+  canon.threads = [{ id: "t", updated_at: at(1), reply_count: 2, reply_count_exact: true }];
+  // The stream's copy of the root, bare: it keeps the store's thread record, reactions, edit mark, address and name.
+  const bare = { id: "r", timestamp: at(1), content: "root" };
+  const kept = foldLiveIn(canon, bare, true, false, null, deps);
+  assert.deepStrictEqual([kept.thread.id, kept.reactions.length, kept.edited_timestamp, kept.upstream_url, kept.thread.display_name],
+    ["t", 1, at(2), "https://example.com/r", "Plans"]);
+  assert.equal(ledger.isPosted(kept), true, "the stream's copy does not say the message as it was posted");
+  // A new reply from the stream counts on its thread's summary and on the root's copy.
+  const reply = { id: "1", timestamp: at(5), thread: { id: "t", is_root: false, reply_count: null, reply_count_exact: false } };
+  foldLiveIn(canon, reply, true, false, null, deps);
+  assert.deepStrictEqual([canon.threads[0].reply_count, canon.messages.find((m) => m.id === "r").thread.reply_count], [3, 3]);
+  // ...but a replayed copy does not.
+  foldLiveIn(canon, { ...reply, id: "2", timestamp: at(6) }, true, true, null, deps);
+  assert.equal(canon.threads[0].reply_count, 3);
+  // A bare live copy of a message no page placed is unplaced, numbered in the order of arrivals.
+  foldLiveIn(canon, { id: "u", timestamp: at(7) }, true, false, null, deps);
+  assert.deepStrictEqual([canon.unplaced.has("u"), canon.unplacedSince.get("u")], [true, 1]);
+  assert.deepStrictEqual([namedRecord(root), namedRecord(reply), namedRecord(null)], [root.thread, null, null]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -52282,8 +52312,8 @@ test("the live echo of a message, which carries no reactions, does not wipe the 
 });
 
 test("negative control: without the rule, the live echo does wipe the reactions from the store", async () => {
-  const page = await reactedThreadPage(brokenScript(
-    "if (held && Array.isArray(held.reactions) && !Array.isArray(kept.reactions)) {", "if (false) {"));
+  const page = await reactedThreadPage(await brokenModule([{ file: "src/core/channels/live.ts",
+    find: "if (held && Array.isArray(held.reactions) && !Array.isArray(kept.reactions)) {", replace: "if (false) {" }]));
   page.timeline = errorResponse(502, "chat_error", "history read timed out");
   const { reactions: _unseen, ...echo } = page.messages.find((m) => m.id === "200");
   await deliver(page, page.stream(), sseMessage({ ...echo, content: "main channel announcement, edited" }));
@@ -52550,8 +52580,8 @@ test("a live copy that does not say when a message was edited keeps the mark a r
 });
 
 test("negative control: without the rule, the live echo does take the edit from the store", async () => {
-  const page = await reactedThreadPage(brokenScript(
-    "if (held && held.edited_timestamp && !kept.edited_timestamp) {", "if (false) {"));
+  const page = await reactedThreadPage(await brokenModule([{ file: "src/core/channels/live.ts",
+    find: "if (held && held.edited_timestamp && !kept.edited_timestamp) {", replace: "if (false) {" }]));
   const read = page.messages.find((m) => m.id === "200");
   page.messages = page.messages.map((m) => (m.id === "200" ? { ...m, edited_timestamp: "2026-08-19T04:45:00.000Z" } : m));
   await pollOnce(page);
@@ -57503,12 +57533,12 @@ test("`#231 two-column-polish`: a live reply counts on its thread's card and on 
 
   // The controls. Without the count a live reply adds, the card and the root stay where the reads left
   // them; counting a replayed copy too counts it on the card.
-  const uncounted = await replies(brokenScript("  const fresh = !held && !replayed && read === null && thread !== null",
-    "  const fresh = false && thread !== null"));
+  const uncounted = await replies(await brokenModule([{ file: "src/core/channels/live.ts",
+    find: "  const fresh = !held && !replayed && read === null && thread !== null", replace: "  const fresh = false && thread !== null" }]));
   assert.match(uncounted.live.first, / · 3 replies$/, "the negative control counted the reply, so the check above proves nothing");
   assert.equal(uncounted.live.badge, "Thread(3)");
-  const replayCounted = await replies(brokenScript("  const fresh = !held && !replayed && read === null && thread !== null",
-    "  const fresh = !held && read === null && thread !== null"));
+  const replayCounted = await replies(await brokenModule([{ file: "src/core/channels/live.ts",
+    find: "  const fresh = !held && !replayed && read === null && thread !== null", replace: "  const fresh = !held && read === null && thread !== null" }]));
   assert.match(replayCounted.afterReplay, / · 5 replies$/,
     "the negative control did not count the replayed reply, so the check above proves nothing");
 });
@@ -77991,7 +78021,8 @@ const threadOfSaved = (page, id) => {
   return saved && saved.thread ? saved.thread.id : null;
 };
 /** The rule that a reply's read of All counts no reply on its root, for a negative control. */
-const REPLY_PLACE_COUNTS_NOTHING = ["!held && !replayed && read === null && thread !== null", "!held && !replayed && thread !== null"];
+const REPLY_PLACE_COUNTS_NOTHING = { file: "src/core/channels/live.ts",
+  find: "!held && !replayed && read === null && thread !== null", replace: "!held && !replayed && thread !== null" };
 
 test("`#328 removal-outside-window`: a message the stream reports removed is taken out by the next newest page of its view even when it is older than that page reaches back to", async () => {
   const run = async (script = SCRIPT) => {
@@ -78062,7 +78093,7 @@ test("`#328 removal-outside-window`: a reply the stream left unplaced, taken out
   assert.equal(page.screen(), "main", "the premise is Main on screen after the send");
   assert.equal(threadButton(rowOf(page, "201")).textContent, "2 replies", "Main's root says another count than its thread has");
   // THE CONTROL: the reply's read of All counting what it puts back as a new reply: 3 for a thread of 2.
-  const control = await run(brokenScript(...REPLY_PLACE_COUNTS_NOTHING));
+  const control = await run(await brokenModule([REPLY_PLACE_COUNTS_NOTHING]));
   assert.equal(savedMessage(control, "201").thread.reply_count, 3, "the put-back reply was not counted again anyway, so this test cannot see it");
 });
 
@@ -78396,7 +78427,8 @@ for (const change of ["edit", "pushed edit", "removal"]) {
 
     // THE CONTROL: the root's count stamped as new as the moment the live reply moved it on, Main's page,
     // sent before then, refuses its copy of the root, or its removal, and the polls after never bring it.
-    const control = await run(brokenScript("    buildCopyOn(counted, root);\n", "    orderCopy(counted, orderNow());\n"));
+    const control = await run(await brokenModule([{ file: "src/core/channels/live.ts",
+      find: "    deps.ledger.buildCopyOn(counted, root);\n", replace: "    deps.ledger.orderCopy(counted, deps.orderNow());\n" }]));
     if (change === "removal") {
       assert.ok(control.landed.shown.includes("201") && control.landed.saved,
         "Main's page took the root out anyway, so this test cannot see it");
@@ -78493,8 +78525,8 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not und
 
   // THE CONTROL: the root's count taken for older in what it says than any page, as a live message is, the
   // read for the counts takes its copy of the root over it, from before the edit.
-  const control = await run(brokenScript("    buildCopyOn(counted, root);\n",
-    "    buildCopyOn(counted, root);\n    copyLedger.markPosted(counted);\n"));
+  const control = await run(await brokenModule([{ file: "src/core/channels/live.ts", find: "    deps.ledger.buildCopyOn(counted, root);\n",
+    replace: "    deps.ledger.buildCopyOn(counted, root);\n    deps.ledger.markPosted(counted);\n" }]));
   assert.equal(control.landed.saved, "first thread root", "the edit survived anyway, so this test cannot see it");
 });
 
