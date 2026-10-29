@@ -317,6 +317,15 @@ pub trait AgentApi: Send + Sync {
     fn verifies_muse_followups(&self) -> bool {
         false
     }
+    /// Whether this client's `working` wait after an unconfirmed submission proves on screen that
+    /// the pane took the prompt, as a verified submission receipt does: an idle Muse pane's wait
+    /// returns only once the prompt left its editor for a new user turn, its input queue or its
+    /// journal. A drain then counts the delivery as verified, so a chat request typed into an
+    /// idle Muse earns its ✅ receipt like one steered into a working Muse (#700
+    /// chat-receipt-idle-muse). Herdr's lifecycle state alone proves nothing about the prompt.
+    fn working_wait_proves_printed(&self) -> bool {
+        false
+    }
 }
 
 impl AgentApi for HerdrClient {
@@ -2480,7 +2489,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
             runtime,
         ) {
             Ok(()) => Ok(Delivered::Confirmed {
-                verified: false,
+                verified: client.working_wait_proves_printed(),
                 evidence: None,
             }),
             Err(error) => misrouted(&error).unwrap_or_else(|| {
@@ -2516,7 +2525,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
         match client.wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime) {
             Ok(()) => {
                 return Ok(Delivered::Confirmed {
-                    verified: false,
+                    verified: client.working_wait_proves_printed(),
                     evidence: None,
                 })
             }
@@ -3415,6 +3424,7 @@ mod tests {
         readiness_checks: usize,
         misroute_submit: bool,
         verify_muse: bool,
+        working_proves_printed: bool,
     }
 
     struct FakeAgent {
@@ -3494,6 +3504,10 @@ mod tests {
     impl AgentApi for FakeAgent {
         fn verifies_muse_followups(&self) -> bool {
             self.state.lock().unwrap().verify_muse
+        }
+
+        fn working_wait_proves_printed(&self) -> bool {
+            self.state.lock().unwrap().working_proves_printed
         }
 
         fn codex_idle_ready_with_runtime(
@@ -3995,6 +4009,35 @@ mod tests {
                     .lock()
                     .expect("queue counts")
                     .push((count("inflight"), count("processed")));
+            }
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_submission_counts_as_printed_only_when_the_working_wait_proves_it() {
+        // #700 chat-receipt-idle-muse: an idle Muse takes an unconfirmed submission whose
+        // `working` wait reads the prompt off the screen, so the drain reports it printed and a
+        // chat request earns its receipt. A wait on Herdr's lifecycle state alone stays unproven.
+        for proves in [true, false] {
+            let directory = TestDirectory::new(&format!("working-proves-{proves}"));
+            let fake = FakeAgent::new(&["idle"]);
+            fake.state.lock().unwrap().working_proves_printed = proves;
+            let runtime = PrintNotingRuntime::default();
+            enqueue(directory.path(), "an owner request", Some("chat-proof")).unwrap();
+            let result = drain_with_runtime(
+                &fake,
+                &target(),
+                directory.path(),
+                DrainOptions::default(),
+                &runtime,
+            )
+            .unwrap();
+            assert_eq!(result.delivered, ["chat-proof"], "{proves}: {result:?}");
+            let printed = runtime.printed.lock().unwrap().clone();
+            if proves {
+                assert_eq!(printed, ["chat-proof"]);
+            } else {
+                assert!(printed.is_empty(), "{printed:?}");
             }
         }
     }

@@ -1,10 +1,11 @@
 ---
 title: 'chat-requests-unbatched: owner messages are never batched; working-pane batching off by default'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-10-29T20:32:31.572862183+00:00
-updated_at: 2026-10-29T20:32:31.572862183+00:00
+updated_at: 2026-10-29T21:16:08.350114992+00:00
+closed_at: 2026-10-29T21:16:08.350114852+00:00
 ---
 
 # Description

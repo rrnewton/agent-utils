@@ -4554,6 +4554,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     fn verifies_muse_followups(&self) -> bool {
         self.uses_muse_composer()
     }
+    fn working_wait_proves_printed(&self) -> bool {
+        // The Muse `working` wait reads the screen for the submitted prompt (see
+        // `wait_agent_status_with_runtime_unchecked`), never Herdr's state alone.
+        self.uses_muse_composer()
+    }
     fn codex_idle_ready_with_runtime(
         &self,
         info: &AgentPaneInfo,

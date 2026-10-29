@@ -109,6 +109,44 @@ fn owned_muse_delivers_at_every_footer_mode_and_through_a_collapsed_paste() {
     }
 }
 
+// #700 chat-receipt-idle-muse: a prompt typed into an idle Muse is proved by the screen (it left
+// the editor for a new user turn), so the drain reports it printed and a chat request earns its
+// ✅ receipt, as one steered into a working Muse does. Before, an idle Muse's delivery was
+// confirmed but never reported printed, so the bridge saved no receipt.
+#[test]
+fn a_prompt_typed_into_an_idle_muse_is_reported_printed() {
+    struct Noting {
+        inner: agent::SystemRuntime,
+        printed: Mutex<Vec<String>>,
+    }
+    impl agent::AgentRuntime for Noting {
+        fn monotonic(&self) -> Duration {
+            self.inner.monotonic()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.inner.sleep(duration);
+        }
+        fn prompt_printed(&self, message_id: &str) {
+            self.printed.lock().unwrap().push(message_id.to_owned());
+        }
+    }
+    let fixture = Fixture::new();
+    let manager = start_muse(&fixture);
+    *fixture.client.status.lock().unwrap() = Some("done".to_owned());
+    *fixture.client.muse_editor.lock().unwrap() =
+        Some(MuseEditor::new("Launch overrides", true, None));
+    let runtime = Noting {
+        inner: agent::SystemRuntime::default(),
+        printed: Mutex::new(Vec::new()),
+    };
+    let id = format!("chat-{}", "a".repeat(64));
+    let result = manager
+        .send_identified_with_runtime("worker", "an owner request", held(), &id, &runtime)
+        .unwrap();
+    assert_eq!(result.delivered, [id.as_str()], "{result:?}");
+    assert_eq!(*runtime.printed.lock().unwrap(), [id]);
+}
+
 // New: every refusal raised before any input leaves the prompt pending (exit 75), never
 // quarantined as possibly submitted (#395 muse-launch-overrides-input).
 #[test]
