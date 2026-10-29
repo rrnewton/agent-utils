@@ -364,4 +364,53 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
         serde_json::from_slice::<Value>(&list.stdout).unwrap(),
         json!([])
     );
+
+    // Every step above extended the session lineage (#686 agent-turnover).
+    let history = fixture.agentctl_json(&["history", "worker", "--json"]);
+    let steps: Vec<(String, String)> = history["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            let detail = entry
+                .get("relation")
+                .or_else(|| entry.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (
+                entry["kind"].as_str().unwrap().to_owned(),
+                detail.to_owned(),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String)> = [
+        ("generation", "start"),
+        ("ended", "died"),
+        ("generation", "resume"),
+        ("ended", "stopped"),
+    ]
+    .iter()
+    .map(|(kind, detail)| ((*kind).to_owned(), (*detail).to_owned()))
+    .collect();
+    assert_eq!(steps, expected, "{history:#}");
+    let entries = history["entries"].as_array().unwrap();
+    assert!(entries
+        .iter()
+        .all(|entry| entry["session"] == json!(session) && entry["line"] == history["line"]));
+    assert_eq!(history["sessions"], 1);
+    let adopted = fixture.agentctl_json(&["history", "manual-agent", "--json"]);
+    let kinds: Vec<&str> = adopted["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry.get("relation").or_else(|| entry.get("reason")))
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(kinds, ["adopt", "stopped"], "{adopted:#}");
+    let owners = fixture.agentctl_json(&["history", "--session", &session, "--json"]);
+    assert!(owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|owner| owner["name"] == "worker"));
 }

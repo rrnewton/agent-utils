@@ -209,6 +209,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl tail coordinator --follow\n  agentctl tail coordinator --last 50 --types assistant.text,turn.\n  agentctl tail coordinator --json --since 4180\n  agentctl tail coordinator --at 4182\n\nThe log is REGISTRY/agents/NAME/events/<generation>.jsonl (schema v1, one JSON object per line; see\n`agentctl userguide`). Any number of tails may run beside the agent; closing one never touches it.\nA hole in the sequence (pruned or unreadable lines) prints as a gap line. Not to be confused with\n`agentctl read --output tail`, which reads an interactive agent's pane."
     )]
     Tail(Tail),
+    /// List the harness sessions an agent name has run, oldest first: how each began (start, adopt, resume, fresh, rebound, takeover, handback), how it ended, and its transcript; read-only
+    #[command(
+        after_help = "Examples:\n  agentctl history cl-foo\n  agentctl history cl-foo --all --json\n  agentctl history --session 10154bdf-b1c8-411a-80b2-55d024f32713\n\nLifecycle commands (start, adopt, attach-self, stop, retire-stale-registration, revive, rename,\nrestore, takeover, handback, bind-session, anchor) append to REGISTRY/.lineage/NAME/entries.jsonl after they run (schema agentctl-lineage/v1).\nThe lineage is advisory: routing never reads it, and generations nothing recorded (before this\nbuild, or by another build) are filled in from REGISTRY/archive/ and the live record, marked\nunrecorded. A line groups one continuous piece of work; start begins a new one. Times are\nlocal (set TZ to choose the zone). Exit 1 when the name has no entries, archived generations or\nlive record."
+    )]
+    History(History),
     /// Run a headless agent's wrapper in the foreground: one persistent harness process (Claude Code stream-json) that is the only drainer of the agent's queue; normally run by a systemd user unit
     #[command(
         after_help = "Examples:\n  agentctl run-headless coordinator\n  agentctl install-units --headless coordinator --dest ~/.config/systemd/user\n\nThe wrapper resumes the agent's recorded session when Claude Code has a transcript for it,\nrecovers inputs a previous wrapper left in flight from that transcript, writes the event log,\nand serves REGISTRY/agents/NAME/control.sock. SIGTERM closes the harness's input, waits up to 60 s for\nit to finish, and exits 0. An unexpected harness exit restarts it with --resume (backoff, at\nmost 5 in 10 minutes), then exits 1. Exit 75 when another wrapper already serves NAME."
@@ -411,6 +416,26 @@ struct InstallUnits {
     /// CLAUDE_CONFIG_DIR when set, and the claude found on PATH
     #[arg(long, value_name = "NAME", conflicts_with = "bridge_unit")]
     headless: Option<String>,
+}
+
+#[derive(Args)]
+struct History {
+    /// Agent name whose sessions to list (required unless --session); a former name works too
+    #[arg(
+        value_name = "NAME",
+        required_unless_present = "session",
+        conflicts_with = "session"
+    )]
+    name: Option<String>,
+    /// Include earlier lines too: work the name ran before its latest fresh start
+    #[arg(long, conflicts_with = "session")]
+    all: bool,
+    /// Print the history as one JSON document instead of text
+    #[arg(long)]
+    json: bool,
+    /// List the agents (name and generation token) that ran this harness conversation ID instead
+    #[arg(long, value_name = "ID")]
+    session: Option<String>,
 }
 
 #[derive(Args)]
@@ -1870,7 +1895,19 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
     let stop_context = matches!(&args.command, Some(Commands::Stop(_)))
         .then(|| StopContext::new(&args.registry, &args.herdr_bin));
     let service_log = args.writes_service_log();
-    match run(args, environment) {
+    // Lifecycle commands extend the agents' session lineage (#686 agent-turnover).
+    let lineage = args
+        .command
+        .as_ref()
+        .and_then(lineage_action)
+        .map(|action| crate::lineage::Observation::before(&args.registry, action));
+    let outcome = run(args, environment);
+    if let Some(observation) = lineage {
+        for warning in observation.after(matches!(outcome, Ok(0))) {
+            eprintln!("{warning}");
+        }
+    }
+    match outcome {
         Ok(code) => code,
         Err(Failure::Agent(error)) => emit_agent_failure(
             service_log,
@@ -2101,6 +2138,69 @@ fn write_text(text: &str) -> io::Result<()> {
     output.flush()
 }
 
+/// The lineage action of a lifecycle command; `None` for everything else, dry runs included.
+fn lineage_action(command: &Commands) -> Option<crate::lineage::Action> {
+    use crate::lineage::Action;
+    Some(match command {
+        Commands::Start(value) => Action::Start(value.agent.name.clone()),
+        Commands::Adopt(value) => Action::Adopt(value.agent.name.clone()),
+        Commands::AttachSelf(value) => Action::Adopt(value.agent.name.clone()),
+        Commands::RetireStaleRegistration(value) if !value.dry_run => {
+            Action::Retire(value.agent.name.clone())
+        }
+        Commands::Stop(value) => Action::Stop(value.agent.name.clone()),
+        Commands::Revive(value) if !value.dry_run => Action::Revive(value.name.clone()),
+        Commands::Rename(value) => Action::Rename(value.agent.name.clone(), value.new_name.clone()),
+        Commands::Restore(value) if !value.dry_run => Action::Restore,
+        Commands::Takeover(value) => Action::Takeover(value.agent.name.clone()),
+        Commands::Handback(value) => Action::Handback(value.agent.name.clone()),
+        Commands::BindSession(value) => Action::Bind(value.agent.name.clone()),
+        Commands::Anchor(value) => Action::Bind(value.agent.name.clone()),
+        _ => return None,
+    })
+}
+
+fn run_history(registry: &Path, value: &History) -> Result<i32, Failure> {
+    if let Some(session) = &value.session {
+        let owners = crate::lineage::session_owners(registry, session).map_err(Failure::Usage)?;
+        let found = owners["owners"]
+            .as_array()
+            .is_some_and(|list| !list.is_empty());
+        if value.json {
+            write_json(&owners).map_err(Failure::Output)?;
+        } else if found {
+            for owner in owners["owners"].as_array().into_iter().flatten() {
+                println!(
+                    "{}  token {}  ({})",
+                    owner["name"].as_str().unwrap_or("?"),
+                    owner["token"].as_str().unwrap_or("?"),
+                    owner["source"].as_str().unwrap_or("?")
+                );
+            }
+        } else {
+            eprintln!(
+                "agentctl history: no agent in {} ran session {session}",
+                registry.display()
+            );
+        }
+        return Ok(i32::from(!found));
+    }
+    let name = value
+        .name
+        .as_deref()
+        .expect("clap requires NAME or --session");
+    let history = crate::lineage::history(registry, name, value.all).map_err(Failure::Usage)?;
+    let found = history["entries"]
+        .as_array()
+        .is_some_and(|list| !list.is_empty());
+    if value.json {
+        write_json(&history).map_err(Failure::Output)?;
+    } else {
+        print!("{}", crate::lineage::render(&history));
+    }
+    Ok(i32::from(!found))
+}
+
 /// `agentctl tail NAME`: read the agent's event log without touching the agent.
 fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
     let name = &value.agent.name;
@@ -2302,6 +2402,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             print!("{}", crate::QUICKSTART);
             return Ok(0);
         }
+        Commands::History(value) => return run_history(&args.registry, &value),
         Commands::Userguide => {
             print!("{}", crate::USER_GUIDE);
             return Ok(0);
@@ -3237,7 +3338,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Watch(_)
         | Commands::WatchAgents(_)
         | Commands::Hold(_)
-        | Commands::Tail(_) => {
+        | Commands::Tail(_)
+        | Commands::History(_) => {
             unreachable!()
         }
     };

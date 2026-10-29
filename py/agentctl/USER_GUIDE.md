@@ -806,6 +806,45 @@ marks the record `running`; it never touches the tab, pane, or process. A
 harness busy running a tool has several foreground processes; rerun at a quiet
 moment.
 
+### Session lineage and history (Rust edition)
+
+One agent name can run several harness sessions over its life. A revive resumes
+the same conversation, and a fresh start under a reused name begins another.
+`agentctl history` lists them, oldest first:
+
+```sh
+agentctl history reviewer               # the current line of work
+agentctl history reviewer --all --json  # every line, as JSON
+agentctl history --session 10154bdf-b1c8-411a-80b2-55d024f32713   # who ran it
+```
+
+Each generation shows how it began (`relation`), its session, its record token,
+its status (`live`, `live as NEW` after a rename, how it ended, or `archived`),
+and its transcript when the
+harness keeps one. Relations are `start`, `adopt`, `resume` (revived on the
+same session), `fresh` (revived on another or no session), `rebound` (the
+record's session changed in place, by `bind-session` or `anchor`), `takeover`
+and `handback`. A *line* groups one continuous piece of work. `start` begins a
+new line, so a reused name never runs two unrelated agents together, and
+without `--all` only the current line is shown. `rename` links the two names,
+and `history NEW` includes what the agent ran as OLD.
+
+`start`, `adopt`, `attach-self`, `stop`, `retire-stale-registration`,
+`revive`, `rename`, `restore`, `takeover`, `handback`, `bind-session` and
+`anchor` append entries to
+`REGISTRY/.lineage/NAME/entries.jsonl` after they run. The file is append-only,
+one JSON object per line, schema `agentctl-lineage/v1`. The leading dot keeps
+the directory out of every build's scan for agents. The lineage is advisory:
+routing, liveness and locks read `agent.json` only, and an entry that cannot be
+written is a warning that changes no command's outcome. Generations that
+nothing recorded are filled in from `REGISTRY/archive/` and the live record and
+shown as unrecorded: anything from before this build, or run by a build without
+lineage. In the default view these appear when they are newer than the start of
+the current line. A change two commands record at once (a boot restore and a
+manual revive) is written once. Readers ignore keys and kinds they do not know.
+A writer refuses to add to a file that holds entries of a newer major schema,
+and gives up with a warning after waiting 5 seconds for another writer's lock.
+
 ### Restore a team after the host restarts (Rust edition)
 
 After a reboot every harness is gone, the Herdr server may not be running, and

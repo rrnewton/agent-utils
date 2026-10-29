@@ -49,16 +49,20 @@ in a fresh session from a handoff message. The owner asked two things:
 ## Lineage store
 
 ```text
-REGISTRY/lineage/agent.json             tripwire (a JSON string, like agents/agent.json)
-REGISTRY/lineage/<name>/entries.jsonl   append-only, one JSON object per line
-REGISTRY/lineage/<name>/turnover.json   the journal of a turnover in progress (absent otherwise)
-REGISTRY/lineage/<name>/handoffs/       one file per turnover: <seq>.md (a collection, so its own directory)
+REGISTRY/.lineage/<name>/entries.jsonl   append-only, one JSON object per line
+REGISTRY/..lineage/<name>/turnover.json   the journal of a turnover in progress (absent otherwise)
+REGISTRY/.lineage/<name>/handoffs/       one file per turnover: <seq>.md (a collection, so its own directory)
 ```
 
 The lineage lives outside `agents/<name>/` because that directory is archived and replaced at
-every stop and revive, while the lineage must outlive generations. `lineage/` holds one
+every stop and revive, while the lineage must outlive generations. The directory's name starts
+with a dot, as `.renames/` does. Every build, the other edition included, lists registry-root
+entries named like agents (`[a-z][a-z0-9-]*`) as layout-1 agents. A plain `lineage/` would
+therefore show up as a broken agent in the deployed bridge's and watcher's listings, and no
+reserved name or tripwire added now could reach those builds. `.lineage/` holds one
 collection (names); each name's directory holds fixed files plus the `handoffs/` collection.
-This follows the design rule.
+This follows the design rule. (Amended while implementing piece 1: the first draft of this note
+proposed `lineage/` with a tripwire.)
 
 Entry (one line; schema `agentctl-lineage/v1`):
 
@@ -87,11 +91,8 @@ Compatibility rules:
 - **Forward:** readers ignore unknown keys and unknown `kind`s. A writer that finds a line with
   a schema major it does not know (`agentctl-lineage/v2`) refuses to append, fails closed and
   says so. `history` still prints such lines raw.
-- **Backward:** builds older than this one never read or write `lineage/`. `lineage` joins the
-  registry's reserved names. The tripwire `lineage/agent.json` is a JSON string, so an old
-  build asked for an agent named `lineage` finds an unreadable record and refuses, rather than
-  writing into it (the same trick as layout 2's `agents/agent.json`). A registry that already
-  has an agent named `lineage` is refused before the directory is created.
+- **Backward:** builds older than this one never read or write `.lineage/`, and its leading
+  dot keeps it out of their agent scans, so nothing changes for them.
 - **Backfill:** `history` derives entries for generations no new build recorded (anything
   before this change, anything the Python edition or an old build revived) from
   `archive/<name>-<token>/agent.json` and the live record, marked `derived` with relation
@@ -108,14 +109,14 @@ history --session ID` answers which agent owned a session.
 
 `agentctl turnover NAME [--handoff-timeout 15m] [--interrupt] [--handoff FILE] [--no-ask]`
 
-The journal `lineage/<name>/turnover.json` records `phase`, a nonce, the old token and
+The journal `.lineage/<name>/turnover.json` records `phase`, a nonce, the old token and
 session, the handoff path, and timestamps. Every phase is idempotent, and rerunning the same
 command continues from the recorded phase.
 
 | Phase | What happens | Leaving it |
 |---|---|---|
 | `requested` | Checks: the agent is local, running and not paused; no takeover; no other turnover; its harness can start a fresh session from the launch spec. Writes the journal. | `asking`, or `captured` when `--handoff FILE` or `--no-ask` |
-| `asking` | Queues one prompt, via the normal send path with an `agentctl turnover` header: "write your handoff to PATH (what you were doing, its state, the commits and branch, what is next, open questions, open chat requests), end it with the line `<!-- agentctl-turnover NONCE -->`, then stop." PATH is `lineage/<name>/handoffs/<seq>.md`. The prompt waits for the turn boundary, unless `--interrupt`. | `captured` when PATH ends with the nonce line and the agent is idle (headless: `turn.completed`; pane: the usual idle check). On a timeout, see failures. |
+| `asking` | Queues one prompt, via the normal send path with an `agentctl turnover` header: "write your handoff to PATH (what you were doing, its state, the commits and branch, what is next, open questions, open chat requests), end it with the line `<!-- agentctl-turnover NONCE -->`, then stop." PATH is `.lineage/<name>/handoffs/<seq>.md`. The prompt waits for the turn boundary, unless `--interrupt`. | `captured` when PATH ends with the nonce line and the agent is idle (headless: `turn.completed`; pane: the usual idle check). On a timeout, see failures. |
 | `captured` | Records the handoff's sha256. Pending queue items stay where they are. | `stopping` |
 | `stopping` | Stops the old harness the way `stop` does, but publishes through revive's journaled two-step: the old directory and its queue go to the archive, and an `ended` entry is appended. | `starting` |
 | `starting` | Launches from the launch spec with the session flags replaced by a new session ID (per harness: Claude Code `--session-id NEW` in place of `--resume`/`--session-id OLD`). Appends the `generation` entry with `relation: turnover`. Runs `wrkslots transfer-owner` for a slot agent, as restore does. Registers the new pane in other registries that name the agent (the chat bridge's), as restore does. | `feeding` |
@@ -137,7 +138,7 @@ command continues from the recorded phase.
   `ended`/`generation` pair.
 
 The issue suggests the lineage live on the agent record, in a subdirectory once it grows. It
-goes beside the record instead, under `REGISTRY/lineage/<name>/`, for the two reasons above:
+goes beside the record instead, under `REGISTRY/.lineage/<name>/`, for the two reasons above:
 the agent directory is replaced at every generation, and the strict row contracts leave no
 room for it in `agent.json`.
 
@@ -182,7 +183,7 @@ room for it in `agent.json`.
   turnover prompt does not ask for one.
 - **Watcher:** reads the journal. It reports no "dead" or "idle without verdict" for an agent in
   `stopping`..`feeding`, and resets its per-agent timers at `done`. It sends one notice: "NAME
-  turned over: session OLD → NEW, handoff lineage/NAME/handoffs/7.md". A turnover stuck in one
+  turned over: session OLD → NEW, handoff .lineage/NAME/handoffs/7.md". A turnover stuck in one
   phase for more than 30 minutes is reported like a stall.
 - **Chat bridge:** it targets the agent by name, and its pane registration is refreshed in
   `starting`. Open chat requests survive because their request keys appear in the handoff, and
@@ -201,7 +202,7 @@ room for it in `agent.json`.
 
 ## Open questions for the owner
 
-1. Is the handoff location `REGISTRY/lineage/<name>/handoffs/<seq>.md` right? It is
+1. Is the handoff location `REGISTRY/.lineage/<name>/handoffs/<seq>.md` right? It is
    agentctl-owned and survives `/tmp` cleanup. `--handoff-dir` could override it.
 2. When the agent does not answer: stop and leave it running (proposed), or fall back to the
    mechanical handoff automatically?
