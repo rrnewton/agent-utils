@@ -153,3 +153,10 @@ exact local commit receipts, reply capture, explicit route closure and bounded
 retirement, fail-closed provider gaps, recovery, and service-manager limits. A
 status with `healthy: false` and an unresolved gap is not live success; protocol
 v1 intentionally refuses automatic reconnect.
+
+Only one bridge may serve a channel: a second `run` on a channel that already
+has a live bridge on this host exits at startup and names it. To point a running
+bridge at another registered agent without restarting it, run
+`agentctl --registry REG chat repoint --bridge-state DIR --agent NAME`; waiting
+requests move to the new agent, and any that may already have reached the old
+one are listed as uncertain rather than typed twice.

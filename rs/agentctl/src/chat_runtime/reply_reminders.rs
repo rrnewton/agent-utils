@@ -314,6 +314,9 @@ then start again from that time",
     /// the post-rate breaker holds back included, newest delivery first, each with the reply ID
     /// its prompt gave; and the key of every request the state retains.
     pub(crate) fn reply_reminder_candidates(&self) -> Result<ReminderCandidates> {
+        // A prompt typed before the bridge was repointed went to the previous agent, which the
+        // current one cannot answer for (#677 chat-bridge-repoint).
+        let retargeted_at = self.retargeted_at_millis().unwrap_or(0);
         let (records, alias_record) = {
             let _snapshot = self.lock_state_snapshot()?;
             (self.request_records()?, self.read_reply_aliases().ok())
@@ -331,7 +334,10 @@ then start again from that time",
             {
                 continue;
             }
-            let Some(delivered_at_millis) = record.delivered_at_millis else {
+            let Some(delivered_at_millis) = record
+                .delivered_at_millis
+                .filter(|delivered| *delivered >= retargeted_at)
+            else {
                 continue;
             };
             found.candidates.push(ReminderCandidate {

@@ -1221,6 +1221,11 @@ enum ChatCommand {
         after_help = "Example: agentctl chat accept-checkpoint-boundary --bridge-state /home/me/chat-state --keep-cursor <CURSOR> --expected-checkpoint-sha256 <SHA256> --expected-configuration-sha256 <SHA256>\n\nUse it when `chat status` reports a boundary_mismatch whose offered batch is a checkpoint only: the provider can resume at the saved inclusive cursor only as a checkpoint, while the saved boundary there also carried messages. The command refuses unless the service is stopped, the pins match, the cursor is the current one, no gap is unresolved, the boundary's provider commit is confirmed, and every saved boundary message is a stored request that is acknowledged and was delivered or replied to (or a retired request). It writes one audit under boundary-acceptances/ and removes boundary-mismatch.json; start the service afterwards. The cursor never moves backwards or skips: the provider's checkpoint at this cursor is admitted once and delivery resumes after it."
     )]
     AcceptCheckpointBoundary(ChatAcceptCheckpointBoundary),
+    /// Point a running bridge at another agent without restarting it
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl chat repoint --bridge-state ~/.local/state/agentctl/chat --agent coordinator\n  agentctl --registry ~/project/.agentctl chat repoint --bridge-state DIR --agent coord2 --pane w1:p4\n\nThe target is checked first: it must be registered in --registry, and either be a pane agent whose\npane is alive with a harness Herdr recognizes (in --pane when given), or a headless agent whose\nwrapper answers. The request is then recorded in the state directory's target.json, with who asked\nand when, and the running `chat run` is woken through its .wake.sock; it applies the request\nafter its current pass, without a restart, while its chat subscription stays up. With no service\nrunning, this command applies it itself. Applying it settles every request whose prompt has not\nreached the previous agent: a prompt still waiting in that agent's queue is taken back out and\nmoves to the new agent with the others; one the queue already typed stays delivered there; one\nthat may have reached it is marked uncertain and listed, never typed twice and never dropped.\nRequests delivered to the previous agent and not answered are listed: that agent can still answer\nthem with `agentctl chat reply`. agent_name in bridge.json is rewritten, so a restart keeps the\nnew target, and a notice is posted in the bridge's first channel.\n\nAny local agent of the same user may run it: the state directory's permissions are the authority.\nPrints one JSON object: request, service_running, service_woken, applied, and outcome (moved,\ndelivered_to_previous, awaiting_reply_from_previous, uncertain, pane_id) and summary once applied.\nExit status: 0 once applied; 1 when the target was refused or a newer repoint superseded this one;\n75 when the running service has not applied it within --wait (it still will)."
+    )]
+    Repoint(ChatRepoint),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
     /// Print one thread's retained messages as quoted text, oldest first, without writes
@@ -1357,6 +1362,22 @@ struct ChatInit {
     /// Private owner-only JSON bridge configuration (maximum 1 MiB)
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
+}
+
+#[derive(Args)]
+struct ChatRepoint {
+    #[command(flatten)]
+    state: ChatState,
+    /// Registered agent the bridge should type into from now on
+    #[arg(long, value_name = "NAME")]
+    agent: String,
+    /// Herdr pane the agent must be in; refused if the registry places it elsewhere (default: the
+    /// pane the registry records)
+    #[arg(long, value_name = "ID")]
+    pane: Option<String>,
+    /// Seconds to wait for a running service to apply the request, 1-600 (default: 30)
+    #[arg(long, value_name = "SECONDS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
+    wait: u64,
 }
 
 #[derive(Args)]
@@ -3321,6 +3342,26 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
+        }
+        ChatCommand::Repoint(value) => {
+            let client =
+                HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+            let manager = ManagedAgents::new(&client, &registry)?.with_lock_priority();
+            let requested_by = crate::sender_header::resolve_current(
+                manager.caller_edge().map(|edge| edge.agent),
+                std::env::var("AGENTCTL_AGENT").ok(),
+            );
+            let (result, code) = crate::chat_service::repoint(
+                &value.state.bridge_state,
+                &manager,
+                &value.agent,
+                value.pane.as_deref(),
+                requested_by.label(),
+                Duration::from_secs(value.wait),
+            )
+            .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(code)
         }
         ChatCommand::Inspect(value) => {
             let result =

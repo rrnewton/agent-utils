@@ -154,7 +154,7 @@ fn whole_duration_seconds(duration: Duration) -> Result<u64> {
 }
 
 impl BridgeState {
-    fn read_grant_configuration_locked(&self) -> Result<ConfigurationEnvelope> {
+    pub(super) fn read_grant_configuration_locked(&self) -> Result<ConfigurationEnvelope> {
         let envelope: ConfigurationEnvelope =
             read_document(&self.root.join("bridge.json"), 1 << 20)?;
         if envelope.version != STATE_VERSION {

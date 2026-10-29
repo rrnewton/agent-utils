@@ -37,9 +37,11 @@ use crate::subagents::{ManagedAgents, ManagedApi};
 mod grants;
 mod rejections;
 mod reply_reminders;
+mod repoint;
 
 pub use grants::{parse_grant_duration, SenderGrant, DEFAULT_MAX_GRANT_SECONDS};
 pub use rejections::RejectionSaves;
+pub use repoint::{RepointOutcome, RepointRequest, UncertainRequest};
 
 #[cfg(test)]
 pub(crate) use reply_reminders::REPLY_REMINDER_FILE;
@@ -7164,6 +7166,7 @@ impl BridgeState {
         });
         // Beside `phases`, outside the literal above, which is at the macro's recursion limit.
         status["stages"] = Value::Object(stages);
+        status["repoint"] = self.repoint_status_locked();
         Ok(status).map(|mut status| {
             if let Some(object) = status.as_object_mut() {
                 object.insert("slack_format".to_owned(), Value::from(slack_format));
