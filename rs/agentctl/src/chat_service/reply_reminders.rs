@@ -1019,14 +1019,14 @@ seen working and is idle again, or for {}s if it is not seen working",
             .into_iter()
             .partition(|candidate| printed.contains(&candidate.reply_id));
         for candidate in left_out {
+            // This one names Claude Code deliberately: the replies left out here are the
+            // ones a Claude Code transcript holds, the only transcript ever read for them.
             self.say(format_args!(
                 "agentctl: reply reminders: request {} (reply ID {}) is not reminded: the \
-coordinator's {} transcript holds a complete reply block under that ID that no read of \
+coordinator's Claude Code transcript holds a complete reply block under that ID that no read of \
 its pane has captured yet, as when the pane's view is scrolled away from its end; the bridge \
 sends that reply once the pane shows it",
-                candidate.key,
-                candidate.reply_id,
-                harness_display_name(info)
+                candidate.key, candidate.reply_id
             ));
             self.printed.insert(candidate.key);
         }
