@@ -88529,3 +88529,39 @@ test("`#650 cache-first-older-reads`: a counts read the server answered from its
   for (let i = 0; i < 3; i += 1) await control.page.settle();
   assert.equal(control.counted.length, 1, JSON.stringify(control.counted));
 });
+
+// The owner, 2026-10-29 (#624 voice-page-modularity): replies seen in Slack to a message posted moments
+// earlier, not seen here. Every way they may come in, by stream with the thread record, by stream
+// without one (left unplaced until a read places it), or by the poll's read alone, puts each reply in
+// All and counts it on the root's Thread(N) in Main.
+for (const how of ["stream", "bare-stream", "poll-only"]) {
+  test(`replies (${how}) to a message that arrived live moments earlier are in All and counted on Main`, async () => {
+    const { page } = await freshMessagePage();
+    await pickThread(page, "flat");
+    const thread = { id: "spaces/A/threads/live", root_message_id: "300", is_root: true, reply_count: 0, reply_count_exact: true };
+    const root = message({ id: "300", content: "the owner's new question", author: "owner", author_id: "1000000000000000099",
+      author_is_bot: false, thread });
+    page.messages = [...page.messages, root];
+    await deliver(page, page.stream(), sseMessage(root));
+    await page.settle();
+    for (const n of [1, 2, 3]) {
+      page.setClock(page.clock() + 27000);
+      const reply = message({ id: `30${n}`, content: `answer ${n}`, author: "bot", author_id: "1000000000000000088", author_is_bot: true,
+        thread: { ...thread, is_root: false, reply_count: null, reply_count_exact: false } });
+      page.messages = [...page.messages.map((m) => (m.id === "300" ? { ...m, thread: { ...thread, reply_count: n } } : m)), reply];
+      if (how === "stream") await deliver(page, page.stream(), sseMessage(reply));
+      if (how === "bare-stream") {
+        const { thread: _thread, ...bare } = reply;
+        await deliver(page, page.stream(), sseMessage(bare));
+      }
+      for (let i = 0; i < 3; i += 1) await page.settle();
+    }
+    page.setClock(page.clock() + DISCORD_POLL_MS);
+    await pollOnce(page);
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.deepStrictEqual(shownIds(page).filter((id) => id.startsWith("30")), ["300", "301", "302", "303"], `${how}: All lost a reply`);
+    await pickThread(page, "main");
+    assert.ok(!shownIds(page).includes("301"), `${how}: a reply was drawn on Main`);
+    assert.equal(tagOf(rowOf(page, "300")).text, "Thread(3)", `${how}: Main's root does not count its replies`);
+  });
+}
