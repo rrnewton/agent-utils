@@ -403,7 +403,7 @@ pub(crate) fn glob_parts(pattern: &str) -> Vec<String> {
         .collect()
 }
 
-fn fnmatch_component(pattern: &str, text: &str) -> bool {
+pub(crate) fn fnmatch_component(pattern: &str, text: &str) -> bool {
     // fnmatch.fnmatchcase for one path component: `*`, `?`, `[...]`.
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();

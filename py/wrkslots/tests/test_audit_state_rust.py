@@ -372,6 +372,67 @@ def test_audit_symlink_file_candidate_matches_python(tmp_path: Path) -> None:
     assert "cache path crosses a symlink" in str(row["cache_error"])
 
 
+def test_audit_planning_work_exhaustion_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _cache_fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text().replace("- cache\n", "- cache/**\n"))
+    python_payload = _python(root, tmp_path, work_limit=5)
+    rust_result = _rust(
+        root, census_state=tmp_path / "rust-census.json", work_limit=5
+    )
+    assert rust_result.returncode == 0, rust_result.stderr
+    assert _scrub(json.loads(rust_result.stdout)) == _scrub(python_payload)
+    row = _rows(python_payload)[0]
+    assert row["cache_status"] == "error"
+    assert "share of 5 directory listings" in str(row["cache_error"])
+
+
+def test_audit_planning_fair_share_matches_python(tmp_path: Path) -> None:
+    root = _cache_fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text().replace("- cache\n", "- cache/**\n"))
+    checkout = _ghost_checkout(root, tmp_path)
+    cache = checkout / "cache"
+    for index in range(30):
+        directory = cache / f"d{index}"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "f.bin").write_bytes(b"x" * 1024)
+    python_payload = _python(root, tmp_path, work_limit=6)
+    rust_result = _rust(
+        root, census_state=tmp_path / "rust-census.json", work_limit=6
+    )
+    assert rust_result.returncode == 0, rust_result.stderr
+    assert _scrub(json.loads(rust_result.stdout)) == _scrub(python_payload)
+    by_slot = {str(item["slot"]): item for item in _rows(python_payload)}
+    # Two planning targets: each is offered half of the six
+    # listings, and each exhausts exactly that share.
+    for slot in ("slot-a", "ghost"):
+        assert by_slot[slot]["cache_status"] == "error"
+        assert "share of 3 directory listings" in str(
+            by_slot[slot]["cache_error"]
+        )
+
+
+def test_audit_wrong_repository_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    _repo(tmp_path / "other-repo")
+    active_path = root / "worktrees" / "ACTIVE.node-a.json"
+    active = json.loads(active_path.read_text())
+    active["slots"][0]["checkouts"][0]["repository"] = "../other-repo"
+    active_path.write_text(json.dumps(active))
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    cache = root / "worktrees" / "slot-a" / "repo" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "f.bin").write_bytes(b"x" * 1024)
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["cache_status"] == "error"
+    assert "does not belong to repository" in str(row["cache_error"])
+
+
 def test_audit_cache_bytes_match_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     config = root / ".wrkslots.yml"

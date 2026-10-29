@@ -8,11 +8,12 @@
 //! and the disk/gate summary. Validation rows are judged by
 //! their run authority, including stable retained run handles.
 //! Unregistered agent slots plan their caches from the Git
-//! checkouts they contain. Resume-state reuse, validation-row
-//! nested-Git disposability judging, cache-planning budget
-//! exhaustion, journal-slot cache planning, and unreadable host
-//! evidence stay with the Python edition for now and refuse by
-//! name. Read-only.
+//! checkouts they contain, and every subject plans under a fair
+//! share of the planning work and wall allowances. Resume-state
+//! reuse, validation-row nested-Git disposability judging,
+//! journal-slot cache planning, and unreadable host evidence
+//! stay with the Python edition for now and refuse by name.
+//! Read-only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ use crate::canonical::canonical_sha256;
 use crate::config_validate::{load_config, refuse_symlink, relative_inside, validate_name};
 use crate::ensure_states::refuse_partial_state_allow_seals;
 use crate::finish_write::{
-    assert_cache_policy_untracked, cache_globs_for, glob_parts, glob_parts_match, stored_path,
+    assert_cache_policy_untracked, cache_globs_for, fnmatch_component, glob_parts, stored_path,
     stored_repository_path, verify_existing_worktree,
 };
 use crate::global_state::{discover_machines, load_event_chain};
@@ -473,107 +474,351 @@ fn judge_planned_candidate(
     None
 }
 
-/// Every cache directory the given globs name inside one
-/// checkout: the candidate paths, or the planning refusal.
-/// Matches of any entry kind are judged (a symlinked or
-/// mount-crossing match refuses); only real directories count.
-fn plan_cache_candidates(
+/// Python's `{value:g}` rendering for the wall allowance:
+/// six significant digits, fixed notation from 1e-4 up to (but
+/// not including) 1e6, scientific outside, exponent signed and
+/// at least two digits.
+fn fmt_g(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if !value.is_finite() {
+        return format!("{value}");
+    }
+    let scientific = format!("{value:.5e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .unwrap_or((scientific.as_str(), "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa
+        .chars()
+        .filter(|character| *character != '.' && *character != '-')
+        .collect::<String>()
+        .trim_end_matches('0')
+        .to_string();
+    let digits = if digits.is_empty() {
+        "0".to_string()
+    } else {
+        digits
+    };
+    let sign = if value < 0.0 { "-" } else { "" };
+    if !(-4..6).contains(&exponent) {
+        let fraction = if digits.len() > 1 {
+            format!(".{}", &digits[1..])
+        } else {
+            String::new()
+        };
+        return format!("{sign}{}{fraction}e{exponent:+03}", &digits[..1]);
+    }
+    if exponent >= 0 {
+        let split = (exponent + 1) as usize;
+        let mut integer = digits.to_string();
+        while integer.len() < split {
+            integer.push('0');
+        }
+        let (integer, fraction) = integer.split_at(split);
+        if fraction.is_empty() {
+            return format!("{sign}{integer}");
+        }
+        return format!("{sign}{integer}.{fraction}");
+    }
+    format!("{sign}0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+}
+
+#[cfg(test)]
+mod fmt_g_tests {
+    use super::fmt_g;
+
+    #[test]
+    fn renders_like_python_g() {
+        assert_eq!(fmt_g(60.0), "60");
+        assert_eq!(fmt_g(5.0), "5");
+        assert_eq!(fmt_g(2.5), "2.5");
+        assert_eq!(fmt_g(100_000.0), "100000");
+        assert_eq!(fmt_g(123_456.0), "123456");
+        assert_eq!(fmt_g(999_999.9), "1e+06");
+        assert_eq!(fmt_g(1_000_000.0), "1e+06");
+        assert_eq!(fmt_g(1_234_567.0), "1.23457e+06");
+        assert_eq!(fmt_g(0.001), "0.001");
+        assert_eq!(fmt_g(0.0001), "0.0001");
+        assert_eq!(fmt_g(0.00001), "1e-05");
+        assert_eq!(fmt_g(1e-9), "1e-09");
+        assert_eq!(fmt_g(0.0), "0");
+    }
+}
+
+/// One audit subject's share of cache-glob planning, mirroring
+/// the oracle's `_CachePlanBudget`: one work unit per directory
+/// listing, a fair share of the remaining wall allowance, and
+/// the oracle's two exhaustion spellings.
+struct PlanBudget {
+    work_limit: i64,
+    work_consumed: i64,
+    seconds: f64,
+    wall_total: f64,
+    spent: f64,
+}
+
+impl PlanBudget {
+    fn check(&self, walking: f64) -> Result<()> {
+        if self.spent + walking >= self.seconds {
+            return Err(format!(
+                "cache planning exhausted this subject's share of the fixed wall \
+                 allowance of {} seconds; no cache total can be published within \
+                 this allowance",
+                fmt_g(self.wall_total)
+            ));
+        }
+        if self.work_limit - self.work_consumed <= 0 {
+            return Err(format!(
+                "cache planning exhausted this subject's share of {} directory \
+                 listings; no cache total can be published within this allowance",
+                self.work_limit
+            ));
+        }
+        Ok(())
+    }
+
+    fn debit(&mut self, walking: f64) -> Result<()> {
+        self.check(walking)?;
+        self.work_consumed += 1;
+        Ok(())
+    }
+}
+
+/// Expand the globs below one checkout exactly as the oracle's
+/// `_expand_cache_globs_walk` does: a per-pattern position walk
+/// where `**` matches the directory itself and every descendant
+/// reached without following a symlink, a non-final component
+/// follows symlinks, and each directory listing is debited.
+/// Returns the matches per pattern, in the oracle's order.
+fn expand_cache_globs(
     checkout_path: &Path,
     globs: &[String],
-    mounts: &PlanMounts,
-) -> (Vec<PathBuf>, Option<String>) {
-    use std::os::unix::fs::MetadataExt as _;
-    let patterns: Vec<Vec<String>> = globs.iter().map(|item| glob_parts(item)).collect();
-    if patterns.is_empty() {
-        return (Vec::new(), None);
+    budget: &mut PlanBudget,
+) -> Result<Vec<Vec<PathBuf>>> {
+    let started = std::time::Instant::now();
+    let outcome = expand_cache_globs_walk(checkout_path, globs, budget, started);
+    budget.spent += started.elapsed().as_secs_f64();
+    outcome
+}
+
+/// One directory awaiting its listing in the glob walk: its
+/// path, its reach sequence, and the pattern positions it was
+/// reached with.
+type WalkPending = (PathBuf, i64, std::collections::BTreeSet<(usize, usize)>);
+
+fn expand_cache_globs_walk(
+    checkout_path: &Path,
+    globs: &[String],
+    budget: &mut PlanBudget,
+    started: std::time::Instant,
+) -> Result<Vec<Vec<PathBuf>>> {
+    use std::collections::BTreeSet;
+    let parts: Vec<Vec<String>> = globs.iter().map(|item| glob_parts(item)).collect();
+    fn closure(
+        parts: &[Vec<String>],
+        positions: &BTreeSet<(usize, usize)>,
+    ) -> BTreeSet<(usize, usize)> {
+        let mut closed = positions.clone();
+        for &(index, mut position) in positions {
+            while position < parts[index].len() && parts[index][position] == "**" {
+                position += 1;
+                closed.insert((index, position));
+            }
+        }
+        closed
     }
-    // Enumerate directories like the remove slice's expansion,
-    // descending through a symlinked directory only where a
-    // non-`**` glob component can reach it (the oracle's walk
-    // follows symlinks for those, never for `**`), and without
-    // looping through an ancestor link.
-    let mut directories: Vec<PathBuf> = Vec::new();
-    let root_identity = std::fs::metadata(checkout_path)
-        .map(|meta| (meta.dev(), meta.ino()))
-        .unwrap_or((0, 0));
-    let mut pending: Vec<(PathBuf, Vec<(u64, u64)>)> =
-        vec![(checkout_path.to_path_buf(), vec![root_identity])];
-    while let Some((directory, ancestors)) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
+    let mut matches: Vec<Vec<((i64, i64), PathBuf)>> = parts.iter().map(|_| Vec::new()).collect();
+    let mut reached: i64 = 0;
+    let initial: BTreeSet<(usize, usize)> = (0..parts.len()).map(|index| (index, 0)).collect();
+    let mut pending: Vec<WalkPending> =
+        vec![(checkout_path.to_path_buf(), 0, closure(&parts, &initial))];
+    while let Some((directory, sequence, positions)) = pending.pop() {
+        for &(index, position) in &positions {
+            if position == parts[index].len() {
+                matches[index].push(((sequence, -1), directory.clone()));
+            }
+        }
+        if positions
+            .iter()
+            .all(|&(index, position)| position == parts[index].len())
+        {
+            continue;
+        }
+        budget.debit(started.elapsed().as_secs_f64())?;
+        let Ok(listing) = std::fs::read_dir(&directory) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            directories.push(path.clone());
-            if directory == checkout_path && entry.file_name() == ".git" {
-                continue;
-            }
-            if !path.is_dir() {
-                continue;
-            }
-            let is_link = entry
-                .file_type()
-                .map(|kind| kind.is_symlink())
-                .unwrap_or(false);
-            if is_link {
-                let relative = path.strip_prefix(checkout_path).unwrap_or(&path);
-                let parts: Vec<String> = relative
-                    .components()
-                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                    .collect();
-                let (name, parent) = parts
-                    .split_last()
-                    .map(|(name, parent)| (name.clone(), parent.to_vec()))
-                    .unwrap_or_default();
-                let reachable = patterns.iter().any(|pattern| {
-                    (0..pattern.len()).any(|index| {
-                        pattern[index] != "**"
-                            && glob_parts_match(
-                                &pattern[index..=index],
-                                std::slice::from_ref(&name),
-                            )
-                            && glob_parts_match(&pattern[..index], &parent)
-                    })
-                });
-                if !reachable {
-                    continue;
+        let mut entries: Vec<std::fs::DirEntry> = Vec::new();
+        for entry in listing {
+            match entry {
+                Ok(entry) => entries.push(entry),
+                Err(error) => {
+                    return Err(format!(
+                        "cannot expand cache globs in {}: {error}",
+                        checkout_path.display()
+                    ));
                 }
             }
-            let identity = std::fs::metadata(&path)
-                .map(|meta| (meta.dev(), meta.ino()))
-                .unwrap_or((0, 0));
-            if ancestors.contains(&identity) {
-                continue;
-            }
-            let mut chain = ancestors.clone();
-            chain.push(identity);
-            pending.push((path, chain));
         }
+        let mut children: Vec<WalkPending> = Vec::new();
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let child = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let mut advanced: BTreeSet<(usize, usize)> = BTreeSet::new();
+            for &(index, position) in &positions {
+                let pattern = &parts[index];
+                if position == pattern.len() {
+                    continue;
+                }
+                let part = &pattern[position];
+                if part == "**" {
+                    let descend = entry
+                        .file_type()
+                        .map(|kind| kind.is_dir() && !kind.is_symlink())
+                        .unwrap_or(false);
+                    if descend {
+                        advanced.insert((index, position));
+                    }
+                } else if fnmatch_component(part, &name) {
+                    if position + 1 == pattern.len() {
+                        matches[index].push(((sequence, entry_index as i64), child.clone()));
+                    } else if child.is_dir() {
+                        advanced.insert((index, position + 1));
+                    }
+                }
+            }
+            if !advanced.is_empty() {
+                reached += 1;
+                children.push((child, reached, closure(&parts, &advanced)));
+            }
+        }
+        pending.extend(children.into_iter().rev());
     }
+    Ok(matches
+        .into_iter()
+        .map(|mut found| {
+            found.sort_by_key(|(order, _)| *order);
+            found.into_iter().map(|(_, path)| path).collect()
+        })
+        .collect())
+}
+
+/// Plan one checkout's caches: the oracle's
+/// `_cache_directories_for_path` checks (allowance, presence,
+/// tracked/submodule policy) and glob expansion, then selection
+/// of the real directories it names, shallowest first, with a
+/// candidate inside a selected one dropped.
+/// The identity planning brackets a checkout with: device,
+/// inode, and mount id, compared before and after the Git
+/// verification so a swapped checkout refuses.
+fn directory_identity(path: &Path, mounts: &PlanMounts) -> (u64, u64, Option<i64>) {
+    use std::os::unix::fs::MetadataExt as _;
+    let (device, inode) = std::fs::metadata(path)
+        .map(|meta| (meta.dev(), meta.ino()))
+        .unwrap_or((0, 0));
+    let mount = mounts
+        .as_ref()
+        .ok()
+        .and_then(|mounts| mount_id_of(path, mounts));
+    (device, inode, mount)
+}
+
+fn plan_one_checkout(
+    checkout_path: &Path,
+    globs: &[String],
+    name: &str,
+    source_repository: Option<&Path>,
+    budget: &mut PlanBudget,
+    mounts: &PlanMounts,
+) -> (Vec<PathBuf>, Option<String>) {
+    if let Err(error) = budget.check(0.0) {
+        return (Vec::new(), Some(error));
+    }
+    let unsafe_checkout = checkout_path
+        .symlink_metadata()
+        .map(|meta| meta.file_type().is_symlink() || !meta.is_dir())
+        .unwrap_or(true);
+    if unsafe_checkout {
+        return (
+            Vec::new(),
+            Some(format!(
+                "checkout is missing or unsafe for cache inspection: {}",
+                checkout_path.display()
+            )),
+        );
+    }
+    let identity = directory_identity(checkout_path, mounts);
+    let verified = match source_repository {
+        Some(repository) => verify_existing_worktree(repository, checkout_path).map(|_| ()),
+        None => repository_root(checkout_path).and_then(|root| {
+            if root == checkout_path {
+                Ok(())
+            } else {
+                Err(format!(
+                    "cache target is not a Git checkout root: {}",
+                    checkout_path.display()
+                ))
+            }
+        }),
+    };
+    if let Err(error) = verified {
+        return (Vec::new(), Some(error));
+    }
+    if directory_identity(checkout_path, mounts) != identity {
+        return (
+            Vec::new(),
+            Some(format!(
+                "checkout changed during cache inspection: {}",
+                checkout_path.display()
+            )),
+        );
+    }
+    if let Err(error) = assert_cache_policy_untracked(checkout_path, name, globs) {
+        return (Vec::new(), Some(error));
+    }
+    let expanded = match expand_cache_globs(checkout_path, globs, budget) {
+        Ok(expanded) => expanded,
+        Err(error) => return (Vec::new(), Some(error)),
+    };
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for pattern in &patterns {
-        for candidate in &directories {
-            let relative = candidate.strip_prefix(checkout_path).unwrap_or(candidate);
-            let parts: Vec<String> = relative
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            if !glob_parts_match(pattern, &parts) {
-                continue;
+    for (pattern, found) in globs.iter().zip(expanded.iter()) {
+        for candidate in found {
+            if candidate == checkout_path {
+                return (
+                    Vec::new(),
+                    Some(format!(
+                        "cache glob '{pattern}' escaped checkout {}",
+                        checkout_path.display()
+                    )),
+                );
             }
             if let Some(error) = judge_planned_candidate(checkout_path, candidate, mounts) {
                 return (Vec::new(), Some(error));
             }
-            let is_real_dir = candidate
-                .symlink_metadata()
-                .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
-                .unwrap_or(false);
-            if is_real_dir && !candidates.contains(candidate) {
+            if candidate.is_dir() && !candidates.contains(candidate) {
                 candidates.push(candidate.clone());
             }
         }
     }
-    (candidates, None)
+    candidates.sort_by(|a, b| {
+        a.components()
+            .count()
+            .cmp(&b.components().count())
+            .then_with(|| a.cmp(b))
+    });
+    let mut selected: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if selected
+            .iter()
+            .any(|parent| candidate != *parent && candidate.starts_with(parent))
+        {
+            continue;
+        }
+        selected.push(candidate);
+    }
+    (selected, None)
 }
 
 /// Overlapping globs must not count one directory twice: a
@@ -599,6 +844,7 @@ fn cache_roots(
     cfg: &Cfg,
     config: &Value,
     record: &Value,
+    budget: &mut PlanBudget,
     mounts: &PlanMounts,
 ) -> (Vec<(PathBuf, PathBuf, u64)>, Option<String>) {
     use std::os::unix::fs::MetadataExt as _;
@@ -614,9 +860,6 @@ fn cache_roots(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let globs = cache_globs_for(config, name);
-        if globs.is_empty() {
-            continue;
-        }
         let raw_path = checkout
             .get("path")
             .and_then(Value::as_str)
@@ -625,13 +868,22 @@ fn cache_roots(
             Ok(path) => path,
             Err(error) => return (Vec::new(), Some(error)),
         };
-        if !checkout_path.is_dir() {
-            continue;
-        }
-        if let Err(error) = assert_cache_policy_untracked(&checkout_path, name, &globs) {
-            return (Vec::new(), Some(error));
-        }
-        let (candidates, error) = plan_cache_candidates(&checkout_path, &globs, mounts);
+        let raw_repository = checkout
+            .get("repository")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let repository = match stored_repository_path(cfg, raw_repository) {
+            Ok((_relative, repository)) => repository,
+            Err(error) => return (Vec::new(), Some(error)),
+        };
+        let (candidates, error) = plan_one_checkout(
+            &checkout_path,
+            &globs,
+            name,
+            Some(&repository),
+            budget,
+            mounts,
+        );
         if let Some(error) = error {
             return (Vec::new(), Some(error));
         }
@@ -728,9 +980,13 @@ fn unregistered_cache_subject(
     cfg: &Cfg,
     config: &Value,
     slot: &str,
+    budget: &mut PlanBudget,
     mounts: &PlanMounts,
 ) -> CensusSubject {
     use std::os::unix::fs::MetadataExt as _;
+    if let Err(error) = budget.check(0.0) {
+        return (Vec::new(), Some(error), false);
+    }
     let roots = match unregistered_cache_roots(cfg, slot) {
         Ok(roots) => roots,
         Err(error) => return (Vec::new(), Some(error), false),
@@ -762,10 +1018,8 @@ fn unregistered_cache_subject(
     let mut planned: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
     for (index, root) in roots.iter().enumerate() {
         let label = format!("unregistered-{}", index + 1);
-        if let Err(error) = assert_cache_policy_untracked(root, &label, &global_globs) {
-            return (Vec::new(), Some(error), false);
-        }
-        let (candidates, error) = plan_cache_candidates(root, &global_globs, mounts);
+        let (candidates, error) =
+            plan_one_checkout(root, &global_globs, &label, None, budget, mounts);
         if let Some(error) = error {
             return (Vec::new(), Some(error), false);
         }
@@ -3436,6 +3690,12 @@ pub(crate) fn parse_audit(
     machine_override: Option<&str>,
     census: CensusRequest,
 ) -> Result<Value> {
+    if census.work_limit < 1 {
+        return Err("--cache-work-limit must be positive".to_string());
+    }
+    if !census.wall_seconds.is_finite() || census.wall_seconds <= 0.0 {
+        return Err("--cache-wall-seconds must be finite and positive".to_string());
+    }
     let (cfg, selected) = load_cfg(root, machine_override)?;
     let config = load_config(root, machine_override)?;
     refuse_partial_state_allow_seals(&cfg.control)?;
@@ -3558,30 +3818,57 @@ pub(crate) fn parse_audit(
         .flat_map(|record| validation_row_paths(&cfg, record))
         .collect();
     let plan_mounts = read_plan_mounts();
-    let mut census_subjects: Vec<CensusSubject> = records
-        .iter()
-        .map(|record| {
-            let (roots, error) = cache_roots(&cfg, &config, record, &plan_mounts);
-            let validation = record.get("slot_type").and_then(Value::as_str) == Some("validate");
-            (roots, error, validation)
-        })
-        .collect();
-    // Unregistered agent slots plan caches from the checkouts
-    // they contain. A slot with an interrupted journal plans from
+    // Planning targets in the oracle's order: every record, then
+    // unregistered agent slots. Each target plans with a fair
+    // share of what earlier targets left of the work and wall
+    // allowances. A slot with an interrupted journal plans from
     // its journal in the oracle; that stays Python-owned, as does
     // an unregistered validation directory (no cache subject).
-    let mut unregistered_subjects: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // Target positions follow the oracle: records first, then
+    // unregistered agent slots in sorted order. A journal slot
+    // occupies its position (and so shrinks its peers' shares)
+    // even though its own planning stays Python-owned.
+    let mut target_actions: Vec<Option<(String, String)>> = Vec::new();
     for (slot_type, slot) in on_disk.difference(&registered) {
         if slot_type != "agent" || journals.contains_key(slot) {
+            if slot_type == "agent" {
+                target_actions.push(None);
+            }
             continue;
         }
+        target_actions.push(Some((slot_type.clone(), slot.clone())));
+    }
+    let target_count = records.len() + target_actions.len();
+    let mut census_subjects: Vec<CensusSubject> = Vec::new();
+    let mut unregistered_subjects: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut plan_work_consumed: i64 = 0;
+    let mut plan_seconds = census.wall_seconds;
+    let make_budget = |position: usize, consumed: i64, seconds_left: f64| PlanBudget {
+        work_limit: (census.work_limit - consumed) / (target_count - position) as i64,
+        work_consumed: 0,
+        seconds: seconds_left / (target_count - position) as f64,
+        wall_total: census.wall_seconds,
+        spent: 0.0,
+    };
+    for (position, record) in records.iter().enumerate() {
+        let mut budget = make_budget(position, plan_work_consumed, plan_seconds);
+        let (roots, error) = cache_roots(&cfg, &config, record, &mut budget, &plan_mounts);
+        plan_work_consumed += budget.work_consumed;
+        plan_seconds = (plan_seconds - budget.spent).max(0.0);
+        let validation = record.get("slot_type").and_then(Value::as_str) == Some("validate");
+        census_subjects.push((roots, error, validation));
+    }
+    for (offset, action) in target_actions.iter().enumerate() {
+        let Some((slot_type, slot)) = action else {
+            continue;
+        };
+        let position = records.len() + offset;
+        let mut budget = make_budget(position, plan_work_consumed, plan_seconds);
+        let subject = unregistered_cache_subject(&cfg, &config, slot, &mut budget, &plan_mounts);
+        plan_work_consumed += budget.work_consumed;
+        plan_seconds = (plan_seconds - budget.spent).max(0.0);
         unregistered_subjects.insert((slot_type.clone(), slot.clone()), census_subjects.len());
-        census_subjects.push(unregistered_cache_subject(
-            &cfg,
-            &config,
-            slot,
-            &plan_mounts,
-        ));
+        census_subjects.push(subject);
     }
     let registry_revision = {
         use sha2::Digest as _;
