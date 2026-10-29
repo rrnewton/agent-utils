@@ -6600,6 +6600,32 @@ test("`#624 voice-page-modularity`: a live arrival folded into a store, from the
   assert.deepStrictEqual([namedRecord(root), namedRecord(reply), namedRecord(null)], [root.thread, null, null]);
 });
 
+test("`#624 voice-page-modularity`: an unplaced message placed by a read, and which newer pages speak for it, from the module alone", () => {
+  const { emptyCanon, placeFromPageIn, newerPage, newerPageSpeaksFor, answeredThread, createCopyOrder } = CHANNELS;
+  const canon = emptyCanon("c");
+  const reply = { id: "1", timestamp: "2026-10-01T00:00:01Z", thread: { id: "t", is_root: false } };
+  const bare = { id: "1", timestamp: "2026-10-01T00:00:01Z" };
+  assert.deepStrictEqual([answeredThread(reply), answeredThread(bare), answeredThread({ id: "r", thread: { id: "t", is_root: true } })], ["t", null, null]);
+  canon.views.set("thread:t", { floor: null, more: false, notice: "", top: null, dense: null, at: 0, live: true, cursor: null, fullSent: 5 });
+  assert.deepStrictEqual([newerPage(canon, "thread", 4, "t"), newerPage(canon, "thread", 5, "t"), newerPage(canon, "main", 0)], [true, false, false]);
+  assert.deepStrictEqual([newerPageSpeaksFor(canon, reply, 4), newerPageSpeaksFor(canon, bare, 4)], [true, false]);
+  // The stream's bare copy, unplaced; a read's answer carrying its thread record places it.
+  const ledger = createCopyOrder();
+  canon.messages = [bare];
+  canon.unplaced.add("1");
+  assert.equal(placeFromPageIn({ messages: [reply] }, canon, 6, null, ledger), true);
+  assert.deepStrictEqual([canon.unplaced.has("1"), canon.messages[0].thread.id], [false, "t"]);
+  // Nothing unplaced: nothing placed.
+  assert.equal(placeFromPageIn({ messages: [reply] }, canon, 6, null, ledger), false);
+  // One the store lost, put back unless a newer page that speaks for it has landed.
+  canon.messages = [];
+  canon.unplaced.add("1");
+  assert.equal(placeFromPageIn({ messages: [reply] }, canon, 4, null, ledger), false, "a reply a newer thread page speaks for came back");
+  canon.unplaced.add("1");
+  assert.equal(placeFromPageIn({ messages: [reply] }, canon, 6, null, ledger), true);
+  assert.deepStrictEqual(canon.messages.map((m) => m.id), ["1"]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -74744,7 +74770,8 @@ for (const mode of ["newest", "delta"]) {
     const control = await run(mode === "newest"
       ? brokenScriptEach(COUNTS_SPEAK_FOR_ALL,
         ["    cover.fullSent = sentNumberOf(payload);\n", "    cover.fullSent = timelineAnswersAsked + 1;\n"])
-      : brokenScriptEach(COUNTS_SPEAK_FOR_ALL, ["  const back = newerPage(canon, \"flat\", number) ? []", "  const back = true ? []"]));
+      : await brokenModule([{ file: "src/core/channels/placement.ts", find: "  const back = newerPage(canon, \"flat\", number) ? []",
+        replace: "  const back = true ? []" }], brokenScriptEach(COUNTS_SPEAK_FOR_ALL)));
     assert.equal(savedMessage(control.page, "300"), null, "the reply was held anyway, so this test cannot see it");
     assert.ok(!(await threadFromStore(control.page, control.first.id)).includes("300"),
       "the reply reached its thread anyway, so this test cannot see it");
@@ -74926,7 +74953,8 @@ for (const mode of ["delta", "newest"]) {
     if (mode === "delta") {
       assert.deepStrictEqual(thrown.onMain, [true, true, true], "the reply left Main anyway, so this test cannot see it");
     } else {
-      const lost = await run(brokenScript("  const back = newerPage(canon, \"flat\", number) ? []", "  const back = true ? []"));
+      const lost = await run(await brokenModule([{ file: "src/core/channels/placement.ts", find: "  const back = newerPage(canon, \"flat\", number) ? []",
+        replace: "  const back = true ? []" }]));
       assert.equal(savedMessage(lost.page, "300"), null, "the reply was held anyway, so this test cannot see it");
     }
   });
@@ -77790,7 +77818,8 @@ for (const main of ["delta", "newest"]) {
 
     // THE CONTROL, as #308 left it: the store's copy takes only the answer's thread record. Where Main's
     // newest page took the bare copy out, the answer puts it back whole either way.
-    const control = await run(brokenScript("    if (held && copyOlderThan(stored, id, number, held, true)) {\n", "    if (false) {\n"));
+    const control = await run(await brokenModule([{ file: "src/core/channels/placement.ts",
+      find: "    if (held && ledger.copyOlderThan(stored, id, number, held, true)) {\n", replace: "    if (false) {\n" }]));
     const controlled = savedMessage(control.page, "300");
     if (main === "delta") {
       assert.equal(controlled.content, "the bridge's answer, in the first discussion",
@@ -78636,8 +78665,9 @@ test("`#316 late-counts-resurrect`: a placing read that is not folded does not p
 
   // THE CONTROL, as the page was: asking only whether a newer newest page of Main has landed, the placing
   // read puts the reply back into its thread and the saved store, and the polls after keep it there.
-  const control = await run(brokenScript("    : [...carried.values()].filter((copy) => !newerPageSpeaksFor(canon, copy, number));\n",
-    "    : [...carried.values()].filter((copy) => answeredThread(copy) !== null || !newerPage(canon, \"main\", number));\n"));
+  const control = await run(await brokenModule([{ file: "src/core/channels/placement.ts",
+    find: "    : [...carried.values()].filter((copy) => !newerPageSpeaksFor(canon, copy, number));\n",
+    replace: "    : [...carried.values()].filter((copy) => answeredThread(copy) !== null || !newerPage(canon, \"main\", number));\n" }]));
   assert.deepStrictEqual(control.landed, { shown: true, saved: true }, "the reply stayed out anyway, so this test cannot see it");
   assert.ok(control.polls.every((state) => state.shown && state.saved));
 });

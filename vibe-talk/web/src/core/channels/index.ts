@@ -32,3 +32,4 @@ export { createRemovals, forgetUnplaced } from "./removals.ts";
 export type { Removals } from "./removals.ts";
 export { foldLiveIn, namedRecord } from "./live.ts";
 export type { LiveFoldDependencies } from "./live.ts";
+export { answeredThread, newerPage, newerPageSpeaksFor, placeFromPage as placeFromPageIn } from "./placement.ts";
