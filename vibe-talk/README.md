@@ -5521,6 +5521,14 @@ make contract-check typecheck   # what validation runs: stale generated files, t
 also brings the page build's esbuild, which every `cargo build` runs (`build.rs`, `web/build.mjs`,
 `#624 voice-page-modularity`); a binary built that way serves the page with no Node at all.
 
+The page's TypeScript modules below `web/src` are layered: the wire contract, the foundations and
+the ports at the bottom, the portable core services above them (`web/src/core`, checked with no
+browser declarations at all), the browser's implementation of the ports beside them, and the one
+composition point the legacy script reads (`web/src/legacy/imports.ts`). `make typecheck` ends with
+`node web/architecture.mjs`, which refuses an import against that direction, a deep import into
+another package past its `index.ts`, a cycle between files, a dynamic or unresolved import, and a
+module in a directory its `PACKAGES` table does not name.
+
 ## Resuming a conversation across a hang-up
 
 The vendor cannot resume a conversation once the socket closes — the initiation message and the

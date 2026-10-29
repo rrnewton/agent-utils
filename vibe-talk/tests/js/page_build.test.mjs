@@ -20,6 +20,7 @@ import {
   requireStrict,
 } from "../../web/build.mjs";
 import { SHELL, WEB, moduleSources, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
+import { PACKAGES, checkArchitecture } from "../../web/architecture.mjs";
 
 const scratch = mkdtempSync(join(tmpdir(), "vibe-talk-page-build-"));
 process.on("exit", () => rmSync(scratch, { recursive: true, force: true }));
@@ -373,4 +374,52 @@ test("no module opts out of type checking: no @ts-nocheck, @ts-ignore or @ts-exp
   // The scan sees an opt-out where there is one.
   assert.ok(/@ts-(?:nocheck|ignore|expect-error)\b/.test("// @ts-nocheck"));
   assert.ok(/(?::|<|\bas)\s*any\b/.test("const x: any = 1;") && /(?::|<|\bas)\s*any\b/.test("y as any"));
+});
+
+test("`#624 voice-page-modularity`: every import under web/src goes the page's way", () => {
+  assert.deepStrictEqual(checkArchitecture(), [], "web/architecture.mjs finds the page's modules importing against their direction");
+  // Every package the tree has is a row, and every row a package the tree has.
+  const dirs = new Set(moduleSources().map(({ name }) => name.split("/").slice(1, -1).join("/"))
+    .filter((dir) => dir !== ""));
+  for (const name of Object.keys(PACKAGES)) assert.ok([...dirs].some((dir) => dir === name || dir.startsWith(`${name}/`)), `${name} is a row with no modules`);
+});
+
+test("`#624 voice-page-modularity`: the import checker fails closed on every wrong edge, however it is spelled", () => {
+  // Each case: a copy of web/src with one file written into it, and the violation that must be found.
+  const cases = [
+    ["core/api/bad.ts", 'import { createWebPorts } from "../../platform/web/index.ts";\nexport const x = createWebPorts;\n',
+      /core\/api may not import platform\/web/],
+    ["core/api/bad.ts", 'import type { WebPorts } from "../../platform/web/index.ts";\nexport type X = WebPorts;\n',
+      /core\/api may not import platform\/web/],
+    ["core/search/bad.ts", 'export { createWebPorts as ports } from "../../platform/web/index.ts";\n',
+      /core\/search may not import platform\/web/],
+    ["core/search/bad.ts", 'export * from "../navigation/index.ts";\n', /core\/search may not import core\/navigation/],
+    ["foundation/bad.ts", 'import { createApi } from "../core/api/index.ts";\nexport const y = createApi;\n',
+      /foundation may not import core\/api/],
+    ["ports/bad.ts", 'export type T = import("../core/api/index.ts").ServerApi;\n', /ports may not import core\/api/],
+    ["legacy/bad.ts", 'export { createApi } from "../core/api/client.ts";\n', /only through core\/api\/index\.ts/],
+    ["core/api/bad.ts", 'export const z = () => import("./client.ts");\n', /a dynamic import/],
+    ["core/api/bad.ts", 'export const z = require("./client.ts");\n', /a require import/],
+    ["core/api/bad.ts", 'import ajv from "ajv";\nexport const a = ajv;\n', /not a relative path/],
+    ["core/api/bad.ts", 'import { gone } from "./nowhere.ts";\nexport const b = gone;\n', /no module under web\/src/],
+    ["view/bad.ts", "export const c = 1;\n", /in no package/],
+  ];
+  for (const [file, text, wanted] of cases) {
+    const copy = mkdtempSync(join(scratch, "architecture-"));
+    cpSync(join(WEB, "src"), copy, { recursive: true });
+    const path = join(copy, file);
+    cpSync(join(WEB, "src", "foundation", "text.ts"), path); // makes the directory if it is new
+    writeFileSync(path, text);
+    const problems = checkArchitecture(copy);
+    assert.ok(problems.some((problem) => wanted.test(problem)), `${file} (${text.trim()}) was not refused: ${JSON.stringify(problems)}`);
+    rmSync(copy, { recursive: true, force: true });
+  }
+  // A cycle, even inside one package and through its own index.
+  const copy = mkdtempSync(join(scratch, "architecture-"));
+  cpSync(join(WEB, "src"), copy, { recursive: true });
+  writeFileSync(join(copy, "foundation", "text.ts"), readFileSync(join(WEB, "src", "foundation", "text.ts"), "utf8") +
+    'import { glyphEm } from "./index.ts";\nexport const again = glyphEm;\n');
+  assert.ok(checkArchitecture(copy).some((problem) => /a cycle between files: .*foundation\/text\.ts/.test(problem)),
+    "a cycle through foundation/index.ts was not refused");
+  rmSync(copy, { recursive: true, force: true });
 });
