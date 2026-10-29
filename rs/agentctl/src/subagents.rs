@@ -13,7 +13,7 @@ use std::os::unix::fs::{
 };
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -26,8 +26,9 @@ use crate::client::{
     muse_editor_rows_empty, muse_startup_metadata, muse_trust_prompt, muse_verified_pane_status,
     muse_verified_process_editor_rows, muse_verified_process_idle_composer,
     muse_verified_process_paste_in_composer, muse_verified_process_paste_is_exact_composer,
-    muse_verified_process_prompt_transcript_count, AgentIdentity, AgentPaneInfo,
-    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
+    muse_verified_process_prompt_queued_count, muse_verified_process_prompt_transcript_count,
+    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
+    ProcessLiveness,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
@@ -2174,6 +2175,10 @@ struct CustomPaneSubmission {
     staged_screen: String,
     text: String,
     prior_transcript_count: usize,
+    /// Items of Muse's input queue that showed the prompt before Enter.
+    prior_queued_count: usize,
+    /// Muse's journal, watched from before Enter (#678 muse-bridge-latency).
+    journal: Option<Arc<Mutex<crate::harness::muse::JournalWatch>>>,
 }
 
 struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
@@ -2384,6 +2389,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             runtime.sleep(POLL);
         };
         let prior = muse_verified_process_prompt_transcript_count(&staged, text);
+        let prior_queued = muse_verified_process_prompt_queued_count(&staged, text);
         let mut journal = self.muse_journal();
         guarded.send_keys(pane_id, "Enter")?;
         let pressed = runtime.monotonic();
@@ -2403,14 +2409,18 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 && muse_verified_process_prompt_transcript_count(&screen, text) > prior
             {
                 Some("prompt appeared above the Muse editor as a new user turn")
-            } else if left_editor
-                && crate::harness_tui::muse::MuseTui::editor_empty(&screen)
-                && journal.as_mut().is_some_and(|watch| watch.accepted(text))
-            {
-                // Muse took the prompt but draws the turn only after the tool call in flight.
-                // The journal counts only once the editor is empty again: a prompt still there
-                // (or put back there, as Muse does with a steer it refuses) is not delivered.
-                Some("Muse's journal records the prompt as an accepted user intent")
+            } else if left_editor && crate::harness_tui::muse::MuseTui::editor_empty(&screen) {
+                // Muse took the prompt but draws the turn only after the tool call in flight, or
+                // holds it in its input queue for its next step. Either counts only once the
+                // editor is empty again: a prompt still there (or put back there, as Muse does
+                // with a steer it refuses) is not delivered.
+                if muse_verified_process_prompt_queued_count(&screen, text) > prior_queued {
+                    Some("Muse queued the prompt for its next step (`◆ Queued input`)")
+                } else if journal.as_mut().is_some_and(|watch| watch.accepted(text)) {
+                    Some("Muse's journal records the prompt as an accepted user intent")
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -4236,13 +4246,13 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 return self.submit_goal_command(pane_id, text, argument, runtime);
             }
         }
-        // A Muse pane takes an ordinary prompt by steering its running turn (#505
-        // agentctl-muse-followup), and the same paste and Enter submits it to an idle editor.
-        // That path proves its own submission and takes back a prompt Muse refused, so it is
-        // used whether or not the pane looked busy: a busy Muse can read idle for a moment, and
-        // then a 5 s idle-to-working wait expired before Muse drew the turn (#678
-        // muse-bridge-latency).
-        if self.uses_muse_composer() && !text.trim_start().starts_with('/') {
+        // A queue drain that found the pane working passes a follow-up key; a Muse pane then
+        // takes an ordinary prompt by steering its running turn (#505 agentctl-muse-followup).
+        // An idle Muse takes the idle path, whose proof the Python edition shares.
+        if self.uses_muse_composer()
+            && !text.trim_start().starts_with('/')
+            && runtime.followup_key().is_some()
+        {
             return self.muse_followup(pane_id, text, runtime);
         }
         // Custom panes verify through their own composer model, and slash
@@ -4320,10 +4330,25 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 self.verify_muse_process(pane_id)?;
                 let screen = self.client.read(pane_id, "visible", Some(200))?;
                 self.verify_muse_process(pane_id)?;
-                if screen != submission.staged_screen
+                let left_editor =
+                    !muse_verified_process_paste_in_composer(&screen, &submission.text);
+                // As for a steer: a new user turn, or, once the editor is empty again, the prompt
+                // in Muse's input queue or accepted in its journal (#678 muse-bridge-latency).
+                let taken = left_editor
+                    && crate::harness_tui::muse::MuseTui::editor_empty(&screen)
+                    && (muse_verified_process_prompt_queued_count(&screen, &submission.text)
+                        > submission.prior_queued_count
+                        || submission.journal.as_ref().is_some_and(|watch| {
+                            watch
+                                .lock()
+                                .expect("journal watch lock poisoned")
+                                .accepted(&submission.text)
+                        }));
+                if (screen != submission.staged_screen
+                    && left_editor
                     && muse_verified_process_prompt_transcript_count(&screen, &submission.text)
-                        > submission.prior_transcript_count
-                    && !muse_verified_process_paste_in_composer(&screen, &submission.text)
+                        > submission.prior_transcript_count)
+                    || taken
                 {
                     *self
                         .custom_submission
@@ -4404,10 +4429,25 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     self.client
                         .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
                 self.verify_muse_process_with_runtime(pane_id, runtime)?;
-                if screen != submission.staged_screen
+                let left_editor =
+                    !muse_verified_process_paste_in_composer(&screen, &submission.text);
+                // As for a steer: a new user turn, or, once the editor is empty again, the prompt
+                // in Muse's input queue or accepted in its journal (#678 muse-bridge-latency).
+                let taken = left_editor
+                    && crate::harness_tui::muse::MuseTui::editor_empty(&screen)
+                    && (muse_verified_process_prompt_queued_count(&screen, &submission.text)
+                        > submission.prior_queued_count
+                        || submission.journal.as_ref().is_some_and(|watch| {
+                            watch
+                                .lock()
+                                .expect("journal watch lock poisoned")
+                                .accepted(&submission.text)
+                        }));
+                if (screen != submission.staged_screen
+                    && left_editor
                     && muse_verified_process_prompt_transcript_count(&screen, &submission.text)
-                        > submission.prior_transcript_count
-                    && !muse_verified_process_paste_in_composer(&screen, &submission.text)
+                        > submission.prior_transcript_count)
+                    || taken
                 {
                     *self
                         .custom_submission
@@ -4621,6 +4661,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
             );
         };
+        let journal = self.muse_journal().map(|watch| Arc::new(Mutex::new(watch)));
         // The guard verifies the pinned Muse process immediately around the Enter.
         guarded.send_keys(pane_id, "Enter")?;
         *self
@@ -4628,6 +4669,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .lock()
             .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
             prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
+            prior_queued_count: muse_verified_process_prompt_queued_count(&staged, text),
+            journal,
             staged_screen: staged,
             text: text.to_owned(),
         });
@@ -4829,6 +4872,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
             );
         };
+        let journal = self.muse_journal().map(|watch| Arc::new(Mutex::new(watch)));
         // The guard verifies the pinned Muse process immediately around the Enter.
         guarded.send_keys(pane_id, "Enter")?;
         *self
@@ -4836,6 +4880,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .lock()
             .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
             prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
+            prior_queued_count: muse_verified_process_prompt_queued_count(&staged, text),
+            journal,
             staged_screen: staged,
             text: text.to_owned(),
         });
@@ -12715,6 +12761,8 @@ pub(crate) mod tests {
                 staged_screen: String::new(),
                 text: "text".to_owned(),
                 prior_transcript_count: 0,
+                prior_queued_count: 0,
+                journal: None,
             })),
             queue: None,
             registry: None,

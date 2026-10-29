@@ -297,7 +297,11 @@ mod tests {
                     .replace("◆ Thinking (", &format!("{glyph} Thinking ("))
                     .replace("◇ Running command", &format!("{glyph} Running command"))
                     .replace("◆ Double checking", &format!("{glyph} Double checking"));
-                assert_eq!(muse_verified_pane_status("done", &screen), "working", "{name} {glyph}");
+                assert_eq!(
+                    muse_verified_pane_status("done", &screen),
+                    "working",
+                    "{name} {glyph}"
+                );
             }
         }
         assert_eq!(muse_verified_pane_status("done", &headerless(IDLE)), "idle");
@@ -310,7 +314,10 @@ mod tests {
         // it back out instead of leaving a draft that refuses every later prompt.
         let prompt = "x".repeat(1635);
         assert!(STEER_FAILED.contains("steer failed"));
-        assert!(muse_verified_process_paste_is_exact_composer(STEER_FAILED, &prompt));
+        assert!(muse_verified_process_paste_is_exact_composer(
+            STEER_FAILED,
+            &prompt
+        ));
         assert!(!MuseTui::editor_empty(STEER_FAILED));
         assert_eq!(state(STEER_FAILED), State::Working);
     }
@@ -338,7 +345,11 @@ mod tests {
             assert_ne!(screen, IDLE);
             for screen in [screen.clone(), headerless(&screen)] {
                 assert!(!muse_verified_process_turn_running(&screen), "{quoted}");
-                assert_eq!(muse_verified_pane_status("done", &screen), "idle", "{quoted}");
+                assert_eq!(
+                    muse_verified_pane_status("done", &screen),
+                    "idle",
+                    "{quoted}"
+                );
             }
         }
     }
@@ -354,5 +365,28 @@ mod tests {
         assert_eq!(muse_verified_pane_status("done", SUBAGENT), "working");
         let finished = SUBAGENT.replace("◈ Thinking (3s · esc to interrupt)", "◆ Worked for 40s");
         assert_eq!(muse_verified_pane_status("done", &finished), "idle");
+    }
+
+    #[test]
+    fn a_prompt_in_the_input_queue_is_counted_by_its_text_or_its_placeholder() {
+        use crate::client::muse_verified_process_prompt_queued_count;
+        let queued = headerless(QUEUED);
+        assert_eq!(muse_verified_process_prompt_queued_count(&queued, BETA), 1);
+        assert_eq!(muse_verified_process_prompt_queued_count(&queued, ALPHA), 0);
+        let long = "y".repeat(1637);
+        let placeholder = queued.replace(&format!("└ {BETA}"), "└ [Pasted Content 1637 chars]");
+        assert_eq!(
+            muse_verified_process_prompt_queued_count(&placeholder, &long),
+            1
+        );
+        assert_eq!(
+            muse_verified_process_prompt_queued_count(&placeholder, &"y".repeat(1636)),
+            0
+        );
+        // No queue block, no count; a user turn is not a queued item.
+        assert_eq!(
+            muse_verified_process_prompt_queued_count(&headerless(STEERED), ALPHA),
+            0
+        );
     }
 }

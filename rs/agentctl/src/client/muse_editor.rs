@@ -225,7 +225,9 @@ fn muse_turn_running(transcript: &str) -> bool {
         .filter(|line| !line.is_empty())
         .rev()
         .take(PROGRESS_ROWS)
-        .any(|line| starts_with_marker(line, &PROGRESS_MARKERS) && line.ends_with("esc to interrupt)"))
+        .any(|line| {
+            starts_with_marker(line, &PROGRESS_MARKERS) && line.ends_with("esc to interrupt)")
+        })
 }
 
 /// An empty editor below a transcript that does not end in Muse's progress line.
@@ -565,6 +567,49 @@ pub(crate) fn muse_editor_rows_empty(rows: &str) -> bool {
     muse_editor_segments(rows).is_some_and(|segments| segments.is_empty())
 }
 
+/// How many items of Muse's `◆ Queued input` block above its editor show `text`: its text,
+/// words collapsed, or the placeholder Muse draws for a long paste of it.
+///
+/// Muse can hold an Enter-submitted prompt in this queue rather than steer the running turn at
+/// once, drawing `◆ Queued input · ↑ to edit` and `└ [Pasted Content 1637 chars]`, and gives it
+/// to the model at its next step; the user turn and the journal's accepted intent come only then
+/// (#678 muse-bridge-latency). A caller compares the count before and after its Enter, since an
+/// older queued paste of the same length draws the same placeholder.
+pub(crate) fn muse_verified_process_prompt_queued_count(screen: &str, text: &str) -> usize {
+    let Some((transcript, _)) = muse_composer_regions(screen, false) else {
+        return 0;
+    };
+    let lines = splitlines(&transcript);
+    let Some(start) = lines
+        .iter()
+        .rposition(|line| line.starts_with("◆ Queued input"))
+    else {
+        return 0;
+    };
+    let mut items: Vec<String> = Vec::new();
+    for line in &lines[start + 1..] {
+        let row = strip(line);
+        if row.is_empty() {
+            continue;
+        }
+        if let Some(rest) = row.strip_prefix('└').or_else(|| row.strip_prefix('├')) {
+            items.push(strip(rest).to_owned());
+        } else if line.starts_with(is_space) && !items.is_empty() {
+            let item = items.last_mut().expect("an item was pushed");
+            item.push(' ');
+            item.push_str(row);
+        } else {
+            break;
+        }
+    }
+    let wanted = normalize(text);
+    let placeholder = format!("[Pasted Content {} chars]", muse_paste_length(text));
+    items
+        .iter()
+        .filter(|item| normalize(item) == wanted || **item == placeholder)
+        .count()
+}
+
 /// Whether the rows above Muse's editor show its running-turn row anywhere near the bottom.
 ///
 /// Unlike [`muse_verified_process_turn_running`], which reads only the last transcript row, this
@@ -572,7 +617,8 @@ pub(crate) fn muse_editor_rows_empty(rows: &str) -> bool {
 /// (`└ tick 2 (ctrl+b to send to background)`), a `◆ Queued input` block, or the row in its
 /// `◆` animation phase (`◆ Calling tools (26s · esc to interrupt)`).
 pub(crate) fn muse_verified_process_turn_in_progress(screen: &str) -> bool {
-    muse_composer_regions(screen, false).is_some_and(|(transcript, _)| muse_turn_running(&transcript))
+    muse_composer_regions(screen, false)
+        .is_some_and(|(transcript, _)| muse_turn_running(&transcript))
 }
 
 #[cfg(test)]
