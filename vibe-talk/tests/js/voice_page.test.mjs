@@ -6375,6 +6375,42 @@ test("`#624 voice-page-modularity`: a view shows the store only from where its o
   assert.deepStrictEqual(projectionOf(canon, "thread:t", "thread", "t").map((x) => x.id), ["2", "3"]);
 });
 
+test("`#624 voice-page-modularity`: a channel's store saved and restored, from the module alone: what is kept, what is not, what is not trusted", () => {
+  const { emptyCanon, savedTimelineOf, restoreCanon } = CHANNELS;
+  const canon = emptyCanon("c");
+  canon.messages = [{ id: "1", thread: { id: "t", is_root: true } }, { id: "2" }];
+  canon.threads = [{ id: "t" }];
+  canon.views.set("main", { floor: 5, more: true, notice: "", top: 9, dense: NaN, at: 7, live: true, cursor: "cur",
+    newest: "next", fullAt: 3, fullSent: 2 });
+  canon.dismissed = new Set(["1", "gone"]);
+  canon.unplaced = new Set(["2", "gone"]);
+  canon.removed = new Map([["2", 4], ["gone", 4]]);
+  canon.replyGaps = new Map([["t", 3], ["other", 1]]);
+  canon.passedOver = new Set(["t", "other"]);
+  canon.settledByDone = new Map([["t", 2]]);
+  canon.scope = null;
+  const saved = savedTimelineOf(canon, 1234, { at: "2" });
+  // Only what the store still holds, of messages and of threads; no cursor; a NaN is a null.
+  assert.deepStrictEqual(saved.views, { main: { floor: 5, more: true, at: 7, notice: "", top: 9, dense: null } });
+  assert.deepStrictEqual([saved.dismissed, saved.unplaced, saved.removed, saved.replyGaps, saved.passedOver, saved.settledByDone],
+    [["1"], ["2"], ["2"], { t: 3 }, ["t"], { t: 2 }]);
+  assert.deepStrictEqual([saved.mode, saved.usedAt, saved.bookmark], ["timeline", 1234, { at: "2" }]);
+  assert.notEqual(saved.messages, canon.messages, "the save shares the store's list");
+  const back = emptyCanon("c");
+  restoreCanon(back, JSON.parse(JSON.stringify(saved)));
+  assert.deepStrictEqual([...back.dismissed], ["1"]);
+  assert.deepStrictEqual([...back.removed], [["2", 0]], "a removal came back with its old place in the order of reads");
+  assert.deepStrictEqual(back.views.get("main"), { floor: 5, more: true, at: 7, notice: "", top: 9, dense: null, live: false, cursor: null });
+  assert.deepStrictEqual([...back.replyGaps], [["t", 3]]);
+  // A save from before passed-over threads and Done's settling were kept: its gaps, and All's cover, are not trusted.
+  const old = { ...JSON.parse(JSON.stringify(saved)), views: { ...saved.views, flat: saved.views.main } };
+  delete old.passedOver;
+  delete old.settledByDone;
+  const older = emptyCanon("c");
+  restoreCanon(older, old);
+  assert.deepStrictEqual([older.replyGaps.size, older.settledByDone.size, older.views.has("flat"), older.views.has("main")], [0, 0, false, true]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -77383,7 +77419,8 @@ test("`#315 removed-reply-target`: after a reload during the outage, a reply to 
 
   // THE CONTROL: the removal not saved with the store, the reload takes the bare copy for a message on
   // the main channel.
-  const control = await run(brokenScript("      removed: [...channelCanon.removed.keys()].filter((id) => held.has(id)),\n", ""));
+  const control = await run(await brokenModule([{ file: "src/core/channels/saved.ts",
+    find: "    removed: [...canon.removed.keys()].filter((id) => held.has(id)),\n", replace: "" }]));
   assert.deepStrictEqual(control.posted, [{ text: "still answering it", reply_to: "300" }],
     "without saving the removal the reply was still refused, so this test cannot see it");
 });

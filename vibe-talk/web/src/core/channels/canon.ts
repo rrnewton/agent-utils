@@ -28,12 +28,15 @@ export interface ViewCover {
   live: boolean;
   /** The view's walk-back cursor, or null. */
   cursor: string | null;
-  /** `#203 incremental-refresh`. The forward cursor of the last newest read or delta folded, or null. */
-  newest: string | null;
+  /**
+   * `#203 incremental-refresh`. The forward cursor of the last newest read or delta folded, or null.
+   * This and the next two are in memory only: absent on a cover restored from the device's save.
+   */
+  newest?: string | null;
   /** ...and when the last newest read landed. */
-  fullAt: number;
+  fullAt?: number;
   /** `#308 live-reply-in-main`. Where that read was sent in the order of reads (`sentNumberOf`). */
-  fullSent: number;
+  fullSent?: number;
   /** Main's cover borrowed from All's (`coverFromAll`). */
   fromAll?: boolean;
   /** Rows a landed page carried that the view hid. */

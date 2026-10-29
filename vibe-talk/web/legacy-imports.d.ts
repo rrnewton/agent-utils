@@ -24,6 +24,8 @@ declare const timeOf: LegacyImports["timeOf"];
 declare const viewOfKey: LegacyImports["viewOfKey"];
 declare const coverViewOf: LegacyImports["coverViewOf"];
 declare const projectionOf: LegacyImports["projectionOf"];
+declare const restoreCanon: LegacyImports["restoreCanon"];
+declare const savedTimelineOf: LegacyImports["savedTimelineOf"];
 declare const allPageAnswersFor: LegacyImports["allPageAnswersFor"];
 declare const exactCount: LegacyImports["exactCount"];
 declare const goneByAbsence: LegacyImports["goneByAbsence"];

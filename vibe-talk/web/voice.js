@@ -24324,28 +24324,8 @@ function loadCanon(channel) {
   const cache = readMessageCache();
   const entry = cache ? cache.scopes[String(channel)] : undefined;
   if (!entry || entry.mode !== "timeline") return;
-  channelCanon.messages = entry.messages;
-  channelCanon.threads = entry.threads;
-  channelCanon.hasThreads = entry.hasThreads;
-  channelCanon.scope = entry.scope || null;
-  channelCanon.dismissed = new Set(entry.dismissed.map(String));
-  // A reload does not place a message either: what the stream left unplaced stays so until read.
-  channelCanon.unplaced = new Set((entry.unplaced || []).map(String));
-  // ...nor bring back a message removed upstream: every read from here on is sent after its removal.
-  channelCanon.removed = new Map((entry.removed || []).map((id) => [String(id), 0]));
-  // `#222 unread-replies`. A copy saved before passed-over threads and Done's settling were both
-  // kept may hold a wrong gap for a thread All's page passed over: nothing, which made its unknown
-  // replies "N new" for good, past Done; or its whole count, set by Main's read after the copy was
-  // cut, which hid an unread answer. Its gaps are not trusted, and All's cover goes with them, so
-  // All is read behind Main once more and places them afresh (`readAllForCounts`).
-  const trusted = entry.passedOver !== undefined && entry.settledByDone !== undefined;
-  channelCanon.replyGaps = trusted ? new Map(Object.entries(entry.replyGaps || {})) : new Map();
-  channelCanon.passedOver = new Set((entry.passedOver || []).map(String));
-  channelCanon.settledByDone = trusted ? new Map(Object.entries(entry.settledByDone || {})) : new Map();
-  for (const [key, cover] of Object.entries(entry.views)) {
-    if (!trusted && key === viewKey("flat")) continue;
-    channelCanon.views.set(key, { ...cover, live: false, cursor: null });
-  }
+  // What the device kept of it (web/src/core/channels `restoreCanon`).
+  restoreCanon(channelCanon, entry);
   restoreSavedBookmark(channel, entry.bookmark);
   // `#427 server-thread-hues`: the saved rows were saved as they were served, colours on them,
   // so a reload draws the server's colours before any read lands — not this browser's fallback.
@@ -24500,32 +24480,8 @@ function saveChannelScope() {
   if (threadingSupported) {
     if (channelCanon.channel !== key) return;
     syncCanonDismissed();
-    const views = {};
-    for (const [view, cover] of channelCanon.views) {
-      views[view] = { floor: cover.floor, more: cover.more, at: cover.at, notice: cover.notice,
-        top: Number.isFinite(cover.top) ? cover.top : null, dense: Number.isFinite(cover.dense) ? cover.dense : null };
-    }
-    const held = new Set(channelCanon.messages.map((message) => String(message.id)));
-    const heldThreads = new Set(channelCanon.messages.map(threadOf).filter((id) => id !== null));
-    entry = {
-      mode: "timeline",
-      usedAt: now,
-      messages: channelCanon.messages.slice(),
-      threads: channelCanon.threads.slice(),
-      views,
-      hasThreads: channelCanon.hasThreads,
-      scope: channelCanon.scope,
-      dismissed: [...channelCanon.dismissed].filter((id) => held.has(id)),
-      unplaced: [...channelCanon.unplaced].filter((id) => held.has(id)),
-      // `#315 removed-reply-target`. What it still holds of what was removed upstream: the read that
-      // takes it out may never have landed, and a reply to it is still refused after a reload.
-      removed: [...channelCanon.removed.keys()].filter((id) => held.has(id)),
-      // Only for threads the store still holds something of: the rest have no chip to draw.
-      replyGaps: Object.fromEntries([...channelCanon.replyGaps].filter(([id]) => heldThreads.has(id))),
-      passedOver: [...channelCanon.passedOver].filter((id) => heldThreads.has(id)),
-      settledByDone: Object.fromEntries([...channelCanon.settledByDone].filter(([id]) => heldThreads.has(id))),
-      bookmark: bookmarkToSave(key),
-    };
+    // The store as the device keeps it (web/src/core/channels `savedTimelineOf`).
+    entry = savedTimelineOf(channelCanon, now, bookmarkToSave(key));
   } else {
     // In time order, gathered replies or not (`#215 reply-coalesce`): a reload draws these as they
     // are saved, and nothing it draws is gathered.
