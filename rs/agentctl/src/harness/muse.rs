@@ -350,6 +350,7 @@ pub fn background_work(screen: &str) -> Option<String> {
 /// a submitted or steered prompt, while it may draw the user turn only seconds later, after the
 /// tool call in flight. A steer Muse refuses (`! steer failed: ...`, the prompt put back in the
 /// editor) writes no such record.
+#[derive(Debug)]
 pub(crate) struct JournalWatch {
     path: PathBuf,
     offset: u64,
@@ -538,7 +539,8 @@ mod tests {
 
     #[test]
     fn the_journal_watch_sees_only_an_accepted_intent_with_the_prompt_written_after_it_started() {
-        let dir = std::env::temp_dir().join(format!("agentctl-muse-journal-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agentctl-muse-journal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.jsonl");
         let accepted = |text: &str| {
@@ -555,7 +557,10 @@ mod tests {
         assert!(!watch.accepted(prompt));
         let append = |line: String| {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             file.write_all(line.as_bytes()).unwrap();
         };
         // Another prompt, and a steer queued (not an accepted intent) with this one's text.
@@ -580,7 +585,9 @@ mod tests {
     fn running_terminals_in_the_panel_are_background_work() {
         let rule = "─".repeat(40);
         let footer = "  watermelon-full-preview · xhigh · ~/work/project · Launch overrides";
-        let screen = |rows: &str| format!("◆ Finished · Sleep · ✓ · ctrl+o\n{rule}\n❯\n{rule}\n{rows}{footer}\n");
+        let screen = |rows: &str| {
+            format!("◆ Finished · Sleep · ✓ · ctrl+o\n{rule}\n❯\n{rule}\n{rows}{footer}\n")
+        };
         assert_eq!(
             background_work(&screen(
                 "main · ↓ to select\n├ ◈ Sleep ninety seconds  running      1m 21s\n└ ◆ Sleep sixty seconds  running   18s\n"
@@ -589,13 +596,17 @@ mod tests {
             Some("2 background shells")
         );
         assert_eq!(
-            background_work(&screen("main · ↓ to select\n└ ◆ Sleep between steps  ran 18s, exit 0      20s\n")),
+            background_work(&screen(
+                "main · ↓ to select\n└ ◆ Sleep between steps  ran 18s, exit 0      20s\n"
+            )),
             None
         );
         assert_eq!(background_work(&screen("")), None);
         // A transcript row that says running is not the panel.
         assert_eq!(
-            background_work(&format!("└ ◆ Sleep  running   3s\n{rule}\n❯\n{rule}\n{footer}\n")),
+            background_work(&format!(
+                "└ ◆ Sleep  running   3s\n{rule}\n❯\n{rule}\n{footer}\n"
+            )),
             None
         );
     }
