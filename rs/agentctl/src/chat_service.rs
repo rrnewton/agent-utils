@@ -4285,10 +4285,13 @@ fn spawn_signal_worker(
 struct TurnEvidence {
     // Herdr last reported the pane as `working`.
     herdr: bool,
-    // Herdr last reported the pane as `idle` or `done`, the only statuses in which a drain types,
-    // or as `working` in a Claude Code pane when `while_working` allows a drain to type then.
+    // Herdr last reported the pane as `idle` or `done`, or as `working` in a pane whose harness
+    // takes typed input during a turn (Claude Code, Codex, Muse) when `while_working` allows a
+    // drain to type then.
     ready: bool,
-    // `chat run --deliver-while-working`: a drain also types into a working Claude Code pane.
+    // `chat run --deliver-while-working`: a drain also types into a working pane of any harness
+    // that takes typed input during a turn, and a scan retries prompts left waiting while it
+    // works, not only once the pane is idle.
     while_working: bool,
     // The last read of the loop's own that could tell showed a running turn, or a later pass
     // asked for a prompt or a notice to be typed, or a later output event's screen showed a
@@ -4310,7 +4313,10 @@ impl TurnEvidence {
     fn agent_status(&mut self, status: &str, agent: Option<&str>) {
         self.herdr = status == "working";
         self.ready = matches!(status, "idle" | "done")
-            || (self.while_working && status == "working" && agent == Some("claude"));
+            || (self.while_working
+                && status == "working"
+                && crate::harness_tui::followup_tui(agent)
+                    .is_some_and(|tui| tui.working_followups()));
         self.seen_working = self.seen_working.wrapping_add(u64::from(self.herdr));
     }
 
@@ -4785,8 +4791,9 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
         // A rescan tries every prompt waiting to be typed, so a due scan retries none of its own
         // when one runs. Nor does it while the status the loop last learned from Herdr is other
-        // than `idle` or `done`: a drain types only in those, so with no ready timeout, the
-        // default, a retry could only fail, at the cost of a few durable writes, and with one it
+        // than `idle` or `done`, or, with `--deliver-while-working`, `working` in a pane whose
+        // harness takes typed input during a turn (`TurnEvidence::ready`): a drain types only in
+        // those, so with no ready timeout, the default, a retry could only fail, at the cost of a few durable writes, and with one it
         // would hold the loop while it waits. Whenever a scan finds prompts to retry, the loop
         // looks the status up afresh, since without a working pane event subscription it would
         // otherwise learn the status only at the next reconciliation. A failed lookup does not
@@ -16614,25 +16621,31 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
     }
 
     #[test]
-    fn with_deliver_while_working_a_working_claude_pane_is_ready_for_a_prompt() {
+    fn with_deliver_while_working_a_working_pane_of_any_typing_harness_is_ready_for_a_prompt() {
         let mut turn = TurnEvidence {
             while_working: true,
             ..TurnEvidence::default()
         };
         for (status, agent, ready) in [
             ("working", Some("claude"), true),
-            ("working", Some("codex"), false),
+            ("working", Some("codex"), true),
+            ("working", Some("muse"), true),
+            // No harness, or one that takes no input during a turn, still waits.
             ("working", None, false),
+            ("working", Some("agentcloud"), false),
             ("idle", Some("codex"), true),
             ("blocked", Some("claude"), false),
+            ("blocked", Some("muse"), false),
         ] {
             turn.agent_status(status, agent);
             assert_eq!(turn.ready(), ready, "{status:?} {agent:?}");
             assert_eq!(turn.working(), status == "working", "{status:?}");
         }
-        let mut turn = TurnEvidence::default();
-        turn.agent_status("working", Some("claude"));
-        assert!(!turn.ready());
+        for agent in ["claude", "codex", "muse"] {
+            let mut turn = TurnEvidence::default();
+            turn.agent_status("working", Some(agent));
+            assert!(!turn.ready(), "{agent}");
+        }
     }
 
     #[test]

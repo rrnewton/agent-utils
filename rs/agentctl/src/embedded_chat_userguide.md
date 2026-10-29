@@ -1463,28 +1463,37 @@ and its record keeps the reason, which `chat inspect` shows in
 `delivery_uncertain` instead, and its prompt is never typed again, because a
 second copy could reach the agent.
 
-### Typing while a Claude Code agent works
+### Typing while an agent works
 
-`chat run --deliver-while-working` lets the queue also type into a Claude Code
-pane that herdr reports `working`, so a request reaches the agent while its
-current turn runs instead of after it: Claude Code holds the prompt and runs
-it when the turn ends. Off by default. Only Claude Code panes are typed into
-this way; other harnesses, and prompts that start with `/`, which open a menu
-rather than reach the composer, still wait for `idle` or `done`. The usual
-checks still apply. The composer must be empty first: a draft still refuses
-the prompt, while the faint hint Claude Code draws in an empty composer, such
-as `Press up to edit queued messages`, and the cursor cell are not a draft.
-The submission must be verified on the screen: the prompt leaves the composer,
-and the queued-message hint, a running turn or the prompt itself shows. An
-Enter that Claude Code drops, as it can while its hooks run, is pressed again
-with a doubling wait for up to 60 seconds. If the prompt is still in the
-composer then, the queue takes it back out with editing keys (`ctrl+e`,
-`ctrl+u`, and `backspace` where those change nothing) and, once the composer
-is proved empty and nothing shows the prompt was accepted, records the request
-`pending` without counting an attempt, so a later retry types it again. If
-the composer cannot be proved empty, the prompt is left there and the request
-is `delivery_uncertain`, as for any prompt left staged. The retries every 10
-seconds also run while the pane is `working`.
+Codex and Muse take an ordinary request while their turn runs: when a new
+request arrives and herdr reports the pane `working`, its prompt is typed into
+the empty editor and Enter steers the running turn with it. Muse prints the
+steered prompt at once as a new user turn above its editor, which is the
+proof; a Muse with an active goal is no exception, since the goal notice Muse
+draws on its footer line does not hide the editor.
+
+`chat run --deliver-while-working` extends this. The queue also types into a
+Claude Code pane that herdr reports `working`, so a request reaches the agent
+while its current turn runs instead of after it: Claude Code holds the prompt
+and runs it when the turn ends. And the retries every 10 seconds of a request
+left waiting also run while the pane is `working`, in Claude Code, Codex and
+Muse alike; without the option they wait for `idle` or `done`. Off by default.
+Prompts that start with `/`, which open a menu rather than reach the composer,
+and harnesses that take no input during a turn, still wait for `idle` or
+`done`. The usual checks still apply in every harness. The composer must be
+empty first: a draft still refuses the prompt, while the faint hint Claude
+Code draws in an empty composer, such as `Press up to edit queued messages`,
+and the cursor cell are not a draft. The submission must be verified on the
+screen: the prompt leaves the composer, and the queued-message hint, a running
+turn, the new user turn or the prompt itself shows. An Enter that the harness
+drops, as Claude Code can while its hooks run, is pressed again with a
+doubling wait for up to 60 seconds. If the prompt is still in the composer
+then, the queue takes it back out with editing keys (`ctrl+e`, `ctrl+u`, and
+`backspace` where those change nothing) and, once the composer is proved empty
+and nothing shows the prompt was accepted, records the request `pending`
+without counting an attempt, so a later retry types it again. If the composer
+cannot be proved empty, the prompt is left there and the request is
+`delivery_uncertain`, as for any prompt left staged.
 
 ### A headless coordinator
 
