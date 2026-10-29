@@ -60,6 +60,28 @@ GH_PACED=/opt/tools/bin/gh-paced   # wherever you installed it
 exec "$GH_PACED" --account octocat --real-gh /usr/bin/gh -- "$@"
 ```
 
+A ready-made account wrapper ships beside the crate as `rs/gh-paced/gh-team`.
+Link it into a team's own tool directory under the name `gh`, put that
+directory first on the agents' `PATH`, and name the account in the team's
+environment (for example the file every agent's `BASH_ENV` points at):
+
+```bash
+ln -s "$CHECKOUT/rs/gh-paced/gh-team" "$TEAM/bin/gh"
+export GH_PACED_ACCOUNT=team-bot        # in the team env file
+```
+
+Each call then runs the real gh as that account, with the account's stored
+token in `GH_TOKEN` and gh's machine-wide active account untouched, through
+gh-paced. The wrapper finds the real gh in `$GH_PACED_REAL_GH`, `/usr/bin/gh`
+or `/usr/local/bin/gh`, never on `PATH`, and refuses one that resolves to
+itself (exit 78). It refuses `gh auth login`, `logout`, `refresh` and `switch`
+(exit 64), which change credentials every shell on the machine shares, and it
+never falls back to another account when the named one has no stored token
+(exit 1). gh-paced is `$GH_PACED`, else this checkout's release build; when
+neither exists the wrapper refuses rather than call GitHub unpaced (exit 127).
+`GH_TEAM_HOST` selects another GitHub host. Set any proxy variables in the team
+environment, not in the wrapper.
+
 Everything after `--` is passed to gh exactly as given. git's credential helper
 setting (`!gh auth git-credential`) goes through the same wrapper. That means
 `git fetch` and `git push` are paced too, as GIT_CREDENTIAL calls. Such a call

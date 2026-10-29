@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# gh-team: run the GitHub CLI as the account a team configures, paced by gh-paced.
+#
+# Link it into a team's own tool directory under the name `gh`
+# (`ln -s <checkout>/rs/gh-paced/gh-team <team>/bin/gh`) and put that directory first on the
+# agents' PATH. Every call then runs the real gh as the team's account, without changing gh's
+# machine-wide active account, and passes through gh-paced so the account's API budget is shared
+# by everything that calls it.
+#
+#   GH_PACED_ACCOUNT   required: the stored gh account to act as (set it in the team env file)
+#   GH_PACED_REAL_GH   the real gh; default /usr/bin/gh, then /usr/local/bin/gh (never PATH)
+#   GH_PACED           the gh-paced executable; default this checkout's release build (rs/target/release/gh-paced)
+#   GH_TEAM_HOST       GitHub host; default github.com
+#
+# Safety rules: it never looks up gh on PATH, so it cannot recurse into itself; it refuses
+# `gh auth login|logout|refresh|switch`, which change stored credentials every shell and agent on
+# the machine shares; and it never falls back to another account when the configured one has no
+# stored token.
+set -euo pipefail
+
+say() { printf 'gh-team: %s\n' "$*" >&2; }
+
+account="${GH_PACED_ACCOUNT:-}"
+if [[ -z "$account" ]]; then
+    say "GH_PACED_ACCOUNT is not set; the team env file should name the account this team's gh acts as"
+    exit 78
+fi
+host="${GH_TEAM_HOST:-github.com}"
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+real_gh="${GH_PACED_REAL_GH:-}"
+if [[ -z "$real_gh" ]]; then
+    for candidate in /usr/bin/gh /usr/local/bin/gh; do
+        if [[ -x "$candidate" ]]; then
+            real_gh="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -z "$real_gh" || ! -x "$real_gh" ]]; then
+    say "the real GitHub CLI is missing (set GH_PACED_REAL_GH, or install it in /usr/bin or /usr/local/bin)"
+    exit 127
+fi
+if [[ "$(readlink -f "$real_gh")" == "$self" ]]; then
+    say "GH_PACED_REAL_GH resolves to this wrapper; refusing to recurse"
+    exit 78
+fi
+
+if [[ "${1:-}" == "auth" ]]; then
+    case "${2:-}" in
+        login | logout | refresh | switch)
+            say "refusing shared-state command: gh auth $2"
+            say "run $real_gh directly, and only when you mean to change the stored credentials"
+            exit 64
+            ;;
+    esac
+fi
+
+paced="${GH_PACED:-$(dirname "$self")/../target/release/gh-paced}"
+if [[ ! -x "$paced" ]]; then
+    say "gh-paced is missing at $paced; build it or set GH_PACED. Refusing to call GitHub unpaced"
+    exit 127
+fi
+
+token=""
+if ! token="$(
+    env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+        "$real_gh" auth token --hostname "$host" --user "$account" 2>/dev/null
+)" || [[ -z "$token" ]]; then
+    say "no stored token for $account on $host; repair that login with $real_gh, refusing to fall back to another account"
+    exit 1
+fi
+
+export GH_HOST="$host" GH_TOKEN="$token"
+unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+exec "$paced" --account "$account" --real-gh "$real_gh" -- "$@"

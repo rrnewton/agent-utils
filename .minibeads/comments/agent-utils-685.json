@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-685-c386b6b266d",
+    "issue_id": "agent-utils-685",
+    "author": "cl-envpath",
+    "body": "[opus 5.5] Progress on #685 agent-env-path:\n\n- Done (main 333cd812): item 1, a registry `launch_env` in profiles.json, in both editions. Items 2 and 3: build provenance (AGENTCTL_SOURCE_COMMIT / DIRTY / FP, shown in `--version` and `capabilities`) and the AGENT_UTILS_CHECKOUT staleness check (warns; refuses state-changing commands unless AGENTCTL_ALLOW_STALE=1).\n- Item 4, the launcher fast path, belongs to #680 launcher-fast-path.\n- Added to the plan (owner decision): a team-configured gh wrapper, `rs/gh-paced/gh-team`. It is linked into each team's bin dir as `gh`; the account comes from GH_PACED_ACCOUNT in the team env file. It never resolves gh through PATH, refuses shared-state `gh auth` commands, never falls back to another account, and always paces through gh-paced. The user-level gh wrapper is removed in the final step.\n- Remaining: per-team built binaries keyed by commit (item 5), each team's migration (runbook drafted privately), and removing the global copies (item 6).",
+    "created_at": "2026-10-29T14:38:33.692320471Z",
+    "updated_at": "2026-10-29T14:38:33.692320471Z"
+  }
+]
