@@ -27,6 +27,7 @@ export {
   deltaSideState,
   emptyCanon,
   exactCount,
+  foldDeltaIn,
   forgetUnplaced,
   goneByAbsence,
   heldCopies,

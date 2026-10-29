@@ -6534,6 +6534,42 @@ test("`#624 voice-page-modularity`: the record of removals, from the module alon
   forgetUnplaced(canon, "nothing");
 });
 
+test("`#624 voice-page-modularity`: a delta folded into a store, from the module alone, the page's part injected", () => {
+  const { emptyCanon, foldDeltaIn, createCopyOrder, createRemovals } = CHANNELS;
+  const at = (s) => `2026-10-01T00:00:${String(s).padStart(2, "0")}Z`;
+  const canon = emptyCanon("c");
+  const held = { id: "1", timestamp: at(1), content: "a" };
+  canon.messages = [held, { id: "2", timestamp: at(2), content: "b" }];
+  canon.views.set("main", { floor: null, more: false, notice: "", top: null, dense: null, at: 0, live: false, cursor: null, newest: "cur" });
+  const seen = [];
+  const deps = {
+    ledger: createCopyOrder(), removals: createRemovals(),
+    numberOf: () => 7, readsSent: () => 6,
+    forgetArchived: (id) => seen.push(["archived", id]),
+    foldReadState: () => { seen.push(["read"]); return false; },
+    noteReplyGaps: (before) => seen.push(["gaps", [...before.keys()]]),
+    markUnchanged: () => seen.push(["unchanged"]),
+    staleAsOf: () => null,
+  };
+  const delta = (over) => ({ messages: [], delta: { deleted: [], removed_threads: [], complete: true }, next_after: "next", ...over });
+  // A cursor the cover no longer holds: nothing touched.
+  assert.equal(foldDeltaIn(canon, delta({}), "old", "main", "main", deps), false);
+  assert.deepStrictEqual(seen, []);
+  // A deletion, an edit and a copy held word for word.
+  const changed = delta({ messages: [{ ...held }, { id: "2", timestamp: at(2), content: "edited" }],
+    delta: { deleted: ["9"], removed_threads: [], complete: true } });
+  canon.messages.push({ id: "9", timestamp: at(9), content: "gone" });
+  assert.equal(foldDeltaIn(canon, changed, "cur", "main", "main", deps), true);
+  assert.deepStrictEqual(canon.messages.map((m) => m.content), ["a", "edited"]);
+  assert.equal(canon.messages[0], held, "a copy held word for word lost the store's object");
+  assert.deepStrictEqual([canon.removed.get("9"), canon.complete, canon.views.get("main").newest, canon.views.get("main").live], [6, true, "next", true]);
+  assert.deepStrictEqual(seen, [["archived", "9"], ["read"], ["gaps", ["1", "2"]]], "the page's part came in another order");
+  // A delta that changes nothing is marked so.
+  seen.length = 0;
+  assert.equal(foldDeltaIn(canon, delta({ messages: [] }), "next", "main", "main", deps), true);
+  assert.deepStrictEqual(seen.map(([what]) => what), ["read", "gaps", "unchanged"]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -87102,7 +87138,7 @@ const storedText = (page, id) => {
 };
 
 /** `#473`: the page deciding by read-send order alone, as before C7. */
-const SERVER_VERSIONS_IGNORED = { file: "src/core/channels/fold.ts",
+const SERVER_VERSIONS_IGNORED = { file: "src/core/channels/versions.ts",
   find: "export function serverVersions(payload: unknown): ServerVersions | null {\n",
   replace: "export function serverVersions(payload: unknown): ServerVersions | null {\n  return null;\n" };
 

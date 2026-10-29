@@ -24004,22 +24004,11 @@ function staleAsOf(payload) {
 }
 
 /**
- * Fold a DELTA — what changed in a view since its forward cursor — into the store. `#203
- * incremental-refresh`. False, and nothing touched, when the cover no longer holds the cursor the
- * read was sent with: a newest read or another delta landed in between, and the next read asks
- * again from where that one left the view.
- *
- * NEVER THE NEWEST PAGE'S RULE. A row a delta does not carry is unchanged, not deleted: removal is
- * said only by `delta.deleted`, channel-wide, and by `delta.removed_threads`. Coverage is not
- * changed either — a delta continues the view upward from its previous newest position without a
- * gap, so the floor and whether older history exists stay as they were, and "a projection never
- * invents coverage" still holds. Its rows are the server's own answer, so a thread record on one
- * replaces the store's, and the id leaves `unplaced`, as a page row does (`#185`).
- *
- * `#226 page-energy-profile`. A copy the store holds word for word changes nothing, so the store
- * keeps its own object, the one the row on screen was drawn from. A delta that changed nothing at
- * all — no row, no deletion, no read state, no thread, no count, no notice — is put in
- * `unchangedDeltas`, which is what lets a refresh with nothing new draw nothing (`rowsAsDrawn`).
+ * Fold a DELTA — what changed in a view since its forward cursor — into the store (web/src/core/channels
+ * `foldDeltaIn`, `#203 incremental-refresh`, which says why each rule is what it is): false, and nothing
+ * touched, when the cover no longer holds the cursor the read was sent with. What it does to the page
+ * besides the store is passed in, to happen where it always did: Done forgotten for a deleted message,
+ * read state folded, the replies the store lacks noted, an unchanged delta marked (`unchangedDeltas`).
  */
 function foldTimelineDelta(payload, sent, view = channelView, thread = selectedThreadId) {
   // `#529 page-build-stale-notice`: a delta says which page the server serves as a full read does.
@@ -24027,76 +24016,17 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
   // `#427 server-thread-hues`: a delta's new threads carry their colours, as a page's do.
   noteServerThreadHuesIn(payload.messages || [],
     [...(payload.threads || []), payload.thread].filter(Boolean));
-  const key = viewKey(view, thread);
-  const cover = channelCanon.views.get(key);
-  if (!cover || !sent || cover.newest !== sent) return false;
-  const delta = payload.delta;
-  const sideBefore = deltaSideState(channelCanon, payload.thread);
-  const gone = new Set((delta.deleted || []).map(String));
-  if (gone.size) {
-    channelCanon.messages = channelCanon.messages.filter((message) => !gone.has(String(message.id)));
-    for (const id of gone) {
-      channelCanon.dismissed.delete(id);
-      noteRemoved(channelCanon, id, typeof payload.observed_ms === "number" ? payload.observed_ms : null);
-      archivedIds.delete(id);
-    }
-  }
-  // Never a message removed upstream after it was sent (`removedSince`, `#316 late-counts-resurrect`).
-  const number = sentNumberOf(payload);
-  const unfiltered = (payload.messages || []).filter((message) => !removedSince(channelCanon, String(message.id), number));
-  const before = heldCopies(channelCanon, unfiltered);
-  // `#408 copy-upstream-link`: as in `foldLiveMessage`, a copy formed without the message's
-  // upstream address does not take a held copy's away. Before anything compares or orders
-  // them, so the copy that is kept is the copy that is counted.
-  const arriving = unfiltered.map((message) => {
-    const held = before.get(String(message.id));
-    return held && held.upstream_url && !message.upstream_url
-      ? { ...message, upstream_url: held.upstream_url }
-      : message;
+  return foldDeltaIn(channelCanon, payload, sent, view, viewKey(view, thread), {
+    ledger: copyLedger,
+    removals: removalRecord,
+    numberOf: () => sentNumberOf(payload),
+    readsSent: () => timelineAnswersAsked,
+    forgetArchived: (id) => archivedIds.delete(id),
+    foldReadState: () => foldReadState(payload, view),
+    noteReplyGaps: (before) => noteReplyGaps(payload, view, false, true, before),
+    markUnchanged: () => unchangedDeltas.add(payload),
+    staleAsOf: () => staleAsOf(payload),
   });
-  const fresh = arriving.filter((message) => !sameMessage(before.get(String(message.id)), message));
-  if (fresh.length) {
-    const ids = new Set(fresh.map((message) => String(message.id)));
-    channelCanon.messages = inTimeOrder(
-      [...channelCanon.messages.filter((held) => !ids.has(String(held.id))), ...fresh], "timestamp");
-  }
-  // What it brought, or found word for word, stands where it was sent (`copyOrder`).
-  orderCopiesRead(arriving, number);
-  for (const message of arriving) channelCanon.unplaced.delete(String(message.id));
-  believeCarried(channelCanon, payload);
-  const readChanged = foldReadState(payload, view);
-  for (const summary of payload.threads || []) upsertThreadSummary(channelCanon, summary);
-  const removed = new Set((delta.removed_threads || []).map(String));
-  if (removed.size) channelCanon.threads = channelCanon.threads.filter((held) => !removed.has(String(held.id)));
-  if (payload.thread) upsertThreadSummary(channelCanon, payload.thread);
-  for (const summary of [...(payload.threads || []), payload.thread]) {
-    if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
-  }
-  if (view !== "thread") {
-    channelCanon.scope = payload.thread ? String(payload.thread.id) : null;
-    channelCanon.hasThreads = payload.has_threads === true;
-  }
-  noteReplyGaps(payload, view, false, true, before);
-  if (!gone.size && !fresh.length && !readChanged && !(payload.threads || []).length && !removed.size &&
-      (payload.notice || "") === (cover.notice || "") && deltaSideState(channelCanon, payload.thread) === sideBefore) {
-    unchangedDeltas.add(payload);
-  }
-  const asOf = staleAsOf(payload);
-  // `#578 search-status-clarity`. A delta continues the view up from where it was without a gap, so
-  // the newest message it carries is one the next newest read may join (`coverView`).
-  const carried = arriving.filter((message) => view !== "flat" || !threadOf(message) || message.thread.is_root === true)
-    .map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
-  const top = Math.max(Number.isFinite(cover.top) ? cover.top : -Infinity, ...carried);
-  channelCanon.views.set(key, {
-    ...cover,
-    notice: payload.notice || "",
-    at: asOf === null ? Date.now() : asOf,
-    live: true,
-    newest: payload.next_after || null,
-    top: Number.isFinite(top) ? top : cover.top ?? null,
-  });
-  channelCanon.complete = delta.complete === true;
-  return true;
 }
 
 /** The delta pages `foldTimelineDelta` found changed nothing. `#226 page-energy-profile`. */

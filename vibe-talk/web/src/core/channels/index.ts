@@ -7,6 +7,7 @@ export {
   allPageAnswersFor,
   deltaSideState,
   exactCount,
+  foldDeltaIn,
   goneByAbsence,
   heldCopies,
   heldNow,
@@ -15,10 +16,11 @@ export {
   pageFoldIn,
   refreshFailed,
   removedSince,
-  serverVersions,
   upsertThreadSummary,
 } from "./fold.ts";
-export type { PageFold, PageFoldDependencies, ServerVersions } from "./fold.ts";
+export type { DeltaFoldDependencies, PageFold, PageFoldDependencies } from "./fold.ts";
+export { serverVersions } from "./versions.ts";
+export type { ServerVersions } from "./versions.ts";
 export { coverViewOf, projectionOf } from "./views.ts";
 export { restoreCanon, savedTimelineOf } from "./saved.ts";
 export type { SavedCover, SavedTimeline } from "./saved.ts";

@@ -5,8 +5,8 @@
 
 import type { Message } from "../../contract/index.ts";
 import type { ChannelCanon } from "./canon.ts";
-import type { ServerVersions } from "./fold.ts";
-import { serverVersions } from "./fold.ts";
+import type { ServerVersions } from "./versions.ts";
+import { serverVersions } from "./versions.ts";
 
 /**
  * Message `id` is gone upstream — a removal from the stream (`noteLiveRemoval`), or a delta's
