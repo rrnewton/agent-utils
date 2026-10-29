@@ -167,7 +167,7 @@ fn relative_inside(root: &Path, raw: &str, label: &str) -> Result<(String, PathB
     Ok((lexical, absolute))
 }
 
-fn stored_path(cfg: &Cfg, raw: &str, label: &str) -> Result<PathBuf> {
+pub(crate) fn stored_path(cfg: &Cfg, raw: &str, label: &str) -> Result<PathBuf> {
     let (_lexical, absolute) = relative_inside(&cfg.root, raw, label)?;
     ensure_no_symlink_components(&cfg.root, &absolute, label)?;
     Ok(absolute)
@@ -296,7 +296,7 @@ pub(crate) fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<(String, Pa
     Ok((stored, absolute))
 }
 
-fn common_directory(repository: &Path) -> Result<PathBuf> {
+pub(crate) fn common_directory(repository: &Path) -> Result<PathBuf> {
     let output = git(
         repository,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -316,7 +316,7 @@ fn common_directory(repository: &Path) -> Result<PathBuf> {
     Ok(common)
 }
 
-fn verify_existing_worktree(repository: &Path, checkout: &Path) -> Result<String> {
+pub(crate) fn verify_existing_worktree(repository: &Path, checkout: &Path) -> Result<String> {
     let source_common = common_directory(repository)?;
     let root_output = git(checkout, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(root_output.trim());

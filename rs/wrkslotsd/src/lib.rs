@@ -82,6 +82,7 @@ mod schema;
 mod status_state;
 mod storage_state;
 mod transfer_write;
+mod unpushed_state;
 mod yamlconfig;
 
 use std::error::Error;
