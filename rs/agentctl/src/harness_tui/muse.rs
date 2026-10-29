@@ -100,6 +100,9 @@ mod tests {
     const INTERRUPTING: &str = include_str!("../../testdata/muse-busy/muse-interrupting.txt");
     const WRAPPED: &str = include_str!("../../testdata/muse-busy/muse-wrapped-draft.txt");
     const OVERLONG: &str = include_str!("../../testdata/muse-busy/muse-overlong-token-draft.txt");
+    // Muse 1.4.15, 2026-10-29, inside a /goal turn (#678 muse-bridge-latency).
+    const FOREGROUND_HINT: &str = include_str!("../../testdata/muse-busy/muse-foreground-hint.txt");
+    const STEER_FAILED: &str = include_str!("../../testdata/muse-busy/muse-steer-failed.txt");
 
     const ALPHA: &str = "FOLLOWUP-ALPHA: when you reply, also include the word ALPHA.";
     const BETA: &str = "FOLLOWUP-BETA: also include the word BETA.";
@@ -198,13 +201,15 @@ mod tests {
 
     #[test]
     fn the_running_turn_row_is_found_below_output_and_queued_input() {
-        // The last-row rule that drives `agentctl status` misses the row when command output or
-        // a queued-input block follows it; the follow-up reader does not.
-        for screen in [COMMAND, QUEUED, DOUBLE_CHECKING] {
+        // `agentctl status` and the follow-up reader share one rule, which finds the row when
+        // command output or a queued-input block follows it, and in its `◆` phase (#678
+        // muse-bridge-latency).
+        for screen in [THINKING, COMMAND, QUEUED, DOUBLE_CHECKING] {
             let screen = headerless(screen);
-            assert!(!muse_verified_process_turn_running(&screen));
+            assert!(muse_verified_process_turn_running(&screen));
             assert!(muse_verified_process_turn_in_progress(&screen));
         }
+        assert!(!muse_verified_process_turn_running(&headerless(IDLE)));
         assert!(!muse_verified_process_turn_in_progress(&headerless(IDLE)));
     }
 
@@ -240,5 +245,48 @@ mod tests {
             muse_verified_process_prompt_transcript_count(&headerless(QUEUED), BETA),
             0
         );
+    }
+
+    #[test]
+    fn a_running_turn_reads_working_whatever_herdr_reports_and_whatever_its_glyph() {
+        use crate::client::muse_verified_pane_status;
+        // Herdr reports a Muse pane done once the turn's answer is drawn, while Muse is still in
+        // its `◆ Double checking` phase, and its progress glyph cycles through `◆ ◇ ◈`.
+        for (name, screen) in [
+            ("◆ thinking", THINKING),
+            ("◆ double checking", DOUBLE_CHECKING),
+            ("foreground command hint", FOREGROUND_HINT),
+            ("steer refused mid command", STEER_FAILED),
+        ] {
+            for screen in [screen.to_owned(), headerless(screen)] {
+                for reported in ["idle", "done", "working"] {
+                    assert_eq!(
+                        muse_verified_pane_status(reported, &screen),
+                        "working",
+                        "{name} reported {reported}"
+                    );
+                }
+            }
+            for glyph in ["◆", "◇", "◈"] {
+                let screen = screen
+                    .replace("◆ Thinking (", &format!("{glyph} Thinking ("))
+                    .replace("◇ Running command", &format!("{glyph} Running command"))
+                    .replace("◆ Double checking", &format!("{glyph} Double checking"));
+                assert_eq!(muse_verified_pane_status("done", &screen), "working", "{name} {glyph}");
+            }
+        }
+        assert_eq!(muse_verified_pane_status("done", &headerless(IDLE)), "idle");
+    }
+
+    #[test]
+    fn a_refused_steer_is_the_whole_editor_again() {
+        // Muse puts a steer it refuses back in its editor as the paste's placeholder, so the
+        // steer path sees the prompt still staged, presses Enter again, and at its deadline takes
+        // it back out instead of leaving a draft that refuses every later prompt.
+        let prompt = "x".repeat(1635);
+        assert!(STEER_FAILED.contains("steer failed"));
+        assert!(muse_verified_process_paste_is_exact_composer(STEER_FAILED, &prompt));
+        assert!(!MuseTui::editor_empty(STEER_FAILED));
+        assert_eq!(state(STEER_FAILED), State::Working);
     }
 }

@@ -436,6 +436,24 @@ def test_captured_headerless_frames_count_pastes_in_code_points() -> None:
     assert not muse_verified_process_paste_in_composer(answered, unicode)
 
 
+def test_a_running_muse_turn_is_never_an_idle_composer() -> None:
+    # #678 muse-bridge-latency: Muse 1.4's progress row animates through ◆ ◇ ◈, and a
+    # foreground command draws its hint below it, so neither the glyph nor the last row decides.
+    footer = "  watermelon-full-preview · xhigh · /work/project · Launch overrides\n"
+    rule = "────────────────\n"
+    for glyph in ("◆", "◇", "◈"):
+        for below in ("", "└ (ctrl+b to send to background)\n"):
+            screen = (
+                f"Muse Code 1.4.15\n❯ run the step\n"
+                f"{glyph} Running command · Sleep — running (15s · esc to interrupt)\n"
+                f"{below}{rule}❯\n{rule}{footer}"
+            )
+            assert not client_module.muse_idle_composer(screen), (glyph, below)
+            assert not muse_verified_process_idle_composer(screen), (glyph, below)
+    finished = f"Muse Code 1.4.15\n❯ run the step\n◆ Worked for 2m 00s\n{rule}❯\n{rule}{footer}"
+    assert client_module.muse_idle_composer(finished)
+
+
 def test_verified_headerless_muse_composer_distinguishes_buffered_input() -> None:
     divider = "─" * 40
     footer = "kiki · xhigh · /work/project · YOLO\n"
