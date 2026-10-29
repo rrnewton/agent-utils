@@ -27975,28 +27975,22 @@ async function readAllForCounts(channel, soon = false) {
 // the reader's own act until the next read: a reply dealt with in its thread counted as unread on
 // Main again. So each local write is remembered by message id until a read sent after it settled can
 // speak for that message: while the write is on its way no read does, and once it is settled only a
-// read sent after. `readStateEpoch` moves at every write's start and end; a read records it when sent.
-let readStateEpoch = 0;
-/** @type {Map<string, {pending: number, from: number}>} */
-const localReadWrites = new Map();
-/** @type {WeakMap<object, number>} */
-const readSentEpochs = new WeakMap();
+// read sent after. The epoch moves at every write's start and end; a read records it when sent. The
+// epoch, the local writes and when each read was sent are the ledger's (web/src/core/annotations
+// `createReadLedger`, `#624 voice-page-modularity`), here where they stood.
+const readLedger = createReadLedger();
 
 /** Whether `payload`'s read state for message `id` is newer than every local write to it. */
 function readSpeaksFor(payload, id) {
-  const write = localReadWrites.get(String(id));
-  if (!write) return true;
-  if (write.pending > 0) return false;
-  return sentEpochOf(payload) >= write.from;
+  return readLedger.speaksFor(payload, id);
 }
 
 /**
- * When `payload`'s read was sent, as `readStateEpoch` then. Now for a payload no read sent — the
- * store drawn as a page, say — which holds the local state already.
+ * When `payload`'s read was sent, as the epoch then. Now for a payload no read sent — the store drawn
+ * as a page, say — which holds the local state already.
  */
 function sentEpochOf(payload) {
-  const sent = readSentEpochs.get(payload);
-  return typeof sent === "number" ? sent : readStateEpoch;
+  return readLedger.sentEpochOf(payload);
 }
 
 /**
@@ -28057,12 +28051,12 @@ function copyOlderThan(copy, id, number, held, says = false) {
  * @returns {Promise<VibeTalk.TimelineResponse>}
  */
 async function readTimeline(path, options) {
-  const sent = readStateEpoch;
+  const sent = readLedger.epoch();
   // Counted as it is sent, before the answer is awaited (`apiDecoded`).
   const asked = apiDecoded("TimelineResponse", path, options);
   const number = timelineAnswersAsked;
   const payload = await asked;
-  readSentEpochs.set(payload, sent);
+  readLedger.noteSent(payload, sent);
   readSentNumbers.set(payload, number);
   return payload;
 }
@@ -28096,13 +28090,9 @@ async function readTimeline(path, options) {
  * @returns {HeldDoneMark}
  */
 function markHeldDone(ids, done, settles = false) {
-  readStateEpoch += 1;
   const marked = ids.map(String);
-  for (const id of marked) {
-    const write = localReadWrites.get(id) || { pending: 0, from: 0 };
-    write.pending += 1;
-    localReadWrites.set(id, write);
-  }
+  // The epoch moves, and each has one more write on its way (`ReadLedger.writeStarted`).
+  readLedger.writeStarted(marked);
   const canon = threadingSupported && channelStore.current().channel === String(selectedChannelId())
     ? channelStore.current() : null;
   const flipped = canon ? marked.filter((id) => canon.dismissed.has(id) !== done) : [];
@@ -28200,13 +28190,8 @@ function unsettleReplies(canon, ids) {
  * @param {boolean} ok
  */
 function settleHeldDone(mark, ok) {
-  readStateEpoch += 1;
-  for (const id of mark.ids) {
-    const write = localReadWrites.get(id);
-    if (!write) continue;
-    write.pending = Math.max(0, write.pending - 1);
-    if (write.pending === 0) write.from = readStateEpoch;
-  }
+  // The epoch moves, and each settles there once none is left on its way (`ReadLedger.writeSettled`).
+  readLedger.writeSettled(mark.ids);
   if (ok || mark.canon === null) return;
   for (const id of mark.flipped) {
     if (mark.done) mark.canon.dismissed.delete(id);
@@ -28635,7 +28620,7 @@ function joinedDeltas(pages) {
     dismissed: pages.flatMap((page) => page.dismissed || []),
   };
   // As old as its oldest page, for `readSpeaksFor`. `#222 unread-replies`.
-  readSentEpochs.set(joined, Math.min(...pages.map(sentEpochOf)));
+  readLedger.noteSent(joined, Math.min(...pages.map(sentEpochOf)));
   return joined;
 }
 
@@ -32978,7 +32963,7 @@ function dressUnpackedRows() {
  *
  * @typedef {import("./src/core/annotations/index.ts").HeldBookmark} HeldBookmark
  */
-const bookmarkStore = createBookmarks({ bumpEpoch: () => ++readStateEpoch });
+const bookmarkStore = createBookmarks({ bumpEpoch: () => readLedger.bump() });
 
 /** The row each column draws the line on, and on which side of it, or null. */
 const bookmarkDrawn = { main: null, side: null };
@@ -35720,13 +35705,13 @@ function startsRead(message) {
  */
 function noteStartsRead(messages) {
   const fresh = messages.filter((message) => startsRead(message) &&
-    !(threadingSupported && heldMessage(String(message.id))) && !localReadWrites.has(String(message.id)));
+    !(threadingSupported && heldMessage(String(message.id))) && !readLedger.written(String(message.id)));
   if (fresh.length === 0) return;
-  readStateEpoch += 1;
+  const epoch = readLedger.bump();
   const here = String(selectedChannelId());
   for (const message of fresh) {
     const id = String(message.id);
-    localReadWrites.set(id, { pending: 0, from: readStateEpoch });
+    readLedger.seed(id, epoch);
     if (String(message.channel_id) !== here) continue;
     if (threadingSupported && channelStore.current().channel === here) channelStore.current().dismissed.add(id);
     archivedIds.add(id);
@@ -42569,18 +42554,18 @@ async function loadDiscord(options) {
     // only when asked. `#217 markdown-blocks`.
     const path = withReadReason(
       `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}&render=html`, options);
-    const sent = readStateEpoch;
+    const sent = readLedger.epoch();
     // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
     const abandoned = { key: holdKey, channel: String(channel), sentAt: Date.now(),
       live: liveEventsSeen.get(String(channel)) || 0, news: liveNewsSeen.get(String(channel)) || 0, canon: null,
       generation };
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }),
       (answer) => abandonRead(answer, abandoned, (late) => {
-        if (late && typeof late === "object") readSentEpochs.set(late, sent);
+        if (late && typeof late === "object") readLedger.noteSent(late, sent);
         drawChannelPage(late, area, landedReadPosition(area, true, false));
       }));
     // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
-    if (payload && typeof payload === "object") readSentEpochs.set(payload, sent);
+    if (payload && typeof payload === "object") readLedger.noteSent(payload, sent);
     if (!currentDiscordLoad(generation, channel, false)) {
       return;
     }
@@ -43199,7 +43184,7 @@ function noteArchived(payload, replace) {
   // written Done or put back since it was loaded (`localReadWrites` only grows): a few hundred at most in
   // a long session, against a read that has just drawn its page, so it is not bounded further.
   if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {
-    for (const id of localReadWrites.keys()) {
+    for (const id of readLedger.writtenIds()) {
       if (readSpeaksFor(payload, id)) continue;
       if (channelStore.current().dismissed.has(id)) archivedIds.add(id);
       else archivedIds.delete(id);
@@ -43362,12 +43347,12 @@ async function loadTodo(options) {
     // default because the bulk clear has to send it back: `{through}` is resolved against a window
     // on the server, and a boundary resolved against a WIDER window than the one this page
     // displayed would clear messages the reader never saw. See `clearBacklog`.
-    const sent = readStateEpoch;
+    const sent = readLedger.epoch();
     const payload = await api(
       withReadReason(`/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`, options)
     );
     // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
-    if (payload && typeof payload === "object") readSentEpochs.set(payload, sent);
+    if (payload && typeof payload === "object") readLedger.noteSent(payload, sent);
     if (!currentDiscordLoad(generation, channel, true)) {
       return;
     }

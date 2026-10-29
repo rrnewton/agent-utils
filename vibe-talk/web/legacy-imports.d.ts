@@ -17,6 +17,7 @@ declare const createWebPorts: LegacyImports["createWebPorts"];
 declare const createNavigation: LegacyImports["createNavigation"];
 declare const anchorOfMessage: LegacyImports["anchorOfMessage"];
 declare const createBookmarks: LegacyImports["createBookmarks"];
+declare const createReadLedger: LegacyImports["createReadLedger"];
 declare const isBookmarkState: LegacyImports["isBookmarkState"];
 declare const sameAnchor: LegacyImports["sameAnchor"];
 declare const emptyCanon: LegacyImports["emptyCanon"];

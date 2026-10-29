@@ -6730,6 +6730,32 @@ test("`#624 voice-page-modularity`: the reading bookmark's owner, from the modul
   assert.equal(store.settle(move, null), null, "a write settled after its credential was forgotten");
 });
 
+test("`#624 voice-page-modularity`: which reads still speak for a message's read state, from the module alone", () => {
+  const { createReadLedger } = ANNOTATIONS;
+  const ledger = createReadLedger();
+  const before = {};
+  ledger.noteSent(before, ledger.epoch());
+  assert.equal(ledger.speaksFor(before, "1"), true, "a read spoke for nothing it wrote");
+  ledger.writeStarted(["1"]);
+  const during = {};
+  ledger.noteSent(during, ledger.epoch());
+  assert.deepStrictEqual([ledger.speaksFor(before, "1"), ledger.speaksFor(during, "1"), ledger.written("1")], [false, false, true]);
+  ledger.writeSettled(["1"]);
+  const after = {};
+  ledger.noteSent(after, ledger.epoch());
+  assert.deepStrictEqual([ledger.speaksFor(during, "1"), ledger.speaksFor(after, 1)], [false, true],
+    "a read sent while the write was out spoke after it settled, or one sent after did not");
+  // Two writes on their way: settling one is not enough.
+  ledger.writeStarted(["2"]);
+  ledger.writeStarted(["2"]);
+  ledger.writeSettled(["2"]);
+  assert.equal(ledger.speaksFor({}, "2"), false);
+  // A payload no read sent is now, and holds the local state already; a seeded message speaks from its epoch.
+  ledger.seed("3", ledger.bump());
+  assert.equal(ledger.speaksFor({}, "3"), true);
+  assert.deepStrictEqual([...ledger.writtenIds()], ["1", "2", "3"]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -76955,8 +76981,8 @@ test("`#326 refused-undo-restores-done`: a put back from its row that the server
 //       list until the next read.
 
 /** The lines of `noteArchived` that give a copy the store's state for a message the read does not speak for, for a negative control. */
-const COPY_TAKES_STORE = ["  if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {\n    for (const id of localReadWrites.keys()) {",
-  "  if (false) {\n    for (const id of localReadWrites.keys()) {"];
+const COPY_TAKES_STORE = ["  if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {\n    for (const id of readLedger.writtenIds()) {",
+  "  if (false) {\n    for (const id of readLedger.writtenIds()) {"];
 /** The wait of Through here for a Done on its way on a row it covers, for a negative control. */
 const THROUGH_WAITS = [
   "    if (!(await doneSaved(waitingFor, () => String(selectedChannelId()) === channel && doneHeldHere(waitingFor)))) {",

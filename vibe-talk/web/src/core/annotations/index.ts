@@ -3,3 +3,5 @@
 
 export { anchorOfMessage, createBookmarks, isBookmarkState, sameAnchor } from "./bookmarks.ts";
 export type { BookmarkMove, BookmarkState, Bookmarks, BookmarksDependencies, HeldBookmark } from "./bookmarks.ts";
+export { createReadLedger } from "./reads.ts";
+export type { ReadLedger } from "./reads.ts";
