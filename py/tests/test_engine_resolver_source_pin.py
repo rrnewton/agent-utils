@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import os
 import shutil
@@ -122,7 +123,9 @@ def _build_sandbox(tmp_path: Path) -> Path:
         "    }\n"
         "}\n"
     )
-    (root / ".gitignore").write_text("/rs/target/\n")
+    (root / ".gitignore").write_text(
+        "/rs/target/\n/rs/.agent-utils-locks/\n/rs/.agent-utils-snapshots/\n"
+    )
 
     subprocess.run(
         [
@@ -156,7 +159,14 @@ def test_launcher_builds_then_reuses_verified_workspace_cache(tmp_path: Path) ->
     assert target.parents[2] == root / "rs" / "target"
     provenance = target.with_name("tick-hub.provenance")
     assert target.is_file()
-    assert provenance.read_text().count("\n") == 2
+    stamp = provenance.read_text()
+    assert stamp.count("source_fp=") == 1
+    assert stamp.count("binary_sha256=") == 1
+    # Fast warm path (#680 launcher-fast-path) token fields ride along; the git fields are
+    # empty in this uncommitted sandbox, populated once HEAD and a clean rs/ tree identify
+    # the source.
+    for field in ("git_head=", "git_rs_tree=", "toolchain_fp="):
+        assert stamp.count(field) == 1
     original_mtime = target.stat().st_mtime_ns
     original_bytes = target.read_bytes()
 
@@ -170,6 +180,164 @@ def test_launcher_builds_then_reuses_verified_workspace_cache(tmp_path: Path) ->
     ensured_again = _run_launcher(root, ensure_only=True)
     assert ensured_again.returncode == 0, ensured_again.stderr
     assert ensured_again.stdout == f"{target}\n"
+
+
+def _git_commit(root: Path, message: str) -> None:
+    _git(root, "add", "-A")
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Launcher Test",
+            "-c",
+            "user.email=launcher@example.com",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
+    )
+
+
+def _git_stdout(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
+    ).stdout.strip()
+
+
+def test_fast_warm_path_skips_cargo_and_notices_pin_moves(tmp_path: Path) -> None:
+    """A committed, clean checkout execs the verified snapshot without Cargo or the lock.
+
+    Any rs/ dirt (tracked edit or untracked file), a replaced snapshot, or a HEAD move (a
+    pinned submodule's pin moving) misses the fast path and re-verifies on the slow path.
+    """
+    root = _build_sandbox(tmp_path)
+    assert _run_launcher(root).stdout == "v1\n"
+    _git_commit(root, "pin v1")
+
+    # The first committed call upgrades the stamp through the slow verified path.
+    assert _run_launcher(root).stdout == "v1\n"
+    target = Path(_run_launcher(root, ensure_only=True).stdout.strip())
+    provenance = target.with_name("tick-hub.provenance")
+    stamp = provenance.read_text()
+    assert stamp.split("git_head=")[1].splitlines()[0] == _git_stdout(root, "rev-parse", "HEAD")
+
+    real_cargo = shutil.which("cargo")
+    assert real_cargo is not None
+    wrapper_dir = tmp_path / "cargo log"
+    wrapper_dir.mkdir()
+    cargo_log = tmp_path / "cargo-calls.log"
+    cargo_wrapper = wrapper_dir / "cargo"
+    cargo_wrapper.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >>"$AGENT_UTILS_TEST_CARGO_LOG"\n'
+        'exec "$AGENT_UTILS_TEST_REAL_CARGO" "$@"\n'
+    )
+    _chmod_x(cargo_wrapper)
+    logged_env = {
+        "PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"],
+        "AGENT_UTILS_TEST_REAL_CARGO": real_cargo,
+        "AGENT_UTILS_TEST_CARGO_LOG": str(cargo_log),
+    }
+
+    # Warm call: Cargo is never executed.
+    warm = _run_launcher(root, extra_env=logged_env)
+    assert warm.returncode == 0, warm.stderr
+    assert warm.stdout == "v1\n"
+    assert "cache=verified" in warm.stderr
+    assert not cargo_log.exists()
+
+    # Parallel warm calls all run the same verified bytes.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: _run_launcher(root, extra_env=logged_env), range(8)))
+    assert [result.stdout for result in results] == ["v1\n"] * 8
+    assert not cargo_log.exists()
+
+    # A replaced snapshot is never executed; the slow path republishes verified bytes.
+    snapshots = list((root / "rs" / ".agent-utils-snapshots" / "tick-hub").glob("*/tick-hub"))
+    assert len(snapshots) == 1
+    snapshots[0].write_text("#!/bin/sh\necho PLANTED_SNAPSHOT\n")
+    _chmod_x(snapshots[0])
+    repaired = _run_launcher(root, extra_env=logged_env)
+    assert repaired.returncode == 0, repaired.stderr
+    assert repaired.stdout == "v1\n"
+    assert "PLANTED_SNAPSHOT" not in repaired.stdout
+
+    # An assume-unchanged edit is invisible to git status but not to the content
+    # fingerprint: the fast path must refuse it and the slow path must rebuild.
+    library = root / "rs" / "tick-hub" / "src" / "lib.rs"
+    _git(root, "update-index", "--assume-unchanged", "rs/tick-hub/src/lib.rs")
+    library.write_text('pub fn message() -> &\'static str { "v3-hidden" }\n')
+    hidden = _run_launcher(root, extra_env=logged_env)
+    assert hidden.returncode == 0, hidden.stderr
+    assert hidden.stdout == "v3-hidden\n"
+    _git(root, "update-index", "--no-assume-unchanged", "rs/tick-hub/src/lib.rs")
+    library.write_text('pub fn message() -> &\'static str { "v1" }\n')
+    restored = _run_launcher(root, extra_env=logged_env)
+    assert restored.returncode == 0, restored.stderr
+    assert restored.stdout == "v1\n"
+    cargo_log.unlink(missing_ok=True)
+
+    # An untracked file under rs/ is source: it invalidates the stamp and forces a real build.
+    extra = root / "rs" / "tick-hub" / "src" / "extra.txt"
+    extra.write_text("untracked\n")
+    untracked = _run_launcher(root, extra_env=logged_env)
+    assert untracked.returncode == 0, untracked.stderr
+    assert untracked.stdout == "v1\n"
+    assert cargo_log.exists()
+    extra.unlink()
+    cargo_log.unlink()
+
+    # An uncommitted edit rebuilds; committing it (the pin move) restamps; then warm is fast.
+    library = root / "rs" / "tick-hub" / "src" / "lib.rs"
+    library.write_text('pub fn message() -> &\'static str { "v2" }\n')
+    changed = _run_launcher(root, extra_env=logged_env)
+    assert changed.returncode == 0, changed.stderr
+    assert changed.stdout == "v2\n"
+    assert "cache=refreshed" in changed.stderr
+    _git_commit(root, "pin v2")
+    assert _run_launcher(root).stdout == "v2\n"
+    cargo_log.unlink(missing_ok=True)
+    warm_v2 = _run_launcher(root, extra_env=logged_env)
+    assert warm_v2.returncode == 0, warm_v2.stderr
+    assert warm_v2.stdout == "v2\n"
+    assert not cargo_log.exists()
+
+    # A HEAD move that does not touch rs/ restamps without Cargo and stays fast afterwards.
+    (root / "NOTES.txt").write_text("unrelated\n")
+    _git_commit(root, "docs only")
+    moved = _run_launcher(root, extra_env=logged_env)
+    assert moved.returncode == 0, moved.stderr
+    assert moved.stdout == "v2\n"
+    assert not cargo_log.exists()
+    stamp = provenance.read_text()
+    assert stamp.split("git_head=")[1].splitlines()[0] == _git_stdout(root, "rev-parse", "HEAD")
+
+    # A build-affecting environment change (here RUSTFLAGS) changes the toolchain token:
+    # Cargo runs again instead of the warm path blessing the previous build's bytes.
+    flagged = _run_launcher(
+        root, extra_env={**logged_env, "RUSTFLAGS": "--cfg launcher_fast_path_test"}
+    )
+    assert flagged.returncode == 0, flagged.stderr
+    assert flagged.stdout == "v2\n"
+    assert cargo_log.exists()
 
 
 def test_library_change_rebuilds_unchanged_entrypoint(tmp_path: Path) -> None:

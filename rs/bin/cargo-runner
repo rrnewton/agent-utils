@@ -2,11 +2,24 @@
 # Tracked, source-current launcher for repository-local Rust commands.
 #
 # Every public link beside this file points here. Cargo checks the real workspace dependency graph
-# on every invocation, using rs/target as its normal incremental cache. A provenance stamp beside
+# on the slow path below, using rs/target as its normal incremental cache. A provenance stamp beside
 # the resulting target binary detects an absent, malformed, or replaced cached artifact before it
 # can execute. This is deliberately not rust-script: rust-script 0.36 invalidates its executable
 # cache from the entrypoint script, but these entrypoints delegate into library crates whose source
 # can change without main.rs changing.
+#
+# Fast warm path (#680 launcher-fast-path): when a previous slow-path run stamped the checkout's
+# git state (HEAD plus the HEAD:rs tree) and a hashed toolchain token beside the binary, and both
+# still match a clean `git status --porcelain -- rs`, the working tree under rs/ is exactly the
+# stamped source, so the launcher verifies the content-addressed snapshot's hash and execs it
+# directly: no lock, no Cargo, no full source fingerprint. A pinned submodule whose pin moves
+# changes HEAD, so it misses the fast path and rebuilds on the slow path automatically. Any doubt
+# (no git, no HEAD, dirty tree, assume-unchanged/skip-worktree index entries, byte-rewriting
+# .gitattributes, stale stamp, changed toolchain, replaced snapshot) falls through to the locked
+# slow path, which re-verifies with the full content fingerprint before building; git's own stat,
+# fsmonitor, and untracked caches are trusted exactly as `git status` trusts them. The slow path
+# also skips Cargo entirely when that fingerprint, the target hash, and the toolchain token
+# already match the stamp.
 set -euo pipefail
 
 CALLER_CWD="$PWD"
@@ -14,6 +27,16 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 TOOL="$(basename "$0")"
 cd "$ROOT"
+
+# Every git verdict below must describe THIS checkout. A caller inside a git hook or wrapper may
+# export repository/index/config pointers for a different tree, so drop them all; git discovery
+# from $ROOT (plus the caller's ordinary config files) is the only authority the launcher uses.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+  GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX GIT_CEILING_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS \
+  GIT_CONFIG_COUNT GIT_CONFIG_SYSTEM GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
+for git_env_name in $(compgen -e GIT_CONFIG_KEY_ || true) $(compgen -e GIT_CONFIG_VALUE_ || true); do
+  unset "$git_env_name"
+done
 
 case "$TOOL" in
   dagrun|cpuset-alloc)
@@ -50,16 +73,6 @@ case "$TOOL" in
     ;;
 esac
 
-for required in cargo cp flock mktemp sha256sum; do
-  if ! command -v "$required" >/dev/null 2>&1; then
-    echo "[$TOOL] Rust source launcher requires '$required'" >&2
-    if [[ "$required" == "cargo" ]]; then
-      echo "[$TOOL] install the Rust toolchain (https://rustup.rs), or run the Python edition through the repository dispatcher with DAGRUN_ENGINE=python" >&2
-    fi
-    exit 127
-  fi
-done
-
 absolute_command_path() {
   local requested="$1"
   local resolved
@@ -73,10 +86,6 @@ absolute_command_path() {
   printf '%s\n' "$resolved"
 }
 
-CARGO_BIN="$(absolute_command_path cargo)" || {
-  echo "[$TOOL] Rust source launcher could not resolve the Cargo executable" >&2
-  exit 127
-}
 RUSTC_REQUESTED="${RUSTC:-rustc}"
 RUSTC_BIN="$(absolute_command_path "$RUSTC_REQUESTED")" || {
   echo "[$TOOL] Rust source launcher requires Rust compiler '$RUSTC_REQUESTED'" >&2
@@ -89,6 +98,273 @@ if [[ -n "${RUSTC:-}" ]]; then
   RUSTC="$RUSTC_BIN"
   export RUSTC
 fi
+
+# --- Fast warm path helpers (also used to stamp the slow path) ---
+
+# Fill FAST_ENTRIES with the `git ls-files -v -- rs` entries, one "<tag> <path>" per element;
+# nonzero on any git failure or an empty listing. Plain (non-NUL) output is safe in command
+# substitution: git quotes unusual paths instead of emitting raw control bytes.
+read_ls_files_v() {
+  FAST_ENTRIES=()
+  local listing
+  listing="$(GIT_OPTIONAL_LOCKS=0 git ls-files -v -- rs 2>/dev/null)" || return 1
+  [[ -n "$listing" ]] || return 1
+  mapfile -t FAST_ENTRIES <<<"$listing"
+  ((${#FAST_ENTRIES[@]} > 0))
+}
+
+# Index entries carrying assume-unchanged (lowercase tag) or skip-worktree (S) are invisible to
+# git status however their bytes change, so no git-only check may bless them.
+index_bits_clean() {
+  local entry
+  read_ls_files_v || return 1
+  for entry in "${FAST_ENTRIES[@]}"; do
+    case "${entry:0:1}" in
+      [a-zS]) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# Set FAST_HEAD/FAST_RS_TREE when HEAD and the HEAD:rs tree identify a clean rs/ tree; clear both
+# otherwise. A clean porcelain status (tracked modifications and non-ignored untracked files alike)
+# plus a matching tree means the working tree under rs/ is exactly the stamped source: git's own
+# stat cache does the unchanged-file work the full content fingerprint would redo by hand.
+compute_fast_token() {
+  FAST_HEAD=""
+  FAST_RS_TREE=""
+  command -v git >/dev/null 2>&1 || return 1
+  local status_out rev_out
+  status_out="$(GIT_OPTIONAL_LOCKS=0 git status --porcelain --untracked-files=normal -- rs 2>/dev/null)" || return 1
+  [[ -z "$status_out" ]] || return 1
+  index_bits_clean || return 1
+  rev_out="$(GIT_OPTIONAL_LOCKS=0 git rev-parse HEAD HEAD:rs 2>/dev/null)" || return 1
+  local -a rev_lines=()
+  mapfile -t rev_lines <<<"$rev_out"
+  [[ "${#rev_lines[@]}" == "2" ]] || return 1
+  [[ "${rev_lines[0]}" =~ ^[0-9a-f]{40,64}$ && "${rev_lines[1]}" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+  FAST_HEAD="${rev_lines[0]}"
+  FAST_RS_TREE="${rev_lines[1]}"
+  return 0
+}
+
+# Read a provenance stamp into ST_* globals. Missing or unreadable stamps leave them empty, which
+# every caller treats as unverified. A duplicated source_fp/binary_sha256 line voids the stamp:
+# the Python provenance reader (cross/differential.py) requires exactly one of each, and the two
+# readers must share that contract.
+parse_provenance() {
+  ST_SOURCE=""
+  ST_BINARY=""
+  ST_HEAD=""
+  ST_TREE=""
+  ST_TOOLCHAIN=""
+  [[ -f "$1" && -r "$1" ]] || return 0
+  local line key value seen_source=0 seen_binary=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      source_fp)
+        seen_source=$((seen_source + 1))
+        ST_SOURCE="$value"
+        ;;
+      binary_sha256)
+        seen_binary=$((seen_binary + 1))
+        ST_BINARY="$value"
+        ;;
+      git_head) ST_HEAD="$value" ;;
+      git_rs_tree) ST_TREE="$value" ;;
+      toolchain_fp) ST_TOOLCHAIN="$value" ;;
+    esac
+  done <"$1"
+  if ((seen_source != 1 || seen_binary != 1)); then
+    ST_SOURCE=""
+    ST_BINARY=""
+    ST_HEAD=""
+    ST_TREE=""
+    ST_TOOLCHAIN=""
+  fi
+}
+
+# Hash everything that would make Cargo rebuild with unchanged rs/ source: the compiler binary
+# (and every rustup-managed compiler beside it, which `rustup update` replaces in place), the
+# rustup/Cargo configuration files, and the build-affecting environment. The stamp stores only
+# this hash, so no raw environment value can inject lines into the stamp.
+toolchain_token() {
+  local rustup_home="${RUSTUP_HOME:-${HOME:-}/.rustup}"
+  local cargo_home="${CARGO_HOME:-${HOME:-}/.cargo}"
+  local -a targets=("$RUSTC_BIN" "$rustup_home/settings.toml" "$cargo_home/config.toml" "$cargo_home/config")
+  local tc file name stats="" envs="" digest
+  for tc in "$rustup_home"/toolchains/*/bin/rustc; do
+    if [[ -e "$tc" ]]; then
+      targets+=("$tc")
+    fi
+  done
+  local -a existing=()
+  for file in "${targets[@]}"; do
+    if [[ -e "$file" ]]; then
+      existing+=("$file")
+    fi
+  done
+  if ((${#existing[@]})); then
+    stats="$(stat -c '%n %s:%Y' -- "${existing[@]}" 2>/dev/null || true)"
+  fi
+  for name in RUSTC RUSTUP_TOOLCHAIN RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS \
+    CARGO_ENCODED_RUSTFLAGS AGENTCTL_SOURCE_FP; do
+    envs+="$name=${!name:-};"
+  done
+  local profile_names
+  profile_names="$(compgen -e CARGO_PROFILE_ || true)"
+  if [[ -n "$profile_names" ]]; then
+    profile_names="$(printf '%s\n' "$profile_names" | LC_ALL=C sort)"
+  fi
+  for name in $profile_names; do
+    envs+="$name=${!name:-};"
+  done
+  digest="$(printf '%s' "targets=${targets[*]}|stats=$stats|env=$envs" | sha256sum 2>/dev/null || true)"
+  printf '%s\n' "${digest%% *}"
+}
+
+# Identify the index file and the root .gitattributes by stat identity (inode, size, mtimes).
+# Index-bit and attribute changes rewrite one of those files, so an unchanged key proves the
+# earlier ls-files verdict still holds and the pass can be skipped.
+index_verdict_key() {
+  local first gitdir index ikey akey="none"
+  if [[ -d "$ROOT/.git" ]]; then
+    index="$ROOT/.git/index"
+  elif [[ -f "$ROOT/.git" ]]; then
+    IFS= read -r first <"$ROOT/.git" || return 1
+    gitdir="${first#gitdir: }"
+    [[ "$gitdir" != "$first" ]] || return 1
+    if [[ "$gitdir" != /* ]]; then
+      gitdir="$ROOT/$gitdir"
+    fi
+    index="$gitdir/index"
+  else
+    return 1
+  fi
+  [[ -f "$index" ]] || return 1
+  ikey="$(stat -c '%i:%s:%Y:%Z' -- "$index" 2>/dev/null)" || return 1
+  [[ -n "$ikey" ]] || return 1
+  if [[ -e "$ROOT/.gitattributes" ]]; then
+    akey="$(stat -c '%i:%s:%Y:%Z' -- "$ROOT/.gitattributes" 2>/dev/null)" || return 1
+    [[ -n "$akey" ]] || return 1
+  fi
+  printf '%s;%s\n' "$ikey" "$akey"
+}
+
+write_index_verdict() {
+  local key="$1" vtmp
+  mkdir -p "$ROOT/rs/.agent-utils-locks" 2>/dev/null || true
+  vtmp="$(mktemp "$ROOT/rs/.agent-utils-locks/.fast-index-verdict.XXXXXX" 2>/dev/null || true)"
+  if [[ -n "${vtmp:-}" ]]; then
+    if printf '%s\n' "$key" >"$vtmp"; then
+      mv -f -- "$vtmp" "$FAST_VERDICT_FILE" || rm -f -- "$vtmp"
+    else
+      rm -f -- "$vtmp"
+    fi
+  fi
+}
+
+# Fast-path git verdict: sets FAST_HEAD_NOW/FAST_CLEAN. The status branch header names HEAD and
+# any file entry means rs/ is dirty; the ls-files pass rejects index entries git status cannot
+# see through (assume-unchanged/skip-worktree) and collects applicable .gitattributes files,
+# whose byte-rewriting attributes are then refused. A clean verdict at the stamped HEAD means
+# the working tree under rs/ is exactly the stamped source.
+fast_git_state() {
+  FAST_HEAD_NOW=""
+  FAST_CLEAN=0
+  local status_out line entry attr_file key=""
+  status_out="$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 --branch --untracked-files=normal -- rs 2>/dev/null)" || return 1
+  FAST_CLEAN=1
+  while IFS= read -r line; do
+    case "$line" in
+      "# branch.oid "*) FAST_HEAD_NOW="${line#'# branch.oid '}" ;;
+      "# "*) ;;
+      *) FAST_CLEAN=0 ;;
+    esac
+  done <<<"$status_out"
+  key="$(index_verdict_key || true)"
+  if [[ -n "$key" && "$(cat "$FAST_VERDICT_FILE" 2>/dev/null || true)" == "$key" ]]; then
+    [[ "$FAST_CLEAN" == "1" ]]
+    return
+  fi
+  read_ls_files_v || return 1
+  local -a attr_files=()
+  if [[ -f "$ROOT/.gitattributes" ]]; then
+    attr_files+=("$ROOT/.gitattributes")
+  fi
+  for entry in "${FAST_ENTRIES[@]}"; do
+    case "${entry:0:1}" in
+      [a-zS]) FAST_CLEAN=0 ;;
+    esac
+    case "${entry:2}" in
+      .gitattributes | */.gitattributes) attr_files+=("$ROOT/${entry:2}") ;;
+    esac
+  done
+  for attr_file in "${attr_files[@]}"; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        *filter=* | *eol=* | *working-tree-encoding=*) FAST_CLEAN=0 ;;
+      esac
+    done <"$attr_file"
+  done
+  if [[ "$FAST_CLEAN" == "1" && -n "$key" ]]; then
+    write_index_verdict "$key" || true
+  fi
+  [[ "$FAST_CLEAN" == "1" ]]
+}
+
+HOST_CACHE_FILE="$ROOT/rs/.agent-utils-locks/host-target"
+FAST_VERDICT_FILE="$ROOT/rs/.agent-utils-locks/fast-index-verdict"
+
+# Fast warm path: a stamp whose git token and toolchain identity still match, plus a snapshot whose
+# bytes hash to the stamped binary hash, is exactly what the slow path would re-verify at full cost.
+# Exec it without the checkout lock so parallel warm calls do not serialize. Ensure-only callers
+# print the Cargo target path, so they always take the slow path.
+if [[ "${AGENT_UTILS_RS_ENSURE_ONLY:-}" != "1" ]]; then
+  FAST_HOST=""
+  if [[ -f "$HOST_CACHE_FILE" ]]; then
+    IFS= read -r FAST_HOST <"$HOST_CACHE_FILE" || FAST_HOST=""
+  fi
+  if [[ "$FAST_HOST" =~ ^[A-Za-z0-9_.-]+$ && "$FAST_HOST" != *".."* ]]; then
+    parse_provenance "$ROOT/rs/target/$FAST_HOST/release/$TOOL.provenance" || true
+    if [[ "$ST_SOURCE" =~ ^[0-9a-f]{64}$ && "$ST_BINARY" =~ ^[0-9a-f]{64}$ &&
+      "$ST_HEAD" =~ ^[0-9a-f]{40,64}$ && "$ST_TREE" =~ ^[0-9a-f]{40,64}$ &&
+      "$ST_TOOLCHAIN" =~ ^[0-9a-f]{64}$ && "$ST_TOOLCHAIN" == "$(toolchain_token)" ]]; then
+      FAST_SNAPSHOT="$ROOT/rs/.agent-utils-snapshots/$TOOL/$ST_BINARY/$TOOL"
+      # Hash first, git verdict second: the source check then runs after the long hash, so an
+      # edit landing in either window is seen before exec, never after it.
+      if [[ -x "$FAST_SNAPSHOT" ]]; then
+        FAST_SNAPSHOT_SHA="$(sha256sum -- "$FAST_SNAPSHOT" 2>/dev/null || true)"
+        if [[ "${FAST_SNAPSHOT_SHA%% *}" == "$ST_BINARY" ]] &&
+          fast_git_state && [[ "$FAST_HEAD_NOW" == "$ST_HEAD" ]]; then
+          echo "[$TOOL] rust cache=verified source=${ST_SOURCE:0:12} binary=${ST_BINARY:0:12}" >&2
+          cd "$CALLER_CWD"
+          unset AGENT_UTILS_RS_ENSURE_ONLY
+          exec "$FAST_SNAPSHOT" "$@"
+        fi
+      fi
+    fi
+  fi
+fi
+
+# Slow path only from here: it needs the full toolchain, so pay for its discovery now.
+for required in cargo cp flock mktemp sha256sum; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    echo "[$TOOL] Rust source launcher requires '$required'" >&2
+    if [[ "$required" == "cargo" ]]; then
+      echo "[$TOOL] install the Rust toolchain (https://rustup.rs), or run the Python edition through the repository dispatcher with DAGRUN_ENGINE=python" >&2
+    fi
+    exit 127
+  fi
+done
+
+CARGO_BIN="$(absolute_command_path cargo)" || {
+  echo "[$TOOL] Rust source launcher could not resolve the Cargo executable" >&2
+  exit 127
+}
+
 # Match Cargo's neutral configuration/toolchain discovery below. Otherwise an enclosing consumer
 # rust-toolchain.toml could select one compiler for this target path while Cargo, launched from /,
 # selects another. Explicit RUSTC/RUSTUP_TOOLCHAIN environment choices remain authoritative.
@@ -117,6 +393,33 @@ mkdir -p "$LOCK_ROOT"
 exec 9>"$LOCK_ROOT/cache.lock"
 flock 9
 
+# Cache the host triple where the fast warm path can find the stamp without paying for `rustc -vV`.
+# Best effort: a stale or missing cache only costs the fast path, never correctness.
+if [[ "$(cat "$HOST_CACHE_FILE" 2>/dev/null || true)" != "$HOST_TARGET" ]]; then
+  host_tmp="$(mktemp "$LOCK_ROOT/.host-target.XXXXXX" 2>/dev/null || true)"
+  if [[ -n "${host_tmp:-}" ]]; then
+    if printf '%s\n' "$HOST_TARGET" >"$host_tmp"; then
+      mv -f -- "$host_tmp" "$HOST_CACHE_FILE" || rm -f -- "$host_tmp"
+    else
+      rm -f -- "$host_tmp"
+    fi
+  fi
+fi
+
+# Write a provenance stamp for one built tool: the full source fingerprint and binary hash (the
+# slow path's authority) plus the fast warm path's git/toolchain tokens, empty when the rs/ tree
+# is dirty or uncommitted at stamp time. $source_after must hold the verified fingerprint and
+# $TOOLCHAIN_NOW the current toolchain token.
+stamp_provenance_file() {
+  local stamp_target="$1" stamp_sha="$2"
+  local stamp_tmp
+  compute_fast_token || true
+  stamp_tmp="$(mktemp "$TARGET_RELEASE/.$(basename "$stamp_target").provenance.XXXXXX")"
+  printf 'source_fp=%s\nbinary_sha256=%s\ngit_head=%s\ngit_rs_tree=%s\ntoolchain_fp=%s\n' \
+    "$source_after" "$stamp_sha" "$FAST_HEAD" "$FAST_RS_TREE" "$TOOLCHAIN_NOW" >"$stamp_tmp"
+  mv -f -- "$stamp_tmp" "$stamp_target.provenance"
+}
+
 run_cargo() {
   # Cargo discovers configuration by walking upward from its PROCESS cwd, not from
   # --manifest-path.  agent-utils is often checked out inside a consumer repository, whose
@@ -133,10 +436,15 @@ run_cargo() {
 
 cache_state="missing"
 before_binary=""
+stamped_source=""
+stamped_binary=""
+ST_TOOLCHAIN=""
 source_before="$("$FINGERPRINT")"
+TOOLCHAIN_NOW="$(toolchain_token)"
 if [[ -f "$TARGET" && -x "$TARGET" && -f "$PROVENANCE" ]]; then
-  stamped_source="$(sed -n 's/^source_fp=//p' "$PROVENANCE")"
-  stamped_binary="$(sed -n 's/^binary_sha256=//p' "$PROVENANCE")"
+  parse_provenance "$PROVENANCE" || true
+  stamped_source="$ST_SOURCE"
+  stamped_binary="$ST_BINARY"
   before_binary="$(sha256sum -- "$TARGET" | cut -d' ' -f1)"
   if [[ -n "$stamped_source" && -n "$stamped_binary" && "$before_binary" == "$stamped_binary" ]]; then
     if [[ "$stamped_source" == "$source_before" ]]; then
@@ -240,50 +548,72 @@ fi
 attempt=1
 while ((attempt <= 3)); do
   source_before="$("$FINGERPRINT")"
-  build_targets=(--bin "$TOOL")
-  if [[ "$force_refresh" == "1" ]]; then
-    build_targets=(--bins)
-  fi
-  if ! run_cargo build --quiet --locked --release \
-      --manifest-path "$MANIFEST" --package "$PACKAGE" \
-      --target-dir "$TARGET_ROOT" --target "$HOST_TARGET" "${build_targets[@]}"; then
-    echo "[$TOOL] Cargo build failed; no cached Rust artifact was executed" >&2
-    exit 3
-  fi
-  source_after="$("$FINGERPRINT")"
-  if [[ "$source_before" != "$source_after" ]]; then
-    echo "[$TOOL] Rust source changed during build; retrying ($attempt/3)" >&2
-    refresh_package
-    attempt=$((attempt + 1))
-    continue
-  fi
-  stamp_tools=("$TOOL")
-  if [[ "$force_refresh" == "1" ]]; then
-    stamp_tools=("${PACKAGE_TOOLS[@]}")
-  fi
   stamped_current_sha=""
-  for stamp_tool in "${stamp_tools[@]}"; do
-    stamp_target="$TARGET_RELEASE/$stamp_tool"
-    stamp_provenance="$stamp_target.provenance"
-    if [[ ! -x "$stamp_target" ]]; then
-      echo "[$TOOL] Cargo succeeded but produced no executable at $stamp_target" >&2
+  if [[ "$cache_state" == "verified" && "$force_refresh" == "0" &&
+    "$ST_TOOLCHAIN" == "$TOOLCHAIN_NOW" ]]; then
+    # The full content fingerprint, target hash, and toolchain token all match the stamp: nothing
+    # to build. Skip Cargo (its no-op pass was pure overhead here) and go to snapshot publication.
+    # A toolchain mismatch takes the build branch instead, where Cargo stays the authority.
+    if [[ "$source_before" != "$stamped_source" ]]; then
+      refresh_package
+      attempt=$((attempt + 1))
+      continue
+    fi
+    if ! binary_sha="$(sha256sum -- "$TARGET" 2>/dev/null | cut -d' ' -f1)" ||
+      [[ "$binary_sha" != "$stamped_binary" ]]; then
+      refresh_package
+      attempt=$((attempt + 1))
+      continue
+    fi
+    source_after="$source_before"
+    stamped_current_sha="$binary_sha"
+    # Upgrade a stamp that predates the fast warm path (or whose HEAD moved without touching rs/)
+    # so the next call can take the fast path. The bytes are already verified; this never rebuilds.
+    if compute_fast_token &&
+      [[ "$ST_HEAD" != "$FAST_HEAD" || "$ST_TREE" != "$FAST_RS_TREE" ]]; then
+      stamp_provenance_file "$TARGET" "$binary_sha"
+    fi
+  else
+    build_targets=(--bin "$TOOL")
+    if [[ "$force_refresh" == "1" ]]; then
+      build_targets=(--bins)
+    fi
+    if ! run_cargo build --quiet --locked --release \
+        --manifest-path "$MANIFEST" --package "$PACKAGE" \
+        --target-dir "$TARGET_ROOT" --target "$HOST_TARGET" "${build_targets[@]}"; then
+      echo "[$TOOL] Cargo build failed; no cached Rust artifact was executed" >&2
       exit 3
     fi
-    stamp_binary_sha="$(sha256sum -- "$stamp_target" | cut -d' ' -f1)"
-    if [[ "$stamp_tool" == "$TOOL" ]]; then
-      stamped_current_sha="$stamp_binary_sha"
+    source_after="$("$FINGERPRINT")"
+    if [[ "$source_before" != "$source_after" ]]; then
+      echo "[$TOOL] Rust source changed during build; retrying ($attempt/3)" >&2
+      refresh_package
+      attempt=$((attempt + 1))
+      continue
     fi
-    provenance_tmp="$(mktemp "$TARGET_RELEASE/.${stamp_tool}.provenance.XXXXXX")"
-    printf 'source_fp=%s\nbinary_sha256=%s\n' \
-      "$source_after" "$stamp_binary_sha" >"$provenance_tmp"
-    mv -f -- "$provenance_tmp" "$stamp_provenance"
-  done
-  binary_sha="$(sha256sum -- "$TARGET" | cut -d' ' -f1)"
-  if [[ -z "$stamped_current_sha" || "$binary_sha" != "$stamped_current_sha" ]]; then
-    echo "[$TOOL] Rust artifact changed while stamping; retrying ($attempt/3)" >&2
-    refresh_package
-    attempt=$((attempt + 1))
-    continue
+    stamp_tools=("$TOOL")
+    if [[ "$force_refresh" == "1" ]]; then
+      stamp_tools=("${PACKAGE_TOOLS[@]}")
+    fi
+    for stamp_tool in "${stamp_tools[@]}"; do
+      stamp_target="$TARGET_RELEASE/$stamp_tool"
+      if [[ ! -x "$stamp_target" ]]; then
+        echo "[$TOOL] Cargo succeeded but produced no executable at $stamp_target" >&2
+        exit 3
+      fi
+      stamp_binary_sha="$(sha256sum -- "$stamp_target" | cut -d' ' -f1)"
+      if [[ "$stamp_tool" == "$TOOL" ]]; then
+        stamped_current_sha="$stamp_binary_sha"
+      fi
+      stamp_provenance_file "$stamp_target" "$stamp_binary_sha"
+    done
+    binary_sha="$(sha256sum -- "$TARGET" | cut -d' ' -f1)"
+    if [[ -z "$stamped_current_sha" || "$binary_sha" != "$stamped_current_sha" ]]; then
+      echo "[$TOOL] Rust artifact changed while stamping; retrying ($attempt/3)" >&2
+      refresh_package
+      attempt=$((attempt + 1))
+      continue
+    fi
   fi
 
   # Close the source-change window before publishing this executable to the caller.

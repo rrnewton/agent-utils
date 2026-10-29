@@ -134,9 +134,11 @@ case "$ENGINE" in
         exec "${CI_HUB_PYTHON:-python3}" "$TARGET" "$@"
         ;;
     rust|rs)
-        # The tracked rs/bin link invokes the shared Cargo/provenance launcher. It checks the real
-        # workspace cache on every invocation, rejects replaced artifacts, and rebuilds stale source
-        # before exec. Never fall back to Python silently; that would re-hide an engine mismatch.
+        # The tracked rs/bin link invokes the shared Cargo/provenance launcher. It verifies the
+        # workspace cache on every invocation (a clean committed tree takes its fast warm path;
+        # anything else gets the full content fingerprint under a lock), rejects replaced
+        # artifacts, and rebuilds stale source before exec. Never fall back to Python silently;
+        # that would re-hide an engine mismatch.
         TARGET="$ROOT/rs/bin/$TOOL"
         if [[ -n "$WRKSLOTS_OPTIN" ]]; then
             # The wrkslots Rust edition ships as the wrkslotsd binary.
