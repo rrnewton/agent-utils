@@ -1851,6 +1851,8 @@ const SEARCH_LANGUAGE = await searchLanguage();
 const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
 /** The glyph widths the fold model counts lines by (web/src/foundation/). */
 const GLYPHS = await moduleForTests("src/foundation/index.ts");
+/** Where the reader is: the selection's one owner (web/src/core/navigation). */
+const NAVIGATION = await moduleForTests("src/core/navigation/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -6019,6 +6021,81 @@ async function signIn(page) {
   await page.settle();
   assert.equal(page.screen(), "main", "signing in did not reach the main interface");
 }
+
+// --- the page's own names, and the browser's (`#624 voice-page-modularity`) ----------------------
+
+/**
+ * The browser's globals, as the pinned TypeScript's DOM declarations name them (every `declare var`,
+ * `function`, `const` and `let` in lib.dom.d.ts), and the ones the page's browsers have that those
+ * declarations do not yet: `navigation`, the Navigation API (Chromium), which `historyIndex` reads.
+ */
+const DOM_GLOBALS = new Set([...readFileSync(join(WEB, "..", "contract", "node_modules", "typescript", "lib", "lib.dom.d.ts"),
+  "utf8").matchAll(/^declare (?:var|function|const|let) (\w+)/gm)].map((found) => found[1]).concat(["navigation"]));
+
+test("`#624 voice-page-modularity`: no top-level name of the legacy script or its prelude hides a browser global", () => {
+  // A classic script's top-level function or var becomes a property of `window`, over the
+  // browser's own: a `function navigation()` in voice.js replaced the Navigation API that
+  // `historyIndex` reads `window.navigation` for, which only a real browser showed. The prelude's
+  // constants hide a global from every unqualified reference in the page as surely.
+  const ts = loadTool("typescript");
+  const file = ts.createSourceFile("voice.js", SCRIPT, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const names = new Set(PRELUDE ? PRELUDE.names : []);
+  for (const statement of file.statements) {
+    if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) && statement.name) names.add(statement.name.text);
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) names.add(declaration.name.text);
+      }
+    }
+  }
+  assert.ok(names.size > 1000 && DOM_GLOBALS.size > 500 && DOM_GLOBALS.has("navigation") && names.has("selectedChannelId"),
+    "the scan found too few names to mean anything");
+  // `stop` (the call's teardown) has hidden `window.stop` for as long as the page has had calls, and
+  // nothing in the page means the browser's; it is the one name allowed, and only it.
+  const KNOWN = new Set(["stop"]);
+  const hiding = [...names].filter((name) => DOM_GLOBALS.has(name) && !KNOWN.has(name));
+  assert.deepStrictEqual(hiding, [], `these page names hide the browser's globals of the same name: ${hiding.join(", ")}`);
+  for (const name of KNOWN) assert.ok(names.has(name), `${name} no longer needs its exception: take it off the list`);
+});
+
+// --- the selection's owner (`#624 voice-page-modularity`) ----------------------------------------
+
+test("`#624 voice-page-modularity`: the selection starts on no channel, and every choice reaches every subscriber in order, read-only", () => {
+  const navigation = NAVIGATION.createNavigation();
+  assert.deepStrictEqual(navigation.snapshot(), { channelId: "" });
+  const heard = [];
+  navigation.subscribe((snapshot) => heard.push(["first", snapshot.channelId]));
+  const stop = navigation.subscribe((snapshot) => heard.push(["second", snapshot.channelId]));
+  navigation.selectChannel("200");
+  navigation.selectChannel("200");
+  stop();
+  navigation.selectChannel("300");
+  assert.deepStrictEqual(heard, [["first", "200"], ["second", "200"], ["first", "200"], ["second", "200"], ["first", "300"]],
+    "a choice of the channel already chosen must still redraw what shows it");
+  const snapshot = navigation.snapshot();
+  assert.equal(snapshot.channelId, "300");
+  assert.throws(() => { "use strict"; snapshot.channelId = "400"; }, TypeError, "a snapshot could be written to");
+  assert.equal(navigation.snapshot().channelId, "300");
+});
+
+test("`#624 voice-page-modularity`: the bar's picker shows the selection, and a value put on it with no change chooses nothing", async () => {
+  const other = { id: "1110000000000000002", label: "build noise", writable: false };
+  const page = newPage();
+  page.channels = [{ ...CHANNEL }, other];
+  await signIn(page);
+  await showDiscord(page, [message({ content: "hello" })]);
+  assert.equal(page.el("discord-channel").value, CHANNEL.id);
+  // A value with no change event, which no reader can make in a browser: the selection stays.
+  page.el("discord-channel").value = other.id;
+  assert.equal(page.pure("selectedChannelId()"), CHANNEL.id);
+  // The reader's choice, with its change: the selection first, then the picker shows it.
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.equal(page.pure("selectedChannelId()"), other.id);
+  // A channel the picker does not list, as a link can name, chooses none, as a <select> does.
+  page.pure("(chooseChannel('9990000000000000009'), 0)");
+  assert.deepStrictEqual([page.pure("selectedChannelId()"), page.el("discord-channel").value], ["", ""]);
+});
 
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
@@ -35084,7 +35161,15 @@ test("RENAMING A CHANNEL IS NOT A CHANGE OF CHANNEL", async () => {
   page.channels = [{ ...CHANNEL }, other];
   await signIn(page);
   await showDiscord(page, [message({ content: "hello" })]);
+  // Chosen as a reader chooses it, with the change a browser fires. (`#624 voice-page-modularity`:
+  // the picker shows the selection, so a value put on it with no change event chooses nothing.)
   page.el("discord-channel").value = other.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  // ...and the remembered channel, for this window and the device, put back on the first, so the
+  // redraw is seen to keep the channel being read over the one a new window would open on.
+  page.pure(`(keepWindowItem(ACTIVE_CHANNEL_KEY, "${CHANNEL.id}"), localStorage.setItem(ACTIVE_CHANNEL_KEY, "${CHANNEL.id}"), 0)`);
+  assert.equal(page.pure("storedActiveChannel()"), CHANNEL.id, "the remembered channel was not put back");
   const readsBefore = page.pageReads;
 
   await renameFrom(page, CHANNEL.id, "the team");

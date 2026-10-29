@@ -18,6 +18,7 @@ export {
 } from "../core/search/index.ts";
 export { readPieces, sentenceEnds, speechSegments } from "../core/speech/index.ts";
 export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
+export { createNavigation } from "../core/navigation/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   DEEP_LINK_PART_MAX,

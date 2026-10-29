@@ -239,17 +239,46 @@ function el(id) {
 }
 
 /**
- * The id of the channel chosen in the column being worked on, as its picker holds it ("" for none).
+ * The selection's one owner (web/src/core/navigation, `#624 voice-page-modularity`): the channel
+ * chosen to read. Made on first use, when the bar's picker is subscribed to it as its projection. A
+ * `var` with no initialiser, so a use before this line has run finds it undefined rather than in its
+ * dead zone, and this line, when it runs, does not throw away an owner already made.
  *
- * `#624 voice-page-modularity`, plan step 9: every read of the selection goes through here, so the
- * selection can move out of the DOM into one owner without touching each reader again. For now it
- * still reads the picker, through {@link el}, so it follows the column being worked on exactly as
- * the reads it replaced did.
+ * @type {import("./src/core/navigation/index.ts").Navigation | undefined}
+ */
+var pageNavigation;
+
+/** {@link pageNavigation}, made if it is not yet. */
+function selectionOwner() {
+  if (!pageNavigation) {
+    pageNavigation = createNavigation();
+    // The bar's picker shows the selection, and nothing else: no reader asks the picker which
+    // channel is chosen. It has no right-column stand-in, so `el` always finds the bar's.
+    pageNavigation.subscribe((snapshot) => {
+      el("discord-channel").value = snapshot.channelId;
+    });
+  }
+  return pageNavigation;
+}
+
+/**
+ * The id of the channel chosen to read ("" for none). Page-wide: both columns read one channel.
  *
  * @returns {string}
  */
 function selectedChannelId() {
-  return el("discord-channel").value;
+  return selectionOwner().snapshot().channelId;
+}
+
+/**
+ * Choose channel `id` to read, as the bar's picker takes a value: one it does not list chooses no
+ * channel at all, as setting a `<select>` to a value it has no option for leaves it on none. The
+ * caller says what the choice means (`changeSelectedChannel`); this only records it.
+ *
+ * @param {string} id
+ */
+function chooseChannel(id) {
+  selectionOwner().selectChannel(knownChannels.some((channel) => String(channel.id) === String(id)) ? String(id) : "");
 }
 
 /**
@@ -1883,7 +1912,7 @@ async function applyDeepLink() {
       return;
     }
     if (String(selectedChannelId()) !== wantedChannel) {
-      el("discord-channel").value = wantedChannel;
+      chooseChannel(wantedChannel);
       // The link's own arrival on its channel is no choice of the reader's.
       const wasShowing = deepLinkShowing;
       deepLinkShowing = true;
@@ -2188,7 +2217,7 @@ async function linkJumpRead(channel, ticket) {
 
 /** Choose channel `channel` as a link's arrival, which is no choice of the reader's (`#462`). */
 function arriveOnChannel(channel) {
-  el("discord-channel").value = channel;
+  chooseChannel(channel);
   const wasShowing = deepLinkShowing;
   deepLinkShowing = true;
   try {
@@ -13189,11 +13218,11 @@ function stepChannel(event) {
   if (picker.hidden || picker.disabled) return false;
   // In the order shown, across service groups. `#355 provider-grouped-channels`.
   const order = channelsInPickerOrder();
-  const at = order.findIndex((channel) => String(channel.id) === String(picker.value));
+  const at = order.findIndex((channel) => String(channel.id) === String(selectedChannelId()));
   const next = at < 0 ? null : order[at + (event.key === "ArrowDown" ? 1 : -1)];
   // At either end the list stops, rather than wrapping round to a channel at the other end.
   if (!next) return true;
-  picker.value = String(next.id);
+  chooseChannel(String(next.id));
   guardQuietly(changeSelectedChannel)();
   settleFocus();
   return true;
@@ -56358,7 +56387,8 @@ function fillChannelSelect(id) {
   const select = el(id);
   // Restore only an ID still present in the server's current channel list. Settings has its own
   // picker and must not change the remembered reading destination merely by editing a channel.
-  const chosen = select.value || (id === "discord-channel" ? storedActiveChannel() : "");
+  // The bar's picker shows the selection (`navigation`), so its channel is the selection's.
+  const chosen = id === "discord-channel" ? selectedChannelId() || storedActiveChannel() : select.value || "";
   select.replaceChildren();
   // `#349 channel-settings-all`. Settings' picker opens with All channels where there is more than
   // one: Clear unread set for every channel at once. Never the reading picker's: a view reads one.
@@ -56397,15 +56427,17 @@ function fillChannelSelect(id) {
     for (const channel of id === "settings-channel" ? settingsChannels() : knownChannels) select.append(optionFor(channel));
   }
   const order = grouped ? channelsInPickerOrder() : id === "settings-channel" ? settingsChannels() : knownChannels;
-  if (all && chosen === ALL_CHANNELS) {
-    select.value = ALL_CHANNELS;
-  } else if (order.some((channel) => String(channel.id) === String(chosen))) {
-    select.value = chosen;
-  } else if (order.length > 0) {
-    select.value = order[0].id;
-  } else {
-    select.value = "";
-  }
+  const showing = all && chosen === ALL_CHANNELS
+    ? ALL_CHANNELS
+    : order.some((channel) => String(channel.id) === String(chosen))
+      ? chosen
+      : order.length > 0
+        ? order[0].id
+        : "";
+  // The bar's picker is redrawn onto the selection, which this keeps on its channel or moves to the
+  // first: through its owner, whose picker then shows it.
+  if (id === "discord-channel") selectionOwner().selectChannel(String(showing));
+  else select.value = showing;
   if (id === "discord-channel") rememberActiveChannel();
   // `#351 settings-polish`, `#402 who-is-who-channel-box`. Settings' picker redrawn onto another
   // channel than the one it showed (the box's channel removed from under it) moves who is who with it.
@@ -58082,7 +58114,6 @@ function applyClientConfig(config) {
   };
   session.providerName = conversationalVoice.name;
   renderAgentLink();
-  const select = el("discord-channel");
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.
   knownChannels = config.channels || [];
@@ -58169,11 +58200,11 @@ function applyClientConfig(config) {
   // or stream of it has gone out yet, so the offer is issued before anything that could colour
   // those threads itself. Not awaited: sign-in does not wait on a colour offer, and the reads
   // that follow carry the server's answer either way (first writer wins there).
-  void seedServerThreadHues(select.value);
+  void seedServerThreadHues(selectedChannelId());
   // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
-  startChannelStream(select.value);
+  startChannelStream(selectedChannelId());
   clientConfigApplied = true;
   saveCacheShell(config);
   // ...and the views chosen in channels it no longer lists, as their saved rows went: a thread's
@@ -60235,6 +60266,9 @@ function changeSelectedChannel() {
   startChannelStream(selectedChannelId());
   return loadDiscord(saved && currentView === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
 }
+// `#624 voice-page-modularity`. A channel the reader chose on the picker is the selection's first,
+// before anything that reads it hears of the change.
+el("discord-channel").addEventListener("change", () => selectionOwner().selectChannel(el("discord-channel").value));
 el("discord-channel").addEventListener("change", guardQuietly(changeSelectedChannel));
 // `#224 keyboard-shortcuts`. After the change above has started: a channel chosen from Ctrl+K.
 el("discord-channel").addEventListener("change", channelPicked);
