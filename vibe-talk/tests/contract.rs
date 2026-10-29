@@ -1324,8 +1324,9 @@ fn server_frames_round_trip_and_an_unknown_optional_field_is_ignored() {
 }
 
 /// The generated browser validators accept every sample above and refuse broken ones. Like the
-/// page suites, this FAILS when Node is missing rather than skipping: it needs no packages, only
-/// the checked-in `web/contract.js`.
+/// page suites, this FAILS when Node is missing rather than skipping: it needs no packages for the
+/// checked-in `web/contract.js`, and the pinned esbuild to build its ES module twin
+/// `web/src/contract/` (`#624 voice-page-modularity`).
 #[test]
 fn the_browser_validators_accept_the_samples_and_refuse_broken_values() {
     const SUITE: &str = "tests/js/contract.test.mjs";

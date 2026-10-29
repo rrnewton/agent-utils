@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Generate the browser's side of the wire contract from `vibe-talk.schema.json`.
 //
-//   node contract/generate.mjs           rewrite web/contract.js and web/contract.d.ts
+//   node contract/generate.mjs           rewrite web/contract.js, web/contract.d.ts and the module
+//                                        web/src/contract/validators.js with its .d.ts
 //   node contract/generate.mjs --check   exit 1, naming the stale files, instead of writing
 //
 // The schema itself is generated from the Rust types (`src/contract.rs`) by `tests/contract.rs`;
@@ -14,6 +15,11 @@
 // script refuses to write output that does. web/contract.d.ts declares the same types for
 // TypeScript's checkJs pass over voice.js, and is emitted by the small translator below, which
 // fails loudly on any schema keyword it does not understand rather than approximating it.
+//
+// `#624 voice-page-modularity`: the page's modules take the same validators as an ES module,
+// web/src/contract/validators.js (the same Ajv code and helpers, exported rather than published as a
+// global), typed by web/src/contract/validators.d.ts and reached through web/src/contract/index.ts.
+// web/contract.js stays as it was, for the legacy script and for a cached page that loads it alone.
 //
 // Output is deterministic for a given schema and a given locked Ajv version.
 
@@ -43,6 +49,8 @@ const schemaPath = join(here, "vibe-talk.schema.json");
 const outputs = {
   js: join(crate, "web", "contract.js"),
   dts: join(crate, "web", "contract.d.ts"),
+  moduleJs: join(crate, "web", "src", "contract", "validators.js"),
+  moduleDts: join(crate, "web", "src", "contract", "validators.d.ts"),
 };
 
 const doc = JSON.parse(readFileSync(schemaPath, "utf8"));
@@ -130,6 +138,11 @@ function generateValidators() {
         "browser script cannot load. Avoid the schema feature that needs it, or vendor the helper.",
     );
   }
+  return code;
+}
+
+/** web/contract.js: the validators as a classic script defining one global, VibeTalkContract. */
+function generateClassicValidators(code) {
   return `${HEADER}//
 // Runtime validators for the vibe-talk wire contract, and the one global the page uses them
 // through: VibeTalkContract. See web/contract.d.ts for the types.
@@ -140,7 +153,36 @@ const module = { exports };
 // ---- Ajv standalone output begins ----
 ${code.trim()}
 // ---- Ajv standalone output ends ----
-const variants = module.exports;
+${runtime()}
+
+globalThis.VibeTalkContract = Object.freeze({ roots: Object.freeze(roots.slice()), is, decode, decodeTagged });
+})();
+`;
+}
+
+/**
+ * web/src/contract/validators.js: the same validators and helpers as an ES module, exporting what
+ * the global holds instead of publishing it. `#624 voice-page-modularity`.
+ */
+function generateModuleValidators(code) {
+  return `${HEADER}//
+// Runtime validators for the vibe-talk wire contract, as an ES module for the page's modules: the
+// same code as web/contract.js, exported rather than published as a global. See validators.d.ts.
+const exports = {};
+const module = { exports };
+// ---- Ajv standalone output begins ----
+${code.trim()}
+// ---- Ajv standalone output ends ----
+${runtime()}
+
+const frozenRoots = Object.freeze(roots.slice());
+export { decode, decodeTagged, frozenRoots as roots, is };
+`;
+}
+
+/** The helpers both wrappers share: variants, tagged unions, is, decode and decodeTagged. */
+function runtime() {
+  return `const variants = module.exports;
 const roots = ${JSON.stringify(roots)};
 const tagged = ${JSON.stringify(TAGGED)};
 
@@ -215,11 +257,7 @@ function decodeTagged(name, value) {
   if (!tags) throw new TypeError(name + " is not an extensible tagged union");
   if (variantFor(name, value) === null) return null;
   return decode(name, value);
-}
-
-globalThis.VibeTalkContract = Object.freeze({ roots: Object.freeze(roots.slice()), is, decode, decodeTagged });
-})();
-`;
+}`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -301,18 +339,23 @@ function objectType(schema, where, indent) {
   return `{\n${fields.join("\n")}\n${indent}}`;
 }
 
-function generateDeclarations() {
-  const body = Object.keys(defs)
+/** Every schema type as a TypeScript declaration, each line starting `indent`, each `prefix`ed. */
+function typeDeclarations(indent, prefix) {
+  return Object.keys(defs)
     .sort()
     .map((name) => {
       const schema = defs[name];
-      const comment = doc_comment(schema.description, "  ");
+      const comment = doc_comment(schema.description, indent);
       const isPlainObject = schema.type === "object" && !schema.oneOf && !schema.anyOf;
       if (isPlainObject) {
-        return `${comment}  interface ${name} ${objectType(schema, name, "  ")}`;
+        return `${comment}${indent}${prefix}interface ${name} ${objectType(schema, name, indent)}`;
       }
-      return `${comment}  type ${name} = ${tsType(schema, name, "  ")};`;
+      return `${comment}${indent}${prefix}type ${name} = ${tsType(schema, name, indent)};`;
     });
+}
+
+function generateDeclarations() {
+  const body = typeDeclarations("  ", "");
   const contract = roots.map((name) => `    ${name}: ${name};`).join("\n");
   const taggedNames = Object.keys(TAGGED).map((n) => JSON.stringify(n)).join(" | ");
   return `${HEADER}//
@@ -353,11 +396,53 @@ declare const VibeTalkContract: {
 `;
 }
 
+/**
+ * web/src/contract/validators.d.ts: the same types, exported from a module, and the module's
+ * functions. `#624 voice-page-modularity`.
+ */
+function generateModuleDeclarations() {
+  const contract = roots.map((name) => `  ${name}: ${name};`).join("\n");
+  const taggedNames = Object.keys(TAGGED).map((n) => JSON.stringify(n)).join(" | ");
+  return `${HEADER}//
+// The vibe-talk wire contract's types, and the validators web/src/contract/validators.js exports.
+
+${typeDeclarations("", "export ").join("\n\n")}
+
+/** Every type that crosses a boundary on its own, by name. */
+export interface Contract {
+${contract}
+}
+
+/** A contract type a peer may extend with new \`type\` tags. */
+export type Tagged = ${taggedNames};
+
+/** The error {@link decode} throws. */
+export interface ContractError extends Error {
+  contract: keyof Contract;
+}
+
+/** Every root type name. */
+export declare const roots: ReadonlyArray<keyof Contract>;
+/** Whether value is a well-formed name. */
+export declare function is<K extends keyof Contract>(name: K, value: unknown): value is Contract[K];
+/** value, if well formed; otherwise throws a {@link ContractError}. */
+export declare function decode<K extends keyof Contract>(name: K, value: unknown): Contract[K];
+/**
+ * null when value carries a \`type\` tag this contract does not know, which a receiver ignores;
+ * otherwise as {@link decode}.
+ */
+export declare function decodeTagged<K extends Tagged>(name: K, value: unknown): Contract[K] | null;
+`;
+}
+
 // ---------------------------------------------------------------------------------------------
 
+const validatorCode = generateValidators();
 const generated = {
-  [outputs.js]: generateValidators(),
+  [outputs.js]: generateClassicValidators(validatorCode),
   [outputs.dts]: generateDeclarations(),
+  [outputs.moduleJs]: generateModuleValidators(validatorCode),
+  [outputs.moduleDts]: generateModuleDeclarations(),
 };
 
 const check = process.argv.includes("--check");

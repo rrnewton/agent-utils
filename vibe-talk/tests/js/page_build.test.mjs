@@ -338,14 +338,19 @@ test("a module overlay whose text the module does not hold is refused, not built
 });
 
 test("every handwritten module is TypeScript, so the strict and portable checks see all of them", () => {
-  const plain = moduleSources().map(({ name }) => name).filter((name) => !name.endsWith(".ts"));
+  // Machine output may be JavaScript, with generated declarations beside it (the contract's
+  // validators), as the plan allows; nothing written by hand may.
+  const names = new Set(moduleSources().map(({ name }) => name));
+  const plain = moduleSources()
+    .filter(({ name, generated }) => !name.endsWith(".ts") && !(generated && names.has(name.replace(/\.js$/, ".d.ts"))))
+    .map(({ name }) => name);
   assert.deepStrictEqual(plain, [], "a module below web/src is not .ts, so tsconfig.core.json and tsconfig.web.json skip it");
   assert.ok(moduleSources().length > 0, "no module found, so this checks nothing");
 });
 
 test("no module opts out of type checking: no @ts-nocheck, @ts-ignore or @ts-expect-error, and no `any`", () => {
   const found = [];
-  for (const { name, text } of moduleSources()) {
+  for (const { name, text } of moduleSources().filter(({ generated }) => !generated)) {
     const code = text.replace(/\/\*[\s\S]*?\*\//g, (comment) => comment.replace(/[^\n]/g, " "));
     code.split("\n").forEach((line, at) => {
       if (/@ts-(?:nocheck|ignore|expect-error)\b/.test(line) || /(?::|<|\bas)\s*any\b/.test(line.replace(/\/\/.*$/, ""))) {

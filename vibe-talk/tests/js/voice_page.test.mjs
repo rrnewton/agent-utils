@@ -177,7 +177,7 @@ const SCRIPT_CODE = stripJsComments(SCRIPT);
  * SCRIPT_CODE every line of the page's handwritten code. An assertion that something appears
  * NOWHERE in the page reads PAGE_CODE, so code that moves out of web/voice.js stays under it.
  */
-const MODULE_CODE = moduleSources().map(({ text }) => stripJsComments(text)).join("\n");
+const MODULE_CODE = moduleSources().filter(({ generated }) => !generated).map(({ text }) => stripJsComments(text)).join("\n");
 
 /**
  * `code` with the text of every string and template literal blanked, found by the pinned TypeScript
