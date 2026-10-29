@@ -222,7 +222,7 @@ const sourceName = (name) => `vibe-talk/web/${name}`;
 // top-level `let`/`const`/`class` to `var` (a read before its declaration would then give
 // `undefined` instead of throwing) and drops its "use strict" (checked against esbuild 0.28.2). So
 // the modules it calls are bundled on their own, inside a strict function, and that function hands
-// the legacy script exactly the names web/src/legacy/imports.js exports, as constants declared just
+// the legacy script exactly the names web/src/legacy/imports.ts exports, as constants declared just
 // before it runs:
 //
 //   const { searchQueryParse, ... } = (() => {
@@ -236,7 +236,7 @@ const sourceName = (name) => `vibe-talk/web/${name}`;
 /** The legacy page script, which the prelude runs just before. */
 export const LEGACY_SCRIPT = "voice.js";
 /** The module whose exports are what the legacy script takes from the modules. */
-export const LEGACY_IMPORTS = "src/legacy/imports.js";
+export const LEGACY_IMPORTS = "src/legacy/imports.ts";
 const PRELUDE_GLOBAL = "__voiceLegacyImports";
 
 /**
@@ -275,7 +275,7 @@ async function exportedNames(esbuild, entry, plugins) {
 
 /**
  * The prelude the legacy script runs after (see above): `{ code, map, lineCount, names }`, or null
- * when web/src/legacy/imports.js exports nothing. `minify` takes out white space and comments only,
+ * when web/src/legacy/imports.ts exports nothing. `minify` takes out white space and comments only,
  * as for the rest of the page; `overlays` patch module sources first (see overlayPlugin).
  */
 export async function legacyPrelude(esbuild, web = WEB, { minify = true, overlays = [] } = {}) {

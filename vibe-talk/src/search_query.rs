@@ -84,7 +84,7 @@ pub const FOLD_VERSION: &str = "fold-2";
 
 /// What lower-casing leaves for full case folding, and letters whose mark is not a combining
 /// character. Mirrored, entry for entry, by `SEARCH_FOLD_TABLE` in
-/// `web/src/core/search/language.js` (a test reads that table back and compares).
+/// `web/src/core/search/language.ts` (a test reads that table back and compares).
 pub const FOLD_TABLE: &[(char, &str)] = &[
     ('ß', "ss"),
     ('ς', "σ"),
@@ -915,11 +915,11 @@ mod tests {
         // The page states its tables as source text; this reads them back from it and compares
         // them both ways, so neither copy can drift without this failing. The page's search
         // language is its own module (`#624 voice-page-modularity`).
-        let page = include_str!("../web/src/core/search/language.js");
+        let page = include_str!("../web/src/core/search/language.ts");
         let block = |start: &str, end: &str| -> String {
             let from = page
                 .find(start)
-                .unwrap_or_else(|| panic!("language.js lacks {start}"));
+                .unwrap_or_else(|| panic!("language.ts lacks {start}"));
             let rest = &page[from + start.len()..];
             rest[..rest.find(end).expect("the block ends")].to_owned()
         };
@@ -999,7 +999,7 @@ mod tests {
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 const { moduleForTests } = await import(pathToFileURL(join(process.argv[1], "web", "build.mjs")).href);
-const api = await moduleForTests("src/core/search/index.js");
+const api = await moduleForTests("src/core/search/index.ts");
 let seed = 20261027;
 const pick = (list) => { seed = (seed * 1103515245 + 12345) % 2147483648; return list[seed % list.length]; };
 const pieces = ["a", "b", "ab", "abc", "Café", "cafe", "ΟΣ", "σ", "ß", "ss", "ﬁ", "-", "--", "(", ")", "\"", " ", "\t",

@@ -80,11 +80,14 @@ contract:
 contract-check:
 	node contract/generate.mjs --check
 
-# TypeScript checks web/voice.js as JavaScript (checkJs, noEmit) against the generated
-# declarations and the modules it calls; see tsconfig.json. The page build bundles them; see
-# web/build.mjs.
+# TypeScript as a checker only (noEmit): web/voice.js as JavaScript (checkJs) against the generated
+# declarations and the modules it calls (tsconfig.json); the page's modules below web/src strict,
+# the core alone with no browser or Node declarations (tsconfig.core.json), and all of them with the
+# browser's (tsconfig.web.json). The page build compiles them; see web/build.mjs.
 typecheck:
 	contract/node_modules/.bin/tsc -p tsconfig.json
+	contract/node_modules/.bin/tsc -p tsconfig.core.json
+	contract/node_modules/.bin/tsc -p tsconfig.web.json
 
 # `cargo test` runs the page's suites through `node --test` as well as the Rust tests, so this is
 # not only the Rust half. Those suites FAIL rather than skip when node is missing, which is what

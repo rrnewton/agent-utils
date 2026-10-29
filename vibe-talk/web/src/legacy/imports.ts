@@ -15,4 +15,4 @@ export {
   searchQueryParse,
   searchQueryTree,
   searchSubject,
-} from "../core/search/index.js";
+} from "../core/search/index.ts";

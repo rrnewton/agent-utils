@@ -9,4 +9,13 @@ export {
   searchQueryTree,
   searchSubject,
   searchUpstreamPlan,
-} from "./language.js";
+} from "./language.ts";
+export type {
+  SearchDay,
+  SearchNode,
+  SearchScanReason,
+  SearchSubject,
+  SearchSubjectInput,
+  SearchTree,
+  SearchUpstreamPlan,
+} from "./language.ts";

@@ -1803,7 +1803,7 @@ const COMPILED = new Map(PAGE_SCRIPTS.map((name) => [
 ]));
 /**
  * The page build's prelude (`#624 voice-page-modularity`): the modules the legacy script calls,
- * declaring for it the names web/src/legacy/imports.js exports, run just before it as the page build
+ * declaring for it the names web/src/legacy/imports.ts exports, run just before it as the page build
  * runs it. Built here, unminified, by the same function; null while nothing has moved.
  */
 const PRELUDE = await legacyPrelude(loadTool("esbuild"), WEB, { minify: false });
@@ -87374,7 +87374,7 @@ test("`#624 voice-page-modularity`: a page knows its build from the page build's
 const SEARCH_CORPUS = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "search_query.json"), "utf8"));
 
 /** The search language module (`#624 voice-page-modularity`), with `overlays` patched into its sources. */
-const searchLanguage = (overlays = []) => moduleForTests("src/core/search/index.js", { overlays });
+const searchLanguage = (overlays = []) => moduleForTests("src/core/search/index.ts", { overlays });
 const SEARCH_LANGUAGE = await searchLanguage();
 
 function searchCorpusDisagreements(language) {
@@ -87423,7 +87423,7 @@ test("`#521 server-side-search`: the page's search language folds, parses, match
 
 test("`#521 server-side-search`: the corpus catches a page that lost one fold entry or bound OR loosely (negative controls)", async () => {
   // Without final sigma folded, ΟΣ (lower-cased to ος) no longer finds ΟΣΑ (οσα).
-  const LANGUAGE = "src/core/search/language.js";
+  const LANGUAGE = "src/core/search/language.ts";
   const sigma = await searchLanguage([{ file: LANGUAGE, find: "[\"ς\", \"σ\"], ", replace: "" }]);
   assert.ok(searchCorpusDisagreements(sigma).some((line) => line.includes("ΟΔΟΣ")));
   // OR taking whatever follows it as a whole conjunction disagrees with Gmail's binding of its neighbours.

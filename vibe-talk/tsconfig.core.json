@@ -1,0 +1,22 @@
+{
+  // The portable core (`#624 voice-page-modularity`): what a later native client reuses unchanged.
+  // Checked with no browser and no Node declarations at all (lib ES2022, no types), so a core module
+  // that reaches for `window`, `document`, `fetch` or a timer fails here rather than in a port.
+  // Strict from the first line. Run with `make -C vibe-talk typecheck`.
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "types": [],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "skipLibCheck": false
+  },
+  "include": ["web/src/core/**/*.ts"]
+}

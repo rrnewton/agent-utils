@@ -6,8 +6,60 @@
  * matching that ignores case and accents. The rules are written once, in that file's module
  * documentation, and both copies answer to the corpus in tests/fixtures/search_query.json: a change
  * to one that the other does not make fails a suite. The search box matches by them, message by
- * message (`#606 server-side-search`, below).
+ * message (`#606 server-side-search`, in web/voice.js).
+ *
+ * Moved here from web/voice.js unchanged but for its types (`#624 voice-page-modularity`): pure
+ * functions over strings and plain records, with no browser, clock or page state.
  */
+
+/** A calendar day, as `before:` and `after:` name it. */
+export interface SearchDay {
+  readonly year: number;
+  readonly month: number;
+  readonly day: number;
+}
+
+/** A parsed query: a term, a field, or a combination of them. */
+export type SearchNode =
+  | { readonly kind: "word" | "phrase"; readonly text: string }
+  | { readonly kind: "from"; readonly raw: string; readonly folded: string }
+  | { readonly kind: "in"; readonly place: "thread" | "main" }
+  | { readonly kind: "before" | "after"; readonly day: SearchDay }
+  | { readonly kind: "has" }
+  | { readonly kind: "not"; readonly child: SearchNode }
+  | { readonly kind: "and" | "or"; readonly children: readonly SearchNode[] };
+
+/** A parsed tree in the corpus's notation: ["word", "x"], ["and", ...] and so on. */
+export type SearchTree = readonly (string | SearchTree | null)[];
+
+/** A message as the matcher sees it: `text` and `author` folded once (`searchSubject`). */
+export interface SearchSubject {
+  readonly text: string;
+  readonly author: string;
+  readonly authorId: string;
+  readonly createdMs: number;
+  readonly inThread: boolean;
+  readonly hasLink: boolean;
+}
+
+/** What `searchSubject` folds: each part of a message the haystack is made of. */
+export interface SearchSubjectInput {
+  readonly author?: string;
+  readonly authorId?: string;
+  readonly text?: string;
+  readonly links?: readonly string[];
+  readonly createdMs?: number;
+  readonly inThread?: boolean;
+}
+
+/** Why some alternative of a query needs a scan of what the server holds, if any does. */
+export type SearchScanReason = "no-term" | "not-word-aligned" | "too-many-alternatives";
+
+/** How to ask a word-based upstream service for candidates (`searchUpstreamPlan`). */
+export interface SearchUpstreamPlan {
+  readonly queries: readonly (readonly string[])[];
+  readonly scan: SearchScanReason | null;
+}
 
 /**
  * What lower-casing leaves for full case folding, and letters whose mark is not a combining
@@ -29,10 +81,11 @@ const SEARCH_DIACRITICS = /[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff
 /** Unicode White_Space, spelled out: JavaScript's `\s` is a different set (it has U+FEFF, not U+0085). */
 const SEARCH_SPACE = "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000";
 const SEARCH_SPACE_RUN = new RegExp(`[${SEARCH_SPACE}]+`, "g");
-const searchIsSpace = (character) => character !== undefined && SEARCH_SPACE.includes(character);
+const searchIsSpace = (character: string | undefined): boolean =>
+  character !== undefined && SEARCH_SPACE.includes(character);
 
 /** Fold text for comparison: diacritics dropped, lower-cased, the table applied, white space collapsed. */
-function searchFold(text) {
+export function searchFold(text: unknown): string {
   const lower = String(text).normalize("NFD").replace(SEARCH_DIACRITICS, "").normalize("NFC").toLowerCase();
   let out = "";
   for (const character of lower) out += SEARCH_FOLD_TABLE.get(character) ?? character;
@@ -40,15 +93,15 @@ function searchFold(text) {
 }
 
 /** A calendar day from `YYYY-MM-DD`, `YYYY/MM/DD` or `MM/DD/YYYY`, when it names a real date; else null. */
-function searchDay(text) {
+function searchDay(text: string): SearchDay | null {
   const separator = text.includes("-") ? "-" : "/";
   const parts = text.split(separator);
   if (parts.length !== 3 || parts.some((part) => !/^[0-9]+$/.test(part))) return null;
-  let year;
-  let month;
-  let day;
-  if (parts[0].length === 4) [year, month, day] = parts;
-  else if (parts[2].length === 4 && separator === "/") [month, day, year] = parts;
+  let year: string;
+  let month: string;
+  let day: string;
+  if (parts[0]!.length === 4) [year, month, day] = parts as [string, string, string];
+  else if (parts[2]!.length === 4 && separator === "/") [month, day, year] = parts as [string, string, string];
   else return null;
   if (month.length > 2 || day.length > 2) return null;
   const value = { year: Number(year), month: Number(month), day: Number(day) };
@@ -57,21 +110,21 @@ function searchDay(text) {
   return value.month >= 1 && value.month <= 12 && value.day >= 1 && value.day <= length ? value : null;
 }
 
-const searchDayText = (day) =>
+const searchDayText = (day: SearchDay): string =>
   `${String(day.year).padStart(4, "0")}-${String(day.month).padStart(2, "0")}-${String(day.day).padStart(2, "0")}`;
 
 /** The phrase opening at `chars[at]`: its text as typed, and the index after it. */
-function searchPhraseAt(chars, at) {
+function searchPhraseAt(chars: readonly string[], at: number): { text: string; next: number } {
   let end = at + 1;
   while (end < chars.length && chars[end] !== "\"") end += 1;
   return { text: chars.slice(at + 1, end).join(""), next: Math.min(end + 1, chars.length) };
 }
 
 /** Folded and trimmed of spaces only (`String.prototype.trim` would also take U+FEFF, which the server keeps). */
-const searchFoldedValue = (text) => searchFold(text).replace(/^ +| +$/g, "");
+const searchFoldedValue = (text: string): string => searchFold(text).replace(/^ +| +$/g, "");
 
 /** Trimmed of Unicode White_Space only, as typed. */
-function searchTrimSpace(text) {
+function searchTrimSpace(text: string): string {
   const chars = Array.from(text);
   let start = 0;
   let end = chars.length;
@@ -81,19 +134,19 @@ function searchTrimSpace(text) {
 }
 
 /** The field node `raw` names when its value is valid, else null; a bare `from:` before a quote takes the phrase. */
-function searchField(raw, chars, cursor, mayTakePhrase) {
+function searchField(raw: string, chars: readonly string[], cursor: { at: number }, mayTakePhrase: boolean): SearchNode | null {
   const colon = raw.indexOf(":");
   if (colon < 0) return null;
   const name = raw.slice(0, colon).replace(/[A-Z]/g, (letter) => letter.toLowerCase());
   if (!["from", "in", "before", "after", "has"].includes(name)) return null;
   let value = raw.slice(colon + 1);
-  let afterPhrase = null;
+  let afterPhrase: number | null = null;
   if (value === "" && mayTakePhrase && chars[cursor.at] === "\"") {
     const phrase = searchPhraseAt(chars, cursor.at);
     value = phrase.text;
     afterPhrase = phrase.next;
   }
-  let node = null;
+  let node: SearchNode | null = null;
   if (name === "from") {
     const folded = searchFoldedValue(value);
     if (folded) node = { kind: "from", raw: searchTrimSpace(value), folded };
@@ -104,16 +157,19 @@ function searchField(raw, chars, cursor, mayTakePhrase) {
     if (searchFoldedValue(value) === "link") node = { kind: "has" };
   } else {
     const day = searchDay(value);
-    if (day) node = { kind: name, day };
+    if (day) node = { kind: name as "before" | "after", day };
   }
   if (node && afterPhrase !== null) cursor.at = afterPhrase;
   return node;
 }
 
+/** One token of a query: "(", ")", "-", "OR", "AND", "empty" (folded to nothing), or an atom. */
+type SearchToken = "(" | ")" | "-" | "OR" | "AND" | "empty" | { readonly atom: SearchNode };
+
 /** Split a query into tokens: "(", ")", "-", "OR", "AND", "empty" (folded to nothing), or an atom. */
-function searchTokens(query) {
+function searchTokens(query: unknown): SearchToken[] {
   const chars = Array.from(String(query));
-  const out = [];
+  const out: SearchToken[] = [];
   let depth = 0;
   const cursor = { at: 0 };
   while (cursor.at < chars.length) {
@@ -163,22 +219,22 @@ function searchTokens(query) {
 }
 
 /** One node from several: none is null, one is itself, more an AND or OR, flattened. */
-function searchCombine(items, kind) {
-  const flat = [];
+function searchCombine(items: readonly SearchNode[], kind: "and" | "or"): SearchNode | null {
+  const flat: SearchNode[] = [];
   for (const item of items) {
     if (item.kind === kind) flat.push(...item.children);
     else flat.push(item);
   }
   if (flat.length === 0) return null;
-  return flat.length === 1 ? flat[0] : { kind, children: flat };
+  return flat.length === 1 ? flat[0]! : { kind, children: flat };
 }
 
 /** Parse a query into a tree of nodes, or null for no search. Never fails: what is not syntax is words. */
-function searchQueryParse(query) {
+export function searchQueryParse(query: unknown): SearchNode | null {
   const tokens = searchTokens(query);
   let at = 0;
-  const and = (inGroup) => {
-    const items = [];
+  const and = (inGroup: boolean): SearchNode | null => {
+    const items: SearchNode[] = [];
     while (at < tokens.length) {
       const token = tokens[at];
       if (token === ")" && inGroup) break;
@@ -191,7 +247,7 @@ function searchQueryParse(query) {
     }
     return searchCombine(items, "and");
   };
-  const or = () => {
+  const or = (): SearchNode | null => {
     const first = unary();
     const items = first ? [first] : [];
     while (tokens[at] === "OR") {
@@ -201,7 +257,7 @@ function searchQueryParse(query) {
     }
     return searchCombine(items, "or");
   };
-  const unary = () => {
+  const unary = (): SearchNode | null => {
     const token = tokens[at];
     if (token === "-") {
       at += 1;
@@ -226,7 +282,7 @@ function searchQueryParse(query) {
 }
 
 /** A parsed tree in the corpus's notation: ["word", "x"], ["and", ...] and so on; null for none. */
-function searchQueryTree(node) {
+export function searchQueryTree(node: SearchNode | null): SearchTree | null {
   if (!node) return null;
   switch (node.kind) {
     case "word":
@@ -253,7 +309,7 @@ function searchQueryTree(node) {
  * `{ text, author, authorId, createdMs, inThread, hasLink }` with `text` and `author` already
  * folded (`searchSubject`); `dayStartMs(day)` is the start of a day in the reader's zone.
  */
-function searchQueryMatches(node, subject, dayStartMs) {
+export function searchQueryMatches(node: SearchNode | null, subject: SearchSubject, dayStartMs: (day: SearchDay) => number): boolean {
   if (!node) return true;
   switch (node.kind) {
     case "word":
@@ -279,7 +335,7 @@ function searchQueryMatches(node, subject, dayStartMs) {
 }
 
 /** A message, folded once for matching: the haystack is the author, the drawn text and each link address, one a line. */
-function searchSubject({ author = "", authorId = "", text = "", links = [], createdMs = 0, inThread = false }) {
+export function searchSubject({ author = "", authorId = "", text = "", links = [], createdMs = 0, inThread = false }: SearchSubjectInput): SearchSubject {
   return {
     text: searchFold([author, text, ...links].join("\n")),
     author: searchFold(author),
@@ -291,10 +347,9 @@ function searchSubject({ author = "", authorId = "", text = "", links = [], crea
 }
 
 /** The words and phrases a match may hold, folded, to mark: not those under a minus, nor fields. */
-function searchPositiveTerms(node) {
-  /** @type {string[]} */
-  const out = [];
-  const walk = (/** @type {any} */ at) => {
+export function searchPositiveTerms(node: SearchNode | null): string[] {
+  const out: string[] = [];
+  const walk = (at: SearchNode | null): void => {
     if (!at) return;
     if (at.kind === "word" || at.kind === "phrase") out.push(at.text);
     else if (at.kind === "and" || at.kind === "or") at.children.forEach(walk);
@@ -307,7 +362,7 @@ function searchPositiveTerms(node) {
 const SEARCH_MAX_UPSTREAM_QUERIES = 4;
 
 /** Whether a folded term can be sent to a word-based upstream search: three letters or digits or more, nothing else but spaces. */
-const searchWordAligned = (term) =>
+const searchWordAligned = (term: string): boolean =>
   Array.from(term).filter((character) => character !== " ").length >= 3 && term.split(" ").every((word) => /^[\p{Alphabetic}\p{N}]+$/u.test(word));
 
 /**
@@ -315,12 +370,12 @@ const searchWordAligned = (term) =>
  * why some alternative needs a scan of what the server holds ("no-term", "not-word-aligned",
  * "too-many-alternatives") or is null. See `upstream_plan` in src/search_query.rs.
  */
-function searchUpstreamPlan(node) {
+export function searchUpstreamPlan(node: SearchNode | null): SearchUpstreamPlan {
   if (!node) return { queries: [], scan: "no-term" };
-  const dnf = (n) => {
+  const dnf = (n: SearchNode): string[][] | null => {
     if (n.kind === "word" || n.kind === "phrase") return [[n.text]];
     if (n.kind === "or") {
-      const out = [];
+      const out: string[][] = [];
       for (const child of n.children) {
         const alternatives = dnf(child);
         if (!alternatives) return null;
@@ -330,11 +385,11 @@ function searchUpstreamPlan(node) {
       return out;
     }
     if (n.kind === "and") {
-      let out = [[]];
+      let out: string[][] = [[]];
       for (const child of n.children) {
         const alternatives = dnf(child);
         if (!alternatives) return null;
-        const next = [];
+        const next: string[][] = [];
         for (const left of out) for (const right of alternatives) next.push([...left, ...right]);
         if (next.length > SEARCH_MAX_UPSTREAM_QUERIES) return null;
         out = next;
@@ -345,8 +400,8 @@ function searchUpstreamPlan(node) {
   };
   const alternatives = dnf(node);
   if (!alternatives) return { queries: [], scan: "too-many-alternatives" };
-  const queries = [];
-  let scan = null;
+  const queries: string[][] = [];
+  let scan: SearchScanReason | null = null;
   for (const terms of alternatives) {
     if (terms.length === 0) {
       scan = scan ?? "no-term";
@@ -358,15 +413,3 @@ function searchUpstreamPlan(node) {
   }
   return { queries, scan };
 }
-
-// Moved here from web/voice.js unchanged (`#624 voice-page-modularity`); what the page and the
-// tests use of it. The next change gives it its types.
-export {
-  searchFold,
-  searchPositiveTerms,
-  searchQueryMatches,
-  searchQueryParse,
-  searchQueryTree,
-  searchSubject,
-  searchUpstreamPlan,
-};

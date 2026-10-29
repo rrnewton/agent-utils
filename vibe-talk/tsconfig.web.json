@@ -1,0 +1,10 @@
+{
+  // Every TypeScript module of the page (`#624 voice-page-modularity`), strict, with the browser's
+  // declarations: the core (also checked alone, portably, by tsconfig.core.json), and the modules
+  // that bind it to the browser and to the legacy script. Run with `make -C vibe-talk typecheck`.
+  "extends": "./tsconfig.core.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "include": ["web/src/**/*.ts"]
+}

@@ -118,7 +118,7 @@ steps:
 
   - group: check
     job: contract
-    desc: generated browser contract is current, and tsc --checkJs over voice.js
+    desc: generated browser contract is current; tsc --checkJs over voice.js, and the page's modules strict and portable
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && make contract-check typecheck
     jobs_flag: ""

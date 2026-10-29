@@ -281,12 +281,12 @@ test("a script that is not strict throughout is refused rather than made strict 
 
 // ---- The legacy prelude (`#624 voice-page-modularity`) ------------------------------------------
 
-test("the prelude gives the legacy script exactly what web/src/legacy/imports.js exports, and its declarations say the same", () => {
+test("the prelude gives the legacy script exactly what web/src/legacy/imports.ts exports, and its declarations say the same", () => {
   const names = MANIFEST.legacy_imports;
   assert.ok(names.length > 0, "nothing has moved, so this checks nothing");
   const declared = [...readWeb("legacy-imports.d.ts").matchAll(/^declare const (\w+): LegacyImports\["(\w+)"\];$/gm)]
     .map(([, name, key]) => (assert.equal(name, key), name));
-  assert.deepStrictEqual(declared.sort(), [...names].sort(), "web/legacy-imports.d.ts and imports.js name different things");
+  assert.deepStrictEqual(declared.sort(), [...names].sort(), "web/legacy-imports.d.ts and imports.ts name different things");
 });
 
 test("the bundle declares nothing of the modules but what the legacy script takes, strictly, just before it", () => {
@@ -314,24 +314,24 @@ test("the bundle declares nothing of the modules but what the legacy script take
   }
 });
 
-test("a position in the prelude maps back to the module's source", () => {
+test("a position in the prelude maps back to the module's TypeScript source", () => {
   const lines = text(SCRIPT_PATH).split("\n");
   const needle = "function searchCombine(";
   const line = lines.findIndex((l) => l.includes(needle));
   assert.ok(line >= 0, `${needle} is not in the bundle`);
   const map = new SourceMap(JSON.parse(text(relativePath(MANIFEST.assets.script.map))));
   const found = map.findEntry(line, lines[line].indexOf(needle));
-  const source = readWeb("src/core/search/language.js");
-  assert.equal(found.originalSource, "vibe-talk/web/src/core/search/language.js");
+  const source = readWeb("src/core/search/language.ts");
+  assert.equal(found.originalSource, "vibe-talk/web/src/core/search/language.ts");
   assert.equal(found.originalLine, source.slice(0, source.indexOf(needle)).split("\n").length - 1);
 });
 
 test("a module overlay whose text the module does not hold is refused, not built unchanged", async () => {
-  await assert.rejects(moduleForTests("src/core/search/index.js", {
-    overlays: [{ file: "src/core/search/language.js", find: "no such text anywhere", replace: "" }],
+  await assert.rejects(moduleForTests("src/core/search/index.ts", {
+    overlays: [{ file: "src/core/search/language.ts", find: "no such text anywhere", replace: "" }],
   }), /holds 0 times, not 1/);
-  const patched = await moduleForTests("src/core/search/index.js", {
-    overlays: [{ file: "src/core/search/language.js", find: "const SEARCH_MAX_UPSTREAM_QUERIES = 4;", replace: "const SEARCH_MAX_UPSTREAM_QUERIES = 1;" }],
+  const patched = await moduleForTests("src/core/search/index.ts", {
+    overlays: [{ file: "src/core/search/language.ts", find: "const SEARCH_MAX_UPSTREAM_QUERIES = 4;", replace: "const SEARCH_MAX_UPSTREAM_QUERIES = 1;" }],
   });
   const plan = patched.searchUpstreamPlan(patched.searchQueryParse("alpha OR bravo"));
   assert.equal(plan.scan, "too-many-alternatives", "the overlay did not reach the built module");
