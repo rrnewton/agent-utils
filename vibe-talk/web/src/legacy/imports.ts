@@ -63,7 +63,7 @@ export {
   upsertThreadSummary,
   viewOfKey,
 } from "../core/channels/index.ts";
-export { anchorOfMessage, createBookmarks, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
+export { anchorOfMessage, createBookmarks, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
 export { createNavigation } from "../core/navigation/index.ts";
 export {
   DEFAULT_CARD_MAX_LINES,

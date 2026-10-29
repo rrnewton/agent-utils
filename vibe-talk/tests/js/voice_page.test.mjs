@@ -6756,6 +6756,38 @@ test("`#624 voice-page-modularity`: which reads still speak for a message's read
   assert.deepStrictEqual([...ledger.writtenIds()], ["1", "2", "3"]);
 });
 
+test("`#624 voice-page-modularity`: the pinned messages' owner, from the module alone: a list, changes laid over it, answers and refusals", () => {
+  const { createPins } = ANNOTATIONS;
+  const pins = createPins();
+  const pin = (id) => ({ message_id: id, content: `m${id}` });
+  pins.forget("c");
+  assert.deepStrictEqual([pins.channel(), pins.revision(), pins.size()], ["c", null, 0]);
+  // A change asked for and not answered survives a list read meanwhile.
+  pins.stage("2", pin("2"));
+  pins.apply({ pins: [pin("1")], revision: 4, limit: 50 });
+  assert.deepStrictEqual(pins.entries().map(([id]) => id), ["1", "2"]);
+  assert.deepStrictEqual([pins.revision(), pins.limit(), pins.isPinned("c", 2), pins.isPinned("d", "2")], [4, 50, true, false]);
+  // Answered: the server's pin, and the oldest it unpinned to make room.
+  pins.answered("2", { ...pin("2"), content: "server's" }, ["1"]);
+  assert.deepStrictEqual(pins.entries().map(([id, held]) => [id, held.content]), [["2", "server's"]]);
+  // Refused: what was held before, back.
+  const before = pins.held("2");
+  pins.stage("2", null);
+  assert.equal(pins.isPinned("c", "2"), false);
+  pins.rollback("2", before);
+  assert.equal(pins.held("2"), before);
+  // One read in flight; a newer one supersedes it; a failure says why.
+  const first = pins.startRead("c");
+  const second = pins.startRead("c");
+  assert.deepStrictEqual([pins.isCurrent(first), pins.isCurrent(second)], [false, true]);
+  pins.endRead(first);
+  assert.equal(pins.inFlight(), second, "an old read's end ended the current one");
+  pins.failed("no answer");
+  assert.equal(pins.problem(), "no answer");
+  pins.forget("d");
+  assert.deepStrictEqual([pins.channel(), pins.problem(), pins.inFlight(), pins.size()], ["d", "", null, 0]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

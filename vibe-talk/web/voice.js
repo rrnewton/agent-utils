@@ -6272,8 +6272,8 @@ function pinnedEmptySentence(loaded, matched, searching, tally = null, author = 
         `${hiddenKindNames(tally.matching)} are hidden.`
       : "None of this channel's pinned messages with a link match that search.";
   }
-  if (pinsProblem) return `This channel's pinned messages could not be loaded: ${pinsProblem}`;
-  if (pinsRevision === null || pinsChannel !== currentChannelId()) return "Loading this channel's pinned messages…";
+  if (pinStore.problem()) return `This channel's pinned messages could not be loaded: ${pinStore.problem()}`;
+  if (pinStore.revision() === null || pinStore.channel() !== currentChannelId()) return "Loading this channel's pinned messages…";
   return "No pinned messages in this channel yet — pin one from its ⋯ menu.";
 }
 
@@ -44558,20 +44558,13 @@ function setReadMode(mode) {
 // lands an hour later on another device's say-so is not one the owner could reason about; the tap
 // is refused out loud and the row is left as it was.
 
-/** This channel's pins as the server listed them, by message id, with `pinsPending` laid over. */
-let pins = new Map();
-/** The channel `pins` is for; "" before any list. */
-let pinsChannel = "";
-/** The revision the held list came with, or null until one has been read for `pinsChannel`. */
-let pinsRevision = null;
-/** How many pins the server keeps in one channel, as it last said; 0 before it has. */
-let pinsLimit = 0;
-/** Why the list could not be read, which the Pinned filter says; "" when it could. */
-let pinsProblem = "";
-/** The list read in flight: its channel, its promise, and the newest revision noted meanwhile. */
-let pinsInFlight = null;
-/** Changes asked for and not yet answered: id -> the pin it will be, or null for an unpin. */
-const pinsPending = new Map();
+/**
+ * This channel's pins as the server listed them, with this page's unanswered changes laid over, its
+ * channel, revision and limit, why the list could not be read, and the read in flight
+ * (web/src/core/annotations `createPins`, `#624 voice-page-modularity`): private to the owner. Here
+ * where the variables it replaces stood.
+ */
+const pinStore = createPins();
 /** Whether the Pinned filter is on. Only while the search bar is open: closing it turns this off. */
 let pinnedOnly = false;
 /** What the filter's list was last drawn from, so it is rebuilt only when that changes. */
@@ -44589,17 +44582,12 @@ const currentChannelId = () => String(selectedChannelId() || "");
 
 /** Whether this message is pinned in the channel on screen. */
 function isPinnedId(id) {
-  return pinsChannel === currentChannelId() && pins.has(String(id));
+  return pinStore.isPinned(currentChannelId(), id);
 }
 
 /** Forget the held list: another channel, or another credential. */
 function forgetPins(channel = "") {
-  pins = new Map();
-  pinsChannel = channel;
-  pinsRevision = null;
-  pinsProblem = "";
-  pinsInFlight = null;
-  pinsPending.clear();
+  pinStore.forget(channel);
   pinnedListDrawn = "";
 }
 
@@ -44611,11 +44599,12 @@ function forgetPins(channel = "") {
 function notePinsRevision(revision) {
   const channel = currentChannelId();
   if (typeof revision !== "number" || !channel) return;
-  if (pinsChannel !== channel) forgetPins(channel);
-  if (pinsRevision === revision) return;
+  if (pinStore.channel() !== channel) forgetPins(channel);
+  if (pinStore.revision() === revision) return;
   // One read at a time: a revision noted while one is out is checked against what it brings back.
-  if (pinsInFlight && pinsInFlight.channel === channel) {
-    pinsInFlight.noted = revision;
+  const flight = pinStore.inFlight();
+  if (flight && flight.channel === channel) {
+    flight.noted = revision;
     return;
   }
   guardQuietly(loadPins)();
@@ -44625,43 +44614,36 @@ function notePinsRevision(revision) {
 function ensurePins() {
   const channel = currentChannelId();
   if (!channel) return;
-  if (pinsChannel !== channel) forgetPins(channel);
-  if (pinsRevision === null && !(pinsInFlight && pinsInFlight.channel === channel)) guardQuietly(loadPins)();
+  if (pinStore.channel() !== channel) forgetPins(channel);
+  const flight = pinStore.inFlight();
+  if (pinStore.revision() === null && !(flight && flight.channel === channel)) guardQuietly(loadPins)();
 }
 
 /** Read this channel's pins, and draw what changed. */
 async function loadPins() {
   const channel = currentChannelId();
   if (!channel) return;
-  if (pinsChannel !== channel) forgetPins(channel);
-  const read = { channel, noted: null };
-  pinsInFlight = read;
+  if (pinStore.channel() !== channel) forgetPins(channel);
+  const read = pinStore.startRead(channel);
   try {
     const payload = await apiDecoded("PinsResponse", `/api/v1/channels/${encodeURIComponent(channel)}/pins`);
-    if (pinsInFlight !== read || currentChannelId() !== channel) return;
+    if (!pinStore.isCurrent(read) || currentChannelId() !== channel) return;
     applyPinsList(payload);
   } catch (error) {
-    if (pinsInFlight !== read || currentChannelId() !== channel) return;
+    if (!pinStore.isCurrent(read) || currentChannelId() !== channel) return;
     // SAID, by the filter that would have shown them; a channel read is not failed for it.
-    pinsProblem = error.detail || error.message || "the server did not answer";
+    pinStore.failed(error.detail || error.message || "the server did not answer");
     renderPins();
   } finally {
-    if (pinsInFlight === read) pinsInFlight = null;
+    pinStore.endRead(read);
   }
   // A read that landed meanwhile named a revision this list is not at: read once more.
-  if (read.noted !== null && read.noted !== pinsRevision && currentChannelId() === channel) await loadPins();
+  if (read.noted !== null && read.noted !== pinStore.revision() && currentChannelId() === channel) await loadPins();
 }
 
 /** Take a list the server sent as the truth, with this page's unanswered changes laid over it. */
 function applyPinsList(payload) {
-  pins = new Map(payload.pins.map((pin) => [String(pin.message_id), pin]));
-  for (const [id, pending] of pinsPending) {
-    if (pending) pins.set(id, pending);
-    else pins.delete(id);
-  }
-  pinsRevision = payload.revision;
-  pinsLimit = payload.limit;
-  pinsProblem = "";
+  pinStore.apply(payload);
   renderPins();
 }
 
@@ -44763,13 +44745,13 @@ function keptMessage(pin, channel) {
  */
 function pinnedMessages() {
   const channel = currentChannelId();
-  if (pinsChannel !== channel || pins.size === 0) return [];
+  if (pinStore.channel() !== channel || pinStore.size() === 0) return [];
   const held = new Map();
   const loaded = threadingSupported && channelStore.current().channel === channel
     ? [...channelStore.current().threads.map((summary) => summary.root).filter(Boolean), ...channelStore.current().messages, ...timelineMessages]
     : [...el("discord-log").children].flatMap(rowMessages);
   for (const message of loaded) held.set(String(message.id), message);
-  return inTimeOrder([...pins].map(([id, pin]) => held.get(id) || keptMessage(pin, channel)), "timestamp");
+  return inTimeOrder(pinStore.entries().map(([id, pin]) => held.get(id) || keptMessage(pin, channel)), "timestamp");
 }
 
 /**
@@ -44847,20 +44829,17 @@ function pinRequest(message) {
 async function togglePin(messages) {
   const channel = currentChannelId();
   if (!channel || messages.length === 0) return;
-  if (pinsChannel !== channel) forgetPins(channel);
+  if (pinStore.channel() !== channel) forgetPins(channel);
   const pinning = !messages.some((message) => isPinnedId(message.id));
   const act = pinning ? "pinned" : "unpinned";
   if (navigator.onLine === false) {
     setStatus(`Offline — nothing was ${act}. Try again once the connection is back.`);
     return;
   }
-  const before = new Map(messages.map((message) => [String(message.id), pins.get(String(message.id))]));
+  const before = new Map(messages.map((message) => [String(message.id), pinStore.held(String(message.id))]));
   for (const message of messages) {
     const id = String(message.id);
-    const pin = pinning ? provisionalPin(message) : null;
-    pinsPending.set(id, pin);
-    if (pin) pins.set(id, pin);
-    else pins.delete(id);
+    pinStore.stage(id, pinning ? provisionalPin(message) : null);
   }
   renderPins();
   const unpinned = [];
@@ -44874,27 +44853,19 @@ async function togglePin(messages) {
       const answer = await queueInboxWrite(() => apiDecoded("PinChangeResponse", path,
         pinning ? { method: "PUT", body: pinRequest(message) } : { method: "DELETE" }));
       answered += 1;
-      if (pinsChannel !== channel) continue;
-      pinsPending.delete(id);
-      if (answer.pin) pins.set(id, answer.pin);
-      else pins.delete(id);
+      if (pinStore.channel() !== channel) continue;
       // At the bound the server unpinned the oldest pin to make room, and named it.
-      for (const gone of answer.unpinned) {
-        unpinned.push(String(gone));
-        pins.delete(String(gone));
-      }
+      pinStore.answered(id, answer.pin, answer.unpinned);
+      for (const gone of answer.unpinned) unpinned.push(String(gone));
       revision = answer.revision;
     }
   } catch (error) {
-    if (pinsChannel === channel) {
+    if (pinStore.channel() === channel) {
       // Back to what it was — for the messages the server did not answer for. Any it did are
       // its truth now, and the list is read again to be sure of them.
       for (const message of messages.slice(answered)) {
         const id = String(message.id);
-        pinsPending.delete(id);
-        const held = before.get(id);
-        if (held) pins.set(id, held);
-        else pins.delete(id);
+        pinStore.rollback(id, before.get(id));
       }
       renderPins();
       if (answered > 0) guardQuietly(loadPins)();
@@ -44904,14 +44875,14 @@ async function togglePin(messages) {
       : `That message was not ${act}: ${error.detail || error.message}`);
     return;
   }
-  if (pinsChannel !== channel) return;
+  if (pinStore.channel() !== channel) return;
   renderPins();
   // The list's revision has moved; read it again unless this change is all that moved it.
   notePinsRevision(revision);
   const service = chatProviderName || "the chat service";
   if (!pinning) setStatus("Unpinned.");
   else if (unpinned.length > 0) {
-    setStatus(`Pinned. The oldest pin here was unpinned to stay at ${pinsLimit || "the limit of"} pins.`);
+    setStatus(`Pinned. The oldest pin here was unpinned to stay at ${pinStore.limit() || "the limit of"} pins.`);
   } else setStatus(`Pinned here, not in ${service}.`);
 }
 
