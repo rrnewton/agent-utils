@@ -253,6 +253,27 @@ pub(super) fn replay_arguments(
     Ok(adapter.replay_arguments(rest, conversation))
 }
 
+/// The recorded arguments with every selector replaced by the start of a new conversation
+/// `conversation`; refused for a harness that cannot be given a new conversation's ID.
+pub(super) fn fresh_arguments(
+    harness: &str,
+    argv: &[String],
+    conversation: &str,
+) -> Result<Vec<String>> {
+    if !valid_metadata_text(conversation) {
+        return Err(fail(
+            "a fresh start needs a nonempty native conversation id",
+        ));
+    }
+    let (_, rest) = split(harness, argv)?;
+    let adapter = crate::harness::adapter(harness).expect("split accepted the harness");
+    adapter.fresh_arguments(rest, conversation).ok_or_else(|| {
+        fail(format!(
+            "{harness} cannot be started on a conversation ID agentctl chooses, so it cannot be revived fresh"
+        ))
+    })
+}
+
 /// Is the recorded program the harness itself, so Herdr's kind launch reproduces it?
 pub(super) fn program_matches(harness: &str, executable: Option<&str>) -> bool {
     executable.is_none_or(|executable| {

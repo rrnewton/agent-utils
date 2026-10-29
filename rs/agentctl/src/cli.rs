@@ -773,6 +773,9 @@ struct Revive {
     /// Require this exact old generation token; applies only to a named revive
     #[arg(long, requires = "name", value_name = "TOKEN")]
     expected_token: Option<String>,
+    /// Start a fresh conversation instead of resuming the recorded one (Claude Code only: agentctl chooses the new session ID); for an agent whose conversation is lost or no longer wanted. Applies only to a named revive
+    #[arg(long, requires = "name", conflicts_with = "dry_run")]
+    fresh: bool,
     /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
@@ -2477,6 +2480,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 report["designation_problem"] = json!(problem);
             }
             write_json(&report).map_err(Failure::Output)?;
+            for warning in report["fresh_starts"].as_array().into_iter().flatten() {
+                eprintln!("agentctl restore: {}", warning.as_str().unwrap_or_default());
+            }
             let done = report["action"] == "already-restored"
                 || (report["complete"] == true && report["refused"] == 0);
             return Ok(if done || value.dry_run { 0 } else { 75 });
@@ -3096,6 +3102,14 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             let timeout = Duration::from_secs_f64(value.startup_timeout);
             let mut result = if value.all {
                 manager.revive_all(value.dry_run, timeout)?
+            } else if value.fresh {
+                let name = value
+                    .name
+                    .as_deref()
+                    .expect("clap requires NAME with --fresh");
+                manager
+                    .mark_fresh_revive(name, "the operator asked for a fresh revive (--fresh)")?;
+                manager.revive(name, false, value.expected_token.as_deref(), timeout)?
             } else {
                 manager.revive(
                     value.name.as_deref().expect("clap requires NAME or --all"),

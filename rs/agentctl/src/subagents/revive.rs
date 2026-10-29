@@ -8,6 +8,62 @@ const SCHEMA: &str = "agentctl-revive/v1";
 #[cfg(test)]
 thread_local! {
     static FAILURE_POINT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    /// The Claude Code configuration directories a test pretends exist.
+    pub(super) static CLAUDE_CONFIG_ROOTS: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where Claude Code may keep transcripts: `$CLAUDE_CONFIG_DIR`, then `~/.claude`.
+fn claude_config_roots() -> Vec<PathBuf> {
+    // Tests never read the host's own configuration: only what a test pretends.
+    #[cfg(test)]
+    return CLAUDE_CONFIG_ROOTS
+        .with(|roots| roots.borrow().clone())
+        .unwrap_or_default();
+    #[cfg(not(test))]
+    let mut roots = Vec::new();
+    #[cfg(not(test))]
+    if let Some(directory) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty())
+    {
+        roots.push(PathBuf::from(directory));
+    }
+    #[cfg(not(test))]
+    if let Some(home) = crate::harness::home() {
+        roots.push(home.join(".claude"));
+    }
+    #[cfg(not(test))]
+    roots
+}
+
+/// Whether a Claude Code transcript of `session` begun in `cwd` exists under any of `roots`:
+/// `Some(true)` found, `Some(false)` missing from every root that has a `projects` directory,
+/// `None` when no root has one (nowhere to look, so no verdict).
+pub(super) fn claude_transcript_verdict(
+    roots: &[PathBuf],
+    cwd: &str,
+    session: &str,
+) -> Option<bool> {
+    let encoded: String = cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let mut looked = false;
+    for root in roots {
+        let projects = root.join("projects");
+        if !projects.is_dir() {
+            continue;
+        }
+        looked = true;
+        if projects
+            .join(&encoded)
+            .join(format!("{session}.jsonl"))
+            .is_file()
+            || crate::inbox::watch::transcript_of_session(&projects, session).is_some()
+        {
+            return Some(true);
+        }
+    }
+    looked.then_some(false)
 }
 
 #[cfg(test)]
@@ -616,8 +672,38 @@ fn policy_arguments(record: &AgentRecord, native: &NativeSession) -> Result<Vec<
     Ok(arguments)
 }
 
-/// The conversation a revive resumes: the launch spec's, else the record's own.
+/// The record key that asks the next revive to start a fresh conversation instead of resuming
+/// the recorded one (#686 agent-turnover): `{"schema", "session", "reason"}`. It lives in the
+/// dead record, so a revive interrupted and finished later still starts the same fresh
+/// conversation; the revived record does not carry it.
+pub(super) const FRESH_REVIVE: &str = "fresh_revive";
+const FRESH_REVIVE_SCHEMA: &str = "agentctl-fresh-revive/v1";
+
+/// The fresh conversation (session, reason) a record asks its next revive to start.
+pub(super) fn fresh_revive(record: &AgentRecord) -> Option<(String, String)> {
+    let marker = record
+        .extra
+        .get(FRESH_REVIVE)
+        .filter(|marker| marker["schema"] == FRESH_REVIVE_SCHEMA)?;
+    let session = marker["session"]
+        .as_str()
+        .filter(|session| valid_metadata_text(session))?;
+    Some((
+        session.to_owned(),
+        marker["reason"].as_str().unwrap_or_default().to_owned(),
+    ))
+}
+
+/// The conversation a revive starts: a requested fresh one, else the recorded one.
 fn revive_conversation(record: &AgentRecord) -> Result<NativeSession> {
+    match fresh_revive(record) {
+        Some((session, _)) => Ok(NativeSession::new(&record.harness, &session, "asserted")),
+        None => recorded_conversation(record),
+    }
+}
+
+/// The conversation a revive resumes: the launch spec's, else the record's own.
+fn recorded_conversation(record: &AgentRecord) -> Result<NativeSession> {
     match record
         .launch_spec
         .as_ref()
@@ -651,7 +737,15 @@ fn spec_arguments(record: &AgentRecord) -> Option<Vec<String>> {
 
 /// The exact harness arguments a revive of `record` launches.
 fn expected_arguments(record: &AgentRecord) -> Result<Vec<String>> {
-    let native = revive_conversation(record)?;
+    if let Some((session, _)) = fresh_revive(record) {
+        if let Some(argv) = spec_arguments(record) {
+            return launch_spec::fresh_arguments(&record.harness, &argv, &session);
+        }
+        let recorded = recorded_conversation(record)?;
+        let policy = policy_arguments(record, &recorded)?;
+        return fresh_selector(&record.harness, policy, &session);
+    }
+    let native = recorded_conversation(record)?;
     if let Some(argv) = spec_arguments(record) {
         return launch_spec::replay_arguments(&record.harness, &argv, &native.value);
     }
@@ -675,6 +769,17 @@ fn expected_arguments(record: &AgentRecord) -> Result<Vec<String>> {
         .chain(policy)
         .collect()
     })
+}
+
+/// `arguments` with the selector that starts the fresh conversation `session` in front.
+fn fresh_selector(harness: &str, arguments: Vec<String>, session: &str) -> Result<Vec<String>> {
+    crate::harness::adapter(harness)
+        .and_then(|adapter| adapter.fresh_arguments(arguments, session))
+        .ok_or_else(|| {
+            fail(format!(
+                "{harness} cannot be started on a conversation ID agentctl chooses, so it cannot be revived fresh"
+            ))
+        })
 }
 
 /// The project's configured wrkslots, unless `AGENTCTL_WRKSLOTS_BIN` already names one.
@@ -798,8 +903,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if let Some(spec) = record.launch_spec.as_ref() {
             return self.spec_launch_plan(record, spec, cwd, startup_timeout);
         }
-        let native = conversation(record)?;
-        let policy = policy_arguments(record, &native)?;
+        let recorded = conversation(record)?;
+        let policy = policy_arguments(record, &recorded)?;
+        let fresh = fresh_revive(record);
+        let native = match &fresh {
+            Some((session, _)) => NativeSession::new(&record.harness, session, "asserted"),
+            None => recorded,
+        };
         let mut options = StartOptions {
             harness: record.harness.clone(),
             profile: record.profile.clone(),
@@ -859,12 +969,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )?;
         let mut structured = effort;
         structured.extend(options.harness_args.iter().cloned());
-        let arguments = harness_arguments(
-            &record.harness,
-            record.model.as_deref(),
-            Some(&native.value),
-            &structured,
-        )?;
+        let arguments = match &fresh {
+            Some((session, _)) => fresh_selector(
+                &record.harness,
+                harness_arguments(&record.harness, record.model.as_deref(), None, &structured)?,
+                session,
+            )?,
+            None => harness_arguments(
+                &record.harness,
+                record.model.as_deref(),
+                Some(&native.value),
+                &structured,
+            )?,
+        };
         self.finish_launch_plan(record, options, arguments, native, cwd)
     }
 
@@ -936,7 +1053,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             options.environment = profile.environment.clone();
         }
         let argv = spec_arguments(record).unwrap_or_default();
-        let arguments = launch_spec::replay_arguments(&record.harness, &argv, &native.value)?;
+        let arguments = if fresh_revive(record).is_some() {
+            launch_spec::fresh_arguments(&record.harness, &argv, &native.value)?
+        } else {
+            launch_spec::replay_arguments(&record.harness, &argv, &native.value)?
+        };
         self.finish_launch_plan(record, options, arguments, native, cwd)
     }
 
@@ -1823,6 +1944,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         candidate
             .extra
             .insert("revived_from".to_owned(), json!(record.token));
+        // The fresh conversation is this generation's own; its next revive resumes it.
+        candidate.extra.remove(FRESH_REVIVE);
         let previous_label = record
             .launch_spec
             .as_ref()
@@ -2442,5 +2565,80 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             agent::sync_directory(operation.parent().expect("revive operation parent"))?;
         }
         agent::sync_directory(destination)
+    }
+}
+
+impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
+    /// Why a revive of `agent_name` could not resume its recorded conversation, when that is
+    /// knowable: today, a Claude Code agent whose transcript is in none of the configuration
+    /// directories that exist (`$CLAUDE_CONFIG_DIR`, `~/.claude`). `None` when the transcript
+    /// is there, or when agentctl cannot tell (another harness, no configuration directory, or
+    /// a launch profile that sets `CLAUDE_CONFIG_DIR`, which moves the transcripts).
+    pub fn revive_unresumable_reason(&self, agent_name: &str) -> Result<Option<String>> {
+        let record = self.read_record(agent_name)?;
+        if record.harness != "claude"
+            || fresh_revive(&record).is_some()
+            || record
+                .environment_names
+                .iter()
+                .any(|name| name == "CLAUDE_CONFIG_DIR")
+        {
+            return Ok(None);
+        }
+        let Ok(native) = recorded_conversation(&record) else {
+            return Ok(None);
+        };
+        // Only a verdict of "missing" from a real configuration directory starts fresh: a wrong
+        // guess would throw away a conversation that could have been resumed.
+        Ok(
+            (claude_transcript_verdict(&claude_config_roots(), &record.cwd, &native.value)
+                == Some(false))
+            .then(|| {
+                format!(
+                    "no Claude Code transcript for session {} remains, so it cannot be resumed",
+                    native.value
+                )
+            }),
+        )
+    }
+
+    /// Mark the dead record of `agent_name` so that its next revive starts a fresh
+    /// conversation, recording `reason`; returns the new conversation's ID. A record already
+    /// marked keeps its mark, so a retried revive starts the same conversation.
+    pub fn mark_fresh_revive(&self, agent_name: &str, reason: &str) -> Result<String> {
+        let _lock = self.lock(agent_name)?;
+        if journals(&self.registry)?
+            .iter()
+            .any(|journal| journal.name == agent_name)
+        {
+            return Err(fail(format!(
+                "an interrupted revive of {agent_name} is pending; finish it first with agentctl revive {agent_name}"
+            )));
+        }
+        let mut record = self.read_record(agent_name)?;
+        if let Some((session, _)) = fresh_revive(&record) {
+            return Ok(session);
+        }
+        if crate::harness::adapter(&record.harness)
+            .and_then(|adapter| adapter.fresh_arguments(Vec::new(), "probe"))
+            .is_none()
+        {
+            return Err(fail(format!(
+                "{} cannot be started on a conversation ID agentctl chooses, so {agent_name} cannot be revived fresh",
+                record.harness
+            )));
+        }
+        if self.revive_liveness(&record) == ProcessLiveness::Alive {
+            return Err(fail(format!(
+                "{agent_name}'s recorded harness is alive; nothing to revive"
+            )));
+        }
+        let session = new_conversation_id()?;
+        record.extra.insert(
+            FRESH_REVIVE.to_owned(),
+            json!({"schema": FRESH_REVIVE_SCHEMA, "session": session, "reason": reason}),
+        );
+        self.save(&record)?;
+        Ok(session)
     }
 }

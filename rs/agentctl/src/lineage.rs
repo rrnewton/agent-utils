@@ -363,6 +363,9 @@ impl Observation {
                     planned.push(ended_entry(name, old, "died"));
                     let relation = if old.session.is_some() && old.session == new.session {
                         "resume"
+                    } else if matches!(self.action, Action::Restore) {
+                        // Restore writes this entry itself, with its reason; this one repeats it.
+                        "fresh-after-restore"
                     } else {
                         "fresh"
                     };

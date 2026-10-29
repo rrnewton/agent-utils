@@ -353,6 +353,49 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
     let sent = fixture.agentctl_json(&["send", "worker", "hello after revive"]);
     assert_eq!(sent["outcome"], "delivered");
 
+    // Revive fresh (#686 agent-turnover): kill the revived harness, then start a new
+    // conversation under the same name instead of resuming the recorded one.
+    let revived_status = fixture.agentctl_json(&["status", "worker"]);
+    let revived_pid = revived_status["harness_identity"]["pid"]
+        .as_u64()
+        .expect("revived harness pid");
+    let cmdline =
+        fs::read_to_string(format!("/proc/{revived_pid}/cmdline")).expect("harness cmdline");
+    assert!(cmdline.contains(&fixture.fake.display().to_string()));
+    assert!(Command::new("kill")
+        .arg(revived_pid.to_string())
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let output = fixture.agentctl(&["revive", "worker", "--dry-run"]);
+        if serde_json::from_slice::<Value>(&output.stdout)
+            .is_ok_and(|plan| plan["action"] == "revive")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no revive plan after the second death"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let fresh = fixture.agentctl_json(&["revive", "worker", "--fresh", "--startup-timeout", "30"]);
+    assert_eq!(fresh["revived"], json!(true), "{fresh:#}");
+    let fresh_status = fixture.agentctl_json(&["status", "worker"]);
+    let fresh_session = fresh_status["native_session"]["value"]
+        .as_str()
+        .expect("fresh session")
+        .to_owned();
+    assert_ne!(fresh_session, session);
+    let argv_log = fs::read_to_string(&fixture.argv_file).expect("fake argv log");
+    let last = argv_log.lines().last().unwrap();
+    assert!(
+        last.contains(&format!("--session-id {fresh_session}")) && !last.contains("--resume"),
+        "fresh revive argv: {last}"
+    );
+
     // Stop closes the owned pane and archives the record.
     let stopped = fixture.agentctl_json(&["stop", "worker"]);
     assert_eq!(stopped["pane_closed"], json!(true));
@@ -387,6 +430,8 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
         ("generation", "start"),
         ("ended", "died"),
         ("generation", "resume"),
+        ("ended", "died"),
+        ("generation", "fresh"),
         ("ended", "stopped"),
     ]
     .iter()
@@ -394,10 +439,14 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
     .collect();
     assert_eq!(steps, expected, "{history:#}");
     let entries = history["entries"].as_array().unwrap();
-    assert!(entries
+    assert!(entries[..4]
         .iter()
-        .all(|entry| entry["session"] == json!(session) && entry["line"] == history["line"]));
-    assert_eq!(history["sessions"], 1);
+        .all(|entry| entry["session"] == json!(session)));
+    assert!(entries[4..]
+        .iter()
+        .all(|entry| entry["session"] == json!(fresh_session)));
+    assert!(entries.iter().all(|entry| entry["line"] == history["line"]));
+    assert_eq!(history["sessions"], 2);
     let adopted = fixture.agentctl_json(&["history", "manual-agent", "--json"]);
     let kinds: Vec<&str> = adopted["entries"]
         .as_array()
@@ -407,7 +456,7 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
         .filter_map(Value::as_str)
         .collect();
     assert_eq!(kinds, ["adopt", "stopped"], "{adopted:#}");
-    let owners = fixture.agentctl_json(&["history", "--session", &session, "--json"]);
+    let owners = fixture.agentctl_json(&["history", "--session", &fresh_session, "--json"]);
     assert!(owners["owners"]
         .as_array()
         .unwrap()

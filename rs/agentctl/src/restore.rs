@@ -682,9 +682,24 @@ fn recover_agent<A: ManagedApi + ?Sized>(
             return json!({"name": name, "action": "refused", "reason": error.to_string()});
         }
     };
+    // A conversation that cannot be resumed never blocks a restore: the agent starts fresh,
+    // and the report, the coordinator's notice and the agent's first prompt say so loudly
+    // (owner decision, #686 agent-turnover). A pending revive journal finishes as it began.
+    let unresumable = if plan["action"] == "revive" {
+        manager.revive_unresumable_reason(name).ok().flatten()
+    } else {
+        None
+    };
     match plan["action"].as_str().unwrap_or_default() {
+        "revive" if options.dry_run && unresumable.is_some() => json!({
+            "name": name, "action": "revive-fresh", "dry_run": true, "reason": unresumable,
+        }),
         "revive" | "recover" if options.dry_run => {
             json!({"name": name, "action": "revive", "dry_run": true})
+        }
+        "revive" if unresumable.is_some() => {
+            let reason = unresumable.unwrap_or_default();
+            revive_fresh(manager, name, &plan, &reason, options)
         }
         "revive" | "recover" => {
             let token = plan["token"].as_str().map(str::to_owned);
@@ -703,6 +718,101 @@ fn recover_agent<A: ManagedApi + ?Sized>(
         "skip" => json!({"name": name, "action": "skipped", "reason": plan["reason"]}),
         _ => json!({"name": name, "action": "refused", "reason": plan["reason"]}),
     }
+}
+
+/// Revive `name` on a fresh conversation because `reason` says its own cannot be resumed; warn
+/// the agent in its first prompt and record the lineage.
+fn revive_fresh<A: ManagedApi + ?Sized>(
+    manager: &ManagedAgents<'_, A>,
+    name: &str,
+    plan: &Value,
+    reason: &str,
+    options: &RestoreOptions,
+) -> Value {
+    let old = manager.status(name).ok();
+    let session = match manager.mark_fresh_revive(name, reason) {
+        Ok(session) => session,
+        Err(error) => {
+            return json!({"name": name, "action": "refused",
+                          "reason": format!("{reason}; a fresh start was refused: {error}")});
+        }
+    };
+    let token = plan["token"].as_str().map(str::to_owned);
+    let result = match manager.revive(name, false, token.as_deref(), options.startup_timeout) {
+        Ok(result) => result,
+        Err(error) => {
+            return json!({"name": name, "action": "refused",
+                          "reason": format!("{reason}; the fresh start failed: {error}")});
+        }
+    };
+    let old_session = old.as_ref().and_then(crate::lineage::session_of);
+    let warning = format!(
+        "WARNING: {name} was started FRESH, with no memory of its previous conversation{}: {reason}. Give it its task and context again.",
+        old_session
+            .as_deref()
+            .map(|session| format!(" ({session})"))
+            .unwrap_or_default()
+    );
+    let prompt = format!(
+        "{}\nWARNING: this is a fresh session. Your previous conversation{} could not be resumed after the host restarted ({reason}), so you remember nothing of it. Before doing anything else, read your working tree, your notes and your handoff files, and tell your coordinator what you can and cannot reconstruct.",
+        crate::sender_header::render(
+            &crate::sender_header::Sender::Other("agentctl-restore".to_owned()),
+            crate::sender_header::ROUTE,
+        ),
+        old_session
+            .as_deref()
+            .map(|session| format!(" ({session})"))
+            .unwrap_or_default()
+    );
+    let prompted = manager.send_identified(
+        name,
+        &prompt,
+        DrainOptions {
+            ready_timeout: Duration::from_secs(60),
+            ..DrainOptions::default()
+        },
+        Some(&format!(
+            "restore-fresh-{}",
+            &session[..8.min(session.len())]
+        )),
+    );
+    if let Ok(status) = manager.status(name) {
+        let token = status["token"].as_str().unwrap_or_default().to_owned();
+        let mut entry = serde_json::Map::new();
+        for (key, value) in [
+            ("kind", json!("generation")),
+            ("relation", json!("fresh-after-restore")),
+            ("reason", json!(reason)),
+            ("token", json!(token)),
+            ("session", json!(session)),
+            ("harness", status["harness"].clone()),
+            ("cwd", status["cwd"].clone()),
+            (
+                "predecessor",
+                json!({"token": plan["token"], "session": old_session}),
+            ),
+        ] {
+            if !value.is_null() {
+                entry.insert(key.to_owned(), value);
+            }
+        }
+        if let Err(error) = crate::lineage::append(manager.registry(), name, entry) {
+            eprintln!("agentctl: lineage of {name} not recorded: {error}");
+        }
+    }
+    json!({
+        "name": name,
+        "action": "revived-fresh",
+        "pane_id": result["pane_id"],
+        "workspace_id": result["workspace_id"],
+        "session": session,
+        "reason": reason,
+        "warning": warning,
+        "first_prompt": match prompted {
+            Ok(queued) => json!(queued)["outcome"].clone(),
+            Err(error) => json!(format!("not queued: {error}")),
+        },
+    })
 }
 
 /// Point another registry's record for the coordinator at the coordinator's live pane.
@@ -1085,6 +1195,10 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
             )
         },
         format!("Revived: {}.", list("revived", &pane)),
+        format!(
+            "STARTED FRESH, no memory of their previous conversation (give them their task again): {}.",
+            list("revived-fresh", &reason)
+        ),
         format!("Promoted: {}.", list("promoted", &pane)),
         format!("Refused: {}.", list("refused", &reason)),
         format!(
@@ -1270,6 +1384,13 @@ pub fn restore<A: ManagedApi + ?Sized>(
         rows.iter().filter(|row| row["action"] == "refused").count()
     });
     report["refused"] = json!(refused);
+    // Loud: every agent that lost its conversation, the coordinator included.
+    let fresh_starts: Vec<Value> = std::iter::once(&report["coordinator"])
+        .chain(report["agents"].as_array().into_iter().flatten())
+        .filter(|row| row["action"] == "revived-fresh")
+        .map(|row| row["warning"].clone())
+        .collect();
+    report["fresh_starts"] = json!(fresh_starts);
     report["complete"] = json!(herdr_ready && coordinator_ok && !options.dry_run);
     // A dry run never completes; this says whether the same run for real would.
     report["would_complete"] = json!(herdr_ready && coordinator_ok && refused == 0);

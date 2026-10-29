@@ -76,6 +76,12 @@ impl HarnessAdapter for ClaudeCode {
         Some(split(argv))
     }
 
+    fn fresh_arguments(&self, rest: Vec<String>, conversation: &str) -> Option<Vec<String>> {
+        let mut arguments = vec!["--session-id".to_owned(), conversation.to_owned()];
+        arguments.extend(rest);
+        Some(arguments)
+    }
+
     fn replay_arguments(&self, rest: Vec<String>, conversation: &str) -> Vec<String> {
         let mut arguments = vec!["--resume".to_owned(), conversation.to_owned()];
         arguments.extend(rest);

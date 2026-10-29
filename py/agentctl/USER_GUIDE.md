@@ -779,6 +779,16 @@ candidate record and terminal for inspection. `--dry-run` does not change
 records, locks, tabs, or processes. Batch recovery skips live and non-running
 records, continues past blocked names, and exits 75 if any name remains blocked.
 
+`agentctl revive NAME --fresh` (Rust edition) starts a new conversation instead
+of resuming the recorded one: the replay launches Claude Code with
+`--session-id NEW`, where agentctl chooses NEW, in place of `--resume OLD`.
+Everything else is replayed as usual. Use it when the old conversation is lost
+or no longer wanted; it is refused for harnesses that cannot be started on a
+conversation ID chosen in advance (Codex, Muse). The request is written into the
+dead record before the launch, so an interrupted fresh revive finishes on the
+same new conversation, and the revived record no longer carries it. The lineage
+records the step as `fresh` (`agentctl history NAME`).
+
 ### Promote a launch that timed out but runs
 
 Herdr's startup wait expects an idle prompt. A Codex harness resuming a
@@ -824,7 +834,8 @@ and its transcript when the
 harness keeps one. Relations are `start`, `adopt`, `resume` (revived on the
 same session), `fresh` (revived on another or no session), `rebound` (the
 record's session changed in place, by `bind-session` or `anchor`), `turnover`
-(a fresh session fed a handoff, below), `takeover` and `handback`. A *line* groups one continuous piece of work. `start` begins a
+(a fresh session fed a handoff, below), `fresh-after-restore` (restore could not
+resume the conversation), `takeover` and `handback`. A *line* groups one continuous piece of work. `start` begins a
 new line, so a reused name never runs two unrelated agents together, and
 without `--all` only the current line is shown. `rename` links the two names,
 and `history NEW` includes what the agent ran as OLD.
@@ -922,12 +933,22 @@ In order, it:
    promoted agent boxed to a slot it runs `wrkslots transfer-owner` with the new
    harness's process ID (accepted because that harness runs inside the slot's
    box) and then releases its own reboot hold; a slot whose agent stays down
-   keeps the hold;
+   keeps the hold. A Claude Code agent (the coordinator included) whose
+   conversation cannot be resumed, because its transcript is in none of the
+   configuration directories that exist (`$CLAUDE_CONFIG_DIR`, `~/.claude`),
+   does not block the restore: it is revived fresh, as `revive --fresh` does.
+   The restore then says so loudly: the report's row has action `revived-fresh`
+   with the reason and a warning, the report lists every such warning under
+   `fresh_starts` and prints each one to standard error, the recovery notice
+   names these agents under "STARTED FRESH", and the agent's first prompt warns
+   it that it remembers nothing. The lineage records `fresh-after-restore` with
+   the reason. When agentctl cannot tell (no configuration directory, or a
+   launch profile that sets `CLAUDE_CONFIG_DIR`), it resumes as before;
 7. runs `systemctl --user reset-failed` and `start` for each of `units`;
 8. queues one recovery notice for the coordinator (message ID
    `restore-` and the first 8 characters of the boot ID, so it is sent once per
-   boot): what was revived and where, what was promoted or refused and why, the
-   units, the slot images, and the report path.
+   boot): what was revived and where, what started fresh and why, what was
+   promoted or refused and why, the units, the slot images, and the report path.
 
 Names in `exclude` are left alone and not counted (the coordinator cannot be
 excluded); use it for a record that is not meant to come back, or stop that

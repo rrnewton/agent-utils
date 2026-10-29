@@ -1309,3 +1309,157 @@ fn watch_leaves_a_timer_alone_while_the_service_it_triggered_runs() {
     assert_eq!(timer["detail"], "keeps its schedule");
     assert!(!changed_anything(&host), "{:?}", host.commands());
 }
+
+/// A Claude Code agent the reboot killed, as `dead_agent` makes a Codex one.
+fn dead_claude_agent(fixture: &Fixture) -> AgentRecord {
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            "lane",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = fixture.manager().load("lane").unwrap();
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(record.pane_id.clone().unwrap());
+    fixture.client.started.store(false, Ordering::Relaxed);
+    record
+}
+
+/// Pretend these Claude Code configuration directories until the guard drops.
+struct PretendClaudeRoots;
+
+impl Drop for PretendClaudeRoots {
+    fn drop(&mut self) {
+        crate::subagents::revive::CLAUDE_CONFIG_ROOTS.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+#[must_use]
+fn pretend_claude_roots(roots: Vec<PathBuf>) -> PretendClaudeRoots {
+    crate::subagents::revive::CLAUDE_CONFIG_ROOTS.with(|cell| *cell.borrow_mut() = Some(roots));
+    PretendClaudeRoots
+}
+
+#[test]
+fn restore_starts_a_claude_agent_fresh_when_its_transcript_is_gone_and_says_so() {
+    let fixture = Fixture::new();
+    let old = dead_claude_agent(&fixture);
+    let old_session = old.native_session.clone().unwrap().value;
+    let claude = fixture.root.join("claude-config");
+    fs::create_dir_all(claude.join("projects")).unwrap();
+    let _roots = pretend_claude_roots(vec![claude]);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(None),
+    )
+    .unwrap();
+    let row = &report["agents"][0];
+    assert_eq!(row["action"], "revived-fresh", "{report:#}");
+    let session = row["session"].as_str().unwrap().to_owned();
+    assert_ne!(session, old_session);
+    assert!(row["warning"].as_str().unwrap().contains("FRESH"), "{row}");
+    assert!(row["reason"].as_str().unwrap().contains(&old_session));
+    assert!(
+        !row["first_prompt"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("not queued"),
+        "{row}"
+    );
+    assert_eq!(report["fresh_starts"].as_array().unwrap().len(), 1);
+    let revived = fixture.manager().load("lane").unwrap();
+    assert_eq!(revived.native_session.unwrap().value, session);
+    assert!(!revived.extra.contains_key("fresh_revive"));
+    assert!(revived
+        .arguments
+        .starts_with(&["--session-id".to_owned(), session.clone()]));
+    let lineage = crate::lineage::read(&registry, "lane").unwrap();
+    let entry = lineage
+        .entries
+        .iter()
+        .find(|entry| entry["relation"] == "fresh-after-restore")
+        .expect("fresh-after-restore entry");
+    assert_eq!(entry["session"], session.as_str());
+    assert_eq!(entry["predecessor"]["session"], old_session.as_str());
+    assert!(entry["reason"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be resumed"));
+    let notice =
+        crate::restore::read_report(&fixture.root.join("reports").join(format!("{BOOT}.json")))
+            .unwrap();
+    assert_eq!(notice["agents"][0]["action"], "revived-fresh");
+}
+
+#[test]
+fn restore_resumes_a_claude_agent_whose_transcript_exists_or_cannot_be_checked() {
+    for with_transcript in [true, false] {
+        let fixture = Fixture::new();
+        let old = dead_claude_agent(&fixture);
+        let session = old.native_session.clone().unwrap().value;
+        let claude = fixture.root.join("claude-config");
+        if with_transcript {
+            let encoded: String = old
+                .cwd
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let project = claude.join("projects").join(encoded);
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join(format!("{session}.jsonl")), "{}\n").unwrap();
+        }
+        // Without a projects directory there is nowhere to look, so no verdict: resume.
+        let _roots = pretend_claude_roots(vec![claude]);
+        let host = ScriptedHost::new();
+        let report = restore(
+            &fixture.client,
+            &fixture.root.join("registry"),
+            &host,
+            &config(&fixture, None),
+            &options(None),
+        )
+        .unwrap();
+        assert_eq!(report["agents"][0]["action"], "revived", "{report:#}");
+        let revived = fixture.manager().load("lane").unwrap();
+        assert_eq!(revived.native_session.unwrap().value, session);
+        assert!(report["fresh_starts"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_claude_transcript_verdict_needs_a_real_configuration_directory() {
+    let root = std::env::temp_dir().join(format!("agentctl-verdict-{}", std::process::id()));
+    let missing = root.join("nowhere");
+    let empty = root.join("empty");
+    let full = root.join("full");
+    fs::create_dir_all(empty.join("projects")).unwrap();
+    fs::create_dir_all(full.join("projects/elsewhere")).unwrap();
+    fs::write(full.join("projects/elsewhere/s-1.jsonl"), "{}\n").unwrap();
+    use crate::subagents::revive::claude_transcript_verdict as verdict;
+    assert_eq!(verdict(std::slice::from_ref(&missing), "/w", "s-1"), None);
+    assert_eq!(
+        verdict(&[missing.clone(), empty.clone()], "/w", "s-1"),
+        Some(false)
+    );
+    // Found under another project directory still counts (a moved working directory).
+    assert_eq!(verdict(&[empty, full], "/w", "s-1"), Some(true));
+    fs::remove_dir_all(root).unwrap();
+}

@@ -250,4 +250,11 @@ room for it in `agent.json`.
    moving and never blocks. It starts fresh and prints loud warnings in its report, in the
    recovery notice to the coordinator, and in the agent's first prompt. The lineage records
    `fresh-after-restore` with the reason. That path sends no handoff request. This is the
-   default, not behind a flag. It is a piece of its own, after piece 2.
+   default, not behind a flag. Implemented as piece 2b: restore checks, before reviving a
+   Claude Code agent, whether its transcript is in any configuration directory that exists.
+   Only a definite "missing" starts fresh; "cannot tell" resumes as before, because a wrong
+   guess would discard a conversation. The fresh request is written into the dead record
+   (`fresh_revive`: new session and reason), so an interrupted revive finishes on the same
+   conversation. `revive NAME --fresh` exposes the same path to an operator. Codex and Muse
+   cannot be started on a conversation ID chosen in advance, so they still report a refusal
+   with its reason, and the restore moves on.

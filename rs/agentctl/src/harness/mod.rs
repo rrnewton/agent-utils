@@ -106,6 +106,12 @@ pub trait HarnessAdapter: Sync {
     fn split_conversation(&self, _argv: &[String]) -> Option<Conversations> {
         None
     }
+    /// `rest` (arguments without any conversation selector) starting a new conversation with
+    /// the ID `conversation`, when the harness lets its caller choose a new conversation's ID;
+    /// `None` otherwise.
+    fn fresh_arguments(&self, _rest: Vec<String>, _conversation: &str) -> Option<Vec<String>> {
+        None
+    }
     /// `rest` (arguments without any conversation selector) with one explicit resume of
     /// `conversation`.
     fn replay_arguments(&self, rest: Vec<String>, conversation: &str) -> Vec<String> {
