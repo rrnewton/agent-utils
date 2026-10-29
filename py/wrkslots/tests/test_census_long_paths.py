@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import errno
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -36,7 +37,7 @@ def _deep_directory(top: Path) -> Path:
 
 
 @pytest.fixture
-def layout(tmp_path: Path):
+def layout(tmp_path: Path) -> Iterator[tuple[Path, Path, list[int]]]:
     target = tmp_path / "slots" / "selected"
     target.mkdir(parents=True)
     outside = tmp_path / "outside"
@@ -53,7 +54,9 @@ def _held(top: Path, opened: list[int]) -> Path:
     return link
 
 
-def test_the_walk_places_a_directory_readlink_cannot_name(layout) -> None:
+def test_the_walk_places_a_directory_readlink_cannot_name(
+    layout: tuple[Path, Path, list[int]],
+) -> None:
     target, outside, opened = layout
     inner = _held(target, opened)
     other = _held(outside, opened)
@@ -88,17 +91,24 @@ def _proc_with_fd(tmp_path: Path, destination: Path) -> Path:
     return proc_root
 
 
-def _census(monkeypatch: pytest.MonkeyPatch, proc_root: Path, targets: dict[Path, str]):
+def _census(
+    monkeypatch: pytest.MonkeyPatch, proc_root: Path, targets: dict[Path, str]
+) -> tuple[
+    tuple[tuple[int, str, str, str], ...],
+    tuple[tuple[int, str, str, str], ...],
+    dict[int, set[int]],
+    tuple[wrkslots._AbsentProcessObservation, ...],
+]:
     monkeypatch.setattr(wrkslots, "_process_filesystem_uid", lambda _path: os.getuid())
     monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _process: True)
     real_readlink = os.readlink
 
-    def too_long(path, *args, **kwargs):
+    def too_long(path: str | Path) -> str:
         if str(path).endswith("/fd/0"):
             raise OSError(errno.ENAMETOOLONG, "File name too long", str(path))
-        return real_readlink(path, *args, **kwargs)
+        return real_readlink(path)
 
-    monkeypatch.setattr(wrkslots.os, "readlink", too_long)
+    monkeypatch.setattr(os, "readlink", too_long)
     return wrkslots._direct_process_identity_matches(
         [wrkslots._AbsentProcessObservation(PID, 17, "", "mnt:[1]")],
         targets,
@@ -148,7 +158,9 @@ def test_direct_census_refuses_a_too_long_link_it_cannot_walk(
 
 
 @pytest.mark.parametrize("reader", ["_link_target", "_readable_link_target"])
-def test_slot_use_places_a_too_long_directory_on_the_same_device(layout, reader: str) -> None:
+def test_slot_use_places_a_too_long_directory_on_the_same_device(
+    layout: tuple[Path, Path, list[int]], reader: str
+) -> None:
     # The device proof (#618) cannot decide a same-device target; the walk can.
     target, outside, opened = layout
     read = getattr(wrkslots, reader)
