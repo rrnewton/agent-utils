@@ -1770,19 +1770,51 @@ pub fn stand_in_after(config: &crate::config::Config) -> std::time::Duration {
 pub const FIRST_PAINT_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
 
 /// How long `request` waits on upstream before the cache stands in for it: [`FIRST_PAINT_WAIT`]
-/// for a page entering a view, [`stand_in_after`] for every other read.
+/// for a page entering a view, nothing for a read placing a live message while the provider is
+/// limiting ([`placing_under_limits`]), and [`stand_in_after`] for every other read.
 fn stand_in_wait(
     state: &AppState,
+    channel: &ChannelId,
     request: &crate::threads::TimelineRequest,
 ) -> std::time::Duration {
     let wait = stand_in_after(&state.config);
-    if request.after.is_none()
+    if placing_under_limits(state, channel) {
+        std::time::Duration::ZERO
+    } else if request.after.is_none()
         && crate::read_reason::ReadReason::current() == crate::read_reason::ReadReason::Enter
     {
         wait.min(FIRST_PAINT_WAIT)
     } else {
         wait
     }
+}
+
+/// How lately the provider must have rate-limited one of its routes for a read placing a live
+/// message to be answered from the cache at once ([`placing_under_limits`]).
+pub const LIMITED_LATELY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether this read places a live message (`place`, `reply-place`) while `channel`'s provider is
+/// limiting: it rate-limited a route within [`LIMITED_LATELY`]. Such a read exists to ask the
+/// provider what this server does not know, so it goes to the provider first and the cache stands
+/// in only after [`stand_in_after`]; but with the provider refusing reads, that wait is spent for
+/// nothing, so the cache answers at once and the read runs on behind it, giving up at the first
+/// rate limit. `#688 vt-timeline-latency`.
+fn placing_under_limits(state: &AppState, channel: &ChannelId) -> bool {
+    use crate::read_reason::ReadReason;
+    matches!(
+        ReadReason::current(),
+        ReadReason::Place | ReadReason::ReplyPlace
+    ) && state
+        .providers
+        .client_for(channel)
+        .and_then(|client| client.rate_limit_pressure())
+        .is_some_and(|pressure| {
+            pressure.routes.values().any(|route| {
+                route
+                    .last_limited_s_ago
+                    .is_some_and(|ago| ago < LIMITED_LATELY.as_secs())
+            })
+        })
 }
 
 /// One upstream timeline read, with what it offers the cache and compares when it lands: owned,
@@ -2175,7 +2207,7 @@ async fn read_or_stand_in(
             }));
         }
     }
-    let deadline = tokio::time::Instant::now() + stand_in_wait(state, request);
+    let deadline = tokio::time::Instant::now() + stand_in_wait(state, channel, request);
     // One read upstream of a view at a time, whoever asks (single-flight): a read that finds one
     // already under way waits for it to end, within the same wait, and is answered from the cache
     // if it has not. Under a provider that is rate-limiting or slow, the page's polls, other tabs
@@ -2206,7 +2238,7 @@ async fn read_or_stand_in(
     let reason = crate::read_reason::ReadReason::current();
     // `#614 timeline-read-failures`: a read the cache stands in for when it fails need not wait
     // out the provider's rate limits; giving up at the first leaves the route to everyone else.
-    let hurried = fails_fast();
+    let hurried = fails_fast() || placing_under_limits(state, channel);
     let sink = std::sync::Arc::clone(&state.message_cache);
     let (noted_channel, noted_request) = (channel.clone(), request.clone());
     let mut running = tokio::spawn(reason.scope(crate::read_reason::hurry(hurried, async move {
@@ -2225,11 +2257,19 @@ async fn read_or_stand_in(
         Ok(joined) => joined,
         Err(_) => {
             if let Some(held) = held_for(state, channel, request).await {
-                log_stand_in(request, "slow", None);
+                let (upstream, why) = if hurried && !fails_fast() {
+                    (
+                        "limited",
+                        "The chat service is limiting how fast it can be read.",
+                    )
+                } else {
+                    ("slow", "The chat service did not answer in time.")
+                };
+                log_stand_in(request, upstream, None);
                 crate::cache_first::note(crate::cache_first::Source::StandIn);
                 return Ok(Answered::StandIn(StoodIn {
                     held,
-                    why: Some("The chat service did not answer in time."),
+                    why: Some(why),
                     dated: true,
                 }));
             }

@@ -2443,6 +2443,46 @@ async fn no_page_read_of_a_view_the_cache_holds_waits_on_slack() {
     );
 }
 
+#[tokio::test]
+async fn placing_a_live_message_while_slack_is_limiting_is_answered_from_the_cache_at_once() {
+    let (state, fake, _clock, _dir) = slack_threads_deployment("place-limited", true).await;
+    state.message_cache.set_serve(true);
+    let all = path(SLACK_CH, "/timeline?view=flat&limit=50&reason=place");
+    // Slack answering: placement reads it first, as ever, and is answered by it.
+    let body = ok(&state, &all, WRITE_TOKEN).await;
+    assert!(body.get("refresh_failed").is_none(), "{body}");
+
+    // Slack starts refusing reads, and has just refused one.
+    rate_limit(&fake, "conversations.history");
+    rate_limit(&fake, "conversations.replies");
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=flat&limit=50&reason=counts"),
+        WRITE_TOKEN,
+    )
+    .await;
+    quiet(&state, &newest_key(SLACK_CH, TimelineView::Flat, 50)).await;
+    let capture = vibe_talk::testing::LogCapture::start();
+    // It used to wait out the whole stand-in wait (ten seconds) on a Slack that was refusing it.
+    let body = tokio::time::timeout(AT_ONCE, ok(&state, &all, WRITE_TOKEN))
+        .await
+        .expect("answered from the cache at once while Slack is limiting");
+    assert!(
+        texts(&body).contains(&"only reply".to_owned()),
+        "All from the cache, replies included: {body}"
+    );
+    assert!(body["refresh_failed"].is_string(), "{body}");
+    // Stood in for at once: as limited, or as failed when the read behind gave up at the first
+    // rate limit before the answer was put together.
+    assert!(
+        capture
+            .text()
+            .contains("read_reason=\"place\" read_view=\"flat\" read_cursor=\"newest\" served_from=\"stand-in\""),
+        "{}",
+        capture.text()
+    );
+}
+
 /// A server voice that answers at once.
 struct QuickSpeech;
 
