@@ -15,8 +15,9 @@
 //! Every request is counted against its method over the last minute, with its priority, from what
 //! it is for ([`crate::read_reason::ReadReason`]):
 //!
-//! * **interactive** — the page's reads, a send, speech, a voice agent's tools, and anything that
-//!   says nothing of what it is for (an untagged request may be a person's);
+//! * **write** — a post, a read mark, and the read a post makes first (see "Writes first" below);
+//! * **interactive** — the page's reads, speech, a voice agent's tools, and anything that says
+//!   nothing of what it is for (an untagged request may be a person's);
 //! * **live** — the live poller, relist, the reachability probe, the reply-mark check;
 //! * **background** — thread naming and a summary's window;
 //! * **crawl** — backfill and the shadow's check.
@@ -31,6 +32,28 @@
 //!
 //! The ceilings are this server's own, set below Slack's published tier 3 floor; the counts are
 //! per process, which is per workspace in every deployment this serves.
+//!
+//! # Writes first (`#699 vt-send-priority`)
+//!
+//! A transport in front of Slack may limit the account as a whole rather than each method: one
+//! token bucket for every call it makes, from every host. Then a refused read means the next post
+//! will be refused too, and every background read sent meanwhile takes a token a post was waiting
+//! for. Measured on 2026-10-29: one send took 35 s, 30 of them in its own read of the thread it was
+//! posting into, refused three times behind a ten-second `Retry-After` while the live poller,
+//! relist and older-page reads kept the bucket empty.
+//!
+//! So a **write** (a post, a read mark: [`is_write`]) and the reads a post makes first
+//! ([`ReadReason::Write`]) come before everything else: they never wait out a `Retry-After`
+//! another request was given, and when refused themselves they try again on their own short
+//! schedule ([`write_retry_wait`]). And while the provider is **limiting** (it answered any method
+//! with a rate limit in the last [`LIMITING_WINDOW`]), the reads that drain the bucket
+//! ([`gives_way`]: `conversations.history` and `conversations.replies`) give way
+//! ([`while_limiting`]): naming and crawl work pause; live work makes one try, never waiting out a
+//! `Retry-After`, and pauses while a send is in flight; a read the message cache would answer in
+//! the provider's place fails at once without being sent; and a person's read holds while a send
+//! is in flight. A paused read says to come back in at most [`PAUSE_RETRY_AFTER`]. Author and
+//! channel lookups are never paused: they are few, and a failed one is remembered for minutes.
+//! The minute's report says how many requests were writes and how many reads were paused.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
@@ -46,6 +69,95 @@ pub const WINDOW: Duration = Duration::from_secs(60);
 /// (`backfill_requests_per_minute`, twenty unless set) bounds its own share, so the two together
 /// stay under the floor.
 pub const CRAWL_YIELD_AT: usize = 25;
+/// How long after a rate limit on any method the provider counts as limiting.
+pub const LIMITING_WINDOW: Duration = Duration::from_secs(60);
+/// The most a paused read says to wait before trying again: the limiting window moves on with
+/// every rate limit, and a live poller that waited it out would go silent while it lasts.
+pub const PAUSE_RETRY_AFTER: Duration = Duration::from_secs(10);
+/// The reads that give way to writes while the provider is limiting.
+const GIVES_WAY: [&str; 2] = ["conversations.history", "conversations.replies"];
+/// The longest a person's read holds for a send in flight while the provider is limiting.
+pub const WRITE_HOLD: Duration = Duration::from_secs(10);
+/// How many times one write may be sent before a rate limit is declared unclearable: more than a
+/// read, because each try is short.
+pub const MAX_WRITE_ATTEMPTS: u32 = 12;
+/// The waits between a refused write's tries, the last repeated; each no longer than the
+/// `Retry-After` it was given.
+const WRITE_RETRY_STEPS: [Duration; 5] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// The Web API methods that change something on the owner's behalf. `#699 vt-send-priority`.
+const WRITE_METHODS: [&str; 6] = [
+    "chat.postMessage",
+    "chat.update",
+    "chat.delete",
+    "reactions.add",
+    "reactions.remove",
+    "conversations.mark",
+];
+
+/// Whether `method` is a write ([`Priority::Write`]).
+#[must_use]
+pub fn is_write(method: &str) -> bool {
+    WRITE_METHODS.contains(&method)
+}
+
+/// Whether a read of `method` gives way to writes while the provider is limiting
+/// ([`while_limiting`]).
+#[must_use]
+pub fn gives_way(method: &str) -> bool {
+    GIVES_WAY.contains(&method)
+}
+
+/// Whether a read at `priority` that gives way makes only one try while the provider is limiting:
+/// it never waits out a `Retry-After`, its own or another's. Live work, naming and crawl work.
+#[must_use]
+pub fn one_try_while_limiting(priority: Priority) -> bool {
+    priority <= Priority::Live
+}
+
+/// How long a write waits before its next try, having been sent `attempts` times and refused
+/// with `retry_after`: its own short schedule, never longer than what it was told.
+#[must_use]
+pub fn write_retry_wait(attempts: u32, retry_after: Duration) -> Duration {
+    let step = usize::try_from(attempts.saturating_sub(1))
+        .unwrap_or(usize::MAX)
+        .min(WRITE_RETRY_STEPS.len() - 1);
+    WRITE_RETRY_STEPS[step].min(retry_after)
+}
+
+/// What a request does while the provider is limiting. `#699 vt-send-priority`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhileLimiting {
+    /// Goes as it would otherwise.
+    Go,
+    /// Waits for the sends in flight to finish, at most [`WRITE_HOLD`], then goes.
+    HoldForWrites,
+    /// Fails at once as a rate limit, without being sent.
+    Pause,
+}
+
+/// What a read that gives way ([`gives_way`]) at `priority` does while the provider is limiting: a
+/// write goes; naming and crawl work pause; live work goes ([`one_try_while_limiting`]) except
+/// while a send is in flight; a person's read the message cache would answer (`hurried`) pauses,
+/// and any other holds for a send in flight.
+#[must_use]
+pub fn while_limiting(priority: Priority, hurried: bool, writes_in_flight: bool) -> WhileLimiting {
+    match priority {
+        Priority::Write => WhileLimiting::Go,
+        Priority::Crawl | Priority::Background => WhileLimiting::Pause,
+        Priority::Live if writes_in_flight => WhileLimiting::Pause,
+        Priority::Live => WhileLimiting::Go,
+        Priority::Interactive if hurried => WhileLimiting::Pause,
+        Priority::Interactive if writes_in_flight => WhileLimiting::HoldForWrites,
+        Priority::Interactive => WhileLimiting::Go,
+    }
+}
 
 /// How much a request may take of a method's allowance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,6 +170,8 @@ pub enum Priority {
     Live,
     /// What a person is waiting on.
     Interactive,
+    /// A write, and the reads a post makes before it is sent. `#699 vt-send-priority`.
+    Write,
 }
 
 impl Priority {
@@ -65,6 +179,7 @@ impl Priority {
     #[must_use]
     pub const fn of(reason: ReadReason) -> Self {
         match reason {
+            ReadReason::Write => Self::Write,
             ReadReason::Backfill | ReadReason::Shadow => Self::Crawl,
             ReadReason::Naming | ReadReason::SummaryWindow => Self::Background,
             ReadReason::Relist
@@ -80,11 +195,12 @@ impl Priority {
     /// How many requests of a method with `ceiling` a minute may have been sent in the last minute,
     /// by everyone, for a request at this priority to go: the whole ceiling for a person's request
     /// and live work, three quarters for naming and summaries, half for crawl work. So what
-    /// keeps the page current always has room the rest cannot take.
+    /// keeps the page current always has room the rest cannot take. A write is never held to a
+    /// ceiling; this is its whole for completeness.
     #[must_use]
     pub fn share(self, ceiling: usize) -> usize {
         match self {
-            Self::Interactive | Self::Live => ceiling,
+            Self::Write | Self::Interactive | Self::Live => ceiling,
             Self::Background => (ceiling * 3 / 4).max(1),
             Self::Crawl => (ceiling / 2).max(1),
         }
@@ -188,6 +304,12 @@ pub struct Tally {
     /// Requests failed as a rate limit without being sent, by method: a `Retry-After` in force, or
     /// crawl work yielding.
     refused: BTreeMap<&'static str, u32>,
+    /// Of those, the ones paused because the provider was limiting ([`while_limiting`]).
+    paused: BTreeMap<&'static str, u32>,
+    /// Requests sent at [`Priority::Write`].
+    writes: u32,
+    /// Rate-limited answers to them.
+    limited_writes: u32,
 }
 
 /// One method's calls in a report: how many, and how many for each read reason.
@@ -204,6 +326,14 @@ pub struct Report {
     pub limited: u32,
     /// Requests refused without being sent.
     pub refused: u32,
+    /// Requests sent at [`Priority::Write`]: posts, read marks, and the reads a post makes first.
+    pub writes: u32,
+    /// Requests sent for anything else.
+    pub reads: u32,
+    /// Rate-limited answers to writes.
+    pub limited_writes: u32,
+    /// Refusals that were reads paused while the provider was limiting.
+    pub paused: u32,
     /// `method=n` for each method sent, most first.
     pub by_method: String,
     /// `method:reason=n,...` for each method, most first within it.
@@ -212,19 +342,40 @@ pub struct Report {
     pub limited_by_method: String,
     /// `method=n` for refusals.
     pub refused_by_method: String,
+    /// `method=n` for paused reads.
+    pub paused_by_method: String,
 }
 
 impl Tally {
-    /// Count a request of `method` for `reason`, sent now.
-    pub fn sent(&mut self, method: &'static str, reason: ReadReason, now: Instant) {
+    /// Count a request of `method` for `reason` at `priority`, sent now.
+    pub fn sent(
+        &mut self,
+        method: &'static str,
+        reason: ReadReason,
+        priority: Priority,
+        now: Instant,
+    ) {
         self.since.get_or_insert(now);
         *self.sent.entry((method, reason)).or_default() += 1;
+        if priority == Priority::Write {
+            self.writes += 1;
+        }
     }
 
-    /// Count an answer of `method` that was a rate limit.
-    pub fn limited(&mut self, method: &'static str, now: Instant) {
+    /// Count an answer of `method` at `priority` that was a rate limit.
+    pub fn limited(&mut self, method: &'static str, priority: Priority, now: Instant) {
         self.since.get_or_insert(now);
         *self.limited.entry(method).or_default() += 1;
+        if priority == Priority::Write {
+            self.limited_writes += 1;
+        }
+    }
+
+    /// Count a read of `method` paused, without being sent, because the provider was limiting.
+    /// Counted as refused too.
+    pub fn paused(&mut self, method: &'static str, now: Instant) {
+        self.since.get_or_insert(now);
+        *self.paused.entry(method).or_default() += 1;
     }
 
     /// Count a request of `method` failed as a rate limit without being sent.
@@ -275,15 +426,21 @@ impl Tally {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
+        let sent: u32 = taken.sent.values().sum();
         Some(Report {
             window_s: covered.as_secs(),
-            sent: taken.sent.values().sum(),
+            sent,
             limited: taken.limited.values().sum(),
             refused: taken.refused.values().sum(),
+            writes: taken.writes,
+            reads: sent.saturating_sub(taken.writes),
+            limited_writes: taken.limited_writes,
+            paused: taken.paused.values().sum(),
             by_method,
             by_caller,
             limited_by_method: listed(&taken.limited),
             refused_by_method: listed(&taken.refused),
+            paused_by_method: listed(&taken.paused),
         })
     }
 }
@@ -297,10 +454,15 @@ impl Report {
             sent = self.sent,
             limited = self.limited,
             refused = self.refused,
+            writes = self.writes,
+            reads = self.reads,
+            limited_writes = self.limited_writes,
+            paused = self.paused,
             by_method = %self.by_method,
             by_caller = %self.by_caller,
             limited_by_method = %self.limited_by_method,
             refused_by_method = %self.refused_by_method,
+            paused_by_method = %self.paused_by_method,
             "Slack calls since the last report, by method and by what each was for"
         );
     }
@@ -324,6 +486,58 @@ mod tests {
         assert!(Priority::Interactive > Priority::Live);
         assert!(Priority::Live > Priority::Background);
         assert!(Priority::Background > Priority::Crawl);
+        // `#699 vt-send-priority`: a post and the reads it makes first come before a person's read.
+        assert_eq!(Priority::of(ReadReason::Write), Priority::Write);
+        assert!(Priority::Write > Priority::Interactive);
+        assert!(is_write("chat.postMessage") && is_write("conversations.mark"));
+        assert!(!is_write("conversations.replies") && !is_write("conversations.history"));
+    }
+
+    #[test]
+    fn while_limiting_a_write_goes_and_everything_else_gives_way() {
+        use WhileLimiting::{Go, HoldForWrites, Pause};
+        for writes in [false, true] {
+            assert_eq!(while_limiting(Priority::Write, false, writes), Go);
+            for priority in [Priority::Background, Priority::Crawl] {
+                assert_eq!(while_limiting(priority, false, writes), Pause);
+            }
+            // A read the message cache would answer is not sent at all.
+            assert_eq!(while_limiting(Priority::Interactive, true, writes), Pause);
+        }
+        // A person's read and live work go, but not beside a send.
+        assert_eq!(while_limiting(Priority::Interactive, false, false), Go);
+        assert_eq!(
+            while_limiting(Priority::Interactive, false, true),
+            HoldForWrites
+        );
+        assert_eq!(while_limiting(Priority::Live, false, false), Go);
+        assert_eq!(while_limiting(Priority::Live, false, true), Pause);
+        // Live work, naming and crawl work make one try; a person's read waits as before.
+        assert!(one_try_while_limiting(Priority::Live));
+        assert!(one_try_while_limiting(Priority::Crawl));
+        assert!(!one_try_while_limiting(Priority::Interactive));
+        // Only the reads that drain the bucket give way; lookups never do.
+        assert!(gives_way("conversations.replies") && gives_way("conversations.history"));
+        assert!(!gives_way("users.info") && !gives_way("conversations.info"));
+    }
+
+    #[test]
+    fn a_refused_write_tries_again_soon_and_never_later_than_it_was_told() {
+        let told = Duration::from_secs(10);
+        let waits: Vec<Duration> = (1..=7).map(|n| write_retry_wait(n, told)).collect();
+        assert_eq!(
+            waits,
+            [250, 500, 1000, 1000, 2000, 2000, 2000].map(Duration::from_millis)
+        );
+        assert_eq!(
+            write_retry_wait(5, Duration::from_millis(300)),
+            Duration::from_millis(300)
+        );
+        // Twelve tries fit well inside the thirty seconds a read may wait.
+        let total: Duration = (1..MAX_WRITE_ATTEMPTS)
+            .map(|n| write_retry_wait(n, told))
+            .sum();
+        assert!(total < Duration::from_secs(30), "{total:?}");
     }
 
     #[test]
@@ -374,27 +588,57 @@ mod tests {
         let mut tally = Tally::default();
         assert_eq!(tally.due(now), None, "nothing counted, nothing to say");
         for _ in 0..3 {
-            tally.sent("conversations.history", ReadReason::Side, now);
+            tally.sent(
+                "conversations.history",
+                ReadReason::Side,
+                Priority::Interactive,
+                now,
+            );
         }
-        tally.sent("conversations.history", ReadReason::LivePoll, now);
-        tally.sent("conversations.replies", ReadReason::Naming, now);
-        tally.limited("conversations.history", now);
+        tally.sent(
+            "conversations.history",
+            ReadReason::LivePoll,
+            Priority::Live,
+            now,
+        );
+        tally.sent(
+            "conversations.replies",
+            ReadReason::Naming,
+            Priority::Background,
+            now,
+        );
+        tally.sent(
+            "chat.postMessage",
+            ReadReason::Untagged,
+            Priority::Write,
+            now,
+        );
+        tally.limited("conversations.history", Priority::Live, now);
+        tally.limited("chat.postMessage", Priority::Write, now);
         tally.refused("conversations.history", now);
+        tally.refused("conversations.replies", now);
+        tally.paused("conversations.replies", now);
         assert_eq!(tally.due(now + Duration::from_secs(59)), None);
         let report = tally.due(now + WINDOW).expect("a minute on, a report");
         assert_eq!(
             report,
             Report {
                 window_s: 60,
-                sent: 5,
-                limited: 1,
-                refused: 1,
-                by_method: "conversations.history=4 conversations.replies=1".to_owned(),
-                by_caller:
-                    "conversations.history:side=3,live-poll=1; conversations.replies:naming=1"
-                        .to_owned(),
-                limited_by_method: "conversations.history=1".to_owned(),
-                refused_by_method: "conversations.history=1".to_owned(),
+                sent: 6,
+                limited: 2,
+                refused: 2,
+                writes: 1,
+                reads: 5,
+                limited_writes: 1,
+                paused: 1,
+                by_method: "conversations.history=4 chat.postMessage=1 conversations.replies=1"
+                    .to_owned(),
+                by_caller: "conversations.history:side=3,live-poll=1; \
+                            chat.postMessage:untagged=1; conversations.replies:naming=1"
+                    .to_owned(),
+                limited_by_method: "chat.postMessage=1 conversations.history=1".to_owned(),
+                refused_by_method: "conversations.history=1 conversations.replies=1".to_owned(),
+                paused_by_method: "conversations.replies=1".to_owned(),
             }
         );
         assert_eq!(tally.due(now + 2 * WINDOW), None, "cleared by the report");

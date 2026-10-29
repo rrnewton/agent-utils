@@ -35,6 +35,7 @@ use super::ids::{self, ChannelRef};
 use crate::chat::{ChatError, RegisteredChannel};
 use crate::directory::{DirectoryEntry, DirectoryPage, DirectoryRequest, MAX_NAME_CHARS};
 use crate::model::{ChannelId, MentionName, Message, MessageId};
+use crate::read_reason::ReadReason;
 use crate::threads::{ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest, TimelineView};
 
 /// The most entries one timeline page returns.
@@ -53,9 +54,11 @@ pub const FLAT_MAX_REPLIES: usize = 50;
 pub const FLAT_RECONCILE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Most threads whose Flat replies are remembered at once.
 const FLAT_REMEMBERED_MAX: usize = 256;
-/// How long the thread the first part of a long post went into or started is taken to be there
-/// without reading it first: long enough for the rest of that post, parts and a retry of the rest,
-/// short enough that a thread removed meanwhile is soon read again. `#448 send-dedupe`.
+/// How long a thread root is taken to be there without reading it first, once the first part of a
+/// long post went into or started it (`#448 send-dedupe`) or a read returned it (`#699
+/// vt-send-priority`): long enough for the rest of that post, parts and a retry of the rest, and
+/// for a reply to a thread the page has just read; short enough that a thread removed meanwhile is
+/// soon read again.
 pub const ROOTS_KEEP: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 /// Pages of `users.conversations` one discovery request may read while filtering.
 pub const DISCOVERY_PAGES: usize = 10;
@@ -1381,6 +1384,9 @@ impl HttpSlackClient {
     /// Slack has no reply pointer: its only reply is a thread reply. So `reply_to` on a whole
     /// conversation posts into that message's thread — starting one when it has none — and a
     /// channel narrowed to one thread always posts into that thread.
+    ///
+    /// A post, with the read that places it, goes ahead of every other request (`#699
+    /// vt-send-priority`, [`super::budget`]).
     pub(super) async fn post(
         &self,
         channel: &ChannelId,
@@ -1388,14 +1394,19 @@ impl HttpSlackClient {
         reply_to: Option<&MessageId>,
         key: Option<&str>,
     ) -> Result<Message, ChatError> {
-        let target = Self::channel_ref(channel)?;
-        let conversation = target.conversation.as_str();
-        let thread = match (&target.thread_ts, reply_to) {
-            (Some(scope), _) => Some(scope.clone()),
-            (None, Some(id)) => Some(self.reply_thread(conversation, id).await?),
-            (None, None) => None,
-        };
-        self.post_raw(channel, conversation, content, thread.as_deref(), key)
+        let _in_flight = self.write_in_flight();
+        ReadReason::Write
+            .scope(async {
+                let target = Self::channel_ref(channel)?;
+                let conversation = target.conversation.as_str();
+                let thread = match (&target.thread_ts, reply_to) {
+                    (Some(scope), _) => Some(scope.clone()),
+                    (None, Some(id)) => Some(self.reply_thread(conversation, id).await?),
+                    (None, None) => None,
+                };
+                self.post_raw(channel, conversation, content, thread.as_deref(), key)
+                    .await
+            })
             .await
     }
 
@@ -1482,6 +1493,9 @@ impl HttpSlackClient {
     /// [`crate::chat::ChatClient::post_in_thread`], without the provider label.
     ///
     /// The destination is the thread; `reply_to` adds nothing Slack can carry and is ignored.
+    ///
+    /// A post, with the read that proves its thread, goes ahead of every other request (`#699
+    /// vt-send-priority`, [`super::budget`]).
     pub(super) async fn thread_post(
         &self,
         channel: &ChannelId,
@@ -1490,36 +1504,59 @@ impl HttpSlackClient {
         _reply_to: Option<&MessageId>,
         key: Option<&str>,
     ) -> Result<Message, ChatError> {
-        let target = Self::channel_ref(channel)?;
-        let thread = self.member_thread(&target, thread_id)?;
-        // `#448 send-dedupe`. The second and third parts of a long post went in only after a read
-        // of the thread their own first part had just started — a round trip each, one after
-        // another, on a post the owner was already waiting seconds for. That thread is proven
-        // there by the first part's own answer (`note_posted_root`); any other is read first, so
-        // a reply to a root removed meanwhile is still refused (`#315 removed-reply-target`).
-        if !self.posted_root_known(&target.conversation, &thread) {
-            self.thread_root(&target.conversation, &thread).await?;
-        }
-        self.post_raw(channel, &target.conversation, content, Some(&thread), key)
+        let _in_flight = self.write_in_flight();
+        ReadReason::Write
+            .scope(async {
+                let target = Self::channel_ref(channel)?;
+                let thread = self.member_thread(&target, thread_id)?;
+                // `#448 send-dedupe`. The second and third parts of a long post went in only after
+                // a read of the thread their own first part had just started — a round trip each,
+                // one after another, on a post the owner was already waiting seconds for. That
+                // thread is proven there by the first part's own answer, and a thread a read has
+                // just returned by that read (`note_known_root`, `#699 vt-send-priority`: the
+                // read before a reply was 30 s of a 35 s send while Slack was limiting); any other
+                // is read first, so a reply to a root removed meanwhile is still refused (`#315
+                // removed-reply-target`).
+                if !self.root_known(&target.conversation, &thread) {
+                    self.thread_root(&target.conversation, &thread).await?;
+                }
+                self.post_raw(channel, &target.conversation, content, Some(&thread), key)
+                    .await
+            })
             .await
     }
 
     /// Remember that `thread` in `conversation` is there: the thread the first part of a long post
-    /// just went into or started, where the rest of it goes next.
-    pub(super) fn note_posted_root(&self, conversation: &str, thread: &str) {
+    /// just went into or started, where the rest of it goes next, or a root a read just returned.
+    pub(super) fn note_known_root(&self, conversation: &str, thread: &str) {
+        self.note_known_roots(conversation, std::iter::once(thread));
+    }
+
+    /// [`Self::note_known_root`] for several roots of one conversation at once.
+    pub(super) fn note_known_roots<'t>(
+        &self,
+        conversation: &str,
+        threads: impl IntoIterator<Item = &'t str>,
+    ) {
+        let mut threads = threads.into_iter().peekable();
+        if threads.peek().is_none() {
+            return;
+        }
         let mut roots = self
-            .posted_roots
+            .known_roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         roots.retain(|_, at| now.duration_since(*at) < ROOTS_KEEP);
-        roots.insert((conversation.to_owned(), thread.to_owned()), now);
+        for thread in threads {
+            roots.insert((conversation.to_owned(), thread.to_owned()), now);
+        }
     }
 
-    /// Whether this client posted into `thread` in `conversation`, or posted its root, within
-    /// [`ROOTS_KEEP`].
-    fn posted_root_known(&self, conversation: &str, thread: &str) -> bool {
-        self.posted_roots
+    /// Whether this client posted into `thread` in `conversation`, posted its root, or read it,
+    /// within [`ROOTS_KEEP`].
+    fn root_known(&self, conversation: &str, thread: &str) -> bool {
+        self.known_roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(conversation.to_owned(), thread.to_owned()))

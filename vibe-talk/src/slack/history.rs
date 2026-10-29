@@ -147,7 +147,28 @@ impl HttpSlackClient {
             .iter()
             .cloned()
             .map(Raw::parse)
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        // Every thread root this read returned is proven there, so a post into it soon after need
+        // not read it again first. `#699 vt-send-priority`. Only a root with replies: removing one
+        // leaves a tombstone that heads its thread still, as the read before a post would also
+        // have found; a reply is never one, so a reply's ts is never posted into as a thread.
+        match feed {
+            Feed::History(_) => self.note_known_roots(
+                conversation,
+                raws.iter()
+                    .filter(|raw| raw.is_thread_root())
+                    .map(|raw| raw.ts.as_str()),
+            ),
+            Feed::Replies(_, thread) => {
+                if raws
+                    .first()
+                    .is_some_and(|raw| raw.ts == thread && raw.is_thread_root())
+                {
+                    self.note_known_root(conversation, thread);
+                }
+            }
+        }
+        let raws = raws
             .into_iter()
             // Bounds are applied here as well as upstream: `conversations.replies` may include the
             // root outside the requested window, and a lenient server may ignore a bound.

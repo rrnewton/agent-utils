@@ -2204,8 +2204,9 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   stands in for, native or emulated: a catch-up's head read and its read of several channels are
   `recent`, the head read checked beside the probe is `probe`, and speech preparation's lookup by
   id is `speech`. The live poller's reads, its head read included, are `live-poll` (`#614
-  timeline-read-failures`; they used to be `untagged`). A word the page does not send is `other`;
-  a read nobody gave a reason for (a send's, for one) is `untagged`. **Mostly attribution:** what
+  timeline-read-failures`; they used to be `untagged`). A post, with the read it makes first of the
+  thread it goes into, is `write` (`#699 vt-send-priority`; it used to be `untagged`). A word the
+  page does not send is `other`; a read nobody gave a reason for is `untagged`. **Mostly attribution:** what
   a caller may see is never decided by the reason. What is: Slack's shared budget places a read
   by it, `backfill` gives up at the first rate limit, and with serving on the page's `side` and
   `counts` reads give up at the first rate limit and fail fast, and a `side` read of a live-fed
@@ -4766,20 +4767,42 @@ was sent since the last one: `sent`, `limited` (answers that were a rate limit) 
 (requests failed as one without being sent), and `by_method` and `by_caller`
 (`conversations.history:side=12,live-poll=6,poll=3; …`, by read reason). It is written by the
 first call a minute or more after the last line, so a quiet minute writes none, and `window_s`
-says how long it covers. The live poller's reads say `live-poll`.
+says how long it covers. The live poller's reads say `live-poll`. `writes` and `reads` split
+`sent` (a write is a post, a read mark, or the read a post makes first), `limited_writes` counts
+the rate limits writes were answered with, and `paused` (with `paused_by_method`) counts the
+refusals that were reads given way to writes while Slack was limiting (`#699 vt-send-priority`).
 
 **One Slack budget, shared by priority** (`#611 timeline-read-failures`, `vibe_talk::slack::budget`).
 Slack limits each Web API method per workspace (`conversations.history` and `conversations.replies`
 are tier 3, about fifty a minute), and every reader spends the same allowance. Every request is
 counted against its method over the last minute, with its priority, from its read reason: a
-person's request (the page's reads, a send, speech, a voice agent's tools, and anything untagged)
-first, then live work (the live poller, relist, the probe), then thread naming and summaries, then backfill and the
+write first (see "Writes first" below), then a person's request (the page's reads, speech, a voice
+agent's tools, and anything untagged), then live work (the live poller, relist, the probe), then thread naming and summaries, then backfill and the
 shadow's check. Once Slack has answered a method with a `Retry-After`, nobody sends it again before
 that runs out: every request waits within its own budget, except crawl work, which fails at once and
 is tried again later. Backfill holds off a method while everyone else has sent 25 of it in the last
 minute (`ChatClient::crawl_hold`), so `backfill = "full"` takes only what is left over, within its
 own `backfill_requests_per_minute`; while the page is busy it may make no progress at all. Nothing
 but crawl work is refused by a count.
+
+**Writes first** (`#699 vt-send-priority`). A transport in front of Slack may limit the account as
+a whole, one bucket for every method and every host, so a refused read means the next post is
+refused too. Live, 2026-10-29: one send took 35 s, 30 of them its own read of the thread it went
+into, refused three times behind a ten-second `Retry-After` while background reads kept the bucket
+empty. Now a write (`chat.postMessage`, `conversations.mark`, and a post's own read first) never
+waits out a `Retry-After` another request was given, and when refused tries again after 0.25, 0.5,
+1, 1 and then 2 s (never longer than it was told), up to twelve times within the 30 s budget; an
+answer clears the `Retry-After` its method was under. A reply goes into a thread without reading it
+first when a read returned that thread's root, with its replies, in the last two minutes (a removed
+root with replies leaves a tombstone, which the read before a post accepts too). While Slack is
+limiting (a rate limit on any method in the last minute), `conversations.history` and
+`conversations.replies` reads give way, failing at once without being sent where they pause:
+naming, summaries and crawl work pause (a refused naming read pauses naming in its channel for ten
+minutes, as before); live work (the live poller, relist, the probe) makes one try, never waiting
+out a `Retry-After`, and pauses while a post is in flight; a read the message cache answers in
+Slack's place is answered from the cache alone; and a person's read waits up to 10 s for a post in
+flight before it goes. A paused read is told to try again in at most 10 s. Author and channel
+lookups are never paused.
 
 Every request that answers a 5xx logs one WARN line beside its access line (`server error`): the
 error code and detail it answered with, its `read_reason`, and the upstream operation that last
