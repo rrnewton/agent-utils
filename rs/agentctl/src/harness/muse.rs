@@ -309,6 +309,40 @@ fn read_transcript(lines: &[&[u8]], activity: &mut super::transcript::Activity) 
     );
 }
 
+/// Background shells Muse lists as running in its terminals panel, drawn between the editor's
+/// bottom rule and the footer while any exist: `main · ↓ to select`, then one row per terminal,
+/// `├ ◈ Sleep 20 between steps  running   19s`, and `ran 18s, exit 0` once it finished. A Muse
+/// that ended its turn waiting on one, as a goal turn often does between steps, has not stopped
+/// without a verdict (#678 muse-bridge-latency). `None` when no terminal runs.
+#[must_use]
+pub fn background_work(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let bottom = lines.iter().rposition(|line| {
+        let line = line.trim();
+        line.chars().count() >= 8 && line.chars().all(|c| matches!(c, '─' | '━' | '═'))
+    })?;
+    let running = lines[bottom + 1..]
+        .iter()
+        .skip_while(|line| !line.trim_start().starts_with("main · "))
+        .skip(1)
+        .take_while(|line| {
+            let line = line.trim_start();
+            line.starts_with('├') || line.starts_with('└')
+        })
+        .filter(|line| {
+            line.split("  ")
+                .map(str::trim)
+                .any(|field| field == "running")
+        })
+        .count();
+    (running > 0).then(|| {
+        format!(
+            "{running} background shell{}",
+            if running == 1 { "" } else { "s" }
+        )
+    })
+}
+
 /// Muse's journal, read forward from a point fixed before a prompt is submitted, for the proof
 /// that Muse accepted that prompt (#678 muse-bridge-latency).
 ///
@@ -540,5 +574,29 @@ mod tests {
         append(format!("{tail}\n"));
         assert!(watch.accepted(prompt));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn running_terminals_in_the_panel_are_background_work() {
+        let rule = "─".repeat(40);
+        let footer = "  watermelon-full-preview · xhigh · ~/work/project · Launch overrides";
+        let screen = |rows: &str| format!("◆ Finished · Sleep · ✓ · ctrl+o\n{rule}\n❯\n{rule}\n{rows}{footer}\n");
+        assert_eq!(
+            background_work(&screen(
+                "main · ↓ to select\n├ ◈ Sleep ninety seconds  running      1m 21s\n└ ◆ Sleep sixty seconds  running   18s\n"
+            ))
+            .as_deref(),
+            Some("2 background shells")
+        );
+        assert_eq!(
+            background_work(&screen("main · ↓ to select\n└ ◆ Sleep between steps  ran 18s, exit 0      20s\n")),
+            None
+        );
+        assert_eq!(background_work(&screen("")), None);
+        // A transcript row that says running is not the panel.
+        assert_eq!(
+            background_work(&format!("└ ◆ Sleep  running   3s\n{rule}\n❯\n{rule}\n{footer}\n")),
+            None
+        );
     }
 }

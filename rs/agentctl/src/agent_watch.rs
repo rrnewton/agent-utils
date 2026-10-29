@@ -1146,7 +1146,8 @@ fn classify(
         && !observation.has_pending
     {
         let running = turn_running(screen);
-        let background = background_work(screen);
+        let background =
+            background_work(screen).or_else(|| crate::harness::muse::background_work(screen));
         let work = background
             .clone()
             .or_else(|| running.then(|| "esc to interrupt".to_owned()));
