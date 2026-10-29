@@ -39,6 +39,20 @@ function offUnlessOn(key: string, refused?: boolean): DeviceSetting<boolean> {
   };
 }
 
+/** On only when "on" is kept; kept as "on" or "off". A refused read is off. */
+function onOrOff(key: string): DeviceSetting<boolean> {
+  return { key, read: (raw) => raw === "on", write: (on) => (on ? "on" : "off"), refused: { value: false } };
+}
+
+/** A voice that reads messages aloud: the voice agent's, the device's, or Wit.ai's. */
+export type ReadAudioSource = "agent" | "device" | "wit";
+
+/** An offset on screen, in CSS pixels. */
+export interface SteerOffset {
+  readonly x: number;
+  readonly y: number;
+}
+
 /** The device's settings, by name. */
 export const DEVICE_SETTINGS = Object.freeze({
   /** `#543 in-app-message-links`. Whether a link to a message opens it here. */
@@ -66,6 +80,61 @@ export const DEVICE_SETTINGS = Object.freeze({
   hideEmptyMessages: onUnlessOff("vibe-talk.voice.hide-empty"),
   /** Whether messages are combined. */
   combineMessages: onUnlessOff("vibe-talk.voice.combine"),
+  /**
+   * `#580 open-in-chat-jump`. The view a sent card's Open in channel lands in: "flat", All, unless
+   * the reader chose "main". ABSENT MEANS ALL, the owner's choice.
+   */
+  openInView: {
+    key: "vibe-talk.voice.open-in-view",
+    read: (raw: string | null): "flat" | "main" => (raw === "main" ? "main" : "flat"),
+    write: (view: "flat" | "main") => (view === "main" ? "main" : "flat"),
+  } satisfies DeviceSetting<"flat" | "main">,
+  /** Which voice reads messages aloud, as chosen: null for no choice (or one this page does not know). */
+  readAudioSource: {
+    key: "vibe-talk.voice.read-audio-source",
+    read: (raw: string | null): ReadAudioSource | null =>
+      (raw === "agent" || raw === "device" || raw === "wit" ? raw : null),
+    write: (source: ReadAudioSource | null) => source,
+    refused: { value: null },
+  } satisfies DeviceSetting<ReadAudioSource | null>,
+  /** `#552 wit-tts-provider`. The Wit.ai voice chosen: "" for the configured one, kept as nothing. */
+  witVoice: {
+    key: "vibe-talk.voice.wit-voice",
+    read: (raw: string | null) => raw || "",
+    write: (name: string) => name || null,
+    refused: { value: "" },
+  } satisfies DeviceSetting<string>,
+  /** Where the floating read-aloud controller was dragged to, as an offset from where it docks: null
+   * for docked. A damaged record is docked. */
+  readSteerOffset: {
+    key: "vibe-talk.voice.read-steer-offset",
+    read: (raw: string | null): SteerOffset | null => {
+      const held = JSON.parse(raw || "null") as { x?: unknown; y?: unknown } | null;
+      return held && Number.isFinite(held.x) && Number.isFinite(held.y)
+        ? { x: held.x as number, y: held.y as number }
+        : null;
+    },
+    write: (offset: SteerOffset | null) => (offset === null ? null : JSON.stringify(offset)),
+    refused: { value: null },
+  } satisfies DeviceSetting<SteerOffset | null>,
+  /** `#481 slack-app-deep-link`. Where Open in Slack goes from here: the app, or a browser tab unless the app was chosen. */
+  slackOpen: {
+    key: "vibe-talk.voice.slack-open",
+    read: (raw: string | null): "app" | "browser" => (raw === "app" ? "app" : "browser"),
+    write: (where: "app" | "browser") => where,
+    refused: { value: "browser" },
+  } satisfies DeviceSetting<"app" | "browser">,
+  /** The device's choice of Main channel among the thread list's cards: kept "on" or "off". */
+  threadsMain: onOrOff("vibe-talk.voice.threads-main"),
+  /** `#388 thread-header-collapse`. Whether the card at the top of the thread list is folded: kept "on" or "off". */
+  threadCardFolded: onOrOff("vibe-talk.voice.thread-card-folded"),
+  /** `#610 mobile-keyboard-compose`. Whether the keyboard layout debug readout is drawn: kept "1", forgotten when off. */
+  keyboardDebug: {
+    key: "vibe-talk.voice.keyboard-debug",
+    read: (raw: string | null) => raw === "1",
+    write: (on: boolean) => (on ? "1" : null),
+    refused: { value: false },
+  } satisfies DeviceSetting<boolean>,
 });
 
 /** The device's settings, kept in its storage. */
@@ -74,6 +143,11 @@ export interface DeviceSettings {
   get<T>(setting: DeviceSetting<T>): T;
   /** Keep `value` for `setting`. Throws, or silently keeps nothing, where storage is refused. */
   keep<T>(setting: DeviceSetting<T>, value: T): void;
+  /**
+   * Whether the device now holds exactly what `value` keeps for `setting`: the read-back after a
+   * keep, since a refusing browser may drop a write silently. Throws where storage is refused.
+   */
+  keptAs<T>(setting: DeviceSetting<T>, value: T): boolean;
 }
 
 /** The device's settings in `storage`. */
@@ -91,6 +165,9 @@ export function createDeviceSettings(storage: StoragePort): DeviceSettings {
       const raw = setting.write(value);
       if (raw === null) storage.removeItem(setting.key);
       else storage.setItem(setting.key, raw);
+    },
+    keptAs<T>(setting: DeviceSetting<T>, value: T): boolean {
+      return storage.getItem(setting.key) === setting.write(value);
     },
   };
 }

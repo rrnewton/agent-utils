@@ -73,7 +73,7 @@ const HIDE_EMPTY_KEY = DEVICE_SETTINGS.hideEmptyMessages.key;
 const RICH_HEADERS_KEY = DEVICE_SETTINGS.richHeaders.key;
 const IN_APP_LINKS_KEY = DEVICE_SETTINGS.inAppLinks.key;
 /** `#580 open-in-chat-jump`. The view a sent card's Open in channel lands in: "flat" (All) or "main". */
-const OPEN_IN_VIEW_KEY = "vibe-talk.voice.open-in-view";
+const OPEN_IN_VIEW_KEY = DEVICE_SETTINGS.openInView.key;
 const SUMMARIZE_COLLAPSED_KEY = DEVICE_SETTINGS.summarizeCollapsed.key;
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
@@ -2084,7 +2084,7 @@ function storedInAppLinks() {
  * @returns {"flat" | "main"}
  */
 function storedOpenInView() {
-  return deviceStorage().getItem(OPEN_IN_VIEW_KEY) === "main" ? "main" : "flat";
+  return deviceSettings().get(DEVICE_SETTINGS.openInView);
 }
 
 /** Draw the choice as stored. Never writes it: an absent choice stays absent, so it syncs nothing. */
@@ -2095,7 +2095,7 @@ function renderOpenInView() {
 /** Keep the reader's choice, `view`, and draw it. */
 function chooseOpenInView(view) {
   try {
-    deviceStorage().setItem(OPEN_IN_VIEW_KEY, view === "main" ? "main" : "flat");
+    deviceSettings().keep(DEVICE_SETTINGS.openInView, view);
   } catch (_error) {
     // A browser that refuses storage keeps the shipped default.
   }
@@ -37091,7 +37091,7 @@ let readingMode = false;
 // voice is explicitly selected; it never falls back to a remote speech service.
 let readAloudPlayback = "audio";
 let readAloudLabel = "Voice provider";
-const READ_AUDIO_SOURCE_KEY = "vibe-talk.voice.read-audio-source";
+const READ_AUDIO_SOURCE_KEY = DEVICE_SETTINGS.readAudioSource.key;
 let agentReadAloud = null;
 let readAudioSource = "device";
 let browserVoicesListening = false;
@@ -37099,19 +37099,15 @@ let waitingForBrowserVoice = false;
 let browserVoiceProblem = "";
 
 function storedReadAudioSource() {
-  try {
-    const held = deviceStorage().getItem(READ_AUDIO_SOURCE_KEY);
-    return held === "agent" || held === "device" || held === "wit" ? held : null;
-  } catch (_error) {
-    return null;
-  }
+  // A browser refusing storage reads as no choice (`DEVICE_SETTINGS.readAudioSource.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.readAudioSource);
 }
 
 // `#552 wit-tts-provider`. When the server's read-aloud backend is Wit.ai,
 // Settings offers its catalogue: a voice the reader picks here rides on
 // every speech preparation, and the server's configured voice is the
 // fallback the empty choice names.
-const WIT_VOICE_KEY = "vibe-talk.voice.wit-voice";
+const WIT_VOICE_KEY = DEVICE_SETTINGS.witVoice.key;
 let witReadAloud = null;
 let witVoice = "";
 
@@ -37141,19 +37137,15 @@ function readWithDeviceTail(parts, id, ticket) {
 }
 
 function storedWitVoice() {
-  try {
-    return deviceStorage().getItem(WIT_VOICE_KEY) || "";
-  } catch (_error) {
-    return "";
-  }
+  // A browser refusing storage reads as the configured voice (`DEVICE_SETTINGS.witVoice.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.witVoice);
 }
 
 /** Choose the Wit.ai voice for later reads; the configured voice when cleared. */
 function setWitVoice(name, announce = true) {
   witVoice = String(name || "");
   try {
-    if (witVoice) deviceStorage().setItem(WIT_VOICE_KEY, witVoice);
-    else deviceStorage().removeItem(WIT_VOICE_KEY);
+    deviceSettings().keep(DEVICE_SETTINGS.witVoice, witVoice);
   } catch (_error) {
     // The choice still applies to this page when storage is unavailable.
   }
@@ -37214,7 +37206,7 @@ function setReadAudioSource(source, announce = true) {
     prepareBrowserSpeech();
   }
   try {
-    deviceStorage().setItem(READ_AUDIO_SOURCE_KEY, readAudioSource);
+    deviceSettings().keep(DEVICE_SETTINGS.readAudioSource, readAudioSource);
   } catch (_error) {
     // The selection still applies to this page when storage is unavailable.
   }
@@ -38989,25 +38981,19 @@ function renderReadSteer() {
  * strip docked under the thumb. Whether the grip is drawn is the one question asked here, so the
  * layout stays the stylesheet's to decide (`#55 voice-desktop-app`).
  */
-const READ_STEER_OFFSET_KEY = "vibe-talk.voice.read-steer-offset";
 /** @type {{ x: number, y: number } | null} */
 let readSteerOffset = storedReadSteerOffset();
 /** @type {{ x: number, y: number, from: { x: number, y: number } } | null} */
 let readSteerDrag = null;
 
 function storedReadSteerOffset() {
-  try {
-    const held = JSON.parse(deviceStorage().getItem(READ_STEER_OFFSET_KEY) || "null");
-    return held && Number.isFinite(held.x) && Number.isFinite(held.y) ? { x: held.x, y: held.y } : null;
-  } catch (_error) {
-    return null;
-  }
+  // A browser refusing storage, or a damaged record, reads as docked (`DEVICE_SETTINGS.readSteerOffset.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.readSteerOffset);
 }
 
 function rememberReadSteerOffset() {
   try {
-    if (readSteerOffset === null) deviceStorage().removeItem(READ_STEER_OFFSET_KEY);
-    else deviceStorage().setItem(READ_STEER_OFFSET_KEY, JSON.stringify(readSteerOffset));
+    deviceSettings().keep(DEVICE_SETTINGS.readSteerOffset, readSteerOffset);
   } catch (_error) {
     // The strip still stays where it was put on this page when storage is unavailable.
   }
@@ -41314,8 +41300,6 @@ function upstreamUrlOf(message) {
   return /^https:\/\//i.test(url) && !/\s/.test(url) && HTTP_ADDRESS.test(url) ? url : null;
 }
 
-const SLACK_OPEN_KEY = "vibe-talk.voice.slack-open";
-
 /**
  * Where this device opens Slack links: in Slack's app or in the browser (`#481
  * slack-app-deep-link`). Kept on the device and never synced, as Screen and keys' choices are:
@@ -41324,21 +41308,16 @@ const SLACK_OPEN_KEY = "vibe-talk.voice.slack-open";
  * owner's word that it is there. Anything stored that is neither word is the browser.
  */
 function storedSlackOpen() {
-  let stored = null;
-  try {
-    stored = deviceStorage().getItem(SLACK_OPEN_KEY);
-  } catch (_error) {
-    stored = null;
-  }
-  return stored === "app" ? "app" : "browser";
+  // A browser refusing storage reads as a browser tab (`DEVICE_SETTINGS.slackOpen.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.slackOpen);
 }
 
 function slackOpenChanged() {
   const chosen = el("slack-open-in").value === "app" ? "app" : "browser";
   let saved = false;
   try {
-    deviceStorage().setItem(SLACK_OPEN_KEY, chosen);
-    saved = deviceStorage().getItem(SLACK_OPEN_KEY) === chosen;
+    deviceSettings().keep(DEVICE_SETTINGS.slackOpen, chosen);
+    saved = deviceSettings().keptAs(DEVICE_SETTINGS.slackOpen, chosen);
   } catch (_error) {
     saved = false;
   }
@@ -51586,15 +51565,12 @@ async function readUnpackThread(id) {
 //     opened anywhere hides it, and putting the reply down gives it back (`dockReply`).
 
 /** The device's choice of Main channel among the cards: "on", or anything else for cards alone. */
-const THREADS_MAIN_KEY = "vibe-talk.voice.threads-main";
+const THREADS_MAIN_KEY = DEVICE_SETTINGS.threadsMain.key;
 
 /** Whether Main channel is pressed, kept on the server (`#457 settings-server-side`). `#419 threads-view-main-messages`. */
 function storedMainRows() {
-  try {
-    return deviceStorage().getItem(THREADS_MAIN_KEY) === "on";
-  } catch (_error) {
-    return false;
-  }
+  // A browser refusing storage reads as cards alone (`DEVICE_SETTINGS.threadsMain.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.threadsMain);
 }
 
 /** Whether the main channel's messages stand among the cards. */
@@ -51616,7 +51592,7 @@ function renderMainToggle() {
 function setMainRowsShown(on) {
   mainRowsShown = on;
   try {
-    deviceStorage().setItem(THREADS_MAIN_KEY, on ? "on" : "off");
+    deviceSettings().keep(DEVICE_SETTINGS.threadsMain, on);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -52452,18 +52428,15 @@ function paintThreadCard(card, choice, tally) {
 //   * It replaces `#298`'s press on clamped text opening the card over the list: the press has one
 //     meaning on the card now, as it has on a message.
 
-const THREAD_CARD_FOLD_KEY = "vibe-talk.voice.thread-card-folded";
+const THREAD_CARD_FOLD_KEY = DEVICE_SETTINGS.threadCardFolded.key;
 
 /** The cards at the top of a thread, one per column, and the list each heads. */
 const THREAD_CARD_LISTS = [["thread-card", "scroll-area"], ["side-thread-card", "side-scroll"]];
 
 /** What was stored. ABSENT MEANS OPEN; a browser that refuses storage reads as nothing stored. */
 function storedThreadCardFolded() {
-  try {
-    return deviceStorage().getItem(THREAD_CARD_FOLD_KEY) === "on";
-  } catch (_error) {
-    return false;
-  }
+  // A browser refusing storage reads as open (`DEVICE_SETTINGS.threadCardFolded.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.threadCardFolded);
 }
 
 /** Whether the cards at the top of a thread are folded to a bar: the reader's choice, kept on the device. */
@@ -52514,7 +52487,7 @@ function threadCardPressed(card, event) {
  */
 function setThreadCardFolded(folded) {
   try {
-    deviceStorage().setItem(THREAD_CARD_FOLD_KEY, folded ? "on" : "off");
+    deviceSettings().keep(DEVICE_SETTINGS.threadCardFolded, folded);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -59694,8 +59667,6 @@ for (const type of ["touchstart", "pointerdown", "wheel"]) {
 // Typing › "Keyboard layout debug" draws them over the top of the page, live, for a screenshot to carry
 // back. Off by default, kept on this device alone.
 
-const KEYBOARD_DEBUG_KEY = "vibe-talk.voice.keyboard-debug";
-
 /** Whether the readout is drawn; see `applyKeyboardDebug`. */
 let keyboardDebug = false;
 /** The readout's own redraw while it is drawn, for what moves with no event of the page's: its timer, or 0. */
@@ -59711,18 +59682,14 @@ function tickKeyboardDebug() {
 
 /** What was stored. ABSENT MEANS OFF. */
 function storedKeyboardDebug() {
-  try {
-    return deviceStorage().getItem(KEYBOARD_DEBUG_KEY) === "1";
-  } catch (_error) {
-    return false;
-  }
+  // A browser refusing storage reads as off (`DEVICE_SETTINGS.keyboardDebug.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.keyboardDebug);
 }
 
 /** The reader's choice, kept on this device. @param {boolean} on */
 function applyKeyboardDebug(on) {
   try {
-    if (on) deviceStorage().setItem(KEYBOARD_DEBUG_KEY, "1");
-    else deviceStorage().removeItem(KEYBOARD_DEBUG_KEY);
+    deviceSettings().keep(DEVICE_SETTINGS.keyboardDebug, on);
   } catch (_error) {
     // A browser that refuses storage still draws it for this session.
   }

@@ -6188,37 +6188,52 @@ test("`#624 voice-page-modularity`: the settings sync runs on its own ports: the
   assert.equal(kept.get(KEY), "show", "a refusal cost this device its value");
 });
 
-test("`#624 voice-page-modularity`: each on/off setting reads, keeps and refuses as its own reader and writer always did", () => {
+test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses as its own reader and writer always did", () => {
   const { DEVICE_SETTINGS, createDeviceSettings } = SETTINGS;
-  // [name, key, nothing kept, what on keeps, what off keeps, a refused read (undefined: thrown)].
+  const THROWN = Symbol("thrown");
+  // [name, key, nothing kept, [[a value, what it keeps (null: forgotten)], ...], a refused read].
+  const onOff = (name, key, absent, refused) => [name, key, absent, [[true, "1"], [false, "0"]], refused];
   const table = [
-    ["inAppLinks", "vibe-talk.voice.in-app-links", true, "1", "0", undefined],
-    ["summarizeCollapsed", "vibe-talk.voice.summarize-collapsed", false, "1", "0", false],
-    ["linksRaw", "vibe-talk.voice.link-raw-urls", false, "on", null, false],
-    ["composerGrow", "vibe-talk.voice.composer-grow", false, "1", "0", false],
-    ["enterSends", "vibe-talk.voice.enter-sends", true, "1", "0", undefined],
-    ["singleKeys", "vibe-talk.voice.single-keys", true, "1", "0", true],
-    ["richHeaders", "vibe-talk.voice.rich-headers", true, "1", "0", true],
-    ["markOwnRead", "vibe-talk.voice.mark-own-read", true, "1", "0", undefined],
-    ["hideEmptyMessages", "vibe-talk.voice.hide-empty", true, "1", "0", undefined],
-    ["combineMessages", "vibe-talk.voice.combine", true, "1", "0", undefined],
+    onOff("inAppLinks", "vibe-talk.voice.in-app-links", true, THROWN),
+    onOff("summarizeCollapsed", "vibe-talk.voice.summarize-collapsed", false, false),
+    ["linksRaw", "vibe-talk.voice.link-raw-urls", false, [[true, "on"], [false, null]], false],
+    onOff("composerGrow", "vibe-talk.voice.composer-grow", false, false),
+    onOff("enterSends", "vibe-talk.voice.enter-sends", true, THROWN),
+    onOff("singleKeys", "vibe-talk.voice.single-keys", true, true),
+    onOff("richHeaders", "vibe-talk.voice.rich-headers", true, true),
+    onOff("markOwnRead", "vibe-talk.voice.mark-own-read", true, THROWN),
+    onOff("hideEmptyMessages", "vibe-talk.voice.hide-empty", true, THROWN),
+    onOff("combineMessages", "vibe-talk.voice.combine", true, THROWN),
+    ["openInView", "vibe-talk.voice.open-in-view", "flat", [["main", "main"], ["flat", "flat"]], THROWN],
+    ["readAudioSource", "vibe-talk.voice.read-audio-source", null, [["agent", "agent"], ["device", "device"], ["wit", "wit"]], null],
+    ["witVoice", "vibe-talk.voice.wit-voice", "", [["Charlie", "Charlie"], ["", null]], ""],
+    ["readSteerOffset", "vibe-talk.voice.read-steer-offset", null, [[{ x: 3, y: -4 }, '{"x":3,"y":-4}'], [null, null]], null],
+    ["slackOpen", "vibe-talk.voice.slack-open", "browser", [["app", "app"], ["browser", "browser"]], "browser"],
+    ["threadsMain", "vibe-talk.voice.threads-main", false, [[true, "on"], [false, "off"]], false],
+    ["threadCardFolded", "vibe-talk.voice.thread-card-folded", false, [[true, "on"], [false, "off"]], false],
+    ["keyboardDebug", "vibe-talk.voice.keyboard-debug", false, [[true, "1"], [false, null]], false],
   ];
   const refused = () => { throw new Error("SecurityError"); };
   const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
-  for (const [name, key, absent, onKept, offKept, whenRefused] of table) {
+  for (const [name, key, absent, values, whenRefused] of table) {
     const kept = new Map();
     const settings = createDeviceSettings({ getItem: (k) => kept.get(k) ?? null, setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) });
     const setting = DEVICE_SETTINGS[name];
     assert.equal(setting.key, key, name);
-    assert.equal(settings.get(setting), absent, `${name}: nothing kept`);
-    settings.keep(setting, true);
-    assert.deepStrictEqual([kept.get(key) ?? null, settings.get(setting)], [onKept, true], `${name}: on`);
-    settings.keep(setting, false);
-    assert.deepStrictEqual([kept.get(key) ?? null, settings.get(setting)], [offKept, false], `${name}: off`);
-    if (whenRefused === undefined) assert.throws(() => off.get(setting), /SecurityError/, `${name}: a refusal was swallowed`);
-    else assert.equal(off.get(setting), whenRefused, `${name}: refused`);
-    assert.throws(() => off.keep(setting, true), /SecurityError/, `${name}: a refused write was swallowed`);
+    assert.deepStrictEqual(settings.get(setting), absent, `${name}: nothing kept`);
+    for (const [value, keeps] of values) {
+      settings.keep(setting, value);
+      assert.deepStrictEqual([kept.get(key) ?? null, settings.get(setting)], [keeps, value], `${name}: ${JSON.stringify(value)}`);
+      assert.equal(settings.keptAs(setting, value), true, `${name}: the read-back of ${JSON.stringify(value)}`);
+    }
+    if (whenRefused === THROWN) assert.throws(() => off.get(setting), /SecurityError/, `${name}: a refusal was swallowed`);
+    else assert.deepStrictEqual(off.get(setting), whenRefused, `${name}: refused`);
+    assert.throws(() => off.keep(setting, values[0][0]), /SecurityError/, `${name}: a refused write was swallowed`);
   }
+  // What a reader made of a value it does not know, as before: the default, never the stray text.
+  const stray = createDeviceSettings({ getItem: () => "{nonsense", setItem: () => {}, removeItem: () => {} });
+  assert.deepStrictEqual([stray.get(DEVICE_SETTINGS.readAudioSource), stray.get(DEVICE_SETTINGS.openInView),
+    stray.get(DEVICE_SETTINGS.slackOpen), stray.get(DEVICE_SETTINGS.readSteerOffset)], [null, "flat", "browser", null]);
   assert.deepStrictEqual(Object.keys(DEVICE_SETTINGS).sort(), table.map(([name]) => name).sort(), "a setting with no row here");
 });
 
@@ -59381,7 +59396,7 @@ test("`#388 thread-header-collapse`: the fold is kept on the device — a reload
   assert.deepStrictEqual(await reopened("off"), { right: [false, "true"], wide: [false, "true"] });
   assert.deepStrictEqual(await reopened(null), { right: [false, "true"], wide: [false, "true"] }, "with nothing kept the card is folded");
   // The control: a page that reads nothing kept draws the card open after the reload.
-  const forgot = await reopened("on", brokenScript("return deviceStorage().getItem(THREAD_CARD_FOLD_KEY) === \"on\";", "return false;"));
+  const forgot = await reopened("on", brokenScript("return deviceSettings().get(DEVICE_SETTINGS.threadCardFolded);", "return false;"));
   assert.deepStrictEqual(forgot.right, [false, "true"], "the negative control kept the fold too, so the check above proves nothing");
   // Across the window: a thread from the picker, the card read from the same choice.
   const page = await threadPage("main");
