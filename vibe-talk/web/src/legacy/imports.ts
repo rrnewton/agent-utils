@@ -22,6 +22,7 @@ export {
   allPageAnswersFor,
   allReachesThread,
   coverViewOf,
+  createCopyOrder,
   deltaSideState,
   emptyCanon,
   exactCount,

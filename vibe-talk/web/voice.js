@@ -24042,7 +24042,7 @@ function pageFold(canon, payload, held) {
       const kept = versions ? storedNow().get(id) : undefined;
       // A copy that says the message as it was posted (the stream's, the reader's own send) is older
       // in what it says than any read that carries the message, however late it arrived.
-      const byServer = kept && postedCopies.has(kept) ? true : versions ? pageCopyNewer(kept, message, versions) : null;
+      const byServer = kept && copyLedger.isPosted(kept) ? true : versions ? pageCopyNewer(kept, message, versions) : null;
       if (byServer !== null) return byServer;
       if (!held || !holds) return true;
       if (holds.has(id)) return older(id, true);
@@ -24249,10 +24249,10 @@ function foldLiveMessage(message, live = false, replayed = false, read = null) {
   // brought (`read`) where that read was sent. A message the store did not hold is newer than every read
   // sent before it arrived, and one it held is as new as the store's copy was (`copyBuiltOn`). Either
   // says the message as it was posted (`postedCopies`).
-  if (read !== null) copyOrder.set(kept, read);
+  if (read !== null) copyLedger.place(kept, read);
   else if (!held) orderCopy(kept, orderNow());
   else if (held !== kept) buildCopyOn(kept, held);
-  if (read === null && held !== kept) postedCopies.add(kept);
+  if (read === null && held !== kept) copyLedger.markPosted(kept);
   if (!live || threadOf(kept)) channelCanon.unplaced.delete(id);
   else if (!held) {
     channelCanon.unplaced.add(id);
@@ -28343,130 +28343,34 @@ function sentNumberOf(payload) {
 }
 
 /**
- * By copy of a message in the store, where it stands in that same order (`sentNumberOf`): a copy a read
- * brought, or found word for word, stands where that read was sent, and a message from the stream or the
- * reader's own send where it went into the store, after every read sent by then and before the next. A
- * copy put together here from the store's own — a count, a thread record, the stream's copy of a message
- * the store held — stands where that one stood (`copyBuiltOn`). A page landing after a copy went in
- * takes the message out only where that copy is the older (`copyOlderThan`, `pageFold`), and takes its
- * own copy over it by the same test, except where the copy says the message as it was posted
- * (`postedCopies`). `#310 stale-live-read-flicker`.
- *
- * @type {WeakMap<object, number>}
+ * Where each copy of a message in the store stands in the order of reads (`sentNumberOf`), the copy it
+ * was put together on, and whether it says the message as it was posted (web/src/core/channels
+ * `createCopyOrder`, `#310 stale-live-read-flicker`, which says what each means and why): the facts
+ * private to the ledger, reached only by its named commands. Here where the maps it replaces stood.
  */
-const copyOrder = new WeakMap();
+const copyLedger = createCopyOrder();
 
-/**
- * By copy put together here from the store's copy of the message — a root's count moved on by a live
- * reply (`foldLiveMessage`), a thread record from the stream (`takeThreadRecord`) or from an answer of
- * All that is not folded (`placeFromPage`), the stream's copy of a message the store held — the copy it
- * was built on, never itself one of these: it stands where that one stood (`copyOrder`).
- *
- * NOT WHERE IT WENT INTO THE STORE. It says nothing newer than that copy of whether the message is there,
- * nor of what it says, the stream carrying no edits (`placeFromEdit`); a count or a thread record is all
- * that changed. Stamped as new as the moment it went in, it made a newest page sent before then refuse
- * its own copy of the message, though that page, answered later, carried the newer text: a root's edit,
- * if a live reply had moved its count on, or a bridge's finished answer, if the stream had placed it.
- * The polls after, deltas from that page's cursor, already past the edit, never brought it either, and
- * the old text stayed shown and saved until the next newest page, up to `TIMELINE_RECONCILE_MS` later
- * on a server whose deltas carry edits. And a root removed upstream stayed as long, behind a page sent
- * before a live reply moved its count on, which then did not take it out.
- *
- * @type {WeakMap<object, object>}
- */
-const copyBuiltOn = new WeakMap();
-
-/**
- * The copies in the store that say a message as it was posted: the stream's copy of a message (the stream
- * carries no edits, and a copy it replays is the message as it was published), the reader's own send as
- * the server took it, and a copy put together on one of those (`copyBuiltOn`). A read that carries the
- * message has that or newer, wherever it stands in the order (`copyOrder`), so a page that carries the
- * message takes its own copy over one of these (`pageFold`, `placeFromPage`). A message the stream
- * delivered while a newest page was out, and a bot then edited from its placeholder to its answer, kept
- * the placeholder, shown and saved, until the next newest page fifteen minutes on.
- *
- * @type {WeakSet<object>}
- */
-const postedCopies = new WeakSet();
-
-/** Where a message that goes into the store now, other than from a read, stands (`copyOrder`). */
+/** Where a message that goes into the store now, other than from a read, stands (`copyLedger`). */
 const orderNow = () => timelineAnswersAsked + 0.5;
 
-/**
- * Copy `copy`, the store's, stands at `at` (`copyOrder`), or later: a read that brings a copy the store
- * holds word for word keeps the store's object, which is then as new as that read.
- *
- * @param {any} copy
- * @param {number} at
- */
+/** Copy `copy`, the store's, stands at `at`, or later (`CopyOrder.orderCopy`). */
 function orderCopy(copy, at) {
-  const was = copyOrder.get(copy);
-  if (was === undefined || was < at) copyOrder.set(copy, at);
+  copyLedger.orderCopy(copy, at);
 }
 
-/**
- * Copy `copy`, put together here from `from`, the store's copy of the message, stands where `from` stood
- * (`copyBuiltOn`), and says the message as it was posted if `from` does (`postedCopies`).
- *
- * @param {any} copy
- * @param {any} from
- */
+/** Copy `copy`, put together here from `from`, stands where `from` stood (`CopyOrder.buildCopyOn`). */
 function buildCopyOn(copy, from) {
-  copyBuiltOn.set(copy, copyBuiltOn.get(from) ?? from);
-  if (postedCopies.has(from)) postedCopies.add(copy);
+  copyLedger.buildCopyOn(copy, from);
 }
 
-/**
- * The store's copies of `messages`, which the read numbered `number` (`sentNumberOf`) brought, or found
- * word for word, stand where that read was sent, or later (`orderCopy`): one put together here as well
- * (`copyBuiltOn`), which the read speaks for from now on. One walk over the store.
- *
- * @param {any[]} messages
- * @param {number} number
- */
+/** The store's copies of `messages` stand where the read numbered `number` was sent (`CopyOrder.orderCopiesRead`). */
 function orderCopiesRead(messages, number) {
-  if (messages.length === 0) return;
-  const ids = new Set(messages.map((message) => String(message.id)));
-  for (const copy of channelCanon.messages) {
-    if (!ids.has(String(copy.id))) continue;
-    const from = copyBuiltOn.get(copy);
-    if (from) {
-      copyBuiltOn.delete(copy);
-      const at = copyOrder.get(from);
-      if (at !== undefined) orderCopy(copy, at);
-    }
-    orderCopy(copy, number);
-  }
+  copyLedger.orderCopiesRead(channelCanon, messages, number);
 }
 
-/**
- * Whether `copy`, the store's copy of message `id`, is older than the read numbered `number`
- * (`sentNumberOf`), sent when the store's copies were `held` (`heldNow`): it stands before that read
- * (`copyOrder`), or the copy it was built on does (`copyBuiltOn`). A copy with no place — one saved on
- * the device, which every read since the reload is newer than — is older exactly when the store held it,
- * or a copy built on it, as the read was sent. `says`: older in what it says, for a page that carries the
- * message and would take its own copy over it — which a copy saying the message as it was posted always
- * is (`postedCopies`).
- *
- * NOT "UNCHANGED SINCE IT WAS SENT". A copy replaced while the read was out may have been replaced by
- * an OLDER read: the read of All for Main's counts, sent first and answered after an edit, landing
- * while Main's newer newest page was out. Taken for newer, it made that page refuse its own copy of the
- * next edit, and its removal of the message, until the next newest page, up to `TIMELINE_RECONCILE_MS`
- * later on a server whose deltas carry edits and deletions. `#310 stale-live-read-flicker`.
- *
- * @param {any} copy
- * @param {string} id
- * @param {number} number
- * @param {Map<string, any>} held
- * @param {boolean} [says]
- */
+/** Whether the store's `copy` of message `id` is older than the read numbered `number` (`CopyOrder.copyOlderThan`). */
 function copyOlderThan(copy, id, number, held, says = false) {
-  if (says && postedCopies.has(copy)) return true;
-  const from = copyBuiltOn.get(copy) ?? copy;
-  const at = copyOrder.get(from);
-  if (at !== undefined) return at < number;
-  const was = held.get(id);
-  return was !== undefined && (copyBuiltOn.get(was) ?? was) === from;
+  return copyLedger.copyOlderThan(copy, id, number, held, says);
 }
 
 /**

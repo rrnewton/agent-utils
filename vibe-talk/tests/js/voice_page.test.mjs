@@ -6453,6 +6453,35 @@ test("`#624 voice-page-modularity`: the replies a store lacks for being old, by 
   assert.equal(allReachesThread(canon, "t", null), true);
 });
 
+test("`#624 voice-page-modularity`: the copy-order ledger, from the module alone: where a copy stands, what it was built on, what says it as posted", () => {
+  const { createCopyOrder, emptyCanon } = CHANNELS;
+  const ledger = createCopyOrder();
+  const read = { id: "1" };
+  ledger.place(read, 5);
+  assert.deepStrictEqual([ledger.copyOlderThan(read, "1", 6, new Map()), ledger.copyOlderThan(read, "1", 5, new Map())], [true, false]);
+  // Later only: an older read does not move a copy back.
+  ledger.orderCopy(read, 3);
+  assert.equal(ledger.copyOlderThan(read, "1", 4, new Map()), false, "an older read moved the copy back");
+  // A copy built on another stands where that one stood, and inherits "as posted".
+  const live = { id: "2" };
+  ledger.place(live, 2);
+  ledger.markPosted(live);
+  const counted = { id: "2", thread: {} };
+  ledger.buildCopyOn(counted, live);
+  assert.deepStrictEqual([ledger.isPosted(counted), ledger.copyOlderThan(counted, "2", 3, new Map())], [true, true]);
+  assert.equal(ledger.copyOlderThan(counted, "2", 1, new Map(), true), true, "a posted copy was not older in what it says");
+  // A read that brings the copy speaks for it from then on: no longer built on, as new as the read.
+  const canon = emptyCanon("c");
+  canon.messages = [counted];
+  ledger.orderCopiesRead(canon, [{ id: "2" }], 9);
+  assert.equal(ledger.copyOlderThan(counted, "2", 9, new Map()), false);
+  // A copy with no place (saved on the device) is older exactly when the store held it as the read was sent.
+  const saved = { id: "3" };
+  assert.deepStrictEqual([ledger.copyOlderThan(saved, "3", 1, new Map([["3", saved]])), ledger.copyOlderThan(saved, "3", 1, new Map())], [true, false]);
+  // Two ledgers share nothing.
+  assert.equal(createCopyOrder().isPosted(live), false);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -78117,7 +78146,8 @@ for (const change of ["edit", "remove"]) {
 
     // THE CONTROL, as the page was: a copy replaced while the page was out taken for newer than it, the
     // page refuses its own, and the polls after, deltas from its cursor, never bring it.
-    const control = await run(brokenScript("  if (at !== undefined) return at < number;\n", ""));
+    const control = await run(await brokenModule([{ file: "src/core/channels/order.ts",
+      find: "      if (at !== undefined) return at < number;\n", replace: "" }]));
     if (change === "edit") {
       assert.equal(control.landed.saved.content, "the announcement, edited once",
         "Main's page brought the second edit anyway, so this test cannot see it");
@@ -78229,7 +78259,8 @@ test("`#310 stale-live-read-flicker`: Main's newest page brings the edit of a me
 
   // THE CONTROL: the stream's copy taken for newer in what it says than every read sent before it arrived,
   // Main's page refuses its own, and the polls after, deltas from its cursor, never bring the edit.
-  const control = await run(brokenScript("  if (says && postedCopies.has(copy)) return true;\n", ""));
+  const control = await run(await brokenModule([{ file: "src/core/channels/order.ts",
+    find: "      if (says && postedCopies.has(copy)) return true;\n", replace: "" }]));
   assert.equal(control.landed.saved, "Working…", "Main's page brought the edit anyway, so this test cannot see it");
   assert.deepStrictEqual(control.polls, ["Working…", "Working…", "Working…"]);
 });
@@ -78375,7 +78406,7 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not und
   // THE CONTROL: the root's count taken for older in what it says than any page, as a live message is, the
   // read for the counts takes its copy of the root over it, from before the edit.
   const control = await run(brokenScript("    buildCopyOn(counted, root);\n",
-    "    buildCopyOn(counted, root);\n    postedCopies.add(counted);\n"));
+    "    buildCopyOn(counted, root);\n    copyLedger.markPosted(counted);\n"));
   assert.equal(control.landed.saved, "first thread root", "the edit survived anyway, so this test cannot see it");
 });
 
