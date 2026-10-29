@@ -12537,8 +12537,9 @@ fn drive_fence_feedback(
                 "the coordinator queue set fence feedback aside untyped".to_owned(),
             ));
         }
-        // Either one drains the queue, which types the prompts in its inbox in the order they
-        // were queued until it reaches one it cannot type.
+        // Either one drains the queue, which types the prompts in its inbox, owner requests
+        // first and then the rest in the order they were queued (#698
+        // chat-requests-unbatched), until it reaches one it cannot type.
         Some(QueueMessageState::Pending) => {
             guard_typing(state, delivery, None).and_then(|()| delivery.drain(agent_name, options))
         }
@@ -12958,8 +12959,9 @@ pub(crate) fn deliver_request_with(
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
             return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
         }
-        // Either one drains the queue, which types the prompts in its inbox in the order they
-        // were queued until it reaches one it cannot type.
+        // Either one drains the queue, which types the prompts in its inbox, owner requests
+        // first and then the rest in the order they were queued (#698
+        // chat-requests-unbatched), until it reaches one it cannot type.
         Some(QueueMessageState::Pending) => match guard_typing(state, delivery, None) {
             Ok(()) => match delivery.drain_reporting(agent_name, options) {
                 Ok(reason) => {

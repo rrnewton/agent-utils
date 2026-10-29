@@ -6316,8 +6316,9 @@ impl NoteLog {
 /// prompts whose requests do not record them as typed. Every `retry_interval` it scans the
 /// request records. It first records as typed each prompt the coordinator's queue reports
 /// processed while its request still waits, as happens when a drain made for another request
-/// typed it: a drain types the prompts in the queue's inbox in the order they were queued, until
-/// it reaches one it cannot type, whichever requests they belong to. Then it logs the stalled
+/// typed it: a drain types the prompts in the queue's inbox, owner requests first and then the
+/// rest in the order they were queued (#698 chat-requests-unbatched), until it reaches one it
+/// cannot type, whichever requests they belong to. Then it logs the stalled
 /// requests as [`StallLog`] describes, keeps `delivery-alarm.json` in the state directory
 /// current, and lists the requests whose prompts it should try to type again: those whose records
 /// say pending or submitting. Last, it reads again the reply route of each request whose prompt

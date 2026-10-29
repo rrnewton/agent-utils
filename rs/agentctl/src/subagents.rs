@@ -9532,7 +9532,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if let Some(first) = queued.first() {
             return Ok(Some(format!(
                 "the agent's queue already holds {} prompt{} not typed yet, such as {first}, which \
-its drain would type first, so it was not queued",
+its drain would also type, so it was not queued",
                 queued.len(),
                 if queued.len() == 1 { "" } else { "s" }
             )));

@@ -509,6 +509,12 @@ pub struct DrainOptions {
     /// types it. Such a prompt goes to `inbox.v2/`, which only drainers that honour expiry and
     /// tombstones read.
     pub not_after: Option<u64>,
+    /// Internal, off by default: type a working pane's ordinary backlog as one combined
+    /// "N queued messages:" prompt instead of one prompt per message (#697
+    /// send-muse-while-working). The owner turned it off (#698 chat-requests-unbatched): a
+    /// harness that caps long pastes shows a batch as unreadable. Owner prompts (chat-bridge
+    /// requests and console input) are never batched either way; see [`owner_prompt`].
+    pub batch_working_backlog: bool,
 }
 
 impl Default for DrainOptions {
@@ -522,6 +528,7 @@ impl Default for DrainOptions {
             deadline: None,
             max_items: None,
             not_after: None,
+            batch_working_backlog: false,
         }
     }
 }
@@ -1166,13 +1173,14 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     let mut initial_info: Option<AgentPaneInfo> = None;
     let deadline = options.deadline.map(|limit| started.saturating_add(limit));
     // An urgent send drains only its own prompt (#697 send-muse-while-working): the backlog
-    // stays pending for the normal paced path instead of flushing ahead of it.
+    // stays pending for the normal paced path instead of flushing ahead of it. Otherwise the
+    // owner's prompts go first, ahead of any agent backlog (#698 chat-requests-unbatched).
     let pending_paths: Vec<PathBuf> = match &priority_only {
         Some(identifier) => pending_in_queue_order(&directories)?
             .into_iter()
             .filter(|path| message_id_from_path(path).is_ok_and(|id| id == *identifier))
             .collect(),
-        None => pending_in_queue_order(&directories)?,
+        None => owner_first(pending_in_queue_order(&directories)?),
     };
     // Prompts a working-pane batch already typed as one combined prompt.
     let mut batched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1301,13 +1309,17 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 }
             };
 
-            // Backlog into a working pane is typed as one combined prompt, not a burst of
-            // separate steers (#697 send-muse-while-working): every prompt a drain would
-            // type into this working pane, oldest first, up to BATCH_MAX, with each stored
-            // text (and its sender header) intact. Slash commands, set-aside prompts and
-            // prompts out of attempts end the batch and keep their own path. A drain with
-            // an explicit --max-items, and an urgent priority drain, never batch.
-            if info.status == "working"
+            // With the internal batch_working_backlog option (off by default, #698
+            // chat-requests-unbatched), backlog into a working pane is typed as one combined
+            // prompt, not a burst of separate steers (#697 send-muse-while-working): every
+            // prompt a drain would type into this working pane, oldest first, up to
+            // BATCH_MAX, with each stored text (and its sender header) intact. Owner
+            // prompts, slash commands, set-aside prompts and prompts out of attempts end the
+            // batch and keep their own path; an owner prompt never starts one either. A
+            // drain with an explicit --max-items, and an urgent priority drain, never batch.
+            if options.batch_working_backlog
+                && info.status == "working"
+                && !owner_prompt(&identifier, &document)
                 && priority_only.is_none()
                 && options.max_items.is_none()
                 && message_text(&document).is_ok_and(|text| !text.trim_start().starts_with('/'))
@@ -1341,6 +1353,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             .and_then(Value::as_str)
                             .map_or(candidate_filename.clone(), str::to_owned);
                         if candidate_attempts >= options.max_attempts
+                            || owner_prompt(&candidate_id, &candidate_document)
                             || set_aside_reason(
                                 &directories,
                                 &candidate_filename,
@@ -3114,6 +3127,41 @@ fn typed_text(document: &Map<String, Value>) -> AgentResult<String> {
     Ok(retimed.unwrap_or(text))
 }
 
+/// Whether a queued prompt came from the owner (#698 chat-requests-unbatched): a chat-bridge
+/// request (queue ID `chat-<key>`; the bridge's own reminders and reply feedback are not the
+/// owner's), or console input, whose sender header names `human@HOST`. The owner's prompts are
+/// typed first and each on its own, never in a batch, so the owner sees their own message in the
+/// pane and the bridge's delivered mark belongs to it.
+fn owner_prompt(identifier: &str, document: &Map<String, Value>) -> bool {
+    let request = |id: &str| crate::chat_runtime::request_key_of_message(id).is_some();
+    request(identifier)
+        || document
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(request)
+        || message_text(document).is_ok_and(|text| {
+            crate::sender_header::parse(text.lines().next().unwrap_or_default())
+                .is_some_and(|header| header.sender.starts_with("human@"))
+        })
+}
+
+/// `paths` with the owner's prompts first; each group keeps its queue order (#698
+/// chat-requests-unbatched). A prompt that cannot be read stays with the backlog, where the
+/// drain quarantines it as before. An owner slash command (a chat `/goal`) keeps its place too:
+/// it waits for an idle pane, and at the head it would hold back older backlog that a working
+/// pane can take.
+fn owner_first(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let (owner, backlog): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|path| {
+        message_id_from_path(path).is_ok_and(|identifier| {
+            load_message(path).is_ok_and(|document| {
+                owner_prompt(&identifier, &document)
+                    && message_text(&document).is_ok_and(|text| !text.trim_start().starts_with('/'))
+            })
+        })
+    });
+    owner.into_iter().chain(backlog).collect()
+}
+
 fn message_text(document: &Map<String, Value>) -> AgentResult<String> {
     document
         .get("text")
@@ -4374,13 +4422,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.delivered.len(), 2);
-        // Backlog into a working pane is one combined prompt, not a burst of steers
-        // (#697 send-muse-while-working).
+        // Batching is off by default (#698 chat-requests-unbatched): each queued prompt is
+        // its own steer.
         assert_eq!(
             fake.screen.as_ref().unwrap().state().steered,
             [
                 "codex receives a follow-up",
-                "2 queued messages:\n\nsecond follow-up\n\nthird follow-up"
+                "second follow-up",
+                "third follow-up"
             ]
         );
 
@@ -4404,10 +4453,211 @@ mod tests {
         );
     }
 
+    /// [`while_working`] with the internal backlog batching of #697 send-muse-while-working on.
+    fn while_working_batched() -> DrainOptions {
+        DrainOptions {
+            batch_working_backlog: true,
+            ..while_working()
+        }
+    }
+
+    /// A chat-bridge request's queue ID, `chat-<key>`.
+    fn chat_request_id(fill: char) -> String {
+        format!("chat-{}", fill.to_string().repeat(64))
+    }
+
+    /// Queues, oldest first: agent note a, an owner chat request, agent note b, owner console
+    /// input, agent note c. Returns the chat request's ID.
+    fn enqueue_owner_among_backlog(root: &Path) -> String {
+        let chat = chat_request_id('a');
+        enqueue(root, "[from a via agentctl] note a", Some("note-a")).unwrap();
+        enqueue(root, "The owner asks: status?", Some(&chat)).unwrap();
+        enqueue(root, "[from b via agentctl] note b", Some("note-b")).unwrap();
+        enqueue(
+            root,
+            "[from human@host-a via agentctl]\nconsole note",
+            Some("console"),
+        )
+        .unwrap();
+        enqueue(root, "[from c via agentctl] note c", Some("note-c")).unwrap();
+        chat
+    }
+
     #[test]
-    fn a_working_pane_backlog_is_typed_as_one_combined_prompt() {
-        // #697 send-muse-while-working: queued prompts behind a running turn arrive as a
-        // single readable batch with every sender text intact, not a burst of steers.
+    fn by_default_a_working_pane_gets_every_prompt_on_its_own_with_the_owner_first() {
+        // #698 chat-requests-unbatched: batching is off by default, so every queued prompt is
+        // typed individually, and the owner's prompts (the chat request and console input) go
+        // ahead of the agent backlog that was queued before them.
+        let directory = TestDirectory::new("working-unbatched");
+        let (fake, target) =
+            working_claude(crate::submission::fake::FakeScreen::new("claude", true));
+        let chat = enqueue_owner_among_backlog(directory.path());
+        let result = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            while_working(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.delivered,
+            [chat.as_str(), "console", "note-a", "note-b", "note-c"],
+            "{result:?}"
+        );
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.pastes.len(), 5);
+        assert_eq!(
+            screen.queued,
+            [
+                "The owner asks: status?",
+                "[from human@host-a via agentctl]\nconsole note",
+                "[from a via agentctl] note a",
+                "[from b via agentctl] note b",
+                "[from c via agentctl] note c",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_idle_pane_also_gets_the_owner_prompt_ahead_of_older_backlog() {
+        // #698 chat-requests-unbatched: owner-first order holds whatever the pane's state. The
+        // bridge's own reply reminder is not the owner's and keeps its place in the queue.
+        let directory = TestDirectory::new("idle-owner-first");
+        let fake = FakeAgent::new(&["idle"]);
+        let chat = chat_request_id('b');
+        let reminder = format!("chat-reminder-{}", "e".repeat(64));
+        enqueue(directory.path(), "bridge reminder", Some(&reminder)).unwrap();
+        enqueue(directory.path(), "older agent note", Some("older")).unwrap();
+        enqueue(directory.path(), "owner request", Some(&chat)).unwrap();
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.delivered,
+            [chat.as_str(), reminder.as_str(), "older"],
+            "{result:?}"
+        );
+        assert_eq!(
+            fake.runs(),
+            ["owner request", "bridge reminder", "older agent note"]
+        );
+    }
+
+    #[test]
+    fn owner_first_covers_both_inboxes_and_a_one_item_drain_but_not_a_slash_command() {
+        // #698 chat-requests-unbatched: an owner request in inbox.v2 still goes ahead of older
+        // backlog in inbox, and a drain limited to one prompt types the owner's. An owner slash
+        // command (a chat `/goal`) keeps its queue place, since it waits for an idle pane and
+        // at the head would hold back backlog a working pane can take.
+        let directory = TestDirectory::new("owner-first-lanes");
+        let root = directory.path();
+        let goal = chat_request_id('c');
+        let chat = chat_request_id('d');
+        enqueue(root, "/goal ship it", Some(&goal)).unwrap();
+        enqueue(root, "older agent note", Some("older")).unwrap();
+        enqueue_internal(
+            root,
+            "owner request, expiring",
+            Some(&chat),
+            true,
+            Some(now_millis() + 3_600_000),
+            &SystemRuntime::default(),
+        )
+        .unwrap();
+        assert!(root.join(format!("inbox.v2/{chat}.json")).exists());
+        let fake = FakeAgent::new(&["idle"]);
+        let one = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions {
+                max_items: Some(1),
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(one.delivered, [chat.as_str()], "{one:?}");
+        let rest = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(rest.delivered, [goal.as_str(), "older"], "{rest:?}");
+        assert_eq!(
+            fake.runs(),
+            [
+                "owner request, expiring",
+                "/goal ship it",
+                "older agent note"
+            ]
+        );
+    }
+
+    #[test]
+    fn with_batching_on_owner_prompts_stay_out_of_the_batch_and_go_first() {
+        // #698 chat-requests-unbatched: even with the internal batch option, a batch never
+        // holds an owner prompt; each owner prompt is its own submission, so the bridge's
+        // delivered mark is set by that submission alone, while one inflight item exists.
+        let directory = TestDirectory::new("working-batch-owner");
+        let fake = FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("codex", true));
+        {
+            let mut state = fake.state.lock().expect("fake state");
+            state.states.clear();
+            state.last_state = "working".to_owned();
+        }
+        let chat = enqueue_owner_among_backlog(directory.path());
+        let runtime = PrintNotingRuntime {
+            queue: Some(directory.path().to_owned()),
+            ..PrintNotingRuntime::default()
+        };
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            while_working_batched(),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            result.delivered,
+            [chat.as_str(), "console", "note-a", "note-b", "note-c"],
+            "{result:?}"
+        );
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().steered,
+            [
+                "The owner asks: status?".to_owned(),
+                "[from human@host-a via agentctl]\nconsole note".to_owned(),
+                "3 queued messages:\n\n[from a via agentctl] note a\n\n\
+                 [from b via agentctl] note b\n\n[from c via agentctl] note c"
+                    .to_owned(),
+            ]
+        );
+        let printed = runtime.printed.lock().unwrap().clone();
+        let when = runtime.queue_when_printed.lock().unwrap().clone();
+        let position = printed
+            .iter()
+            .position(|id| *id == chat)
+            .expect("the chat request is reported printed");
+        assert_eq!(position, 0, "{printed:?}");
+        assert_eq!(when[position], (1, 0), "{when:?}");
+    }
+
+    #[test]
+    fn with_the_internal_option_a_working_pane_backlog_is_typed_as_one_combined_prompt() {
+        // #697 send-muse-while-working, now behind the internal batch_working_backlog option
+        // (#698 chat-requests-unbatched): queued prompts behind a running turn arrive as a
+        // single batch with every sender text intact, not a burst of steers.
         let directory = TestDirectory::new("working-batch");
         let (fake, target) =
             working_claude(crate::submission::fake::FakeScreen::new("claude", true));
@@ -4428,7 +4678,7 @@ mod tests {
             &fake,
             &target,
             directory.path(),
-            while_working(),
+            while_working_batched(),
             &FakeRuntime::default(),
         )
         .unwrap();
@@ -4460,8 +4710,14 @@ mod tests {
         enqueue(directory.path(), "first astray", Some("astray-a")).unwrap();
         enqueue(directory.path(), "second astray", Some("astray-b")).unwrap();
         let runtime = FakeRuntime::default();
-        let first = drain_with_runtime(&fake, &target, directory.path(), while_working(), &runtime)
-            .unwrap();
+        let first = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            while_working_batched(),
+            &runtime,
+        )
+        .unwrap();
         assert_eq!(first.quarantined, Vec::<String>::new(), "{first:?}");
         assert_eq!(first.pending, ["astray-a", "astray-b"], "{first:?}");
         let pending = json_paths(&directory.path().join("inbox")).unwrap();
@@ -4475,9 +4731,14 @@ mod tests {
             );
             assert_eq!(document["delivery_state"], "pending", "{document}");
         }
-        let second =
-            drain_with_runtime(&fake, &target, directory.path(), while_working(), &runtime)
-                .unwrap();
+        let second = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            while_working_batched(),
+            &runtime,
+        )
+        .unwrap();
         assert_eq!(second.quarantined, ["astray-a", "astray-b"], "{second:?}");
         let failed = json_paths(&directory.path().join("failed")).unwrap();
         assert_eq!(failed.len(), 2);
