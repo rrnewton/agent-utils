@@ -1,10 +1,11 @@
 ---
 title: 'muse-bridge-rescan-intake: Slack rescans hold live messages and spend the owner''s rate limit'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-29T15:54:23.496721519+00:00
-updated_at: 2026-10-29T15:54:23.496721519+00:00
+updated_at: 2026-10-29T17:37:24.170343356+00:00
+closed_at: 2026-10-29T17:37:24.170343136+00:00
 ---
 
 # Description
