@@ -285,8 +285,15 @@ def _muse_status_mode(line: str) -> str | None:
     never checked against a list: the owner launches in YOLO as a matter of course, and an
     unknown model, effort or mode must not make an idle editor read as busy. The mode returned is
     the fourth field, or ``standard`` when Muse shows only three.
+
+    Rows of Muse's terminals panel (its ``main · ↓ to select`` header and its ``├``/``└`` tree
+    rows, which list background shells and sub-agents) are never footers (#678
+    muse-bridge-latency).
     """
-    footer, _notice = _muse_split_notice(line.strip())
+    stripped = line.strip()
+    if stripped.startswith(("├", "└", "│")) or "↓ to select" in stripped:
+        return None
+    footer, _notice = _muse_split_notice(stripped)
     fields = [field.strip() for field in footer.split("·")]
     if len(fields) < 3 or not all(fields):
         return None

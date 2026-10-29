@@ -135,6 +135,11 @@ fn split_notice(line: &str) -> (&str, Option<&str>) {
     (line, None)
 }
 
+/// Glyphs that open a row of Muse's terminals panel.
+const PANEL_ROW_GLYPHS: [char; 3] = ['├', '└', '│'];
+/// The hint on the header row of Muse's terminals panel.
+const PANEL_HEADER_HINT: &str = "↓ to select";
+
 /// Return the mode of one structurally valid Muse footer line, or `None` for any other line.
 ///
 /// The footer is recognized by its structure alone: at least three non-empty `·`-separated
@@ -143,8 +148,18 @@ fn split_notice(line: &str) -> (&str, Option<&str>) {
 /// approval mode are never checked against a list: the owner launches in YOLO as a matter of
 /// course, and an unknown model, effort or mode must not make an idle editor read as busy. The
 /// mode returned is the fourth field, or `standard` when Muse shows only three.
+///
+/// Rows of Muse's terminals panel, which sits between the bottom rule and the footer while a
+/// background shell or a sub-agent exists, are never footers: its `main · ↓ to select` header and
+/// its tree rows (`└ ◇ counter ·3  shared · Run the shell command ...`), whose `·` fields would
+/// otherwise make a second footer and hide the editor for as long as a sub-agent runs (#678
+/// muse-bridge-latency).
 fn muse_status_mode(line: &str) -> Option<String> {
-    let (footer, _) = split_notice(strip(line));
+    let line = strip(line);
+    if line.starts_with(PANEL_ROW_GLYPHS) || line.contains(PANEL_HEADER_HINT) {
+        return None;
+    }
+    let (footer, _) = split_notice(line);
     let fields = footer.split('·').map(strip).collect::<Vec<_>>();
     if fields.len() < 3 || fields.iter().any(|field| field.is_empty()) {
         return None;

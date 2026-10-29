@@ -454,6 +454,19 @@ def test_a_running_muse_turn_is_never_an_idle_composer() -> None:
     assert client_module.muse_idle_composer(finished)
 
 
+def test_a_muse_terminals_panel_row_is_never_a_second_footer() -> None:
+    # #678 muse-bridge-latency: a sub-agent's panel row has `·` fields like a footer.
+    rule = "────────────────\n"
+    screen = (
+        "❯ count the docs\n◆ Worked for 40s\n"
+        f"{rule}❯\n{rule}"
+        "main · ↓ to select\n"
+        "└ ◇ counter ·3  shared · Run the shell command `sleep 30`, then count  0s\n"
+        "  watermelon-full-preview · medium · /work/project · Launch overrides\n"
+    )
+    assert muse_verified_process_idle_composer(screen)
+
+
 def test_verified_headerless_muse_composer_distinguishes_buffered_input() -> None:
     divider = "─" * 40
     footer = "kiki · xhigh · /work/project · YOLO\n"
