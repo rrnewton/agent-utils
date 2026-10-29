@@ -18687,7 +18687,109 @@ def _process_state(identity: ProcessIdentity | None) -> tuple[str, str]:
     return "dead", f"PID {identity.pid} was reused; the recorded generation exited"
 
 
-def _link_target(path: Path) -> Path | None:
+def _find_inode_in_slot(target_dev: int, target_ino: int, slot_path: Path) -> Path | None:
+    """Return the slot path holding one inode, or None when it is not there.
+
+    This is the identity proof of last resort for an overlong descriptor
+    target, so it runs only for that rare descriptor.  A part of the slot
+    that cannot be searched makes the answer indeterminate for that one
+    descriptor rather than for every slot on the host.
+    """
+
+    pending = [slot_path]
+    incomplete = False
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            incomplete = True
+            continue
+        for entry in entries:
+            entry_path = Path(entry.path)
+            try:
+                identity = entry.stat(follow_symlinks=False)
+            except OSError:
+                incomplete = True
+                continue
+            if (identity.st_dev, identity.st_ino) == (target_dev, target_ino):
+                return entry_path
+            if stat.S_ISDIR(identity.st_mode):
+                pending.append(entry_path)
+                continue
+            try:
+                followed = entry.stat(follow_symlinks=True)
+            except OSError:
+                incomplete = True
+                continue
+            if (followed.st_dev, followed.st_ino) == (target_dev, target_ino):
+                return entry_path
+    if incomplete:
+        raise Refusal(
+            f"process use is indeterminate because an overlong descriptor target "
+            f"on the slot's device could not be searched for in {slot_path}"
+        )
+    return None
+
+
+def _resolve_overlong_link(path: Path, slot_path: Path) -> Path | None:
+    """Decide by identity where an overlong link target lies.
+
+    ``readlink`` on ``/proc/<pid>/fd/<n>`` fails with ``ENAMETOOLONG`` when
+    the target path exceeds the kernel buffer, however deep that target is.
+    That one descriptor must not make every slot on the host indeterminate.
+    Stat the descriptor (which follows it to its target), try to resolve it
+    through an ``O_PATH`` handle in our own fd table, and finally search the
+    slot for its inode.  Return the target, or ``None`` when it is proven
+    outside ``slot_path``.  Raise ``Refusal`` only for that one descriptor,
+    and only when it sits on the slot's own device, where it could plausibly
+    be under the slot, and no identity proof can decide it.  A target on a
+    different device that cannot be resolved is not plausibly under the
+    slot root.
+    """
+
+    try:
+        target_stat = os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refusal(
+            f"process use is indeterminate because {path} failed: {exc}"
+        ) from exc
+    try:
+        slot_stat = os.stat(slot_path)
+    except OSError as exc:
+        raise Refusal(
+            f"process use is indeterminate because {slot_path} cannot be inspected: {exc}"
+        ) from exc
+    if (target_stat.st_dev, target_stat.st_ino) == (slot_stat.st_dev, slot_stat.st_ino):
+        return slot_path
+    try:
+        handle = os.open(path, os.O_PATH)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        if target_stat.st_dev != slot_stat.st_dev:
+            return None
+        return _find_inode_in_slot(target_stat.st_dev, target_stat.st_ino, slot_path)
+    try:
+        try:
+            raw = os.readlink(Path("/proc/self/fd") / str(handle))
+        except OSError:
+            if target_stat.st_dev != slot_stat.st_dev:
+                return None
+            return _find_inode_in_slot(target_stat.st_dev, target_stat.st_ino, slot_path)
+    finally:
+        os.close(handle)
+    if raw.endswith(" (deleted)"):
+        raw = raw[: -len(" (deleted)")]
+    target = Path(raw)
+    if not target.is_absolute():
+        return None
+    return Path(os.path.normpath(str(target)))
+
+
+def _link_target(path: Path, slot_path: Path | None = None) -> Path | None:
     try:
         raw = os.readlink(path)
     except FileNotFoundError:
@@ -18699,6 +18801,8 @@ def _link_target(path: Path) -> Path | None:
     except OSError as exc:
         if exc.errno == errno.EINVAL:
             return None
+        if exc.errno == errno.ENAMETOOLONG and slot_path is not None:
+            return _resolve_overlong_link(path, slot_path)
         raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
     if raw.endswith(" (deleted)"):
         raw = raw[: -len(" (deleted)")]
@@ -18725,7 +18829,7 @@ def _process_uses_slot(
 
     def link_target(path: Path) -> Path | None:
         try:
-            return _link_target(path)
+            return _link_target(path, slot_path)
         except Refusal as exc:
             if unreadable_is_no_evidence and isinstance(exc.__cause__, PermissionError):
                 return None
@@ -39438,7 +39542,7 @@ def _capture_agent_remove_batch_census(
     )
 
 
-def _readable_link_target(path: Path) -> str | None:
+def _readable_link_target(path: Path, slot_path: Path | None = None) -> str | None:
     """Return an absolute link target, or None when absent or unreadable.
 
     A link the invoking user may not read is also invisible to lsof run as
@@ -39453,6 +39557,9 @@ def _readable_link_target(path: Path) -> str | None:
             errno.ENOENT, errno.ESRCH, errno.EINVAL, errno.EACCES, errno.EPERM,
         ):
             return None
+        if exc.errno == errno.ENAMETOOLONG and slot_path is not None:
+            resolved = _resolve_overlong_link(path, slot_path)
+            return None if resolved is None else str(resolved)
         raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
     raw = raw.removesuffix(" (deleted)")
     if not raw.startswith("/"):
@@ -39531,7 +39638,7 @@ def _agent_batch_fresh_use(
         uses.extend(mount_verdicts.uses(pid_dir))
         if not uses:
             for name in ("cwd", "root", "exe"):
-                target = _readable_link_target(pid_dir / name)
+                target = _readable_link_target(pid_dir / name, slot_path)
                 if within(target):
                     uses.append(f"{name}={target}")
                     break
@@ -39548,7 +39655,7 @@ def _agent_batch_fresh_use(
                     ) from exc
                 descriptors = []
             for descriptor in descriptors:
-                target = _readable_link_target(fd_dir / descriptor)
+                target = _readable_link_target(fd_dir / descriptor, slot_path)
                 if within(target):
                     uses.append(f"fd/{descriptor}={target}")
                     break
@@ -55641,8 +55748,16 @@ def _direct_process_identity_matches(
             nonlocal vanished
             budget.consume_observation()
             budget.remaining_seconds()
+            raw_target: str | None
             try:
-                raw_target = os.readlink(path)
+                try:
+                    raw_target = os.readlink(path)
+                except OSError as exc:
+                    if exc.errno != errno.ENAMETOOLONG:
+                        raise
+                    # An overlong target cannot be named, but the inode
+                    # identity below still decides whether it is a target.
+                    raw_target = None
                 metadata = path.stat()
             except FileNotFoundError:
                 if transient:
@@ -55674,12 +55789,14 @@ def _direct_process_identity_matches(
                     )
                 vanished = True
                 return False
-            observed_path = Path(
-                os.path.normpath(raw_target.removesuffix(" (deleted)"))
-            )
-            matched = _matching_absent_validate_target(
-                observed_path, targets, match_cache
-            )
+            matched = None
+            if raw_target is not None:
+                observed_path = Path(
+                    os.path.normpath(raw_target.removesuffix(" (deleted)"))
+                )
+                matched = _matching_absent_validate_target(
+                    observed_path, targets, match_cache
+                )
             if matched is not None:
                 _target, slot = matched
                 process_link_matches.append(
