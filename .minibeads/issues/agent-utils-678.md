@@ -1,10 +1,11 @@
 ---
 title: 'muse-bridge-latency: Muse delivery, idle detection and steer recovery for the chat bridge'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-10-29T12:16:15.148946519+00:00
-updated_at: 2026-10-29T12:16:15.148946519+00:00
+updated_at: 2026-10-29T15:54:36.772367075+00:00
+closed_at: 2026-10-29T15:54:36.772366965+00:00
 ---
 
 # Description

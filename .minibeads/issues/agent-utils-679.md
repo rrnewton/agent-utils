@@ -1,10 +1,11 @@
 ---
 title: 'muse-bridge-study: measure Muse delivery latency and idle detection through the chat bridge'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-10-29T12:16:20.688100471+00:00
-updated_at: 2026-10-29T12:16:20.688100471+00:00
+updated_at: 2026-10-29T15:54:36.776437403+00:00
+closed_at: 2026-10-29T15:54:36.776437263+00:00
 ---
 
 # Description
