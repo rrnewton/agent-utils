@@ -25,8 +25,9 @@ static MARKERS: ScreenMarkers = ScreenMarkers {
     reply_bullets: &['◆'],
     user_turn_glyphs: &['❯'],
     tool_output_glyphs: &['└'],
-    // `◆`/`◇` open its running row (`◇ Calling tools (30s · esc to interrupt)`).
-    running_glyphs: &['◆', '◇'],
+    // `◆`/`◇`/`◈` open its running row (`◇ Calling tools (30s · esc to interrupt)`), which
+    // animates through all three.
+    running_glyphs: &['◆', '◇', '◈'],
     // Attribution not recorded where the placeholder was added; kept with the editor it most
     // resembles.
     composer_placeholders: &["Type your message"],
@@ -308,6 +309,103 @@ fn read_transcript(lines: &[&[u8]], activity: &mut super::transcript::Activity) 
     );
 }
 
+/// Muse's journal, read forward from a point fixed before a prompt is submitted, for the proof
+/// that Muse accepted that prompt (#678 muse-bridge-latency).
+///
+/// Muse writes `runtime.user_intent.accepted`, with the prompt's exact text, the moment it takes
+/// a submitted or steered prompt, while it may draw the user turn only seconds later, after the
+/// tool call in flight. A steer Muse refuses (`! steer failed: ...`, the prompt put back in the
+/// editor) writes no such record.
+pub(crate) struct JournalWatch {
+    path: PathBuf,
+    offset: u64,
+    carry: Vec<u8>,
+}
+
+/// The most journal bytes one [`JournalWatch::accepted`] call reads; a turn writes far less
+/// between two polls.
+const JOURNAL_READ_LIMIT: u64 = 16 * 1024 * 1024;
+
+impl JournalWatch {
+    /// Start watching the journal of the Muse runtime under process `pid` (the launcher or the
+    /// runtime itself) at its current end. `None` when no journal can be found.
+    pub(crate) fn start(pid: u32) -> Option<Self> {
+        let home = super::home();
+        let path = transcript_path(&super::transcript::Hints {
+            session: None,
+            cwd: None,
+            home: home.as_deref(),
+            pid: Some(pid),
+            proc: Some(&crate::work_state::LinuxProc),
+        })?;
+        Self::at_end(path)
+    }
+
+    /// Start watching `path` at its current end.
+    pub(crate) fn at_end(path: PathBuf) -> Option<Self> {
+        let offset = std::fs::metadata(&path).ok()?.len();
+        Some(Self {
+            path,
+            offset,
+            carry: Vec::new(),
+        })
+    }
+
+    /// Whether the journal, since the watch started, records `prompt` as a user intent Muse
+    /// accepted. Text is compared with runs of whitespace collapsed, as the screen proofs do.
+    pub(crate) fn accepted(&mut self, prompt: &str) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return false;
+        };
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return false;
+        }
+        let mut chunk = Vec::new();
+        let Ok(read) = file.take(JOURNAL_READ_LIMIT).read_to_end(&mut chunk) else {
+            return false;
+        };
+        self.offset += read as u64;
+        self.carry.extend_from_slice(&chunk);
+        let Some(end) = self.carry.iter().rposition(|byte| *byte == b'\n') else {
+            return false;
+        };
+        let complete: Vec<u8> = self.carry.drain(..=end).collect();
+        let wanted = collapse(prompt);
+        complete
+            .split(|byte| *byte == b'\n')
+            .filter(|line| {
+                line.windows(ACCEPTED.len())
+                    .any(|window| window == ACCEPTED.as_bytes())
+            })
+            .flat_map(records)
+            .any(|record| {
+                record["payload_type"] == ACCEPTED && accepted_text(&record) == Some(wanted.clone())
+            })
+    }
+}
+
+/// The journal record of a user intent Muse accepted.
+const ACCEPTED: &str = "runtime.user_intent.accepted";
+
+/// The text of an accepted user intent, its text blocks joined, whitespace collapsed.
+fn accepted_text(record: &serde_json::Value) -> Option<String> {
+    let messages = record["payload"]["model_messages"].as_array()?;
+    let text: Vec<&str> = messages
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|block| block["kind"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    (!text.is_empty()).then(|| collapse(&text.join("\n")))
+}
+
+/// Words separated by single spaces.
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::transcript::{Activity, Hints, ToolLimit};
@@ -402,5 +500,45 @@ mod tests {
         };
         assert_eq!(transcript_path(&hints), Some(own.join("session.jsonl")));
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn the_journal_watch_sees_only_an_accepted_intent_with_the_prompt_written_after_it_started() {
+        let dir = std::env::temp_dir().join(format!("agentctl-muse-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let accepted = |text: &str| {
+            serde_json::json!({
+                "payload_type": "runtime.user_intent.accepted",
+                "payload": {"model_messages": [{"content": [{"kind": "text", "text": text}]}]},
+            })
+            .to_string()
+        };
+        let prompt = "hold: stop after the current step\nand report";
+        // Accepted before the watch started: not this submission.
+        std::fs::write(&path, format!("{}\n", accepted(prompt))).unwrap();
+        let mut watch = JournalWatch::at_end(path.clone()).unwrap();
+        assert!(!watch.accepted(prompt));
+        let append = |line: String| {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(line.as_bytes()).unwrap();
+        };
+        // Another prompt, and a steer queued (not an accepted intent) with this one's text.
+        append(format!("{}\n", accepted("something else")));
+        append(format!(
+            "{}\n",
+            serde_json::json!({"payload_type": "runtime.session", "payload": {"event": {"kind": "inbox_item_queued", "body": prompt}}})
+        ));
+        assert!(!watch.accepted(prompt));
+        // Half a line is kept until its newline arrives; a transaction frame's children count,
+        // and whitespace is compared collapsed.
+        let frame = serde_json::json!({"children": [{"record_json": accepted("hold:  stop after the current step and report")}]}).to_string();
+        let (head, tail) = frame.split_at(frame.len() / 2);
+        append(head.to_owned());
+        assert!(!watch.accepted(prompt));
+        append(format!("{tail}\n"));
+        assert!(watch.accepted(prompt));
+        std::fs::remove_dir_all(dir).ok();
     }
 }

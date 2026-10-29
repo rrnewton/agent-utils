@@ -25,3 +25,12 @@ dropped, trailing blanks were trimmed, and the session directory was replaced by
 | `muse-interrupting.txt` | Esc with a draft staged: the turn is interrupted (`interrupting run`) and the queued input submitted. |
 | `muse-wrapped-draft.txt` | A long paste staged mid-turn, wrapped inside `odd/places`. |
 | `muse-overlong-token-draft.txt` | A 210-character token wrapped mid-word. |
+
+Two more frames come from a Muse 1.4.15 session on 2026-10-29 (#678 muse-bridge-latency),
+launched the same way with an active `/goal`; only the last 24 rows were kept and the session
+directory was replaced by `~/work/project`.
+
+| File | What the session was doing |
+|---|---|
+| `muse-foreground-hint.txt` | A foreground command inside the goal turn: its progress row, then `└ (ctrl+b to send to background)` as the last transcript row. |
+| `muse-steer-failed.txt` | A 1635-character prompt steered during that command: Muse reported `! steer failed: ...` and put the prompt back in the editor as `[Pasted Content 1635 chars]`. |

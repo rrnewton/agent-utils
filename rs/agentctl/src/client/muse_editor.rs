@@ -183,22 +183,31 @@ fn muse_composer_regions(screen: &str, require_header: bool) -> Option<(String, 
     Some((lines[..top].join("\n"), lines[top + 1..bottom].join("\n")))
 }
 
-/// Markers of the progress line Muse 1.4 draws right above its editor while a turn runs.
-const PROGRESS_MARKERS: [&str; 2] = ["◇", "◈"];
+/// Markers of the progress row Muse 1.4 draws above its editor while a turn runs. The row
+/// animates through all three (`◇ Thinking`, `◈ Double checking`, `◆ Calling tools`), so a
+/// reader that knows only some of them misreads a running turn as idle on the other frames.
+const PROGRESS_MARKERS: [&str; 3] = ["◆", "◇", "◈"];
 
-/// Whether the transcript ends in Muse's progress line, so a turn is still running.
+/// Transcript rows above the editor searched for Muse's running-turn row.
+const PROGRESS_ROWS: usize = 16;
+
+/// Whether the rows above Muse's editor show its running-turn row near the bottom, so a turn is
+/// still running.
 ///
-/// Muse 1.4 keeps its editor empty and drawn while it works, with `◇ Thinking (3s · esc to
-/// interrupt)` or `◈ Double checking (1s · esc to interrupt)` as the last transcript line, so
-/// that line, not the editor, says whether a turn is running.
+/// Muse 1.4 keeps its editor empty and drawn while it works, with a progress row such as
+/// `◇ Thinking (3s · esc to interrupt)` above it, so that row, not the editor, says whether a
+/// turn is running. It is not always the last row: Muse draws a foreground command's output and
+/// hint below it (`└ (ctrl+b to send to background)`), and a `◆ Queued input` block. The
+/// post-turn `◈ Double checking (1m 35s · esc to interrupt)` phase is a running turn too, during
+/// which Herdr already reports the pane done (#678 muse-bridge-latency).
 fn muse_turn_running(transcript: &str) -> bool {
     splitlines(transcript)
         .into_iter()
         .map(strip)
-        .rfind(|line| !line.is_empty())
-        .is_some_and(|line| {
-            starts_with_marker(line, &PROGRESS_MARKERS) && line.ends_with("esc to interrupt)")
-        })
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(PROGRESS_ROWS)
+        .any(|line| starts_with_marker(line, &PROGRESS_MARKERS) && line.contains("esc to interrupt)"))
 }
 
 /// An empty editor below a transcript that does not end in Muse's progress line.
@@ -515,9 +524,6 @@ pub(crate) fn muse_verified_process_prompt_transcript_count(screen: &str, text: 
 // Rust-only helpers for follow-ups typed into a running Muse turn (#505 agentctl-muse-followup).
 // The Python edition still waits for an idle editor, so nothing in py/agentctl mirrors them.
 
-/// Transcript rows above the editor searched for Muse's running-turn row.
-const FOLLOWUP_PROGRESS_ROWS: usize = 16;
-
 /// The rows of Muse's editor as drawn, each without trailing blanks, after live-Muse process
 /// verification; `None` when the screen shows no ruled region whose first row starts with a
 /// prompt marker, above exactly one status footer.
@@ -548,17 +554,7 @@ pub(crate) fn muse_editor_rows_empty(rows: &str) -> bool {
 /// (`└ tick 2 (ctrl+b to send to background)`), a `◆ Queued input` block, or the row in its
 /// `◆` animation phase (`◆ Calling tools (26s · esc to interrupt)`).
 pub(crate) fn muse_verified_process_turn_in_progress(screen: &str) -> bool {
-    muse_composer_regions(screen, false).is_some_and(|(transcript, _)| {
-        splitlines(&transcript)
-            .into_iter()
-            .map(strip)
-            .filter(|line| !line.is_empty())
-            .rev()
-            .take(FOLLOWUP_PROGRESS_ROWS)
-            .any(|line| {
-                starts_with_marker(line, &["◆", "◇", "◈"]) && line.contains("esc to interrupt)")
-            })
-    })
+    muse_composer_regions(screen, false).is_some_and(|(transcript, _)| muse_turn_running(&transcript))
 }
 
 #[cfg(test)]

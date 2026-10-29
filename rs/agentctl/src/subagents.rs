@@ -2255,6 +2255,17 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         })
     }
 
+    /// Start watching the pinned Muse process's journal at its current end, when the record
+    /// names that process and its journal can be found.
+    fn muse_journal(&self) -> Option<crate::harness::muse::JournalWatch> {
+        let identity = match self.record.adapter.as_str() {
+            "herdr-pane" => self.record.custom_process_identity.as_ref(),
+            "tmux" => self.record.harness_anchor(),
+            _ => None,
+        }?;
+        crate::harness::muse::JournalWatch::start(u32::try_from(identity.pid).ok()?)
+    }
+
     /// Read the visible screen between two checks of the pinned Muse process.
     fn verified_muse_screen(
         &self,
@@ -2318,12 +2329,14 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// turn with Enter, and prove from the screen that Muse took it (#505
     /// agentctl-muse-followup).
     ///
-    /// Muse prints a steered prompt at once as a new user turn above its editor, so the proof is
-    /// the same as for an idle editor: one more exact copy of the prompt as a user turn than the
-    /// staged screen showed, and the prompt gone from the editor. Enter is pressed again, with a
-    /// doubling wait, only while the exact prompt is still staged. A prompt still staged when the
-    /// submission deadline passes is taken back out of the editor and reported as not typed, so
-    /// it stays pending; if that fails, or the prompt left the editor without the proof, the
+    /// The proof is one more exact copy of the prompt as a user turn above the editor than the
+    /// staged screen showed, with the prompt gone from the editor, or Muse's journal recording
+    /// the prompt as an accepted user intent: Muse writes that at once, but can draw a steered
+    /// turn only after the tool call in flight ends (#678 muse-bridge-latency). Enter is pressed
+    /// again, with a doubling wait, only while the exact prompt is still staged, which is also
+    /// where Muse puts a steer it refused. A prompt still staged when the submission deadline
+    /// passes is taken back out of the editor and reported as not typed, so it stays pending and
+    /// is retried; if that fails, or the prompt left the editor without either proof, the
     /// outcome is unknown and the caller treats the prompt as possibly submitted.
     fn muse_followup(
         &self,
@@ -2371,6 +2384,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             runtime.sleep(POLL);
         };
         let prior = muse_verified_process_prompt_transcript_count(&staged, text);
+        let mut journal = self.muse_journal();
         guarded.send_keys(pane_id, "Enter")?;
         let pressed = runtime.monotonic();
         let mut presses: u32 = 1;
@@ -2383,23 +2397,35 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             }
             let screen = self.verified_muse_screen(pane_id, runtime)?;
             let now = runtime.monotonic();
-            if screen != staged
+            let evidence = if screen != staged
                 && muse_verified_process_prompt_transcript_count(&screen, text) > prior
                 && !muse_verified_process_paste_in_composer(&screen, text)
             {
+                Some("prompt appeared above the Muse editor as a new user turn")
+            } else if journal.as_mut().is_some_and(|watch| watch.accepted(text)) {
+                // Muse took the prompt but draws the turn only after the tool call in flight.
+                Some("Muse's journal records the prompt as an accepted user intent")
+            } else {
+                None
+            };
+            if let Some(evidence) = evidence {
                 return Ok(Submission::Verified(crate::submission::SubmissionReceipt {
                     key: "Enter",
                     key_presses: presses,
                     elapsed: now.saturating_sub(started),
-                    evidence: "prompt appeared above the Muse editor as a new user turn".to_owned(),
+                    evidence: evidence.to_owned(),
                     printed: true,
                     settled: true,
                 }));
             }
             let still_staged = muse_verified_process_paste_is_exact_composer(&screen, text);
             if now.saturating_sub(pressed) >= SUBMIT_TIMEOUT {
-                if still_staged && runtime.withdraw_unaccepted_prompt() {
-                    return self.withdraw_muse_followup(
+                // A prompt that is still the whole editor was not taken: Muse puts a steer it
+                // refuses (`! steer failed: ...`) back there. Left in place it would refuse every
+                // later prompt as a draft until the turn ends, which under a goal can be hours,
+                // so it is always taken back out and retried later (#678 muse-bridge-latency).
+                if still_staged {
+                    let withdrawn = self.withdraw_muse_followup(
                         &guarded,
                         pane_id,
                         text,
@@ -2408,14 +2434,24 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                         now.saturating_sub(started),
                         runtime,
                     );
+                    if matches!(withdrawn, Ok(Submission::NotStaged(_)))
+                        && journal.as_mut().is_some_and(|watch| watch.accepted(text))
+                    {
+                        return unknown(
+                            "Muse's journal records the prompt as accepted while it was taken \
+                             back out of the editor",
+                        );
+                    }
+                    return withdrawn;
                 }
                 return unknown(&format!(
-                    "the prompt {} after {presses} Enter key press(es), without a new user turn \
-                     above the Muse editor",
-                    if still_staged {
-                        "is still staged in the Muse editor"
+                    "the prompt left the Muse editor or the editor is not recognisable after \
+                     {presses} Enter key press(es), without a new user turn above the Muse \
+                     editor{}",
+                    if journal.is_some() {
+                        " or an accepted intent in Muse's journal"
                     } else {
-                        "left the Muse editor or the editor is not recognisable"
+                        ""
                     }
                 ));
             }
@@ -4194,12 +4230,13 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 return self.submit_goal_command(pane_id, text, argument, runtime);
             }
         }
-        // A queue drain that found the pane working passes a follow-up key; a Muse pane then
-        // takes an ordinary prompt by steering its running turn (#505 agentctl-muse-followup).
-        if self.uses_muse_composer()
-            && !text.trim_start().starts_with('/')
-            && runtime.followup_key().is_some()
-        {
+        // A Muse pane takes an ordinary prompt by steering its running turn (#505
+        // agentctl-muse-followup), and the same paste and Enter submits it to an idle editor.
+        // That path proves its own submission and takes back a prompt Muse refused, so it is
+        // used whether or not the pane looked busy: a busy Muse can read idle for a moment, and
+        // then a 5 s idle-to-working wait expired before Muse drew the turn (#678
+        // muse-bridge-latency).
+        if self.uses_muse_composer() && !text.trim_start().starts_with('/') {
             return self.muse_followup(pane_id, text, runtime);
         }
         // Custom panes verify through their own composer model, and slash

@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(glyphs, expected);
         let mut glyphs = running_glyphs().to_vec();
         glyphs.sort_unstable();
-        let mut expected = vec!['•', '◦', '◆', '◇', '✻', '✽', '✶', '✳', '✢', '*'];
+        let mut expected = vec!['•', '◦', '◆', '◇', '◈', '✻', '✽', '✶', '✳', '✢', '*'];
         expected.sort_unstable();
         assert_eq!(glyphs, expected);
         let mut placeholders = composer_placeholders().to_vec();

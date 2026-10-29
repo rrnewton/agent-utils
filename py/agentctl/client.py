@@ -144,19 +144,28 @@ def muse_trust_prompt(screen: str) -> bool:
     )
 
 
-def _muse_turn_running(transcript: str) -> bool:
-    """Whether the transcript ends in Muse's progress line, so a turn is still running.
+# Markers of the progress row Muse 1.4 draws above its editor while a turn runs. The row
+# animates through all three, so a reader that knows only some misreads a running turn as idle.
+_MUSE_PROGRESS_MARKERS = ("◆", "◇", "◈")
+# Transcript rows above the editor searched for Muse's running-turn row.
+_MUSE_PROGRESS_ROWS = 16
 
-    Muse 1.4 keeps its editor empty and drawn while it works, with ``◇ Thinking (3s · esc to
-    interrupt)`` or ``◈ Double checking (1s · esc to interrupt)`` as the last transcript line, so
-    that line, not the editor, says whether a turn is running.
+
+def _muse_turn_running(transcript: str) -> bool:
+    """Whether the rows above Muse's editor show its running-turn row near the bottom.
+
+    Muse 1.4 keeps its editor empty and drawn while it works, with a progress row such as
+    ``◇ Thinking (3s · esc to interrupt)`` above it, so that row, not the editor, says whether a
+    turn is running. It is not always the last row: a foreground command's output and hint
+    (``└ (ctrl+b to send to background)``) and a ``◆ Queued input`` block sit below it, and the
+    post-turn ``◈ Double checking`` phase is a running turn too (#678 muse-bridge-latency).
     """
-    last = next(
-        (line.strip() for line in reversed(transcript.splitlines()) if line.strip()), "",
-    )
+    rows = [line.strip() for line in transcript.splitlines() if line.strip()]
     return any(
-        last == marker or last.startswith(marker + " ") for marker in ("◇", "◈")
-    ) and last.endswith("esc to interrupt)")
+        any(line == marker or line.startswith(marker + " ") for marker in _MUSE_PROGRESS_MARKERS)
+        and "esc to interrupt)" in line
+        for line in rows[-_MUSE_PROGRESS_ROWS:]
+    )
 
 
 def _muse_editor_idle(regions: tuple[str, str] | None) -> bool:
