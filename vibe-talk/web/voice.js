@@ -14421,103 +14421,10 @@ function setPromptsOpen(open) {
 // --- the server ------------------------------------------------------------------------------
 
 /**
- * What {@link api} throws: an ordinary Error, plus the facts a caller branches on.
+ * What {@link api} throws. `#624 voice-page-modularity`: web/src/core/api says what each field means.
  *
- * `timedOut` and `shownInPill` are the page's own, from `#195 send-resilience`: the page stopped
- * waiting for the answer, and the freshness pill already says the read failed. `gatewayStatus` is
- * the status of a failed answer that was not this server's JSON — a proxy's own 502 or 504 page —
- * kept apart from `status` so nothing words it as the chat service's failure.
- *
- * @typedef {Error & {
- *   network?: boolean,
- *   refused?: boolean,
- *   status?: number,
- *   code?: string,
- *   detail?: string,
- *   timedOut?: boolean,
- *   shownInPill?: boolean,
- *   gatewayStatus?: number,
- *   body?: unknown,
- * }} ApiRequestError
+ * @typedef {import("./src/core/api/index.ts").ApiRequestError} ApiRequestError
  */
-
-/**
- * One request to vibe-talk, with the token, and one error taxonomy out of it.
- *
- * The server answers with a real taxonomy — 503 `elevenlabs_not_configured` names the exact
- * setting that is missing, 502 `elevenlabs_error` carries the vendor's status and message,
- * including things only the vendor knows, such as an API key that lacks the `convai_write`
- * permission. Flattening that to "could not start" would throw away the only sentence that says
- * what to fix, so all of it is passed through.
- */
-async function api(path, options) {
-  const headers = { Authorization: `Bearer ${token()}` };
-  const init = { method: (options && options.method) || "GET", headers };
-  if (options && options.signal) init.signal = options.signal;
-  // Only when there IS one. A GET with a Content-Type and no body is a request that says it is
-  // carrying JSON and is not, which some proxies treat as a malformed request rather than as a
-  // harmless extra header.
-  if (options && options.body !== undefined) {
-    headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(options.body);
-  }
-  let response;
-  try {
-    response = await fetch(path, init);
-  } catch (cause) {
-    const action = init.method === "GET" ? "loading data" : "saving your change";
-    const error = /** @type {ApiRequestError} */ (new Error(
-      `Could not reach vibe-talk while ${action}. Your current screen is still available; retry when the connection recovers.`
-    ));
-    error.cause = cause;
-    error.network = true;
-    throw error;
-  }
-  const text = await response.text();
-  let payload = null;
-  try {
-    payload = text ? JSON.parse(text) : null;
-  } catch (_error) {
-    const error = /** @type {ApiRequestError} */ (new Error(`vibe-talk returned non-JSON (HTTP ${response.status})`));
-    if (!response.ok) error.gatewayStatus = response.status;
-    throw error;
-  }
-  if (!response.ok) {
-    // The server's error body is part of the wire contract. Anything else on a failed response —
-    // a proxy's page, a gateway's JSON — is not this server speaking, so it names no code of its
-    // own and the status line says so rather than inventing one.
-    const body = VibeTalkContract.is("ApiErrorBody", payload) ? payload : null;
-    const detail = body && body.detail ? body.detail : "(no detail)";
-    const code = body && body.error ? body.error : "error";
-    const error = /** @type {ApiRequestError} */ (new Error(`HTTP ${response.status} ${code}: ${detail}`));
-    // Only these two mean "your token is wrong". Everything else means the server is unhappy for
-    // a reason that signing in again will not fix, and bouncing the owner back to the sign-in
-    // screen for those would be a lie about which thing is broken.
-    error.refused = response.status === 401 || response.status === 403;
-    // A token the server no longer accepts, or a read it refuses, ends this device's copy of
-    // what that token read. A 403 on a WRITE is narrower — a read-only channel — and is not this.
-    if (response.status === 401 || (response.status === 403 && init.method === "GET")) {
-      dropMessageCache();
-    }
-    // THE MACHINE-READABLE HALF, kept rather than folded into the sentence. The server answers
-    // with a taxonomy — `summarizer_not_configured` is a fact about the DEPLOYMENT, while
-    // `summarizer_error` is a fact about one attempt — and a caller that has to tell those apart
-    // would otherwise be matching substrings of prose the server is free to rewrite. The sentence
-    // is for the reader; these two are for the code.
-    error.status = response.status;
-    error.code = code;
-    // ...and the server's own sentence on its own, for the places that want prose rather than a
-    // diagnosis. `error.message` is the right thing on a status line, where the code and the
-    // status are what an operator acts on; it is the wrong thing in a standing sentence that a
-    // reader is meant to understand.
-    error.detail = body && body.detail ? body.detail : "";
-    // ...and the whole answer, for the one refusal that carries the state it refused against: a
-    // bookmark moved meanwhile (409), which says where it is now. `#240 reading-bookmark`.
-    error.body = payload;
-    throw error;
-  }
-  return payload;
-}
 
 /**
  * How many timeline reads the page has sent, of any view, by any path. `remote-ops-audit` W7: see
@@ -14526,12 +14433,49 @@ async function api(path, options) {
 let timelineAnswersAsked = 0;
 
 /**
- * {@link api}, with the answer checked against the wire contract before anything reads it.
+ * The page's requests to vibe-talk (web/src/core/api, `#624 voice-page-modularity`), on the
+ * browser's transport, timers and cancellation, made the first time the page asks anything. A `var`
+ * with no initialiser, so a request made before this line has run finds it undefined rather than in
+ * its dead zone, and this line, when it runs, does not throw away an instance already made.
  *
- * The page and the server ship in one binary, so a body that does not match is a defect — or
- * something between them rewriting it — rather than version skew to tolerate. It fails the way the
- * request itself would have: one error, whose sentence names the type and the field that is wrong,
- * instead of a missing property surfacing as `undefined` somewhere far from the cause.
+ * @type {import("./src/core/api/index.ts").ServerApi | undefined}
+ */
+var serverApi;
+
+/** {@link serverApi}, made if it is not yet. */
+function theServer() {
+  if (!serverApi) {
+    serverApi = createApi(createWebPorts(), {
+      token,
+      // A token the server no longer accepts, or a read it refuses, ends this device's copy of
+      // what that token read.
+      readRefused: dropMessageCache,
+      // `remote-ops-audit` W7. Every timeline read the page sends passes here, and is counted as it
+      // is sent, so a read given up on can tell whether any was sent after it (`abandonedReadStands`).
+      asking: (type) => {
+        if (type === "TimelineResponse") timelineAnswersAsked += 1;
+      },
+      answerer: () => sentenceStart(chatServiceOf(el("discord-channel").value)),
+    });
+  }
+  return serverApi;
+}
+
+/**
+ * One request to vibe-talk, with the token, and one error taxonomy out of it: every field of the
+ * server's error answer passed through (web/src/core/api `request`).
+ *
+ * @param {string} path
+ * @param {import("./src/core/api/index.ts").ApiRequestOptions} [options]
+ * @returns {Promise<any>}
+ */
+function api(path, options) {
+  return theServer().request(path, options);
+}
+
+/**
+ * {@link api}, with the answer checked against the wire contract before anything reads it
+ * (web/src/core/api `decoded`).
  *
  * @template {keyof VibeTalk.Contract} K
  * @param {K} type the contract type the route answers with
@@ -14539,32 +14483,16 @@ let timelineAnswersAsked = 0;
  * @param {{method?: string, body?: unknown, signal?: AbortSignal}} [options]
  * @returns {Promise<VibeTalk.Contract[K]>}
  */
-async function apiDecoded(type, path, options) {
-  // `remote-ops-audit` W7. Every timeline read the page sends passes here, and is counted as it is
-  // sent, so a read given up on can tell whether any was sent after it (`abandonedReadStands`).
-  if (type === "TimelineResponse") timelineAnswersAsked += 1;
-  const payload = await api(path, options);
-  try {
-    return VibeTalkContract.decode(type, payload);
-  } catch (cause) {
-    const error = /** @type {ApiRequestError} */ (new Error(
-      `vibe-talk returned a malformed answer — ${cause.message}. Reload the page; if this persists, ` +
-        `the page and the server disagree about the wire format.`
-    ));
-    error.cause = cause;
-    throw error;
-  }
+function apiDecoded(type, path, options) {
+  return theServer().decoded(type, path, options);
 }
 
 /**
  * A request to vibe-talk that stops waiting after `ms`, failing as a timeout the reader can be
- * told about rather than as a "refreshing…" nobody ends.
- *
- * `#195 send-resilience`. The server bounds its own read of a slow chat service, but at a figure
- * set for the service — fifty seconds, in the incident this was written for — not for a reader
- * looking at the screen. Giving up here does not cancel the server's read; it only stops this page
- * waiting on it. The poll does not read that view again until the read answers, the server's own
- * bound has passed, or a live event says the service is answering (`readHeld`, `remote-ops-audit` W7).
+ * told about rather than as a "refreshing…" nobody ends (web/src/core/api `within`, `#195
+ * send-resilience`). The poll does not read that view again until the read answers, the server's
+ * own bound has passed, or a live event says the service is answering (`readHeld`,
+ * `remote-ops-audit` W7).
  *
  * `abandoned`, when given, is handed the request still on the wire when the wait is given up, and
  * the request is then not aborted: its answer, if it comes, is the caller's to use or drop
@@ -14576,33 +14504,8 @@ async function apiDecoded(type, path, options) {
  * @param {((answer: Promise<T>) => void) | null} [abandoned]
  * @returns {Promise<T>}
  */
-async function within(ms, request, abandoned = null) {
-  const controller = typeof AbortController === "function" && !abandoned ? new AbortController() : null;
-  /** @type {ReturnType<typeof setTimeout> | null} */
-  let timer = null;
-  let gaveUp = false;
-  /** @type {Promise<never>} */
-  const late = new Promise((_resolve, reject) => {
-    timer = setTimeout(() => {
-      gaveUp = true;
-      if (controller) controller.abort();
-      const error = /** @type {ApiRequestError} */ (new Error(
-        `${sentenceStart(chatServiceOf(el("discord-channel").value))} did not answer within ` +
-          `${Math.round(ms / 1000)} seconds.`
-      ));
-      error.timedOut = true;
-      reject(error);
-    }, ms);
-  });
-  const asked = request(controller ? controller.signal : undefined);
-  try {
-    return await Promise.race([asked, late]);
-  } catch (error) {
-    if (gaveUp && abandoned) abandoned(asked);
-    throw error;
-  } finally {
-    if (timer !== null) clearTimeout(timer);
-  }
+function within(ms, request, abandoned = null) {
+  return theServer().within(ms, /** @type {(signal: unknown) => Promise<T>} */ (request), abandoned);
 }
 
 // --- what a slow or failing chat service means, in words ------------------------------------------

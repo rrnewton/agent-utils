@@ -1851,6 +1851,8 @@ const SEARCH_LANGUAGE = await searchLanguage();
 const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
 /** The glyph widths the fold model counts lines by (web/src/foundation/). */
 const GLYPHS = await moduleForTests("src/foundation/index.ts");
+/** The page's requests to its server, on ports a test supplies (web/src/core/api). */
+const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   // A page whose MODULES are broken on purpose (`brokenModule`): its prelude, and the legacy script.
@@ -6017,6 +6019,121 @@ async function signIn(page) {
   await page.settle();
   assert.equal(page.screen(), "main", "signing in did not reach the main interface");
 }
+
+// --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
+
+/**
+ * web/src/core/api on ports and dependencies a test supplies: every request it sends, every timer
+ * it sets, every cancellation it makes, and every call it makes back into the page, recorded.
+ * `answers` is what the transport does with each request in turn: a `{status, text}` answer, or an
+ * Error to fail to reach the server with.
+ */
+function apiOnPorts(answers = []) {
+  const record = { sent: [], timers: [], cleared: [], cancellations: [], refused: 0, asked: [] };
+  const ports = {
+    http: {
+      fetch: async (path, init) => {
+        record.sent.push({ path, init });
+        const answer = answers.shift() ?? { status: 200, text: "{}" };
+        if (answer instanceof Error) throw answer;
+        return { status: answer.status, ok: answer.status >= 200 && answer.status < 300, text: async () => answer.text };
+      },
+    },
+    clock: {
+      setTimeout: (run, ms) => { record.timers.push({ run, ms }); return record.timers.length; },
+      clearTimeout: (handle) => { record.cleared.push(handle); },
+    },
+    cancellation: {
+      create: () => {
+        const cancellation = { signal: { aborted: false }, abort() { this.signal.aborted = true; } };
+        record.cancellations.push(cancellation);
+        return cancellation;
+      },
+    },
+  };
+  const server = SERVER_API.createApi(ports, {
+    token: () => "tok",
+    readRefused: () => { record.refused += 1; },
+    asking: (type) => { record.asked.push({ type, sentBefore: record.sent.length }); },
+    answerer: () => "Discord",
+  });
+  return { server, record };
+}
+
+test("`#624 voice-page-modularity`: the requests module sends through its transport port, with the token, and a body only when there is one", async () => {
+  const { server, record } = apiOnPorts([{ status: 200, text: '{"a":1}' }, { status: 200, text: "" }]);
+  assert.deepStrictEqual(await server.request("/api/v1/x"), { a: 1 });
+  assert.equal(await server.request("/api/v1/y", { method: "POST", body: { b: 2 } }), null, "an empty answer is null");
+  assert.deepStrictEqual(record.sent.map((s) => s.path), ["/api/v1/x", "/api/v1/y"]);
+  assert.deepStrictEqual(record.sent[0].init, { method: "GET", headers: { Authorization: "Bearer tok" } },
+    "a GET says it carries JSON, or carries a signal it was not given");
+  assert.deepStrictEqual(record.sent[1].init,
+    { method: "POST", headers: { Authorization: "Bearer tok", "Content-Type": "application/json" }, body: '{"b":2}' });
+});
+
+test("`#624 voice-page-modularity`: the requests module keeps the error taxonomy, and ends the device's copy only on a refused token or read", async () => {
+  const refusal = (status) => ({ status, text: JSON.stringify({ error: "nope", detail: "Not yours." }) });
+  for (const [status, method, refused] of [[401, "POST", 1], [403, "GET", 1], [403, "POST", 0], [500, "GET", 0]]) {
+    const { server, record } = apiOnPorts([refusal(status)]);
+    const error = await server.request("/api/v1/x", { method }).then(() => null, (e) => e);
+    assert.ok(error, `HTTP ${status} to a ${method} succeeded`);
+    assert.equal(error.message, `HTTP ${status} nope: Not yours.`);
+    assert.deepStrictEqual([error.status, error.code, error.detail, error.refused],
+      [status, "nope", "Not yours.", status === 401 || status === 403]);
+    assert.deepStrictEqual(error.body, { error: "nope", detail: "Not yours." });
+    assert.equal(record.refused, refused, `HTTP ${status} to a ${method}: the page's copy was dropped ${record.refused} times`);
+  }
+  // Not this server speaking: a proxy's page, a gateway's JSON, the network.
+  const proxy = await apiOnPorts([{ status: 502, text: "<html>" }]).server.request("/x").catch((e) => e);
+  assert.deepStrictEqual([proxy.message, proxy.gatewayStatus], ["vibe-talk returned non-JSON (HTTP 502)", 502]);
+  const garbled = await apiOnPorts([{ status: 200, text: "<html>" }]).server.request("/x").catch((e) => e);
+  assert.equal(garbled.gatewayStatus, undefined, "a garbled success was worded as a gateway's failure");
+  const gateway = await apiOnPorts([{ status: 504, text: '{"message":"x"}' }]).server.request("/x").catch((e) => e);
+  assert.deepStrictEqual([gateway.message, gateway.code], ["HTTP 504 error: (no detail)", "error"]);
+  const unreachable = await apiOnPorts([new TypeError("Failed to fetch")]).server
+    .request("/x", { method: "PUT" }).catch((e) => e);
+  assert.equal(unreachable.network, true);
+  assert.match(unreachable.message, /^Could not reach vibe-talk while saving your change\./);
+  assert.equal(unreachable.cause.message, "Failed to fetch");
+});
+
+test("`#624 voice-page-modularity`: a decoded request is told to the page before it is sent, and a malformed answer names the type", async () => {
+  const { server, record } = apiOnPorts([{ status: 200, text: '{"nope":true}' }]);
+  const error = await server.decoded("ApiErrorBody", "/x").catch((e) => e);
+  assert.deepStrictEqual(record.asked, [{ type: "ApiErrorBody", sentBefore: 0 }]);
+  assert.equal(record.sent.length, 1, "the decoded request was told to the page but never sent");
+  assert.match(error.message, /^vibe-talk returned a malformed answer — .*ApiErrorBody/);
+  assert.ok(error.cause, "the contract's own sentence was dropped");
+});
+
+test("`#624 voice-page-modularity`: a request given up on by `within` times out on the clock port, aborted unless the caller keeps it", async () => {
+  // Aborted: the one cancellation made, its signal handed to the request, and aborted at the limit.
+  const { server, record } = apiOnPorts();
+  let signal = null;
+  const waited = server.within(20_000, (s) => { signal = s; return new Promise(() => {}); }).catch((e) => e);
+  assert.equal(record.timers.length, 1);
+  assert.equal(record.timers[0].ms, 20_000);
+  assert.equal(signal, record.cancellations[0].signal, "the request was not handed the cancellation's signal");
+  record.timers[0].run();
+  const error = await waited;
+  assert.deepStrictEqual([error.message, error.timedOut], ["Discord did not answer within 20 seconds.", true]);
+  assert.equal(signal.aborted, true, "the request given up on was not aborted");
+  assert.deepStrictEqual(record.cleared, [1], "the timer was not cleared");
+  // Kept: no cancellation at all, and the request still on the wire handed back.
+  const kept = apiOnPorts();
+  const still = new Promise(() => {});
+  let handed = null;
+  const keptWait = kept.server.within(1_500, (s) => { assert.equal(s, undefined); return still; }, (answer) => { handed = answer; })
+    .catch((e) => e);
+  kept.record.timers[0].run();
+  assert.match((await keptWait).message, /within 2 seconds/);
+  assert.equal(handed, still, "the request still on the wire was not handed to the caller");
+  assert.equal(kept.record.cancellations.length, 0, "a request the caller keeps was given a cancellation");
+  // Answered in time: the answer, and the timer cleared.
+  const quick = apiOnPorts();
+  assert.equal(await quick.server.within(5_000, async () => "ok"), "ok");
+  assert.deepStrictEqual(quick.record.cleared, [1]);
+});
 
 // --- what the page says when things fail --------------------------------------------------------
 
