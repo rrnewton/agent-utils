@@ -12,6 +12,7 @@ live registry before the edition cutover.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -276,6 +277,52 @@ def test_adopt_matches_python(tmp_path: Path) -> None:
     assert _active(rust_root)["revision"] == 8
     kinds = [event["kind"] for event in _events(rust_root)]
     assert kinds == ["state-imported", "active-state-recorded"]
+
+
+def _add_image_slot(root: Path) -> None:
+    """Add an unrelated unmounted image-backed slot to the registry."""
+    control = root / "worktrees"
+    active_path = control / "ACTIVE.node-a.json"
+    doc = json.loads(active_path.read_text())
+    record = copy.deepcopy(doc["slots"][0])
+    record["slot"] = "slot-img"
+    record["agent"] = "agent-slot-img"
+    record["owner"] = None
+    record["checkouts"][0]["path"] = "worktrees/slot-img/repo"
+    doc["slots"].append(record)
+    active_path.write_text(json.dumps(doc))
+    (control / "slot-img").mkdir()
+    image_dir = control / "slot-images" / "agent" / "slot-img"
+    image_dir.mkdir(parents=True)
+    (image_dir / "slot.img").write_bytes(b"")
+    (image_dir / "IMAGE.json").write_text(
+        json.dumps(
+            {
+                "schema": "wrkslots-slot-image/v1",
+                "slot": "slot-img",
+                "slot_type": "agent",
+                "phase": "ready",
+                "backend": "kernel",
+                "location": str(control / "slot-img"),
+                "created_at": "2026-10-26T00:00:00Z",
+                "ceiling_bytes": 1024,
+                "state_ceiling_bytes": 1024,
+            }
+        )
+    )
+
+
+def test_adopt_with_image_records_matches_python(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    _unowned(rust_root)
+    _unowned(oracle_root)
+    _add_image_slot(rust_root)
+    _add_image_slot(oracle_root)
+    assert _python_adopt(oracle_root, os.getpid()) == 0
+    result = _rust_adopt(rust_root, os.getpid())
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["already_adopted"] is False
+    assert _active(rust_root) == _active(oracle_root)
 
 
 def test_adopt_repeat_is_already_adopted(tmp_path: Path) -> None:

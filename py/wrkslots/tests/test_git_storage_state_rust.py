@@ -179,6 +179,46 @@ def test_parse_storage_git_missing_repository_refuses_like_python(
     assert fragment in result.stderr
 
 
+def test_parse_storage_git_unmounted_image_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    control = root / "worktrees"
+    # slot-b's checkout becomes a real registered worktree of the
+    # upstream repository, inside what is now an unmounted image's
+    # mount point: the census must still record it (no orphan
+    # finding), while no Git inspection runs against it.
+    shutil.rmtree(control / "slot-b" / "repo")
+    _git(
+        tmp_path / "upstream-repo", "worktree", "add", "-q", "-b",
+        "suite/img", str(control / "slot-b" / "repo"), "HEAD",
+    )
+    image_dir = control / "slot-images" / "agent" / "slot-b"
+    image_dir.mkdir(parents=True)
+    (image_dir / "slot.img").write_bytes(b"")
+    (image_dir / "IMAGE.json").write_text(
+        json.dumps(
+            {
+                "schema": "wrkslots-slot-image/v1",
+                "slot": "slot-b",
+                "slot_type": "agent",
+                "phase": "ready",
+                "backend": "kernel",
+                "location": str(control / "slot-b"),
+                "created_at": "2026-10-26T00:00:00Z",
+                "ceiling_bytes": 1024,
+                "state_ceiling_bytes": 1024,
+            }
+        )
+    )
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(result.stdout)
+    assert actual == _expected(root)
+    slot_b = [item["kind"] for item in actual["findings"] if item["slot"] == "slot-b"]
+    assert slot_b == []
+
+
 def test_parse_storage_git_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     result = _rust(root)

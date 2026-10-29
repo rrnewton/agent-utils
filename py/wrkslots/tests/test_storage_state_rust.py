@@ -185,6 +185,77 @@ def test_parse_storage_empty_images_directory_matches_python(tmp_path: Path) -> 
     assert json.loads(result.stdout) == _expected(root)
 
 
+def test_parse_storage_unmounted_image_matches_python(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    _fixture(root)
+    control = root / "worktrees"
+    (control / "slot-b").mkdir()
+    image_dir = control / "slot-images" / "agent" / "slot-b"
+    image_dir.mkdir(parents=True)
+    (image_dir / "slot.img").write_bytes(b"")
+    (image_dir / "IMAGE.json").write_text(
+        json.dumps(
+            {
+                "schema": "wrkslots-slot-image/v1",
+                "slot": "slot-b",
+                "slot_type": "agent",
+                "phase": "ready",
+                "backend": "kernel",
+                "location": str(control / "slot-b"),
+                "created_at": "2026-10-26T00:00:00Z",
+                "ceiling_bytes": 1024,
+                "state_ceiling_bytes": 1024,
+            }
+        )
+    )
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(result.stdout)
+    assert actual == _expected(root)
+    slot_b = [item["kind"] for item in actual["findings"] if item["slot"] == "slot-b"]
+    assert slot_b == ["image-not-mounted"]
+
+
+def test_parse_storage_bad_image_record_matches_python(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    _fixture(root)
+    control = root / "worktrees"
+    (control / "slot-b").mkdir()
+    image_dir = control / "slot-images" / "agent" / "slot-b"
+    image_dir.mkdir(parents=True)
+    (image_dir / "slot.img").write_bytes(b"")
+    record = {
+        "schema": "bogus",
+        "slot": "slot-b",
+        "slot_type": "agent",
+        "phase": "ready",
+        "backend": "kernel",
+        "location": str(control / "slot-b"),
+        "created_at": "2026-10-26T00:00:00Z",
+        "ceiling_bytes": 1024,
+        "state_ceiling_bytes": 1024,
+    }
+    (image_dir / "IMAGE.json").write_text(json.dumps(record))
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(result.stdout)
+    assert actual == _expected(root)
+    slot_b = [item for item in actual["findings"] if item["slot"] == "slot-b"]
+    assert slot_b[0]["kind"] == "image-not-mounted"
+    assert "cannot read the slot image record of slot-b" in slot_b[0]["detail"]
+    # A non-canonical location refuses the same way, never silently
+    # treating the slot as not image-backed.
+    record["schema"] = "wrkslots-slot-image/v1"
+    record["location"] = str(control) + "/../worktrees/slot-b"
+    (image_dir / "IMAGE.json").write_text(json.dumps(record))
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(result.stdout)
+    assert actual == _expected(root)
+    slot_b = [item for item in actual["findings"] if item["slot"] == "slot-b"]
+    assert "has a non-canonical location" in slot_b[0]["detail"]
+
+
 def test_parse_storage_clean_registry(tmp_path: Path) -> None:
     root = _root(tmp_path)
     control = root / "worktrees"

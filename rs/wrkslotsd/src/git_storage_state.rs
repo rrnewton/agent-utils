@@ -236,17 +236,6 @@ fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<PathBuf> {
 /// registrations, printing the sorted findings.
 pub(crate) fn parse_storage_git(root: Option<&Path>) -> Result<Value> {
     let (cfg, _selected) = load_cfg(root, None)?;
-    let images = cfg.control.join("slot-images");
-    let has_image_records = images.is_dir()
-        && std::fs::read_dir(&images)
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false);
-    if has_image_records {
-        return Err(
-            "slot image records are present; storage diagnosis stays with the Python status"
-                .to_string(),
-        );
-    }
     let machines = discover_machines(&cfg.control)?;
     let mut findings: Vec<Value> = Vec::new();
     let mut records: Vec<(String, String, String, Value)> = Vec::new();
@@ -286,7 +275,15 @@ pub(crate) fn parse_storage_git(root: Option<&Path>) -> Result<Value> {
     }
     for (machine, slot, slot_type, stored) in &records {
         let slot_path = slot_root(&cfg, slot_type).join(slot);
-        let mut inspectable = slot_path.is_dir()
+        // An unmounted image is never Git-inspected (the filesystem
+        // diagnosis owns the image-not-mounted finding), but its
+        // checkouts still join the repository census below, exactly as
+        // the oracle's `slot_inspectable = False` path does.
+        let unmounted =
+            crate::storage_state::unmounted_image_detail(&cfg, slot, slot_type, &slot_path)
+                .is_some();
+        let mut inspectable = !unmounted
+            && slot_path.is_dir()
             && !slot_path
                 .symlink_metadata()
                 .map(|meta| meta.file_type().is_symlink())
