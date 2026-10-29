@@ -74,6 +74,7 @@ export {
   createDismissedSends,
   createOwnPosts,
   nextRetryAt,
+  outgoingFromSaved as entryFromSaved,
   retriesItself as outboxRetriesItself,
 } from "../core/outbox/index.ts";
 export {

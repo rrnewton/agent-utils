@@ -17,6 +17,7 @@ declare const createWebPorts: LegacyImports["createWebPorts"];
 declare const createNavigation: LegacyImports["createNavigation"];
 declare const nextRetryAt: LegacyImports["nextRetryAt"];
 declare const outboxRetriesItself: LegacyImports["outboxRetriesItself"];
+declare const entryFromSaved: LegacyImports["entryFromSaved"];
 declare const DISMISSED_SENDS_DAYS: LegacyImports["DISMISSED_SENDS_DAYS"];
 declare const DISMISSED_SENDS_LIMIT: LegacyImports["DISMISSED_SENDS_LIMIT"];
 declare const createDismissedSends: LegacyImports["createDismissedSends"];

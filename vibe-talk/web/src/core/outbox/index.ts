@@ -7,3 +7,5 @@ export { DISMISSED_SENDS_DAYS, DISMISSED_SENDS_LIMIT, createDismissedSends } fro
 export type { DismissedSend, DismissedSends, DismissedSendsDependencies } from "./dismissed.ts";
 export { OWN_POST_GRACE_MS, createOwnPosts } from "./own.ts";
 export type { OwnPosts, OwnPostsDependencies } from "./own.ts";
+export { outgoingFromSaved, savedWire } from "./saved.ts";
+export type { OutgoingEntry, OutgoingPart, OutgoingWire } from "./saved.ts";

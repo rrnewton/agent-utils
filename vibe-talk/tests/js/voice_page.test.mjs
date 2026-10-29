@@ -6963,6 +6963,39 @@ test("`#624 voice-page-modularity`: the page's own posts, kept in their grace an
   assert.equal(saved.has("vibe-talk.own-posts"), false, "nothing in its grace was still saved");
 });
 
+test("`#624 voice-page-modularity`: an outbox entry read back from the device, from the module alone", () => {
+  const { outgoingFromSaved, savedWire } = OUTBOX;
+  let asked = 0;
+  const now = () => { asked += 1; return 5000; };
+  const base = { id: "e1", channel: "c", text: " hi ", createdAt: 100, state: "failed", detail: "Refused." };
+  for (const bad of [null, 7, "x", {}, { ...base, id: 1 }, { ...base, channel: "" }, { ...base, text: null }, { ...base, state: "posting" }]) {
+    assert.equal(outgoingFromSaved(bad, now), null, `read back as an entry: ${JSON.stringify(bad)}`);
+  }
+  const failed = outgoingFromSaved(base, now);
+  assert.deepStrictEqual(
+    [failed.state, failed.remaining, failed.originView, failed.marksRead, failed.sendStartedAt, failed.detail, failed.mayHavePosted],
+    ["failed", "hi", "main", null, 100, "Refused.", false]);
+  assert.equal(asked, 0, "the clock was asked where no saved time was missing");
+  // The page closed mid-send: only a POST that had started may have been delivered.
+  const posting = outgoingFromSaved({ ...base, state: "sending", phase: "posting", createdAt: undefined }, now);
+  assert.deepStrictEqual([posting.state, posting.mayHavePosted, posting.createdAt, posting.detail],
+    ["unconfirmed", true, 5000, "This page closed before delivery was confirmed."]);
+  for (const phase of ["queued", "placing"]) {
+    const waiting = outgoingFromSaved({ ...base, state: "sending", phase }, now);
+    assert.deepStrictEqual([waiting.state, waiting.mayHavePosted, waiting.detail],
+      ["failed", false, "This page closed before this message was sent."]);
+  }
+  // An entry saved before marksRead marks what it answers; parts and wire keep only what is whole.
+  const reply = outgoingFromSaved({ ...base, state: "sent", replyTo: "r", originView: "thread",
+    parts: [{ id: "p", content: "a" }, { id: 2, content: "b" }, null], observedParts: ["p", 3],
+    wire: { text: "w", replyTo: "", threadId: "t" }, serverMs: "12", upstreamMs: "soon", sentAt: 9 }, now);
+  assert.deepStrictEqual(
+    [reply.marksRead, reply.originView, reply.parts, reply.observedParts, reply.wire, reply.serverMs, reply.upstreamMs, reply.sentAt],
+    ["r", "thread", [{ id: "p", content: "a" }], ["p"], { text: "w", replyTo: null, threadId: "t" }, 12, null, 9]);
+  assert.equal(outgoingFromSaved({ ...base, replyTo: "r", marksRead: null }, now).marksRead, null);
+  assert.equal(savedWire({ text: 3 }), null);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

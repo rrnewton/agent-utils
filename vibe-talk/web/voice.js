@@ -28989,64 +28989,14 @@ function persistOutgoingMessages() {
 
 /**
  * An outbox entry as it was saved — in the outbox, or among the recently dismissed (`#193
- * compose-draft-loss`) — or null for anything that is not one.
+ * compose-draft-loss`) — or null for anything that is not one (web/src/core/outbox
+ * `outgoingFromSaved`, `#624 voice-page-modularity`). Typed loosely here: the outbox's entries gain
+ * fields as they are sent (`retriesUsed`, and others) that a saved one does not carry.
+ *
+ * @returns {any}
  */
 function outgoingFromSaved(held) {
-  if (!held || typeof held.id !== "string" || typeof held.channel !== "string" ||
-      !held.channel || typeof held.text !== "string" ||
-      !["sending", "sent", "failed", "unconfirmed"].includes(held.state)) return null;
-  const interrupted = held.state === "sending";
-  // The rule signing out goes by: only a POST that had started can have been delivered. One
-  // still waiting its turn, or still finding out where its reply goes, was posted nowhere.
-  const attempted = interrupted && !["queued", "placing"].includes(held.phase);
-  return {
-    id: held.id, channel: held.channel,
-    threadId: typeof held.threadId === "string" ? held.threadId : null,
-    // A reply whose destination was still to be found out keeps finding it out on Retry.
-    placement: held.placement === "unknown" ? "unknown" : null,
-    replyTo: typeof held.replyTo === "string" ? held.replyTo : null,
-    // `#300 reply-marks-read`. What it marks read once sent. An entry saved before this was kept
-    // marks what it answers, as it always did.
-    marksRead: typeof held.marksRead === "string" ? held.marksRead
-      : held.marksRead === null ? null : typeof held.replyTo === "string" ? held.replyTo : null,
-    originView: ["main", "threads", "thread", "flat"].includes(held.originView) ? held.originView : "main",
-    text: held.text,
-    remaining: typeof held.remaining === "string" ? held.remaining : held.text.trim(),
-    state: attempted ? "unconfirmed" : interrupted ? "failed" : held.state,
-    phase: "", createdAt: Number(held.createdAt) || Date.now(),
-    postedCount: Math.max(0, Number(held.postedCount) || 0),
-    parts: Array.isArray(held.parts) ? held.parts.filter((part) =>
-      part && typeof part.id === "string" && typeof part.content === "string") : [],
-    observedParts: Array.isArray(held.observedParts)
-      ? held.observedParts.filter((id) => typeof id === "string") : [],
-    // Absent from an entry saved before keys were sent: its attempts went without one.
-    keyedOnly: held.keyedOnly === true,
-    // `#193 compose-draft-loss`. See `editableSend`.
-    mayHavePosted: held.mayHavePosted === true || held.state === "unconfirmed" || attempted,
-    // `#263 post-split-per-provider`: where the rest of a post cut in parts goes.
-    continueIn: typeof held.continueIn === "string" && held.continueIn ? held.continueIn : null,
-    // `#448 send-dedupe`: where its words went on the first attempt that sent them.
-    wire: savedWire(held.wire),
-    // `#500 sent-receipts-pile-up`: when the server confirmed it, for a send that is sent.
-    sentAt: Number(held.sentAt) || 0,
-    // `#621 send-double-check`.
-    sendStartedAt: Number(held.sendStartedAt) || Number(held.createdAt) || Date.now(),
-    serverMs: held.serverMs != null && Number.isFinite(Number(held.serverMs)) ? Number(held.serverMs) : null,
-    upstreamMs: held.upstreamMs != null && Number.isFinite(Number(held.upstreamMs)) ? Number(held.upstreamMs) : null,
-    serverTick: held.serverTick === true,
-    upstreamTick: held.upstreamTick === true,
-    tickFailed: held.tickFailed === true,
-    showTimes: false,
-    detail: attempted ? "This page closed before delivery was confirmed."
-      : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
-  };
-}
-
-/** A saved entry's `wire` (`dispatchOutgoingMessage`), or null for anything that is not one. */
-function savedWire(wire) {
-  const place = (value) => (typeof value === "string" && value ? value : null);
-  return wire && typeof wire.text === "string"
-    ? { text: wire.text, replyTo: place(wire.replyTo), threadId: place(wire.threadId) } : null;
+  return entryFromSaved(held, Date.now);
 }
 
 function loadOutgoingMessages() {
