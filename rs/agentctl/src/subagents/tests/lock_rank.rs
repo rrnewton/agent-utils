@@ -111,3 +111,124 @@ fn a_read_back_asks_a_pane_that_keeps_no_scrollback_for_its_visible_rows_only() 
     assert_eq!(scrollback_lines(scroll(0, 0)), SCROLLBACK_LINES);
     assert_eq!(scrollback_lines(None), SCROLLBACK_LINES);
 }
+
+/// #702 send-hard-timeout: a send whose agent stays locked by another operation for its whole
+/// deadline gives up with exit 75, queues nothing, and holds no lock afterwards.
+#[test]
+fn a_send_gives_up_at_its_deadline_while_the_agent_stays_locked_and_queues_nothing() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let manager = fixture.manager();
+    let queued_before = agent::queued_prompts(&manager.queue("worker").unwrap()).unwrap();
+    let holder = manager.lock("worker").expect("first lock is free");
+    let started = std::time::Instant::now();
+    let error = manager
+        .send_identified(
+            "worker",
+            "never typed",
+            DrainOptions {
+                deadline: Some(Duration::from_millis(300)),
+                ..DrainOptions::default()
+            },
+            Some("hard-deadline-lock"),
+        )
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    assert_eq!(error.exit_code(), 75);
+    assert!(error.to_string().contains("nothing was queued"), "{error}");
+    assert!(error.to_string().contains("send deadline"), "{error}");
+    assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+    assert_eq!(
+        agent::queued_prompts(&manager.queue("worker").unwrap()).unwrap(),
+        queued_before
+    );
+    drop(holder);
+    // The send that gave up holds nothing: the lock is free at once.
+    let system = agent::SystemRuntime::default();
+    let free = agent::UntilRuntime::after(&system, Duration::from_secs(5));
+    let _free = manager
+        .lock_with_runtime("worker", &free)
+        .expect("lock free after the send gave up");
+}
+
+/// #702 send-hard-timeout: a send whose pane never becomes ready gives up at its deadline, not
+/// at its much longer readiness timeout; the prompt stays pending, safe to send again, and every
+/// lock is released, so the next send is not blocked.
+#[test]
+fn a_send_whose_pane_never_becomes_ready_gives_up_at_its_deadline_and_releases_every_lock() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    *fixture.client.status.lock().unwrap() = Some("working".to_owned());
+    let manager = fixture.manager();
+    let started = std::time::Instant::now();
+    // A slash command waits for an idle pane, even for a Codex that takes follow-ups.
+    let error = manager
+        .send_identified(
+            "worker",
+            "/status",
+            DrainOptions {
+                ready_timeout: Duration::from_secs(900),
+                deadline: Some(Duration::from_millis(400)),
+                ..DrainOptions::default()
+            },
+            Some("hard-deadline-ready"),
+        )
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    assert_eq!(error.exit_code(), 75);
+    assert!(
+        error.to_string().contains("send deadline passed"),
+        "{error}"
+    );
+    assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+    let queue = manager.queue("worker").unwrap();
+    assert_eq!(
+        agent::message_state(&queue, "hard-deadline-ready").unwrap(),
+        Some(agent::QueueMessageState::Pending)
+    );
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+    let system = agent::SystemRuntime::default();
+    let free = agent::UntilRuntime::after(&system, Duration::from_secs(5));
+    let _free = manager
+        .lock_with_runtime("worker", &free)
+        .expect("agent lock free after the deadline");
+    let queue_lock = agent::open_private_lock(&queue.join(".delivery.lock"), "queue lock").unwrap();
+    assert!(
+        fs2::FileExt::try_lock_exclusive(&queue_lock).is_ok(),
+        "queue delivery lock free after the deadline"
+    );
+}
+
+/// #702 send-hard-timeout: the deadline is the call's own when it sets one, else the registry's
+/// settings.json `send_deadline_seconds`, else 10 minutes.
+#[test]
+fn the_send_deadline_is_the_calls_then_the_registrys_then_ten_minutes() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let registry = fixture.root.join("registry");
+    assert_eq!(manager.send_deadline(), Duration::from_secs(600));
+    assert_eq!(
+        manager.with_send_deadline(DrainOptions::default()).deadline,
+        Some(Duration::from_secs(600))
+    );
+    fs::create_dir_all(&registry).unwrap();
+    fs::write(
+        registry.join("settings.json"),
+        r#"{"send_deadline_seconds": 300}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        manager.with_send_deadline(DrainOptions::default()).deadline,
+        Some(Duration::from_secs(300))
+    );
+    let call = DrainOptions {
+        deadline: Some(Duration::from_secs(5)),
+        ..DrainOptions::default()
+    };
+    assert_eq!(
+        manager.with_send_deadline(call).deadline,
+        Some(Duration::from_secs(5))
+    );
+}

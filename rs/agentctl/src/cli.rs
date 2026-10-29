@@ -1152,6 +1152,9 @@ struct Send {
     /// Seconds --urgent waits for the harness to take the prompt before it interrupts the turn (default: 60)
     #[arg(long, default_value = "60", value_parser = seconds, value_name = "SECONDS", requires = "urgent")]
     boundary_wait: f64,
+    /// Hard wall-clock limit in seconds for the whole send, counted from its start: waits for the agent's lock, the queue and pane locks, and readiness all end by then, and a send that has not typed its prompt gives up with exit 75, leaving the prompt pending (safe to retry) and every lock released. A prompt being typed is finished first (bounded by --working-timeout). Interactive agents only (default: send_deadline_seconds in the registry's settings.json, else 600)
+    #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
+    deadline: Option<f64>,
     #[command(flatten)]
     delivery: Delivery,
 }
@@ -1159,7 +1162,7 @@ struct Send {
 struct Drain {
     #[command(flatten)]
     agent: Named,
-    /// Seconds after the drain starts after which it starts no further prompt; a prompt being typed is not interrupted, and readiness waits end by then (default: no limit)
+    /// Hard wall-clock limit in seconds for the drain, counted from its start: it starts no further prompt after it, waits for locks and readiness end by then, and the prompts not typed stay pending (exit 75); a prompt being typed is not interrupted (default: send_deadline_seconds in the registry's settings.json, else 600)
     #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
     deadline: Option<f64>,
     /// Seconds to wait for the queue's delivery lock and the host-wide target lock before giving up with exit 75 and nothing typed (default: wait until free)
@@ -3215,7 +3218,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 manager.send_urgent(
                     &value.agent.name,
                     &text,
-                    value.delivery.options(),
+                    DrainOptions {
+                        deadline: value.deadline.map(Duration::from_secs_f64),
+                        ..value.delivery.options()
+                    },
                     value.message_id.as_deref(),
                     Duration::from_secs_f64(value.boundary_wait),
                 )?
@@ -3228,6 +3234,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     &text,
                     DrainOptions {
                         not_after,
+                        deadline: value.deadline.map(Duration::from_secs_f64),
                         ..value.delivery.options()
                     },
                     value.message_id.as_deref(),

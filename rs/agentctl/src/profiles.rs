@@ -1456,6 +1456,82 @@ pub(crate) fn reasoning_arguments(
         })
 }
 
+/// The registry settings file (#702 send-hard-timeout): `settings.json` in the registry
+/// directory, for project-wide settings that are not launch profiles. Unlike `profiles.json` it
+/// is read tolerantly: a key this build does not know is ignored, and older builds never read
+/// the file, so adding a key breaks no binary.
+pub(crate) const SETTINGS_FILE: &str = "settings.json";
+
+/// The `settings.json` key that sets the hard deadline of `agentctl send` and `agentctl drain`.
+pub(crate) const SEND_DEADLINE_KEY: &str = "send_deadline_seconds";
+
+/// The hard deadline of `agentctl send` and `agentctl drain` when neither the call
+/// (`--deadline`) nor the registry's `settings.json` sets one: 10 minutes (owner, 2026-10-29).
+pub(crate) const DEFAULT_SEND_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Longest `send_deadline_seconds` accepted: one day.
+const MAX_SEND_DEADLINE_SECONDS: f64 = 86_400.0;
+
+/// Largest `settings.json` read.
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+
+/// The registry's send deadline from `registry/settings.json` (`send_deadline_seconds`, positive
+/// seconds, at most one day), else [`DEFAULT_SEND_DEADLINE`]. A missing file or key is the
+/// default without comment. A file or value that cannot be used is also the default, with a
+/// warning for the caller to print: a damaged settings file must never stop a send.
+pub(crate) fn send_deadline(registry: &Path) -> (Duration, Option<String>) {
+    let path = registry.join(SETTINGS_FILE);
+    let fallback = |problem: String| {
+        (
+            DEFAULT_SEND_DEADLINE,
+            Some(format!(
+                "{problem}; using the default send deadline of {} s",
+                DEFAULT_SEND_DEADLINE.as_secs()
+            )),
+        )
+    };
+    let mut text = String::new();
+    match fs::File::open(&path) {
+        Ok(file) => {
+            if let Err(error) = file.take(MAX_SETTINGS_BYTES + 1).read_to_string(&mut text) {
+                return fallback(format!("cannot read {}: {error}", path.display()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (DEFAULT_SEND_DEADLINE, None);
+        }
+        Err(error) => return fallback(format!("cannot read {}: {error}", path.display())),
+    }
+    if text.len() as u64 > MAX_SETTINGS_BYTES {
+        return fallback(format!(
+            "{} is larger than {MAX_SETTINGS_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let document: Value = match serde_json::from_str(&text) {
+        Ok(document) => document,
+        Err(error) => return fallback(format!("{} is not JSON: {error}", path.display())),
+    };
+    let Some(settings) = document.as_object() else {
+        return fallback(format!("{} is not a JSON object", path.display()));
+    };
+    match settings.get(SEND_DEADLINE_KEY) {
+        None | Some(Value::Null) => (DEFAULT_SEND_DEADLINE, None),
+        Some(value) => match value
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .filter(|seconds| *seconds <= MAX_SEND_DEADLINE_SECONDS)
+        {
+            Some(seconds) => (Duration::from_secs_f64(seconds), None),
+            None => fallback(format!(
+                "{SEND_DEADLINE_KEY} in {} must be a positive number of seconds, at most \
+                 {MAX_SEND_DEADLINE_SECONDS}, got {value}",
+                path.display()
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,6 +1541,48 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn the_send_deadline_comes_from_settings_json_and_falls_back_to_ten_minutes() {
+        // #702 send-hard-timeout: a missing file or key is the default without comment; a
+        // usable value wins; anything unusable is the default with a warning, never an error;
+        // keys this build does not know are ignored.
+        let registry = std::env::temp_dir().join(format!(
+            "agentctl-send-deadline-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&registry).unwrap();
+        assert_eq!(send_deadline(&registry), (DEFAULT_SEND_DEADLINE, None));
+        assert_eq!(DEFAULT_SEND_DEADLINE, Duration::from_secs(600));
+        let write = |text: &str| fs::write(registry.join(SETTINGS_FILE), text).unwrap();
+        write(r#"{"send_deadline_seconds": 300, "a_future_key": {"x": 1}}"#);
+        assert_eq!(send_deadline(&registry), (Duration::from_secs(300), None));
+        write(r#"{"send_deadline_seconds": 0.5}"#);
+        assert_eq!(send_deadline(&registry), (Duration::from_millis(500), None));
+        write(r#"{"other": true}"#);
+        assert_eq!(send_deadline(&registry), (DEFAULT_SEND_DEADLINE, None));
+        write(r#"{"send_deadline_seconds": null}"#);
+        assert_eq!(send_deadline(&registry), (DEFAULT_SEND_DEADLINE, None));
+        for bad in [
+            r#"{"send_deadline_seconds": 0}"#,
+            r#"{"send_deadline_seconds": -5}"#,
+            r#"{"send_deadline_seconds": "300"}"#,
+            r#"{"send_deadline_seconds": 1e9}"#,
+            "[1, 2]",
+            "not json",
+        ] {
+            write(bad);
+            let (deadline, warning) = send_deadline(&registry);
+            assert_eq!(deadline, DEFAULT_SEND_DEADLINE, "{bad}");
+            let warning = warning.unwrap_or_else(|| panic!("no warning for {bad}"));
+            assert!(
+                warning.contains("default send deadline of 600 s"),
+                "{warning}"
+            );
+        }
+        fs::remove_dir_all(&registry).unwrap();
+    }
 
     #[test]
     fn launch_env_accepts_files_and_directories_and_refuses_mistakes() {

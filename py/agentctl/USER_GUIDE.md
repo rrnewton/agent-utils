@@ -324,7 +324,7 @@ files stay easy to find however many agents have come and gone (layout 2):
 
 ```text
 REGISTRY/
-  profiles.json  coordinator.json  restore.json  landing-queue.json
+  profiles.json  settings.json  coordinator.json  restore.json  landing-queue.json
   .identity.lock  .coordinator.lock  .restore.lock
   agents/NAME/           one directory per active agent: agent.json, queue/, logs
   agents/agent.json      the layout tripwire; not an agent
@@ -1816,6 +1816,19 @@ being typed is never interrupted, and readiness waits end by then); `--max-items
 N` types at most N prompts; `--lock-timeout SECONDS` gives up with exit 75 and
 nothing typed when the queue's delivery lock or the host-wide target lock stays
 held that long. Prompts left over stay pending.
+
+Every `send` and `drain` to an interactive agent has a hard deadline, counted
+from its start, that also bounds the wait for the agent's own lock: a send
+that has not typed its prompt by then exits 75, leaves the prompt pending (or,
+if the agent stayed locked the whole time, queues nothing) and releases every
+lock, so it is safe to send again. The deadline is `--deadline SECONDS` on the
+call, else `send_deadline_seconds` in the registry's `settings.json`, else 600
+seconds. `settings.json` is read tolerantly: keys a build does not know are
+ignored, and an unusable file or value falls back to 600 seconds with a warning.
+
+```json
+{"send_deadline_seconds": 300}
+```
 
 agentctl binaries older than these directories never read `inbox.v2/` and
 never honour tombstones: until every drainer of a queue (a pinned chat bridge or

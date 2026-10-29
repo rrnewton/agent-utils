@@ -1308,7 +1308,19 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             let info = match readiness {
                 Ok(info) => info,
                 Err(error) => {
-                    let detail = error.to_string();
+                    // A readiness wait the hard deadline cut short says so (#702
+                    // send-hard-timeout): the prompt stays pending and is safe to send again.
+                    let detail = if deadline.is_some_and(|deadline| runtime.monotonic() >= deadline)
+                    {
+                        format!(
+                            "the send deadline passed while waiting for the pane to become \
+                             ready; the prompt stays pending, safe to send again (agentctl send \
+                             --deadline, or send_deadline_seconds in the registry's \
+                             settings.json; default 600 s): {error}"
+                        )
+                    } else {
+                        error.to_string()
+                    };
                     document.insert("delivery_state".to_owned(), json!("pending"));
                     document.insert("delivery_error".to_owned(), json!(detail));
                     document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));

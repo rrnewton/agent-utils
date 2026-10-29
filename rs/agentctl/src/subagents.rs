@@ -5599,6 +5599,72 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )))
     }
 
+    /// The hard deadline of a send or drain whose caller set none (#702 send-hard-timeout): the
+    /// registry's `settings.json` `send_deadline_seconds`, else 10 minutes. A settings file that
+    /// cannot be used is reported on standard error and never stops the send.
+    pub(crate) fn send_deadline(&self) -> Duration {
+        let (deadline, warning) = crate::profiles::send_deadline(&self.registry);
+        if let Some(warning) = warning {
+            eprintln!("agentctl: {warning}");
+        }
+        deadline
+    }
+
+    /// `options` with the registry's hard deadline when the caller set none.
+    fn with_send_deadline(&self, options: DrainOptions) -> DrainOptions {
+        DrainOptions {
+            deadline: Some(options.deadline.unwrap_or_else(|| self.send_deadline())),
+            ..options
+        }
+    }
+
+    /// Take `agent_name`'s lifecycle lock for a send or drain, waiting no longer than its hard
+    /// deadline (#702 send-hard-timeout), and return the options with the deadline that remains,
+    /// so the whole operation keeps one wall clock. A lock still held at the deadline is exit 75
+    /// with nothing queued or typed, so the send is safe to retry.
+    fn delivery_lock(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+        message_id: Option<&str>,
+    ) -> Result<(LifecycleLock, DrainOptions)> {
+        let options = self.with_send_deadline(options);
+        let deadline = options
+            .deadline
+            .unwrap_or(crate::profiles::DEFAULT_SEND_DEADLINE);
+        let started = Instant::now();
+        let system = agent::SystemRuntime::default();
+        let bounded = agent::UntilRuntime::after(&system, deadline);
+        let lock = self
+            .lock_with_runtime(agent_name, &bounded)
+            .map_err(|error| {
+                if agent::AgentRuntime::cancelled(&bounded) {
+                    AgentError::Pending(agent::UndeliveredMessage {
+                        message: format!(
+                            "agent {agent_name:?} stayed locked by another operation for the \
+                             whole {:.1}s send deadline; nothing was queued or typed, so the send \
+                             is safe to retry: {error}",
+                            deadline.as_secs_f64()
+                        ),
+                        message_id: message_id.unwrap_or_default().to_owned(),
+                        artifact: self.registry.clone(),
+                    })
+                } else {
+                    error
+                }
+            })?;
+        let remaining = deadline
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(1));
+        Ok((
+            lock,
+            DrainOptions {
+                deadline: Some(remaining),
+                ..options
+            },
+        ))
+    }
+
     fn identity_lock(&self) -> Result<File> {
         agent::create_private_directory(&self.registry, "agent registry", true, true)?;
         let file =
@@ -9460,7 +9526,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         options: DrainOptions,
         message_id: Option<&str>,
     ) -> Result<QueueResult> {
-        let _lock = self.lock(agent_name)?;
+        let (_lock, options) = self.delivery_lock(agent_name, options, message_id)?;
         let record = self.load(agent_name)?;
         self.send_record(&record, text, options, message_id, None)
     }
@@ -9930,7 +9996,7 @@ its drain would also type, so it was not queued",
         // Only the urgent prompt is typed, ahead of the queued backlog, which stays
         // pending for the normal paced path (#697 send-muse-while-working).
         let result = {
-            let _lock = self.lock(agent_name)?;
+            let (_lock, options) = self.delivery_lock(agent_name, options, message_id)?;
             let record = self.load(agent_name)?;
             self.send_record_priority(
                 &record,
@@ -10269,7 +10335,7 @@ its drain would also type, so it was not queued",
 
     /// Drain only prompts known not to have been injected.
     pub fn drain(&self, agent_name: &str, options: DrainOptions) -> Result<QueueResult> {
-        let lock = self.lock(agent_name)?;
+        let (lock, options) = self.delivery_lock(agent_name, options, None)?;
         let record = self.load(agent_name)?;
         if record.is_headless() {
             return self.wake_headless_record(lock, &record);
