@@ -256,6 +256,122 @@ def test_audit_unregistered_directory_matches_python(tmp_path: Path) -> None:
     assert actual["worktree_count"] == 2
 
 
+def _ghost_checkout(root: Path, base: Path) -> Path:
+    checkout = root / "worktrees" / "ghost" / "repo"
+    _git(
+        base / "upstream-repo", "worktree", "add", "-q", "-b", "suite/ghost",
+        str(checkout), "HEAD",
+    )
+    return checkout
+
+
+def test_audit_unregistered_cache_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    checkout = _ghost_checkout(root, tmp_path)
+    cache = checkout / "cache"
+    cache.mkdir(parents=True)
+    for index in range(10):
+        (cache / f"f{index}.bin").write_bytes(b"x" * 1024)
+    actual = _check(root, tmp_path)
+    row = {str(item["slot"]): item for item in _rows(actual)}["ghost"]
+    assert row["cache_status"] == "complete"
+    assert row["cache_error"] is None
+    # Scrubbed sentinel: an integer byte count was published.
+    assert row["cache_bytes"] == "counted"
+
+
+def test_audit_unregistered_non_checkout_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    ghost = root / "worktrees" / "ghost"
+    _repo(ghost)
+    (ghost / "file.txt").unlink()
+    (ghost / "inner").mkdir()
+    actual = _check(root, tmp_path)
+    row = {str(item["slot"]): item for item in _rows(actual)}["ghost"]
+    assert row["cache_status"] == "error"
+    # The first entry judged (the repository's own .git directory)
+    # is refused by Git in both editions, with the same spelling.
+    assert "Git refused in" in str(row["cache_error"])
+
+
+def test_audit_unregistered_file_entry_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    ghost = root / "worktrees" / "ghost"
+    ghost.mkdir(parents=True)
+    (ghost / "notes.txt").write_text("hi\n")
+    actual = _check(root, tmp_path)
+    row = {str(item["slot"]): item for item in _rows(actual)}["ghost"]
+    assert row["cache_status"] == "error"
+    assert "contains a non-checkout entry" in str(row["cache_error"])
+
+
+def test_audit_unregistered_repo_globs_only_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(
+        config.read_text() + "repo_cache_globs:\n  repo:\n    - cache\n"
+    )
+    _ghost_checkout(root, tmp_path)
+    actual = _check(root, tmp_path)
+    row = {str(item["slot"]): item for item in _rows(actual)}["ghost"]
+    assert row["cache_status"] == "error"
+    assert "no trusted repository-name mapping" in str(row["cache_error"])
+
+
+def test_audit_unregistered_tracked_cache_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    checkout = _ghost_checkout(root, tmp_path)
+    tracked = checkout / "cache" / "tracked.bin"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_bytes(b"x" * 16)
+    _git(checkout, "add", "cache/tracked.bin")
+    _git(checkout, "commit", "-q", "-m", "tracked cache")
+    actual = _check(root, tmp_path)
+    row = {str(item["slot"]): item for item in _rows(actual)}["ghost"]
+    assert row["cache_status"] == "error"
+    assert "overlaps tracked source at cache/tracked.bin" in str(
+        row["cache_error"]
+    )
+
+
+def test_audit_unregistered_symlink_ancestor_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - link/cache\n")
+    checkout = _ghost_checkout(root, tmp_path)
+    real = checkout / "real"
+    (real / "cache").mkdir(parents=True)
+    (real / "cache" / "f.bin").write_bytes(b"x" * 1024)
+    (checkout / "link").symlink_to(real, target_is_directory=True)
+    actual = _check(root, tmp_path)
+    row = {str(item["slot"]): item for item in _rows(actual)}["ghost"]
+    assert row["cache_status"] == "error"
+    assert "cache path crosses a symlink" in str(row["cache_error"])
+
+
+def test_audit_symlink_file_candidate_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / "target-file").write_bytes(b"x" * 16)
+    (checkout / "cache").symlink_to(checkout / "target-file")
+    actual = _check(root, tmp_path)
+    row = {str(item["slot"]): item for item in _rows(actual)}["slot-a"]
+    assert row["cache_status"] == "error"
+    assert "cache path crosses a symlink" in str(row["cache_error"])
+
+
 def test_audit_cache_bytes_match_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     config = root / ".wrkslots.yml"

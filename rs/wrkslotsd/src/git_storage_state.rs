@@ -43,7 +43,7 @@ fn note(
     })
 }
 
-fn git_run(repository: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git_run(repository: &Path, args: &[&str]) -> Result<String> {
     let mut command = Command::new("git");
     command.args([
         "--no-replace-objects",
