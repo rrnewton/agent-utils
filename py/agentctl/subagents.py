@@ -1076,6 +1076,13 @@ def _readback_tail(text: str) -> str:
     return _readback_form(text)[-40:]
 
 
+def _readback_head(text: str) -> str:
+    """The first 40 characters of a prompt as read-back compares it: with its tail, the
+    part that tells one prompt from another. The tail alone does not: every prompt a chat
+    bridge types ends in the same boilerplate."""
+    return _readback_form(text)[:40]
+
+
 # Markers that start the rows where typed input lands in a harness pane: the composer and the
 # user turns above it. Claude Code and Muse draw both after ``❯``; Codex draws a user turn after
 # ``›``, input it holds for a running turn after ``↳``, and its input box after ``»``.
@@ -1087,10 +1094,15 @@ def _input_occurrences(screen: str, text: str) -> int:
     in another agent's pane: in a run of rows that starts with an input-marker row and goes on
     over the blank and indented rows under it, up to a row at the left edge, a rule, or a tool
     output row (``⎿`` or ``└``). The same words printed anywhere else, such as in the output of
-    a command that read this target's screen, were not typed into that pane."""
+    a command that read this target's screen, were not typed into that pane.
+
+    One input region counts only when it holds both the text's head and its tail: a peer
+    that received a different prompt ending in the same words shows the tail alone and
+    counts nothing."""
     tail = _readback_tail(text)
     if not tail:
         return 0
+    head = _readback_head(text)
     regions: list[list[str]] = []
     open_region = False
     for line in screen.splitlines():
@@ -1107,7 +1119,12 @@ def _input_occurrences(screen: str, text: str) -> int:
             continue
         if regions:
             regions[-1].append(line)
-    return sum(_readback_form("\n".join(region)).count(tail) for region in regions)
+    total = 0
+    for region in regions:
+        form = _readback_form("\n".join(region))
+        if head in form:
+            total += form.count(tail)
+    return total
 
 
 class RecipientUnanchored(RecipientChanged):
@@ -1579,6 +1596,14 @@ class _WorkspaceClient:
                 f"native session is {info.session_agent!r}/{info.session_value!r}, recorded "
                 f"{record.session_agent or record.harness!r}/{record.session_value!r}"
             )
+        if record._session_source == "asserted" and (
+            info.session_value != record.session_value
+            or info.session_agent != (record.session_agent or record.harness)
+        ):
+            failures.append(
+                f"native session is {info.session_agent!r}/{info.session_value!r}, asserted "
+                f"{record.session_agent or record.harness!r}/{record.session_value!r}"
+            )
         if failures:
             raise RecipientChanged(
                 f"refusing input to agent {record.name!r}: " + "; ".join(failures)
@@ -1615,6 +1640,8 @@ class _WorkspaceClient:
                 )
             return
         if record.session_value is not None and record._session_source != "asserted":
+            return
+        if record._session_source == "asserted":
             return
         raise RecipientUnanchored(
             f"refusing input to agent {record.name!r}: its record pins no harness process or "
