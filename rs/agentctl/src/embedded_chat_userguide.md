@@ -2618,6 +2618,20 @@ systemd-run --user --unit=agentctl-chat-project \
 A transient unit does not survive a reboot or a restart of the user manager;
 the installed unit below does.
 
+Only one bridge may serve a channel. `chat run` takes a lock for each configured
+channel before its provider subscribes and holds it until it exits, so a second
+`chat run` naming a channel that already has a live bridge exits at startup with
+an error such as `channel C0123456789 already has a live bridge (process 4242,
+serving bridge state /home/USER/.local/state/agentctl/project-chat; ...)`,
+whichever state directory, registry or build it uses. Two bridges on one channel
+would each admit every message, and the second could type them into another
+agent's pane. The locks are one file per channel in `/run/user/UID/agentctl/chat-channels/`,
+or `/tmp/agentctl-UID/chat-channels/` when the user has no runtime directory;
+`AGENTCTL_CHAT_CHANNEL_LOCK_DIR` names another directory, for an isolated
+installation or test. A bridge that exits for any reason, a crash included,
+releases its locks. They are host-local: a bridge for the same channel on
+another host is not detected.
+
 Slow or briefly failing local tools do not stop `chat run`. A Herdr call that
 fails or times out, or finds Herdr unavailable, ends only the loop that types
 prompts and reads replies: `chat run` logs a line starting `agentctl: warning:
