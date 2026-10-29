@@ -67,6 +67,7 @@ export {
 } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarks, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
 export { createNavigation } from "../core/navigation/index.ts";
+export { nextRetryAt, retriesItself as outboxRetriesItself } from "../core/outbox/index.ts";
 export {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_COLLAPSED_LINES,

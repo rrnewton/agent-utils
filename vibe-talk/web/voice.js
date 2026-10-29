@@ -2884,18 +2884,8 @@ const OWN_POST_GRACE_MS = 600000;
 // goes once the page holds the message (`sentReceiptRetires`); and it goes by OWN_POST_GRACE_MS after
 // confirmation whatever the page holds.
 const SENT_RECEIPT_MS = 15000;
-// `#195 send-resilience`. A send whose answer was lost goes out again on its own after the first
-// wait, then after each wait this many times the last, never more than the longest — 3 s, 6 s,
-// 12 s, 20 s, 20 s, 20 s — and then a person decides. Each wait counts from when the attempt that
-// failed STARTED, so an attempt a slow service took a minute to fail goes again at once rather than
-// a further wait later (never sooner than the floor). `#277 send-order`: it was 5 s, 15 s and 45 s,
-// counted from the failure, and a message behind one waits for it. Only where it cannot post
-// twice; see `retriesItself`.
-const OUTGOING_RETRY_FIRST_MS = 3000;
-const OUTGOING_RETRY_FACTOR = 2;
-const OUTGOING_RETRY_MAX_MS = 20000;
-const OUTGOING_RETRY_FLOOR_MS = 1000;
-const OUTGOING_RETRY_ATTEMPTS = 6;
+// `#195 send-resilience`. When a send whose answer was lost goes out again on its own, and the waits
+// before it, are web/src/core/outbox's (`nextRetryAt`, `#624 voice-page-modularity`).
 const outgoingMessages = new Map();
 const outgoingObservations = new Map();
 // By entry id, the attempt in progress — a reply being placed, or a POST — and nothing else: a send
@@ -30970,16 +30960,7 @@ function channelPostsOnce(channel) {
  * one of those. `#263 post-split-per-provider`.
  */
 function retriesItself(entry) {
-  return entry.keyedOnly === true && channelPostsOnce(entry.channel) &&
-    !(entry.postedCount > 0 && entry.replyTo && !entry.continueIn);
-}
-
-/**
- * The wait before automatic attempt `used` + 1, from when the attempt before it started: 3 s, 6 s,
- * 12 s, then OUTGOING_RETRY_MAX_MS. `#277 send-order`.
- */
-function outgoingRetryWait(used) {
-  return Math.min(OUTGOING_RETRY_MAX_MS, OUTGOING_RETRY_FIRST_MS * OUTGOING_RETRY_FACTOR ** used);
+  return outboxRetriesItself(entry, channelPostsOnce);
 }
 
 /**
@@ -30991,9 +30972,8 @@ function outgoingRetryWait(used) {
  * OUTGOING_RETRY_ATTEMPTS. `#277 send-order`.
  */
 function planOutgoingRetry(entry, startedAt, unposted = false) {
-  const used = entry.retriesUsed || 0;
-  if ((!unposted && !retriesItself(entry)) || used >= OUTGOING_RETRY_ATTEMPTS) return false;
-  const at = Math.max(startedAt + outgoingRetryWait(used), Date.now() + OUTGOING_RETRY_FLOOR_MS);
+  const at = nextRetryAt(entry, startedAt, Date.now(), channelPostsOnce, unposted);
+  if (at === null) return false;
   holdOutgoingMessage(entry, { at, offline: navigator.onLine === false, unsent: false });
   return true;
 }

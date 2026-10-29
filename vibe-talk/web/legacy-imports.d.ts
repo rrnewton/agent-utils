@@ -15,6 +15,8 @@ declare const speechSegments: LegacyImports["speechSegments"];
 declare const createApi: LegacyImports["createApi"];
 declare const createWebPorts: LegacyImports["createWebPorts"];
 declare const createNavigation: LegacyImports["createNavigation"];
+declare const nextRetryAt: LegacyImports["nextRetryAt"];
+declare const outboxRetriesItself: LegacyImports["outboxRetriesItself"];
 declare const anchorOfMessage: LegacyImports["anchorOfMessage"];
 declare const createBookmarks: LegacyImports["createBookmarks"];
 declare const createReadLedger: LegacyImports["createReadLedger"];

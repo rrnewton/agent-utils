@@ -36,6 +36,7 @@ export const PACKAGES = Object.freeze({
   "core/api": BASE,
   "core/channels": BASE,
   "core/navigation": BASE,
+  "core/outbox": BASE,
   "core/search": BASE,
   "core/settings": BASE,
   "core/speech": BASE,

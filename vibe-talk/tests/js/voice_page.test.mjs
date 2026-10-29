@@ -1859,6 +1859,8 @@ const SETTINGS = await moduleForTests("src/core/settings/index.ts");
 const CHANNELS = await moduleForTests("src/core/channels/index.ts");
 /** What the reader has done to messages, as the page holds it (web/src/core/annotations). */
 const ANNOTATIONS = await moduleForTests("src/core/annotations/index.ts");
+/** The outbox: what waits to be sent, and what became of each send (web/src/core/outbox). */
+const OUTBOX = await moduleForTests("src/core/outbox/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -6832,6 +6834,23 @@ test("`#624 voice-page-modularity`: the reader's writes run one after another, a
   await assert.rejects(second, /refused/);
   assert.equal(await third, 3, "a failure stopped the task after it");
   assert.deepStrictEqual(order, ["first", "second", "third"]);
+});
+
+test("`#624 voice-page-modularity`: when a lost send goes out again by itself, and the waits, from the module alone", () => {
+  const { nextRetryAt, outgoingRetryWait, retriesItself, OUTGOING_RETRY_ATTEMPTS } = OUTBOX;
+  const once = () => true;
+  const never = () => false;
+  assert.deepStrictEqual([0, 1, 2, 3, 4, 5].map(outgoingRetryWait), [3000, 6000, 12000, 20000, 20000, 20000]);
+  const keyed = { keyedOnly: true, channel: "c" };
+  assert.deepStrictEqual([retriesItself(keyed, once), retriesItself(keyed, never), retriesItself({ channel: "c" }, once)], [true, false, false]);
+  assert.equal(retriesItself({ ...keyed, postedCount: 1, replyTo: "9" }, once), false, "a remainder starting with the reply went again");
+  assert.equal(retriesItself({ ...keyed, postedCount: 1, replyTo: "9", continueIn: "t" }, once), true);
+  // From when the failed attempt started, never sooner than the floor; none after the last attempt.
+  assert.equal(nextRetryAt(keyed, 1000, 1500, once), 4000);
+  assert.equal(nextRetryAt(keyed, 1000, 60000, once), 61000, "a slow failure waited a full wait again");
+  assert.equal(nextRetryAt({ ...keyed, retriesUsed: OUTGOING_RETRY_ATTEMPTS }, 0, 0, once), null);
+  assert.equal(nextRetryAt({ channel: "c" }, 0, 0, once), null, "a send that may post twice went again");
+  assert.equal(nextRetryAt({ channel: "c" }, 0, 0, never, true), 3000, "an attempt that posted nothing did not go again");
 });
 
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
