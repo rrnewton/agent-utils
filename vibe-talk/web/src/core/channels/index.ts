@@ -12,12 +12,13 @@ export {
   heldNow,
   mergeIntoCanon,
   pageCopyNewer,
+  pageFoldIn,
   refreshFailed,
   removedSince,
   serverVersions,
   upsertThreadSummary,
 } from "./fold.ts";
-export type { ServerVersions } from "./fold.ts";
+export type { PageFold, PageFoldDependencies, ServerVersions } from "./fold.ts";
 export { coverViewOf, projectionOf } from "./views.ts";
 export { restoreCanon, savedTimelineOf } from "./saved.ts";
 export type { SavedCover, SavedTimeline } from "./saved.ts";

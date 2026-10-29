@@ -6482,6 +6482,32 @@ test("`#624 voice-page-modularity`: the copy-order ledger, from the module alone
   assert.equal(createCopyOrder().isPosted(live), false);
 });
 
+test("`#624 voice-page-modularity`: what a page may fold, from the module alone, with the page's questions injected", () => {
+  const { emptyCanon, pageFoldIn, createCopyOrder } = CHANNELS;
+  const canon = emptyCanon("c");
+  const asked = [];
+  const deps = (over = {}) => ({
+    number: 5, ledger: createCopyOrder(),
+    removedAfterRead: () => false,
+    newerPageSpeaksFor: (_canon, message) => { asked.push(message.id); return message.id === "spoken"; },
+    ownPostStands: (id) => id === "mine",
+    ...over,
+  });
+  // No store as it was sent: every copy taken; every message answered for, but a fresh own post.
+  const plain = pageFoldIn(canon, { messages: [] }, null, deps());
+  assert.deepStrictEqual([plain.takes({ id: "1" }), plain.answers({ id: "1" }), plain.answers({ id: "mine" })], [true, true, false]);
+  // A removal newer than the read: never taken, always answered for, whatever the page carries.
+  canon.removed.set("gone", 7);
+  assert.deepStrictEqual([plain.takes({ id: "gone" }), plain.answers({ id: "gone" })], [false, true]);
+  // With the store as it was sent: a message never held is taken unless a newer page speaks for it.
+  const late = pageFoldIn(canon, { messages: [] }, new Map(), deps());
+  assert.deepStrictEqual([late.takes({ id: "new" }), late.takes({ id: "spoken" })], [true, false]);
+  assert.deepStrictEqual(asked, ["new", "spoken"]);
+  // The server's record of removals is asked too.
+  const removedLate = pageFoldIn(canon, { messages: [] }, null, deps({ removedAfterRead: (_c, id) => id === "x" }));
+  assert.deepStrictEqual([removedLate.takes({ id: "x" }), removedLate.answers({ id: "x" })], [false, true]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -77800,8 +77826,8 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
   assert.equal(savedMessage(page, "250").content, "a quiet reply in the second discussion", "the read for the counts brought nothing");
 
   // THE CONTROL: taking every message the store has not held, the read for the counts puts it back.
-  const control = await run(brokenScript(
-    "      return !newerPageSpeaksFor(canon, message, number);\n", "      return true;\n"));
+  const control = await run(await brokenModule([{ file: "src/core/channels/fold.ts",
+    find: "      return !deps.newerPageSpeaksFor(canon, message, number);\n", replace: "      return true;\n" }]));
   assert.ok(shownIds(control.page).includes("400"), "the read for the counts left the message out anyway, so this test cannot see it");
 });
 
@@ -77810,9 +77836,9 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
 // removal does not carry the message, and its cursor is past the deletion, so that read, a delta from it,
 // never reported it, and the message stayed on Main, and saved, until the next newest page fifteen
 // minutes on. A removal replayed from the stream's tail asks for no read at all.
-const REMOVED_LEFT_TO_ITS_READ = [
-  "      if (removedSince(canon, id, number) || removedAfterRead(canon, id, versions)) return true;\n",
-  "      if (removedSince(canon, id, number) || removedAfterRead(canon, id, versions)) return false;\n"];
+const REMOVED_LEFT_TO_ITS_READ = { file: "src/core/channels/fold.ts",
+  find: "      if (removedSince(canon, id, number) || deps.removedAfterRead(canon, id, versions)) return true;\n",
+  replace: "      if (removedSince(canon, id, number) || deps.removedAfterRead(canon, id, versions)) return false;\n" };
 
 for (const removal of ["after", "before", "tail"]) {
   const named = { after: "answered after the removal", before: "answered before the removal",
@@ -77878,7 +77904,7 @@ for (const removal of ["after", "before", "tail"]) {
 
     // THE CONTROL: the removal left to the read behind it, the message stays, on Main and saved, through
     // every poll after.
-    const control = await run(brokenScript(...REMOVED_LEFT_TO_ITS_READ));
+    const control = await run(await brokenModule([REMOVED_LEFT_TO_ITS_READ]));
     assert.ok(control.landed.shown.includes("200"), "the message left Main anyway, so this test cannot see it");
     assert.ok(control.landed.saved, "the message left the store anyway, so this test cannot see it");
     assert.ok(shownIds(control.page).includes("200") && savedMessage(control.page, "200"));
@@ -78463,8 +78489,11 @@ for (const when of ["held", "never held"]) {
 
     // THE CONTROL, as the page was: asking only whether a newer newest page of Main has landed, the read for
     // the counts puts the reply into its thread and the saved store, and the polls after keep it there.
-    const control = await run(brokenScript("      return !newerPageSpeaksFor(canon, message, number);\n",
-      "      return answeredThread(message) !== null || !newerPage(canon, \"main\", number);\n"));
+    // In the module, `answeredThread` and `newerPage` are the legacy script's own functions, found at run
+    // time in the page's global scope as every top-level function of a classic script is.
+    const control = await run(await brokenModule([{ file: "src/core/channels/fold.ts",
+      find: "      return !deps.newerPageSpeaksFor(canon, message, number);\n",
+      replace: "      return answeredThread(message) !== null || !newerPage(canon, \"main\", number);\n" }]));
     assert.deepStrictEqual(control.landed, { shown: true, saved: true }, "the reply stayed out anyway, so this test cannot see it");
     assert.ok(control.polls.every((state) => state.shown && state.saved));
   });

@@ -34,6 +34,7 @@ export {
   mergeIntoCanon,
   noteReplyGapsIn,
   pageCopyNewer,
+  pageFoldIn,
   projectionOf,
   refreshFailed,
   removedSince,

@@ -23969,100 +23969,24 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
 }
 
 /**
- * What a page of a view, `payload`, may fold into store `canon` (`foldTimelinePage`): the messages it
- * `takes` its copy of, and those it `answers` for — takes out as deleted where it does not carry them.
- * `#316 late-counts-resurrect`.
- *
- * NEVER A MESSAGE REMOVED UPSTREAM AFTER IT WAS SENT (`removedSince`), AND THAT ONE ALWAYS OUT. It is
- * older than the removal, so it takes no copy of the message: the read of All for Main's counts, sent
- * before a removal and landing after Main's read had taken the message out, brought it back onto Main
- * until the next full read. And it takes the message out, whatever it carries: the removal is newer,
- * and says the message is gone. That used to be left to the read behind the removal, which may never
- * say it: a newest page sent before the removal and answered after it does not carry the message, and
- * its cursor is past the deletion, so the read behind the removal, a delta from that cursor, did not
- * report it either, and the message stayed shown and saved until the next newest page, up to
- * `TIMELINE_RECONCILE_MS` later. A removal from the stream's replay tail asks for no read at all.
- *
- * AND WITH `held` — the store's copies as the read was sent (`heldNow`) — ONLY OVER THE COPIES OLDER
- * THAN IT (`copyOlderThan`), in the order reads were sent: a copy a read wrote stands where that read
- * was sent, a message from the stream where it went into the store, and a count or a thread record put
- * on here where the copy it was put on stood (`copyBuiltOn`). It takes its copy of a message whose copy
- * in the store is older, or says the message as it was posted (`postedCopies`), and of one the store has
- * not held at all — unless a newest page of the view that message belongs in, its thread or Main, sent
- * after it has landed (`newerPageSpeaksFor`), which speaks for it and did not leave it in the store, as
- * an answer of All that is not folded puts back nothing such a page took out (`placeFromPage`). It
- * answers only for the messages whose copy is older, and those removed since. A copy newer than the
- * page — an edit, a thread record or a count that a read sent after it brought, a message the stream
- * delivered after it was sent — it would undo, or take out as deleted (`#310 stale-live-read-flicker`);
- * a message taken out since it was sent, it would put back. But the stream's copy of a message is newer
- * only in being there: the page, which carries the message as it was posted or newer, takes its own
- * over it. Refused, a placeholder the stream drew while the page was out, and a bot then edited to its
- * answer, stayed a placeholder until the next newest page. And a copy that an OLDER read brought while
- * it was out is older than the page, which takes its own over it: the read of All for Main's counts,
- * answered after one edit and landing while Main's newer newest page was out, made that page refuse its
- * copy of the next edit, or of a removal, until the next newest page. Of what it does not take, a
- * message the stream left unplaced still takes its thread record (`placeFromPage`), and the counts,
- * which come of the replies it brings that the store never held, are what such a read is for.
+ * What a page of a view, `payload`, may fold into store `canon` (web/src/core/channels `pageFoldIn`,
+ * `#316 late-counts-resurrect`, which says why each rule is what it is), its read placed in the order of
+ * reads (`sentNumberOf`), with the copy ledger, the server's record of removals (`removedAfterRead`),
+ * whether a newer newest page speaks for a message (`newerPageSpeaksFor`) and whether the reader's own
+ * fresh post stands (`ownPostStands`).
  *
  * @param {any} canon
  * @param {VibeTalk.TimelineResponse} payload
  * @param {Map<string, any> | null} held
  */
 function pageFold(canon, payload, held) {
-  const number = sentNumberOf(payload);
-  const holds = held ? heldNow(canon) : null;
-  const versions = serverVersions(payload);
-  /** @type {Map<string, any> | null} the store's copies by id, for the server's versions: built once */
-  let stored = null;
-  const storedNow = () => {
-    if (!stored) stored = holds || new Map(canon.messages.map((copy) => [String(copy.id), copy]));
-    return stored;
-  };
-  /** @type {Set<string> | null} the ids the page carries, for the server's versions: built once */
-  let carriedIds = null;
-  const carried = () => {
-    if (!carriedIds) carriedIds = new Set((payload.messages || []).map((copy) => String(copy.id)));
-    return carriedIds;
-  };
-  /**
-   * @param {string} id whether the store holds a copy of message `id` older than this page
-   * @param {boolean} [says] older in what it says (`copyOlderThan`)
-   */
-  const older = (id, says = false) => {
-    const copy = holds && holds.get(id);
-    return Boolean(held && copy && copyOlderThan(copy, id, number, held, says));
-  };
-  return {
-    /** @param {any} message */
-    takes: (message) => {
-      const id = String(message.id);
-      if (removedSince(canon, id, number) || removedAfterRead(canon, id, versions)) return false;
-      // `#473 replication-c7-server-versions`: where the server says how new both copies are, that
-      // decides, whatever order the reads were sent in.
-      const kept = versions ? storedNow().get(id) : undefined;
-      // A copy that says the message as it was posted (the stream's, the reader's own send) is older
-      // in what it says than any read that carries the message, however late it arrived.
-      const byServer = kept && copyLedger.isPosted(kept) ? true : versions ? pageCopyNewer(kept, message, versions) : null;
-      if (byServer !== null) return byServer;
-      if (!held || !holds) return true;
-      if (holds.has(id)) return older(id, true);
-      // Taken out since it was sent.
-      if (held.has(id)) return false;
-      return !newerPageSpeaksFor(canon, message, number);
-    },
-    /** @param {any} message */
-    answers: (message) => {
-      const id = String(message.id);
-      if (removedSince(canon, id, number) || removedAfterRead(canon, id, versions)) return true;
-      // `#473 replication-c7-server-versions`: the replication model's rule 4, as the server applies
-      // it. A held copy is gone by its absence only where the server says it observed that copy
-      // before this page's read began and it was created below the stretch the page proves.
-      // A message the page carries is there, whichever copy of it the store keeps.
-      const byServer = versions ? (carried().has(id) ? false : goneByAbsence(message, versions)) : null;
-      if (byServer !== null) return byServer;
-      return (!held || older(id)) && (canon.removed.has(id) || !ownPostStands(message.id));
-    },
-  };
+  return pageFoldIn(canon, payload, held, {
+    number: sentNumberOf(payload),
+    ledger: copyLedger,
+    removedAfterRead,
+    newerPageSpeaksFor,
+    ownPostStands,
+  });
 }
 
 /**
