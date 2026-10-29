@@ -1855,6 +1855,8 @@ const GLYPHS = await moduleForTests("src/foundation/index.ts");
 const NAVIGATION = await moduleForTests("src/core/navigation/index.ts");
 /** The device's settings and, on its own handle, its token (web/src/core/settings). */
 const SETTINGS = await moduleForTests("src/core/settings/index.ts");
+/** One store per channel and its views' rules (web/src/core/channels). */
+const CHANNELS = await moduleForTests("src/core/channels/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -6250,6 +6252,38 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
   [72, 100, 3, 5, null]);
   assert.deepStrictEqual([keptText("  ").get(DEVICE_SETTINGS.collapsedLines), keptText("").get(DEVICE_SETTINGS.readingWidth)], [3, 72]);
   assert.deepStrictEqual(Object.keys(DEVICE_SETTINGS).sort(), table.map(([name]) => name).sort(), "a setting with no row here");
+});
+
+test("`#624 voice-page-modularity`: the channel store's rules hold from the module alone: views, time order, threads", () => {
+  const { emptyCanon, inTimeOrder, inViewOf, sameMessage, threadOf, timeOf, viewOfKey } = CHANNELS;
+  const a = emptyCanon(42);
+  const b = emptyCanon();
+  assert.equal(a.channel, "42");
+  assert.equal(b.channel, "");
+  assert.notEqual(a.views, b.views, "two stores share a map");
+  assert.deepStrictEqual([a.scope, a.complete, a.hasThreads, a.messages, a.threads], [null, null, false, [], []]);
+  assert.deepStrictEqual(viewOfKey("thread:t1"), { view: "thread", thread: "t1" });
+  assert.deepStrictEqual(viewOfKey("main"), { view: "main", thread: null });
+  assert.ok(Number.isNaN(timeOf(null, "timestamp")) && Number.isNaN(timeOf({ timestamp: "never" }, "timestamp")));
+  // Stable by time where every row has one; the server's order where one has none.
+  const rows = [{ id: "b", timestamp: "2026-10-01T00:00:02Z" }, { id: "a", timestamp: "2026-10-01T00:00:01Z" },
+    { id: "c", timestamp: "2026-10-01T00:00:01Z" }];
+  assert.deepStrictEqual(inTimeOrder(rows, "timestamp").map((row) => row.id), ["a", "c", "b"]);
+  const unknown = [...rows, { id: "d" }];
+  assert.equal(inTimeOrder(unknown, "timestamp"), unknown, "a row with no time did not leave the order as given");
+  // The server's timeline rule: All everything, a thread its own, Main roots and unthreaded, and in a
+  // scoped channel its one conversation whole.
+  const root = { id: "1", thread: { id: "t", is_root: true } };
+  const reply = { id: "2", thread: { id: "t", is_root: false } };
+  const plain = { id: "3" };
+  assert.deepStrictEqual([root, reply, plain].map((m) => inViewOf(m, "main", null, null)), [true, false, true]);
+  assert.deepStrictEqual([root, reply, plain].map((m) => inViewOf(m, "thread", "t", null)), [true, true, false]);
+  assert.deepStrictEqual([root, reply, plain].map((m) => inViewOf(m, "flat", null, null)), [true, true, true]);
+  assert.equal(inViewOf(reply, "main", null, "t"), true, "a scoped channel's reply is not on its Main");
+  assert.deepStrictEqual([threadOf(reply), threadOf(plain), threadOf(null), threadOf({ thread: { id: 7 } })], ["t", null, null, null]);
+  assert.equal(sameMessage({ id: "1", content: "x" }, { id: "1", content: "x" }), true);
+  assert.equal(sameMessage({ content: "x", id: "1" }, { id: "1", content: "x" }), false, "fields in another order are another copy");
+  assert.equal(sameMessage(undefined, undefined), false, "nothing held is never the arriving copy");
 });
 
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------

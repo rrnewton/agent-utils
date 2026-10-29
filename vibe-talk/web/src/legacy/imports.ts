@@ -18,6 +18,7 @@ export {
 } from "../core/search/index.ts";
 export { readPieces, sentenceEnds, speechSegments } from "../core/speech/index.ts";
 export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
+export { emptyCanon, inTimeOrder, inViewOf, sameMessage, threadOf, timeOf, viewOfKey } from "../core/channels/index.ts";
 export { createNavigation } from "../core/navigation/index.ts";
 export {
   DEFAULT_CARD_MAX_LINES,

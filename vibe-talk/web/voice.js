@@ -23863,68 +23863,14 @@ function saveCacheChannels() {
 /** The selected channel's store. `views` maps a view key to how far back that view is covered. */
 let channelCanon = emptyCanon();
 
-function emptyCanon(channel = "") {
-  return {
-    channel: String(channel), messages: [], threads: [], views: new Map(), dismissed: new Set(), hasThreads: false,
-    scope: null, unplaced: new Set(),
-    // `#308 live-reply-in-main`. By unplaced id, `unplacedArrivals` as its arrival made it — absent for
-    // one saved before a reload — and the unplaced ids a read of All sent after they arrived has
-    // answered for, carried or not (`placeUnplaced`).
-    unplacedSince: new Map(), unplacedAnswered: new Set(),
-    // `#315 removed-reply-target`. By id, each message removed upstream — by the stream, or by a delta's
-    // deletions — with `timelineAnswersAsked` as the removal came (`noteRemoved`). The store may still
-    // hold it until the read the removal asks for lands; meanwhile nothing places it, and a reply to it
-    // is refused (`replyRoute`, `placeReplyTarget`). Not "no longer unplaced", which reads as placed.
-    removed: new Map(),
-    // `#203 incremental-refresh`. Whether this channel's forward reads carry edits and deletions:
-    // null until one has landed. The backend's property rather than a view's, so it outlives a
-    // view's cover being reset by an explicit refresh.
-    complete: null,
-    // `#222 unread-replies`. By thread id: how many of its replies the store lacks for being older
-    // than anything read of it (`noteReplyGaps`). Absent is "not known yet".
-    replyGaps: new Map(),
-    // ...and the threads whose gap is not known because All's newest page carried their root and
-    // none of their replies, saying it leaves some out (Slack's threads past fifty replies, and before
-    // `#603 server-side-search` past its ten threads a page): All reaching such a root says nothing of
-    // its replies' age (`noteReplyGaps`).
-    passedOver: new Set(),
-    // ...and by thread id, the gap Done on the root set for a thread whose gap was not known
-    // (`settleUnknownReplies`), until a read sets one of its own (a read that only lowers it leaves
-    // it Done's, lowered): putting the root back takes it back (`unsettleReplies`).
-    settledByDone: new Map(),
-  };
-}
+// `emptyCanon`, `viewOfKey`, `timeOf`, `inTimeOrder`, `threadOf` and `sameMessage` are
+// web/src/core/channels's (`#624 voice-page-modularity`), with the store's shape (`ChannelCanon`).
 
 const viewKey = (view = channelView, thread = selectedThreadId) => (view === "thread" ? `thread:${thread}` : view);
 
-function viewOfKey(key) {
-  return key.startsWith("thread:") ? { view: "thread", thread: key.slice("thread:".length) } : { view: key, thread: null };
-}
-
-const timeOf = (item, field) => Date.parse(item && item[field]);
-
-/**
- * Whether `message` belongs in `view`: the same rule the server's timeline applies.
- *
- * `scope` is the one thread a channel registered as a single conversation is: its Main is that
- * whole conversation, root and replies, so a reply in it is a Main row. A channel with child
- * threads has no scope, and its Main keeps only roots and unthreaded messages.
- */
+/** Whether `message` belongs in `view` (web/src/core/channels `inViewOf`), in this channel's scope by default. */
 function inView(message, view, thread, scope = channelCanon.scope) {
-  const id = threadOf(message);
-  if (view === "flat") return true;
-  if (view === "thread") return id === thread;
-  return !id || message.thread.is_root === true || id === scope;
-}
-
-/** Stable by time when every row has one; otherwise in the order given, which is the server's. */
-function inTimeOrder(items, field) {
-  const times = items.map((item) => timeOf(item, field));
-  if (!times.every(Number.isFinite)) return items;
-  return items
-    .map((item, index) => ({ item, at: times[index], index }))
-    .sort((a, b) => a.at - b.at || a.index - b.index)
-    .map(({ item }) => item);
+  return inViewOf(message, view, thread, scope);
 }
 
 /**
@@ -24460,9 +24406,6 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
 
 /** The delta pages `foldTimelineDelta` found changed nothing. `#226 page-energy-profile`. */
 const unchangedDeltas = new WeakSet();
-
-/** Whether `held` is `arriving`, word for word: the same message, to draw and to keep. */
-const sameMessage = (held, arriving) => held !== undefined && JSON.stringify(held) === JSON.stringify(arriving);
 
 /**
  * What a delta can change in the store besides its rows — the counts of replies the store lacks,
@@ -25695,11 +25638,6 @@ function channelContextKey() {
 
 function channelComposerKey() {
   return JSON.stringify([selectedChannelId(), selectedThreadId]);
-}
-
-function threadOf(message) {
-  return message && message.thread && typeof message.thread.id === "string"
-    ? message.thread.id : null;
 }
 
 /**
