@@ -799,7 +799,10 @@ struct Stop {
     /// Archive a running adopted record whose pinned harness is dead, without querying Herdr; requires --expected-token and --expected-record-sha256
     #[arg(long, conflicts_with = "recover_legacy_adoption")]
     retire_dead_adoption: bool,
-    /// Exact lowercase 64-hex SHA-256 of raw agent.json bytes; valid only with an adopted-record recovery flag
+    /// Archive a running or launch-failed native record whose Herdr agent is gone, without closing anything; requires --expected-token and --expected-record-sha256
+    #[arg(long, conflicts_with_all = ["recover_legacy_adoption", "retire_dead_adoption"])]
+    retire_dead_native: bool,
+    /// Exact lowercase 64-hex SHA-256 of raw agent.json bytes; valid only with a record recovery flag
     #[arg(long, value_name = "SHA256")]
     expected_record_sha256: Option<String>,
     /// Agentcloud agents only: close the tab and archive the record WITHOUT halting or archiving
@@ -2829,6 +2832,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Stop(value) => {
             let recovery_selector = if value.retire_dead_adoption {
                 Some("--retire-dead-adoption")
+            } else if value.retire_dead_native {
+                Some("--retire-dead-native")
             } else if value.recover_legacy_adoption {
                 Some("--recover-legacy-adoption")
             } else {
@@ -2843,7 +2848,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             }
             if recovery_selector.is_none() && value.expected_record_sha256.is_some() {
                 return Err(Failure::Usage(
-                    "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption".to_owned(),
+                    "--expected-record-sha256 requires --recover-legacy-adoption, --retire-dead-adoption, or --retire-dead-native".to_owned(),
                 ));
             }
             manager.advised_stop_with_options(
@@ -2852,6 +2857,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     expected_token: value.expected_token,
                     recover_legacy_adoption: value.recover_legacy_adoption,
                     retire_dead_adoption: value.retire_dead_adoption,
+                    retire_dead_native: value.retire_dead_native,
                     expected_record_sha256: value.expected_record_sha256,
                     skip_cloud_halt: value.skip_cloud_halt,
                 },

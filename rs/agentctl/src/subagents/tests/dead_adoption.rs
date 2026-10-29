@@ -1156,3 +1156,118 @@ fn dead_adoption_retirement_preserves_a_live_reused_pid_and_changed_boot() {
         assert_eq!(unsafe { libc::kill(process.0.id() as libc::pid_t, 0) }, 0);
     }
 }
+
+fn native_options(fixture: &Fixture, record: &AgentRecord) -> StopOptions {
+    StopOptions {
+        expected_token: Some(record.token.clone()),
+        expected_record_sha256: Some(format!(
+            "{:x}",
+            Sha256::digest(
+                fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap()
+            )
+        )),
+        retire_dead_native: true,
+        ..StopOptions::default()
+    }
+}
+
+#[test]
+fn dead_native_retirement_archives_a_native_record_whose_herdr_agent_is_gone() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let record = fixture.manager().load("worker").unwrap();
+    assert_eq!(record.adapter, "herdr");
+    let raw = fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap();
+    fixture
+        .client
+        .agent_get_missing
+        .store(true, Ordering::Relaxed);
+    let result = fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .unwrap();
+    assert_eq!(result["name"], "worker");
+    assert_eq!(result["pane_closed"], false);
+    assert_eq!(result["tab_closed"], false);
+    assert_eq!(result["runtime_preserved"], true);
+    assert_eq!(result["retired_dead_native"], true);
+    let archive = PathBuf::from(result["archive"].as_str().unwrap());
+    assert_eq!(
+        archive.file_name().unwrap(),
+        format!("worker-{}", record.token).as_str()
+    );
+    assert_eq!(fs::read(archive.join("agent.json")).unwrap(), raw);
+    assert!(!fixture.root.join("registry/agents/worker").exists());
+}
+
+#[test]
+fn dead_native_retirement_refuses_while_the_herdr_agent_still_exists() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let record = fixture.manager().load("worker").unwrap();
+    let error = fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("still exists"),
+        "unexpected refusal: {error}"
+    );
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+    assert!(!fixture.root.join("registry/archive").exists());
+}
+
+#[test]
+fn dead_native_retirement_refuses_a_wrong_record_digest() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let record = fixture.manager().load("worker").unwrap();
+    fixture
+        .client
+        .agent_get_missing
+        .store(true, Ordering::Relaxed);
+    let mut assertions = native_options(&fixture, &record);
+    assertions.expected_record_sha256 = Some("0".repeat(64));
+    let error = fixture
+        .manager()
+        .stop_with_options("worker", assertions)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed before"),
+        "unexpected refusal: {error}"
+    );
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+}
+
+#[test]
+fn dead_native_retirement_archives_a_launch_failed_record_whose_agent_is_gone() {
+    // The devbig014 dead records are launch_failed: no Herdr agent ever
+    // existed, so the same agent_not_found proof archives them.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let path = fixture.root.join("registry/agents/worker/agent.json");
+    let mut document = agent::read_private_json(&path).unwrap();
+    document
+        .as_object_mut()
+        .unwrap()
+        .insert("lifecycle".to_owned(), json!("launch_failed"));
+    agent::atomic_json(&path, &document).unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    assert_eq!(record.lifecycle, "launch_failed");
+    fixture
+        .client
+        .agent_get_missing
+        .store(true, Ordering::Relaxed);
+    let result = fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .unwrap();
+    assert_eq!(result["retired_dead_native"], true);
+    assert!(!path.exists());
+}

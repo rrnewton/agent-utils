@@ -4780,6 +4780,8 @@ pub struct StopOptions {
     pub recover_legacy_adoption: bool,
     /// Retire a dead adopted harness's record without inspecting or changing its runtime.
     pub retire_dead_adoption: bool,
+    /// Archive a native record whose Herdr agent is gone, without closing anything.
+    pub retire_dead_native: bool,
     /// SHA-256 of the exact current `agent.json` bytes for explicit adoption recovery.
     pub expected_record_sha256: Option<String>,
     /// Retire an agentcloud agent's record and tab without halting or archiving its session.
@@ -5519,6 +5521,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .ok_or_else(|| {
                 fail("dead adoption retirement requires a valid harness anchor from the current pinning rule")
             })
+    }
+
+    fn dead_native_anchor(record: &AgentRecord) -> Result<()> {
+        // `launch_failed` is the same absence proved from the other side: the
+        // launch never produced a Herdr agent, so the lookup still decides.
+        if !matches!(record.lifecycle.as_str(), "running" | "launch_failed")
+            || record.mode != "interactive"
+            || record.backend != "herdr"
+            || record.adapter != "herdr"
+        {
+            return Err(fail(
+                "--retire-dead-native applies only to a running or launch-failed interactive herdr record",
+            ));
+        }
+        Ok(())
     }
 
     fn save(&self, record: &AgentRecord) -> Result<()> {
@@ -10958,6 +10975,24 @@ its drain would type first, so it was not queued",
         }
     }
 
+    /// A native agent is gone only when Herdr's own lookup says so. Any other
+    /// answer (a live pane, an unavailable server) cannot prove death.
+    fn require_dead_native(&self, record: &AgentRecord) -> Result<()> {
+        Self::dead_native_anchor(record)?;
+        match self.client.agent_pane(&record.name) {
+            Ok(_) => Err(fail("the recorded Herdr agent still exists")),
+            Err(error)
+                if crate::client::herdr_error_code(&error.to_string()).as_deref()
+                    == Some("agent_not_found") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(fail(format!(
+                "cannot prove the recorded Herdr agent is gone: {error}"
+            ))),
+        }
+    }
+
     fn dead_adoption_stop_recovery(
         &self,
         record: &AgentRecord,
@@ -11078,6 +11113,81 @@ its drain would type first, so it was not queued",
             "tab_closed": false,
             "runtime_preserved": true,
             "retired_dead_adoption": true,
+            "record_sha256": expected_hash,
+        }))
+    }
+
+    /// Archive a native record whose Herdr agent is gone. The record is
+    /// published into the archive exactly as recorded; nothing is closed
+    /// and nothing is deleted.
+    fn retire_dead_native_locked(
+        &self,
+        record: &AgentRecord,
+        pinned: &PinnedAgentDirectory,
+        queue: &RetirementQueue,
+        options: &StopOptions,
+    ) -> Result<Value> {
+        let expected_token = options.expected_token.as_deref().ok_or_else(|| {
+            fail("dead native retirement requires --expected-token and --expected-record-sha256")
+        })?;
+        let expected_hash = options.expected_record_sha256.as_deref().ok_or_else(|| {
+            fail("dead native retirement requires --expected-token and --expected-record-sha256")
+        })?;
+        if !stop_advice::valid_record_digest(expected_hash) {
+            return Err(fail(
+                "expected-record-sha256 must be exactly 64 lowercase hexadecimal characters",
+            ));
+        }
+        let initial = self.dead_adoption_snapshot(pinned, expected_token)?;
+        if &initial.record != record
+            || format!("{:x}", Sha256::digest(&initial.content)) != expected_hash
+        {
+            return Err(fail("native record changed before dead native retirement"));
+        }
+        self.verify_retirement_queue(pinned, queue)?;
+        self.require_dead_native(&initial.record)?;
+        let (_, destination) = self.archive_destination(&initial.record)?;
+        let mut published = false;
+        self.publish_pinned_directory_with_preflight(
+            pinned,
+            &destination,
+            &initial.content,
+            &mut published,
+            || {
+                self.refuse_pending_rename(&[&record.name])?;
+                if self.pending_move_destination_for_stop(record)?.is_some() {
+                    return Err(fail("refusing dead native retirement: move is incomplete"));
+                }
+                self.verify_retirement_queue(pinned, queue)?;
+                let final_snapshot = self.dead_adoption_snapshot(pinned, expected_token)?;
+                if final_snapshot != initial {
+                    return Err(fail(
+                        "native record generation changed before dead native retirement",
+                    ));
+                }
+                self.require_dead_native(&final_snapshot.record)?;
+                self.verify_retirement_queue(pinned, queue)?;
+                if self.dead_adoption_snapshot(pinned, expected_token)? != initial {
+                    return Err(fail(
+                        "native record generation changed during final death proof",
+                    ));
+                }
+                Ok(())
+            },
+            (
+                rename_directory_noreplace_at,
+                || {},
+                || {},
+                |directory: &File, _label| directory.sync_all(),
+            ),
+        )?;
+        Ok(json!({
+            "name": record.name,
+            "archive": destination,
+            "pane_closed": false,
+            "tab_closed": false,
+            "runtime_preserved": true,
+            "retired_dead_native": true,
             "record_sha256": expected_hash,
         }))
     }
@@ -11333,6 +11443,13 @@ its drain would type first, so it was not queued",
                 "--retire-dead-adoption and --recover-legacy-adoption are mutually exclusive",
             ));
         }
+        if options.retire_dead_native
+            && (options.retire_dead_adoption || options.recover_legacy_adoption)
+        {
+            return Err(fail(
+                "--retire-dead-native excludes --retire-dead-adoption and --recover-legacy-adoption",
+            ));
+        }
         if record.adapter == turn_runner::ADAPTER {
             return self.retire_turn_runner(record, options, recovery);
         }
@@ -11341,6 +11458,9 @@ its drain would type first, so it was not queued",
         }
         if options.retire_dead_adoption {
             Self::dead_adoption_anchor(&record)?;
+        }
+        if options.retire_dead_native {
+            Self::dead_native_anchor(&record)?;
         }
         if !record.is_cloud() {
             record.supported()?;
@@ -11357,7 +11477,7 @@ its drain would type first, so it was not queued",
                 "agent {agent_name:?} was replaced before this operation"
             )));
         }
-        let identity_lock = if options.retire_dead_adoption {
+        let identity_lock = if options.retire_dead_adoption || options.retire_dead_native {
             Some(self.identity_lock()?)
         } else if !options.recover_legacy_adoption && Self::dead_adoption_anchor(&record).is_ok() {
             self.identity_lock().ok()
@@ -11385,7 +11505,7 @@ its drain would type first, so it was not queued",
                 "refusing to stop {agent_name:?}: move is incomplete"
             )));
         }
-        let retirement = if options.retire_dead_adoption {
+        let retirement = if options.retire_dead_adoption || options.retire_dead_native {
             let pinned = self.pinned_agent_directory(agent_name)?;
             let queue = self.retirement_queue_locks(&pinned)?;
             Some((pinned, queue))
@@ -11404,6 +11524,12 @@ its drain would type first, so it was not queued",
                 .as_ref()
                 .expect("retirement pins and locks are held");
             return self.retire_dead_adoption_locked(&record, pinned, queue, options);
+        }
+        if options.retire_dead_native {
+            let (pinned, queue) = retirement
+                .as_ref()
+                .expect("retirement pins and locks are held");
+            return self.retire_dead_native_locked(&record, pinned, queue, options);
         }
         if options.recover_legacy_adoption {
             let pane_id = record
@@ -15164,6 +15290,7 @@ fi
                     expected_token: Some(adopted["token"].as_str().unwrap().to_owned()),
                     recover_legacy_adoption: true,
                     retire_dead_adoption: false,
+                    retire_dead_native: false,
                     expected_record_sha256: Some(digest.clone()),
                     skip_cloud_halt: false,
                 },
@@ -15220,6 +15347,7 @@ fi
                 }),
                 recover_legacy_adoption: true,
                 retire_dead_adoption: false,
+                retire_dead_native: false,
                 expected_record_sha256: (case != "missing-hash").then(|| {
                     if case == "wrong-hash" {
                         "0".repeat(64)
@@ -15289,6 +15417,7 @@ fi
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
                         retire_dead_adoption: false,
+                        retire_dead_native: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
                     },
@@ -15334,6 +15463,7 @@ fi
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
                         retire_dead_adoption: false,
+                        retire_dead_native: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
                     },
@@ -15375,6 +15505,7 @@ fi
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
                         retire_dead_adoption: false,
+                        retire_dead_native: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
                     },
@@ -15409,6 +15540,7 @@ fi
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
                     retire_dead_adoption: false,
+                    retire_dead_native: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
                 },
@@ -15434,6 +15566,7 @@ fi
             expected_token: Some(token),
             recover_legacy_adoption: true,
             retire_dead_adoption: false,
+            retire_dead_native: false,
             expected_record_sha256: Some(digest),
             skip_cloud_halt: false,
         };
@@ -15471,6 +15604,7 @@ fi
                     expected_token: Some(token.clone()),
                     recover_legacy_adoption: true,
                     retire_dead_adoption: false,
+                    retire_dead_native: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
                 },
@@ -15506,6 +15640,7 @@ fi
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
                     retire_dead_adoption: false,
+                    retire_dead_native: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
                 },
@@ -16411,6 +16546,7 @@ fi
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
                     retire_dead_adoption: false,
+                    retire_dead_native: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
                 },

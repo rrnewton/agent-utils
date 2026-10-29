@@ -65,6 +65,7 @@ struct Args {
     expected_token: Option<String>,
     recover_legacy_adoption: bool,
     retire_dead_adoption: bool,
+    retire_dead_native: bool,
     expected_record_sha256: Option<String>,
 }
 
@@ -102,6 +103,7 @@ impl Default for Args {
             expected_token: None,
             recover_legacy_adoption: false,
             retire_dead_adoption: false,
+            retire_dead_native: false,
             expected_record_sha256: None,
         }
     }
@@ -239,6 +241,11 @@ fn run(args: Args) -> Result<i32, CliError> {
     if args.retire_dead_adoption && command != "stop" {
         return Err(CliError::Usage(
             "--retire-dead-adoption is valid only with stop".to_owned(),
+        ));
+    }
+    if args.retire_dead_native && command != "stop" {
+        return Err(CliError::Usage(
+            "--retire-dead-native is valid only with stop".to_owned(),
         ));
     }
     if args.name.is_some()
@@ -382,6 +389,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
         && (args.expected_token.is_some()
             || args.recover_legacy_adoption
             || args.retire_dead_adoption
+            || args.retire_dead_native
             || args.expected_record_sha256.is_some())
     {
         return Err(CliError::Usage(
@@ -418,8 +426,16 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                     .to_owned(),
             ));
         }
+        if args.retire_dead_native && (args.retire_dead_adoption || args.recover_legacy_adoption) {
+            return Err(CliError::Usage(
+                "--retire-dead-native excludes --retire-dead-adoption and --recover-legacy-adoption"
+                    .to_owned(),
+            ));
+        }
         let recovery_selector = if args.retire_dead_adoption {
             Some("--retire-dead-adoption")
+        } else if args.retire_dead_native {
+            Some("--retire-dead-native")
         } else if args.recover_legacy_adoption {
             Some("--recover-legacy-adoption")
         } else {
@@ -434,7 +450,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
         }
         if recovery_selector.is_none() && args.expected_record_sha256.is_some() {
             return Err(CliError::Usage(
-                "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption".to_owned(),
+                "--expected-record-sha256 requires --recover-legacy-adoption, --retire-dead-adoption, or --retire-dead-native".to_owned(),
             ));
         }
     }
@@ -517,6 +533,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 expected_token: args.expected_token.clone(),
                 recover_legacy_adoption: args.recover_legacy_adoption,
                 retire_dead_adoption: args.retire_dead_adoption,
+                retire_dead_native: args.retire_dead_native,
                 expected_record_sha256: args.expected_record_sha256.clone(),
                 skip_cloud_halt: false,
             },
@@ -752,6 +769,7 @@ where
                 "--userguide" => args.userguide = true,
                 "--recover-legacy-adoption" => args.recover_legacy_adoption = true,
                 "--retire-dead-adoption" => args.retire_dead_adoption = true,
+                "--retire-dead-native" => args.retire_dead_native = true,
                 option if value_option(option).is_some() => {
                     let value = raw
                         .get(index + 1)
@@ -956,7 +974,7 @@ fn usage_line() -> &'static str {
 
 fn print_help() {
     println!(
-        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --term-backend BACKEND\n  --tmux-bin TMUX_BIN\n  --tmux-socket NAME\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON\n  --expected-token TOKEN\n  --recover-legacy-adoption\n  --retire-dead-adoption\n  --expected-record-sha256 SHA256\n\nAdoption recovery applies only to stop. Select exactly one recovery flag and supply\n--expected-token TOKEN and the lowercase 64-hex SHA-256 of the raw agent.json bytes.\n--retire-dead-adoption archives a running adopted record with a dead pinned harness\nwithout querying Herdr. Example: herdr-agent stop reviewer --retire-dead-adoption\n  --expected-token TOKEN --expected-record-sha256 SHA256",
+        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --term-backend BACKEND\n  --tmux-bin TMUX_BIN\n  --tmux-socket NAME\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON\n  --expected-token TOKEN\n  --recover-legacy-adoption\n  --retire-dead-adoption\n  --retire-dead-native\n  --expected-record-sha256 SHA256\n\nRecovery applies only to stop. Select exactly one recovery flag and supply\n--expected-token TOKEN and the lowercase 64-hex SHA-256 of the raw agent.json bytes.\n--retire-dead-adoption archives a running adopted record with a dead pinned harness\nwithout querying Herdr. --retire-dead-native archives a running or launch-failed native record whose\nHerdr agent is gone, closing nothing. Example: herdr-agent stop reviewer --retire-dead-adoption\n  --expected-token TOKEN --expected-record-sha256 SHA256",
         usage_line()
     );
 }

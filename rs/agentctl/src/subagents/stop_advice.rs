@@ -30,6 +30,15 @@ pub enum RecoveryAction {
         /// SHA-256 of the original raw record bytes.
         record_sha256: String,
     },
+    /// Archive the captured native generation after Herdr reports its agent gone.
+    RetireDeadNative {
+        /// Registered name from the exact private record snapshot.
+        name: String,
+        /// Exact registry generation captured before the refusal.
+        token: String,
+        /// SHA-256 of the original raw record bytes.
+        record_sha256: String,
+    },
     /// Inspect the rename that reserves both names; its CLI cannot assert this token.
     Rename {
         /// Original registered name in the validated journal.
@@ -61,6 +70,7 @@ impl RecoveryAction {
             Self::Doctor => None,
             Self::Stop { token, .. }
             | Self::RetireDeadAdoption { token, .. }
+            | Self::RetireDeadNative { token, .. }
             | Self::Rename { token, .. }
             | Self::Move { token, .. }
             | Self::Revive { token, .. } => Some(token),
@@ -73,7 +83,8 @@ impl RecoveryAction {
         }
         let digest = match &self {
             Self::Stop { record_sha256, .. } => record_sha256.as_deref(),
-            Self::RetireDeadAdoption { record_sha256, .. } => Some(record_sha256.as_str()),
+            Self::RetireDeadAdoption { record_sha256, .. }
+            | Self::RetireDeadNative { record_sha256, .. } => Some(record_sha256.as_str()),
             _ => None,
         };
         if options
@@ -128,6 +139,17 @@ impl RecoveryAction {
                 format!("--expected-token={token}"),
                 format!("--expected-record-sha256={record_sha256}"),
             ],
+            Self::RetireDeadNative {
+                name,
+                token,
+                record_sha256,
+            } => vec![
+                "stop".to_owned(),
+                name.clone(),
+                "--retire-dead-native".to_owned(),
+                format!("--expected-token={token}"),
+                format!("--expected-record-sha256={record_sha256}"),
+            ],
             Self::Rename { .. } | Self::Move { .. } => vec!["doctor".to_owned()],
             Self::Revive { name, token } => vec![
                 "revive".to_owned(),
@@ -140,6 +162,11 @@ impl RecoveryAction {
     fn valid_retirement_authority(&self) -> bool {
         match self {
             Self::RetireDeadAdoption {
+                name,
+                token,
+                record_sha256,
+            }
+            | Self::RetireDeadNative {
                 name,
                 token,
                 record_sha256,
@@ -334,6 +361,7 @@ mod tests {
                 expected_token: Some("original".to_owned()),
                 recover_legacy_adoption: true,
                 retire_dead_adoption: false,
+                retire_dead_native: false,
                 expected_record_sha256: Some(digest),
                 skip_cloud_halt: false,
             }),
@@ -344,6 +372,7 @@ mod tests {
                 expected_token: Some("original".to_owned()),
                 recover_legacy_adoption: true,
                 retire_dead_adoption: false,
+                retire_dead_native: false,
                 expected_record_sha256: Some("b".repeat(64)),
                 skip_cloud_halt: false,
             }),
@@ -373,6 +402,7 @@ mod tests {
                 expected_token: Some("-generation".to_owned()),
                 expected_record_sha256: Some(digest),
                 retire_dead_adoption: true,
+                retire_dead_native: false,
                 ..StopOptions::default()
             }),
             action

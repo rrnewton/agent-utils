@@ -911,6 +911,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "dead-adoption retirement is supported only for interactive herdr-foreign records",
             ));
         }
+        if options.retire_dead_native {
+            return Err(fail(
+                "dead-native retirement is supported only for interactive herdr records",
+            ));
+        }
         if options.recover_legacy_adoption || options.expected_record_sha256.is_some() {
             return Err(fail(
                 "legacy adoption recovery is supported only for interactive herdr-foreign records",
