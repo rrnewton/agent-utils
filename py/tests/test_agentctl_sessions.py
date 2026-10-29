@@ -282,6 +282,32 @@ def test_project_configuration_accepts_the_shared_term_backend_key(tmp_path: Pat
         load_configuration(tmp_path)
 
 
+def test_project_configuration_ignores_unknown_top_level_keys_with_one_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A key a newer agentctl adds must not break this one; a misspelled profile key still does.
+    import agentctl.profiles as profiles_module
+    monkeypatch.setattr(profiles_module, "_warned_unknown_keys", False)
+    _write_project_configuration(tmp_path, "project-agents")
+    path = tmp_path / ".agentctl/profiles.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["zz_future"] = {"on": True}
+    document["a_future"] = 1
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    assert load_configuration(tmp_path)[2] == "project-agents"
+    load_configuration(tmp_path)
+    assert capsys.readouterr().err == (
+        f"agentctl: warning: profile config {path} has top-level key(s) this agentctl does not "
+        "know: a_future, zz_future; ignoring them (a newer agentctl may use them)\n"
+    )
+    document["profiles"] = {"worker": {"harness": "codex", "mode": "interactive", "surprise": 1}}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    with pytest.raises(AgentDeliveryError):
+        load_configuration(tmp_path)
+
+
 @pytest.mark.parametrize(
     "workspace", ["", " leading", "trailing ", "line\nfeed", "tab\tlabel", "x" * 129],
 )

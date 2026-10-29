@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::agent::{AgentError, DrainOptions};
+use crate::profiles::UnknownKeys;
 use crate::subagents::{AdoptOptions, ManagedAgents, ManagedApi, StopOptions};
 
 /// File name of the restore configuration inside the agent registry.
@@ -76,9 +77,10 @@ fn default_herdr_wait() -> u64 {
     300
 }
 
-/// `<registry>/restore.json`.
+/// `<registry>/restore.json`. An unknown top-level key is warned about and ignored rather than
+/// refused (see [`RestoreConfig::load`]), so a key a newer agentctl adds never stops an older one
+/// restoring the registry; keys inside `also_registered` and `timers` entries stay strict.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct RestoreConfig {
     /// Always `agentctl-restore/v1`.
     pub schema: String,
@@ -109,6 +111,9 @@ pub struct RestoreConfig {
     /// Timers the watch keeps firing.
     #[serde(default)]
     pub timers: Vec<TimerWatch>,
+    /// Top-level keys this build does not know, named in a warning and otherwise ignored.
+    #[serde(flatten)]
+    pub(crate) unknown: UnknownKeys,
 }
 
 impl RestoreConfig {
@@ -126,6 +131,13 @@ impl RestoreConfig {
         };
         let config: Self = serde_json::from_str(&text)
             .map_err(|error| fail(format!("invalid {}: {error}", path.display())))?;
+        if let Some(names) = config.unknown.names() {
+            eprintln!(
+                "agentctl: warning: {} has top-level key(s) this agentctl does not know: \
+                 {names}; ignoring them (a newer agentctl may use them)",
+                path.display()
+            );
+        }
         config.validate(&path)?;
         Ok(config)
     }
@@ -164,6 +176,7 @@ impl RestoreConfig {
             report_dir: None,
             herdr_unit: None,
             timers: Vec::new(),
+            unknown: UnknownKeys::default(),
         }
     }
 
@@ -2077,5 +2090,43 @@ pub fn watch<A: ManagedApi + ?Sized>(
             return Ok(health);
         }
         host.sleep(options.interval);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_top_level_keys_are_ignored_but_duplicates_and_nested_keys_are_refused() {
+        let directory =
+            std::env::temp_dir().join(format!("restore-unknown-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        let load = |text: &str| {
+            fs::write(&path, text).unwrap();
+            RestoreConfig::load(&directory)
+        };
+        let config = load(
+            r#"{"schema": "agentctl-restore/v1", "units": ["bridge.service"], "zz_future": 1, "a_future": {}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.units, ["bridge.service"]);
+        assert_eq!(config.unknown.names().unwrap(), "a_future, zz_future");
+        for refused in [
+            r#"{"schema": "agentctl-restore/v1", "timers": [{"unit": "t.timer", "max_age_seconds": 60, "surprise": 1}]}"#,
+            r#"{"schema": "agentctl-restore/v1", "units": ["a.service"], "units": ["b.service"]}"#,
+            r#"{"schema": "agentctl-restore/v1", "also_registered": [{"registry": "/r", "name": "a", "name": "b"}]}"#,
+            r#"{"schema": "agentctl-restore/v1", "x": 1, "x": 2}"#,
+        ] {
+            assert!(load(refused).is_err(), "{refused}");
+        }
+        let error = load(
+            "{\"schema\": \"agentctl-restore/v1\",\n \"timers\": [{\"unit\": \"t.timer\", \"max_age_seconds\": 60, \"surprise\": 1}]}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("line 2"), "{error}");
+        fs::remove_dir_all(&directory).unwrap();
     }
 }

@@ -1009,7 +1009,10 @@ Settings come from three layers, applied in order:
 2. **An optional JSON config file** at `$GH_PACED_CONFIG`, else
    `$XDG_CONFIG_HOME/gh-paced/config.json`, else
    `~/.config/gh-paced/config.json`. A missing default file is fine. A file
-   named by `$GH_PACED_CONFIG` must exist. Unknown keys are an error (exit 78).
+   named by `$GH_PACED_CONFIG` must exist. An unknown top-level key is a
+   warning and is ignored, because the file is often shared between machines
+   running different versions; an unknown key inside a section (`read`,
+   `write`, ...) is an error (exit 78).
 3. **Environment variables**, which can only **tighten** a limit. A looser value
    is ignored with a warning. The exceptions are `GH_PACED_MAX_WAIT`,
    `GH_PACED_GIT_MAX_WAIT` and `GH_PACED_LOCK_WAIT`, which accept any value in

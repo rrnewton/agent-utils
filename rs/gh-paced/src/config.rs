@@ -244,8 +244,10 @@ struct WriteFile {
     max_in_flight: Option<u32>,
 }
 
+/// The config file. An unknown top-level key is reported as a warning and ignored rather than
+/// refused: the file is often shared between hosts running different versions, and a key a newer
+/// gh-paced adds must not stop an older one. Keys inside a section stay strict.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FileConfig {
     read: Option<ClassFile>,
     search: Option<ClassFile>,
@@ -271,6 +273,8 @@ struct FileConfig {
     max_body_bytes: Option<usize>,
     max_base64_run: Option<usize>,
     display_tz: Option<DisplayTz>,
+    #[serde(flatten)]
+    unknown: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 fn finite_at_least(name: &str, value: f64, min: f64) -> Result<f64, String> {
@@ -380,6 +384,17 @@ fn apply_class(
 
 impl FileConfig {
     fn apply(self, c: &mut Config, warnings: &mut Vec<String>) -> Result<(), String> {
+        if !self.unknown.is_empty() {
+            warnings.push(format!(
+                "config: ignoring top-level key(s) this gh-paced does not know: {} (a newer \
+                 gh-paced may use them)",
+                self.unknown
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if let Some(f) = self.read {
             apply_class(
                 Class::Read,
@@ -721,6 +736,16 @@ mod tests {
         assert!(!Config::default().allow_admin_api);
         let (c, warnings) = load(r#"{"plain_403_cooldown_secs": 1800}"#).unwrap();
         assert_eq!(c, Config::default(), "{warnings:?}");
+        let (c, warnings) = load(r#"{"zz_future": {"x": 1}, "a_future": 2}"#).unwrap();
+        assert_eq!(c, Config::default());
+        assert_eq!(
+            warnings,
+            [
+                "config: ignoring top-level key(s) this gh-paced does not know: a_future, \
+              zz_future (a newer gh-paced may use them)"
+            ]
+        );
+        assert!(load(r#"{"write": {"surprise": 1}}"#).is_err());
         let (c, _) = load(r#"{"unknown_403_backoff_secs": 60}"#).unwrap();
         assert_eq!(c.unknown_403_backoff_secs, 60.0);
         for bad in ["0", "0.5", "301", "1e308"] {
@@ -761,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_is_clamped_to_github_ceilings_and_rejects_unknown_keys() {
+    fn config_file_is_clamped_to_github_ceilings_and_warns_about_unknown_keys() {
         let dir = std::env::temp_dir().join(format!("gh-paced-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("c.json");
@@ -776,7 +801,16 @@ mod tests {
         assert_eq!(c.write.per_hour, 500);
         assert_eq!(c.search.per_minute, 4.0);
         assert_eq!(warnings.len(), 2, "{warnings:?}");
+        // A top-level key this version does not know (a newer version's, or a typo) is reported
+        // and ignored; a section's own keys stay strict.
         std::fs::write(&path, r#"{"writes": {"per_minute": 1}}"#).unwrap();
+        let (c, warnings) = Config::load(Some(&path), true, &env).unwrap();
+        assert_eq!(c, Config::default());
+        assert!(
+            warnings[0].contains("does not know: writes"),
+            "{warnings:?}"
+        );
+        std::fs::write(&path, r#"{"write": {"per_minut": 1}}"#).unwrap();
         assert!(Config::load(Some(&path), true, &env).is_err());
         std::fs::write(&path, r#"{"cooldown_secs": 5}"#).unwrap();
         assert!(Config::load(Some(&path), true, &env).is_err());

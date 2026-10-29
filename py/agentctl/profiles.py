@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -602,6 +603,22 @@ def _launch_env(value: object) -> LaunchEnv | None:
     return LaunchEnv(env_file, tuple(directories))
 
 
+# Unknown top-level keys are warned about once and ignored rather than refused, so a key a newer
+# agentctl adds never breaks an older one reading the same file. Keys inside a profile stay strict.
+_KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env"})
+_warned_unknown_keys = False
+
+
+def unknown_keys_warning(path: Path, unknown: set[str]) -> str | None:
+    """Return the one-line warning for top-level keys this edition does not know, if any."""
+    if not unknown:
+        return None
+    return (
+        f"agentctl: warning: profile config {path} has top-level key(s) this agentctl does not know: "
+        f"{', '.join(sorted(unknown))}; ignoring them (a newer agentctl may use them)"
+    )
+
+
 def load_configuration(
     cwd: str | Path, *, absent_ok: bool = False,
 ) -> tuple[Path, dict[str, LaunchProfile], str | None]:
@@ -640,19 +657,22 @@ def load_configuration(
         raw: object = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeError, json.JSONDecodeError, RecursionError, _DuplicateKey) as exc:
         raise AgentDeliveryError(f"cannot read profile config {path}: {exc}") from exc
-    if (not isinstance(raw, dict)
-            or not {"schema", "profiles"}.issubset(raw)
-            or set(raw) - {"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env"}):
-        raise AgentDeliveryError(
-            "profile config must contain schema and profiles, with optional workspace, wrkslots, term_backend and launch_env"
-        )
+    if not isinstance(raw, dict) or not {"schema", "profiles"}.issubset(raw):
+        raise AgentDeliveryError("profile config must contain schema and profiles")
     if raw.get("schema") != SCHEMA or not isinstance(raw.get("profiles"), dict):
         raise AgentDeliveryError(f"profile config must use schema {SCHEMA!r} and an object of profiles")
     profiles = {name: _profile(name, value) for name, value in cast(dict[str, object], raw["profiles"]).items()}
     _wrkslots(raw.get("wrkslots"))
     _term_backend(raw.get("term_backend"))
     _launch_env(raw.get("launch_env"))
-    return path, dict(sorted(profiles.items())), _workspace(raw.get("workspace"))
+    workspace = _workspace(raw.get("workspace"))
+    # Only a file that loads is warned about, so a refusal reads the same in both editions.
+    warning = unknown_keys_warning(path, set(raw) - _KNOWN_TOP_LEVEL_KEYS)
+    global _warned_unknown_keys
+    if warning is not None and not _warned_unknown_keys:
+        _warned_unknown_keys = True
+        print(warning, file=sys.stderr)
+    return path, dict(sorted(profiles.items())), workspace
 
 
 def load_profiles(cwd: str | Path, *, absent_ok: bool = False) -> tuple[Path, dict[str, LaunchProfile]]:

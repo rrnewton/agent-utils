@@ -390,8 +390,11 @@ slot directory) still uses the project's profiles. The file is deliberately
 project-local and untracked. `agentctl`
 requires `.agentctl/` to match a Git ignore rule, requires the directory and
 file to be owned by the current user with no group or other permissions, and
-refuses symlinks, hard links, unknown fields, malformed text, NUL, and
-credential-shaped environment or argument names.
+refuses symlinks, hard links, unknown fields inside a profile, malformed text,
+NUL, and credential-shaped environment or argument names. An unknown top-level
+key is not refused: `agentctl` prints one warning naming it and ignores it, so a
+key added by a newer `agentctl` never stops an older one that reads the same
+file.
 
 ```json
 {
@@ -960,7 +963,9 @@ The report is `REPORT_DIR/BOOT_ID.json` (default
 with no refusal, 75 otherwise. `--boot` marks the report as the boot unit's run.
 
 The configuration is `REGISTRY/restore.json`; every key is optional except the
-schema:
+schema. An unknown top-level key is warned about and ignored, so a key added by
+a newer `agentctl` does not stop an older one; unknown keys inside an
+`also_registered` or `timers` entry are refused:
 
 ```json
 {

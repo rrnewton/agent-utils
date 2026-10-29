@@ -418,6 +418,27 @@ def _launch_specs(harness: Harness, report: Report) -> None:
             config.chmod(0o600)
         _pair(harness, report, launch_env, f"primary/launch-env-config/{label}",
               ("profiles", "--cwd", "<ROOT>"), expected)
+    # A top-level key from a newer agentctl is warned about and ignored, identically in both editions.
+    newer = harness.case("primary-unknown-top-level-config")
+    for root in (newer.python_root, newer.rust_root):
+        directory = root / ".agentctl"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        init_case_repository(root)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        config = directory / "profiles.json"
+        config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "zz_future": {"on": True},
+                                      "a_future": 1, "profiles": {}}),
+                          encoding="utf-8")
+        config.chmod(0o600)
+    _pair(harness, report, newer, "primary/unknown-top-level-config",
+          ("profiles", "--cwd", "<ROOT>"), 0)
+    # ... but a duplicate key is refused there as everywhere else in the file.
+    for root in (newer.python_root, newer.rust_root):
+        config = root / ".agentctl" / "profiles.json"
+        config.write_text('{"schema": "agentctl-profiles/v1", "profiles": {}, "x": {"a": 1, "a": 2}}',
+                          encoding="utf-8")
+    _pair(harness, report, newer, "primary/unknown-top-level-config/duplicate",
+          ("profiles", "--cwd", "<ROOT>"), 75)
 
 
 def _profiles(harness: Harness, report: Report) -> None:

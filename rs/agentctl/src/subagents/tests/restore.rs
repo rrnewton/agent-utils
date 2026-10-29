@@ -280,11 +280,15 @@ fn restore_configuration_is_strict() {
         json!({"schema": "agentctl-restore/v1", "units": ["a b.service"]}),
         json!({"schema": "agentctl-restore/v1", "also_registered": [{"registry": "relative", "name": "x"}]}),
         json!({"schema": "agentctl-restore/v1", "timers": [{"unit": "tick.service", "max_age_seconds": 60}]}),
-        json!({"schema": "agentctl-restore/v1", "unknown": true}),
+        json!({"schema": "agentctl-restore/v1", "also_registered": [{"registry": "/r", "name": "x", "unknown": true}]}),
     ] {
         fs::write(registry.join("restore.json"), document.to_string()).unwrap();
         assert!(RestoreConfig::load(&registry).is_err(), "{document}");
     }
+    // An unknown top-level key, as a newer agentctl may write, is warned about and ignored.
+    let document = json!({"schema": "agentctl-restore/v1", "unknown": true});
+    fs::write(registry.join("restore.json"), document.to_string()).unwrap();
+    assert!(RestoreConfig::load(&registry).is_ok());
     fs::remove_file(registry.join("restore.json")).unwrap();
     assert_eq!(
         RestoreConfig::load(&registry)

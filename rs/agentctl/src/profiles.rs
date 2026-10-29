@@ -1,5 +1,5 @@
 //! Strict project-local launch profiles.
-use serde::de::{Error as _, MapAccess, Visitor};
+use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -77,8 +77,10 @@ impl LaunchProfile {
     }
 }
 
+/// The configuration file's top level. Unknown top-level keys are kept, warned about once, and
+/// ignored rather than refused, so a key a newer agentctl adds never breaks an older one reading
+/// the same file. Keys inside a profile stay strict: a misspelled `argv` must not be ignored.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Document {
     schema: String,
     #[serde(default)]
@@ -90,6 +92,92 @@ struct Document {
     #[serde(default)]
     launch_env: Option<Value>,
     profiles: UniqueMap<RawProfile>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+/// Top-level keys this build does not know, collected so they can be named in a warning. Their
+/// values are checked only for duplicate keys, at every depth, as the rest of the file is.
+pub(crate) type UnknownKeys = UniqueMap<IgnoredValue>;
+
+impl UnknownKeys {
+    /// The keys, sorted, joined with ", ".
+    pub(crate) fn names(&self) -> Option<String> {
+        (!self.0.is_empty()).then(|| {
+            self.0
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    }
+}
+
+/// Any JSON value, discarded once it has been checked for duplicate object keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct IgnoredValue;
+
+impl<'de> Deserialize<'de> for IgnoredValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct IgnoredVisitor;
+        impl<'de> Visitor<'de> for IgnoredVisitor {
+            type Value = IgnoredValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON value whose objects have unique keys")
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<IgnoredValue, E> {
+                Ok(IgnoredValue)
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<IgnoredValue, E> {
+                Ok(IgnoredValue)
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<IgnoredValue, E> {
+                Ok(IgnoredValue)
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<IgnoredValue, E> {
+                Ok(IgnoredValue)
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<IgnoredValue, E> {
+                Ok(IgnoredValue)
+            }
+
+            fn visit_unit<E>(self) -> Result<IgnoredValue, E> {
+                Ok(IgnoredValue)
+            }
+
+            fn visit_none<E>(self) -> Result<IgnoredValue, E> {
+                Ok(IgnoredValue)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<IgnoredValue, A::Error> {
+                while seq.next_element::<IgnoredValue>()?.is_some() {}
+                Ok(IgnoredValue)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<IgnoredValue, A::Error> {
+                UniqueMapVisitor::<IgnoredValue>(std::marker::PhantomData)
+                    .visit_map(map)
+                    .map(|_| IgnoredValue)
+            }
+        }
+        deserializer.deserialize_any(IgnoredVisitor)
+    }
+}
+
+/// The one-line warning for top-level keys this build does not know, or `None` when there are none.
+fn unknown_keys_warning(path: &Path, unknown: &UnknownKeys) -> Option<String> {
+    unknown.names().map(|names| {
+        format!(
+            "agentctl: warning: profile config {} has top-level key(s) this agentctl does not know: {names}; ignoring them (a newer agentctl may use them)",
+            path.display(),
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -109,29 +197,31 @@ struct RawProfile {
     record_edges: Option<bool>,
 }
 
-#[derive(Debug, Default)]
-struct UniqueMap<V>(BTreeMap<String, V>);
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct UniqueMap<V>(BTreeMap<String, V>);
+
+struct UniqueMapVisitor<V>(std::marker::PhantomData<V>);
+
+impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMapVisitor<V> {
+    type Value = UniqueMap<V>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an object with unique keys")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut values = BTreeMap::new();
+        while let Some((key, value)) = map.next_entry::<String, V>()? {
+            if values.insert(key.clone(), value).is_some() {
+                return Err(A::Error::custom(format!("duplicate key {key:?}")));
+            }
+        }
+        Ok(UniqueMap(values))
+    }
+}
 
 impl<'de, V: Deserialize<'de>> Deserialize<'de> for UniqueMap<V> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct UniqueMapVisitor<V>(std::marker::PhantomData<V>);
-        impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMapVisitor<V> {
-            type Value = UniqueMap<V>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an object with unique keys")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut values = BTreeMap::new();
-                while let Some((key, value)) = map.next_entry::<String, V>()? {
-                    if values.insert(key.clone(), value).is_some() {
-                        return Err(A::Error::custom(format!("duplicate key {key:?}")));
-                    }
-                }
-                Ok(UniqueMap(values))
-            }
-        }
         deserializer.deserialize_map(UniqueMapVisitor(std::marker::PhantomData))
     }
 }
@@ -1064,6 +1154,11 @@ pub(crate) fn load_configuration(
     wrkslots_value(document.wrkslots.as_ref())?;
     backend_value(document.term_backend.as_ref())?;
     launch_env_value(document.launch_env.as_ref())?;
+    // Only a file that loads is warned about, so a refusal reads the same in both editions.
+    if let Some(warning) = unknown_keys_warning(&path, &document.unknown) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| eprintln!("{warning}"));
+    }
     Ok((path, profiles, workspace))
 }
 
@@ -1582,6 +1677,40 @@ mod tests {
             );
         }
         fs::remove_dir_all(&registry).unwrap();
+    }
+
+    #[test]
+    fn unknown_top_level_keys_are_ignored_with_a_warning_but_profile_keys_stay_strict() {
+        use serde_json::json;
+        let document: Document = serde_json::from_value(json!({
+            "schema": SCHEMA,
+            "future_key": {"anything": 1},
+            "another": true,
+            "profiles": {"worker": {"harness": "codex", "mode": "interactive"}}
+        }))
+        .unwrap();
+        assert_eq!(document.unknown.names().unwrap(), "another, future_key");
+        let warning =
+            unknown_keys_warning(Path::new("/p/.agentctl/profiles.json"), &document.unknown)
+                .unwrap();
+        assert!(
+            warning.contains("does not know: another, future_key;"),
+            "{warning}"
+        );
+        assert!(unknown_keys_warning(Path::new("/p"), &UnknownKeys::default()).is_none());
+        // Duplicate keys are refused inside an unknown key's value and among unknown keys, as
+        // everywhere else in the file.
+        for text in [
+            r#"{"schema": "agentctl-profiles/v1", "profiles": {}, "x": 1, "x": 2}"#,
+            r#"{"schema": "agentctl-profiles/v1", "profiles": {}, "x": [{"a": 1, "a": 2}]}"#,
+        ] {
+            assert!(serde_json::from_str::<Document>(text).is_err(), "{text}");
+        }
+        let strict = serde_json::from_value::<Document>(json!({
+            "schema": SCHEMA,
+            "profiles": {"worker": {"harness": "codex", "mode": "interactive", "surprise": 1}}
+        }));
+        assert!(strict.is_err());
     }
 
     #[test]
