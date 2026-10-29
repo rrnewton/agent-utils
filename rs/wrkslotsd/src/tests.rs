@@ -5048,6 +5048,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "heartbeat",
             "hold",
             "unhold",
+            "unpushed",
             "write-handoff",
             "parse-archive",
             "parse-handoff",
