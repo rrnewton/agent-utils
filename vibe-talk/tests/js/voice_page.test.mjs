@@ -6212,6 +6212,11 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["threadsMain", "vibe-talk.voice.threads-main", false, [[true, "on"], [false, "off"]], false],
     ["threadCardFolded", "vibe-talk.voice.thread-card-folded", false, [[true, "on"], [false, "off"]], false],
     ["keyboardDebug", "vibe-talk.voice.keyboard-debug", false, [[true, "1"], [false, null]], false],
+    ["msgScale", "vibe-talk.voice.msg-scale", 100, [[120, "120"], [80, "80"]], THROWN],
+    ["readingWidth", "vibe-talk.voice.width", 72, [[90, "90"], [45, "45"]], THROWN],
+    ["collapsedLines", "vibe-talk.voice.collapsed-lines", 3, [[0, "0"], [8, "8"]], THROWN],
+    ["cardMaxLines", "vibe-talk.voice.thread-card-max-lines", 5, [[1, "1"], [12, "12"]], 5],
+    ["readSpeed", "vibe-talk.voice.read-speed", null, [[150, "150"], [null, null]], THROWN],
   ];
   const refused = () => { throw new Error("SecurityError"); };
   const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
@@ -6234,6 +6239,16 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
   const stray = createDeviceSettings({ getItem: () => "{nonsense", setItem: () => {}, removeItem: () => {} });
   assert.deepStrictEqual([stray.get(DEVICE_SETTINGS.readAudioSource), stray.get(DEVICE_SETTINGS.openInView),
     stray.get(DEVICE_SETTINGS.slackOpen), stray.get(DEVICE_SETTINGS.readSteerOffset)], [null, "flat", "browser", null]);
+  // ...and a number out of its range, or not a number at all, as the clamps always read it: held to
+  // the range; the default, or for the pace no preference; a blank the default, never zero.
+  const keptText = (text) => createDeviceSettings({ getItem: () => text, setItem: () => {}, removeItem: () => {} });
+  assert.deepStrictEqual([keptText("4000").get(DEVICE_SETTINGS.readingWidth), keptText("1").get(DEVICE_SETTINGS.msgScale),
+    keptText("99").get(DEVICE_SETTINGS.collapsedLines), keptText("0").get(DEVICE_SETTINGS.cardMaxLines),
+    keptText("999").get(DEVICE_SETTINGS.readSpeed)], [120, 80, 8, 1, 200]);
+  assert.deepStrictEqual([stray.get(DEVICE_SETTINGS.readingWidth), stray.get(DEVICE_SETTINGS.msgScale),
+    stray.get(DEVICE_SETTINGS.collapsedLines), stray.get(DEVICE_SETTINGS.cardMaxLines), stray.get(DEVICE_SETTINGS.readSpeed)],
+  [72, 100, 3, 5, null]);
+  assert.deepStrictEqual([keptText("  ").get(DEVICE_SETTINGS.collapsedLines), keptText("").get(DEVICE_SETTINGS.readingWidth)], [3, 72]);
   assert.deepStrictEqual(Object.keys(DEVICE_SETTINGS).sort(), table.map(([name]) => name).sort(), "a setting with no row here");
 });
 
@@ -11177,7 +11192,7 @@ test("the text size slider has a − before it and a + after it on one row, each
   const slider = /<input([^>]*\bid="msg-scale"[^>]*)>/.exec(group)[1];
   for (const [attribute, constant] of [["min", "MIN_MSG_SCALE"], ["max", "MAX_MSG_SCALE"], ["step", "MSG_SCALE_STEP"]]) {
     const markup = (new RegExp(`\\b${attribute}="(\\d+)"`).exec(slider) || [])[1];
-    const script = (new RegExp(`const ${constant} = (\\d+);`).exec(SCRIPT) || [])[1];
+    const script = (new RegExp(`const ${constant} = (\\d+);`).exec(PAGE_CODE) || [])[1];
     assert.ok(markup !== undefined && script !== undefined, `the slider's ${attribute} or ${constant} is gone`);
     assert.equal(markup, script, `the slider's ${attribute} and ${constant} disagree`);
   }

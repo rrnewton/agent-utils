@@ -4,6 +4,17 @@
 // setting IS — its key, its encoding, its default — is said once, and the page only draws it.
 
 import type { StoragePort } from "../../ports/index.ts";
+import {
+  DEFAULT_CARD_MAX_LINES,
+  DEFAULT_COLLAPSED_LINES,
+  DEFAULT_MSG_SCALE,
+  DEFAULT_READING_CH,
+  clampCardMaxLines,
+  clampCollapsedLines,
+  clampMsgScale,
+  clampReadSpeed,
+  clampReadingWidth,
+} from "./bounds.ts";
 
 /** One setting kept on the device. */
 export interface DeviceSetting<T> {
@@ -128,6 +139,37 @@ export const DEVICE_SETTINGS = Object.freeze({
   threadsMain: onOrOff("vibe-talk.voice.threads-main"),
   /** `#388 thread-header-collapse`. Whether the card at the top of the thread list is folded: kept "on" or "off". */
   threadCardFolded: onOrOff("vibe-talk.voice.thread-card-folded"),
+  /** The reader's type size for message text, a percentage, clamped (`clampMsgScale`). */
+  msgScale: {
+    key: "vibe-talk.voice.msg-scale",
+    read: (raw: string | null) => clampMsgScale(raw === null ? DEFAULT_MSG_SCALE : raw),
+    write: (pct: number) => String(pct),
+  } satisfies DeviceSetting<number>,
+  /** The reading column's width in characters, clamped (`clampReadingWidth`). */
+  readingWidth: {
+    key: "vibe-talk.voice.width",
+    read: (raw: string | null) => clampReadingWidth(raw === null ? DEFAULT_READING_CH : raw),
+    write: (ch: number) => String(ch),
+  } satisfies DeviceSetting<number>,
+  /** `#425 collapsed-lines`. The lines a fold shows, clamped. Synced. */
+  collapsedLines: {
+    key: "vibe-talk.voice.collapsed-lines",
+    read: (raw: string | null) => clampCollapsedLines(raw === null ? DEFAULT_COLLAPSED_LINES : raw),
+    write: (n: number) => String(n),
+  } satisfies DeviceSetting<number>,
+  /** `#522 thread-card-max-lines`. K, clamped; a refused read is the default. Synced. */
+  cardMaxLines: {
+    key: "vibe-talk.voice.thread-card-max-lines",
+    read: (raw: string | null) => clampCardMaxLines(raw === null ? DEFAULT_CARD_MAX_LINES : raw),
+    write: (n: number) => String(n),
+    refused: { value: DEFAULT_CARD_MAX_LINES },
+  } satisfies DeviceSetting<number>,
+  /** The reading pace, a percentage, or null (nothing kept) for however the agent speaks. Synced. */
+  readSpeed: {
+    key: "vibe-talk.voice.read-speed",
+    read: (raw: string | null) => (raw === null ? null : clampReadSpeed(raw)),
+    write: (pct: number | null) => (pct === null ? null : String(pct)),
+  } satisfies DeviceSetting<number | null>,
   /** `#610 mobile-keyboard-compose`. Whether the keyboard layout debug readout is drawn: kept "1", forgotten when off. */
   keyboardDebug: {
     key: "vibe-talk.voice.keyboard-debug",

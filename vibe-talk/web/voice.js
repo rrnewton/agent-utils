@@ -62,10 +62,8 @@ function takePairingCode() {
 // refusal loop nobody could see the cause of, and silently reusing a credential the owner cannot
 // see is worse than asking for it once.
 const MIC_SETTINGS_KEY = "vibe-talk.voice.mic";
-const WIDTH_KEY = "vibe-talk.voice.width";
-const MSG_SCALE_KEY = "vibe-talk.voice.msg-scale";
-const COLLAPSED_LINES_KEY = "vibe-talk.voice.collapsed-lines";
-const READ_SPEED_KEY = "vibe-talk.voice.read-speed";
+const COLLAPSED_LINES_KEY = DEVICE_SETTINGS.collapsedLines.key;
+const READ_SPEED_KEY = DEVICE_SETTINGS.readSpeed.key;
 const MARK_OWN_KEY = DEVICE_SETTINGS.markOwnRead.key;
 const MARKER_KEY = "vibe-talk.voice.place-marker";
 const COMBINE_KEY = DEVICE_SETTINGS.combineMessages.key;
@@ -4187,9 +4185,6 @@ const FOLD_LESS = "Less";
  * counts hidden words against it, so the two cannot disagree about where the cut falls — which is
  * what the fixed three this replaces held by being one number in two files.
  */
-const MIN_COLLAPSED_LINES = 0;
-const MAX_COLLAPSED_LINES = 8;
-const DEFAULT_COLLAPSED_LINES = 3;
 
 /** The collapsed-lines count in force; `applyCollapsedLines` is its only writer. */
 let collapsedLines = DEFAULT_COLLAPSED_LINES;
@@ -10793,7 +10788,6 @@ function keepWrittenBox(area, seen, now) {
 //     checkbox kept where it was, under the pointer, and Send with it; one who scrolled it away is not
 //     moved. The checkbox ticked is the one the change came from, never read off the focus.
 
-
 /**
  * The boxes that grow, and their Grow checkboxes in the same order. All left-column ids: see `el`. The
  * reply's too, which is one of the composers in the stream (`#410 inline-reply-editor`).
@@ -10973,7 +10967,6 @@ function keepGrowingBoxInView(field) {
 // thread's, which is the same box) sent on Enter without Shift, and the reply screen's had no
 // handler at all, so Enter there was a new line and sending took the mouse. ONE handler now decides
 // for all of them, and the reader decides what it decides: "Enter to send" on the Settings screen.
-
 
 /** The message boxes, each of which hands its Enter to `onComposerKey`. */
 const COMPOSER_FIELDS = ["compose-text", "channel-compose-text", "reply-text", "side-compose-text"];
@@ -14051,7 +14044,6 @@ const typesCharacter = (chord) => !chord.mod && !chord.alt && chord.key.length =
 
 /** Whether the single-key shortcuts are on. ON unless the reader turned them off: see `storedSingleKeys`. */
 let singleKeys = true;
-
 
 /** What was stored. ABSENT MEANS ON, as for Enter to send: the default is the behaviour. */
 function storedSingleKeys() {
@@ -19076,19 +19068,8 @@ function renderControlBar() {
  * length on a phone, and over about a hundred and fifty the fold control and the row's own
  * controls no longer line up with the words they belong to.
  */
-const MIN_MSG_SCALE = 80;
-const MAX_MSG_SCALE = 150;
-const DEFAULT_MSG_SCALE = 100;
 /** The slider's `step` in web/voice.html, and what one press of its − or + moves it by. */
 const MSG_SCALE_STEP = 5;
-
-const clampMsgScale = (value) => {
-  const n = Math.round(Number(value));
-  if (!Number.isFinite(n)) {
-    return DEFAULT_MSG_SCALE;
-  }
-  return Math.min(MAX_MSG_SCALE, Math.max(MIN_MSG_SCALE, n));
-};
 
 /**
  * Put a type size on the page, and return the one actually applied, which is the clamped one.
@@ -19106,13 +19087,12 @@ function applyMsgScale(value) {
 
 /** Store it, and READ IT BACK: private browsing accepts `setItem` and keeps nothing. */
 function persistMsgScale(pct) {
-  const encoded = String(pct);
   try {
-    deviceStorage().setItem(MSG_SCALE_KEY, encoded);
+    deviceSettings().keep(DEVICE_SETTINGS.msgScale, pct);
   } catch (_error) {
     return false;
   }
-  return deviceStorage().getItem(MSG_SCALE_KEY) === encoded;
+  return deviceSettings().keptAs(DEVICE_SETTINGS.msgScale, pct);
 }
 
 /** Apply a new size and say, in Settings, whether it will survive a reload. */
@@ -19145,28 +19125,9 @@ function stepMsgScale(direction) {
   if (held && button.disabled) el("msg-scale").focus();
 }
 
-/**
- * `#425 collapsed-lines`. A lines count this page will actually apply, for the reason
- * `clampReadingWidth` gives: storage is not a trusted input. A blank entry is ABSENT, not zero —
- * `Number("")` is 0, and 0 is a real count now (the header alone), so taking a blank at its word
- * would put a reader who never touched the control into the tightest list there is.
- */
-function clampCollapsedLines(value) {
-  const text = typeof value === "string" ? value.trim() : value;
-  if (text === "" || text === null || text === undefined) {
-    return DEFAULT_COLLAPSED_LINES;
-  }
-  const n = Number(text);
-  if (!Number.isFinite(n)) {
-    return DEFAULT_COLLAPSED_LINES;
-  }
-  return Math.min(MAX_COLLAPSED_LINES, Math.max(MIN_COLLAPSED_LINES, Math.round(n)));
-}
-
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedCollapsedLines() {
-  const stored = deviceStorage().getItem(COLLAPSED_LINES_KEY);
-  return clampCollapsedLines(stored === null ? DEFAULT_COLLAPSED_LINES : stored);
+  return deviceSettings().get(DEVICE_SETTINGS.collapsedLines);
 }
 
 /**
@@ -19187,13 +19148,12 @@ function applyCollapsedLines(value) {
 
 /** Store it, and READ IT BACK: private browsing accepts `setItem` and keeps nothing. */
 function persistCollapsedLines(n) {
-  const encoded = String(n);
   try {
-    deviceStorage().setItem(COLLAPSED_LINES_KEY, encoded);
+    deviceSettings().keep(DEVICE_SETTINGS.collapsedLines, n);
   } catch (_error) {
     return false;
   }
-  return deviceStorage().getItem(COLLAPSED_LINES_KEY) === encoded;
+  return deviceSettings().keptAs(DEVICE_SETTINGS.collapsedLines, n);
 }
 
 /** The count in words, as Settings and the status line say it. */
@@ -19352,33 +19312,17 @@ function renderPageBuild() {
 }
 
 /** The device's copy of K, kept on the server for every device (`#457 settings-server-side`). */
-const CARD_MAX_LINES_KEY = "vibe-talk.voice.thread-card-max-lines";
-const MIN_CARD_MAX_LINES = 1;
-const MAX_CARD_MAX_LINES = 12;
-const DEFAULT_CARD_MAX_LINES = 5;
+const CARD_MAX_LINES_KEY = DEVICE_SETTINGS.cardMaxLines.key;
 /** The characters one card line is counted at: src/threads.rs `CARD_LINE_CHARS`, the same proxy. */
 const CARD_LINE_CHARS = 36;
 
 /** K in force; `applyCardMaxLines` is its only writer. */
 let cardMaxLines = DEFAULT_CARD_MAX_LINES;
 
-/** A K this page will apply, read as `clampCollapsedLines` reads its count, and as the server reads it. */
-function clampCardMaxLines(value) {
-  const text = typeof value === "string" ? value.trim() : value;
-  if (text === "" || text === null || text === undefined) return DEFAULT_CARD_MAX_LINES;
-  const n = Number(text);
-  if (!Number.isFinite(n)) return DEFAULT_CARD_MAX_LINES;
-  return Math.min(MAX_CARD_MAX_LINES, Math.max(MIN_CARD_MAX_LINES, Math.round(n)));
-}
-
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedCardMaxLines() {
-  try {
-    const stored = deviceStorage().getItem(CARD_MAX_LINES_KEY);
-    return clampCardMaxLines(stored === null ? DEFAULT_CARD_MAX_LINES : stored);
-  } catch (_error) {
-    return DEFAULT_CARD_MAX_LINES;
-  }
+  // A browser refusing storage reads as the default (`DEVICE_SETTINGS.cardMaxLines.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.cardMaxLines);
 }
 
 /** Put K on the page, and return the one applied: the slider says it, and every card list is drawn again by it. */
@@ -19403,13 +19347,12 @@ function applyCardMaxLines(value, redraw = true) {
 
 /** Store it, and read it back: private browsing accepts `setItem` and keeps nothing. */
 function persistCardMaxLines(n) {
-  const encoded = String(n);
   try {
-    deviceStorage().setItem(CARD_MAX_LINES_KEY, encoded);
+    deviceSettings().keep(DEVICE_SETTINGS.cardMaxLines, n);
   } catch (_error) {
     return false;
   }
-  return deviceStorage().getItem(CARD_MAX_LINES_KEY) === encoded;
+  return deviceSettings().keptAs(DEVICE_SETTINGS.cardMaxLines, n);
 }
 
 /** K in words, as Settings says it. */
@@ -19943,44 +19886,14 @@ function collapsedLinesFromKeyboard(direction, target) {
   return true;
 }
 
-const MIN_READING_CH = 45;
-const MAX_READING_CH = 120;
-const DEFAULT_READING_CH = 72;
-
-/**
- * A width this page will actually apply.
- *
- * Storage is not a trusted input: it is shared with whatever else runs on this origin, it survives
- * a version of the page that had different limits, and a hand-edited entry is a thing people do.
- * A stored 4000 must become a column, not a window with no margins, so the value is clamped on the
- * way IN as well as on the way out — and anything that is not a number at all falls back to the
- * default rather than to NaN, which CSS would ignore silently.
- */
-function clampReadingWidth(value) {
-  // A blank entry is ABSENT, not zero. `Number("")` is 0 and `Number(null)` is 0, and taking
-  // either at its word would clamp an empty storage slot to the narrowest column the page allows
-  // — a reader who had never touched the control would find it already moved.
-  const text = typeof value === "string" ? value.trim() : value;
-  if (text === "" || text === null || text === undefined) {
-    return DEFAULT_READING_CH;
-  }
-  const ch = Number(text);
-  if (!Number.isFinite(ch)) {
-    return DEFAULT_READING_CH;
-  }
-  return Math.min(MAX_READING_CH, Math.max(MIN_READING_CH, Math.round(ch)));
-}
-
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedMsgScale() {
-  const stored = deviceStorage().getItem(MSG_SCALE_KEY);
-  return clampMsgScale(stored === null ? DEFAULT_MSG_SCALE : stored);
+  return deviceSettings().get(DEVICE_SETTINGS.msgScale);
 }
 
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedReadingWidth() {
-  const stored = deviceStorage().getItem(WIDTH_KEY);
-  return clampReadingWidth(stored === null ? DEFAULT_READING_CH : stored);
+  return deviceSettings().get(DEVICE_SETTINGS.readingWidth);
 }
 
 // The width currently in force, kept here rather than read back out of the DOM: reading a custom
@@ -20010,13 +19923,12 @@ function applyReadingWidth(value) {
  * discovered only after a reload.
  */
 function persistReadingWidth(ch) {
-  const encoded = String(ch);
   try {
-    deviceStorage().setItem(WIDTH_KEY, encoded);
+    deviceSettings().keep(DEVICE_SETTINGS.readingWidth, ch);
   } catch (_error) {
     return false;
   }
-  return deviceStorage().getItem(WIDTH_KEY) === encoded;
+  return deviceSettings().keptAs(DEVICE_SETTINGS.readingWidth, ch);
 }
 
 /** Apply a new width and say, in the settings screen, whether it will survive a reload. */
@@ -36686,8 +36598,6 @@ function toggleMessageDetails(li, messages) {
  * The bounds match the server's own clamp: below half the words stop being words, above double the
  * audio outruns following it, and both ends are a vendor request nobody wanted to pay for.
  */
-const MIN_READ_SPEED = 50;
-const MAX_READ_SPEED = 200;
 /** `#567 pace-stepper`. What one press of − or +, or one arrow key in the box, moves the pace by. */
 const READ_SPEED_STEP = 10;
 /**
@@ -36696,11 +36606,6 @@ const READ_SPEED_STEP = 10;
  */
 const READ_SPEED_SETTLE_MS = 600;
 let readSpeed = null;
-
-const clampReadSpeed = (value) => {
-  const n = Math.round(Number(value));
-  return Number.isFinite(n) ? Math.min(MAX_READ_SPEED, Math.max(MIN_READ_SPEED, n)) : null;
-};
 
 /** Put the pace on the page and remember it. */
 function applyReadSpeed(value) {
@@ -36729,11 +36634,7 @@ function applyReadSpeed(value) {
     ? "reading pace, percent of the device voice's normal pace" : "reading pace, percent of the agent's own");
   el("read-speed-label").textContent = readSpeed === null ? "Pace" : `${readSpeed}%`;
   try {
-    if (readSpeed === null) {
-      deviceStorage().removeItem(READ_SPEED_KEY);
-    } else {
-      deviceStorage().setItem(READ_SPEED_KEY, String(readSpeed));
-    }
+    deviceSettings().keep(DEVICE_SETTINGS.readSpeed, readSpeed);
   } catch (_error) {
     // A browser that refuses storage still reads at the chosen pace for this session.
   }
@@ -36803,8 +36704,7 @@ function commitReadSpeedBox() {
 
 /** What was stored, clamped. Absent means "as the agent speaks", which is not the same as 100%. */
 function storedReadSpeed() {
-  const held = deviceStorage().getItem(READ_SPEED_KEY);
-  return held === null ? null : clampReadSpeed(held);
+  return deviceSettings().get(DEVICE_SETTINGS.readSpeed);
 }
 
 /**
