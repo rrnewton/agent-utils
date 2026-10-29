@@ -1,5 +1,5 @@
 {
- "about": "#486 read-aloud-pieces: the pieces a block's text is read in. src/render.rs read_pieces and web/voice.js readPieces are both held to every case here. A case with \"alone\": true is the whole of a message that is one block (read-chunk-balance).",
+ "about": "#486 read-aloud-pieces: the pieces a block's text is read in. src/render.rs read_pieces and the page's readPieces (web/src/core/speech/) are both held to every case here. A case with \"alone\": true is the whole of a message that is one block (read-chunk-balance).",
  "cases": [
   {
    "name": "typed bullets",

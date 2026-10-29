@@ -1227,7 +1227,7 @@ fn item_source(text: &str) -> String {
 //
 // So a block is read in PIECES, each its own request and its own stop on the controller, by one
 // rule the page applies to the text it drew and the server to the text the block was drawn from
-// (`readPieces` in web/voice.js; both are held to tests/fixtures/read_aloud_pieces.json):
+// (`readPieces` in web/src/core/speech/; both are held to tests/fixtures/read_aloud_pieces.json):
 //
 // - a line that begins with a bullet glyph (`READ_BULLETS`) is a piece of its own, and the lines
 //   between such lines are one piece together, so a "•" list typed as text reads as a list;
@@ -5127,7 +5127,8 @@ mod read_aloud_blocks {
         assert_eq!(blocks[1].source, "- x");
     }
 
-    /// `#486 read-aloud-pieces`: the cases web/voice.js `readPieces` is held to as well.
+    /// `#486 read-aloud-pieces`: the cases the page's `readPieces` (web/src/core/speech/) is held
+    /// to as well.
     #[test]
     fn a_block_is_read_in_the_pieces_the_page_cuts_it_into() {
         let fixture: serde_json::Value =

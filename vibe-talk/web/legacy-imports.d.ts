@@ -9,3 +9,6 @@ declare const searchQueryMatches: LegacyImports["searchQueryMatches"];
 declare const searchQueryParse: LegacyImports["searchQueryParse"];
 declare const searchQueryTree: LegacyImports["searchQueryTree"];
 declare const searchSubject: LegacyImports["searchSubject"];
+declare const readPieces: LegacyImports["readPieces"];
+declare const sentenceEnds: LegacyImports["sentenceEnds"];
+declare const speechSegments: LegacyImports["speechSegments"];

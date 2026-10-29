@@ -16,3 +16,4 @@ export {
   searchQueryTree,
   searchSubject,
 } from "../core/search/index.ts";
+export { readPieces, sentenceEnds, speechSegments } from "../core/speech/index.ts";

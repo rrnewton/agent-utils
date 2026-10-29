@@ -13252,6 +13252,9 @@ test("A CARD WITH NO SUMMARY shows its first message line by line, as the messag
 
 // --- `#486 read-aloud-pieces`: a block read in pieces --------------------------------------------
 
+/** The speech module (`#624 voice-page-modularity`): what a read plays and how a block is cut. */
+const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
+
 /** The cases src/render.rs `read_pieces` is held to: the page cuts each the same way. */
 const PIECES_FIXTURE = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "read_aloud_pieces.json"), "utf8"));
 
@@ -13270,9 +13273,9 @@ test("THE PAGE CUTS A BLOCK INTO THE PIECES THE SERVER READS IT IN, case by case
 test("`read-chunk-balance`: a paragraph's sentences are cut into balanced pieces, as src/render.rs cuts them", () => {
   // The owner's paragraph: sentences of 5, 18, 30 and 8 words, read greedily as 53 and 8. The same
   // examples src/render.rs's `balance_sentences` test holds the server to.
-  const page = newPage();
-  const balance = (counts, alone) => JSON.parse(JSON.stringify(page.pure("balanceSentences")(counts, alone)));
-  const passes = page.pure("pieceSkewPasses");
+  // The module's own functions (`#624 voice-page-modularity`): the page uses them through readPieces.
+  const balance = (counts, alone) => SPEECH_PIECES.balanceSentences(counts, alone);
+  const passes = SPEECH_PIECES.pieceSkewPasses;
   assert.equal(passes([53, 8]), false, "the greedy cut passes the balance metric");
   assert.equal(passes([23, 38]), true);
   assert.ok(passes([30, 60]) && !passes([29, 60]));
