@@ -3,9 +3,9 @@
 //! Reproduces the Python edition's read-only audit payload for
 //! agent rows: per-record verdicts (HELD / DELETABLE / RECOVERABLE /
 //! BLOCKED / UNKNOWN) with the oracle's reasons, unregistered
-//! on-disk directory rows, interrupted-journal rows, stray Git
-//! registrations, cache byte accounting, and the disk/gate summary.
-//! Validation-row liveness, validation-batch seal evidence, and the
+//! on-disk directory rows, interrupted-journal rows, validation-batch
+//! seal evidence, stray Git registrations, cache byte accounting,
+//! and the disk/gate summary. Validation-row liveness and the
 //! bounded/cache-state census machinery stay with the Python
 //! edition for now and refuse by name. Read-only.
 
@@ -14,9 +14,11 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::active_state::{load_cfg, parse_timestamp, slot_directory, Cfg};
+use crate::active_state::{
+    as_int, as_list, as_mapping, as_str, exact_keys, load_cfg, parse_timestamp, slot_directory, Cfg,
+};
 use crate::canonical::canonical_sha256;
-use crate::config_validate::{load_config, validate_name};
+use crate::config_validate::{load_config, refuse_symlink, relative_inside, validate_name};
 use crate::ensure_states::refuse_partial_state_allow_seals;
 use crate::finish_write::{
     cache_globs_for, glob_parts, glob_parts_match, stored_path, stored_repository_path,
@@ -494,6 +496,7 @@ fn apply_overrides(
     slot: &str,
     slot_type: &str,
     slot_absent: bool,
+    sealed_generation: Option<i64>,
 ) {
     if let Some(journal) = journals.get(slot) {
         let state_text = journal.state.replace('-', " ");
@@ -510,6 +513,30 @@ fn apply_overrides(
         row.as_object_mut()
             .expect("row object")
             .insert("verdict".to_string(), json!("BLOCKED"));
+    }
+    if let Some(sealed_generation) = sealed_generation {
+        let active = row.get("generation").and_then(Value::as_i64).unwrap_or(0);
+        let (reason, verdict) = if sealed_generation == active {
+            (
+                "interrupted validation-batch seal requires wrkslots recover".to_string(),
+                "BLOCKED",
+            )
+        } else {
+            (
+                format!(
+                    "validation-batch seal cannot be attributed to the active generation: sealed={sealed_generation} active={active}"
+                ),
+                "UNKNOWN",
+            )
+        };
+        let row_reasons = row
+            .get_mut("reasons")
+            .and_then(Value::as_array_mut)
+            .expect("reasons list");
+        row_reasons.insert(0, json!(reason));
+        row.as_object_mut()
+            .expect("row object")
+            .insert("verdict".to_string(), json!(verdict));
     }
     let verdict = row
         .get("verdict")
@@ -530,6 +557,7 @@ fn apply_overrides(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_record(
     root: Option<&Path>,
     cfg: &Cfg,
@@ -538,6 +566,7 @@ fn audit_record(
     events: &[Value],
     journals: &BTreeMap<String, JournalSlot>,
     strays: &BTreeMap<(String, String), Vec<String>>,
+    sealed_generation: Option<i64>,
 ) -> Result<(Value, bool)> {
     let slot = record
         .get("slot")
@@ -619,7 +648,15 @@ fn audit_record(
             .unwrap_or_default()
             .to_string();
         let mut row = base("HELD", vec![reason]);
-        apply_overrides(&mut row, journals, strays, &slot, &slot_type, slot_absent);
+        apply_overrides(
+            &mut row,
+            journals,
+            strays,
+            &slot,
+            &slot_type,
+            slot_absent,
+            sealed_generation,
+        );
         return Ok((row, agent_running));
     }
     let mut reasons: Vec<String> = Vec::new();
@@ -770,33 +807,245 @@ fn audit_record(
         "BLOCKED"
     };
     let mut row = base(verdict, reasons);
-    apply_overrides(&mut row, journals, strays, &slot, &slot_type, slot_absent);
+    apply_overrides(
+        &mut row,
+        journals,
+        strays,
+        &slot,
+        &slot_type,
+        slot_absent,
+        sealed_generation,
+    );
     Ok((row, agent_running))
+}
+
+type SealTargets = Vec<(String, i64, PathBuf)>;
+type SealErrors = Vec<(Option<String>, String, String)>;
+
+struct SealTarget {
+    machine: String,
+    slot: String,
+    generation: i64,
+    path: PathBuf,
+}
+
+/// The machine a seal journal filename names, when it matches the
+/// oracle's `VALIDATE-BATCH-SEAL.<machine>.journal` pattern.
+fn seal_machine_from_name(name: &str) -> Option<String> {
+    let middle = name
+        .strip_prefix("VALIDATE-BATCH-SEAL.")?
+        .strip_suffix(".journal")?;
+    if middle.is_empty() || middle.len() > 64 {
+        return None;
+    }
+    let mut chars = middle.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if !middle
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(middle.to_string())
+}
+
+fn seal_actor(value: &Value, label: &str) -> Result<()> {
+    if value.is_null() {
+        return Err("validation-batch seal journal has no actor".to_string());
+    }
+    let raw = as_mapping(value, label)?;
+    exact_keys(
+        raw,
+        &["pid", "start_ticks", "boot_id", "host_id", "cgroup_path"],
+        &[],
+        label,
+    )?;
+    as_int(&raw["pid"], &format!("{label}.pid"), 1)?;
+    as_int(&raw["start_ticks"], &format!("{label}.start_ticks"), 1)?;
+    let boot_id = as_str(&raw["boot_id"], &format!("{label}.boot_id"))?;
+    let host_id = as_str(&raw["host_id"], &format!("{label}.host_id"))?;
+    let cgroup_path = as_str(&raw["cgroup_path"], &format!("{label}.cgroup_path"))?;
+    if boot_id.is_empty() || host_id.is_empty() || !cgroup_path.starts_with('/') {
+        return Err(format!(
+            "{label} has an invalid boot, machine, or cgroup identity"
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_identity(value: &Value, label: &str) -> Result<()> {
+    let values = as_list(value, label)?;
+    if values.len() == 3 {
+        for (index, item) in values.iter().enumerate() {
+            as_int(item, &format!("{label}[{index}]"), 1)?;
+        }
+        return Ok(());
+    }
+    if values.len() != 4 {
+        return Err(format!(
+            "{label} must contain dev, ino, file-handle type, and file-handle bytes"
+        ));
+    }
+    as_int(&values[0], &format!("{label}[0]"), 1)?;
+    as_int(&values[1], &format!("{label}[1]"), 1)?;
+    as_int(&values[2], &format!("{label}[2]"), 0)?;
+    let handle = as_str(&values[3], &format!("{label}[3]"))?;
+    if handle.is_empty()
+        || handle.len() > 256
+        || handle.len() % 2 != 0
+        || !handle
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
+        return Err(format!(
+            "{label}[3] must be bounded lowercase hexadecimal bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_target(cfg: &Cfg, value: &Value, label: &str) -> Result<(String, i64, PathBuf)> {
+    let raw = as_mapping(value, label)?;
+    exact_keys(
+        raw,
+        &["slot", "generation", "path", "original_mode", "identity"],
+        &[],
+        label,
+    )?;
+    let slot = validate_name(as_str(&raw["slot"], &format!("{label}.slot"))?, "slot")?;
+    let generation = as_int(&raw["generation"], &format!("{label}.generation"), 1)?;
+    let (_relative, path) = relative_inside(
+        &cfg.root,
+        as_str(&raw["path"], &format!("{label}.path"))?,
+        &format!("{label}.path"),
+    )?;
+    if path != slot_directory(cfg, &slot, "validate")? {
+        return Err(format!(
+            "{label}.path does not match validation slot {slot}"
+        ));
+    }
+    let original_mode = as_int(&raw["original_mode"], &format!("{label}.original_mode"), 0)?;
+    if original_mode > 0o7777 {
+        return Err(format!("{label}.original_mode exceeds permission bits"));
+    }
+    cleanup_identity(&raw["identity"], &format!("{label}.identity"))?;
+    Ok((slot, generation, path))
+}
+
+/// One seal journal, validated like `_validate_batch_seal_journal`.
+fn seal_journal(cfg: &Cfg, path: &Path, value: &Value) -> Result<(String, SealTargets)> {
+    let label = "validation-batch seal journal";
+    let raw = as_mapping(value, label)?;
+    exact_keys(
+        raw,
+        &[
+            "schema",
+            "kind",
+            "machine",
+            "created_at",
+            "actor",
+            "targets",
+        ],
+        &[],
+        label,
+    )?;
+    if as_int(&raw["schema"], &format!("{label}.schema"), 0)? != 1 {
+        return Err("unsupported validation-batch seal journal schema".to_string());
+    }
+    if raw["kind"] != Value::String("validate-batch-seal".to_string()) {
+        return Err("validation-batch seal journal has the wrong operation kind".to_string());
+    }
+    let machine = validate_name(
+        as_str(&raw["machine"], &format!("{label}.machine"))?,
+        "machine",
+    )?;
+    let expected = cfg
+        .control
+        .join(format!("VALIDATE-BATCH-SEAL.{machine}.journal"));
+    if path != expected {
+        return Err(
+            "validation-batch seal journal filename does not match its machine".to_string(),
+        );
+    }
+    parse_timestamp(
+        as_str(&raw["created_at"], &format!("{label}.created_at"))?,
+        &format!("{label}.created_at"),
+    )?;
+    seal_actor(&raw["actor"], &format!("{label}.actor"))?;
+    let items = as_list(&raw["targets"], &format!("{label}.targets"))?;
+    let mut targets: Vec<(String, i64, PathBuf)> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        targets.push(cleanup_target(
+            cfg,
+            item,
+            &format!("{label}.targets[{index}]"),
+        )?);
+    }
+    if targets.len() > 8 {
+        return Err("validation-batch seal journal exceeds the batch limit".to_string());
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    if targets
+        .iter()
+        .any(|(slot, _generation, _path)| !seen.insert(slot.as_str()))
+    {
+        return Err("validation-batch seal journal repeats a slot".to_string());
+    }
+    Ok((machine, targets))
+}
+
+fn read_seal_json(path: &Path) -> Result<Value> {
+    refuse_symlink(path, "validation-batch seal journal")?;
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("missing validation-batch seal journal: {}", path.display())
+        } else {
+            format!(
+                "cannot read validation-batch seal journal {}: {error}",
+                path.display()
+            )
+        }
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|error| format!("validation-batch seal journal is malformed JSON: {error}"))
+}
+
+/// Seal targets and per-journal errors, in the oracle's order: one
+/// bad journal hides neither the other journals nor the rows.
+fn seal_evidence(cfg: &Cfg) -> (Vec<SealTarget>, SealErrors) {
+    let mut targets: Vec<SealTarget> = Vec::new();
+    let mut errors: Vec<(Option<String>, String, String)> = Vec::new();
+    for path in crate::heartbeat_write::seal_paths(cfg) {
+        let name = path
+            .file_name()
+            .map(|item| item.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let machine = seal_machine_from_name(&name);
+        let parsed = read_seal_json(&path).and_then(|value| seal_journal(cfg, &path, &value));
+        match parsed {
+            Ok((parsed_machine, parsed_targets)) => {
+                targets.extend(parsed_targets.into_iter().map(
+                    |(slot, generation, target_path)| SealTarget {
+                        machine: parsed_machine.clone(),
+                        slot,
+                        generation,
+                        path: target_path,
+                    },
+                ));
+            }
+            Err(error) => errors.push((machine, name, error)),
+        }
+    }
+    (targets, errors)
 }
 
 /// The audit payload (`{"schema": 2, ...}`), minus the metrics phase
 /// timings the oracle measures live.
 pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
-    let (cfg, _selected) = load_cfg(root, machine_override)?;
+    let (cfg, selected) = load_cfg(root, machine_override)?;
     let config = load_config(root, machine_override)?;
-    // Seal evidence has no Rust counterpart yet; refuse by name
-    // rather than publish rows that omit it.
-    let entries = std::fs::read_dir(&cfg.control).map_err(|error| {
-        format!(
-            "cannot list control directory {}: {error}",
-            cfg.control.display()
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("cannot list control directory: {error}"))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("VALIDATE-BATCH-SEAL.") && name.ends_with(".journal") {
-            return Err(
-                "audit validation-batch seal evidence stays with the Python edition for now"
-                    .to_string(),
-            );
-        }
-    }
     refuse_partial_state_allow_seals(&cfg.control)?;
     validate_global(root, &cfg)?;
     let journals = journal_slots(&cfg)?;
@@ -824,6 +1073,15 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
             "audit validation-row liveness stays with the Python edition for now".to_string(),
         );
     }
+    let (seal_targets, seal_errors) = seal_evidence(&cfg);
+    let mut seal_by_slot: BTreeMap<(String, String), (i64, PathBuf)> = BTreeMap::new();
+    for target in &seal_targets {
+        seal_by_slot.insert(
+            (target.machine.clone(), target.slot.clone()),
+            (target.generation, target.path.clone()),
+        );
+    }
+    let mut represented_seals: BTreeSet<(String, String, i64)> = BTreeSet::new();
     // Stray Git registrations inside the managed root.
     let mut strays: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     let git_doc = crate::git_storage_state::parse_storage_git(root)?;
@@ -853,13 +1111,11 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
         }
     }
     // On-disk slot directories.
+    let validate_root = crate::storage_state::managed_root(&cfg).join("validate");
     let mut on_disk: BTreeSet<(String, String)> = BTreeSet::new();
     for (slot_type, root_path) in [
         ("agent", cfg.worktrees.clone()),
-        (
-            "validate",
-            crate::storage_state::managed_root(&cfg).join("validate"),
-        ),
+        ("validate", validate_root.clone()),
     ] {
         if !root_path.is_dir() {
             continue;
@@ -876,6 +1132,10 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("EVENTS.") {
+                continue;
+            }
+            // The validate-slots directory itself is not an agent slot.
+            if slot_type == "agent" && path == validate_root {
                 continue;
             }
             if path.is_dir() && !path.is_symlink() {
@@ -907,14 +1167,31 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
             .get("machine")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let slot = record
+            .get("slot")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sealed = seal_by_slot.get(&(machine.to_string(), slot.to_string()));
         let events = events_by_machine.get(machine).cloned().unwrap_or_default();
-        let (row, running) =
-            audit_record(root, &cfg, &config, record, &events, &journals, &strays)?;
+        let (row, running) = audit_record(
+            root,
+            &cfg,
+            &config,
+            record,
+            &events,
+            &journals,
+            &strays,
+            sealed.map(|(generation, _path)| *generation),
+        )?;
         running_agent_count += i64::from(running);
+        if let Some((generation, _path)) = sealed {
+            represented_seals.insert((machine.to_string(), slot.to_string(), *generation));
+        }
         rows.push(row);
     }
     for (slot_type, slot) in on_disk.difference(&registered) {
         let journal = journals.get(slot);
+        let sealed = seal_by_slot.get(&(selected.clone(), slot.clone()));
         let (reason, owner_state) = if let Some(journal) = journal {
             (
                 format!(
@@ -922,6 +1199,11 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
                     journal.state.replace('-', " ")
                 ),
                 journal.state.clone(),
+            )
+        } else if sealed.is_some() {
+            (
+                "interrupted validation-batch seal requires wrkslots recover".to_string(),
+                "validation-batch-seal".to_string(),
             )
         } else if slot_type == "validate" {
             (
@@ -934,21 +1216,44 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
                 "unregistered".to_string(),
             )
         };
+        let (machine_value, generation_value) = if let Some(journal) = journal {
+            (json!(journal.machine), Value::Null)
+        } else if let Some((generation, _path)) = sealed {
+            (json!(selected), json!(generation))
+        } else {
+            (Value::Null, Value::Null)
+        };
+        // A validation directory is not a cache subject, so the
+        // oracle's census reports it complete with no bytes.
+        let (cache_bytes, cache_error, cache_status) = if slot_type == "validate" {
+            (json!(0), Value::Null, "complete")
+        } else {
+            (
+                Value::Null,
+                json!(format!(
+                    "unregistered slot {slot} contains no Git checkouts"
+                )),
+                "error",
+            )
+        };
         rows.push(json!({
             "slot": slot,
             "slot_type": slot_type,
-            "machine": journal.map(|item| item.machine.clone()),
+            "machine": machine_value,
             "agent": Value::Null,
-            "generation": Value::Null,
+            "generation": generation_value,
             "record_sha256": Value::Null,
             "verdict": "BLOCKED",
             "reasons": [reason],
             "owner_state": owner_state,
             "liveness_state": "unverifiable",
-            "cache_bytes": Value::Null,
-            "cache_error": format!("unregistered slot {slot} contains no Git checkouts"),
-            "cache_status": "error",
+            "cache_bytes": cache_bytes,
+            "cache_error": cache_error,
+            "cache_status": cache_status,
         }));
+        if let Some((generation, _path)) = sealed {
+            represented_seals.insert((selected.clone(), slot.clone(), *generation));
+        }
     }
     for journal in journals.values() {
         let known = registered.iter().any(|(_type, slot)| slot == &journal.slot)
@@ -969,6 +1274,52 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
                 journal.state.replace('-', " ")
             )],
             "owner_state": journal.state,
+            "liveness_state": "unverifiable",
+            "cache_bytes": 0,
+            "cache_error": Value::Null,
+            "cache_status": "complete",
+        }));
+    }
+    for target in &seal_targets {
+        if represented_seals.contains(&(
+            target.machine.clone(),
+            target.slot.clone(),
+            target.generation,
+        )) {
+            continue;
+        }
+        rows.push(json!({
+            "slot": target.slot,
+            "slot_type": "validate",
+            "machine": target.machine,
+            "agent": Value::Null,
+            "generation": target.generation,
+            "record_sha256": Value::Null,
+            "verdict": "BLOCKED",
+            "reasons": [format!(
+                "interrupted validation-batch seal requires wrkslots recover; recorded path={}",
+                target.path.display()
+            )],
+            "owner_state": "validation-batch-seal",
+            "liveness_state": "unverifiable",
+            "cache_bytes": 0,
+            "cache_error": Value::Null,
+            "cache_status": "complete",
+        }));
+    }
+    for (machine, journal_name, error) in &seal_errors {
+        rows.push(json!({
+            "slot": journal_name,
+            "slot_type": "validate",
+            "machine": machine,
+            "agent": Value::Null,
+            "generation": Value::Null,
+            "record_sha256": Value::Null,
+            "verdict": "UNKNOWN",
+            "reasons": [format!(
+                "validation-batch seal evidence is unreadable: {error}"
+            )],
+            "owner_state": "validation-batch-seal",
             "liveness_state": "unverifiable",
             "cache_bytes": 0,
             "cache_error": Value::Null,

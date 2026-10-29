@@ -263,6 +263,101 @@ def test_audit_cache_bytes_match_python(tmp_path: Path) -> None:
     assert row["cache_status"] == "complete"
 
 
+def _seal_target(slot: str, generation: int) -> dict[str, object]:
+    return {
+        "slot": slot,
+        "generation": generation,
+        "path": f"worktrees/validate/{slot}",
+        "original_mode": 0o755,
+        "identity": [11, 22, 33],
+    }
+
+
+def _seal(
+    root: Path,
+    targets: list[dict[str, object]],
+    *,
+    schema: int = 1,
+) -> None:
+    (root / "worktrees" / "VALIDATE-BATCH-SEAL.node-a.journal").write_text(
+        json.dumps(
+            {
+                "schema": schema,
+                "kind": "validate-batch-seal",
+                "machine": "node-a",
+                "created_at": "2026-10-26T03:00:00Z",
+                "actor": _dead_identity(),
+                "targets": targets,
+            }
+        )
+    )
+
+
+def test_audit_seal_matching_generation_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    _seal(root, [_seal_target("slot-a", 1)])
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["verdict"] == "BLOCKED"
+    assert row["reasons"] == [
+        "interrupted validation-batch seal requires wrkslots recover"
+    ]
+
+
+def test_audit_seal_generation_mismatch_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    _seal(root, [_seal_target("slot-a", 9)])
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["verdict"] == "UNKNOWN"
+    assert actual["unknown_slots"] == ["slot-a"]
+
+
+def test_audit_seal_unrepresented_target_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    _seal(root, [_seal_target("slot-v", 3)])
+    actual = _check(root, tmp_path)
+    by_slot = {str(row["slot"]): row for row in _rows(actual)}
+    assert by_slot["slot-v"]["verdict"] == "BLOCKED"
+    assert by_slot["slot-v"]["owner_state"] == "validation-batch-seal"
+    assert by_slot["slot-v"]["generation"] == 3
+
+
+def test_audit_seal_unreadable_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    _seal(root, [_seal_target("slot-a", 1)], schema=2)
+    actual = _check(root, tmp_path)
+    by_slot = {str(row["slot"]): row for row in _rows(actual)}
+    error_row = by_slot["VALIDATE-BATCH-SEAL.node-a.journal"]
+    assert error_row["verdict"] == "UNKNOWN"
+    assert error_row["reasons"] == [
+        "validation-batch seal evidence is unreadable: "
+        "unsupported validation-batch seal journal schema"
+    ]
+
+
+def test_audit_seal_unregistered_validate_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    (root / "worktrees" / "validate" / "slot-u").mkdir(parents=True)
+    _seal(root, [_seal_target("slot-u", 5)])
+    actual = _check(root, tmp_path)
+    by_slot = {str(row["slot"]): row for row in _rows(actual)}
+    assert by_slot["slot-u"]["owner_state"] == "validation-batch-seal"
+    assert by_slot["slot-u"]["generation"] == 5
+    assert by_slot["slot-u"]["cache_status"] == "complete"
+    assert by_slot["slot-u"]["cache_error"] is None
+
+
+def test_audit_validate_unregistered_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    (root / "worktrees" / "validate" / "slot-u").mkdir(parents=True)
+    actual = _check(root, tmp_path)
+    by_slot = {str(row["slot"]): row for row in _rows(actual)}
+    assert by_slot["slot-u"]["owner_state"] == "unregistered"
+    assert by_slot["slot-u"]["cache_status"] == "complete"
+    assert by_slot["slot-u"]["cache_error"] is None
+
+
 def test_audit_journal_row_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     identity = _dead_identity()
