@@ -399,19 +399,21 @@ def _launch_specs(harness: Harness, report: Report) -> None:
         _pair(harness, report, configured, f"primary/launch-spec/wrkslots-config/{value}",
               ("profiles", "--cwd", "<ROOT>"), expected)
     launch_env = harness.case("primary-launch-env-config")
-    for label, value, expected in (
+    launch_env_cases: tuple[tuple[str, dict[str, object], int], ...] = (
         ("relative-env-file", {"env_file": "relative/env.sh"}, 75),
         ("unknown-key", {"path": ["/opt/bin"]}, 75),
         ("duplicate-directory", {"path_prepend": ["/opt/bin", "/opt/bin"]}, 75),
         ("valid", {"env_file": "/opt/team/env.sh", "path_prepend": ["/opt/team/bin"]}, 0),
-    ):
+    )
+    for label, launch_value, expected in launch_env_cases:
         for root in (launch_env.python_root, launch_env.rust_root):
             directory = root / ".agentctl"
             directory.mkdir(mode=0o700, exist_ok=True)
             init_case_repository(root)
             (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
             config = directory / "profiles.json"
-            config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "launch_env": value, "profiles": {}}),
+            config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "launch_env": launch_value,
+                                          "profiles": {}}),
                               encoding="utf-8")
             config.chmod(0o600)
         _pair(harness, report, launch_env, f"primary/launch-env-config/{label}",
