@@ -1,10 +1,11 @@
 ---
 title: 'agentctl-services-refresh: guided rebuild and restart of a team''s long-running agentctl services'
-status: in_progress
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-29T21:50:56.998638483+00:00
-updated_at: 2026-10-29T21:51:05.769559311+00:00
+updated_at: 2026-10-29T23:12:34.081066365+00:00
+closed_at: 2026-10-29T23:12:34.081066254+00:00
 ---
 
 # Description
