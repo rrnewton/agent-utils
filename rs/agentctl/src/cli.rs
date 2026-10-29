@@ -1432,8 +1432,8 @@ struct ChatRepoint {
     #[arg(long, value_name = "ID")]
     pane: Option<String>,
     /// Seconds to wait for a running service to apply the request, 1-600 (default: 30)
-    #[arg(long, value_name = "SECONDS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
-    wait: u64,
+    #[arg(long, value_name = "SECONDS", default_value_t = 30, value_parser = clap::value_parser!(u16).range(1..=600))]
+    wait: u16,
 }
 
 #[derive(Args)]
@@ -3448,7 +3448,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 &value.agent,
                 value.pane.as_deref(),
                 requested_by.label(),
-                Duration::from_secs(value.wait),
+                Duration::from_secs(u64::from(value.wait)),
             )
             .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
