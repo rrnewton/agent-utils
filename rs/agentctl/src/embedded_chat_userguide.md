@@ -2599,6 +2599,66 @@ the app. `chat status --bridge-state "$ROOT/bridge"` and the two diagnostics
 logs show each step. To stop the test, stop `chat run`, then the agent; delete
 `$ROOT` only after both have exited.
 
+## Repointing a running bridge
+
+`chat repoint` points a running bridge at another agent without restarting it:
+the chat subscription stays connected and nothing admitted is lost. Use it when
+the agent the bridge types into has moved to another Herdr tab or been replaced,
+or to hand a channel to another coordinator. Any local agent of the same user
+can run it, so an owner who has lost contact with a coordinator can ask any
+other agent to repoint the bridge; the state directory's file permissions are
+the only authority.
+
+```sh
+agentctl --registry ~/project/.agentctl chat repoint \
+  --bridge-state ~/.local/state/agentctl/project-chat --agent coord2
+```
+
+The command first checks the target against `--registry`: the agent must be
+registered, and either be a pane agent whose pane is alive and shows a harness
+Herdr recognizes, or a headless agent whose wrapper answers. `--pane ID` also
+requires the agent to be in that pane; to move an agent's registration to a new
+pane, `agentctl adopt` it first. A refused target changes nothing and exits 1.
+
+The request is recorded in `target.json` in the state directory, with who asked
+(the calling agent's name, or the harness process or user) and when, and the
+running `chat run` is woken through its `.wake.sock`. The service applies it
+after the pass it is in, when no prompt is being typed, and starts its next pass
+on the new agent; the provider worker and the reaction workers keep running.
+With no `chat run` holding the state, the command applies the request itself. A
+service whose wake socket cannot be reached (outbound replies off) applies it at
+its next reconciliation, and a service that starts with a request waiting
+applies it before it types anything. A newer request supersedes one not yet
+applied.
+
+Applying a request settles each request whose prompt has not reached the
+previous agent, by asking that agent's queue:
+
+- a prompt it never held, or set aside untyped, moves to the new agent;
+- a prompt waiting in its inbox is taken back out and moves too;
+- a prompt it has already typed is recorded as delivered and stays there;
+- a prompt it may be typing, or whose queue entry cannot be read, is marked
+  `delivery_uncertain` and listed. It is never typed into the new agent as
+  well, and never dropped: settle it as any uncertain request.
+
+Requests the previous agent received and has not answered are listed as
+`awaiting_reply_from_previous`. The bridge no longer reads that agent's screen,
+but the agent can still answer them with `agentctl chat reply`, and the new
+agent is never reminded of them. `agent_name` in `bridge.json` is rewritten, so
+a later restart keeps the new target, and a notice such as
+`[chat-bridge] now typing into coord2 (pane w1:p4), was coordinator; repointed
+by cl-ops. 2 waiting request(s) moved` is posted as a new message in the
+bridge's first channel.
+
+The command prints one JSON object: the `request`, whether a service was
+running and woken, `applied`, and once applied the `outcome` (`moved`,
+`delivered_to_previous`, `awaiting_reply_from_previous`, `uncertain` with each
+reason, `pane_id`, `applied_by`) and its `summary`. It waits up to `--wait`
+seconds (default 30) for a running service; when that passes it exits 75 and
+the service still applies the request. `chat status` reports the request not
+yet applied and the latest outcome under `repoint`, and `target.json` keeps the
+last 16 outcomes.
+
 ## Service management
 
 `chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM.
@@ -2625,7 +2685,9 @@ an error such as `channel C0123456789 already has a live bridge (process 4242,
 serving bridge state /home/USER/.local/state/agentctl/project-chat; ...)`,
 whichever state directory, registry or build it uses. Two bridges on one channel
 would each admit every message, and the second could type them into another
-agent's pane. The locks are one file per channel in `/run/user/UID/agentctl/chat-channels/`,
+agent's pane. To move a channel's bridge to another agent, repoint the running
+bridge (see "Repointing a running bridge") rather than starting a second one.
+The locks are one file per channel in `/run/user/UID/agentctl/chat-channels/`,
 or `/tmp/agentctl-UID/chat-channels/` when the user has no runtime directory;
 `AGENTCTL_CHAT_CHANNEL_LOCK_DIR` names another directory, for an isolated
 installation or test. A bridge that exits for any reason, a crash included,

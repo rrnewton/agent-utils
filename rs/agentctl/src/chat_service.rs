@@ -45,8 +45,10 @@ mod grant_refresh_tests;
 #[cfg(test)]
 mod rejection_tests;
 mod reply_reminders;
+mod repoint;
 mod sender_grants;
 
+pub use repoint::{repoint, validate_target as validate_repoint_target};
 pub use sender_grants::{grant, grant_limit, grants, revoke};
 
 use reply_reminders::ReplyReminders;
@@ -596,6 +598,12 @@ fn with_termination_deferred<T>(body: impl FnOnce() -> T) -> T {
 /// path is too long, when no service listens there, when the path is not a socket that the
 /// current user owns, or when the socket's queue is full.
 fn wake_service(root: &Path, key: &str) -> bool {
+    wake_service_with(root, &format!("{REPLY_WAKE_PREFIX}{key}"))
+}
+
+/// Send the datagram `payload` to the wake socket of a service running on `root`, as
+/// [`wake_service`] does for a reply.
+fn wake_service_with(root: &Path, payload: &str) -> bool {
     let Ok(path) = reply_wake_socket(root) else {
         return false;
     };
@@ -609,10 +617,7 @@ fn wake_service(root: &Path, key: &str) -> bool {
     let Ok(socket) = UnixDatagram::unbound() else {
         return false;
     };
-    socket.set_nonblocking(true).is_ok()
-        && socket
-            .send_to(format!("{REPLY_WAKE_PREFIX}{key}").as_bytes(), &path)
-            .is_ok()
+    socket.set_nonblocking(true).is_ok() && socket.send_to(payload.as_bytes(), &path).is_ok()
 }
 
 /// The wake socket of the state directory `root`, by the absolute path that a prompt's
@@ -663,9 +668,10 @@ impl ReplyWakeListener {
         wakes: mpsc::SyncSender<String>,
         output_wake: SharedWake,
         overflowed: Arc<AtomicBool>,
+        repoint: Arc<AtomicBool>,
     ) -> Option<Self> {
         match reply_wake_socket(root)
-            .and_then(|path| Self::bind(path, wakes, output_wake, overflowed))
+            .and_then(|path| Self::bind(path, wakes, output_wake, overflowed, repoint))
         {
             Ok(listener) => Some(listener),
             Err(error) => {
@@ -683,6 +689,7 @@ impl ReplyWakeListener {
         wakes: mpsc::SyncSender<String>,
         output_wake: SharedWake,
         overflowed: Arc<AtomicBool>,
+        repoint: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
@@ -718,7 +725,14 @@ impl ReplyWakeListener {
             thread::Builder::new()
                 .name("agentctl-chat-reply-wake".to_owned())
                 .spawn(move || {
-                    receive_reply_wakes(&receiver, &stopping, &wakes, &output_wake, &overflowed);
+                    receive_reply_wakes(
+                        &receiver,
+                        &stopping,
+                        &wakes,
+                        &output_wake,
+                        &overflowed,
+                        &repoint,
+                    );
                     let _ = done_sender.send(());
                 })
         });
@@ -761,19 +775,26 @@ fn listens_for_reply_wakes(config: &BridgeConfiguration) -> bool {
 
 /// The wake socket's thread: hand each well-formed request key to the owner loop and end its
 /// wait, until `stopping` is set. A queue that is full asks the loop for a recovery pass instead,
-/// which finds every request with a reply to send.
+/// which finds every request with a reply to send. A repoint wake sets `repoint`, which ends the
+/// owner loop's pass so that it applies the waiting request (#677 chat-bridge-repoint).
 fn receive_reply_wakes(
     socket: &UnixDatagram,
     stopping: &AtomicBool,
     wakes: &mpsc::SyncSender<String>,
     output_wake: &SharedWake,
     overflowed: &AtomicBool,
+    repoint: &AtomicBool,
 ) {
     // A well-formed datagram is 70 bytes, so one cut to this length is refused.
     let mut buffer = [0_u8; 128];
     while !stopping.load(Ordering::SeqCst) {
         match socket.recv(&mut buffer) {
             Ok(length) => {
+                if &buffer[..length] == repoint::REPOINT_WAKE.as_bytes() {
+                    repoint.store(true, Ordering::SeqCst);
+                    wake_output(output_wake);
+                    continue;
+                }
                 let Some(key) = reply_wake_key(&buffer[..length]) else {
                     continue;
                 };
@@ -1237,6 +1258,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
             reply_wake_sender,
             Arc::clone(&output_wake),
             Arc::clone(&overflowed),
+            Arc::clone(&stop.repoint),
         )
     } else {
         None
@@ -2931,11 +2953,19 @@ struct StopState {
     cleanup_errors: Mutex<Vec<String>>,
     shutdown_window: Mutex<Option<(Instant, Instant)>>,
     ack_queue: Option<Arc<AckQueue>>,
+    // Set when a repoint request waits: it ends the owner loop's pass, not the service, so that
+    // `run_owner_loop` applies the request between passes (#677 chat-bridge-repoint).
+    repoint: Arc<AtomicBool>,
 }
 
 impl StopState {
     fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Whether a repoint request waits for the owner loop.
+    fn repoint_requested(&self) -> bool {
+        self.repoint.load(Ordering::SeqCst)
     }
 
     fn stop(&self) {
@@ -4392,7 +4422,13 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let mut reminders = reminders;
     let mut health = ServiceHealth::new(manager.registry());
     let mut backoff = ProviderBackoff::new();
+    // The state of the agent the bridge serves now: a repoint replaces it between passes.
+    let mut state = state.clone();
+    // A request recorded while no service ran, or before a restart, applies before the first
+    // pass types anything.
+    apply_waiting_repoint(&mut state, manager, stop, transport, &mut reminders);
     let result = loop {
+        let state = &mut state;
         let started = Instant::now();
         health.pass_started(started);
         // A headless coordinator has no pane for the pane loop to read. The prompts' reply
@@ -4431,6 +4467,16 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         };
         let result = owner_loop_end(stop, pass);
         let error = match result {
+            // The pass ended for a repoint request: apply it and start the next pass at once,
+            // while the provider and reaction workers keep running (#677 chat-bridge-repoint).
+            Ok(()) if !stop.is_stopped() && stop.repoint_requested() => {
+                stop.repoint.store(false, Ordering::SeqCst);
+                *output_wake
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                apply_waiting_repoint(state, manager, stop, transport, &mut reminders);
+                continue;
+            }
             Ok(()) => break Ok(()),
             Err(error) if stop.is_stopped() || !error.restarts_owner_loop() => break Err(error),
             Err(error) => error,
@@ -4477,9 +4523,59 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     };
     // A clean stop leaves no failure behind for `chat status` to report as current.
     if result.is_ok() {
-        health.clear(state);
+        health.clear(&state);
     }
     result
+}
+
+/// Apply the repoint request waiting in `state`, if any, and serve the new agent from the next
+/// pass: see [`repoint::apply_pending`]. A reply reminder waiting in the previous agent's queue is
+/// taken back out first. A failure is logged, keeps the current target, and leaves the request
+/// waiting for the next reconciliation.
+fn apply_waiting_repoint<A: ManagedApi + ?Sized>(
+    state: &mut BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    stop: &StopState,
+    transport: &mut Option<CommandOutboundTransport>,
+    reminders: &mut Option<ReplyReminders>,
+) {
+    match state.pending_repoint() {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(error) => {
+            service_log(format_args!(
+                "agentctl: warning: the repoint request could not be read: {error}"
+            ));
+            return;
+        }
+    }
+    if let Some(reminders) = reminders.as_mut() {
+        reminders.settle(state, manager, stop);
+    }
+    let delivery = CancellableDelivery {
+        manager,
+        runtime: StopRuntime::new(stop),
+    };
+    match repoint::apply_pending(state, manager, &delivery, transport.as_mut(), "service") {
+        Ok(Some((_, Some(next)))) => *state = next,
+        Ok(_) => {}
+        Err(error) => service_log(format_args!(
+            "agentctl: warning: the repoint request could not be applied: {error}; still \
+             serving {}, trying again at the next reconciliation",
+            state.config().agent_name
+        )),
+    }
+}
+
+/// Ask for the waiting repoint request to be applied after this pass, for a service whose wake
+/// socket the request's command could not reach.
+fn note_waiting_repoint(state: &BridgeState, stop: &StopState) {
+    if state
+        .pending_repoint()
+        .is_ok_and(|request| request.is_some())
+    {
+        stop.repoint.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Wait `wait` between owner loop passes, until a stop. The provider's notices are still taken
@@ -4792,6 +4888,15 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
     let mut output_retry_delay = Duration::from_secs(1);
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
     while !stop.is_stopped() {
+        // A waiting repoint ends the pass here, between two rounds, when no prompt is being
+        // typed; `run_owner_loop` applies it and starts the next pass on the new target. Queued
+        // keys are found again by that pass's recovery.
+        if stop.repoint_requested() {
+            if !direct_keys.is_empty() {
+                overflowed.store(true, Ordering::SeqCst);
+            }
+            return Ok(());
+        }
         health.tick(state);
         if reminder_waiting {
             if let Some(reminders) = reminders.as_mut() {
@@ -5016,6 +5121,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             notes.log(&report);
             turn.report(&report);
+            note_waiting_repoint(state, stop);
             next_reconciliation = Instant::now() + options.reconciliation_interval;
         }
 
@@ -5681,6 +5787,15 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     );
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
     while !stop.is_stopped() {
+        // A waiting repoint ends the pass here, between two rounds, when no prompt is being
+        // typed; `run_owner_loop` applies it and starts the next pass on the new target. Queued
+        // keys are found again by that pass's recovery.
+        if stop.repoint_requested() {
+            if !direct_keys.is_empty() {
+                overflowed.store(true, Ordering::SeqCst);
+            }
+            return Ok(());
+        }
         health.tick(state);
         approvals.relay(state, outbound(control.transport));
         take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
@@ -5771,6 +5886,7 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             starts.note(&report);
             notes.log(&report);
+            note_waiting_repoint(state, stop);
             next_reconciliation = Instant::now() + options.reconciliation_interval;
         }
         let timeout = if direct_keys.is_empty() {
@@ -12613,6 +12729,7 @@ esac
                 reply_wake_sender,
                 Arc::clone(&output_wake),
                 Arc::clone(&overflowed),
+                Arc::default(),
             )
             .expect("listen for reply wakes")
         });
@@ -15879,6 +15996,7 @@ request. No open chat request has been sent to you."]
             sender,
             Arc::default(),
             Arc::clone(&overflowed),
+            Arc::default(),
         )
         .expect("bind the reply wake socket");
         (listener, wakes, overflowed)
@@ -15892,6 +16010,7 @@ request. No open chat request has been sent to you."]
             sender,
             Arc::default(),
             Arc::new(AtomicBool::new(false)),
+            Arc::default(),
         ) {
             Ok(listener) => {
                 let _ = listener.stop(Instant::now() + Duration::from_secs(5));
@@ -16055,12 +16174,14 @@ request. No open chat request has been sent to you."]
             &too_long,
             sender.clone(),
             Arc::default(),
-            Arc::clone(&overflowed)
+            Arc::clone(&overflowed),
+            Arc::default(),
         )
         .is_none());
         assert!(!wake_service(&too_long, &key));
-        let listener = ReplyWakeListener::start(&fits, sender, Arc::default(), overflowed)
-            .expect("listen in a directory of 96 bytes");
+        let listener =
+            ReplyWakeListener::start(&fits, sender, Arc::default(), overflowed, Arc::default())
+                .expect("listen in a directory of 96 bytes");
         assert!(wake_service(&fits, &key));
         assert_eq!(wakes.recv_timeout(Duration::from_secs(5)), Ok(key));
         listener
@@ -16128,6 +16249,7 @@ request. No open chat request has been sent to you."]
             sender,
             Arc::default(),
             Arc::new(AtomicBool::new(false)),
+            Arc::default(),
         )
         .expect("listen in a directory of 96 bytes");
         assert!(wake_service(&directory, &key));
@@ -16362,6 +16484,7 @@ request. No open chat request has been sent to you."]
             sender,
             Arc::default(),
             Arc::new(AtomicBool::new(false)),
+            Arc::default(),
         )
         .expect("listen on the wake socket");
         match reply(&root, &key, &identifier, "answer").expect("chat reply") {
