@@ -2412,6 +2412,10 @@ struct RequestRecord {
     ack_completed_at_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivery_error: Option<String>,
+    /// When an uncertain delivery that stayed uncertain past its bound was reported to the
+    /// channel, so it is reported once, not on every pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uncertain_reported_at_millis: Option<u64>,
 }
 
 impl SavedMessage {
@@ -2469,6 +2473,7 @@ impl RequestRecord {
             ack_started_at_millis: None,
             ack_completed_at_millis: None,
             delivery_error: None,
+            uncertain_reported_at_millis: None,
             key,
             message: source,
         })
@@ -11199,6 +11204,22 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         Ok(record)
     }
 
+    /// Record that `key`'s uncertain delivery was reported to its channel, with `detail` as
+    /// its delivery error, so [`resolve_uncertain_delivery`] reports it once. The phase stays
+    /// `delivery_uncertain`: the prompt was not proven typed.
+    fn note_uncertain_reported(&self, key: &str, detail: &str) -> Result<RequestRecord> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut record = self.read_request(key)?;
+        record.uncertain_reported_at_millis = Some(unix_millis());
+        record.delivery_error = Some(bounded_detail(detail, 2_000));
+        let mut checkpoint = self.read_checkpoint()?;
+        self.write_request_accounted(&record, &mut checkpoint)?;
+        self.persist_checkpoint(&mut checkpoint)?;
+        Ok(record)
+    }
+
     /// Record `key`'s prompt as typed if the request still waits for it: its phase is `pending`
     /// or `submitting`. Gives whether it recorded it. A request whose delivery is uncertain, or
     /// whose prompt is already recorded as typed, is left as it is.
@@ -12884,11 +12905,7 @@ pub(crate) fn deliver_request_with(
     match record.phase {
         RequestPhase::Delivered => return Ok(CoordinatorDeliveryResult::AlreadyDelivered),
         RequestPhase::DeliveryUncertain => {
-            return Ok(CoordinatorDeliveryResult::Uncertain(
-                record
-                    .delivery_error
-                    .unwrap_or_else(|| "prior coordinator delivery is uncertain".to_owned()),
-            ));
+            return resolve_uncertain_delivery(state, delivery, &record);
         }
         RequestPhase::Pending => {
             record = state.set_delivery_phase(key, RequestPhase::Submitting, None)?;
@@ -13012,6 +13029,97 @@ pub(crate) fn deliver_request_with(
             state.set_delivery_phase(key, RequestPhase::Submitting, Some(&detail))?;
             Ok(CoordinatorDeliveryResult::Pending(detail))
         }
+    }
+}
+
+/// How long a request may stay `delivery_uncertain` before the bridge resolves it instead of
+/// leaving it for an operator forever: half an hour. Prompts that are going to appear in the
+/// pane do so within seconds; after this, waiting longer only loses the request.
+pub(crate) const UNCERTAIN_RESOLVE_AFTER_MILLIS: u64 = 30 * 60 * 1_000;
+
+/// Resolve a request whose delivery is uncertain, so none is left uncertain forever.
+///
+/// Before [`UNCERTAIN_RESOLVE_AFTER_MILLIS`] has passed since delivery started, the request
+/// stays uncertain, as it was. After that the coordinator's queue is asked once more:
+///
+/// * `Processed`: the prompt did arrive: the request is delivered.
+/// * `Pending`: the queue still holds it untyped, so it cannot have been typed: the request
+///   returns to `pending` and the next pass types it.
+/// * anything else (in flight, failed, set aside, or no longer held): the bridge cannot prove
+///   the prompt arrived or that it did not, so it reports that once, as its own reply in the
+///   channel, and the request stays uncertain with the report recorded on it. It is never
+///   typed again, and it is not reported twice.
+fn resolve_uncertain_delivery(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    record: &RequestRecord,
+) -> Result<CoordinatorDeliveryResult> {
+    let key = &record.key;
+    let original = record
+        .delivery_error
+        .clone()
+        .unwrap_or_else(|| "prior coordinator delivery is uncertain".to_owned());
+    let since = record
+        .delivery_started_at_millis
+        .unwrap_or(record.admitted_at_millis);
+    let now = unix_millis();
+    if now.saturating_sub(since) < UNCERTAIN_RESOLVE_AFTER_MILLIS {
+        return Ok(CoordinatorDeliveryResult::Uncertain(original));
+    }
+    let agent_name = &state.config.agent_name;
+    match delivery.message_state(agent_name, &record.delivery_message_id) {
+        Ok(Some(QueueMessageState::Processed)) => {
+            state.note_started(delivery, &record.delivery_message_id);
+            state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
+            reply_to_goal_command(state, delivery, record, None);
+            Ok(CoordinatorDeliveryResult::Delivered)
+        }
+        Ok(Some(QueueMessageState::Pending)) => {
+            let detail = format!(
+                "uncertain delivery resolved after {}: the coordinator queue still holds the \
+                 prompt untyped, so it is queued for typing again",
+                format_age(now, since)
+            );
+            state.set_delivery_phase(key, RequestPhase::Pending, Some(&detail))?;
+            Ok(CoordinatorDeliveryResult::Pending(detail))
+        }
+        Ok(_) | Err(_) if record.uncertain_reported_at_millis.is_some() => {
+            Ok(CoordinatorDeliveryResult::Uncertain(original))
+        }
+        Ok(state_of_queue) => {
+            let detail = format!(
+                "delivery has been uncertain for {} ({original}); the coordinator queue now \
+                 reports {state_of_queue:?}, so the bridge reported the request in the channel \
+                 and does not type it again",
+                format_age(now, since)
+            );
+            let body = format!(
+                "The chat bridge could not confirm that this request reached {agent_name}: \
+                 its delivery has been uncertain for {}. It may not have been seen by the \
+                 agent, and the bridge will not type it again. Please send the request again \
+                 if it still needs an answer.",
+                format_age(now, since)
+            );
+            let identifier = format!(
+                "{}_{}",
+                record.reply_nonce,
+                record.next_reply_ordinal.max(1)
+            );
+            if let Err(error) = state.submit_reply(key, &identifier, &body) {
+                crate::chat_service::service_log(format_args!(
+                    "agentctl: request {key} has been delivery-uncertain for {}, but its \
+                     report to the channel was not stored: {error}",
+                    format_age(now, since)
+                ));
+                return Ok(CoordinatorDeliveryResult::Uncertain(original));
+            }
+            let _ = state.close_replies(key);
+            state.note_uncertain_reported(key, &detail)?;
+            Ok(CoordinatorDeliveryResult::Uncertain(detail))
+        }
+        Err(error) => Ok(CoordinatorDeliveryResult::Uncertain(format!(
+            "{original}; the coordinator queue could not be read to resolve it: {error}"
+        ))),
     }
 }
 
@@ -20689,6 +20797,114 @@ Lines between will be sent to the user as a chat message. Use the same two lines
         let persisted = reopened.read_request(key).expect("persisted request");
         assert_eq!(persisted.delivery_started_at_millis, Some(delivery_started));
         assert!(persisted.delivered_at_millis.is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Make `key` delivery-uncertain since long before the resolution bound.
+    fn backdate_uncertain(state: &BridgeState, key: &str) {
+        let mut record = state.read_request(key).expect("request");
+        let since = unix_millis().saturating_sub(UNCERTAIN_RESOLVE_AFTER_MILLIS + 60_000);
+        record.admitted_at_millis = since;
+        record.phase = RequestPhase::DeliveryUncertain;
+        record.delivery_started_at_millis = Some(since);
+        record.delivery_error = Some("prompt may have been submitted".to_owned());
+        let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+        state
+            .write_request_accounted(&record, &mut checkpoint)
+            .expect("backdate request");
+        state.persist_checkpoint(&mut checkpoint).expect("persist");
+    }
+
+    #[test]
+    fn an_uncertain_request_stays_uncertain_until_the_bound_then_follows_the_queue() {
+        let root = temporary("uncertain-bound");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        state
+            .set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some("maybe typed"))
+            .expect("mark uncertain");
+        let target = FakeDelivery::default();
+        *target.queue_state.lock().expect("queue state lock") =
+            Some(QueueMessageState::Processed);
+        // Within the bound nothing changes, however the queue answers.
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("within bound"),
+            CoordinatorDeliveryResult::Uncertain(_)
+        ));
+        // Past the bound, a queue that shows the prompt processed resolves it as delivered.
+        backdate_uncertain(&state, key);
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("past bound"),
+            CoordinatorDeliveryResult::Delivered
+        ));
+        assert_eq!(
+            state.read_request(key).expect("request").phase,
+            RequestPhase::Delivered
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_uncertain_request_the_queue_still_holds_untyped_is_queued_for_typing_again() {
+        let root = temporary("uncertain-requeue");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        backdate_uncertain(&state, key);
+        let target = FakeDelivery::default();
+        *target.queue_state.lock().expect("queue state lock") =
+            Some(QueueMessageState::Pending);
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("resolve"),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        let record = state.read_request(key).expect("request");
+        assert_eq!(record.phase, RequestPhase::Pending);
+        assert!(record
+            .delivery_error
+            .as_deref()
+            .is_some_and(|error| error.contains("queued for typing again")));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_uncertain_request_that_cannot_be_proven_is_reported_to_the_channel_once() {
+        let root = temporary("uncertain-report");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        backdate_uncertain(&state, key);
+        let target = FakeDelivery::default();
+        *target.queue_state.lock().expect("queue state lock") =
+            Some(QueueMessageState::Failed);
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("resolve"),
+            CoordinatorDeliveryResult::Uncertain(_)
+        ));
+        let record = state.read_request(key).expect("request");
+        assert_eq!(record.phase, RequestPhase::DeliveryUncertain);
+        assert!(record.uncertain_reported_at_millis.is_some());
+        assert_eq!(record.reply_count, 1, "the report is the request's one reply");
+        let reply = state.read_reply(key, 1).expect("report reply");
+        assert!(reply.body.contains("could not confirm"), "{}", reply.body);
+        // A later pass does not report it a second time.
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("resolve again"),
+            CoordinatorDeliveryResult::Uncertain(_)
+        ));
+        assert_eq!(state.read_request(key).expect("request").reply_count, 1);
         fs::remove_dir_all(root).expect("cleanup");
     }
 

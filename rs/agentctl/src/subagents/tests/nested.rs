@@ -214,6 +214,41 @@ fn v3_native_session_source_controls_live_routing_identity() {
 }
 
 #[test]
+fn typing_refuses_a_pane_whose_session_is_not_the_asserted_one() {
+    // The fake pane `owned` reports session `thread` for harness `codex`. An asserted
+    // session does not pin routing, but it must pin typing: a pane of the same harness in
+    // the same directory can be an older agent's, and only the session tells them apart.
+    for (asserted, accepted) in [("asserted-session", false), ("thread", true)] {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let nested = as_v3(
+            nested_v2_record(&stored(&fixture)),
+            json!({
+                "schema": "agentctl-native-session/v1",
+                "agent": "codex",
+                "value": asserted,
+                "source": "asserted",
+            }),
+        );
+        store(&fixture, &nested);
+        let record = fixture.manager().read_record("worker").unwrap();
+        assert!(record.session_asserted(), "{asserted}");
+        let manager = fixture.manager();
+        let workspace = manager.workspace_client(&record);
+        let verdict = workspace.verify_recipient("owned", true);
+        if accepted {
+            verdict.unwrap_or_else(|error| panic!("the asserted pane is typed into: {error}"));
+        } else {
+            let error = verdict.expect_err("another session's pane is refused");
+            assert!(
+                error.to_string().contains("asserted"),
+                "{asserted}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn v3_bind_session_persists_one_asserted_native_authority() {
     let fixture = Fixture::new();
     fixture.start(None);

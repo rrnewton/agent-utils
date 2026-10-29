@@ -2955,6 +2955,25 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
                 repr(record.session_value.as_deref())
             ));
         }
+        // An asserted session does not pin routing, but typing must still prove the pane
+        // holds that session: a pane of the same harness, in the same directory, under the
+        // same tab label can be an older agent's pane, and only the session tells them
+        // apart. A pane that reports another session, or none, is not typed into.
+        if record.session_asserted()
+            && (info.session_value != record.session_value
+                || info.session_agent.as_deref()
+                    != Some(record.session_agent.as_deref().unwrap_or(&record.harness)))
+        {
+            failures.push(format!(
+                "native session is {}/{}, asserted {}/{}",
+                repr(info.session_agent.as_deref()),
+                repr(info.session_value.as_deref()),
+                repr(Some(
+                    record.session_agent.as_deref().unwrap_or(&record.harness)
+                )),
+                repr(record.session_value.as_deref())
+            ));
+        }
         if !failures.is_empty() {
             return Err(AdapterError::recipient_changed(format!(
                 "refusing input to agent '{}': {}; run `agentctl doctor`",
@@ -3008,6 +3027,11 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
             return Ok(());
         }
         if record.observed_session_value().is_some() {
+            return Ok(());
+        }
+        // An asserted session the pane still reports, checked above, proves the recipient
+        // the same way an observed one does.
+        if record.session_asserted() {
             return Ok(());
         }
         Err(AdapterError::recipient_changed(format!(
