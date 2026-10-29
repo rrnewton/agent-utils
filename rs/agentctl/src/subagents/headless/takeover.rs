@@ -26,7 +26,7 @@ use serde_json::Map;
 use super::*;
 
 /// Schema of the takeover mark.
-const TAKEOVER_SCHEMA: &str = "agentctl-headless-takeover/v1";
+pub(super) const TAKEOVER_SCHEMA: &str = "agentctl-headless-takeover/v1";
 /// How long `takeover` waits for the tab's holder to start the interactive harness.
 const HOLD_START: Duration = Duration::from_secs(30);
 
@@ -72,7 +72,7 @@ pub(super) fn takeover_needs_handback(marker: &Value) -> bool {
     }
 }
 
-fn set_marker(record: &mut AgentRecord, marker: Option<Value>) {
+pub(super) fn set_marker(record: &mut AgentRecord, marker: Option<Value>) {
     if let Some(spec) = record
         .extra
         .get_mut("headless")
@@ -90,7 +90,7 @@ fn set_marker(record: &mut AgentRecord, marker: Option<Value>) {
 }
 
 /// The systemd user unit a process runs in, from its cgroup, when it is a headless unit.
-fn systemd_unit(pid: u64) -> Option<String> {
+pub(super) fn systemd_unit(pid: u64) -> Option<String> {
     let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     cgroup
         .lines()
@@ -131,7 +131,7 @@ fn interactive_arguments(arguments: &[String]) -> Vec<String> {
     kept
 }
 
-fn now_seconds() -> f64 {
+pub(super) fn now_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |elapsed| elapsed.as_secs_f64())
@@ -146,9 +146,9 @@ fn note(message: &str) {
 }
 
 /// Why stopping the wrapper failed, and whether it had already been asked to stop.
-struct StopFailure {
-    stop_requested: bool,
-    error: AgentError,
+pub(super) struct StopFailure {
+    pub(super) stop_requested: bool,
+    pub(super) error: AgentError,
 }
 
 fn stop_failure(stop_requested: bool, message: impl Into<String>) -> StopFailure {
@@ -162,7 +162,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// Change the takeover mark `marker_token` of the record `record_token` under the record
     /// lock (`None` clears it). Refuses when the record or the mark was replaced or cleared, so
     /// no step of one takeover can touch another's.
-    fn change_marker(
+    pub(super) fn change_marker(
         &self,
         agent_name: &str,
         record_token: &str,
@@ -404,7 +404,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// Hold the wrapper's deliveries, wait for the running turn to end (interrupting it when
     /// asked), then stop the wrapper and wait for it to release the headless lock. `false` when
     /// no wrapper was running.
-    fn stop_wrapper_for_takeover(
+    pub(super) fn stop_wrapper_for_takeover(
         &self,
         directory: &Path,
         options: &TakeoverOptions,

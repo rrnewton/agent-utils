@@ -9,8 +9,10 @@ use super::*;
 use crate::headless::{self as hl, claude, control as hcontrol, events, wrapper};
 
 mod takeover;
+mod turnover;
 pub use takeover::TakeoverOptions;
 use takeover::{takeover_marker, takeover_needs_handback};
+pub use turnover::TurnoverOptions;
 
 /// Schema of the `headless` block in a headless agent's record.
 const SPEC_SCHEMA: &str = "agentctl-headless/v1";
@@ -875,7 +877,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         } else if let Some(marker) = takeover_marker(record) {
             result["takeover"] = marker.clone();
             result["takeover_needs_handback"] = json!(takeover_needs_handback(marker));
-            ("taken-over", Value::Null)
+            if marker["state"] == "turnover" {
+                ("turning-over", Value::Null)
+            } else {
+                ("taken-over", Value::Null)
+            }
         } else {
             match hcontrol::request(&socket, &json!({"op": "status"}), Duration::from_secs(10)) {
                 Ok(answer) => {
@@ -944,6 +950,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             )));
         }
         if let Some(marker) = takeover_marker(&record) {
+            if marker["state"] == "turnover" {
+                return Err(fail(format!(
+                    "agent {name:?} is turning over to a fresh session; rerun agentctl turnover {name} to finish it first"
+                )));
+            }
             return Err(fail(format!(
                 "agent {name:?} is taken over by an interactive session (tab {}); run agentctl handback {name} first, or exit that session",
                 marker["tab"].as_str().unwrap_or("?")

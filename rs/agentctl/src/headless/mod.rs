@@ -49,7 +49,7 @@ pub fn capabilities() -> serde_json::Value {
         "harnesses": HARNESSES,
         "event_log": format!("v{}", events::VERSION),
         "commands": ["start --mode headless", "run-headless", "tail", "interrupt", "compact",
-                     "send", "drain", "status", "stop", "install-units --headless", "takeover", "handback",
+                     "send", "drain", "status", "stop", "install-units --headless", "takeover", "handback", "turnover",
                      "approvals", "approve", "deny"],
         "approvals": {"default_timeout_s": approval::DEFAULT_TIMEOUT.as_secs(),
                       "answers": ["chat: approve|deny ID", "console: agentctl approve|deny NAME ID"]},

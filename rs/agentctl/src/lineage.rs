@@ -57,6 +57,46 @@ pub fn entries_path(registry_root: &Path, name: &str) -> PathBuf {
     registry_root.join(DIRECTORY).join(name).join(ENTRIES)
 }
 
+/// `REGISTRY/.lineage/<name>/turnover.json`: the journal of a turnover in progress.
+#[must_use]
+pub fn turnover_path(registry_root: &Path, name: &str) -> PathBuf {
+    registry_root
+        .join(DIRECTORY)
+        .join(name)
+        .join("turnover.json")
+}
+
+/// `REGISTRY/.lineage/<name>`, created (mode 0700) when missing.
+///
+/// # Errors
+///
+/// An invalid name, or a directory that cannot be created safely.
+pub fn name_directory(registry_root: &Path, name: &str) -> Result<PathBuf> {
+    if !registry::is_agent_name(name) {
+        return Err(format!("{name:?} is not an agent name"));
+    }
+    let directory = registry_root.join(DIRECTORY);
+    agent_queue::fsio::create_private_directory(&directory, "agent lineage", false, true)
+        .map_err(|error| error.to_string())?;
+    let own = directory.join(name);
+    agent_queue::fsio::create_private_directory(&own, "agent lineage", false, true)
+        .map_err(|error| error.to_string())?;
+    Ok(own)
+}
+
+/// `REGISTRY/.lineage/<name>/handoffs`, created (mode 0700) when missing: one handoff per
+/// turnover, `<seq>.md`.
+///
+/// # Errors
+///
+/// As for [`name_directory`].
+pub fn handoffs_directory(registry_root: &Path, name: &str) -> Result<PathBuf> {
+    let handoffs = name_directory(registry_root, name)?.join("handoffs");
+    agent_queue::fsio::create_private_directory(&handoffs, "agent handoffs", false, true)
+        .map_err(|error| error.to_string())?;
+    Ok(handoffs)
+}
+
 /// One generation of an agent as its record shows it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Generation {
@@ -468,7 +508,7 @@ fn already_recorded(entries: &[Value], entry: &Map<String, Value>) -> Option<u64
     let keys: &[&str] = match (field("kind")?, field("relation")) {
         ("generation", Some("takeover" | "handback")) => return None,
         ("generation", _) => &["kind", "relation", "token", "session"],
-        ("ended", _) => &["kind", "token"],
+        ("ended", _) => &["kind", "token", "session"],
         ("renamed", _) => &["kind", "token", "from", "to"],
         _ => return None,
     };
@@ -488,16 +528,7 @@ fn already_recorded(entries: &[Value], entry: &Map<String, Value>) -> Option<u64
 /// An invalid name, a lineage directory that cannot be created safely, a file holding entries of
 /// another major schema, or a failed write.
 pub fn append(registry_root: &Path, name: &str, mut entry: Map<String, Value>) -> Result<u64> {
-    if !registry::is_agent_name(name) {
-        return Err(format!("{name:?} is not an agent name"));
-    }
-    let directory = registry_root.join(DIRECTORY);
-    agent_queue::fsio::create_private_directory(&directory, "agent lineage", false, true)
-        .map_err(|error| error.to_string())?;
-    let own = directory.join(name);
-    agent_queue::fsio::create_private_directory(&own, "agent lineage", false, true)
-        .map_err(|error| error.to_string())?;
-    let path = own.join(ENTRIES);
+    let path = name_directory(registry_root, name)?.join(ENTRIES);
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
@@ -696,14 +727,16 @@ pub fn history(registry_root: &Path, name: &str, all: bool) -> Result<Value> {
         })
         .filter_map(|entry| text(entry, "/token"))
         .collect();
-    let ended: BTreeMap<String, String> = entries
+    // A generation is its token and session: a turnover keeps a headless agent's token.
+    let key = |entry: &Value| (text(entry, "/token"), text(entry, "/session"));
+    let ended: BTreeMap<(Option<String>, Option<String>), String> = entries
         .iter()
         .filter(|entry| entry.get("kind").and_then(Value::as_str) == Some("ended"))
-        .filter_map(|entry| Some((text(entry, "/token")?, text(entry, "/reason")?)))
+        .filter_map(|entry| Some((key(entry), text(entry, "/reason")?)))
         .collect();
     let mut statuses: BTreeMap<String, &str> = BTreeMap::new();
-    // Live generations by token: this name's, and those of names it was renamed to.
-    let mut live_as: BTreeMap<String, String> = BTreeMap::new();
+    // Live generations: this name's, and those of names it was renamed to.
+    let mut live_as: BTreeMap<(Option<String>, Option<String>), String> = BTreeMap::new();
     let targets: BTreeSet<String> = entries
         .iter()
         .filter(|entry| entry.get("kind").and_then(Value::as_str) == Some("renamed"))
@@ -712,7 +745,7 @@ pub fn history(registry_root: &Path, name: &str, all: bool) -> Result<Value> {
         .collect();
     for target in targets {
         if let Some(generation) = live(registry_root, &target) {
-            live_as.insert(generation.token, target);
+            live_as.insert((Some(generation.token), generation.session), target);
         }
     }
     let found = names
@@ -764,13 +797,13 @@ pub fn history(registry_root: &Path, name: &str, all: bool) -> Result<Value> {
             continue;
         }
         let token = text(entry, "/token").unwrap_or_default();
-        let status = if let Some(target) = live_as.get(&token) {
+        let status = if let Some(target) = live_as.get(&key(entry)) {
             if target == name {
                 "live".to_owned()
             } else {
                 format!("live as {target}")
             }
-        } else if let Some(reason) = ended.get(&token) {
+        } else if let Some(reason) = ended.get(&key(entry)) {
             reason.clone()
         } else {
             statuses
@@ -940,6 +973,9 @@ pub fn render(history: &Value) -> String {
         out.push_str(&format!("  {seq:>4}  {when}  {detail}\n"));
         if let Some(path) = entry["transcript"].as_str() {
             out.push_str(&format!("               transcript {path}\n"));
+        }
+        if let Some(path) = entry["handoff"]["path"].as_str() {
+            out.push_str(&format!("               handoff {path}\n"));
         }
     }
     for problem in history["problems"].as_array().into_iter().flatten() {

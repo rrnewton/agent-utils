@@ -113,6 +113,11 @@ The journal `.lineage/<name>/turnover.json` records `phase`, a nonce, the old to
 session, the handoff path, and timestamps. Every phase is idempotent, and rerunning the same
 command continues from the recorded phase.
 
+The table below is the general plan, which pane agents (piece 3) will follow. Headless agents
+(piece 2, implemented) take the simpler path in the next section. The owner's decisions
+further down override the table where they differ: no first brief, and the handoff request's
+content.
+
 | Phase | What happens | Leaving it |
 |---|---|---|
 | `requested` | Checks: the agent is local, running and not paused; no takeover; no other turnover; its harness can start a fresh session from the launch spec. Writes the journal. | `asking`, or `captured` when `--handoff FILE` or `--no-ask` |
@@ -120,7 +125,36 @@ command continues from the recorded phase.
 | `captured` | Records the handoff's sha256. Pending queue items stay where they are. | `stopping` |
 | `stopping` | Stops the old harness the way `stop` does, but publishes through revive's journaled two-step: the old directory and its queue go to the archive, and an `ended` entry is appended. | `starting` |
 | `starting` | Launches from the launch spec with the session flags replaced by a new session ID (per harness: Claude Code `--session-id NEW` in place of `--resume`/`--session-id OLD`). Appends the `generation` entry with `relation: turnover`. Runs `wrkslots transfer-owner` for a slot agent, as restore does. Registers the new pane in other registries that name the agent (the chat bridge's), as restore does. | `feeding` |
-| `feeding` | Queues, first: "[from agentctl turnover · predecessor: NAME session OLD] You are continuing the work of NAME…", then the handoff text inline (or its path when over 48 KiB), then the predecessor's first brief from its archived `processed/` queue when one exists. Then it moves the old queue's undelivered items into the new queue, in their original order, after that prompt. | `done`: journal removed, `history` shows the new line, and the coordinator gets one notice |
+| `feeding` | Queues, first: "[from agentctl turnover · predecessor: NAME session OLD] You are continuing the work of NAME…", then the handoff text inline (or its path when over 48 KiB), ~~then the predecessor's first brief~~ (dropped by the owner's decision 3). Then it moves the old queue's undelivered items into the new queue, in their original order, after that prompt. | `done`: journal removed, `history` shows the new line, and the coordinator gets one notice |
+
+### Headless agents (piece 2)
+
+A headless agent needs no new record, so its turnover keeps the name, the record token, the
+queue and the slot, and changes only `headless.session`. Messages are therefore never refused
+during a turnover. Phases (`subagents/headless/turnover.rs`):
+
+- `asking`: as in the table. Idle means the wrapper's status shows no running turn and no
+  current input.
+- `captured`: the handoff's sha256 is recorded and a new session ID chosen.
+- `switching`: the record first gets the takeover mark (`headless.takeover`, state
+  `turnover`). The wrappers of every deployed build already exit at once while a takeover mark
+  is set, so a supervisor cannot start one on the old session meanwhile. A new kind of mark
+  would not stop an older wrapper. The wrapper then stops at a turn boundary, holding
+  deliveries while it waits, which is the takeover's own stop. Once no process writes the old
+  session (`wrapper::session_processes`), the record switches to the new session and the mark
+  is removed. The lineage gets `ended` (turned-over, keyed by token and session) and a
+  `generation` with relation `turnover`, its predecessor and the handoff.
+- `feeding`: the handoff prompt is queued as urgent, so the new session reads it before the
+  messages that waited. An urgent message queued earlier still goes first.
+- `starting`: the wrapper starts again, through its systemd unit when it ran in one, otherwise
+  detached as `start` does. The journal is removed.
+
+While the mark is set, `status` reports `turning-over`, `stop` refuses with a pointer to
+`turnover`, and the watcher does not observe the agent. Reporting a stuck turnover is piece
+3's job. A new session ID has no transcript, so the wrapper starts it with
+`--session-id NEW`: a fresh conversation. The end-to-end test (`tests/headless_turnover.rs`)
+covers mechanical turnover during a running turn with a held message, a timeout, a rerun, and
+`--abort`.
 
 ### Variants the issue asks for
 
@@ -148,9 +182,9 @@ room for it in `agent.json`.
   (default 15 minutes) turnover stops in `asking` and changes nothing. The agent keeps running,
   and the journal stays with `phase: asking, timed_out: true`. The operator then chooses:
   rerun the command (waits again), `--abort` (journal removed), or `--no-ask`. That last option
-  writes a mechanical handoff: the first brief, the last assistant messages from the event log
-  or transcript, the queue's pending items, and the slot's branch and `git status`. It is
-  labelled as mechanical.
+  writes a mechanical handoff: the last assistant messages from the event log, the number of
+  queued inputs, and the working tree's `git status` and recent log. It is labelled as
+  mechanical and incomplete.
 - **The harness is already dead or wedged** (the main reason to turn over): it cannot be
   asked. Use `--no-ask` or `--handoff FILE`, which start in `captured`.
 - **A crash mid-turnover.** The journal names the phase. Before `stopping`, the old agent is
@@ -171,9 +205,9 @@ room for it in `agent.json`.
 
 ### Interactions
 
-- **revive / restore:** unchanged behaviour. They append `generation` entries with `resume` (or
-  `fresh`) and the same `line`. Restore can later offer turnover for an agent whose transcript
-  is gone, instead of a silent fresh start.
+- **revive / restore:** they append `generation` entries with `resume` (or `fresh`) and the
+  same `line`. Restore never blocks (owner decision 4, below): when resume is impossible it
+  starts fresh, warns loudly, and records `fresh-after-restore` with the reason.
 - **takeover / handback:** `takeover` and `handback` entries; no new line or token. Turnover is
   refused during a takeover.
 - **rename:** a `renamed` entry in both names' files; the new name continues the same `line`.
@@ -200,13 +234,20 @@ room for it in `agent.json`.
    it.
 3. Turnover for pane agents; watcher and bridge awareness.
 
-## Open questions for the owner
+## Owner decisions (2026-10-29, relayed by the coordinator)
 
-1. Is the handoff location `REGISTRY/.lineage/<name>/handoffs/<seq>.md` right? It is
-   agentctl-owned and survives `/tmp` cleanup. `--handoff-dir` could override it.
-2. When the agent does not answer: stop and leave it running (proposed), or fall back to the
-   mechanical handoff automatically?
-3. Should the replacement also get the predecessor's first brief (proposed: yes, after the
-   handoff), or only the handoff?
-4. Should `restore` turn over, rather than silently start fresh, when an agent's transcript is
-   missing?
+1. **Handoff location:** `REGISTRY/.lineage/<name>/handoffs/<seq>.md`. The directory's leading
+   dot came later, for the reason given under "Lineage store".
+2. **No answer:** wait until the timeout, then report to the coordinator (the command's output,
+   exit 75). The mechanical handoff is used only with `--no-ask`, never as an automatic
+   fallback.
+3. **What the successor gets:** not the original brief, which may be old, while the lane's
+   purpose may have moved on. The request asks for ONE self-contained, big-picture handoff:
+   the lane's current purpose, the state of the work, and the standing rules it works under
+   (slot protocol, gate and landing rules, constraints given along the way). The successor gets
+   only that, plus undelivered queue items.
+4. **Restore when resume is impossible** (for example, the transcript is missing): restore keeps
+   moving and never blocks. It starts fresh and prints loud warnings in its report, in the
+   recovery notice to the coordinator, and in the agent's first prompt. The lineage records
+   `fresh-after-restore` with the reason. That path sends no handoff request. This is the
+   default, not behind a flag. It is a piece of its own, after piece 2.

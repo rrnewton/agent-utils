@@ -823,8 +823,8 @@ its status (`live`, `live as NEW` after a rename, how it ended, or `archived`),
 and its transcript when the
 harness keeps one. Relations are `start`, `adopt`, `resume` (revived on the
 same session), `fresh` (revived on another or no session), `rebound` (the
-record's session changed in place, by `bind-session` or `anchor`), `takeover`
-and `handback`. A *line* groups one continuous piece of work. `start` begins a
+record's session changed in place, by `bind-session` or `anchor`), `turnover`
+(a fresh session fed a handoff, below), `takeover` and `handback`. A *line* groups one continuous piece of work. `start` begins a
 new line, so a reused name never runs two unrelated agents together, and
 without `--all` only the current line is shown. `rename` links the two names,
 and `history NEW` includes what the agent ran as OLD.
@@ -844,6 +844,44 @@ the current line. A change two commands record at once (a boot restore and a
 manual revive) is written once. Readers ignore keys and kinds they do not know.
 A writer refuses to add to a file that holds entries of a newer major schema,
 and gives up with a warning after waiting 5 seconds for another writer's lock.
+
+### Turn an agent over to a fresh session (Rust edition)
+
+A long-running agent's context fills up, or its harness gets into a state it
+cannot leave. `agentctl turnover` continues the same agent in a fresh harness
+session that starts from a handoff written by the old one:
+
+```sh
+agentctl turnover reviewer                        # ask for a handoff, then switch
+agentctl turnover reviewer --handoff-timeout 1800 # give it 30 minutes to write
+agentctl turnover reviewer --no-ask               # wedged harness: a mechanical handoff
+agentctl turnover reviewer --handoff-file notes.md
+agentctl turnover reviewer --abort                # give up before the switch
+```
+
+The agent is asked, through its queue, to write ONE self-contained handoff to
+`REGISTRY/.lineage/NAME/handoffs/<n>.md`: the lane's current purpose, the
+state of the work, and every standing rule it works under (slot protocol, gate
+and landing rules, constraints it picked up along the way). The successor
+reads only that handoff, not the original brief, followed by the messages that
+were still waiting. The handoff is complete when it ends with the nonce line
+the request names and the agent is idle. With no complete handoff by the
+timeout (default 900 seconds) the command exits 75 and changes nothing. Rerun
+it to wait again, pass `--no-ask` for a handoff assembled from the event log,
+queue and working tree, or pass `--abort`.
+
+Then the wrapper stops at a turn boundary (`--interrupt` ends a running turn
+instead), the record switches to a new session ID, the handoff is queued as the
+new session's first input, and the wrapper starts again (through its systemd
+unit when it ran in one). The name, record token, queue and slot stay the
+same, and messages sent meanwhile are never refused. While the record holds the
+turnover mark, `status` reports `turning-over`, `stop` refuses, and a wrapper
+that a supervisor starts exits at once. The journal
+`REGISTRY/.lineage/NAME/turnover.json` records the phase, so rerunning the
+command finishes an interrupted turnover; `--abort` works only until the
+wrapper is asked to stop. The lineage records the old session as ended
+(`turned-over`) and the new one with relation `turnover` and its handoff.
+Headless agents only in this build.
 
 ### Restore a team after the host restarts (Rust edition)
 

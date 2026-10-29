@@ -214,6 +214,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl history cl-foo\n  agentctl history cl-foo --all --json\n  agentctl history --session 10154bdf-b1c8-411a-80b2-55d024f32713\n\nLifecycle commands (start, adopt, attach-self, stop, retire-stale-registration, revive, rename,\nrestore, takeover, handback, bind-session, anchor) append to REGISTRY/.lineage/NAME/entries.jsonl after they run (schema agentctl-lineage/v1).\nThe lineage is advisory: routing never reads it, and generations nothing recorded (before this\nbuild, or by another build) are filled in from REGISTRY/archive/ and the live record, marked\nunrecorded. A line groups one continuous piece of work; start begins a new one. Times are\nlocal (set TZ to choose the zone). Exit 1 when the name has no entries, archived generations or\nlive record."
     )]
     History(History),
+    /// Continue a headless agent in a fresh harness session: ask it for one self-contained handoff, stop its wrapper at a turn boundary, switch the record to a new session, queue the handoff as the new session's first input, and start the wrapper again; same name, token, queue and slot
+    #[command(
+        after_help = "Examples:\n  agentctl turnover cl-foo\n  agentctl turnover cl-foo --handoff-timeout 1800\n  agentctl turnover cl-foo --no-ask            # the harness is wedged: a mechanical handoff\n  agentctl turnover cl-foo --handoff-file notes.md\n  agentctl turnover cl-foo --abort\n\nThe agent writes its handoff to REGISTRY/.lineage/NAME/handoffs/<n>.md, ending with the nonce line\nthe request gives; the turnover continues once that line is there and the agent is idle. Messages\nsent meanwhile wait in the queue and reach the new session after the handoff. The journal\nREGISTRY/.lineage/NAME/turnover.json records the phase, so rerunning the same command continues an\ninterrupted turnover. The lineage records the old session as ended (turned-over) and the new one\nwith relation turnover and the handoff (agentctl history NAME). Headless agents only in this build.\nExit 0 when turned over (or aborted), 75 when no handoff arrived in time (the agent is unchanged)."
+    )]
+    Turnover(Turnover),
     /// Run a headless agent's wrapper in the foreground: one persistent harness process (Claude Code stream-json) that is the only drainer of the agent's queue; normally run by a systemd user unit
     #[command(
         after_help = "Examples:\n  agentctl run-headless coordinator\n  agentctl install-units --headless coordinator --dest ~/.config/systemd/user\n\nThe wrapper resumes the agent's recorded session when Claude Code has a transcript for it,\nrecovers inputs a previous wrapper left in flight from that transcript, writes the event log,\nand serves REGISTRY/agents/NAME/control.sock. SIGTERM closes the harness's input, waits up to 60 s for\nit to finish, and exits 0. An unexpected harness exit restarts it with --resume (backoff, at\nmost 5 in 10 minutes), then exits 1. Exit 75 when another wrapper already serves NAME."
@@ -416,6 +421,30 @@ struct InstallUnits {
     /// CLAUDE_CONFIG_DIR when set, and the claude found on PATH
     #[arg(long, value_name = "NAME", conflicts_with = "bridge_unit")]
     headless: Option<String>,
+}
+
+#[derive(Args)]
+struct Turnover {
+    #[command(flatten)]
+    agent: Named,
+    /// Seconds to wait for the agent's handoff before giving up with the agent unchanged (default: 900)
+    #[arg(long, default_value = "900", value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
+    handoff_timeout: u64,
+    /// Seconds to wait for a running turn to end before the wrapper stops (default: 600)
+    #[arg(long, default_value = "600", value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
+    wait: u64,
+    /// Deliver the handoff request mid-turn, and interrupt a running turn instead of waiting for it before the stop
+    #[arg(long)]
+    interrupt: bool,
+    /// Use this file as the handoff instead of asking the agent (for a wedged or dead harness)
+    #[arg(long, value_name = "PATH", conflicts_with = "no_ask")]
+    handoff_file: Option<PathBuf>,
+    /// Do not ask the agent: write a mechanical handoff from its event log, queue and working tree
+    #[arg(long)]
+    no_ask: bool,
+    /// Abandon a turnover that has not stopped the wrapper yet (the handoff file is kept)
+    #[arg(long, conflicts_with_all = ["handoff_file", "no_ask", "interrupt"])]
+    abort: bool,
 }
 
 #[derive(Args)]
@@ -2287,7 +2316,8 @@ fn writes_registry(command: &Commands) -> bool {
         | Commands::BindSession(_)
         | Commands::Pause(_)
         | Commands::Reset(_)
-        | Commands::Resume(_) => true,
+        | Commands::Resume(_)
+        | Commands::Turnover(_) => true,
         _ => false,
     }
 }
@@ -3203,6 +3233,22 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         )?,
         Commands::Handback(value) => {
             manager.handback_headless(&value.agent.name, Duration::from_secs(value.wait))?
+        }
+        Commands::Turnover(value) => {
+            let result = manager.turnover_headless(
+                &value.agent.name,
+                &crate::subagents::TurnoverOptions {
+                    handoff_timeout: Duration::from_secs(value.handoff_timeout),
+                    wait: Duration::from_secs(value.wait),
+                    interrupt: value.interrupt,
+                    handoff_file: value.handoff_file.clone(),
+                    no_ask: value.no_ask,
+                    abort: value.abort,
+                },
+            )?;
+            write_json(&result).map_err(Failure::Output)?;
+            let done = result["turned_over"] == true || result["aborted"] == true;
+            return Ok(if done { 0 } else { 75 });
         }
         Commands::TakeoverHold(value) => {
             return Ok(manager.run_takeover_hold(

@@ -53,7 +53,7 @@ pub(crate) use cloud::{
 pub use cloud::{CloudLaunch, CloudTools};
 pub(crate) use control::{controller_of, tree_order};
 pub use control::{render_tree, ManageAction};
-pub use headless::{HeadlessApprovals, HeadlessStart, TakeoverOptions};
+pub use headless::{HeadlessApprovals, HeadlessStart, TakeoverOptions, TurnoverOptions};
 pub(crate) use stop_advice::{stop_reason, StopContext};
 pub use stop_advice::{RecoveryAction, StopFailure};
 

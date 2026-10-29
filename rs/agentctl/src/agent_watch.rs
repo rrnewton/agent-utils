@@ -3139,7 +3139,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
                     && row["adapter"].as_str() != Some("agentcloud")
                     // A headless agent taken over by an interactive terminal has its owner at
                     // the keyboard; it is watched again only once that session is over and
-                    // nothing serves its queue until `handback`.
+                    // nothing serves its queue until `handback`. A turnover in progress
+                    // (#686 agent-turnover) stops and restarts the wrapper on purpose.
+                    && row["agent_status"] != "turning-over"
                     && (row["agent_status"] != "taken-over"
                         || row["takeover_needs_handback"] == true)));
         if !watched {
