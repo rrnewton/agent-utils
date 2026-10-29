@@ -6817,6 +6817,23 @@ test("`#624 voice-page-modularity`: Done in the store at once, and taken back ex
   settleDoneIn(none, false);
 });
 
+test("`#624 voice-page-modularity`: the reader's writes run one after another, a failure stopping none after it, from the module alone", async () => {
+  const { createSerialQueue } = GLYPHS;
+  const queue = createSerialQueue();
+  const order = [];
+  let release;
+  const first = queue.run(() => new Promise((resolve) => { release = resolve; }).then(() => { order.push("first"); return 1; }));
+  const second = queue.run(async () => { order.push("second"); throw new Error("refused"); });
+  const third = queue.run(async () => { order.push("third"); return 3; });
+  await Promise.resolve();
+  assert.deepStrictEqual(order, [], "a task started before the one ahead of it settled");
+  release();
+  assert.equal(await first, 1);
+  await assert.rejects(second, /refused/);
+  assert.equal(await third, 3, "a failure stopped the task after it");
+  assert.deepStrictEqual(order, ["first", "second", "third"]);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

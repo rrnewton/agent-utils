@@ -97,6 +97,7 @@ export {
   DEEP_LINK_PART_MAX,
   SPACE_EM,
   WIDE_SCRIPT,
+  createSerialQueue,
   deepLinkRefFrom,
   deepLinkRefText,
   glyphEm,

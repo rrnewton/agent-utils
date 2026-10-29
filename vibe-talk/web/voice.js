@@ -43743,9 +43743,9 @@ function putBackRowsOff(listed, taken) {
 }
 
 // Keep writes ordered while every visible result happens immediately. This prevents a quick run
-// of Done taps from occupying every provider-adapter worker even against an older server.
-/** @type {Promise<unknown>} */
-let inboxWriteTail = Promise.resolve();
+// of Done taps from occupying every provider-adapter worker even against an older server. The queue
+// is web/src/foundation's (`createSerialQueue`, `#624 voice-page-modularity`), made where its tail stood.
+const inboxWrites = createSerialQueue();
 
 /**
  * @template T
@@ -43753,9 +43753,7 @@ let inboxWriteTail = Promise.resolve();
  * @returns {Promise<T>}
  */
 function queueInboxWrite(task) {
-  const run = inboxWriteTail.then(task, task);
-  inboxWriteTail = run.catch(() => {});
-  return run;
+  return inboxWrites.run(task);
 }
 
 // --- what a refused Done or put back takes back --------------------------------------------------

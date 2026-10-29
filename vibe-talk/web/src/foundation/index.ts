@@ -7,3 +7,5 @@ export type { LinkKind } from "./links.ts";
 export { sentenceStart } from "./text.ts";
 export { DEEP_LINK_PART_MAX, deepLinkRefFrom, deepLinkRefText, messageLinkRef } from "./refs.ts";
 export type { DeepLinkRef, MessageLinkRef } from "./refs.ts";
+export { createSerialQueue } from "./queue.ts";
+export type { SerialQueue } from "./queue.ts";

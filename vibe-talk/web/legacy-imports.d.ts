@@ -95,6 +95,7 @@ declare const providerWords: LegacyImports["providerWords"];
 declare const readableFailure: LegacyImports["readableFailure"];
 declare const SPACE_EM: LegacyImports["SPACE_EM"];
 declare const WIDE_SCRIPT: LegacyImports["WIDE_SCRIPT"];
+declare const createSerialQueue: LegacyImports["createSerialQueue"];
 declare const glyphEm: LegacyImports["glyphEm"];
 declare const linkKind: LegacyImports["linkKind"];
 declare const monoEm: LegacyImports["monoEm"];
