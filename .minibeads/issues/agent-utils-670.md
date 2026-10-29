@@ -1,12 +1,12 @@
 ---
 title: 'agentctl-console: rename tail to console, with an owner input line delivered as a plain user turn'
-status: open
+status: in_progress
 priority: 2
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-10-28T18:54:37.529788444+00:00
-updated_at: 2026-10-28T18:54:37.529788444+00:00
+updated_at: 2026-10-29T00:43:08.507909879+00:00
 ---
 
 # Description
