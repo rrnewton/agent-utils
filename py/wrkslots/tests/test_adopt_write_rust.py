@@ -36,6 +36,12 @@ def _git(cwd: Path, *args: str) -> str:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
+            # Pinned fixture commit dates: each pair builds two Git
+            # histories that must produce identical commit ids, which
+            # wall-clock timestamps break whenever creation straddles
+            # a second boundary.
+            "GIT_AUTHOR_DATE": "2026-10-26T00:00:00+00:00",
+            "GIT_COMMITTER_DATE": "2026-10-26T00:00:00+00:00",
         }
     )
     result = subprocess.run(
