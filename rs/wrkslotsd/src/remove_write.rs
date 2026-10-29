@@ -11,9 +11,9 @@
 //! environment), validate slots, owner consent and attestation,
 //! salvage needing a push or local bundle (dirty, unpublished, or
 //! drifted work), cache directories with configured globs (nested
-//! repository judging), legacy HANDOFF.md quarantine, handoff
-//! sidecar retirement, and slot images. Fixture registries only
-//! until the edition cutover (see `ensure_states::require_fixture`).
+//! repository judging), legacy HANDOFF.md quarantine, and slot
+//! images. Fixture registries only until the edition cutover (see
+//! `ensure_states::require_fixture`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -34,6 +34,10 @@ use crate::finish_write::{
     remote_authority, stored_repository_path,
 };
 use crate::global_state::load_event_chain;
+use crate::handoff_state::{
+    load_sidecar_artifact, read_regular_file_identity, sidecar_path, validate_sidecar,
+    SIDECAR_BYTES_LIMIT,
+};
 use crate::heartbeat_write::{assert_caller, release_in_effect};
 use crate::hold_write::{
     acquire_mutation_locks, active_document, current_hold, refuse_target_storage, validate_global,
@@ -873,7 +877,7 @@ fn latest_handoff_read(events: &[Value], record: &Value) -> Result<Option<Value>
             .get("sha256")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        if digest.len() != 64 || !digest.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f')) {
             return Err("handoff-read event sha256 is not a SHA-256 digest".to_string());
         }
         let source = payload.get("source").cloned().unwrap_or(Value::Null);
@@ -959,6 +963,243 @@ fn operation_id() -> Result<String> {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// The publication gate the oracle's `_resolve_handoff_artifact`
+/// applies before a sidecar may act as removal authority: a
+/// write-handoff sidecar must byte-match a completed owner-authenticated
+/// write intent; a legacy projection must not supersede an intent and
+/// needs its own provenance-bearing read.
+fn assert_sidecar_publication(
+    events: &[Value],
+    slot: &str,
+    generation: i64,
+    artifact: &Value,
+) -> Result<()> {
+    let publication = crate::handoff_write::publication(events, slot, generation);
+    if artifact.get("source").and_then(Value::as_str) == Some("write-handoff") {
+        match publication {
+            Some((_sequence, intended, completed)) if intended == *artifact => {
+                if !completed {
+                    return Err(format!(
+                        "slot {slot} handoff publication is incomplete; preserve the sidecar and have its exact owner retry write-handoff"
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "slot {slot} handoff sidecar has no matching owner-authenticated publication intent; preserve it for manual review"
+                ));
+            }
+        }
+        return Ok(());
+    }
+    if let Some((_sequence, _intended, completed)) = publication {
+        let state = if completed {
+            "completed"
+        } else {
+            "outstanding"
+        };
+        return Err(format!(
+            "slot {slot} has a {state} owner-authenticated write intent; legacy sidecar recovery cannot supersede it"
+        ));
+    }
+    let matched = events.iter().any(|event| {
+        if event.get("kind").and_then(Value::as_str) != Some("handoff-read") {
+            return false;
+        }
+        let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+        payload.get("slot").and_then(Value::as_str) == Some(slot)
+            && payload.get("generation").and_then(Value::as_i64) == Some(generation)
+            && payload.get("sha256") == artifact.get("sha256")
+            && payload.get("contents_utf8") == artifact.get("contents_utf8")
+            && payload.get("source").and_then(Value::as_str) == Some("legacy-slot-file")
+            && payload.get("source_path") == artifact.get("source_path")
+            && payload.get("source_identity") == artifact.get("source_identity")
+    });
+    if !matched {
+        return Err(format!(
+            "slot {slot} projected legacy sidecar has no matching provenance-bearing read; preserve it for manual review"
+        ));
+    }
+    Ok(())
+}
+
+fn read_matches_artifact(read: &Value, artifact: &Value) -> bool {
+    read.get("sha256") == artifact.get("sha256")
+        && read.get("source") == artifact.get("source")
+        && read.get("source_path") == artifact.get("source_path")
+        && read.get("source_identity") == artifact.get("source_identity")
+}
+
+/// Move an archived slot's read handoff sidecar to durable
+/// identity-bound retired storage, mirroring the Python
+/// `_remove_handoff_sidecar_after_archive`. Idempotent: an existing
+/// retired artifact is validated against the recorded read digest.
+#[allow(clippy::too_many_arguments)]
+fn retire_handoff_sidecar(
+    cfg: &Cfg,
+    selected: &str,
+    slot: &str,
+    slot_type: &str,
+    generation: i64,
+    recorded_digest: Option<&str>,
+) -> Result<()> {
+    let sidecar = sidecar_path(&cfg.control, selected, slot, generation);
+    let name = sidecar
+        .file_name()
+        .map(|item| item.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+    let prefix = format!("HANDOFF-RETIRED.{}.", &digest[..16]);
+    let mut retired_paths: Vec<PathBuf> = std::fs::read_dir(&cfg.control)
+        .map_err(|error| format!("cannot list control directory: {error}"))?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .map(|item| item.to_string_lossy().starts_with(&prefix))
+                .unwrap_or(false)
+        })
+        .collect();
+    retired_paths.sort();
+    if retired_paths.len() > 1 {
+        return Err(format!(
+            "multiple retired handoff sidecars exist for slot {slot}"
+        ));
+    }
+    if let Some(retired) = retired_paths.into_iter().next() {
+        if sidecar.exists() || sidecar.is_symlink() {
+            return Err(format!(
+                "handoff sidecar was replaced during archived cleanup for slot {slot}; preserve both {} and {}",
+                sidecar.display(),
+                retired.display()
+            ));
+        }
+        let retired_name = retired
+            .file_name()
+            .map(|item| item.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parts: Vec<&str> = retired_name[prefix.len()..].split('.').collect();
+        let lower_hex = |text: &str| {
+            !text.is_empty() && text.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
+        };
+        let parsed = (parts.len() == 5
+            && parts[4] == "json"
+            && lower_hex(parts[0])
+            && lower_hex(parts[1])
+            && parts[2].len() == 64
+            && lower_hex(parts[2])
+            && parts[3].len() == 64
+            && lower_hex(parts[3]))
+        .then(|| {
+            (
+                u64::from_str_radix(parts[0], 16).ok(),
+                u64::from_str_radix(parts[1], 16).ok(),
+                parts[2].to_string(),
+                parts[3].to_string(),
+            )
+        });
+        let Some((Some(device), Some(inode), name_digest, name_file_hash)) = parsed else {
+            return Err(format!(
+                "invalid retired handoff sidecar: {}",
+                retired.display()
+            ));
+        };
+        let (contents, identity) =
+            read_regular_file_identity(&retired, "retired handoff sidecar", SIDECAR_BYTES_LIMIT)?;
+        if identity.device != device
+            || identity.inode != inode
+            || recorded_digest != Some(name_digest.as_str())
+            || identity.sha256 != name_file_hash
+        {
+            return Err(format!(
+                "retired handoff sidecar identity changed: {}",
+                retired.display()
+            ));
+        }
+        let artifact = validate_sidecar(
+            cfg, selected, slot, slot_type, generation, &sidecar, &contents, identity,
+        )?;
+        if recorded_digest != artifact.value.get("sha256").and_then(Value::as_str) {
+            return Err(format!(
+                "retired handoff sidecar does not match the exact read for slot {slot}; preserve it and run 'wrkslots recover'"
+            ));
+        }
+        return Ok(());
+    }
+    let Some(artifact) = load_sidecar_artifact(cfg, selected, slot, slot_type, generation)? else {
+        return Ok(());
+    };
+    let artifact_sha = artifact
+        .value
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if recorded_digest != Some(artifact_sha.as_str()) {
+        return Err(format!(
+            "handoff sidecar changed before archived cleanup for slot {slot}; preserve it and run 'wrkslots recover'"
+        ));
+    }
+    let identity = &artifact.storage_identity;
+    let retired = cfg.control.join(format!(
+        "{prefix}{:x}.{:x}.{}.{}.json",
+        identity.device, identity.inode, artifact_sha, identity.sha256
+    ));
+    if retired.exists() || retired.is_symlink() {
+        return Err(format!(
+            "retired handoff destination already exists for slot {slot}: {}",
+            retired.display()
+        ));
+    }
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &sidecar,
+        rustix::fs::CWD,
+        &retired,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot quarantine handoff sidecar {}: {error}",
+            sidecar.display()
+        )
+    })?;
+    let directory = std::fs::File::open(&cfg.control)
+        .map_err(|error| format!("cannot fsync directory {}: {error}", cfg.control.display()))?;
+    directory
+        .sync_all()
+        .map_err(|error| format!("cannot fsync directory {}: {error}", cfg.control.display()))?;
+    let (contents, retired_identity) =
+        read_regular_file_identity(&retired, "retired handoff sidecar", SIDECAR_BYTES_LIMIT)?;
+    let retired_artifact = validate_sidecar(
+        cfg,
+        selected,
+        slot,
+        slot_type,
+        generation,
+        &sidecar,
+        &contents,
+        retired_identity,
+    )?;
+    if retired_artifact.storage_identity.device != identity.device
+        || retired_artifact.storage_identity.inode != identity.inode
+        || retired_artifact.storage_identity.size != identity.size
+        || retired_artifact.storage_identity.sha256 != identity.sha256
+        || retired_artifact.value.get("sha256").and_then(Value::as_str)
+            != Some(artifact_sha.as_str())
+    {
+        return Err(format!(
+            "retired handoff sidecar identity changed at its archive boundary for slot {slot}; preserved it for inspection"
+        ));
+    }
+    if sidecar.exists() || sidecar.is_symlink() {
+        return Err(format!(
+            "handoff sidecar pathname was replaced during cleanup for slot {slot}; preserved both identities for recovery"
+        ));
+    }
+    Ok(())
 }
 
 /// Remove and archive the named slot.
@@ -1134,17 +1375,7 @@ pub(crate) fn remove_slot(
     assert_slot_contents(&cfg, &record)?;
     // Handoff artifact gates: no uncommitted handoff, and a present
     // artifact must have been read with matching provenance.
-    let sidecar_path = cfg.control.join(format!(
-        "HANDOFF.{}.{}.{}.{}.{}.json",
-        selected.len(),
-        selected,
-        slot.len(),
-        slot,
-        generation
-    ));
-    if sidecar_path.exists() || sidecar_path.is_symlink() {
-        return Err("handoff sidecar retirement stays with the Python edition for now".to_string());
-    }
+    let sidecar = load_sidecar_artifact(&cfg, &selected, slot, &slot_type, generation)?;
     let legacy_handoff = slot_path.join("HANDOFF.md");
     if legacy_handoff.exists() || legacy_handoff.is_symlink() {
         return Err(
@@ -1152,13 +1383,39 @@ pub(crate) fn remove_slot(
         );
     }
     let latest_read = latest_handoff_read(&events, &record)?;
-    if latest_read.is_some() {
-        // No sidecar or legacy artifact is present (both refused
-        // above), yet a read was recorded for one: the artifact
-        // disappeared after it was read.
-        return Err(format!(
-            "slot {slot} handoff artifact disappeared after it was read; restore the exact generation-bound sidecar or legacy HANDOFF.md"
-        ));
+    if sidecar.is_none() {
+        if let Some((_sequence, _intended, completed)) =
+            crate::handoff_write::publication(&events, slot, generation)
+        {
+            let (state, remedy) = if completed {
+                ("completed", "restore the exact completed sidecar")
+            } else {
+                (
+                    "outstanding",
+                    "have the exact owner retry write-handoff or recover its authenticated temp",
+                )
+            };
+            return Err(format!(
+                "slot {slot} has a {state} owner-authenticated handoff write intent but no canonical sidecar; preserve the slot and {remedy}"
+            ));
+        }
+    }
+    if let Some(artifact) = &sidecar {
+        assert_sidecar_publication(&events, slot, generation, &artifact.value)?;
+    }
+    match (&sidecar, &latest_read) {
+        (Some(artifact), Some(read)) if read_matches_artifact(read, &artifact.value) => {}
+        (Some(_), _) => {
+            return Err(format!(
+                "slot {slot} contains an unread HANDOFF.md or handoff sidecar. state: REFUSED -- no checkout was salvaged or removed. remedy: run 'wrkslots read-handoff {slot} --coordinator-authorized --coordinator-pid <current-coordinator-pid>' and read its output, then retry remove"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(format!(
+                "slot {slot} handoff artifact disappeared after it was read; restore the exact generation-bound sidecar or legacy HANDOFF.md"
+            ));
+        }
+        (None, None) => {}
     }
     // Salvage gate: every checkout already published and clean.
     let mut salvage: Vec<Value> = Vec::new();
@@ -1675,6 +1932,17 @@ pub(crate) fn remove_slot(
     atomic_write_json(
         &cfg.control.join(format!("ACTIVE.{selected}.json")),
         &document,
+    )?;
+    retire_handoff_sidecar(
+        &cfg,
+        &selected,
+        slot,
+        &slot_type,
+        generation,
+        latest_read
+            .as_ref()
+            .and_then(|read| read.get("sha256"))
+            .and_then(Value::as_str),
     )?;
     clear_journal(&cfg, &selected, &journal)?;
     validate_global(root, &cfg)?;

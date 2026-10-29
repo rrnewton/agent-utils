@@ -16,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::active_state::{
     as_int, as_mapping, as_str, exact_keys, load_cfg, parse_state, parse_timestamp, slot_directory,
+    Cfg,
 };
 use crate::config_validate::validate_name;
 
@@ -24,7 +25,7 @@ type Result<T> = std::result::Result<T, String>;
 const SIDECAR_SCHEMA: i64 = 2;
 const LEGACY_SCHEMA: i64 = 1;
 const HANDOFF_BYTES_LIMIT: usize = 1024 * 1024;
-const SIDECAR_BYTES_LIMIT: usize = HANDOFF_BYTES_LIMIT * 6 + 64 * 1024;
+pub(crate) const SIDECAR_BYTES_LIMIT: usize = HANDOFF_BYTES_LIMIT * 6 + 64 * 1024;
 
 pub(crate) struct FileIdentity {
     pub(crate) device: u64,
@@ -326,14 +327,62 @@ pub(crate) fn parse_handoff(
         .and_then(Value::as_str)
         .unwrap_or("agent")
         .to_owned();
-    let path = sidecar_path(&cfg.control, &selected, slot, generation);
-    if !path.exists() && !path.is_symlink() {
-        return Ok(Value::Null);
+    match load_sidecar_artifact(&cfg, &selected, slot, &slot_type, generation)? {
+        Some(artifact) => Ok(artifact.value),
+        None => Ok(Value::Null),
     }
-    let (contents, _storage_identity) =
+}
+
+/// One validated handoff sidecar: its printed shape plus the storage
+/// identity of the file it was read from.
+pub(crate) struct SidecarArtifact {
+    pub(crate) value: Value,
+    pub(crate) storage_identity: FileIdentity,
+}
+
+/// Load and validate the generation-bound sidecar for one slot, or None
+/// when no sidecar pathname exists.
+pub(crate) fn load_sidecar_artifact(
+    cfg: &Cfg,
+    selected: &str,
+    slot: &str,
+    slot_type: &str,
+    generation: i64,
+) -> Result<Option<SidecarArtifact>> {
+    let path = sidecar_path(&cfg.control, selected, slot, generation);
+    if !path.exists() && !path.is_symlink() {
+        return Ok(None);
+    }
+    let (contents, storage_identity) =
         read_regular_file_identity(&path, "handoff sidecar", SIDECAR_BYTES_LIMIT)?;
+    validate_sidecar(
+        cfg,
+        selected,
+        slot,
+        slot_type,
+        generation,
+        &path,
+        &contents,
+        storage_identity,
+    )
+    .map(Some)
+}
+
+/// Validate sidecar contents read from `path` (the canonical sidecar
+/// path, or its retired-storage successor) against one slot generation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_sidecar(
+    cfg: &Cfg,
+    selected: &str,
+    slot: &str,
+    slot_type: &str,
+    generation: i64,
+    path: &Path,
+    contents: &[u8],
+    storage_identity: FileIdentity,
+) -> Result<SidecarArtifact> {
     let label = format!("handoff sidecar {}", path.display());
-    let raw = strict_json_object(&contents, "handoff sidecar")?;
+    let raw = strict_json_object(contents, "handoff sidecar")?;
     let schema = as_int(
         raw.get("schema").unwrap_or(&Value::Null),
         &format!("{label}.schema"),
@@ -374,8 +423,7 @@ pub(crate) fn parse_handoff(
     if !matches!(source, "write-handoff" | "legacy-slot-file") {
         return Err(format!("{label}.source is invalid"));
     }
-    let expected_legacy =
-        resolve_loose(&slot_directory(&cfg, slot, &slot_type)?.join("HANDOFF.md"));
+    let expected_legacy = resolve_loose(&slot_directory(cfg, slot, slot_type)?.join("HANDOFF.md"));
     let source_path: Option<PathBuf> = if schema == LEGACY_SCHEMA {
         if source == "legacy-slot-file" {
             Some(expected_legacy.clone())
@@ -423,16 +471,19 @@ pub(crate) fn parse_handoff(
             "legacy handoff sidecar must be provenance-upgraded before it is written".to_owned(),
         );
     }
-    Ok(json!({
-        "schema": SIDECAR_SCHEMA,
-        "machine": selected,
-        "slot": slot,
-        "generation": generation,
-        "recorded_at": recorded_at,
-        "source": source,
-        "source_path": source_path.expect("checked above").to_string_lossy(),
-        "source_identity": identity_to_obj(source_identity.as_ref().expect("checked above")),
-        "contents_utf8": contents_text,
-        "sha256": digest,
-    }))
+    Ok(SidecarArtifact {
+        value: json!({
+            "schema": SIDECAR_SCHEMA,
+            "machine": selected,
+            "slot": slot,
+            "generation": generation,
+            "recorded_at": recorded_at,
+            "source": source,
+            "source_path": source_path.expect("checked above").to_string_lossy(),
+            "source_identity": identity_to_obj(source_identity.as_ref().expect("checked above")),
+            "contents_utf8": contents_text,
+            "sha256": digest,
+        }),
+        storage_identity,
+    })
 }

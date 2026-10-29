@@ -18,6 +18,8 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import cast
 
@@ -271,6 +273,192 @@ def _remove_matches_python(tmp_path: Path) -> None:
         assert not (root / "worktrees" / "ACTIVE.node-a.journal").exists()
 
 
+def _identity_obj(pid: int) -> dict[str, object]:
+    identity = wrkslots_cli._read_process_identity(pid)
+    return {
+        "pid": identity.pid,
+        "start_ticks": identity.start_ticks,
+        "boot_id": identity.boot_id,
+        "host_id": identity.host_id,
+        "cgroup_path": identity.cgroup_path,
+    }
+
+
+_HANDOFF_CHILD = """
+import argparse, json, os, sys, time
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from wrkslots import cli
+root, source, done, mode = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+assert cli._cmd_write_handoff(argparse.Namespace(
+    project_root=root, machine=None, slot="slot-a", agent="agent-slot-a",
+    owner_pid=os.getpid(), expected_generation=1, from_file=source,
+    wait_lock=0.0)) == 0
+if mode == "read":
+    assert cli._cmd_read_handoff(argparse.Namespace(
+        project_root=root, machine=None, slot="slot-a",
+        coordinator_pid=os.getpid(), coordinator_authorized=True,
+        adopt_legacy_change=False, expected_generation=None,
+        wait_lock=0.0)) == 0
+Path(done).write_text("done")
+time.sleep(60)
+"""
+
+
+def _write_and_read_handoff(root: Path, source_dir: Path, *, read: bool) -> None:
+    """Give slot-a a handoff sidecar via its owner process, then kill it.
+
+    The owner must be the invoking process for write-handoff, so a
+    child Python process owns the slot, writes (and optionally reads)
+    the handoff as itself, signals completion, and is then killed so
+    removal sees a proven-dead owner.
+    """
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source = source_dir / "notes.md"
+    source.write_text("# Handoff\n\nAll done.\n")
+    done = source_dir / "done"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(AU_ROOT / "py")
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-c", _HANDOFF_CHILD, str(AU_ROOT / "py"),
+            str(root), str(source), str(done), "read" if read else "write",
+        ],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        active_path = root / "worktrees" / "ACTIVE.node-a.json"
+        doc = json.loads(active_path.read_text())
+        doc["slots"][0]["owner"] = _identity_obj(proc.pid)
+        doc["slots"][0]["coordinator_lease"] = _identity_obj(proc.pid)
+        active_path.write_text(json.dumps(doc))
+        for _ in range(300):
+            if done.exists():
+                break
+            if proc.poll() is not None:
+                _out, err = proc.communicate()
+                raise AssertionError(f"handoff child failed: {err}")
+            time.sleep(0.1)
+        assert done.exists(), "handoff child did not finish"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_remove_read_sidecar_retires_it(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        _remove_read_sidecar_retires_it(base)
+
+
+def _remove_read_sidecar_retires_it(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    _write_and_read_handoff(oracle_root, tmp_path / "oracle-src", read=True)
+    _write_and_read_handoff(rust_root, tmp_path / "rust-src", read=True)
+    assert _python_remove(oracle_root) == 0
+    result = _rust_remove(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _doc(rust_root, "ACTIVE.node-a.json") == _doc(oracle_root, "ACTIVE.node-a.json")
+    assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
+        oracle_root, "ARCHIVED.node-a.json"
+    )
+    assert _kinds_and_actions(rust_root) == _kinds_and_actions(oracle_root)
+    retired_pattern = re.compile(
+        r"HANDOFF-RETIRED\.[0-9a-f]{16}\.[0-9a-f]+\.[0-9a-f]+\."
+        r"[0-9a-f]{64}\.[0-9a-f]{64}\.json"
+    )
+    for root in (rust_root, oracle_root):
+        control = root / "worktrees"
+        assert not (control / "HANDOFF.6.node-a.6.slot-a.1.json").exists()
+        retired = [
+            path for path in control.iterdir() if retired_pattern.fullmatch(path.name)
+        ]
+        assert len(retired) == 1
+        assert not (root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_unread_sidecar_refuses_like_python(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    _write_and_read_handoff(oracle_root, tmp_path / "oracle-src", read=False)
+    _write_and_read_handoff(rust_root, tmp_path / "rust-src", read=False)
+    with pytest.raises(Exception) as caught:
+        _python_remove(oracle_root)
+    assert "contains an unread HANDOFF.md or handoff sidecar" in str(caught.value)
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "contains an unread HANDOFF.md or handoff sidecar" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_sidecar_without_intent_refuses_like_python(
+    tmp_path: Path,
+) -> None:
+    # A real read sidecar whose contents were replaced afterwards: it
+    # no longer byte-matches its owner-authenticated write intent, so
+    # the publication gate refuses before any read-provenance credit.
+    rust_root, oracle_root = _pair(tmp_path)
+    _write_and_read_handoff(oracle_root, tmp_path / "oracle-src", read=True)
+    _write_and_read_handoff(rust_root, tmp_path / "rust-src", read=True)
+    for root in (rust_root, oracle_root):
+        sidecar_path = root / "worktrees" / "HANDOFF.6.node-a.6.slot-a.1.json"
+        sidecar = json.loads(sidecar_path.read_text())
+        # recorded_at is part of the intent-bound artifact object but
+        # is not otherwise constrained by the sidecar loader, so this
+        # replacement reaches the publication gate itself.
+        sidecar["recorded_at"] = "2026-10-26T09:09:09Z"
+        sidecar_path.write_text(json.dumps(sidecar))
+    with pytest.raises(Exception) as caught:
+        _python_remove(oracle_root)
+    assert "no matching owner-authenticated publication intent" in str(caught.value)
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "no matching owner-authenticated publication intent" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_with_image_records_matches_python(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        _remove_with_image_records(base)
+
+
+def _remove_with_image_records(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    for root in (rust_root, oracle_root):
+        control = root / "worktrees"
+        active_path = control / "ACTIVE.node-a.json"
+        doc = json.loads(active_path.read_text())
+        record = json.loads(json.dumps(doc["slots"][0]))
+        record["slot"] = "slot-img"
+        record["agent"] = "agent-slot-img"
+        record["checkouts"][0]["path"] = "worktrees/slot-img/repo"
+        doc["slots"].append(record)
+        active_path.write_text(json.dumps(doc))
+        (control / "slot-img").mkdir()
+        image_dir = control / "slot-images" / "agent" / "slot-img"
+        image_dir.mkdir(parents=True)
+        (image_dir / "slot.img").write_bytes(b"")
+        (image_dir / "IMAGE.json").write_text(
+            json.dumps(
+                {
+                    "schema": "wrkslots-slot-image/v1",
+                    "slot": "slot-img",
+                    "slot_type": "agent",
+                    "phase": "ready",
+                    "backend": "kernel",
+                    "location": str(control / "slot-img"),
+                    "created_at": "2026-10-26T00:00:00Z",
+                    "ceiling_bytes": 1024,
+                    "state_ceiling_bytes": 1024,
+                }
+            )
+        )
+    assert _python_remove(oracle_root) == 0
+    result = _rust_remove(rust_root)
+    assert result.returncode == 0, result.stderr
+    remaining = _doc(rust_root, "ACTIVE.node-a.json")
+    remaining_slots = cast(list[dict[str, object]], remaining["slots"])
+    assert [record["slot"] for record in remaining_slots] == ["slot-img"]
+
+
 def test_remove_dirty_checkout_refuses_salvage_scope(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     (rust_root / "worktrees" / "slot-a" / "repo" / "notes.txt").write_text("wip\n")
@@ -407,7 +595,7 @@ def test_remove_liveness_alive_despite_dead_owner_refuses(tmp_path: Path) -> Non
     assert (rust_root / "worktrees" / "slot-a").exists()
 
 
-def test_remove_sidecar_present_refuses_python_scope(tmp_path: Path) -> None:
+def test_remove_invalid_sidecar_refuses(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     sidecar = rust_root / "worktrees" / "HANDOFF.6.node-a.6.slot-a.1.json"
     sidecar.write_text("{}\n")
