@@ -16,12 +16,12 @@
 //!   handler inside it ([`ReadReason::scope`]).
 //! * **The server says so for its own reads**: thread naming, the voice catch-up's windows, the
 //!   reachability probe, a summary's context window, speech preparation, the recent-view shadow
-//!   check, an MCP tool call, and the live poller (`#614 timeline-read-failures`). Each runs its
-//!   read inside its own reason, which overrides any reason of the request it was made for.
+//!   check, an MCP tool call, the live poller (`#614 timeline-read-failures`), and a post with
+//!   the reads it makes first (`#699 vt-send-priority`). Each runs its read inside its own reason,
+//!   which overrides any reason of the request it was made for.
 //!
-//! A read made with no reason around it counts as [`ReadReason::Untagged`] (a send, for one), so a
-//! path nobody tagged shows up in the figures as exactly that rather than hiding under another's
-//! name.
+//! A read made with no reason around it counts as [`ReadReason::Untagged`], so a path nobody
+//! tagged shows up in the figures as exactly that rather than hiding under another's name.
 //!
 //! The reason is carried in a task-local, not threaded through every signature: the chat trait
 //! stays as it is, and [`crate::upstream_profile::ProfiledClient`] reads it where it times the
@@ -138,6 +138,10 @@ pub enum ReadReason {
     /// The server: the live poller reading each polled channel's newest messages (and the threads
     /// that moved) to publish them. `#614 timeline-read-failures`; it used to be untagged.
     LivePoll,
+    /// The server: a read a write needs before it is made, and the write itself: the thread a post
+    /// goes into, proved there before posting. Placed ahead of every other read by Slack's shared
+    /// budget. `#699 vt-send-priority`; a send's reads used to be untagged.
+    Write,
     /// A reason was given, but it is not one the page sends.
     Other,
     /// No reason was given at all.
@@ -145,7 +149,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 29] = [
+pub const ALL: [ReadReason; 30] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -173,6 +177,7 @@ pub const ALL: [ReadReason; 29] = [
     ReadReason::Relist,
     ReadReason::Backfill,
     ReadReason::LivePoll,
+    ReadReason::Write,
     ReadReason::Other,
     ReadReason::Untagged,
 ];
@@ -209,6 +214,7 @@ impl ReadReason {
             Self::Relist => "relist",
             Self::Backfill => "backfill",
             Self::LivePoll => "live-poll",
+            Self::Write => "write",
             Self::Other => "other",
             Self::Untagged => "untagged",
         }

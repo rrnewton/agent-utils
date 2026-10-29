@@ -1756,3 +1756,158 @@ async fn main_and_a_thread_are_read_forward_from_the_newest_ts_delivered() {
         );
     }
 }
+
+/// Put `client` into the state a refused read leaves it in: Slack answered a rate limit a moment
+/// ago, with a `Retry-After` that has already run out. The read gives up at once, as a read the
+/// message cache stands in for does.
+async fn begin_limiting(fake: &Fake, client: &HttpSlackClient) {
+    fake.with(|state| state.rate_limit_once = Some(("conversations.history".to_owned(), 0)));
+    let error = vibe_talk::read_reason::hurry(true, client.fetch_recent(&channel(), 5))
+        .await
+        .expect_err("refused");
+    assert!(matches!(error.cause(), ChatError::RateLimited(_)), "{error}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// `#699 vt-send-priority`. Live, a send took 35 s: 30 of them its own read of the thread it was
+/// posting into, refused three times behind a ten-second `Retry-After` while background reads kept
+/// the account's bucket empty. Now, while Slack is limiting, a send and its read try again on their
+/// own short schedule, live work pauses beside it, and a person's read holds until it is out.
+#[tokio::test]
+async fn a_send_while_slack_refuses_reads_goes_out_first() {
+    use vibe_talk::read_reason::ReadReason;
+    let (state, [r1, _, _]) = three_threads();
+    let fake = Fake::start(state, 20).await;
+    let client = std::sync::Arc::new(fake.client());
+    begin_limiting(&fake, &client).await;
+    fake.with(|state| {
+        // The bucket refills in a fraction of the ten seconds Slack names.
+        state
+            .rate_limit_many
+            .insert("conversations.replies".to_owned(), (10, 2));
+        state
+            .rate_limit_many
+            .insert("chat.postMessage".to_owned(), (10, 1));
+        // So the post is plainly in flight while the reads below are asked.
+        state.post_delay = Some(Duration::from_millis(600));
+    });
+    let history_before = fake.calls("conversations.history");
+    let started = Instant::now();
+    let send = {
+        let client = std::sync::Arc::clone(&client);
+        let r1 = r1.clone();
+        tokio::spawn(async move {
+            let posted = client
+                .post_in_thread(&channel(), &r1, "the owner's words", None)
+                .await;
+            (posted, Instant::now())
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let live = ReadReason::LivePoll
+        .scope(client.fetch_recent(&channel(), 5))
+        .await
+        .expect_err("live work pauses beside a send");
+    assert!(matches!(live.cause(), ChatError::RateLimited(_)), "{live}");
+    let person = client
+        .fetch_recent(&channel(), 5)
+        .await
+        .expect("a person's read still goes");
+    let read_done = Instant::now();
+    assert!(!person.is_empty());
+    let (posted, posted_at) = send.await.expect("send task");
+    let posted = posted.expect("posted");
+    assert_eq!(posted.content, "the owner's words");
+    assert!(
+        posted_at.duration_since(started) < Duration::from_secs(8),
+        "the send waited out Slack's Retry-After: {:?}",
+        posted_at.duration_since(started)
+    );
+    assert!(
+        read_done >= posted_at,
+        "a person's read went ahead of the send in flight"
+    );
+    assert_eq!(fake.calls("conversations.replies"), 3, "two refused, one read");
+    assert_eq!(fake.calls("chat.postMessage"), 2, "one refused, one posted");
+    assert_eq!(
+        fake.calls("conversations.history"),
+        history_before + 1,
+        "only the person's read was sent; live work was not"
+    );
+}
+
+/// `#699 vt-send-priority`. While Slack is limiting, the reads nobody is waiting on give way:
+/// naming and backfill are not sent, a read the message cache would answer is not sent, and live
+/// work goes once per trickle. A person's read still goes.
+#[tokio::test]
+async fn background_reads_give_way_while_slack_is_limiting() {
+    use vibe_talk::read_reason::ReadReason;
+    let (state, _) = linear(3);
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+    begin_limiting(&fake, &client).await;
+    let sent = fake.calls("conversations.history");
+    for reason in [ReadReason::Naming, ReadReason::Backfill] {
+        let error = reason
+            .scope(client.fetch_recent(&channel(), 5))
+            .await
+            .expect_err("paused");
+        assert!(matches!(error.cause(), ChatError::RateLimited(_)), "{reason}");
+        let wait = error.retry_after().expect("says how long");
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_secs(60),
+            "{wait:?}"
+        );
+    }
+    vibe_talk::read_reason::hurry(true, client.fetch_recent(&channel(), 5))
+        .await
+        .expect_err("the cache answers it");
+    assert_eq!(fake.calls("conversations.history"), sent, "nothing was sent");
+
+    ReadReason::LivePoll
+        .scope(client.fetch_recent(&channel(), 5))
+        .await
+        .expect("live work trickles");
+    ReadReason::LivePoll
+        .scope(client.fetch_recent(&channel(), 5))
+        .await
+        .expect_err("but only once per trickle");
+    assert_eq!(fake.calls("conversations.history"), sent + 1);
+    client
+        .fetch_recent(&channel(), 5)
+        .await
+        .expect("a person's read goes");
+    assert_eq!(fake.calls("conversations.history"), sent + 2);
+
+    // A client Slack has not refused reads for naming as before.
+    let calm = fake.client();
+    ReadReason::Naming
+        .scope(calm.fetch_recent(&channel(), 5))
+        .await
+        .expect("not limiting");
+}
+
+/// `#699 vt-send-priority`. A reply into a thread a read has just returned goes in without reading
+/// the thread again first; one into a thread nobody has read lately is still proved first.
+#[tokio::test]
+async fn a_reply_into_a_thread_just_read_is_not_read_again_first() {
+    let (state, [r1, _, r3]) = three_threads();
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+    client
+        .fetch_thread_message(&channel(), &r1, &mid(&r1))
+        .await
+        .expect("root");
+    let reads = fake.calls("conversations.replies");
+    client
+        .post_in_thread(&channel(), &r1, "straight in", None)
+        .await
+        .expect("posted");
+    assert_eq!(fake.calls("conversations.replies"), reads);
+    client
+        .post_in_thread(&channel(), &r3, "proved first", None)
+        .await
+        .expect("posted");
+    assert_eq!(fake.calls("conversations.replies"), reads + 1);
+    assert_eq!(fake.calls("chat.postMessage"), 2);
+}

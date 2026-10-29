@@ -147,7 +147,23 @@ impl HttpSlackClient {
             .iter()
             .cloned()
             .map(Raw::parse)
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        // Every root this read returned is proven there, so a post into it soon after need not
+        // read it again first. `#699 vt-send-priority`.
+        match feed {
+            Feed::History(_) => self.note_known_roots(
+                conversation,
+                raws.iter()
+                    .filter(|raw| raw.is_thread_root())
+                    .map(|raw| raw.ts.as_str()),
+            ),
+            Feed::Replies(_, thread) => {
+                if raws.iter().any(|raw| raw.ts == thread) {
+                    self.note_known_root(conversation, thread);
+                }
+            }
+        }
+        let raws = raws
             .into_iter()
             // Bounds are applied here as well as upstream: `conversations.replies` may include the
             // root outside the requested window, and a lenient server may ignore a bound.

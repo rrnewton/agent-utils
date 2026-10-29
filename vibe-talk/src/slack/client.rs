@@ -139,6 +139,18 @@ pub(super) enum Patience {
     BestEffort,
 }
 
+/// A post in flight, counted until dropped ([`HttpSlackClient::write_in_flight`]).
+pub(super) struct WriteInFlight<'c>(&'c HttpSlackClient);
+
+impl Drop for WriteInFlight<'_> {
+    fn drop(&mut self) {
+        self.0
+            .writes_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.writes_done.notify_waiters();
+    }
+}
+
 /// One answer from the transport.
 enum Outcome {
     Done(Value),
@@ -228,11 +240,16 @@ pub struct HttpSlackClient {
     /// what background crawling holds off for ([`ChatClient::crawl_hold`]) and the diagnostics
     /// report. `#602 history-settings-and-limits`.
     pressure: Mutex<HashMap<String, MethodPressure>>,
-    /// The threads the first parts of long posts just went into or started, by conversation and
-    /// root `ts`, and when: proven to be there by Slack's own answer to that part, so the rest of
-    /// the post goes in without reading the thread first. `#448 send-dedupe`; see
-    /// `super::timeline::ROOTS_KEEP`.
-    pub(super) posted_roots: Mutex<HashMap<(String, String), Instant>>,
+    /// The thread roots proven there lately, by conversation and root `ts`, and when: the threads
+    /// the first parts of long posts just went into or started, by Slack's own answer to that part
+    /// (`#448 send-dedupe`), and the roots any read just returned (`#699 vt-send-priority`), so a
+    /// post goes in without reading its thread first. See `super::timeline::ROOTS_KEEP`.
+    pub(super) known_roots: Mutex<HashMap<(String, String), Instant>>,
+    /// The posts in flight, each with the reads it makes first: while the provider is limiting, a
+    /// person's read holds for them and live work pauses. `#699 vt-send-priority`.
+    writes_in_flight: std::sync::atomic::AtomicUsize,
+    /// Notified whenever a post finishes.
+    writes_done: tokio::sync::Notify,
     /// Whether Slack, as this client reaches it, has handed back an operation key on a message:
     /// the proof that the transport passes `metadata` through both ways. Until then reads are not
     /// promised to return one. `#465 replication-c6-op-key-marker`.
@@ -309,7 +326,9 @@ impl HttpSlackClient {
             shim_profile: None,
             directory_pages: crate::directory::Kept::default(),
             pressure: Mutex::new(HashMap::new()),
-            posted_roots: Mutex::new(HashMap::new()),
+            known_roots: Mutex::new(HashMap::new()),
+            writes_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            writes_done: tokio::sync::Notify::new(),
             op_keys_returned: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -401,7 +420,12 @@ impl HttpSlackClient {
     ) -> Result<Value, ChatError> {
         let url = format!("{}/{method}", self.api_base);
         let reason = crate::read_reason::ReadReason::current();
-        let priority = super::budget::Priority::of(reason);
+        let priority = if super::budget::is_write(method) {
+            super::budget::Priority::Write
+        } else {
+            super::budget::Priority::of(reason)
+        };
+        let write = priority == super::budget::Priority::Write;
         let mut waited = Duration::ZERO;
         let mut attempts = 0;
         loop {
@@ -412,7 +436,7 @@ impl HttpSlackClient {
                 self.count(|tally, now| tally.refused(method, now));
                 return Err(refused);
             }
-            self.count(|tally, now| tally.sent(method, reason, now));
+            self.count(|tally, now| tally.sent(method, reason, priority, now));
             attempts += 1;
             let timer = self
                 .shim_profile
@@ -432,13 +456,24 @@ impl HttpSlackClient {
             match answer? {
                 Outcome::Done(value) => return Ok(value),
                 Outcome::Limited(retry_after) => {
-                    self.count(|tally, now| tally.limited(method, now));
+                    self.count(|tally, now| tally.limited(method, priority, now));
                     self.note_limited(method, retry_after);
-                    let wait = retry_after.max(MIN_RETRY_WAIT);
+                    // `#699 vt-send-priority`: a write tries again on its own short schedule; a
+                    // bucket shared by every method refills in well under the `Retry-After` it
+                    // names, and the reads that would take the refill are giving way meanwhile.
+                    let (wait, most) = if write {
+                        (
+                            super::budget::write_retry_wait(attempts, retry_after),
+                            super::budget::MAX_WRITE_ATTEMPTS,
+                        )
+                    } else {
+                        (retry_after, MAX_RATE_LIMIT_ATTEMPTS)
+                    };
+                    let wait = wait.max(MIN_RETRY_WAIT);
                     // A wait longer than what is left is refused BEFORE it is taken: parking a
                     // caller and then failing anyway is the worst of both.
                     if patience == Patience::BestEffort
-                        || attempts >= MAX_RATE_LIMIT_ATTEMPTS
+                        || attempts >= most
                         || waited + wait > RATE_LIMIT_BUDGET
                     {
                         return Err(ChatError::RateLimited(RateLimitExhausted {
@@ -466,6 +501,10 @@ impl HttpSlackClient {
     /// A request waits out a `Retry-After` Slack gave anyone for the method, within its own budget,
     /// before every attempt; crawl work, and a request that gives up at the first rate limit, fail
     /// instead of sending into it. Then crawl work yields to everyone else ([`super::budget`]).
+    ///
+    /// `#699 vt-send-priority`: a write goes at once, whatever anyone else was told; and while the
+    /// provider is limiting, every other request first gives way to writes
+    /// ([`super::budget::while_limiting`]).
     async fn admit(
         &self,
         method: &'static str,
@@ -485,6 +524,37 @@ impl HttpSlackClient {
                 global: false,
             })
         };
+        let now = tokio::time::Instant::now();
+        if priority == super::budget::Priority::Write {
+            self.sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(method, priority, now);
+            return None;
+        }
+        if let Some(until) = self.limiting(now) {
+            let in_flight = self.writes_in_flight() > 0;
+            let last_live = self
+                .sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last_sent(super::budget::Priority::Live, now);
+            // Not an author lookup that merely gives up at a rate limit: its failure is
+            // remembered for minutes, where a read the message cache stands in for loses nothing.
+            let hurried = crate::read_reason::hurried();
+            match super::budget::while_limiting(priority, hurried, in_flight, last_live, now) {
+                super::budget::WhileLimiting::Go => {}
+                super::budget::WhileLimiting::Pause => {
+                    self.count(|tally, now| tally.paused(method, now));
+                    return Some(refusal(*waited, until.saturating_duration_since(now)));
+                }
+                super::budget::WhileLimiting::HoldForWrites => {
+                    let longest =
+                        super::budget::WRITE_HOLD.min(RATE_LIMIT_BUDGET.saturating_sub(*waited));
+                    *waited += self.hold_for_writes(longest).await;
+                }
+            }
+        }
         // Looked at again after each wait: another request may have been told to wait longer
         // meanwhile.
         loop {
@@ -556,6 +626,51 @@ impl HttpSlackClient {
         if let Some(report) = report {
             report.log();
         }
+    }
+
+    /// Until when the provider counts as limiting: [`super::budget::LIMITING_WINDOW`] after the
+    /// latest rate limit it answered, on any method. `None` when it is not. `#699
+    /// vt-send-priority`.
+    fn limiting(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        self.pressure()
+            .values()
+            .filter_map(|entry| entry.limited.back())
+            .max()
+            .map(|at| *at + super::budget::LIMITING_WINDOW)
+            .filter(|until| *until > now)
+    }
+
+    /// How many posts are in flight.
+    fn writes_in_flight(&self) -> usize {
+        self.writes_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Count a post in flight until the guard is dropped. `#699 vt-send-priority`.
+    pub(super) fn write_in_flight(&self) -> WriteInFlight<'_> {
+        self.writes_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        WriteInFlight(self)
+    }
+
+    /// Wait until no post is in flight, at most `longest`; how long it waited.
+    async fn hold_for_writes(&self, longest: Duration) -> Duration {
+        let started = tokio::time::Instant::now();
+        let deadline = started + longest;
+        loop {
+            let done = self.writes_done.notified();
+            tokio::pin!(done);
+            // Registered before the count is read, so a post finishing in between is not missed.
+            done.as_mut().enable();
+            if self.writes_in_flight() == 0
+                || tokio::time::timeout_at(deadline, done.as_mut())
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+        started.elapsed()
     }
 
     fn pressure(&self) -> std::sync::MutexGuard<'_, HashMap<String, MethodPressure>> {
@@ -1252,7 +1367,7 @@ impl ChatClient for HttpSlackClient {
         // Slack's answer to the first part has just shown this thread is there, so the rest goes
         // in without reading it first (`#448 send-dedupe`).
         if let Some(target) = ids::ChannelRef::parse(channel.as_str()) {
-            self.note_posted_root(&target.conversation, &thread);
+            self.note_known_root(&target.conversation, &thread);
         }
         Some(thread)
     }
