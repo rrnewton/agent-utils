@@ -13,13 +13,16 @@
 //!
 //! # What it does
 //!
-//! A page's newest or catch-up read ([`eligible`]) of a view the cache has listed the newest end
-//! of at least once is answered from the cache at once (`crate::ops`), as the stand-in of `#611
+//! A page's newest or catch-up read ([`eligible`]) of a view the cache holds anything of is
+//! answered from the cache at once (`crate::ops`), as the stand-in of `#611
 //! timeline-read-failures` answered it after the wait: `refresh_failed` set, so the page lets it
 //! answer for nothing it lacks and reads again soon (3 s, then 10 s). Its `as_of` is when the
 //! cache's copy was last brought up to date: the later of its latest listing of the view's newest
-//! end and the latest upstream read of the view that answered ([`Landed::read_ms`]), so the page
-//! says "Refresh failed" once that is two minutes old, provider outage or not.
+//! end and the latest upstream read of the view that answered ([`Landed::read_ms`]), or, for a
+//! view neither has reached (a thread nobody has opened), the oldest observation it holds; so the
+//! page says "Refresh failed" once that is two minutes old, provider outage or not. `#688
+//! vt-timeline-latency`: it used to need a listing, and a thread live ingestion had brought but
+//! nobody had opened went to the provider first and waited out its rate limits on the request.
 //!
 //! The upstream read it stands for is begun behind the answer, one per view at a time (the
 //! refresh claim, as every read of a view shares it), and fills the cache. Its answer is kept here
@@ -30,7 +33,7 @@
 //! and cover are). A failure the cache may not hide (an expired cursor, an access answer) is kept
 //! the same way and is that next read's answer, so the page learns of it as it did before.
 //!
-//! Slack goes first only for what the cache has never listed, with the fallback as before; and
+//! Slack goes first only for what the cache holds nothing of, with the fallback as before; and
 //! for the reads that exist to ask the provider what this server does not know: placing a live
 //! message's thread (`place`, `reply-place`).
 //!

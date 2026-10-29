@@ -2246,6 +2246,11 @@ impl Sink {
     /// and Slack's All, put together as Slack's own read puts it together: Main, and the newest
     /// replies the cache holds of each thread rooted on it. `#614 timeline-read-failures`: and
     /// Slack's thread list, put together from the file's thread records ([`Self::stale_thread_list`]).
+    ///
+    /// `#688 vt-timeline-latency`: a thread whose scope lacks its root (one nobody has read yet:
+    /// the root is Main's, and only a read of the thread lists it in the thread's scope) is
+    /// answered with the root as Main holds it, ahead of any replies held, so a thread whose
+    /// replies Slack will not give out yet still has something to answer with.
     pub async fn stale_timeline(&self, channel: &ChannelId, ask: &Ask) -> Option<StaleTimeline> {
         if !self.serve_enabled() {
             return None;
@@ -2302,6 +2307,24 @@ impl Sink {
             let more_held = view.rows.len() > asked;
             if more_held {
                 view.rows.remove(0);
+            }
+            let record = match query.scope() {
+                Some(Scope::Thread(thread)) => cache.thread(&chan, thread).served().flatten(),
+                _ => None,
+            };
+            let is_root = |row: &super::CachedMessage| {
+                row.message
+                    .thread
+                    .as_ref()
+                    .is_some_and(|thread| thread.is_root)
+            };
+            // Not below a page that leaves older replies out: the root would sit over a gap.
+            if let Some(root_id) = record.as_ref().and_then(|record| record.root_id.as_ref()) {
+                if !more_held && !view.rows.iter().any(is_root) {
+                    if let Read::Served(Some(root)) = cache.message(&chan, root_id) {
+                        view.rows.insert(0, root);
+                    }
+                }
             }
             let thread = matches!(query.scope(), Some(Scope::Thread(_)));
             // Not with a row left out below (a text no read proved whole): it may be the oldest.

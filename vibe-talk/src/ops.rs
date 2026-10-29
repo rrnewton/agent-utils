@@ -2128,16 +2128,22 @@ async fn read_or_stand_in(
     read: UpstreamTimeline,
 ) -> Result<Answered, OpError> {
     let key = flight_key(channel, request);
-    // `#622 cache-first-reads`: a page's read of a view the cache has listed the newest end of is
-    // answered from it at once, with the read upstream behind the answer; the next read of the
-    // view from the same cursor takes how that read ended, once it has. Asked of the cache first
-    // either way, so a scope it has since blocked (or a route or account that changed) hands out
-    // nothing a read before that brought.
+    // `#622 cache-first-reads`: a page's read of a view the cache holds anything of is answered
+    // from it at once, with the read upstream behind the answer; the next read of the view from
+    // the same cursor takes how that read ended, once it has. Asked of the cache first either way,
+    // so a scope it has since blocked (or a route or account that changed) hands out nothing a
+    // read before that brought.
+    //
+    // `#688 vt-timeline-latency`: held, not listed. A view no read of its newest end has landed
+    // for (a thread live ingestion or Main brought, which nobody has opened since) used to go to
+    // the provider first and wait out its rate limits on the request: 33-58 s and then a 502 for a
+    // new thread while Slack was limiting `conversations.replies`. Such an answer is dated by the
+    // oldest observation it holds, so the page says how old it is rather than wait.
     if crate::cache_first::eligible(request) {
-        if let Some(held) = held_for(state, channel, request).await.filter(|held| {
-            held.checked_ms.is_some()
-                && crate::cache_first::answers(request, held.next_before.as_deref())
-        }) {
+        if let Some(held) = held_for(state, channel, request)
+            .await
+            .filter(|held| crate::cache_first::answers(request, held.next_before.as_deref()))
+        {
             match state.landed.take(&key, request.after.as_deref()) {
                 Some(crate::cache_first::LandedAnswer::Page(landed)) => {
                     return Ok(Answered::Landed(landed));

@@ -1673,6 +1673,18 @@ async fn slack_threads_deployment_with(
     live_poll: bool,
     table: &str,
 ) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
+    slack_threads_deployment_opening(tag, live_poll, table, &[60, 180]).await
+}
+
+/// [`slack_threads_deployment_with`], reading only the threads rooted at `opened` (seconds into the
+/// fixture) after Main: the others are known by their roots and reply counts alone, as a thread
+/// live ingestion or Main brought is until someone opens it.
+async fn slack_threads_deployment_opening(
+    tag: &str,
+    live_poll: bool,
+    table: &str,
+    opened: &[i64],
+) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
     let mut fixture = slack_fake::FakeState::default();
     let mut history: Vec<Value> = (0..6)
         .map(|n| {
@@ -1740,7 +1752,7 @@ writable = true
         WRITE_TOKEN,
     )
     .await;
-    for root in [60, 180] {
+    for &root in opened {
         ok(
             &state,
             &path(
@@ -2328,6 +2340,104 @@ async fn a_view_the_cache_has_never_seen_goes_to_the_provider_first() {
     assert_eq!(d.chat.timeline_reads(), reads + 1);
     assert!(
         capture.text().contains(" served_from=\"upstream\""),
+        "{}",
+        capture.text()
+    );
+}
+
+// --- `#688 vt-timeline-latency`: no page read the cache can answer waits on Slack ---------------
+
+#[tokio::test]
+async fn a_thread_nobody_has_opened_is_answered_from_its_root_at_once_under_a_rate_limit() {
+    // Main was read, so the cache holds the root of the thread at 180 s and its reply count, but
+    // nobody opened the thread: its scope holds nothing, and no read of it has landed.
+    let (state, fake, _clock, _dir) =
+        slack_threads_deployment_opening("unopened-thread", true, "", &[60]).await;
+    state.message_cache.set_serve(true);
+    rate_limit(&fake, "conversations.history");
+    rate_limit(&fake, "conversations.replies");
+    let capture = vibe_talk::testing::LogCapture::start();
+    let thread = path(
+        SLACK_CH,
+        &format!(
+            "/timeline?view=thread&thread_id={}&limit=50&reason=visible",
+            slack_fake::ts(180, 0)
+        ),
+    );
+    // It went to Slack first and waited out the thirty-second Retry-After on the request, then
+    // answered 502: 33-58 s for a new thread on the live instance, and the page gave up.
+    let body = tokio::time::timeout(AT_ONCE, ok(&state, &thread, WRITE_TOKEN))
+        .await
+        .expect("answered from the cache at once, not after Slack's rate limit");
+    assert_eq!(
+        texts(&body),
+        ["message 3"],
+        "the root, as Main holds it: {body}"
+    );
+    assert!(
+        body["refresh_failed"].is_string(),
+        "the page lets it answer for nothing it lacks, and reads again soon: {body}"
+    );
+    assert!(
+        body["as_of"].is_string(),
+        "dated by what it holds, as no read of the thread ever landed: {body}"
+    );
+    assert!(
+        capture.text().contains(" served_from=\"cache-first\""),
+        "{}",
+        capture.text()
+    );
+    assert!(
+        !capture.text().contains("server error"),
+        "{}",
+        capture.text()
+    );
+}
+
+#[tokio::test]
+async fn no_page_read_of_a_view_the_cache_holds_waits_on_slack() {
+    let (state, fake, _clock, _dir) =
+        slack_threads_deployment_opening("no-page-read-waits", true, "", &[60]).await;
+    state.message_cache.set_serve(true);
+    // Slack refuses every read, for thirty seconds at a time, and is slow to say so.
+    rate_limit(&fake, "conversations.history");
+    rate_limit(&fake, "conversations.replies");
+    fake.with(|fixture| fixture.delay = Some(Duration::from_secs(3)));
+    let capture = vibe_talk::testing::LogCapture::start();
+    let views = [
+        "view=main".to_owned(),
+        "view=flat".to_owned(),
+        "view=threads".to_owned(),
+        format!("view=thread&thread_id={}", slack_fake::ts(60, 0)),
+        format!("view=thread&thread_id={}", slack_fake::ts(180, 0)),
+    ];
+    // Every reason a page reads a view's newest end or catches up with, except those that exist to
+    // ask Slack what the server does not know (`place`, `reply-place`, and "Older threads…").
+    let reasons = [
+        "enter", "poll", "live", "mutation", "visible", "reset", "replay", "pull", "expired",
+        "older", "search", "counts", "side",
+    ];
+    for view in &views {
+        for reason in reasons {
+            let uri = path(
+                SLACK_CH,
+                &format!("/timeline?{view}&limit=50&reason={reason}"),
+            );
+            let began = std::time::Instant::now();
+            let (status, body) = call(&state, &uri, WRITE_TOKEN).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert!(
+                began.elapsed() < AT_ONCE,
+                "{uri} waited on Slack: {:?}",
+                began.elapsed()
+            );
+            let held = body["messages"].as_array().map_or(0, Vec::len)
+                + body["threads"].as_array().map_or(0, Vec::len);
+            assert!(held > 0, "{uri} answered with what the cache holds: {body}");
+        }
+    }
+    assert!(
+        !capture.text().contains("server error"),
         "{}",
         capture.text()
     );
