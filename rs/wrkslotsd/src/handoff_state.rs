@@ -219,7 +219,7 @@ fn strict_to_value(value: &Strict) -> Value {
     }
 }
 
-fn strict_json_object(contents: &[u8], label: &str) -> Result<Map<String, Value>> {
+pub(crate) fn strict_json_object(contents: &[u8], label: &str) -> Result<Map<String, Value>> {
     let strict: Strict = serde_json::from_slice(contents)
         .map_err(|error| format!("{label} is malformed JSON: {error}"))?;
     match strict_to_value(&strict) {

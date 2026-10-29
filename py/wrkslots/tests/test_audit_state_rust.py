@@ -435,16 +435,186 @@ def test_audit_validate_foreign_machine_matches_python(tmp_path: Path) -> None:
     assert by_slot["slot-v"]["verdict"] == "BLOCKED"
 
 
-def test_audit_validate_run_handle_refuses_in_rust(tmp_path: Path) -> None:
-    root = _validate_fixture(tmp_path)
+def _write_run_handle(
+    root: Path,
+    payload: dict[str, object] | str,
+    *,
+    name: str = "slot-a-run.json",
+) -> Path:
     runs = root / "ignored" / "validate" / "runs"
-    runs.mkdir(parents=True)
-    (runs / "some-unit.json").write_text(
-        json.dumps({"checkout": "/elsewhere", "unit": "some-unit.service"})
+    runs.mkdir(parents=True, exist_ok=True)
+    path = runs / name
+    path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+    return path
+
+
+def _handle_identity(proc: subprocess.Popen[bytes]) -> dict[str, object]:
+    identity = wrkslots_cli._read_process_identity(proc.pid)
+    return {
+        "pid": identity.pid,
+        "start_ticks": identity.start_ticks,
+        "boot_id": identity.boot_id,
+    }
+
+
+def _dead_handle_identity() -> dict[str, object]:
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        return _handle_identity(proc)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_audit_validate_unrelated_run_handle_matches_python(tmp_path: Path) -> None:
+    root = _validate_fixture(tmp_path)
+    _write_run_handle(
+        root,
+        {"checkout": "/elsewhere", "unit": "some-unit.service"},
+        name="some-unit.json",
     )
-    result = _rust(root)
-    assert result.returncode != 0
-    assert "validation-run handle evidence" in result.stderr
+    actual = _check(root, tmp_path)
+    assert _rows(actual)[0]["verdict"] == "DELETABLE"
+
+
+def test_audit_validate_related_run_handle_matches_python(tmp_path: Path) -> None:
+    root = _validate_fixture(tmp_path)
+    checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
+    _write_run_handle(
+        root,
+        {"checkout": str(checkout), "unit": "slot-a-run.service"},
+    )
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["verdict"] == "DELETABLE"
+    assert row["liveness_state"] == "dead"
+
+
+def test_audit_validate_relative_run_handle_matches_python(tmp_path: Path) -> None:
+    root = _validate_fixture(tmp_path)
+    _write_run_handle(
+        root,
+        {
+            "checkout": "worktrees/validate/slot-a/repo",
+            "unit": "slot-a-run.service",
+        },
+    )
+    actual = _check(root, tmp_path)
+    assert _rows(actual)[0]["verdict"] == "DELETABLE"
+
+
+def test_audit_validate_source_run_handle_matches_python(tmp_path: Path) -> None:
+    root = _validate_fixture(tmp_path)
+    checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
+    _write_run_handle(
+        root,
+        {
+            "source_checkout": str(checkout / "nested"),
+            "unit": "slot-a-run.service",
+        },
+    )
+    actual = _check(root, tmp_path)
+    assert _rows(actual)[0]["verdict"] == "DELETABLE"
+
+
+def test_audit_validate_dead_process_run_handle_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _validate_fixture(tmp_path)
+    checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
+    _write_run_handle(
+        root,
+        {
+            "checkout": str(checkout),
+            "unit": "slot-a-run.service",
+            "process_identity": _dead_handle_identity(),
+        },
+    )
+    actual = _check(root, tmp_path)
+    assert _rows(actual)[0]["verdict"] == "DELETABLE"
+
+
+def test_audit_validate_live_process_run_handle_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _validate_fixture(tmp_path)
+    checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        _write_run_handle(
+            root,
+            {
+                "checkout": str(checkout),
+                "unit": "slot-a-run.service",
+                "process_identity": _handle_identity(proc),
+            },
+        )
+        actual = _check(root, tmp_path)
+    finally:
+        proc.kill()
+        proc.wait()
+    row = _rows(actual)[0]
+    assert row["verdict"] == "BLOCKED"
+    assert row["liveness_state"] == "alive"
+
+
+def test_audit_validate_other_boot_run_handle_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _validate_fixture(tmp_path)
+    checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        identity = _handle_identity(proc)
+        identity["boot_id"] = "foreign-boot"
+        _write_run_handle(
+            root,
+            {
+                "checkout": str(checkout),
+                "unit": "slot-a-run.service",
+                "process_identity": identity,
+            },
+        )
+        actual = _check(root, tmp_path)
+    finally:
+        proc.kill()
+        proc.wait()
+    assert _rows(actual)[0]["verdict"] == "DELETABLE"
+
+
+def test_audit_validate_duplicate_run_handle_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _validate_fixture(tmp_path)
+    checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
+    _write_run_handle(
+        root,
+        (
+            '{"checkout":"/elsewhere","checkout":"'
+            + str(checkout)
+            + '","unit":"slot-a-run.service"}'
+        ),
+    )
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["verdict"] == "BLOCKED"
+    assert row["liveness_state"] == "unverifiable"
+
+
+def test_audit_validate_mismatched_run_handle_matches_python(
+    tmp_path: Path,
+) -> None:
+    root = _validate_fixture(tmp_path)
+    checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
+    _write_run_handle(
+        root,
+        {"checkout": str(checkout), "unit": "slot-a-run.service"},
+        name="other.json",
+    )
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["verdict"] == "BLOCKED"
+    assert row["liveness_state"] == "unverifiable"
 
 
 def test_audit_journal_row_matches_python(tmp_path: Path) -> None:

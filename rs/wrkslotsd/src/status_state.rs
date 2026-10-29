@@ -55,7 +55,7 @@ fn host_id() -> std::result::Result<String, String> {
     ))
 }
 
-fn boot_id() -> std::result::Result<String, String> {
+pub(crate) fn boot_id() -> std::result::Result<String, String> {
     match std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
         Ok(text) => {
             let value = text.trim().to_string();
@@ -94,6 +94,19 @@ fn parse_proc_stat(raw: &[u8], pid: i64) -> Option<i64> {
         return None;
     }
     Some(start_ticks)
+}
+
+pub(crate) fn process_start_ticks(pid: i64) -> std::result::Result<Option<i64>, String> {
+    let path = format!("/proc/{pid}/stat");
+    match std::fs::read(&path) {
+        Ok(raw) => parse_proc_stat(&raw, pid)
+            .map(Some)
+            .ok_or_else(|| format!("process generation is invalid for PID {pid}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "process generation is indeterminate because {path} is unreadable: {error}"
+        )),
+    }
 }
 
 pub(crate) fn read_process_identity(pid: i64) -> std::result::Result<Identity, String> {
