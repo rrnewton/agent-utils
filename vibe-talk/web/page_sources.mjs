@@ -9,7 +9,7 @@
 // Not served: the server's static table (src/http/assets.rs) names every file it serves, and this
 // is not among them.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,3 +51,21 @@ export function shellStyles(html) {
 
 /** How many times `needle` occurs in `text`, overlapping occurrences not counted twice. */
 export const occurrences = (text, needle) => (needle === "" ? 0 : text.split(needle).length - 1);
+
+/**
+ * The page's modules (`#624 voice-page-modularity`): every `.js` and `.ts` file below `web/src`, as
+ * `{ name, text }` with `name` relative to `web`, sorted. With the legacy script, voice.js, they are
+ * all the page's handwritten code; a test that scans "the page" for something reads both.
+ */
+export function moduleSources(web = WEB) {
+  const found = [];
+  const walk = (relative) => {
+    for (const entry of readdirSync(join(web, relative), { withFileTypes: true })) {
+      const path = `${relative}/${entry.name}`;
+      if (entry.isDirectory()) walk(path);
+      else if (/\.[jt]s$/.test(entry.name)) found.push({ name: path, text: readFileSync(join(web, path), "utf8") });
+    }
+  };
+  if (existsSync(join(web, "src"))) walk("src");
+  return found.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}

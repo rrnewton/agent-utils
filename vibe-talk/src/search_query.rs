@@ -1,10 +1,10 @@
 //! The search language, and the one rule for whether a message matches it.
 //!
 //! `#521 server-side-search` asks for one language giving exactly the same results on the page and
-//! on the server. The page has a twin of this module in `web/voice.js` (`searchQueryParse`,
-//! `searchQueryMatches`, `searchFold`, `searchUpstreamPlan`), and both are held to the conformance corpus in
-//! `tests/fixtures/search_query.json`: a change to either that the other does not make fails one of
-//! the two suites. The rules below are the specification; the corpus pins every edge of it.
+//! on the server. The page has a twin of this module in `web/src/core/search/`
+//! (`searchQueryParse`, `searchQueryMatches`, `searchFold`, `searchUpstreamPlan`), and both are held
+//! to the conformance corpus in `tests/fixtures/search_query.json`: a change to either that the
+//! other does not make fails one of the two suites. The rules below are the specification; the corpus pins every edge of it.
 //!
 //! **Settled by the owner (2026-10-27):** Gmail's syntax as the base (implicit AND, upper-case
 //! `OR`, `-term`, `"phrase"`, parentheses) plus the field operators the chat services share
@@ -83,8 +83,8 @@ use unicode_normalization::UnicodeNormalization as _;
 pub const FOLD_VERSION: &str = "fold-2";
 
 /// What lower-casing leaves for full case folding, and letters whose mark is not a combining
-/// character. Mirrored, entry for entry, by `SEARCH_FOLD_TABLE` in `web/voice.js` (a test reads
-/// that table back and compares).
+/// character. Mirrored, entry for entry, by `SEARCH_FOLD_TABLE` in
+/// `web/src/core/search/language.js` (a test reads that table back and compares).
 pub const FOLD_TABLE: &[(char, &str)] = &[
     ('ß', "ss"),
     ('ς', "σ"),
@@ -913,12 +913,13 @@ mod tests {
     #[test]
     fn the_fold_table_and_the_space_set_are_the_pages() {
         // The page states its tables as source text; this reads them back from it and compares
-        // them both ways, so neither copy can drift without this failing.
-        let page = include_str!("../web/voice.js");
+        // them both ways, so neither copy can drift without this failing. The page's search
+        // language is its own module (`#624 voice-page-modularity`).
+        let page = include_str!("../web/src/core/search/language.js");
         let block = |start: &str, end: &str| -> String {
             let from = page
                 .find(start)
-                .unwrap_or_else(|| panic!("voice.js lacks {start}"));
+                .unwrap_or_else(|| panic!("language.js lacks {start}"));
             let rest = &page[from + start.len()..];
             rest[..rest.find(end).expect("the block ends")].to_owned()
         };
@@ -990,20 +991,15 @@ mod tests {
         }
     }
 
-    /// The page's half of [`the_page_agrees_on_seeded_random_queries`]: the search block of
-    /// `web/voice.js`, cut out by its markers and run alone (it uses nothing but the language), over
-    /// queries and texts drawn from an adversarial alphabet with a fixed seed.
+    /// The page's half of [`the_page_agrees_on_seeded_random_queries`]: the page's search language
+    /// module (`web/src/core/search/`, `#624 voice-page-modularity`), built by the page build's own
+    /// `moduleForTests` with the pinned esbuild and imported, over queries and texts drawn from an
+    /// adversarial alphabet with a fixed seed.
     const DIFFERENTIAL: &str = r#"
-import { readFileSync } from "node:fs";
-import vm from "node:vm";
-const src = readFileSync(process.argv[1], "utf8");
-const start = src.indexOf("/*\n * THE SEARCH LANGUAGE");
-const end = src.indexOf("\n}\n", src.indexOf("function searchUpstreamPlan(node) {")) + 3;
-if (start < 0 || end < 3) throw new Error("the search block's markers moved");
-const context = {};
-vm.createContext(context);
-vm.runInContext(src.slice(start, end) + "\n;globalThis.api = { searchFold, searchQueryParse, searchQueryTree, searchUpstreamPlan, searchQueryMatches, searchSubject };", context);
-const api = context.api;
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+const { moduleForTests } = await import(pathToFileURL(join(process.argv[1], "web", "build.mjs")).href);
+const api = await moduleForTests("src/core/search/index.js");
 let seed = 20261027;
 const pick = (list) => { seed = (seed * 1103515245 + 12345) % 2147483648; return list[seed % list.length]; };
 const pieces = ["a", "b", "ab", "abc", "Café", "cafe", "ΟΣ", "σ", "ß", "ss", "ﬁ", "-", "--", "(", ")", "\"", " ", "\t",
@@ -1035,7 +1031,7 @@ process.stdout.write(lines.join("\n"));
         // The corpus pins the edges someone thought of; this is the cross-language differential
         // the design asks for, over the edges nobody did. It does not skip without node: the page
         // suite needs node too, and a skipped differential would read as agreement.
-        let page = concat!(env!("CARGO_MANIFEST_DIR"), "/web/voice.js");
+        let page = env!("CARGO_MANIFEST_DIR");
         let output = std::process::Command::new("node")
             .args(["--input-type=module", "-e", DIFFERENTIAL, page])
             .output()

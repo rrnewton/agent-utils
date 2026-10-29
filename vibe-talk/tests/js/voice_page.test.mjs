@@ -35,7 +35,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
 
-import { SHELL, WEB, occurrences, readWeb, shellScripts } from "../../web/page_sources.mjs";
+import { LEGACY_SCRIPT, legacyPrelude, loadTool, moduleForTests } from "../../web/build.mjs";
+import { SHELL, WEB, moduleSources, occurrences, readWeb, shellScripts } from "../../web/page_sources.mjs";
 
 /**
  * One slice of the suite, or all of it. `VOICE_PAGE_SHARD=i/n` runs the tests at positions i, i+n,
@@ -170,6 +171,13 @@ const stripJsComments = (text) =>
   text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
 const HTML_CODE = HTML.replace(/<!--[\s\S]*?-->/g, " ");
 const SCRIPT_CODE = stripJsComments(SCRIPT);
+/**
+ * The page's modules (every .js and .ts file below web/src/, `#624 voice-page-modularity`), comments removed, and with
+ * SCRIPT_CODE every line of the page's handwritten code. An assertion that something appears
+ * NOWHERE in the page reads PAGE_CODE, so code that moves out of web/voice.js stays under it.
+ */
+const MODULE_CODE = moduleSources().map(({ text }) => stripJsComments(text)).join("\n");
+const PAGE_CODE = `${SCRIPT_CODE}\n${MODULE_CODE}`;
 
 /**
  * Every id the served page defines, with the label and the initial `hidden` / `checked` state the
@@ -1793,6 +1801,13 @@ const COMPILED = new Map(PAGE_SCRIPTS.map((name) => [
   name,
   new vm.Script(name === SCRIPT_FILE ? SCRIPT : readWeb(name), { filename: name }),
 ]));
+/**
+ * The page build's prelude (`#624 voice-page-modularity`): the modules the legacy script calls,
+ * declaring for it the names web/src/legacy/imports.js exports, run just before it as the page build
+ * runs it. Built here, unminified, by the same function; null while nothing has moved.
+ */
+const PRELUDE = await legacyPrelude(loadTool("esbuild"), WEB, { minify: false });
+const PRELUDE_COMPILED = PRELUDE && new vm.Script(PRELUDE.code, { filename: "prelude.js" });
 
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const elements = new Map();
@@ -4676,6 +4691,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   if (arrange) arrange(page);
   vm.createContext(context);
   for (const name of PAGE_SCRIPTS) {
+    if (name === LEGACY_SCRIPT && PRELUDE_COMPILED) PRELUDE_COMPILED.runInContext(context);
     const compiled = name === SCRIPT_FILE && script !== SCRIPT ? new vm.Script(script, { filename: name }) : COMPILED.get(name);
     compiled.runInContext(context);
   }
@@ -4782,8 +4798,8 @@ const youSay = (page, text) =>
  */
 const sourceConstant = (name) =>
   Number(
-    new RegExp(`^const ${name} = (\\d+);$`, "m").exec(SCRIPT_CODE)?.[1] ??
-      assert.fail(`web/voice.js no longer states a ${name}`)
+    new RegExp(`^const ${name} = (\\d+);$`, "m").exec(PAGE_CODE)?.[1] ??
+      assert.fail(`the page's code (web/voice.js, web/src/) no longer states a ${name}`)
   );
 
 /**
@@ -4796,7 +4812,7 @@ const sourceConstant = (name) =>
  * its constant with this says what it does when the constant is missing, and fails on its own.
  */
 const optionalSourceConstant = (name) => {
-  const found = new RegExp(`^const ${name} = (\\d+);$`, "m").exec(SCRIPT_CODE);
+  const found = new RegExp(`^const ${name} = (\\d+);$`, "m").exec(PAGE_CODE);
   return found ? Number(found[1]) : undefined;
 };
 
@@ -4808,7 +4824,7 @@ const optionalSourceConstant = (name) => {
  * tells a model where the quoted third-party text starts and stops.
  */
 const sourceString = (name) =>
-  new RegExp(`^const ${name} = "([^"]*)";$`, "m").exec(SCRIPT_CODE)?.[1] ??
+  new RegExp(`^const ${name} = "([^"]*)";$`, "m").exec(PAGE_CODE)?.[1] ??
   assert.fail(`web/voice.js no longer states a ${name}`);
 
 const COLLAPSE_OVER_CHARS = sourceConstant("COLLAPSE_OVER_CHARS");
@@ -5809,7 +5825,7 @@ test("every number this page is tuned by stays inside a band that says what woul
 test("...and the table covers EVERY constant, so a new one cannot escape by being new", () => {
   // This is the part that generalises. Pinning the constants that happened to be noticed leaves
   // the next one unpinned, and the next one is exactly where the same defect comes back.
-  const declared = [...SCRIPT_CODE.matchAll(/^const ([A-Z][A-Z0-9_]*) = (\d+);$/gm)].map(
+  const declared = [...PAGE_CODE.matchAll(/^const ([A-Z][A-Z0-9_]*) = (\d+);$/gm)].map(
     (m) => m[1]
   );
   assert.ok(declared.length >= 13, `only ${declared.length} constants found — the scan is broken`);
@@ -5817,7 +5833,7 @@ test("...and the table covers EVERY constant, so a new one cannot escape by bein
   assert.deepStrictEqual(
     unpinned,
     [],
-    `web/voice.js tunes itself by ${unpinned.join(", ")} and nothing here says what value of ` +
+    `the page tunes itself by ${unpinned.join(", ")} and nothing here says what value of ` +
       "them would be wrong, so widening one of them is a change no test can see"
   );
   const gone = Object.keys(TUNING_BANDS).filter((name) => !declared.includes(name));
@@ -6147,7 +6163,7 @@ test("composer-no-autofill: the token's password field has a form of its own, an
   // form's, and all it does is refuse.
   const submits = [...SCRIPT_CODE.matchAll(/el\("([\w-]+)"\)\.addEventListener\("submit"/g)].map((m) => m[1]);
   assert.deepEqual(submits, ["signin-form"]);
-  assert.doesNotMatch(SCRIPT_CODE, /createElement\("form"\)|\.submit\(\)|requestSubmit/);
+  assert.doesNotMatch(PAGE_CODE, /createElement\("form"\)|\.submit\(\)|requestSubmit/);
 });
 
 test("composer-no-autofill: the sign-in form's submit goes nowhere", async () => {
@@ -6820,11 +6836,11 @@ test("the page LOADS nothing from anywhere but this server", () => {
   // explicitly rather than by a blanket ban, so the next off-origin destination is a link and the
   // next off-origin FETCH is still a failure.
   for (const how of [/fetch\(\s*["'`]https?:/, /new Worker\(\s*["'`]https?:/, /import\(\s*["'`]https?:/]) {
-    assert.doesNotMatch(SCRIPT_CODE, how, "web/voice.js goes and gets something off-origin");
+    assert.doesNotMatch(PAGE_CODE, how, "web/voice.js goes and gets something off-origin");
   }
   // Provider destinations arrive as data from the backend trait; this file knows no vendor URL.
   assert.deepStrictEqual(
-    [...new Set([...SCRIPT_CODE.matchAll(/https?:\/\/[^"'`\s]+/g)].map((m) => m[0]))],
+    [...new Set([...PAGE_CODE.matchAll(/https?:\/\/[^"'`\s]+/g)].map((m) => m[0]))],
     [],
     "web/voice.js hardcodes an off-origin destination instead of using backend data"
   );
@@ -7821,6 +7837,7 @@ test("the desktop layout is chosen by CAPABILITY, and no user-agent string decid
   );
   for (const [name, text] of [
     ["web/voice.js", SCRIPT_CODE],
+    ["web/src/ modules.js", MODULE_CODE],
     ["web/voice.css", CSS_CODE],
     ["web/voice.html", HTML_CODE],
   ]) {
@@ -7838,7 +7855,7 @@ test("the desktop layout is chosen by CAPABILITY, and no user-agent string decid
   }
   // And the page does not decide the layout in script either: which regime is in force is the
   // stylesheet's business, so there is nothing here to disagree with it.
-  assert.doesNotMatch(SCRIPT_CODE, /matchMedia/, "web/voice.js grew a second opinion about layout");
+  assert.doesNotMatch(PAGE_CODE, /matchMedia/, "web/voice.js grew a second opinion about layout");
 });
 
 test("on a desktop both lists are held to a reading column, and the phone is left alone", () => {
@@ -11545,7 +11562,7 @@ test("the channel bar switches between configured agent audio and device audio l
   assert.equal(shown("audio-agent-icon"), true, "agent audio does not show its cloud icon");
   assert.match(HTML_CODE, /id="audio-device-icon"[^>]*data-icon="device"/);
   assert.match(HTML_CODE, /id="audio-agent-icon"[^>]*data-icon="cloud"/);
-  for (const [where, code] of [["web/voice.js", SCRIPT_CODE], ["web/voice.html", HTML_CODE]]) {
+  for (const [where, code] of [["web/voice.js", SCRIPT_CODE], ["web/src/", MODULE_CODE], ["web/voice.html", HTML_CODE]]) {
     assert.doesNotMatch(code, /elevenlabs/i, `${where} names a speech vendor instead of the profile label`);
   }
   const requests = page.prepareCalls.length;
@@ -16774,7 +16791,7 @@ test("the page has ONE html sink, and only a message's content_html ever reaches
   // Static: one assignment to innerHTML in the whole script, inside `insertSanitizedHtml`, and that
   // function is called from one place, with what `renderedHtmlOf` read off a message. None of the
   // other ways to turn a string into markup appears at all.
-  assert.equal((SCRIPT_CODE.match(/innerHTML/g) || []).length, 1, "a second innerHTML sink appeared");
+  assert.equal((PAGE_CODE.match(/innerHTML/g) || []).length, 1, "a second innerHTML sink appeared");
   const sink = /function insertSanitizedHtml\(parent, contentHtml\) \{([\s\S]*?)\n\}/.exec(SCRIPT_CODE);
   assert.ok(sink && /template\.innerHTML = contentHtml;/.test(sink[1]), "innerHTML moved out of insertSanitizedHtml");
   const calls = [...SCRIPT_CODE.matchAll(/insertSanitizedHtml\(([^)]*)\)/g)].map((m) => m[1]);
@@ -41440,7 +41457,7 @@ test("read state and live arrivals are saved as they happen", async () => {
 test("no private response is ever handed to a service worker's CacheStorage", () => {
   // The snapshot lives in this origin's localStorage, scoped to the token and removed with it.
   // CacheStorage would outlive sign-out and be served by whatever a worker decides.
-  assert.doesNotMatch(SCRIPT_CODE, /\bcaches\b|serviceWorker|CacheStorage/);
+  assert.doesNotMatch(PAGE_CODE, /\bcaches\b|serviceWorker|CacheStorage/);
   assert.doesNotMatch(HTML_CODE, /serviceWorker|caches\./);
 });
 
@@ -55948,7 +55965,7 @@ test("`#229 desktop-two-column`: the layout button is a toggle in the bar, offer
   assert.match(cssBlockIn(TWO_COLUMN_QUERY, '#screen-main[data-columns="two"]'),
     /grid-template-columns:\s*minmax\(0, 1fr\) minmax\(0, 1fr\)/);
   // ...and it is the stylesheet's to say, never a query the script reads.
-  assert.doesNotMatch(SCRIPT_CODE, /matchMedia|innerWidth|outerWidth|screen\.width/);
+  assert.doesNotMatch(PAGE_CODE, /matchMedia|innerWidth|outerWidth|screen\.width/);
 
   const page = await threadPage();
   assert.equal(page.el("column-toggle").hidden, false, "not offered on a channel whose provider has threads");
@@ -57753,7 +57770,7 @@ test("`#261 two-column-connectors`: the links are one SVG over the main screen, 
   // A reduced-motion reader's glide is a jump: the stylesheet says so, and the script reads it.
   assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--column-glide: auto;/,
     "the stylesheet does not tell the page a reduced-motion reader's glide should jump");
-  assert.doesNotMatch(SCRIPT_CODE, /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
+  assert.doesNotMatch(PAGE_CODE, /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
 });
 
 test("`#261 two-column-connectors`: a root on Main and its thread's card are joined while both are on screen, out of the root's right edge level with its tag and into the card's left edge, in the thread's colour", async () => {
@@ -59255,7 +59272,7 @@ test("`#298 thread-card-header`: a thread across the window is headed by the sam
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#pane-discord[data-arriving]"), /animation:\s*thread-arrive /);
   assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--card-flight: 0ms;\s*\}\s*\.thread-card-header\[data-flying\],\s*#pane-discord\[data-arriving\],\s*#side-pane\[data-arriving\] \{\s*animation: none;/,
     "the card moves, or the thread fades, for a reader who asked for less motion");
-  assert.doesNotMatch(SCRIPT_CODE, /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
+  assert.doesNotMatch(PAGE_CODE, /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
 });
 
 test("`#298 thread-card-header`: every way into a thread across the window puts the same card at the top — the thread list's replies button, Thread(N) in Main and in All, the picker — and its X says where it goes and goes there, as Esc and ← do", async () => {
@@ -63863,7 +63880,7 @@ test("`#249 search-highlight`: markup in a message stays text, and a mark is bui
   for (const tag of ["b", "script"]) assert.ok(!page.createdTags.includes(tag), `the text became a <${tag}>`);
   assert.equal(page.templatesParsed, templates, "marking parsed something as HTML");
   // The page has one HTML sink, and marking added none.
-  assert.equal((SCRIPT_CODE.match(/\.innerHTML\s*=/g) || []).length, 1, "a second place parses HTML");
+  assert.equal((PAGE_CODE.match(/\.innerHTML\s*=/g) || []).length, 1, "a second place parses HTML");
 });
 
 test("`#249 search-highlight`: a combined row is marked in each of its messages, and a turn of the call is marked too", async () => {
@@ -87356,13 +87373,17 @@ test("`#624 voice-page-modularity`: a page knows its build from the page build's
  */
 const SEARCH_CORPUS = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "search_query.json"), "utf8"));
 
-function searchCorpusDisagreements(page) {
-  const fold = page.pure("searchFold");
-  const parse = page.pure("searchQueryParse");
-  const tree = page.pure("searchQueryTree");
-  const matches = page.pure("searchQueryMatches");
-  const subject = page.pure("searchSubject");
-  const plan = page.pure("searchUpstreamPlan");
+/** The search language module (`#624 voice-page-modularity`), with `overlays` patched into its sources. */
+const searchLanguage = (overlays = []) => moduleForTests("src/core/search/index.js", { overlays });
+const SEARCH_LANGUAGE = await searchLanguage();
+
+function searchCorpusDisagreements(language) {
+  const fold = language.searchFold;
+  const parse = language.searchQueryParse;
+  const tree = language.searchQueryTree;
+  const matches = language.searchQueryMatches;
+  const subject = language.searchSubject;
+  const plan = language.searchUpstreamPlan;
   const data = (value) => JSON.parse(JSON.stringify(value ?? null));
   const wrong = [];
   for (const { in: input, out } of SEARCH_CORPUS.fold) {
@@ -87388,17 +87409,28 @@ function searchCorpusDisagreements(page) {
 test("`#521 server-side-search`: the page's search language folds, parses, matches and plans exactly as the shared corpus says", () => {
   const counted = ["fold", "parse", "match", "upstream"].map((kind) => SEARCH_CORPUS[kind].length);
   assert.ok(counted.every((n) => n >= 20), `the corpus shrank: ${counted}`);
-  assert.deepEqual(searchCorpusDisagreements(newPage()), []);
+  assert.deepEqual(searchCorpusDisagreements(SEARCH_LANGUAGE), []);
+  // `#624 voice-page-modularity`: the page runs the same functions, by the prelude, under the names
+  // its legacy script has always called them by.
+  const page = newPage();
+  for (const name of ["searchQueryParse", "searchQueryTree", "searchQueryMatches", "searchSubject", "searchPositiveTerms"]) {
+    assert.equal(page.pure(`typeof ${name}`), "function", name);
+  }
+  const node = page.pure("searchQueryParse")("from:Ada (a OR b) -c");
+  assert.deepEqual(JSON.parse(JSON.stringify(page.pure("searchQueryTree")(node))),
+    JSON.parse(JSON.stringify(SEARCH_LANGUAGE.searchQueryTree(SEARCH_LANGUAGE.searchQueryParse("from:Ada (a OR b) -c")))));
 });
 
-test("`#521 server-side-search`: the corpus catches a page that lost one fold entry or bound OR loosely (negative controls)", () => {
+test("`#521 server-side-search`: the corpus catches a page that lost one fold entry or bound OR loosely (negative controls)", async () => {
   // Without final sigma folded, ΟΣ (lower-cased to ος) no longer finds ΟΣΑ (οσα).
-  const sigma = brokenScript("[\"ς\", \"σ\"], ", "");
-  assert.ok(searchCorpusDisagreements(newPage(new Map(), sigma)).some((line) => line.includes("ΟΔΟΣ")));
+  const LANGUAGE = "src/core/search/language.js";
+  const sigma = await searchLanguage([{ file: LANGUAGE, find: "[\"ς\", \"σ\"], ", replace: "" }]);
+  assert.ok(searchCorpusDisagreements(sigma).some((line) => line.includes("ΟΔΟΣ")));
   // OR taking whatever follows it as a whole conjunction disagrees with Gmail's binding of its neighbours.
-  const looseOr = brokenScript("    while (tokens[at] === \"OR\") {\n      at += 1;\n      const node = unary();",
-    "    while (tokens[at] === \"OR\") {\n      at += 1;\n      const node = and(false);");
-  assert.ok(searchCorpusDisagreements(newPage(new Map(), looseOr)).some((line) => line.startsWith("parse \"a OR b c\"")));
+  const looseOr = await searchLanguage([{ file: LANGUAGE,
+    find: "    while (tokens[at] === \"OR\") {\n      at += 1;\n      const node = unary();",
+    replace: "    while (tokens[at] === \"OR\") {\n      at += 1;\n      const node = and(false);" }]);
+  assert.ok(searchCorpusDisagreements(looseOr).some((line) => line.startsWith("parse \"a OR b c\"")));
 });
 
 // --- `#611 timeline-read-failures` -----------------------------------------------------------------

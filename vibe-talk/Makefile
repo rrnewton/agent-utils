@@ -81,7 +81,8 @@ contract-check:
 	node contract/generate.mjs --check
 
 # TypeScript checks web/voice.js as JavaScript (checkJs, noEmit) against the generated
-# declarations. Nothing is compiled or bundled; see tsconfig.json.
+# declarations and the modules it calls; see tsconfig.json. The page build bundles them; see
+# web/build.mjs.
 typecheck:
 	contract/node_modules/.bin/tsc -p tsconfig.json
 

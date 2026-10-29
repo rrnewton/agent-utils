@@ -16,7 +16,7 @@ import { join } from "node:path";
 import vm from "node:vm";
 
 import {
-  build, decodeMappings, digest, encodeMappings, joinMaps, linkShell, loadTool, parseScript, requireOutside,
+  build, decodeMappings, digest, encodeMappings, joinMaps, linkShell, loadTool, moduleForTests, parseScript, requireOutside,
   requireStrict,
 } from "../../web/build.mjs";
 import { SHELL, WEB, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
@@ -223,7 +223,10 @@ test("nothing built names the directory it was built in or the one it was built 
   }
   for (const map of [MANIFEST.assets.script.map, MANIFEST.assets.style.map]) {
     const { sources, sourcesContent } = JSON.parse(text(relativePath(map)));
-    for (const source of sources) assert.match(source, /^vibe-talk\/web\/[\w.-]+$/, `${map} names ${source}`);
+    for (const source of sources) {
+      assert.match(source, /^vibe-talk\/web\/[\w.-]+(\/[\w.-]+)*$/, `${map} names ${source}`);
+      assert.ok(!source.split("/").includes(".."), `${map} names ${source}`);
+    }
     assert.deepStrictEqual(sourcesContent, sources.map((source) => readWeb(source.replace("vibe-talk/web/", ""))));
   }
 });
@@ -274,4 +277,62 @@ test("a script that is not strict throughout is refused rather than made strict 
     assert.throws(() => requireStrict(name, code, ts), new RegExp(`${name.replace(".", "\\.")} is not strict throughout`), name);
   }
   assert.throws(() => requireStrict("broken.js", '"use strict";\nlet = ;\n', ts), /broken\.js does not parse/);
+});
+
+// ---- The legacy prelude (`#624 voice-page-modularity`) ------------------------------------------
+
+test("the prelude gives the legacy script exactly what web/src/legacy/imports.js exports, and its declarations say the same", () => {
+  const names = MANIFEST.legacy_imports;
+  assert.ok(names.length > 0, "nothing has moved, so this checks nothing");
+  const declared = [...readWeb("legacy-imports.d.ts").matchAll(/^declare const (\w+): LegacyImports\["(\w+)"\];$/gm)]
+    .map(([, name, key]) => (assert.equal(name, key), name));
+  assert.deepStrictEqual(declared.sort(), [...names].sort(), "web/legacy-imports.d.ts and imports.js name different things");
+});
+
+test("the bundle declares nothing of the modules but what the legacy script takes, strictly, just before it", () => {
+  const script = text(SCRIPT_PATH);
+  const legacy = topLevelNames("voice.js", readWeb("voice.js"));
+  const allowed = new Set([...legacy, ...MANIFEST.legacy_imports]);
+  const declared = topLevelNames("bundle.js", script);
+  assert.deepStrictEqual(declared.filter((name) => !allowed.has(name)), [],
+    "the bundle declares a module's name at its top level beyond the legacy imports");
+  // The prelude's one declaration, opening a strict function, immediately before the legacy script.
+  const { ts, file } = parseScript("bundle.js", script);
+  const statements = file.statements;
+  const at = statements.findIndex((statement) => ts.isVariableStatement(statement) &&
+    ts.isObjectBindingPattern(statement.declarationList.declarations[0].name));
+  assert.ok(at > 0, "no prelude declaration in the bundle");
+  const prelude = statements[at];
+  assert.deepStrictEqual(prelude.declarationList.declarations[0].name.elements.map((element) => element.name.text).sort(),
+    [...MANIFEST.legacy_imports].sort());
+  assert.ok(prelude.getText(file).includes('= (() => {\n"use strict";\n'), "the modules do not run in a strict function");
+  const next = statements[at + 1].getText(file);
+  assert.ok(next.startsWith('"use strict"'), `the legacy script does not follow the prelude: ${next.slice(0, 80)}`);
+  // The modules' own names stay inside it.
+  for (const internal of ["SEARCH_FOLD_TABLE", "searchTokens", "__voiceLegacyImports"]) {
+    assert.ok(!declared.includes(internal), `${internal} is declared at the bundle's top level`);
+  }
+});
+
+test("a position in the prelude maps back to the module's source", () => {
+  const lines = text(SCRIPT_PATH).split("\n");
+  const needle = "function searchCombine(";
+  const line = lines.findIndex((l) => l.includes(needle));
+  assert.ok(line >= 0, `${needle} is not in the bundle`);
+  const map = new SourceMap(JSON.parse(text(relativePath(MANIFEST.assets.script.map))));
+  const found = map.findEntry(line, lines[line].indexOf(needle));
+  const source = readWeb("src/core/search/language.js");
+  assert.equal(found.originalSource, "vibe-talk/web/src/core/search/language.js");
+  assert.equal(found.originalLine, source.slice(0, source.indexOf(needle)).split("\n").length - 1);
+});
+
+test("a module overlay whose text the module does not hold is refused, not built unchanged", async () => {
+  await assert.rejects(moduleForTests("src/core/search/index.js", {
+    overlays: [{ file: "src/core/search/language.js", find: "no such text anywhere", replace: "" }],
+  }), /holds 0 times, not 1/);
+  const patched = await moduleForTests("src/core/search/index.js", {
+    overlays: [{ file: "src/core/search/language.js", find: "const SEARCH_MAX_UPSTREAM_QUERIES = 4;", replace: "const SEARCH_MAX_UPSTREAM_QUERIES = 1;" }],
+  });
+  const plan = patched.searchUpstreamPlan(patched.searchQueryParse("alpha OR bravo"));
+  assert.equal(plan.scan, "too-many-alternatives", "the overlay did not reach the built module");
 });

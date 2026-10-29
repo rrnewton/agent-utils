@@ -42,10 +42,11 @@
 // /voice.js still needs them; the two stylesheets stay as written, in their own order.
 
 import { createHash, randomBytes } from "node:crypto";
-import { cpSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { SHELL, WEB, shellScripts, shellStyles } from "./page_sources.mjs";
 
@@ -213,6 +214,128 @@ export function requireStrict(name, text, ts = loadTool("typescript")) {
 /** The name a page file carries in source maps and assets.json, wherever the checkout is. */
 const sourceName = (name) => `vibe-talk/web/${name}`;
 
+// ---- The legacy prelude ---------------------------------------------------------------------------
+//
+// `#624 voice-page-modularity`. The page's code moves out of web/voice.js into TypeScript modules
+// below web/src/ a piece at a time. What is left of voice.js is still a classic script, and still
+// calls what moved; it is NOT bundled as a module, because esbuild bundling a module rewrites its
+// top-level `let`/`const`/`class` to `var` (a read before its declaration would then give
+// `undefined` instead of throwing) and drops its "use strict" (checked against esbuild 0.28.2). So
+// the modules it calls are bundled on their own, inside a strict function, and that function hands
+// the legacy script exactly the names web/src/legacy/imports.js exports, as constants declared just
+// before it runs:
+//
+//   const { searchQueryParse, ... } = (() => {
+//   "use strict";
+//   var __voiceLegacyImports = (() => { ...the modules... })();
+//   return __voiceLegacyImports;
+//   })();
+//
+// No other name the modules use is visible outside them, and no object is left behind on the page.
+
+/** The legacy page script, which the prelude runs just before. */
+export const LEGACY_SCRIPT = "voice.js";
+/** The module whose exports are what the legacy script takes from the modules. */
+export const LEGACY_IMPORTS = "src/legacy/imports.js";
+const PRELUDE_GLOBAL = "__voiceLegacyImports";
+
+/**
+ * An esbuild plugin that loads each file `overlays` names with its patch applied: `{ file, find,
+ * replace, count = 1 }`, `file` relative to `web`. `find` must occur `count` times (only the first
+ * is replaced), so a negative control whose text the module no longer holds fails rather than
+ * building the module unchanged.
+ */
+function overlayPlugin(web, overlays) {
+  const byPath = new Map();
+  for (const { file, find, replace, count = 1 } of overlays) {
+    const path = resolve(web, file);
+    const text = byPath.get(path) ?? readFileSync(path, "utf8");
+    const found = find === "" ? 0 : text.split(find).length - 1;
+    if (found !== count) throw new Error(`the overlay patches ${JSON.stringify(find)}, which ${file} holds ${found} times, not ${count}`);
+    byPath.set(path, text.replace(find, replace));
+  }
+  return {
+    name: "overlay",
+    setup(builder) {
+      builder.onLoad({ filter: /.*/ }, (args) =>
+        byPath.has(args.path) ? { contents: byPath.get(args.path), loader: args.path.endsWith(".ts") ? "ts" : "js" } : undefined);
+    },
+  };
+}
+
+/** The names a module exports, from an ESM build's metafile. */
+async function exportedNames(esbuild, entry, plugins) {
+  const result = await esbuild.build({
+    entryPoints: [entry], bundle: true, format: "esm", write: false, metafile: true, logLevel: "silent",
+    outfile: `${entry}.names.js`, plugins,
+  });
+  const [output] = Object.values(result.metafile.outputs);
+  return [...output.exports].sort();
+}
+
+/**
+ * The prelude the legacy script runs after (see above): `{ code, map, lineCount, names }`, or null
+ * when web/src/legacy/imports.js exports nothing. `minify` takes out white space and comments only,
+ * as for the rest of the page; `overlays` patch module sources first (see overlayPlugin).
+ */
+export async function legacyPrelude(esbuild, web = WEB, { minify = true, overlays = [] } = {}) {
+  const entry = join(web, LEGACY_IMPORTS);
+  if (!existsSync(entry)) return null;
+  const plugins = overlays.length > 0 ? [overlayPlugin(web, overlays)] : [];
+  const names = await exportedNames(esbuild, entry, plugins);
+  if (names.length === 0) return null;
+  const result = await esbuild.build({
+    entryPoints: [entry],
+    bundle: true,
+    format: "iife",
+    globalName: PRELUDE_GLOBAL,
+    platform: "neutral",
+    write: false,
+    outfile: join(web, "prelude.js"),
+    sourcemap: "external",
+    sourcesContent: true,
+    target: "esnext",
+    charset: "utf8",
+    legalComments: "none",
+    keepNames: true,
+    minifyWhitespace: minify,
+    logLevel: "silent",
+    plugins,
+  });
+  if (result.warnings.length > 0) throw new Error(`the prelude: ${result.warnings.map((warning) => warning.text).join("; ")}`);
+  const output = (suffix) => result.outputFiles.find((file) => file.path.endsWith(suffix));
+  const bundled = output(".js").text;
+  const body = bundled.endsWith("\n") ? bundled : `${bundled}\n`;
+  const code = `const { ${names.join(", ")} } = (() => {\n"use strict";\n${body}return ${PRELUDE_GLOBAL};\n})();\n`;
+  const map = JSON.parse(output(".js.map").text);
+  // Two lines (the wrapper's opening) come before the bundle's first; its sources are named from the
+  // repository root, like every other part's.
+  map.mappings = `;;${map.mappings}`;
+  map.sources = map.sources.map((source) => sourceName(source.split("\\").join("/")));
+  return { name: LEGACY_IMPORTS, code, map, lineCount: code.split("\n").length - 1, names };
+}
+
+/**
+ * The module at `entry` (relative to `web`) built for a test to import, with `overlays` patched into
+ * its sources first: a negative control built exactly as the module is. Returns the module.
+ */
+export async function moduleForTests(entry, { web = WEB, overlays = [] } = {}) {
+  const esbuild = loadTool("esbuild");
+  const plugins = overlays.length > 0 ? [overlayPlugin(web, overlays)] : [];
+  const result = await esbuild.build({
+    entryPoints: [join(web, entry)], bundle: true, format: "esm", platform: "neutral", write: false,
+    target: "esnext", logLevel: "silent", plugins,
+  });
+  const directory = mkdtempSync(join(tmpdir(), "vibe-talk-module-"));
+  try {
+    const file = join(directory, "module.mjs");
+    writeFileSync(file, result.outputFiles[0].text);
+    return await import(pathToFileURL(file).href);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 async function minifyAll(esbuild, web, names, loader) {
   const parts = [];
   for (const name of names) {
@@ -349,7 +472,14 @@ export async function build(out, { web = WEB } = {}) {
   const html = readFileSync(join(web, SHELL), "utf8");
   const scripts = shellScripts(html);
   const styles = shellStyles(html);
-  const js = assemble(await minifyAll(esbuild, web, scripts, "js"), {
+  const scriptParts = await minifyAll(esbuild, web, scripts, "js");
+  const prelude = await legacyPrelude(esbuild, web);
+  if (prelude) {
+    const at = scriptParts.findIndex((part) => part.name === LEGACY_SCRIPT);
+    if (at < 0) throw new Error(`the modules have a prelude for ${LEGACY_SCRIPT}, which the shell does not load`);
+    scriptParts.splice(at, 0, prelude);
+  }
+  const js = assemble(scriptParts, {
     stem: "voice",
     extension: "js",
     leading: '"use strict";\n',
@@ -385,6 +515,7 @@ export async function build(out, { web = WEB } = {}) {
   inputs["vibe-talk/contract/package-lock.json"] = digest(readFileSync(join(TOOLS, "package-lock.json")));
   const manifest = {
     page_build: digest(js.bytes),
+    legacy_imports: prelude ? prelude.names : [],
     assets: {
       script: { path: `/assets/${js.file}`, map: `/assets/${js.mapFile}`, type: "text/javascript; charset=utf-8", sources: scripts },
       style: { path: `/assets/${css.file}`, map: `/assets/${css.mapFile}`, type: "text/css; charset=utf-8", sources: styles },

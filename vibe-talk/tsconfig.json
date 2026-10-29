@@ -11,7 +11,12 @@
     "target": "ES2022",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": [],
-    "skipLibCheck": false
+    "skipLibCheck": false,
+    // web/legacy-imports.d.ts types what the page build's prelude declares for voice.js by importing
+    // the modules' own types (`#624 voice-page-modularity`).
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true
   },
-  "files": ["web/contract.d.ts", "web/globals.d.ts", "web/voice.js"]
+  "files": ["web/contract.d.ts", "web/globals.d.ts", "web/legacy-imports.d.ts", "web/voice.js"]
 }
