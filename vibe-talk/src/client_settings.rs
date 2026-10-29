@@ -58,7 +58,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Every `localStorage` key whose setting lives on the server, in the order the page
-/// declares them. The page's `SYNCED_SETTING_KEYS` in `web/voice.js` must name the same
+/// declares them. The page's `SYNCED_SETTING_KEYS` in `web/src/core/settings/keys.ts` must name the same
 /// set; a test below reads that file and compares, so the two cannot drift apart
 /// silently — a key only the page syncs would be refused here and spin its retry
 /// forever, and a key only here would sit unsynced while its section implied otherwise.
@@ -226,10 +226,13 @@ mod tests {
 
     #[test]
     fn the_page_and_the_server_name_the_same_synced_keys() {
-        let page = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/web/voice.js"))
-            .expect("the page script");
+        let page = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/web/src/core/settings/keys.ts"
+        ))
+        .expect("the page's settings keys");
         let start = page
-            .find("const SYNCED_SETTING_KEYS = [")
+            .find("export const SYNCED_SETTING_KEYS: readonly string[] = [")
             .expect("the page declares its synced keys");
         let rest = &page[start..];
         let end = rest.find("];").expect("the declaration ends");

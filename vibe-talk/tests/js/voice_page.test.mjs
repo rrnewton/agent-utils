@@ -6121,6 +6121,73 @@ test("`#624 voice-page-modularity`: the token is kept, read and forgotten on its
   assert.equal(off.signedOutByRename(), false);
 });
 
+test("`#624 voice-page-modularity`: the settings sync runs on its own ports: the first read, the seed, a local change pushed, a refusal kept local", async () => {
+  const KEY = "vibe-talk.voice.read-mode";
+  const kept = new Map([[KEY, "hide"], ["vibe-talk.voice.combine", "1"]]);
+  const storage = { getItem: (k) => kept.get(k) ?? null, setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) };
+  const asked = [];
+  const timers = [];
+  let held = [{ key: KEY, value: "show", updated_ms: 7 }];
+  let refuse = null;
+  const applied = [];
+  const statuses = [];
+  const sync = SETTINGS.createSettingsSync({
+    storage,
+    clock: { setTimeout: (run, ms) => timers.push({ run, ms }), clearTimeout: () => {} },
+    decoded: async (type, path, options) => {
+      asked.push({ type, path, method: options?.method ?? "GET", body: options?.body });
+      if (refuse) throw refuse;
+      if (options?.method === "PUT") {
+        for (const entry of [...options.body.seed, ...options.body.set]) held = held.filter((h) => h.key !== entry.key).concat([{ ...entry, updated_ms: 9 }]);
+      }
+      return { settings: held };
+    },
+    token: () => "tok",
+    tokenScope: () => "write",
+    apply: (key) => applied.push([key, kept.get(key) ?? null]),
+    status: (text) => statuses.push(text),
+    landed: () => {},
+  });
+  // Nothing goes out before the server is said to keep settings, nor before the token is proven.
+  await sync.syncOnce();
+  assert.equal(asked.length, 0, "asked before either");
+  sync.setSupported(true);
+  await sync.syncOnce();
+  assert.equal(asked.length, 0, "asked with an unproven token");
+  sync.forget();
+  assert.equal(sync.start(), true, "the first start is the caller's to make the first pass of");
+  await sync.syncOnce();
+  assert.equal(asked.length, 0, "asked of a server not said to keep settings");
+  sync.setSupported(true);
+  await sync.syncOnce();
+  // The server's held value wins over one that never moved; the one it does not hold is seeded.
+  assert.deepStrictEqual(asked.map((a) => a.method), ["GET", "PUT"]);
+  assert.deepStrictEqual(asked[1].body, { set: [], seed: [{ key: "vibe-talk.voice.combine", value: "1", updated_ms: 0 }] });
+  assert.deepStrictEqual(applied, [[KEY, "show"]]);
+  assert.deepStrictEqual(sync.agreed(KEY), { value: "show", updatedMs: 7 });
+  // A change here is pushed on the next pass.
+  kept.set(KEY, "hide");
+  await sync.syncOnce();
+  assert.deepStrictEqual(asked[2].body, { set: [{ key: KEY, value: "hide", updated_ms: 0 }], seed: [] });
+  // The timer reschedules itself after each pass, on the clock port: armed once, and again only
+  // once the pass it ran has ended.
+  sync.keepPassing();
+  assert.deepStrictEqual(timers.map((t) => t.ms), [1750]);
+  timers[0].run();
+  assert.equal(timers.length, 1, "the next pass was armed before this one ended");
+  for (let i = 0; i < 5 && timers.length === 1; i += 1) await Promise.resolve();
+  assert.deepStrictEqual(timers.map((t) => t.ms), [1750, 1750], "the timer did not re-arm after its pass");
+  // A permanent refusal keeps everything local and stops asking.
+  refuse = Object.assign(new Error("HTTP 404"), { status: 404 });
+  kept.set(KEY, "show");
+  await sync.syncOnce();
+  assert.equal(statuses.at(-1), "This server does not keep settings, so yours stay on this device.");
+  const before = asked.length;
+  await sync.syncOnce();
+  assert.equal(asked.length, before, "a server that keeps no settings was asked again");
+  assert.equal(kept.get(KEY), "show", "a refusal cost this device its value");
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -14079,12 +14146,12 @@ test("`#549 own-read-stored`: another device turning own messages read off or on
     message({ id: "1000000000000000002", ...CODER }),
   ]);
   assert.equal(rowState(page, 0).archived, "true", "the premise: the owner's message is read");
-  page.pure("keepLocalSetting")("vibe-talk.voice.mark-own-read", "0");
+  page.pure("deviceStorage()").setItem("vibe-talk.voice.mark-own-read", "0");
   page.pure("applySyncedSetting")("vibe-talk.voice.mark-own-read");
   await page.settle();
   assert.equal(page.el("mark-own-read").checked, false, "the switch does not say the synced choice");
   assert.equal(rowState(page, 0).archived, "true", "another device's off put a read message back");
-  page.pure("keepLocalSetting")("vibe-talk.voice.mark-own-read", "1");
+  page.pure("deviceStorage()").setItem("vibe-talk.voice.mark-own-read", "1");
   page.pure("applySyncedSetting")("vibe-talk.voice.mark-own-read");
   await page.settle();
   assert.equal(page.el("mark-own-read").checked, true);
@@ -19686,7 +19753,7 @@ test("`#543 in-app-message-links`: a marked link to a channel this app reads is 
   assert.ok(!off.hasAttribute("data-in-app"), "with the switch off a link was still the app's");
   assert.equal(off.text(), REPLY_HREF);
   assert.equal((await tapLink(page, off)).prevented, false, "with the switch off a tap was still kept in the app");
-  assert.ok(page.pure("SYNCED_SETTING_KEYS.includes(IN_APP_LINKS_KEY)"), "the switch is not one of the synced settings");
+  assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(page.pure("IN_APP_LINKS_KEY")), "the switch is not one of the synced settings");
   // The pure reading of a mark: four escaped parts, an absent one empty; nothing else is one.
   assert.deepStrictEqual(JSON.parse(page.pure(`JSON.stringify(messageLinkRef("gchat:spaces%2FA:spaces%2FA%2Fmessages%2FT.M:"))`)),
     { service: "gchat", channel: "spaces/A", message: "spaces/A/messages/T.M", thread: null });
@@ -22579,15 +22646,15 @@ test("`#488 slack-app-agents`: who is who is chosen once for every device: anoth
     message({ id: "1000000000000000004", author: "chat-bridge", author_id: "30", author_is_bot: true }),
   ]);
   assert.equal(whoOf(page, 3), "bot", "the premise: with two bots, neither is guessed");
-  assert.ok(page.pure("SYNCED_SETTING_KEYS").includes("vibe-talk.voice.identities"), "who is who is not synced");
+  assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes("vibe-talk.voice.identities"), "who is who is not synced");
   // What the sync does with a choice another device made: keep it, then apply it.
-  page.pure("keepLocalSetting")("vibe-talk.voice.identities", JSON.stringify({ 30: "coder" }));
+  page.pure("deviceStorage()").setItem("vibe-talk.voice.identities", JSON.stringify({ 30: "coder" }));
   page.pure("applySyncedSetting")("vibe-talk.voice.identities");
   await page.settle();
   assert.equal(whoOf(page, 3), "coder", "another device's choice did not redraw the row");
   assert.equal(whoOf(page, 1), "bot", "a choice about one account moved another");
   // A value this page cannot read is no choice: every account back to its guess.
-  page.pure("keepLocalSetting")("vibe-talk.voice.identities", "{not json");
+  page.pure("deviceStorage()").setItem("vibe-talk.voice.identities", "{not json");
   page.pure("applySyncedSetting")("vibe-talk.voice.identities");
   await page.settle();
   assert.equal(whoOf(page, 3), "bot");
@@ -22598,14 +22665,15 @@ test("`#488 slack-app-agents`: the first sync merges who is who with the server'
   // would lose this device's.
   const page = newPage(new Map([["vibe-talk.voice.identities", JSON.stringify({ 30: "bot", 40: "me" })]]));
   await signIn(page);
-  page.pure("takeServerSettings")([{ key: "vibe-talk.voice.identities", value: JSON.stringify({ 30: "coder", 50: "human" }),
-    updated_ms: 5 }], true);
+  // The server's choice as another device's frame brings it, before this device has agreed anything.
+  page.pure("onSettingsFrame")({ data: JSON.stringify({ settings: [{ key: "vibe-talk.voice.identities",
+    value: JSON.stringify({ 30: "coder", 50: "human" }), updated_ms: 5 }] }) });
   await page.settle();
-  const kept = JSON.parse(page.pure("localSettingValue")("vibe-talk.voice.identities"));
+  const kept = JSON.parse(page.pure("deviceStorage()").getItem("vibe-talk.voice.identities"));
   assert.deepEqual({ ...kept }, { 30: "coder", 40: "me", 50: "human" });
   // And what is agreed is still the server's value, so the merge goes back to it on the next pass.
-  assert.equal(page.pure("syncedArchive").get("vibe-talk.voice.identities").value, JSON.stringify({ 30: "coder", 50: "human" }));
-  assert.equal(page.pure("mergedIdentities")("[1]", "{}"), null, "a value that is not a map was merged");
+  assert.equal(page.pure("settingsSync()").agreed("vibe-talk.voice.identities").value, JSON.stringify({ 30: "coder", 50: "human" }));
+  assert.equal(SETTINGS.mergedIdentities("[1]", "{}"), null, "a value that is not a map was merged");
 });
 
 test("A LONE BOT IS GUESSED TO BE THE CODING AGENT, AND PEOPLE ARE GUESSED TO BE PEOPLE", async () => {
@@ -42962,7 +43030,7 @@ test("`#580 open-in-chat-jump`: with Main chosen in Settings, a reply opens in i
   // Absent means All, and stays absent until the reader chooses: a default written here would sync
   // over another device's choice.
   assert.equal(fresh.storage.has("vibe-talk.voice.open-in-view"), false, "the default was written as a choice");
-  assert.ok(fresh.pure("SYNCED_SETTING_KEYS.includes(OPEN_IN_VIEW_KEY)"), "the choice is not synced");
+  assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(fresh.pure("OPEN_IN_VIEW_KEY")), "the choice is not synced");
   fresh.el("open-in-view").value = "main";
   await fresh.el("open-in-view").dispatch("change");
   await fresh.settle();
@@ -51209,7 +51277,7 @@ test("URL writes each link under Links as its whole address and back as its name
     assert.deepStrictEqual(linkWords(kept), LABELS, `a device holding ${JSON.stringify(held)} writes addresses`);
   }
   // Kept with the owner's other settings, so every device writes them the same way.
-  assert.ok(page.pure("SYNCED_SETTING_KEYS.includes(LINK_RAW_KEY)"), "URL is not one of the synced settings");
+  assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(page.pure("LINK_RAW_KEY")), "URL is not one of the synced settings");
   assert.equal(page.pure("LINK_RAW_KEY"), LINK_RAW_KEY_NAME);
 
   // THE CONTROL: with the address never written, this sees the names stay.
@@ -85087,7 +85155,7 @@ test("`#522 thread-card-max-lines`: K is Thread card lines in Settings, 1 to 12 
   assertMarkupContains("fold-card-max-lines-body", "card-max-lines");
   assert.match(/<input\s+id="card-max-lines"[^>]*>/.exec(HTML_CODE.replace(/\n\s*/g, " "))[0], /min="1" max="12"/);
   const { page } = await bigCardPage();
-  assert.ok(page.pure("SYNCED_SETTING_KEYS").includes(CARD_LINES_STORAGE), "K is not kept on the server");
+  assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(CARD_LINES_STORAGE), "K is not kept on the server");
   assert.equal(page.el("card-max-lines").value, "5", "the default is not five lines");
   await page.el("card-max-lines").setValue("8");
   await page.settle();

@@ -4793,12 +4793,12 @@ const summariesRefusedOff = new Set();
 
 /**
  * The server's settings were read or written: if it now holds summaries on, the rows it refused
- * while it held them off are asked again. Called from `takeServerSettings`, after every read,
+ * while it held them off are asked again. Called by the settings sync (`landed`), after every read,
  * write and stream frame.
  */
 function summariesSettingLanded() {
   if (summariesRefusedOff.size === 0) return;
-  const held = syncedArchive.get(SUMMARIZE_COLLAPSED_KEY);
+  const held = settingsSync().agreed(SUMMARIZE_COLLAPSED_KEY);
   if (!held || held.value !== "1" || !summaryMode) return;
   for (const key of summariesRefusedOff) summariesAsked.delete(key);
   summariesRefusedOff.clear();
@@ -8444,7 +8444,7 @@ function setLinkKindShown(kind, shown) {
 // its slashes (`rawAddressInto`); off, the name it was given or the label the server made for it.
 // It filters nothing, so it is first in the row, apart from the kinds, and never struck through. The
 // search text still matches what the messages say, addresses included, either way. KEPT with the
-// owner's other settings on the server (LINK_RAW_KEY in `SYNCED_SETTING_KEYS`), as the kinds are, so
+// owner's other settings on the server (LINK_RAW_KEY in web/src/core/settings's `SYNCED_SETTING_KEYS`), as the kinds are, so
 // every device shows the links the same way; with nothing kept it is off.
 
 const LINK_RAW_KEY = "vibe-talk.voice.link-raw-urls";
@@ -33310,7 +33310,7 @@ function headingPieces(heading) {
 // glimpsed once in another channel could stop the coding agent being recognised here. The old key
 // is not migrated and is deliberately removed: nothing in it says which channel anything was seen
 // in, so there is no honest way to split it, and the census costs one channel read to rebuild.
-const IDENTITY_KEY = "vibe-talk.voice.identities";
+// `IDENTITY_KEY` is web/src/core/settings's: its sync merges two devices' choices.
 const AUTHORS_KEY = "vibe-talk.voice.channel-authors";
 const LEGACY_AUTHORS_KEY = "vibe-talk.voice.authors";
 const SELF_ID_KEY = "vibe-talk.voice.self-id";
@@ -58162,7 +58162,7 @@ function applyClientConfig(config) {
   tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
   // `#457 settings-server-side`. Only a server that says it keeps settings is asked for
   // them: an older one is never probed for a route it has not got.
-  settingsSyncSupported = config.client_settings_supported === true;
+  settingsSync().setSupported(config.client_settings_supported === true);
   fillChannelSelect("discord-channel");
   // `#355 provider-grouped-channels`. The Service picker before Settings' channel picker, which lists
   // that service's channels; the hidden list and the add form are that service's too.
@@ -58511,11 +58511,7 @@ async function pairingFailed(sentence) {
 function forgetToken() {
   // `#457 settings-server-side`. The next credential is unproven until `signIn` proves it,
   // and the archive was agreed under this one: both go, and the settings read fresh.
-  settingsSyncProven = false;
-  settingsSyncReady = false;
-  settingsSyncSupported = false;
-  syncedArchive.clear();
-  settingsAtStart.clear();
+  settingsSync().forget();
   clearError();
   // `#462 webapp-deep-links`: signing out forgets where the reader was, address included — a
   // reload after it must not reopen the signed-out reader's place from the query alone.
@@ -58554,135 +58550,36 @@ function forgetToken() {
 // Every setting outside Settings' Screen and keys section lives on the server, shared by all the
 // owner's devices; that one section — text size, reading width, the control bar, typing and the
 // keyboard — stays on this device and says "(client side)" beside its title. The full inventory
-// and its reasons are in `src/client_settings.rs`; `SYNCED_SETTING_KEYS` below must name the same
-// set as the server's list, and a server test reads this file to hold them together.
-//
-// HOW IT SYNCS, in the replication model's terms (`ai_docs/transient/2026-10-23-replication-model.md`):
-// `localStorage` stays this device's replica — every existing reader and writer above is unchanged,
-// which is what keeps a setting working offline and at first paint. This section is the update
-// detector and reconciler between that replica and the server: `syncedArchive` is the state both
-// sides last agreed on, a short timer compares the replica against it and pushes what moved, and
-// what another device moved arrives on the live streams as a `settings` event (and by re-read on
-// focus and reconnect). Per-key last-writer-wins on the SERVER's stamp: a remote entry is applied
-// only when its `updated_ms` is newer than the archive's, and a local change still on its way is
-// left to land after it, which is the same rule the server applied in arrival order. First load
-// after this shipped seeds the server from this device's values where it holds none — and only
-// there, so the second device to load can never clobber the first one's choices with its stale
-// copies. A failed push keeps the local value, says so quietly in Settings, and retries on the
-// timer, because the replica still differs from the archive until the server takes it.
-
-/** Every `localStorage` key whose setting the server keeps. Keep beside `SYNCED_KEYS` in
- * `src/client_settings.rs` — a test there compares the two lists. */
-const SYNCED_SETTING_KEYS = [
-  "vibe-talk.voice.resume",
-  "vibe-talk.voice.relay",
-  "vibe-talk.voice.read-audio-source",
-  "vibe-talk.voice.read-speed",
-  // `#552 wit-tts-provider`. The Wit.ai voice chosen in Settings.
-  "vibe-talk.voice.wit-voice",
-  "vibe-talk.voice.prompts",
-  "vibe-talk.voice.mic",
-  "vibe-talk.voice.read-mode",
-  "vibe-talk.voice.mark-own-read",
-  "vibe-talk.voice.hide-empty",
-  "vibe-talk.voice.combine",
-  "vibe-talk.voice.rich-headers",
-  // `#543 in-app-message-links`. Whether a link to a message opens it here.
-  "vibe-talk.voice.in-app-links",
-  // `#580 open-in-chat-jump`. The view a sent card's Open in channel lands in.
-  "vibe-talk.voice.open-in-view",
-  "vibe-talk.voice.collapsed-lines",
-  "vibe-talk.voice.hidden-link-kinds",
-  // `#620 link-url-chip`. Whether the Links view writes each link as its address.
-  "vibe-talk.voice.link-raw-urls",
-  // `#564 message-summary-toggle`. Summarize collapsed messages; the server reads it too, and
-  // generates no message summary while it is off.
-  "vibe-talk.voice.summarize-collapsed",
-  "vibe-talk.voice.threads-unpacked",
-  "vibe-talk.voice.thread-card-states",
-  "vibe-talk.voice.threads-main",
-  "vibe-talk.voice.thread-order",
-  "vibe-talk.voice.thread-card-folded",
-  // `#522 thread-card-max-lines`. K, the most lines a thread card shows of its root; the server
-  // reads it too, to name a thread whose root is longer from its first reply.
-  "vibe-talk.voice.thread-card-max-lines",
-  // `#488 slack-app-agents`. Who is who: which account is the owner, the coding agent, a person or
-  // another bot, chosen once for every device. The census of who spoke where stays local: a cache.
-  "vibe-talk.voice.identities",
-];
-
-/** How often the replica is compared with the archive. A settings write is a human act; a second
- * and a half is prompt, and far cheaper than asking on every keystroke of a dragged slider. */
-const SETTINGS_SYNC_MS = 1750;
-
-/** The largest value the server keeps for one setting, in characters to its bytes: the
- * server's `MAX_VALUE_BYTES`, mirrored so an oversized value is left local here rather
- * than refused there in a batch with everything else. */
-const SETTINGS_VALUE_MAX = 64 * 1024;
-
-/** Passes between whole re-reads of the document while nothing local moved: about a
- * minute at `SETTINGS_SYNC_MS`, the backstop behind the stream. */
-const SETTINGS_REREAD_PASSES = 34;
+// and its reasons are in `src/client_settings.rs`; web/src/core/settings/keys.ts names the synced
+// keys, and web/src/core/settings/sync.ts says how the device's replica and the server's document
+// are kept in agreement.
 
 /**
- * What this page and the server last agreed, by key: the value (null for none held) and the
- * server's stamp for it. The whole sync is the difference between this and `localStorage`.
+ * The reconciler between this device's replica and the server's document (web/src/core/settings,
+ * `#624 voice-page-modularity`): the synced keys, the archive, the passes and their timer. What
+ * stays here is what it asks of the page: a key's value put into force (`applySyncedSetting`), and
+ * the quiet word about it in Settings. Made on first use; a `var` with no initialiser, like
+ * `serverApi`.
  *
- * @type {Map<string, {value: string | null, updatedMs: number}>}
+ * @type {import("./src/core/settings/index.ts").SettingsSync | undefined}
  */
-const syncedArchive = new Map();
+var pageSettingsSync;
 
-/** Whether the first read of the server's document has landed: until it has, nothing is pushed,
- * so a load cannot overwrite another device's newer choice with this one's not-yet-checked copy. */
-let settingsSyncReady = false;
-
-/** Whether a push or read is on the wire now, so the timer never stacks a second one on it. */
-let settingsSyncBusy = false;
-
-/** False once the server has said it has no such route or no store: settings stay local, unsynced
- * and unretried, rather than asking a question with a permanent answer every second and a half. */
-let settingsSyncSupported = false;
-
-/** Whether the sync's timer is armed: armed once, by the first proven sign-in. */
-let settingsSyncStarted = false;
-
-/** Whether the token now held has been proved by a `/client-config` answer. Nothing reads with
- * an unproven token (`signIn`'s rule for the channel, the same for settings): the sync waits
- * behind the same proof, and signing out un-proves it. */
-let settingsSyncProven = false;
-
-/**
- * This device's values as the sync first saw them, taken in `startSettingsSync` before the
- * first read goes out. A key that moves after that and before the read lands is a change in
- * flight, protected like any other; one that never moved is a migration candidate, and the
- * server's held value rightly wins over it.
- *
- * @type {Map<string, string | null>}
- */
-const settingsAtStart = new Map();
-
-/** Reconciliation passes since the document was last re-read whole: a missed stream frame
- * (a lagged settings receiver is skipped, never reset) is healed by a slow re-read, not left
- * to whenever the reader next refocuses the page. */
-let settingsPassesSinceRead = 0;
-
-/** This device's kept value for a synced key, or null where it holds none. */
-function localSettingValue(key) {
-  try {
-    return deviceStorage().getItem(key);
-  } catch (_error) {
-    return null;
+/** {@link pageSettingsSync}, made if it is not yet. */
+function settingsSync() {
+  if (!pageSettingsSync) {
+    pageSettingsSync = createSettingsSync({
+      storage: deviceStorage(),
+      clock: browserPorts().clock,
+      decoded: apiDecoded,
+      token,
+      tokenScope: () => tokenScope,
+      apply: applySyncedSetting,
+      status: renderSettingsSyncState,
+      landed: summariesSettingLanded,
+    });
   }
-}
-
-/** Keep a synced value on this device, or forget it, exactly as the setting's own writer would. */
-function keepLocalSetting(key, value) {
-  try {
-    if (value === null) deviceStorage().removeItem(key);
-    else deviceStorage().setItem(key, value);
-  } catch (_error) {
-    // A browser that refuses storage honours the applied value for this session only.
-  }
+  return pageSettingsSync;
 }
 
 /**
@@ -58695,7 +58592,7 @@ function applySyncedSetting(key) {
     switch (key) {
       case READ_MODE_KEY: {
         // None kept is the shipped default's turn, as everywhere: Show read.
-        setReadMode(localSettingValue(key) || "show");
+        setReadMode(settingsSync().local(key) || "show");
         break;
       }
       // `#549 own-read-stored`. Only the switch: nothing drawn depends on it.
@@ -58778,7 +58675,7 @@ function applySyncedSetting(key) {
         // drawn that way here too, and the list in Settings says so.
         let held = {};
         try {
-          const parsed = JSON.parse(localSettingValue(key) || "null");
+          const parsed = JSON.parse(settingsSync().local(key) || "null");
           if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) held = parsed;
         } catch (_error) {
           // A value this page cannot read is no choice at all.
@@ -58803,217 +58700,9 @@ function renderSettingsSyncState(text) {
   if (text && line.textContent !== text) line.textContent = text;
 }
 
-/**
- * After a remote value is applied, the archive adopts what this page actually kept. Several
- * settings canonicalize as they apply — a clamped pace, an order this page no longer knows
- * read as the default, a read-aloud voice this device cannot offer kept as its own — and
- * the canonical form is THIS page's reading, not a new choice: pushing it back would move
- * every other device's setting merely because this one opened. A forget is kept a forget:
- * an apply that writes its default back does not resurrect the key.
- */
-function adoptAppliedSetting(key, value, updatedMs) {
-  if (value === null) {
-    keepLocalSetting(key, null);
-    syncedArchive.set(key, { value: null, updatedMs });
-    return;
-  }
-  syncedArchive.set(key, { value: localSettingValue(key), updatedMs });
-}
-
-/**
- * Take entries the server holds — a read's whole document, a write's answer, a stream frame's
- * changes — into the archive, and into this device where they are newer than what it agreed.
- * With `whole`, a synced key absent from the entries is one the server does not hold.
- *
- * @param {Array<{key: string, value: string | null, updated_ms: number}>} entries
- * @param {boolean} whole
- */
-function takeServerSettings(entries, whole) {
-  const seen = new Set();
-  for (const entry of entries) {
-    if (!SYNCED_SETTING_KEYS.includes(entry.key)) continue;
-    seen.add(entry.key);
-    const agreed = syncedArchive.get(entry.key);
-    if (agreed && entry.updated_ms < agreed.updatedMs) continue;
-    const local = localSettingValue(entry.key);
-    // A local change the server has not taken yet stands: it lands after this entry and wins
-    // by the same arrival rule, and taking the remote value now would lose it silently. On
-    // the first read there is no agreement yet, so "changed" is against the snapshot.
-    const pendingLocal = agreed
-      ? local !== agreed.value
-      : settingsAtStart.has(entry.key) && local !== settingsAtStart.get(entry.key);
-    syncedArchive.set(entry.key, { value: entry.value, updatedMs: entry.updated_ms });
-    if (pendingLocal || local === entry.value) continue;
-    // `#488 slack-app-agents`. Who is who was kept per device until it synced, so the first read
-    // finds each device with choices of its own: merged, the server's winning an account both name,
-    // and the merge pushed by the next pass (the archive keeps the server's value, which differs).
-    if (!agreed && entry.key === IDENTITY_KEY && local !== null && entry.value !== null) {
-      const merged = mergedIdentities(local, entry.value);
-      if (merged !== null && merged !== entry.value) {
-        keepLocalSetting(entry.key, merged);
-        applySyncedSetting(entry.key);
-        continue;
-      }
-    }
-    keepLocalSetting(entry.key, entry.value);
-    applySyncedSetting(entry.key);
-    adoptAppliedSetting(entry.key, entry.value, entry.updated_ms);
-  }
-  if (whole) {
-    settingsPassesSinceRead = 0;
-    for (const key of SYNCED_SETTING_KEYS) {
-      if (seen.has(key)) continue;
-      // Absent from the whole document: the server does not hold it — never set, or
-      // forgotten, or purged. A key this page agreed a value for is forgotten here too,
-      // which is also what stops the page that forgot it asking again every pass.
-      const agreed = syncedArchive.get(key);
-      if (!agreed) {
-        // No agreement yet: this is the first read, and a local value here is the
-        // migration's seed, not something a forget is clearing.
-        syncedArchive.set(key, { value: null, updatedMs: 0 });
-        continue;
-      }
-      const local = localSettingValue(key);
-      const pendingLocal = local !== agreed.value;
-      syncedArchive.set(key, { value: null, updatedMs: agreed.updatedMs });
-      if (pendingLocal || local === null) continue;
-      keepLocalSetting(key, null);
-      applySyncedSetting(key);
-      adoptAppliedSetting(key, null, agreed.updatedMs);
-    }
-  }
-  summariesSettingLanded();
-}
-
-/**
- * `#488 slack-app-agents`. Two devices' who-is-who choices as one, the server's winning an account
- * both name, as the stored JSON; null when either is not a map this page can read.
- *
- * @param {string} local
- * @param {string} server
- */
-function mergedIdentities(local, server) {
-  try {
-    const mine = JSON.parse(local);
-    const theirs = JSON.parse(server);
-    const map = (value) => value && typeof value === "object" && !Array.isArray(value);
-    if (!map(mine) || !map(theirs)) return null;
-    return JSON.stringify({ ...mine, ...theirs });
-  } catch (_error) {
-    return null;
-  }
-}
-
-/** Whether this refusal is the permanent kind: no such route, or no store to keep settings in. */
-function settingsSyncRefused(error) {
-  // No route, no store, a token that may only read, or a write the server will never
-  // take as written: asking again in two seconds gets the same answer forever.
-  return !!error && (error.status === 404 || error.status === 400 || error.status === 403 ||
-    error.code === "storage_not_configured");
-}
-
-/**
- * One reconciliation pass: read the server's document until the first one lands (seeding it from
- * this device where it holds none), then push whatever this device moved since the archive.
- * Failures keep every local value and are retried by the timer that calls this.
- */
-async function syncSettingsOnce() {
-  if (settingsSyncBusy || !settingsSyncSupported || !settingsSyncProven || !token()) return;
-  settingsSyncBusy = true;
-  try {
-    if (!settingsSyncReady) {
-      const held = await apiDecoded("ClientSettings", "/api/v1/client-settings");
-      takeServerSettings(held.settings, true);
-      settingsSyncReady = true;
-      // The one-time migration: this device's values, offered only where the server holds
-      // none. Seeds ride the first push below as their own list, never as sets.
-      const seed = [];
-      for (const key of SYNCED_SETTING_KEYS) {
-        const agreed = syncedArchive.get(key);
-        const local = localSettingValue(key);
-        if (agreed && agreed.value === null && local !== null) {
-          seed.push({ key, value: local, updated_ms: 0 });
-        }
-      }
-      // A read-scope token reads the document and applies it, and writes nothing:
-      // asking would only be refused, on every pass, beside work it may do.
-      if (seed.length > 0 && tokenScope !== "read") {
-        const answer = await apiDecoded("ClientSettings", "/api/v1/client-settings", {
-          method: "PUT",
-          body: { set: [], seed },
-        });
-        // The whole document back: a seed another device beat this one to arrives here as
-        // that device's value, and replaces the stale local copy it outraced.
-        takeServerSettings(answer.settings, true);
-      }
-      renderSettingsSyncState("");
-      return;
-    }
-    const set = [];
-    let tooLarge = false;
-    for (const key of SYNCED_SETTING_KEYS) {
-      const agreed = syncedArchive.get(key);
-      const local = localSettingValue(key);
-      if (!agreed || local !== agreed.value) {
-        // One value over the server's limit refused whole would stop every other
-        // setting syncing behind it: it stays local, the rest still go.
-        if (local !== null && local.length > SETTINGS_VALUE_MAX) {
-          tooLarge = true;
-          continue;
-        }
-        set.push({ key, value: local, updated_ms: 0 });
-      }
-    }
-    if (tokenScope === "read") {
-      if (set.length > 0) {
-        renderSettingsSyncState("This token may only read, so settings stay on this device.");
-      }
-      return;
-    }
-    if (set.length === 0) {
-      settingsPassesSinceRead += 1;
-      if (settingsPassesSinceRead >= SETTINGS_REREAD_PASSES) {
-        const held = await apiDecoded("ClientSettings", "/api/v1/client-settings");
-        takeServerSettings(held.settings, true);
-      }
-      renderSettingsSyncState(tooLarge
-        ? "One setting is too large for the server to keep, so it stays on this device."
-        : "");
-      return;
-    }
-    renderSettingsSyncState("Settings are being saved to the server…");
-    const answer = await apiDecoded("ClientSettings", "/api/v1/client-settings", {
-      method: "PUT",
-      body: { set, seed: [] },
-    });
-    takeServerSettings(answer.settings, true);
-    renderSettingsSyncState("");
-  } catch (error) {
-    if (settingsSyncRefused(error)) {
-      settingsSyncSupported = false;
-      renderSettingsSyncState(
-        "This server does not keep settings, so yours stay on this device.");
-      return;
-    }
-    renderSettingsSyncState(
-      "Settings are kept on this device for now — saving to the server will retry.");
-  } finally {
-    settingsSyncBusy = false;
-  }
-}
-
 /** Re-read the document, for the moments a missed stream frame could hide in: refocus, reconnect. */
-async function refreshServerSettings() {
-  if (settingsSyncBusy || !settingsSyncSupported || !settingsSyncReady || !settingsSyncProven || !token()) return;
-  settingsSyncBusy = true;
-  try {
-    const held = await apiDecoded("ClientSettings", "/api/v1/client-settings");
-    takeServerSettings(held.settings, true);
-  } catch (_error) {
-    // The timer's next pass and the stream both carry this; a failed re-read says nothing new.
-  } finally {
-    settingsSyncBusy = false;
-  }
+function refreshServerSettings() {
+  return settingsSync().refresh();
 }
 
 /**
@@ -59022,37 +58711,16 @@ async function refreshServerSettings() {
  * every stream frame this page cannot read is.
  */
 function onSettingsFrame(frame) {
-  if (!frame.data) return;
-  let payload = null;
-  try {
-    payload = JSON.parse(frame.data);
-  } catch (_error) {
-    return;
-  }
-  if (!VibeTalkContract.is("ClientSettings", payload)) return;
-  takeServerSettings(payload.settings, false);
+  settingsSync().onFrame(frame);
 }
 
 /** Start keeping this device's replica and the server's document in agreement. Called from
  * `signIn` once the token is proven, never before: settings are read with the same credential
  * as everything else, and an unproven one reads nothing. */
 function startSettingsSync() {
-  settingsSyncProven = true;
-  if (settingsSyncStarted) {
-    syncSettingsOnce().catch(() => {});
-    return;
-  }
-  settingsSyncStarted = true;
-  for (const key of SYNCED_SETTING_KEYS) settingsAtStart.set(key, localSettingValue(key));
-  guardQuietly(syncSettingsOnce)();
-  // Self-rescheduling rather than an interval, as the poll above is: a slow pass can
-  // never stack a second one on itself.
-  const tick = () => {
-    syncSettingsOnce()
-      .catch(() => {})
-      .then(() => setTimeout(tick, SETTINGS_SYNC_MS));
-  };
-  setTimeout(tick, SETTINGS_SYNC_MS);
+  if (!settingsSync().start()) return;
+  guardQuietly(() => settingsSync().syncOnce())();
+  settingsSync().keepPassing();
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) refreshServerSettings().catch(() => {});
   });
@@ -59060,7 +58728,7 @@ function startSettingsSync() {
     refreshServerSettings().catch(() => {});
   });
   window.addEventListener("online", () => {
-    syncSettingsOnce().catch(() => {});
+    settingsSync().syncOnce().catch(() => {});
   });
 }
 
