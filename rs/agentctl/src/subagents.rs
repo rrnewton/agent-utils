@@ -3307,6 +3307,14 @@ fn readback_tail(text: &str) -> String {
     let chars: Vec<char> = readback_form(text).chars().collect();
     chars[chars.len().saturating_sub(40)..].iter().collect()
 }
+
+/// The first 40 characters of `text` as read-back compares it: with its tail, the part of a
+/// prompt that tells one prompt from another. The tail alone does not: every prompt a chat
+/// bridge types ends in the same boilerplate, so a peer that ever received a bridge prompt
+/// of its own matched every later prompt's tail and made its delivery unattributable.
+fn readback_head(text: &str) -> String {
+    readback_form(text).chars().take(40).collect()
+}
 /// Longest wait for another pane's input lock before a countermand gives up.
 const COUNTERMAND_LOCK: Duration = Duration::from_secs(2);
 /// Lines of scrollback each read-back reads; a read this long may have lost old lines.
@@ -3383,11 +3391,18 @@ const INPUT_MARKERS: [&str; 4] = ["❯", "›", "↳", "»"];
 /// output row (`⎿` or `└`). The same words printed anywhere else, such as in the output of a
 /// command the agent ran that read this target's screen, were not typed into that pane, so they
 /// are no evidence that a prompt went there instead of to its target.
+///
+/// One input region counts only when it holds both the text's head and its tail (see
+/// [`readback_head`]): a peer that received a different prompt ending in the same words —
+/// every chat-bridge prompt ends in the same reply boilerplate — shows the tail alone and
+/// counts nothing, where it used to make the target's prompt unattributable and got it
+/// quarantined as a probable misroute.
 fn input_occurrences(screen: &str, text: &str) -> usize {
     let tail = readback_tail(text);
     if tail.is_empty() {
         return 0;
     }
+    let head = readback_head(text);
     let mut regions = Vec::<String>::new();
     let mut open = false;
     for line in screen.lines() {
@@ -3419,7 +3434,14 @@ fn input_occurrences(screen: &str, text: &str) -> usize {
     }
     regions
         .iter()
-        .map(|region| readback_form(region).matches(&tail).count())
+        .map(|region| {
+            let form = readback_form(region);
+            if form.contains(&head) {
+                form.matches(&tail).count()
+            } else {
+                0
+            }
+        })
         .sum()
 }
 

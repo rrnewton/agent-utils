@@ -1150,6 +1150,31 @@ fn a_peer_window_moving_past_an_old_match_is_uncertain() {
 }
 
 #[test]
+fn a_peer_holding_a_different_prompt_with_the_same_ending_is_no_misroute() {
+    // Every chat-bridge prompt ends in the same reply boilerplate. A peer that ever
+    // received a bridge prompt of its own therefore matches the tail of this one, and
+    // matching the tail alone quarantined the target's first prompt as unattributable
+    // though the target showed it. The peer's prompt differs at its head, so it counts
+    // as absent and the send is attributed to the target.
+    const MINE: &str = "bridge prompt for request alpha with its own reply id, print that \
+reply between the two lines at the end of your turn instead.";
+    const THEIRS: &str = "bridge prompt for request omega with its own reply id, print that \
+reply between the two lines at the end of your turn instead.";
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned(), vec![typed(THEIRS)]);
+    send(&fixture, "worker", MINE).expect("attributed to the target");
+    assert!(runs(&fixture).contains(&MINE.to_owned()));
+    assert!(failed_documents(&fixture, "worker").is_empty());
+}
+
+#[test]
 fn a_full_peer_window_with_an_old_match_is_uncertain() {
     let fixture = Fixture::new();
     fixture.start(None);
