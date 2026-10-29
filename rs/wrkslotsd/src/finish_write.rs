@@ -395,7 +395,7 @@ fn checkout_branch(checkout: &Path) -> Result<String> {
     Ok(branch)
 }
 
-fn glob_parts(pattern: &str) -> Vec<String> {
+pub(crate) fn glob_parts(pattern: &str) -> Vec<String> {
     pattern
         .split('/')
         .filter(|part| !part.is_empty())
@@ -462,7 +462,7 @@ fn fnmatch_component(pattern: &str, text: &str) -> bool {
     inner(&pattern, &text)
 }
 
-fn glob_parts_match(pattern: &[String], path: &[String]) -> bool {
+pub(crate) fn glob_parts_match(pattern: &[String], path: &[String]) -> bool {
     if !pattern
         .iter()
         .any(|part| part.chars().any(|ch| matches!(ch, '*' | '?' | '[')))
@@ -483,7 +483,7 @@ fn glob_parts_match(pattern: &[String], path: &[String]) -> bool {
     inner(pattern, path)
 }
 
-fn cache_glob_contains_path(pattern: &str, path: &str) -> bool {
+pub(crate) fn cache_glob_contains_path(pattern: &str, path: &str) -> bool {
     let pattern_parts = glob_parts(pattern);
     if pattern_parts.is_empty() {
         return false;
@@ -501,6 +501,89 @@ fn cache_glob_contains_path(pattern: &str, path: &str) -> bool {
         return false;
     }
     glob_parts_match(&pattern_parts, &path_parts[..pattern_parts.len()])
+}
+
+/// The oracle's `_assert_cache_policy_untracked_path`: configured
+/// cache globs must not overlap tracked source or cross a submodule.
+pub(crate) fn assert_cache_policy_untracked(
+    path: &Path,
+    name: &str,
+    globs: &[String],
+) -> Result<()> {
+    if globs.is_empty() {
+        return Ok(());
+    }
+    let indexed = git(path, &["ls-files", "--recurse-submodules", "-z"])?;
+    let committed = git(path, &["ls-tree", "-r", "--name-only", "-z", "HEAD"])?;
+    let mut tracked: Vec<String> = Vec::new();
+    for output in [&indexed, &committed] {
+        for candidate in output.split('\0') {
+            if !candidate.is_empty()
+                && globs
+                    .iter()
+                    .any(|glob| cache_glob_contains_path(glob, candidate))
+                && !tracked.iter().any(|existing| existing == candidate)
+            {
+                tracked.push(candidate.to_string());
+            }
+        }
+    }
+    if let Some(first) = tracked.first() {
+        return Err(format!(
+            "configured cache policy for checkout {name} overlaps tracked source at {first}; narrow cache_globs before cleanup or finish"
+        ));
+    }
+    let stage = git(path, &["ls-files", "--stage", "-z"])?;
+    let tree = git(path, &["ls-tree", "-r", "-z", "HEAD"])?;
+    let mut submodules: Vec<String> = Vec::new();
+    for output in [&stage, &tree] {
+        for record in output.split('\0') {
+            if record.is_empty() {
+                continue;
+            }
+            if let Some((metadata, sub_path)) = record.split_once('\t') {
+                if metadata.starts_with("160000 ")
+                    && !submodules.iter().any(|existing| existing == sub_path)
+                {
+                    submodules.push(sub_path.to_string());
+                }
+            }
+        }
+    }
+    for submodule in &submodules {
+        let submodule_parts: Vec<String> = submodule
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect();
+        for pattern in globs {
+            let pattern_parts = glob_parts(pattern);
+            let wildcard_index = pattern_parts
+                .iter()
+                .position(|part| part.chars().any(|ch| matches!(ch, '*' | '?' | '[')))
+                .unwrap_or(pattern_parts.len());
+            let overlaps = if wildcard_index == pattern_parts.len() {
+                submodule_parts[..pattern_parts.len().min(submodule_parts.len())]
+                    == pattern_parts[..pattern_parts.len().min(submodule_parts.len())]
+                    && (submodule_parts.len() >= pattern_parts.len()
+                        || pattern_parts[..submodule_parts.len()] == submodule_parts[..])
+                    || pattern_parts[..submodule_parts.len().min(pattern_parts.len())]
+                        == submodule_parts[..submodule_parts.len().min(pattern_parts.len())]
+            } else {
+                let literal_prefix = &pattern_parts[..wildcard_index];
+                submodule_parts[..literal_prefix.len().min(submodule_parts.len())]
+                    == literal_prefix[..literal_prefix.len().min(submodule_parts.len())]
+                    || literal_prefix[..submodule_parts.len().min(literal_prefix.len())]
+                        == submodule_parts[..submodule_parts.len().min(literal_prefix.len())]
+            };
+            if overlaps {
+                return Err(format!(
+                    "configured cache policy for checkout {name} may cross Git submodule {submodule}; configure that repository separately"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn cache_globs_for(config: &Value, checkout_name: &str) -> Vec<String> {
@@ -953,78 +1036,7 @@ pub(crate) fn assert_checkout_safe(
         }
     }
     let globs = cache_globs_for(config, &name);
-    if !globs.is_empty() {
-        let indexed = git(&path, &["ls-files", "--recurse-submodules", "-z"])?;
-        let committed = git(&path, &["ls-tree", "-r", "--name-only", "-z", "HEAD"])?;
-        let mut tracked: Vec<String> = Vec::new();
-        for output in [&indexed, &committed] {
-            for candidate in output.split('\0') {
-                if !candidate.is_empty()
-                    && globs
-                        .iter()
-                        .any(|glob| cache_glob_contains_path(glob, candidate))
-                    && !tracked.iter().any(|existing| existing == candidate)
-                {
-                    tracked.push(candidate.to_string());
-                }
-            }
-        }
-        if let Some(first) = tracked.first() {
-            return Err(format!(
-                "configured cache policy for checkout {name} overlaps tracked source at {first}; narrow cache_globs before cleanup or finish"
-            ));
-        }
-        let stage = git(&path, &["ls-files", "--stage", "-z"])?;
-        let tree = git(&path, &["ls-tree", "-r", "-z", "HEAD"])?;
-        let mut submodules: Vec<String> = Vec::new();
-        for output in [&stage, &tree] {
-            for record in output.split('\0') {
-                if record.is_empty() {
-                    continue;
-                }
-                if let Some((metadata, sub_path)) = record.split_once('\t') {
-                    if metadata.starts_with("160000 ")
-                        && !submodules.iter().any(|existing| existing == sub_path)
-                    {
-                        submodules.push(sub_path.to_string());
-                    }
-                }
-            }
-        }
-        for submodule in &submodules {
-            let submodule_parts: Vec<String> = submodule
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .map(str::to_string)
-                .collect();
-            for pattern in &globs {
-                let pattern_parts = glob_parts(pattern);
-                let wildcard_index = pattern_parts
-                    .iter()
-                    .position(|part| part.chars().any(|ch| matches!(ch, '*' | '?' | '[')))
-                    .unwrap_or(pattern_parts.len());
-                let overlaps = if wildcard_index == pattern_parts.len() {
-                    submodule_parts[..pattern_parts.len().min(submodule_parts.len())]
-                        == pattern_parts[..pattern_parts.len().min(submodule_parts.len())]
-                        && (submodule_parts.len() >= pattern_parts.len()
-                            || pattern_parts[..submodule_parts.len()] == submodule_parts[..])
-                        || pattern_parts[..submodule_parts.len().min(pattern_parts.len())]
-                            == submodule_parts[..submodule_parts.len().min(pattern_parts.len())]
-                } else {
-                    let literal_prefix = &pattern_parts[..wildcard_index];
-                    submodule_parts[..literal_prefix.len().min(submodule_parts.len())]
-                        == literal_prefix[..literal_prefix.len().min(submodule_parts.len())]
-                        || literal_prefix[..submodule_parts.len().min(literal_prefix.len())]
-                            == submodule_parts[..submodule_parts.len().min(literal_prefix.len())]
-                };
-                if overlaps {
-                    return Err(format!(
-                        "configured cache policy for checkout {name} may cross Git submodule {submodule}; configure that repository separately"
-                    ));
-                }
-            }
-        }
-    }
+    assert_cache_policy_untracked(&path, &name, &globs)?;
     let mut status_args: Vec<String> = vec![
         "status".to_string(),
         "--porcelain=v2".to_string(),

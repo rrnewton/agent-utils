@@ -459,6 +459,44 @@ def _remove_with_image_records(tmp_path: Path) -> None:
     assert [record["slot"] for record in remaining_slots] == ["slot-img"]
 
 
+def _add_cache_globs(root: Path) -> Path:
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache-dir\n")
+    cache = root / "worktrees" / "slot-a" / "repo" / "cache-dir"
+    cache.mkdir(parents=True)
+    (cache / "junk.txt").write_text("regenerable\n")
+    return cache
+
+
+def test_remove_with_cache_globs_matches_python(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        _remove_with_cache_globs(base)
+
+
+def _remove_with_cache_globs(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    _add_cache_globs(rust_root)
+    _add_cache_globs(oracle_root)
+    assert _python_remove(oracle_root) == 0
+    result = _rust_remove(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _doc(rust_root, "ACTIVE.node-a.json") == _doc(oracle_root, "ACTIVE.node-a.json")
+    assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
+        oracle_root, "ARCHIVED.node-a.json"
+    )
+    assert not (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_cache_nested_repo_refuses(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    cache = _add_cache_globs(rust_root)
+    _repo(cache / "inner")
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "nested Git repository" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
 def test_remove_dirty_checkout_refuses_salvage_scope(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     (rust_root / "worktrees" / "slot-a" / "repo" / "notes.txt").write_text("wip\n")

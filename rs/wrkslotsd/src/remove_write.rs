@@ -10,10 +10,10 @@
 //! refuse explicitly here: host-context removal (runner/proof
 //! environment), validate slots, owner consent and attestation,
 //! salvage needing a push or local bundle (dirty, unpublished, or
-//! drifted work), cache directories with configured globs (nested
-//! repository judging), legacy HANDOFF.md quarantine, and slot
-//! images. Fixture registries only until the edition cutover (see
-//! `ensure_states::require_fixture`).
+//! drifted work), nested Git repositories inside configured cache
+//! directories (their judging and salvage evidence), legacy
+//! HANDOFF.md quarantine, and slot images. Fixture registries only
+//! until the edition cutover (see `ensure_states::require_fixture`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -684,6 +684,108 @@ fn has_initialized_submodule(status: &str) -> bool {
         .any(|line| !line.trim().is_empty() && !line.starts_with('-'))
 }
 
+/// Expand the configured cache globs inside one checkout and judge
+/// what removal would reach, failing closed where the oracle's full
+/// nested-repository judging has no Rust counterpart yet: a cache
+/// path that is (or sits under) a symlink or another mount refuses,
+/// and a nested `.git` inside a cache refuses. Ordinary cache
+/// contents are regenerable and need no judging.
+fn judge_cache_directories(checkout_path: &Path, globs: &[String]) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let patterns: Vec<Vec<String>> = globs
+        .iter()
+        .map(|pattern| crate::finish_write::glob_parts(pattern))
+        .collect();
+    let checkout_device = std::fs::metadata(checkout_path)
+        .map(|meta| meta.dev())
+        .unwrap_or(0);
+    // Collect every directory in the checkout (never descending into
+    // the checkout's own .git), then keep those a glob names.
+    let mut directories: Vec<PathBuf> = Vec::new();
+    let mut pending: Vec<PathBuf> = vec![checkout_path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            if directory == checkout_path && entry.file_name() == ".git" {
+                continue;
+            }
+            directories.push(path.clone());
+            pending.push(path);
+        }
+    }
+    for candidate in &directories {
+        let relative = candidate
+            .strip_prefix(checkout_path)
+            .unwrap_or(candidate.as_path());
+        let parts: Vec<String> = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if !patterns
+            .iter()
+            .any(|pattern| crate::finish_write::glob_parts_match(pattern, &parts))
+        {
+            continue;
+        }
+        // No symlink component between the checkout root and the
+        // cache, and the cache stays on the checkout's device.
+        let mut cursor = checkout_path.to_path_buf();
+        for part in &parts {
+            cursor.push(part);
+            let meta = std::fs::symlink_metadata(&cursor).map_err(|error| {
+                format!("cannot inspect cache path {}: {error}", cursor.display())
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "configured cache path is a symlink: {}",
+                    cursor.display()
+                ));
+            }
+            if meta.dev() != checkout_device {
+                return Err(format!(
+                    "configured cache path crosses a mount: {}",
+                    cursor.display()
+                ));
+            }
+        }
+        // A nested Git repository inside the cache needs the oracle's
+        // judging (disposable evidence or salvage), not deletion.
+        let mut pending: Vec<PathBuf> = vec![candidate.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_name() == ".git" {
+                    return Err(format!(
+                        "cache {} contains nested Git repository at {}; nested-repository judging stays with the Python edition for now",
+                        candidate.display(),
+                        entry.path().display()
+                    ));
+                }
+                let file_type = match entry.file_type() {
+                    Ok(kind) => kind,
+                    Err(_) => continue,
+                };
+                if file_type.is_dir() && !file_type.is_symlink() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) -> Result<Value> {
     let name = checkout
         .get("name")
@@ -699,20 +801,22 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
     // ignored files do not dirty a checkout.
     let globs = cache_globs_for(config, &name);
     if !globs.is_empty() {
-        return Err(format!(
-            "configured cache policy for checkout {name} needs nested-repository judging; remove stays with the Python edition for now"
-        ));
+        crate::finish_write::assert_cache_policy_untracked(&path, &name, &globs)?;
+        judge_cache_directories(&path, &globs)?;
     }
-    let status = git(
-        &path,
-        &[
-            "status",
-            "--porcelain=v2",
-            "--untracked-files=all",
-            "--",
-            ".",
-        ],
-    )?;
+    let mut status_args: Vec<String> = vec![
+        "status".to_string(),
+        "--porcelain=v2".to_string(),
+        "--untracked-files=all".to_string(),
+        "--".to_string(),
+        ".".to_string(),
+    ];
+    for pattern in &globs {
+        status_args.push(format!(":(exclude,glob){pattern}"));
+        status_args.push(format!(":(exclude,glob){pattern}/**"));
+    }
+    let status_refs: Vec<&str> = status_args.iter().map(String::as_str).collect();
+    let status = git(&path, &status_refs)?;
     if !status.is_empty() {
         return Err(format!(
             "checkout {name} has uncommitted work; salvage stays with the Python edition for now"
