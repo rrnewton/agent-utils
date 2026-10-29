@@ -200,14 +200,17 @@ const PROGRESS_ROWS: usize = 16;
 /// hint below it (`└ (ctrl+b to send to background)`), and a `◆ Queued input` block. The
 /// post-turn `◈ Double checking (1m 35s · esc to interrupt)` phase is a running turn too, during
 /// which Herdr already reports the pane done (#678 muse-bridge-latency).
+///
+/// The row starts at the left edge and ends with `esc to interrupt)`, so tool output, a quoted
+/// capture (indented under `└`) or an answer that mentions the phrase does not count.
 fn muse_turn_running(transcript: &str) -> bool {
     splitlines(transcript)
         .into_iter()
-        .map(strip)
+        .map(|line| line.trim_end_matches(is_space))
         .filter(|line| !line.is_empty())
         .rev()
         .take(PROGRESS_ROWS)
-        .any(|line| starts_with_marker(line, &PROGRESS_MARKERS) && line.contains("esc to interrupt)"))
+        .any(|line| starts_with_marker(line, &PROGRESS_MARKERS) && line.ends_with("esc to interrupt)"))
 }
 
 /// An empty editor below a transcript that does not end in Muse's progress line.
