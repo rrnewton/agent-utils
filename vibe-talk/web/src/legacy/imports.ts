@@ -25,6 +25,12 @@ export {
 } from "../core/speech/index.ts";
 export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
 export {
+  LOST_TURN,
+  RECONNECT_RECORDS_WAIT_MS,
+  reconnectAsked as callReconnectAsked,
+  reconnectVerdict,
+} from "../core/call/index.ts";
+export {
   allPageAnswersFor,
   allReachesThread,
   answeredThread,

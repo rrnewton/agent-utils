@@ -1861,6 +1861,7 @@ const CHANNELS = await moduleForTests("src/core/channels/index.ts");
 const ANNOTATIONS = await moduleForTests("src/core/annotations/index.ts");
 /** The outbox: what waits to be sent, and what became of each send (web/src/core/outbox). */
 const OUTBOX = await moduleForTests("src/core/outbox/index.ts");
+const CALL = await moduleForTests("src/core/call/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -7145,6 +7146,21 @@ test("`#624 voice-page-modularity`: prepared read-aloud tickets end on either cl
   prepared.keep("10", entry);
   prepared.clear();
   assert.equal(prepared.size(), 0);
+});
+
+test("`#624 voice-page-modularity`: when a call reconnects after a lost turn, and when it ends, from the module alone", () => {
+  const { reconnectAsked, reconnectVerdict, LOST_TURN, RECONNECT_MIN_GAP_MS, RECONNECTS_PER_CALL_MAX } = CALL;
+  const call = { protocol: "vibe-talk-v1", v1Ready: true, reconnects: 0, lastReconnectAt: 0 };
+  const said = "turn 4 never started; reconnect.";
+  assert.equal(reconnectAsked(call, said), true);
+  assert.equal(reconnectAsked(call, "turn 4 never started"), false, "an error that did not ask reconnected");
+  assert.equal(reconnectAsked({ ...call, v1Ready: false }, said), false, "a session that never started reconnected");
+  assert.equal(reconnectAsked({ ...call, protocol: "elevenlabs" }, said), false, "the hosted vendor's protocol reconnected");
+  assert.equal(LOST_TURN.exec(said)[1], "4");
+  assert.equal(reconnectVerdict(call, 1000), "reconnect");
+  assert.equal(reconnectVerdict({ ...call, reconnects: 1, lastReconnectAt: 1000 }, 1000 + RECONNECT_MIN_GAP_MS - 1), "soon");
+  assert.equal(reconnectVerdict({ ...call, reconnects: 1, lastReconnectAt: 1000 }, 1000 + RECONNECT_MIN_GAP_MS), "reconnect");
+  assert.equal(reconnectVerdict({ ...call, reconnects: RECONNECTS_PER_CALL_MAX, lastReconnectAt: 0 }, 1e9), "count");
 });
 
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
@@ -83457,7 +83473,8 @@ test("`#352 voice-reconnect-on-bridge-error`: a second lost turn within a minute
   assert.equal(later.page.sockets.length, 3, "a lost turn a minute after the reconnect was not reconnected");
   assert.deepEqual(later.page.endPosts.map((r) => [r.ended_by, r.reconnects]), [["reconnected", undefined], ["reconnected", 1]]);
   // The negative control: the page that let a bridge reconnect as often as it lost turns.
-  const control = await run(brokenScript("now - session.lastReconnectAt < RECONNECT_MIN_GAP_MS", "now - session.lastReconnectAt < 0"),
+  const control = await run(await brokenModule([{ file: "src/core/call/reconnect.ts",
+    find: "now - call.lastReconnectAt < RECONNECT_MIN_GAP_MS", replace: "now - call.lastReconnectAt < 0" }]),
     RECONNECT_MIN_GAP_MS - 1000);
   assert.equal(control.page.sockets.length, 3, "the control did not reconnect inside the minute, so the test above proves nothing");
 });
@@ -83485,7 +83502,8 @@ test("`#352 voice-reconnect-on-bridge-error`: a fourth lost turn in one call end
     [["reconnected", undefined], ["reconnected", 1], ["reconnected", 2], ["reconnect_limit", 3]]);
   assert.match(page.el("error").textContent,
     /^The voice service lost a turn again after the page had reconnected this call 3 times, so the call has ended/);
-  const control = await run(brokenScript("  if (session.reconnects >= RECONNECTS_PER_CALL_MAX) {\n", "  if (false) {\n"));
+  const control = await run(await brokenModule([{ file: "src/core/call/reconnect.ts",
+    find: "  if (call.reconnects >= RECONNECTS_PER_CALL_MAX) return \"count\";\n", replace: "" }]));
   assert.equal(control.sockets.length, 2 + RECONNECTS_PER_CALL_MAX, "the control did not reconnect a fourth time, so the test above proves nothing");
 });
 

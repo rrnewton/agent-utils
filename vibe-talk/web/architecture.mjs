@@ -34,6 +34,7 @@ export const PACKAGES = Object.freeze({
   ports: [],
   "core/annotations": BASE,
   "core/api": BASE,
+  "core/call": BASE,
   "core/channels": BASE,
   "core/navigation": BASE,
   "core/outbox": BASE,

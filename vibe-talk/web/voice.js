@@ -21992,26 +21992,10 @@ function fileTurnIn(conversationId, speaker, text) {
 // call as `reconnect_limit`, and a reconnect that cannot get a working session ends it as
 // `reconnect_failed`, each said in red as an `error` frame's end is.
 
-/** The bridge's words for "this session is lost; open another": an `error` ending in "; reconnect". */
-const RECONNECT_ASKED = /;\s*reconnect\s*\.?\s*$/iu;
-
-/** "turn 4 never started": the turn the bridge says never began. */
-const LOST_TURN = /\bturn\s+(\d+)\s+never\s+started\b/iu;
-
-/**
- * How soon after one automatic reconnect another request ends the call instead: a bridge that keeps
- * losing turns is not hidden behind reconnects.
- */
-const RECONNECT_MIN_GAP_MS = 60000;
-
-/** The most automatic reconnects in one call: the request after them ends it. */
-const RECONNECTS_PER_CALL_MAX = 3;
-
-/**
- * How long a reconnect waits for this call's turns to reach the server before it asks for the record
- * it hands the new session, so that the record holds what was just said.
- */
-const RECONNECT_RECORDS_WAIT_MS = 3000;
+// The bridge's words that ask for a reconnect (`RECONNECT_ASKED`), the lost turn it names (`LOST_TURN`),
+// the bounds (`RECONNECT_MIN_GAP_MS`, `RECONNECTS_PER_CALL_MAX`) and the wait for this call's records
+// (`RECONNECT_RECORDS_WAIT_MS`) are web/src/core/call's, with the decisions (`#624
+// voice-page-modularity`).
 
 /**
  * What the transcript's "reconnected" line says, by what the new session was handed, the record of
@@ -22071,7 +22055,7 @@ const RECONNECT_FRESH = {
  * @param {string} said the error's words
  */
 function reconnectAsked(said) {
-  return session.protocol === "vibe-talk-v1" && session.v1Ready && RECONNECT_ASKED.test(said);
+  return callReconnectAsked(session, said);
 }
 
 /**
@@ -22082,7 +22066,8 @@ function reconnectAsked(said) {
  */
 function reconnectOrEnd(said) {
   const now = Date.now();
-  if (session.reconnects >= RECONNECTS_PER_CALL_MAX) {
+  const verdict = reconnectVerdict(session, now);
+  if (verdict === "count") {
     const times = session.reconnects;
     endCall("reconnect_limit", said, `a lost turn after ${times} reconnects in this call`);
     showError(
@@ -22092,7 +22077,7 @@ function reconnectOrEnd(said) {
     );
     return;
   }
-  if (session.lastReconnectAt && now - session.lastReconnectAt < RECONNECT_MIN_GAP_MS) {
+  if (verdict === "soon") {
     endCall("reconnect_limit", said, "a second lost turn within a minute of reconnecting");
     showError(
       "The voice service lost a turn again less than a minute after the page reconnected, so the " +
