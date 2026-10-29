@@ -342,3 +342,19 @@ test("every handwritten module is TypeScript, so the strict and portable checks 
   assert.deepStrictEqual(plain, [], "a module below web/src is not .ts, so tsconfig.core.json and tsconfig.web.json skip it");
   assert.ok(moduleSources().length > 0, "no module found, so this checks nothing");
 });
+
+test("no module opts out of type checking: no @ts-nocheck, @ts-ignore or @ts-expect-error, and no `any`", () => {
+  const found = [];
+  for (const { name, text } of moduleSources()) {
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, (comment) => comment.replace(/[^\n]/g, " "));
+    code.split("\n").forEach((line, at) => {
+      if (/@ts-(?:nocheck|ignore|expect-error)\b/.test(line) || /(?::|<|\bas)\s*any\b/.test(line.replace(/\/\/.*$/, ""))) {
+        found.push(`${name}:${at + 1}: ${line.trim()}`);
+      }
+    });
+  }
+  assert.deepStrictEqual(found, [], "a module turns type checking off where the plan holds it strict");
+  // The scan sees an opt-out where there is one.
+  assert.ok(/@ts-(?:nocheck|ignore|expect-error)\b/.test("// @ts-nocheck"));
+  assert.ok(/(?::|<|\bas)\s*any\b/.test("const x: any = 1;") && /(?::|<|\bas)\s*any\b/.test("y as any"));
+});
