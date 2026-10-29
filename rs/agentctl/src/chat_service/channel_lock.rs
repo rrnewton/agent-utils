@@ -62,7 +62,7 @@ pub fn default_lock_directory() -> PathBuf {
 }
 
 /// The lock file of `channel` on `plugin` in `directory`.
-fn lock_path(directory: &Path, plugin: &str, channel: &str) -> PathBuf {
+pub(super) fn lock_path(directory: &Path, plugin: &str, channel: &str) -> PathBuf {
     let digest = Sha256::digest(format!("{plugin}\n{channel}").as_bytes());
     let name: String = digest
         .iter()

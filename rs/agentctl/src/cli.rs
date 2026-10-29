@@ -1226,6 +1226,18 @@ enum ChatCommand {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl chat repoint --bridge-state ~/.local/state/agentctl/chat --agent coordinator\n  agentctl --registry ~/project/.agentctl chat repoint --bridge-state DIR --agent coord2 --pane w1:p4\n\nThe target is checked first: it must be registered in --registry, and either be a pane agent whose\npane is alive with a harness Herdr recognizes (in --pane when given), or a headless agent whose\nwrapper answers. The request is then recorded in the state directory's target.json, with who asked\nand when, and the running `chat run` is woken through its .wake.sock; it applies the request\nafter its current pass, without a restart, while its chat subscription stays up. With no service\nrunning, this command applies it itself. Applying it settles every request whose prompt has not\nreached the previous agent: a prompt still waiting in that agent's queue is taken back out and\nmoves to the new agent with the others; one the queue already typed stays delivered there; one\nthat may have reached it is marked uncertain and listed, never typed twice and never dropped.\nRequests delivered to the previous agent and not answered are listed: that agent can still answer\nthem with `agentctl chat reply`. agent_name in bridge.json is rewritten, so a restart keeps the\nnew target, and a notice is posted in the bridge's first channel.\n\nAny local agent of the same user may run it: the state directory's permissions are the authority.\nPrints one JSON object: request, service_running, service_woken, applied, and outcome (moved,\ndelivered_to_previous, awaiting_reply_from_previous, uncertain, pane_id) and summary once applied.\nExit status: 0 once applied; 1 when the target was refused or a newer repoint superseded this one;\n75 when the running service has not applied it within --wait (it still will)."
     )]
     Repoint(ChatRepoint),
+    /// Say in one line whether a bridge works, then why: service, channels, event stream, target
+    /// agent, last activity, stuck or uncertain requests and reply retry loops
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl chat health --bridge-state ~/.local/state/agentctl/chat\n  agentctl --registry ~/project/.agentctl chat health --bridge-state DIR --json\n\nThe first line is the verdict: `chat health: OK: ...`, or DEGRADED or DOWN followed by every\nproblem found. DOWN: no chat run holds the state (its runner lock, read from /proc/locks), another\nbridge holds one of its channels, the event stream stopped on a gap or boundary mismatch, or the\ntarget agent is not registered, its pane is not alive, or Herdr detects no harness there.\nDEGRADED: the event stream delivered nothing (no batch, no heartbeat) for --stale-after, the subscription or send path is down,\nthe owner loop is failing, requests are stalled untyped or have uncertain delivery, a reply was\nretried 20 or more times or will never be sent, a captured reply is unsent after 10 minutes, the\nreply breaker holds a thread, or a repoint is not applied yet. The lines after it give the service\nprocess, each channel's lock holder, the event stream's last item and checkpoint write, the target's pane, harness and\nstatus, the last admitted, delivered and replied times (UTC and age), request counts, each\nuncertain request's reason, each retry loop, and the last repoint. --json prints the whole report\n(schema agentctl-chat-health/v1). It reads the state, /proc/locks, the registry and Herdr; it\nwrites nothing and never contacts the chat provider. Exit status: 0 OK, 3 DEGRADED, 1 DOWN."
+    )]
+    Health(ChatHealth),
+    /// Report each request's time from posted to admitted, acknowledged, delivered and first reply,
+    /// with percentiles, from the bridge's own records
+    #[command(
+        after_help = "Examples:\n  agentctl chat latency --bridge-state ~/.local/state/agentctl/chat\n  agentctl chat latency --bridge-state DIR --since 2h\n  agentctl chat latency --bridge-state DIR --since 2026-10-29T12:00:00Z --json\n\nStages, for each request the bridge retains: posted (the provider's message time) -> admitted\n(stored as a request); admitted -> acknowledged (the first reaction confirmed added); admitted ->\ndelivered (the prompt verified typed, or a headless model started it: when the second reaction is\nqueued); delivered -> first reply sent; and posted -> first reply sent. Chat providers such as\nSlack record no time on a reaction, so these come from the bridge's records; a request that has\nnot reached a stage is left out of that stage. The table gives the count, p50, p90, p99 and max\nin seconds (nearest rank), then the newest --last requests. --json prints one document (schema\nagentctl-chat-latency/v1) with every request and times in Unix milliseconds. Read-only; never\ncontacts Herdr or the provider."
+    )]
+    Latency(ChatLatency),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
     /// Print one thread's retained messages as quoted text, oldest first, without writes
@@ -1362,6 +1374,50 @@ struct ChatInit {
     /// Private owner-only JSON bridge configuration (maximum 1 MiB)
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
+}
+
+#[derive(Args)]
+struct ChatHealth {
+    #[command(flatten)]
+    state: ChatState,
+    /// Time since the event stream last delivered anything, a heartbeat included, past which it
+    /// counts as stale: a whole number with s, m, h, d or w (default: 5m; the Slack provider sends
+    /// a heartbeat every 30 seconds while idle)
+    #[arg(long, value_name = "DURATION", default_value = "5m", value_parser = crate::chat_runtime::parse_grant_duration)]
+    stale_after: Duration,
+    /// Print the whole report as one JSON document instead of text
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ChatLatency {
+    #[command(flatten)]
+    state: ChatState,
+    /// Only requests admitted since T: a duration back from now (30m, 2h, 7d) or an RFC 3339 time
+    /// (default: every retained request)
+    #[arg(long, value_name = "T", value_parser = latency_since)]
+    since: Option<u64>,
+    /// Requests the text listing shows, newest first, 0-1000 (default: 20)
+    #[arg(long, value_name = "N", default_value_t = 20, value_parser = clap::value_parser!(u16).range(0..=1000))]
+    last: u16,
+    /// Print one JSON document instead of the text report
+    #[arg(long)]
+    json: bool,
+}
+
+/// `chat latency --since`: Unix milliseconds of a duration back from now, or of an RFC 3339 time.
+fn latency_since(value: &str) -> Result<u64, String> {
+    if let Some(at) = crate::chat_runtime::parse_rfc3339_millis(value) {
+        return Ok(at);
+    }
+    let back = crate::chat_runtime::parse_grant_duration(value).map_err(|_| {
+        "expected a duration such as 30m, 2h or 7d, or an RFC 3339 time such as \
+         2026-10-29T12:00:00Z"
+            .to_owned()
+    })?;
+    let back = u64::try_from(back.as_millis()).unwrap_or(u64::MAX);
+    Ok(crate::chat_runtime::unix_millis().saturating_sub(back))
 }
 
 #[derive(Args)]
@@ -3341,6 +3397,41 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             )
             .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Health(value) => {
+            let client =
+                HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+            let manager = ManagedAgents::new(&client, &registry)?;
+            let report = crate::chat_service::health::health(
+                &value.state.bridge_state,
+                &manager,
+                crate::chat_service::health::HealthOptions {
+                    stale_after: value.stale_after,
+                },
+            )
+            .map_err(Failure::Chat)?;
+            if value.json {
+                write_json(&report.document).map_err(Failure::Output)?;
+            } else {
+                write_text(&report.text).map_err(Failure::Output)?;
+            }
+            Ok(report.exit_code())
+        }
+        ChatCommand::Latency(value) => {
+            let (document, text) = crate::chat_service::latency::latency(
+                &value.state.bridge_state,
+                crate::chat_service::latency::LatencyOptions {
+                    since_millis: value.since,
+                    last: usize::from(value.last),
+                },
+            )
+            .map_err(Failure::Chat)?;
+            if value.json {
+                write_json(&document).map_err(Failure::Output)?;
+            } else {
+                write_text(&text).map_err(Failure::Output)?;
+            }
             Ok(0)
         }
         ChatCommand::Repoint(value) => {

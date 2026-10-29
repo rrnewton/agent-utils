@@ -42,6 +42,8 @@ use crate::subagents::{ManagedAgents, ManagedApi};
 pub mod channel_lock;
 #[cfg(test)]
 mod grant_refresh_tests;
+pub mod health;
+pub mod latency;
 #[cfg(test)]
 mod rejection_tests;
 mod reply_reminders;
@@ -87,6 +89,8 @@ const SATURATED_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// looks Herdr's status up anyway, and `idle_poll_at` puts the read at that wake.
 pub const IDLE_SATURATED_POLL_INTERVAL: Duration = DELIVERY_RETRY_INTERVAL;
 const PROVIDER_RETRY_MIN: Duration = Duration::from_secs(1);
+// How often the provider worker touches `provider-alive` at most, for `chat health`.
+const PROVIDER_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const PROVIDER_RETRY_MAX: Duration = Duration::from_secs(60);
 // Already reported reply IDs one recovery-scan log line names before it counts the rest.
 const ALREADY_REPORTED_LOG_IDS: usize = 8;
@@ -4000,7 +4004,13 @@ where
             "agentctl: chat provider: the provider health record could not be saved: {error}"
         ));
     }
+    // When `provider-alive` was last touched; see `BridgeState::note_provider_alive`.
+    let mut alive_noted: Option<Instant> = None;
     loop {
+        if alive_noted.is_none_or(|at| at.elapsed() >= PROVIDER_ALIVE_INTERVAL) {
+            state.note_provider_alive();
+            alive_noted = Some(Instant::now());
+        }
         if stop.is_stopped() {
             cancel_provider(cancellation)
                 .map_err(|error| ProviderGenerationError::Cleanup(error.to_string()))?;

@@ -160,3 +160,7 @@ bridge at another registered agent without restarting it, run
 `agentctl --registry REG chat repoint --bridge-state DIR --agent NAME`; waiting
 requests move to the new agent, and any that may already have reached the old
 one are listed as uncertain rather than typed twice.
+`agentctl --registry REG chat health --bridge-state DIR` prints a one-line
+verdict (OK, DEGRADED or DOWN) and why, and `agentctl chat latency
+--bridge-state DIR` prints each request's time from posted to first reply, with
+percentiles, from the bridge's own records.

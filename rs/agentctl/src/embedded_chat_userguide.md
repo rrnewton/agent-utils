@@ -2659,6 +2659,80 @@ the service still applies the request. `chat status` reports the request not
 yet applied and the latest outcome under `repoint`, and `target.json` keeps the
 last 16 outcomes.
 
+## Checking a bridge: health and latency
+
+`chat health` says in one line whether a bridge works, then why:
+
+```sh
+agentctl --registry ~/project/.agentctl chat health \
+  --bridge-state ~/.local/state/agentctl/project-chat
+```
+
+```text
+chat health: OK: typing into coordinator in pane w1:p4; last request admitted 3.2 min ago
+service: running, process 4242 (/opt/agentctl --registry ... chat run --bridge-state ...)
+channel C0123456789: served by this bridge
+event stream: last item 2026-10-29T12:31:10Z (0.3 min ago); checkpoint written ...; cursor saved
+target: coordinator in pane w1:p4 (claude, idle)
+last admitted: 2026-10-29T12:28:02Z (3.2 min ago)
+last delivered: 2026-10-29T12:28:03Z (3.2 min ago)
+last reply sent: 2026-10-29T12:28:40Z (2.6 min ago)
+requests: 41 retained; 0 stalled; 0 uncertain; 1 delivered and unanswered; 0 unsent repl(ies)
+last repoint: coord-old -> coordinator by ops-agent, 2026-10-28T19:02:11Z (17.4 h ago)
+```
+
+The verdict is `OK`, `DEGRADED` or `DOWN`, followed by every problem found.
+It is `DOWN` when no `chat run` holds the state (its runner lock, as
+`/proc/locks` lists it), another bridge holds one of its channels, the event
+stream stopped on a gap or boundary mismatch, or the target agent is not
+registered, its pane is not alive, or Herdr detects no harness there. It is
+`DEGRADED` when the event stream has delivered nothing, not even a heartbeat,
+for `--stale-after` (default 5 minutes; the Slack provider sends a heartbeat
+every 30 seconds while idle), the subscription or send path is down, the owner
+loop is failing, requests are stalled untyped or have uncertain delivery, a
+reply was retried 20 or more times or will never be sent, a captured reply is
+still unsent after 10 minutes, the reply breaker holds a thread back, or a
+repoint is not applied yet. Each uncertain request is listed with its reason,
+and each retry loop with its attempt count and last failure code. The running
+service touches `provider-alive` in the state directory, at most every 5
+seconds, whenever its provider subscription delivers anything; a service built
+before this record shows the last item as unknown and is never called stale.
+`--json` prints the whole report (schema `agentctl-chat-health/v1`). The
+command writes nothing and never contacts the chat provider. Exit status: 0 OK,
+3 DEGRADED, 1 DOWN, so a timer or another agent can act on it; when a bridge is
+up but typing into a dead pane, `chat repoint` fixes it without a restart.
+
+`chat latency` reports how long each request took to reach each stage, from
+the bridge's own records, since chat providers such as Slack record no time on
+a reaction:
+
+```sh
+agentctl chat latency --bridge-state ~/.local/state/agentctl/project-chat --since 2h
+```
+
+```text
+chat latency: 3 request(s) admitted since 2026-10-29T10:30:00Z, from the bridge's records (seconds; ...)
+stage                                          n      p50      p90      p99      max
+posted -> admitted                             3      0.7      1.7      1.7      1.7
+admitted -> acknowledged (1st reaction)        3      2.0      2.1      2.1      2.1
+admitted -> delivered (2nd reaction)           2      0.8     20.6     20.6     20.6
+delivered -> first reply sent                  2      4.3      4.7      4.7      4.7
+posted -> first reply sent                     3      8.7     25.6     25.6     25.6
+```
+
+Posted is the provider's message time; admitted is when the bridge stored the
+request; acknowledged is when the first reaction was confirmed added; delivered
+is when the prompt was verified typed into the agent, or a headless model
+started it, which is when the second reaction is queued; the last is when the
+provider accepted the first reply. A request that has not reached a stage is
+left out of that stage's row, and a request whose message time cannot be read
+counts its total from admission. Percentiles are nearest-rank. The table is
+followed by the newest `--last` requests (default 20), one row each. `--since`
+takes a duration back from now (`30m`, `2h`, `7d`) or an RFC 3339 time, and
+`--json` prints every request with times in Unix milliseconds (schema
+`agentctl-chat-latency/v1`). Only requests the bridge retains are counted;
+`chat close` retires a request with its times.
+
 ## Service management
 
 `chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM.

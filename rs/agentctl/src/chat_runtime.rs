@@ -35,11 +35,13 @@ use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
 mod grants;
+mod observe;
 mod rejections;
 mod reply_reminders;
 mod repoint;
 
 pub use grants::{parse_grant_duration, SenderGrant, DEFAULT_MAX_GRANT_SECONDS};
+pub use observe::{parse_rfc3339_millis, RequestTimes, UnsentReply};
 pub use rejections::RejectionSaves;
 pub use repoint::{RepointOutcome, RepointRequest, UncertainRequest};
 
@@ -15624,7 +15626,7 @@ pub(crate) fn log_timestamp() -> String {
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` for a Unix time in milliseconds.
-fn utc_timestamp(millis: u64) -> String {
+pub(crate) fn utc_timestamp(millis: u64) -> String {
     let seconds = millis / 1_000;
     let (year, month, day) = civil_from_days(seconds / 86_400);
     let second_of_day = seconds % 86_400;
