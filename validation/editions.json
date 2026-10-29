@@ -97,16 +97,16 @@
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/wrkslots",
-      "note": "Python-only CLI. rs/wrkslotsd is a separate read-only observer/index CLI (not a daemon and not a wrkslots edition); the campaign grows it into the Rust edition subcommand by subcommand (milestone 4)."
+      "note": "Python-primary CLI. The Rust edition grows in rs/wrkslotsd subcommand by subcommand (#562 rust-primary-wrkslots) at differential parity for readers and fixture-guarded writers; it is reachable only through the opt-in WRKSLOTS_ENGINE=rust (default still Python) until the coordinator-approved primary flip. Commands the Rust edition has not ported refuse by name rather than falling back."
     },
     {
       "name": "wrkslotsd",
       "primary": "rust",
       "mirror": {"edition": "python", "state": "absent"},
       "parity_check": null,
-      "rust_entrypoint": null,
+      "rust_entrypoint": "rs/bin/wrkslotsd",
       "python_entrypoint": null,
-      "note": "Rust observer/CLI growing into the wrkslots Rust edition (#562 rust-primary-wrkslots); it replays EVENTS logs and validates the durable file formats at differential parity with the Python loader: parse-config and validate-config (.wrkslots.yml), parse-state (ACTIVE shard), parse-archive (ARCHIVED shard), parse-handoff (generation-bound sidecar), parse-hold, and parse-journal (every recovery-journal kind). Every mutating command remains Python-primary; built by cargo, not a tracked rs/bin launcher."
+      "note": "Rust observer/CLI growing into the wrkslots Rust edition (#562 rust-primary-wrkslots); it replays EVENTS logs and validates the durable file formats at differential parity with the Python loader: parse-config and validate-config (.wrkslots.yml), parse-state (ACTIVE shard), parse-archive (ARCHIVED shard), parse-handoff (generation-bound sidecar), parse-hold, and parse-journal (every recovery-journal kind). Every mutating command remains Python-primary until the edition flip; reachable as the wrkslots Rust edition through WRKSLOTS_ENGINE=rust and directly as rs/bin/wrkslotsd."
     },
     {
       "name": "wrkviz",

@@ -32,6 +32,10 @@ case "$TOOL" in
     PACKAGE="herdr-run"
     PACKAGE_TOOLS=(herdr-run)
     ;;
+  wrkslotsd)
+    PACKAGE="wrkslotsd"
+    PACKAGE_TOOLS=(wrkslotsd)
+    ;;
   agentctl|herdr-agent)
     PACKAGE="agentctl"
     PACKAGE_TOOLS=(agentctl herdr-agent)

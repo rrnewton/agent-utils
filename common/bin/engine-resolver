@@ -2,8 +2,9 @@
 # TRACKED, deterministic engine resolver for repository-local tool commands.
 #
 # The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`, `pr-landing-planner`, `herdr-run`, `herdr-agent`, and `agentctl`) have tracked Python and Cargo-backed Rust launchers under their respective `*/bin`
-# directories. `wrkviz`, `parallel-experiment-runner`, `wrkslots`, `herdr-chat`, and
-# `herdr-subagents` are intentionally Python-only.
+# directories. `wrkviz`, `parallel-experiment-runner`, `herdr-chat`, and
+# `herdr-subagents` are intentionally Python-only. `wrkslots` is Python-primary
+# with a Rust edition opt-in through WRKSLOTS_ENGINE (see below).
 # Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
 # one consistent command surface after any setup mode.
 #
@@ -88,9 +89,23 @@ else
     ENGINE="python"
 fi
 
+# wrkslots edition-switch opt-in (#562 rust-primary-wrkslots): WRKSLOTS_ENGINE is the
+# per-tool trial switch for the Rust edition growing in wrkslotsd. It wins over the
+# generic overrides for this tool only, and it bypasses the mirror-state guard below:
+# the Rust edition is not yet a parity mirror, it is an explicit opt-in whose covered
+# commands run at differential parity and whose remaining commands refuse by name.
+# Unset or empty keeps the Python primary. The default flips only by changing
+# validation/editions.json, never by this variable becoming common.
+WRKSLOTS_OPTIN=""
+if [[ "$TOOL" == "wrkslots" && -n "${WRKSLOTS_ENGINE:-}" ]]; then
+    ENGINE="$WRKSLOTS_ENGINE"
+    ENGINE_VAR="WRKSLOTS_ENGINE"
+    WRKSLOTS_OPTIN="1"
+fi
+
 # An explicit request for the mirror edition is honoured only at parity. A paused, archived, or
 # absent mirror refuses by name and state instead of silently running stale code.
-if [[ -n "$ENGINE_VAR" && -n "$ED_PRIMARY" && -n "$ED_MIRROR_STATE" ]]; then
+if [[ -z "$WRKSLOTS_OPTIN" && -n "$ENGINE_VAR" && -n "$ED_PRIMARY" && -n "$ED_MIRROR_STATE" ]]; then
     case "$ENGINE" in
         python|py) REQUESTED="python" ;;
         rust|rs) REQUESTED="rust" ;;
@@ -123,6 +138,10 @@ case "$ENGINE" in
         # workspace cache on every invocation, rejects replaced artifacts, and rebuilds stale source
         # before exec. Never fall back to Python silently; that would re-hide an engine mismatch.
         TARGET="$ROOT/rs/bin/$TOOL"
+        if [[ -n "$WRKSLOTS_OPTIN" ]]; then
+            # The wrkslots Rust edition ships as the wrkslotsd binary.
+            TARGET="$ROOT/rs/bin/wrkslotsd"
+        fi
         if [[ ! -x "$TARGET" ]]; then
             if [[ -e "$TARGET" || -L "$TARGET" ]]; then
                 echo "[$TOOL] engine=rust but the tracked launcher at rs/bin/$TOOL is not executable. Refusing to silently fall back to Python. Fix the checkout (it must be the tracked symlink to cargo-runner), or run the Python edition with ${ENGINE_VAR:-DAGRUN_ENGINE}=python." >&2
