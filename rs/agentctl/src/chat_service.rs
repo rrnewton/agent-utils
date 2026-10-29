@@ -1030,7 +1030,7 @@ pub struct RunSettings {
     /// unchanged this long, as [`crate::stale_composer`] describes; `None`, the default, never
     /// clears one.
     pub stale_composer_clear_after: Option<Duration>,
-    /// Remind a Claude Code coordinator, once, of each delivered request it has not answered,
+    /// Remind the coordinator, once, of each delivered request it has not answered,
     /// once it has been idle this long: see [`ReplyReminderSettings`]. `None`, the default here,
     /// sends no reminder; `chat run` reminds after [`DEFAULT_REPLY_REMINDER_IDLE`] unless told
     /// otherwise. Reminders need `outbound_enabled`.
