@@ -13066,6 +13066,18 @@ fn resolve_uncertain_delivery(
     if now.saturating_sub(since) < UNCERTAIN_RESOLVE_AFTER_MILLIS {
         return Ok(CoordinatorDeliveryResult::Uncertain(original));
     }
+    // A captured reply proves the prompt arrived, however uncertain its typing looked
+    // (a fresh pane's prompt can be quarantined as unattributable while the agent is
+    // already answering it): such a request is delivered, and is never reported as lost.
+    // (The bridge's own report is also a reply, so a request already reported is left
+    // as it is, above all by this check.)
+    if record.uncertain_reported_at_millis.is_some() {
+        return Ok(CoordinatorDeliveryResult::Uncertain(original));
+    }
+    if record.reply_count > 0 {
+        state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
+        return Ok(CoordinatorDeliveryResult::Delivered);
+    }
     let agent_name = &state.config.agent_name;
     match delivery.message_state(agent_name, &record.delivery_message_id) {
         Ok(Some(QueueMessageState::Processed)) => {
@@ -20806,6 +20818,7 @@ Lines between will be sent to the user as a chat message. Use the same two lines
         let since = unix_millis().saturating_sub(UNCERTAIN_RESOLVE_AFTER_MILLIS + 60_000);
         record.admitted_at_millis = since;
         record.phase = RequestPhase::DeliveryUncertain;
+        record.delivered_at_millis = None;
         record.delivery_started_at_millis = Some(since);
         record.delivery_error = Some("prompt may have been submitted".to_owned());
         let mut checkpoint = state.read_checkpoint().expect("checkpoint");
@@ -20872,6 +20885,49 @@ Lines between will be sent to the user as a chat message. Use the same two lines
             .delivery_error
             .as_deref()
             .is_some_and(|error| error.contains("queued for typing again")));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_uncertain_request_with_a_captured_reply_is_delivered_not_reported() {
+        // A fresh pane's prompt can be quarantined as unattributable while the agent is
+        // already answering it: a captured reply proves delivery, so the request resolves
+        // as delivered and no "could not confirm" report is posted.
+        let root = temporary("uncertain-answered");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        state
+            .set_delivery_phase(key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        let route = state
+            .next_reply_route(key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(
+                key,
+                &format!(
+                    "<CHAT_REPLY_{}>\nthe answer\n</CHAT_REPLY_{}>",
+                    route.identifier, route.identifier
+                ),
+            )
+            .expect("capture reply");
+        backdate_uncertain(&state, key);
+        let target = FakeDelivery::default();
+        *target.queue_state.lock().expect("queue state lock") =
+            Some(QueueMessageState::Failed);
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("resolve"),
+            CoordinatorDeliveryResult::Delivered
+        ));
+        let record = state.read_request(key).expect("request");
+        assert_eq!(record.phase, RequestPhase::Delivered);
+        assert_eq!(record.reply_count, 1, "no report reply was added");
+        assert!(record.uncertain_reported_at_millis.is_none());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
