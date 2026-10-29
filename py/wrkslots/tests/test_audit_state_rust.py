@@ -538,6 +538,65 @@ def test_audit_census_nested_git_matches_python(tmp_path: Path) -> None:
     assert "nested Git metadata" in str(row["cache_error"])
 
 
+def _validate_cache_fixture(base: Path) -> tuple[Path, Path]:
+    root = _validate_fixture(base)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    cache = root / "worktrees" / "validate" / "slot-a" / "repo" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "f.bin").write_bytes(b"x" * 1024)
+    return root, cache
+
+
+def test_audit_validate_nested_repo_disposable_matches_python(
+    tmp_path: Path,
+) -> None:
+    root, cache = _validate_cache_fixture(tmp_path)
+    _repo(cache / "nested")
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["cache_status"] == "complete"
+    assert row["cache_error"] is None
+    assert row["verdict"] == "DELETABLE"
+
+
+def test_audit_validate_nested_core_worktree_matches_python(
+    tmp_path: Path,
+) -> None:
+    root, cache = _validate_cache_fixture(tmp_path)
+    _repo(cache / "nested")
+    _git(cache / "nested", "config", "core.worktree", "/tmp/elsewhere")
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["cache_status"] == "error"
+    assert "repository config sets core.worktree" in str(row["cache_error"])
+
+
+def test_audit_validate_nested_gitfile_matches_python(
+    tmp_path: Path,
+) -> None:
+    root, cache = _validate_cache_fixture(tmp_path)
+    nested = cache / "nested"
+    nested.mkdir(parents=True)
+    (nested / ".git").write_text("gitdir: /tmp/elsewhere\n")
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["cache_status"] == "error"
+    assert ".git is a file" in str(row["cache_error"])
+
+
+def test_audit_validate_nested_linked_worktrees_matches_python(
+    tmp_path: Path,
+) -> None:
+    root, cache = _validate_cache_fixture(tmp_path)
+    _repo(cache / "nested")
+    (cache / "nested" / ".git" / "worktrees" / "fake").mkdir(parents=True)
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["cache_status"] == "error"
+    assert "registered linked worktrees: fake" in str(row["cache_error"])
+
+
 def test_audit_census_state_inside_project_refuses(tmp_path: Path) -> None:
     root = _cache_fixture(tmp_path)
     result = _rust(root, census_state=root / "census.json")

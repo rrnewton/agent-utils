@@ -10,10 +10,9 @@
 //! Unregistered agent slots plan their caches from the Git
 //! checkouts they contain, and every subject plans under a fair
 //! share of the planning work and wall allowances. Resume-state
-//! reuse, validation-row nested-Git disposability judging,
-//! journal-slot cache planning, and unreadable host evidence
-//! stay with the Python edition for now and refuse by name.
-//! Read-only.
+//! reuse, journal-slot cache planning, and unreadable host
+//! evidence stay with the Python edition for now and refuse by
+//! name. Read-only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1189,6 +1188,394 @@ fn walk_cache_root(
     Ok((total, seen))
 }
 
+/// The nested-Git judgment's allowance: 900 seconds per cache
+/// root across its Git commands, 120 per command, shared with
+/// the census wall deadline.
+struct NestedGitBudget {
+    total_seconds: f64,
+    spent_seconds: f64,
+}
+
+impl NestedGitBudget {
+    fn command_seconds(&self) -> f64 {
+        (self.total_seconds - self.spent_seconds).clamp(0.0, 120.0)
+    }
+}
+
+struct NestedGitRun {
+    success: bool,
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run one judgment Git command with the oracle's controlled
+/// environment and bound; every failure is the refusal text.
+fn nested_git_run(
+    dotgit: &Path,
+    args: &[std::ffi::OsString],
+    budget: &mut NestedGitBudget,
+) -> std::result::Result<NestedGitRun, String> {
+    let args_text: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let refuse = |condition: String| {
+        format!(
+            "cache directory contains nested Git metadata: {}: not provably disposable: {condition}",
+            dotgit.display()
+        )
+    };
+    let seconds = budget.command_seconds();
+    if seconds <= 0.0 {
+        return Err(refuse(format!(
+            "nested Git judgment spent its {}-second allowance for this removal before git {}",
+            fmt_g(budget.total_seconds),
+            args_text.join(" ")
+        )));
+    }
+    let mut command = std::process::Command::new("git");
+    command.args([
+        "--no-pager",
+        "--no-replace-objects",
+        "-c",
+        "core.useReplaceRefs=false",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "advice.graftFileDeprecated=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "core.excludesFile=/dev/null",
+        "-c",
+        "core.ignoreStat=false",
+        "-c",
+        "protocol.allow=never",
+    ]);
+    let mut git_dir_arg = std::ffi::OsString::from("--git-dir=");
+    git_dir_arg.push(dotgit.as_os_str());
+    command.arg(git_dir_arg);
+    command.args(args);
+    command.current_dir("/");
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        use std::os::unix::ffi::OsStrExt as _;
+        if !key.as_bytes().starts_with(b"GIT_") {
+            command.env(key, value);
+        }
+    }
+    command.env("LC_ALL", "C");
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command.env("GIT_CONFIG_SYSTEM", "/dev/null");
+    command.env("GIT_GRAFT_FILE", "/dev/null");
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    command.env("GIT_ATTR_NOSYSTEM", "1");
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let started = std::time::Instant::now();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            budget.spent_seconds += started.elapsed().as_secs_f64();
+            return Err(refuse(format!("cannot execute Git: {error}")));
+        }
+    };
+    use std::io::Read as _;
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if started.elapsed().as_secs_f64() >= seconds {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    budget.spent_seconds += started.elapsed().as_secs_f64();
+                    return Err(refuse(format!(
+                        "git {} did not finish within {} seconds",
+                        args_text.join(" "),
+                        fmt_g(seconds)
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    budget.spent_seconds += started.elapsed().as_secs_f64();
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    match status {
+        Ok(status) => Ok(NestedGitRun {
+            success: status.success(),
+            code: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        }),
+        Err(error) => Err(refuse(format!("cannot execute Git: {error}"))),
+    }
+}
+
+fn nested_git_detail(run: &NestedGitRun) -> String {
+    let bytes = if run.stderr.is_empty() {
+        &run.stdout
+    } else {
+        &run.stderr
+    };
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    if text.is_empty() {
+        return format!("exit {}", run.code);
+    }
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(300)
+        .collect()
+}
+
+fn os_args(parts: &[&str]) -> Vec<std::ffi::OsString> {
+    parts.iter().map(std::ffi::OsString::from).collect()
+}
+
+fn nested_git_output(
+    dotgit: &Path,
+    args: &[std::ffi::OsString],
+    budget: &mut NestedGitBudget,
+) -> std::result::Result<String, String> {
+    let run = nested_git_run(dotgit, args, budget)?;
+    if !run.success {
+        let args_text: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        return Err(format!(
+            "cache directory contains nested Git metadata: {}: not provably disposable: git {} failed: {}",
+            dotgit.display(),
+            args_text.join(" "),
+            nested_git_detail(&run)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
+}
+
+/// Judge one nested repository in a completed validation's
+/// cache, as completed validation removal judges it: only
+/// whether deleting it reaches outside the cache. The refusal
+/// text is the oracle's.
+fn judge_nested_git(
+    dotgit: &Path,
+    budget: &mut NestedGitBudget,
+) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let refuse = |condition: String| {
+        format!(
+            "cache directory contains nested Git metadata: {}: not provably disposable: {condition}",
+            dotgit.display()
+        )
+    };
+    let metadata = std::fs::symlink_metadata(dotgit)
+        .map_err(|error| refuse(format!("cannot inspect .git: {error}")))?;
+    let kind = metadata.file_type();
+    if kind.is_symlink() {
+        return Err(refuse(
+            ".git is a symbolic link, not a repository directory".to_string(),
+        ));
+    }
+    if kind.is_file() {
+        return Err(refuse(
+            ".git is a file, not a repository directory (a linked worktree or submodule pointer)"
+                .to_string(),
+        ));
+    }
+    if !kind.is_dir() {
+        return Err(refuse(".git is not a directory".to_string()));
+    }
+    let located = nested_git_run(
+        dotgit,
+        &os_args(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ]),
+        budget,
+    )?;
+    if !located.success {
+        return Err(refuse(format!(
+            "not a well-formed Git repository: {}",
+            nested_git_detail(&located)
+        )));
+    }
+    let identity = (metadata.dev(), metadata.ino());
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        for line in located.stdout.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            let reported = PathBuf::from(std::ffi::OsStr::from_bytes(line));
+            let same = std::fs::metadata(&reported)
+                .map(|meta| (meta.dev(), meta.ino()) == identity)
+                .unwrap_or(false);
+            if !same {
+                return Err(refuse(format!(
+                    "Git reports repository directory {}, not this .git directory",
+                    reported.display()
+                )));
+            }
+        }
+    }
+    for config_name in ["config", "config.worktree"] {
+        let config_path = dotgit.join(config_name);
+        if config_name != "config" && !config_path.exists() {
+            continue;
+        }
+        let mut config_args = os_args(&["config", "--file"]);
+        config_args.push(config_path.clone().into_os_string());
+        config_args.extend(os_args(&["--null", "--list", "--name-only"]));
+        let names = nested_git_output(dotgit, &config_args, budget)?;
+        let keys: std::collections::BTreeSet<&str> =
+            names.split('\0').filter(|item| !item.is_empty()).collect();
+        for key in keys {
+            let lowered = key.to_lowercase();
+            if lowered.starts_with("include.") || lowered.starts_with("includeif.") {
+                return Err(refuse(format!(
+                    "repository config sets {key}, which could load configuration this check does not inspect"
+                )));
+            }
+            if lowered == "core.worktree" {
+                return Err(refuse(
+                    "repository config sets core.worktree, so its worktree may lie outside this cache"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    for (subdirectory, what) in [
+        ("worktrees", "registered linked worktrees"),
+        ("modules", "submodule repositories under .git/modules"),
+    ] {
+        let held: Vec<String> = match std::fs::read_dir(dotgit.join(subdirectory)) {
+            Ok(listing) => {
+                let mut names: Vec<String> = Vec::new();
+                for entry in listing {
+                    match entry {
+                        Ok(entry) => names.push(entry.file_name().to_string_lossy().into_owned()),
+                        Err(error) => {
+                            return Err(refuse(format!(
+                                "cannot inspect .git/{subdirectory}: {error}"
+                            )));
+                        }
+                    }
+                }
+                names.sort();
+                names
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(refuse(format!(
+                    "cannot inspect .git/{subdirectory}: {error}"
+                )));
+            }
+        };
+        if !held.is_empty() {
+            return Err(refuse(format!(
+                "repository has {what}: {}",
+                held.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+    }
+    let _head = nested_git_run(
+        dotgit,
+        &os_args(&["rev-parse", "-q", "--verify", "HEAD^{commit}"]),
+        budget,
+    )?;
+    Ok(())
+}
+
+/// The outcome of judging a completed validation cache's
+/// nested repositories: clean, the first refusal, or the wall
+/// deadline expiring mid-judgment (which the oracle publishes
+/// as a partial root, never an error).
+enum NestedJudgment {
+    Clean,
+    Refused(String),
+    TimedOut,
+}
+
+/// Judge every nested repository a completed validation cache
+/// contains, in the oracle's order; the first refusal wins.
+fn judge_audited_nested(
+    root: &Path,
+    seen: &BTreeMap<PathBuf, CacheIdentity>,
+    deadline: std::time::Instant,
+) -> NestedJudgment {
+    let mut dotgits: Vec<PathBuf> = seen
+        .keys()
+        .filter(|path| {
+            path.as_path() != root && path.file_name().is_some_and(|name| name == ".git")
+        })
+        .cloned()
+        .collect();
+    dotgits.sort_by(|a, b| {
+        let a_parts: Vec<String> = a
+            .strip_prefix(root)
+            .unwrap_or(a)
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let b_parts: Vec<String> = b
+            .strip_prefix(root)
+            .unwrap_or(b)
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        a_parts.cmp(&b_parts)
+    });
+    if dotgits.is_empty() {
+        return NestedJudgment::Clean;
+    }
+    let remaining = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs_f64();
+    let mut budget = NestedGitBudget {
+        total_seconds: remaining.min(900.0),
+        spent_seconds: 0.0,
+    };
+    for dotgit in &dotgits {
+        if std::time::Instant::now() >= deadline {
+            return NestedJudgment::TimedOut;
+        }
+        if let Err(error) = judge_nested_git(dotgit, &mut budget) {
+            if std::time::Instant::now() >= deadline {
+                return NestedJudgment::TimedOut;
+            }
+            return NestedJudgment::Refused(error);
+        }
+    }
+    NestedJudgment::Clean
+}
+
 /// One cache root's bounded census: measure, re-verify the same
 /// identities and bytes, then re-stat every recorded identity
 /// before a total may publish as complete.
@@ -1259,6 +1646,13 @@ fn traverse_cache_root(
                     path.display()
                 ))
             }
+        }
+    }
+    if validation_complete {
+        match judge_audited_nested(root, &seen, deadline) {
+            NestedJudgment::Clean => {}
+            NestedJudgment::Refused(error) => return CacheMeasurement::error(error),
+            NestedJudgment::TimedOut => return CacheMeasurement::partial(),
         }
     }
     CacheMeasurement::complete(measured)
