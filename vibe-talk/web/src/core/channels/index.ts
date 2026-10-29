@@ -8,6 +8,7 @@ export {
   deltaSideState,
   exactCount,
   foldDeltaIn,
+  foldPageIn,
   goneByAbsence,
   heldCopies,
   heldNow,
@@ -18,7 +19,7 @@ export {
   removedSince,
   upsertThreadSummary,
 } from "./fold.ts";
-export type { DeltaFoldDependencies, PageFold, PageFoldDependencies } from "./fold.ts";
+export type { DeltaFoldDependencies, PageFold, PageFoldDependencies, PageFoldInDependencies } from "./fold.ts";
 export { serverVersions } from "./versions.ts";
 export type { ServerVersions } from "./versions.ts";
 export { coverViewOf, projectionOf } from "./views.ts";

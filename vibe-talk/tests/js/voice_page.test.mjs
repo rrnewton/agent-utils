@@ -6626,6 +6626,34 @@ test("`#624 voice-page-modularity`: an unplaced message placed by a read, and wh
   assert.deepStrictEqual(canon.messages.map((m) => m.id), ["1"]);
 });
 
+test("`#624 voice-page-modularity`: a page folded into a store, from the module alone, the page's part injected in order", () => {
+  const { emptyCanon, foldPageIn, createCopyOrder, createRemovals } = CHANNELS;
+  const at = (s) => `2026-10-01T00:00:${String(s).padStart(2, "0")}Z`;
+  const canon = emptyCanon("c");
+  const seen = [];
+  const deps = {
+    ledger: createCopyOrder(), removals: createRemovals(), numberOf: () => 3,
+    foldOf: (held) => { seen.push(["fold", held]); return { takes: () => true, answers: () => true }; },
+    scopeChanged: () => seen.push(["scope"]),
+    staleAsOf: () => null,
+    foldReadState: () => seen.push(["read"]),
+    noteReplyGaps: (before) => seen.push(["gaps", before.size]),
+  };
+  const page = { messages: [{ id: "1", timestamp: at(1) }, { id: "2", timestamp: at(2) }], has_more: true, has_threads: true,
+    next_after: "cur", thread: { id: "t" } };
+  foldPageIn(canon, page, false, "main", null, "main", null, deps);
+  assert.deepStrictEqual(canon.messages.map((m) => m.id), ["1", "2"]);
+  assert.deepStrictEqual([canon.scope, canon.hasThreads], ["t", true], "a page naming its thread did not scope the channel");
+  const cover = canon.views.get("main");
+  assert.deepStrictEqual([cover.newest, cover.fullSent, cover.more, cover.floor], ["cur", 3, true, Date.parse(at(1))]);
+  assert.deepStrictEqual(seen, [["scope"], ["fold", null], ["read"], ["gaps", 0]], "the page's part came in another order");
+  // A page the server answered from its own copy moves no cover, cursor or full read.
+  seen.length = 0;
+  foldPageIn(canon, { ...page, refresh_failed: "slow", next_after: "other" }, false, "main", null, "main", null, deps);
+  assert.equal(canon.views.get("main").newest, "cur", "a failed refresh moved the forward cursor");
+  assert.deepStrictEqual(seen.map(([what]) => what), ["fold", "read", "gaps"], "a scope that did not change asked for columns");
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -74768,8 +74796,9 @@ for (const mode of ["newest", "delta"]) {
     // placing read was sent; or the delta, which no longer continues All, putting back nothing. Either
     // way the placing read is marked as having answered, and the reply is in no column and not held.
     const control = await run(mode === "newest"
-      ? brokenScriptEach(COUNTS_SPEAK_FOR_ALL,
-        ["    cover.fullSent = sentNumberOf(payload);\n", "    cover.fullSent = timelineAnswersAsked + 1;\n"])
+      // `timelineAnswersAsked` is the legacy script's, found in the page's global scope at run time.
+      ? await brokenModule([{ file: "src/core/channels/fold.ts", find: "      cover.fullSent = deps.numberOf();\n",
+        replace: "      cover.fullSent = timelineAnswersAsked + 1;\n" }], brokenScriptEach(COUNTS_SPEAK_FOR_ALL))
       : await brokenModule([{ file: "src/core/channels/placement.ts", find: "  const back = newerPage(canon, \"flat\", number) ? []",
         replace: "  const back = true ? []" }], brokenScriptEach(COUNTS_SPEAK_FOR_ALL)));
     assert.equal(savedMessage(control.page, "300"), null, "the reply was held anyway, so this test cannot see it");
@@ -74839,8 +74868,8 @@ for (const change of ["removed", "edited"]) {
 
     // THE CONTROL: with nothing to say which was sent first, the older page is folded over the newer,
     // if also folded whatever the store has lost or replaced since it was sent (review rounds 4 and 5).
-    const unordered = ["    cover.fullSent = sentNumberOf(payload);\n", ""];
-    const control = await run(brokenScriptEach(unordered, FOLD_OVER_ANY_STORE));
+    const unordered = { file: "src/core/channels/fold.ts", find: "      cover.fullSent = deps.numberOf();\n", replace: "" };
+    const control = await run(await brokenModule([unordered], brokenScriptEach(FOLD_OVER_ANY_STORE)));
     assert.ok(change === "removed" ? shownIds(control.page).includes("202") : !savedMessage(control.page, "202").content.endsWith("edited"),
       "the older page was not folded anyway, so this test cannot see it");
   });

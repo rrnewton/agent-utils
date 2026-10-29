@@ -30,6 +30,7 @@ export {
   exactCount,
   foldDeltaIn,
   foldLiveIn,
+  foldPageIn,
   forgetUnplaced,
   goneByAbsence,
   heldCopies,

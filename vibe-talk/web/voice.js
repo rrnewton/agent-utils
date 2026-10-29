@@ -23910,62 +23910,22 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
     // Copies of another store say nothing of this one's.
     held = null;
   }
-  const hasMore = payload.has_more === true;
-  // Outside the thread view a page names a thread only when the channel IS that one thread.
-  const scopeWas = channelCanon.scope;
-  if (view !== "thread") channelCanon.scope = payload.thread ? String(payload.thread.id) : null;
-  // A channel that is one thread has no other thread to show beside it. `#229 desktop-two-column`.
-  if (channelCanon.scope !== scopeWas) Promise.resolve().then(renderColumns);
-  const before = view === "threads" ? new Map() : heldCopies(channelCanon, payload.messages || []);
-  const fold = pageFold(channelCanon, payload, held);
-  // `#611 timeline-read-failures`. A page the server answered from its own copy, the chat service
-  // having failed or kept it waiting, adds and updates rows and answers for nothing it lacks: the
-  // copy may have gaps and may lag. Nor does it move a view already covered, its forward cursor or
-  // its last full read, so the next read reads as if this one had failed.
-  const failed = refreshFailed(payload);
-  const covered = channelCanon.views.has(viewKey(view, thread));
-  const taken = view === "threads" ? [] : (payload.messages || []).filter(fold.takes);
-  if (view === "threads") {
-    // `#614 timeline-read-failures`: a thread list from the server's own copy answers for no card
-    // it lacks either.
-    mergeIntoCanon(channelCanon, "threads", payload.threads || [], older, hasMore, () => !failed);
-  } else {
-    const inPage = view === "flat" ? allPageAnswersFor(channelCanon, payload.messages || [], Boolean(payload.notice))
-      : (message) => inView(message, view, thread);
-    mergeIntoCanon(channelCanon, "messages", taken, older, hasMore,
-      (message) => !failed && fold.answers(message) && inPage(message), payload.messages || []);
-    // What it took stands where it was sent (`copyOrder`).
-    orderCopiesRead(taken, sentNumberOf(payload));
-  }
-  if (payload.thread) upsertThreadSummary(channelCanon, payload.thread);
-  if (view !== "thread") channelCanon.hasThreads = payload.has_threads === true;
-  if (!failed || !covered) {
-    coverView(view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore, payload.notice || "",
-      view, thread);
-  }
-  if (!older) {
-    const cover = channelCanon.views.get(viewKey(view, thread));
-    if (!failed) {
-      cover.newest = payload.next_after || null;
-      cover.fullAt = Date.now();
-      cover.fullSent = sentNumberOf(payload);
-    }
-    const asOf = staleAsOf(payload);
-    if (asOf !== null) cover.at = asOf;
-  }
-  // A page is the server's own answer for every message on it, thread record or none...
-  for (const message of taken) channelCanon.unplaced.delete(String(message.id));
-  believeCarried(channelCanon, payload);
-  for (const summary of [...(payload.threads || []), payload.thread]) {
-    if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
-  }
-  // ...and one it did not take the copy of still says where it is, if the stream left that unplaced.
-  if (view !== "threads" && taken.length < (payload.messages || []).length) {
-    placeFromPage(payload, channelCanon, sentNumberOf(payload), held);
-  }
-  // ...and read state too, and what it says of the replies the store lacks. `#222 unread-replies`.
-  foldReadState(payload, view);
-  noteReplyGaps(payload, view, older, false, before);
+  // The store's part (web/src/core/channels `foldPageIn`); what it does to the page besides the store is
+  // passed in, to happen where it always did.
+  foldPageIn(channelCanon, payload, older, view, thread, viewKey(view, thread), held, {
+    ledger: copyLedger,
+    removals: removalRecord,
+    numberOf: () => sentNumberOf(payload),
+    foldOf: (heldNow) => pageFold(channelCanon, payload, heldNow),
+    scopeChanged: () => {
+      Promise.resolve().then(renderColumns);
+    },
+    staleAsOf: () => staleAsOf(payload),
+    foldReadState: () => {
+      foldReadState(payload, view);
+    },
+    noteReplyGaps: (before) => noteReplyGaps(payload, view, older, false, before),
+  });
 }
 
 /**

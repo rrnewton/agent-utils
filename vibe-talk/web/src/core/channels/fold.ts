@@ -2,12 +2,14 @@
 // the legacy script a group at a time; plan step 10). Each takes the store it works on.
 
 import type { Message, MessageThread, ThreadSummary, TimelineDelta, TimelineResponse } from "../../contract/index.ts";
-import type { ChannelCanon } from "./canon.ts";
+import type { ChannelCanon, ViewCover } from "./canon.ts";
 import type { CopyOrder } from "./order.ts";
 import type { Removals } from "./removals.ts";
 import type { ServerVersions } from "./versions.ts";
 import { serverVersions } from "./versions.ts";
-import { inTimeOrder, sameMessage, threadOf, timeOf } from "./canon.ts";
+import { inTimeOrder, inViewOf, sameMessage, threadOf, timeOf } from "./canon.ts";
+import { placeFromPage } from "./placement.ts";
+import { coverViewOf } from "./views.ts";
 
 /** A row of either list the store holds. */
 type Row = Message | ThreadSummary;
@@ -474,4 +476,99 @@ export function foldDeltaIn(
   });
   canon.complete = delta.complete === true;
   return true;
+}
+
+/** What `foldPageIn` asks of the page, each at the point the fold always did it. */
+export interface PageFoldInDependencies {
+  /** The copy-order ledger. */
+  readonly ledger: CopyOrder;
+  /** The record of removals. */
+  readonly removals: Removals;
+  /** Where the page's read was sent in the order of reads (`sentNumberOf`). */
+  numberOf(): number;
+  /** What the page may fold over the store's copies as its read was sent, `held` (`pageFold`). */
+  foldOf(held: Map<string, Message> | null): PageFold;
+  /** The channel's scope changed: a channel that is one thread has no other to show beside it. */
+  scopeChanged(): void;
+  /** When the server says the page is complete up to, if old enough to say so (`staleAsOf`). */
+  staleAsOf(): number | null;
+  /** Fold the page's read state (`foldReadState`). */
+  foldReadState(): void;
+  /** What the page says of the replies the store lacks, `before` its copies were folded (`noteReplyGaps`). */
+  noteReplyGaps(before: Map<string, Message>): void;
+}
+
+/**
+ * Fold a page read for view `view` (thread `thread`, under view key `key`) into store `canon`. Never a message removed
+ * upstream after the read was sent; and `held`, when given, is the store's copies as a late read was
+ * sent (`heldNow`): it is folded only over the copies older than it (`pageFold`, `#316
+ * late-counts-resurrect`, `#310 stale-live-read-flicker`). What it takes stands where it was sent
+ * (`copyOrder`).
+ */
+export function foldPageIn(
+  canon: ChannelCanon,
+  payload: TimelineResponse,
+  older: boolean,
+  view: string,
+  thread: string | null,
+  key: string,
+  held: Map<string, Message> | null,
+  deps: PageFoldInDependencies,
+): void {
+  const hasMore = payload.has_more === true;
+  // Outside the thread view a page names a thread only when the channel IS that one thread.
+  const scopeWas = canon.scope;
+  if (view !== "thread") canon.scope = payload.thread ? String(payload.thread.id) : null;
+  // A channel that is one thread has no other thread to show beside it. `#229 desktop-two-column`.
+  if (canon.scope !== scopeWas) deps.scopeChanged();
+  const before = view === "threads" ? new Map<string, Message>() : heldCopies(canon, payload.messages || []);
+  const fold = deps.foldOf(held);
+  // `#611 timeline-read-failures`. A page the server answered from its own copy, the chat service
+  // having failed or kept it waiting, adds and updates rows and answers for nothing it lacks: the
+  // copy may have gaps and may lag. Nor does it move a view already covered, its forward cursor or
+  // its last full read, so the next read reads as if this one had failed.
+  const failed = refreshFailed(payload);
+  const covered = canon.views.has(key);
+  const taken = view === "threads" ? [] : (payload.messages || []).filter(fold.takes);
+  if (view === "threads") {
+    // `#614 timeline-read-failures`: a thread list from the server's own copy answers for no card
+    // it lacks either.
+    mergeIntoCanon(canon, "threads", payload.threads || [], older, hasMore, () => !failed);
+  } else {
+    const inPage = view === "flat" ? allPageAnswersFor(canon, payload.messages || [], Boolean(payload.notice))
+      : (message: Message) => inViewOf(message, view, thread, canon.scope);
+    mergeIntoCanon(canon, "messages", taken, older, hasMore,
+      (message) => !failed && fold.answers(message) && inPage(message), payload.messages || []);
+    // What it took stands where it was sent (`copyOrder`).
+    deps.ledger.orderCopiesRead(canon, taken, deps.numberOf());
+  }
+  if (payload.thread) upsertThreadSummary(canon, payload.thread);
+  if (view !== "thread") canon.hasThreads = payload.has_threads === true;
+  if (!failed || !covered) {
+    coverViewOf(canon, key, view, view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore,
+      payload.notice || "");
+  }
+  if (!older) {
+    const cover = canon.views.get(key) as ViewCover;
+    if (!failed) {
+      cover.newest = payload.next_after || null;
+      cover.fullAt = Date.now();
+      cover.fullSent = deps.numberOf();
+    }
+    const asOf = deps.staleAsOf();
+    if (asOf !== null) cover.at = asOf;
+  }
+  // A page is the server's own answer for every message on it, thread record or none...
+  for (const message of taken) canon.unplaced.delete(String(message.id));
+  deps.removals.believeCarried(canon, payload, deps.numberOf);
+  for (const summary of [...(payload.threads || []), payload.thread]) {
+    if (summary && summary.root) canon.unplaced.delete(String(summary.root.id));
+  }
+  // ...and one it did not take the copy of still says where it is, if the stream left that unplaced.
+  if (view !== "threads" && taken.length < (payload.messages || []).length) {
+    placeFromPage(payload, canon, deps.numberOf(), held, deps.ledger);
+  }
+  // ...and read state too, and what it says of the replies the store lacks. `#222 unread-replies`.
+  deps.foldReadState();
+  deps.noteReplyGaps(before);
 }
