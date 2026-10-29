@@ -115,6 +115,11 @@ impl MuseEditor {
             return None;
         }
         let prompt = self.staged.take()?;
+        // Muse answers a `/goal` command on a row of its own and prints no user turn for it.
+        if let Some(argument) = crate::goal_command::argument(&prompt) {
+            self.history.push(format!("◆ Goal set — {argument}"));
+            return Some(prompt);
+        }
         if self.busy {
             self.history.push(format!("❯ {prompt}"));
         } else {

@@ -1074,6 +1074,40 @@ def _readback_tail(text: str) -> str:
     return _readback_form(text)[-40:]
 
 
+# Markers that start the rows where typed input lands in a harness pane: the composer and the
+# user turns above it. Claude Code and Muse draw both after ``❯``; Codex draws a user turn after
+# ``›``, input it holds for a running turn after ``↳``, and its input box after ``»``.
+_INPUT_MARKERS = ("❯", "›", "↳", "»")
+
+
+def _input_occurrences(screen: str, text: str) -> int:
+    """How often ``text`` shows, compared as read-back compares it, only where typed input lands
+    in another agent's pane: in a run of rows that starts with an input-marker row and goes on
+    over the blank and indented rows under it, up to a row at the left edge, a rule, or a tool
+    output row (``⎿`` or ``└``). The same words printed anywhere else, such as in the output of
+    a command that read this target's screen, were not typed into that pane."""
+    tail = _readback_tail(text)
+    if not tail:
+        return 0
+    regions: list[list[str]] = []
+    open_region = False
+    for line in screen.splitlines():
+        stripped = line.lstrip()
+        if any(stripped == marker or stripped.startswith((marker + " ", marker + "\u00a0"))
+               for marker in _INPUT_MARKERS):
+            regions.append([])
+            open_region = True
+        elif not stripped:
+            continue
+        elif (not open_region or len(stripped) == len(line) or stripped.startswith(("⎿", "└"))
+              or set(stripped) <= {"─", "━", "═"}):
+            open_region = False
+            continue
+        if regions:
+            regions[-1].append(line)
+    return sum(_readback_form("\n".join(region)).count(tail) for region in regions)
+
+
 class RecipientUnanchored(RecipientChanged):
     """The record pins no harness process or observed session, so input is refused."""
 
@@ -1199,7 +1233,8 @@ class _WorkspaceClient:
         windows: dict[str, int] = {}
         for pane in panes:
             try:
-                windows[pane] = self._window(pane, text)
+                # Another agent's pane counts the prompt only where typed input lands in it.
+                windows[pane] = self._window(pane, text, peer=pane != pane_id)
             except (HerdrUnavailable, AgentDeliveryError) as exc:
                 missing = _missing_target(exc) if pane != pane_id else None
                 if missing is None:
@@ -1211,20 +1246,24 @@ class _WorkspaceClient:
                 })
         return windows
 
-    def _window(self, pane: str, text: str) -> int:
-        """How often the text shows in the pane's scrollback."""
+    def _window(self, pane: str, text: str, *, peer: bool = False) -> int:
+        """How often the text shows in the pane's scrollback; in another agent's pane, only
+        where typed input lands."""
         tail = _readback_tail(text)
         if not tail:
             return 0
-        return _readback_form(self.client.read_scrollback(pane)).count(tail)
+        screen = self.client.read_scrollback(pane)
+        if peer:
+            return _input_occurrences(screen, text)
+        return _readback_form(screen).count(tail)
 
-    def _observe(self, pane: str, text: str, before: dict[str, int]) -> str:
+    def _observe(self, pane: str, text: str, before: dict[str, int], *, peer: bool = False) -> str:
         """``fresh`` when the text shows more often than before. When it does not, a pane
         that already showed it is ``uncertain``: an old occurrence may have scrolled or
         redrawn out as a new one came in, which equal counts cannot tell apart, whatever
         the window's length and even when the bytes read are unchanged. Otherwise
         ``absent``."""
-        count = self._window(pane, text)
+        count = self._window(pane, text, peer=peer)
         old_count = before.get(pane, 0)
         if count > old_count:
             return "fresh"
@@ -1246,7 +1285,8 @@ class _WorkspaceClient:
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
     def _peer_states(self, pane_id: str, text: str, before: dict[str, int]) -> dict[str, str]:
-        return {peer: self._observe(peer, text, before) for peer in before if peer != pane_id}
+        return {peer: self._observe(peer, text, before, peer=True)
+                for peer in before if peer != pane_id}
 
     def _deliver_checked(
         self, pane_id: str, command: str, guarded: _GuardedTerminal,

@@ -912,6 +912,37 @@ def test_by_default_a_prompt_in_another_pane_is_quarantined_and_nothing_is_typed
     assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
 
 
+def test_the_prompt_printed_in_another_agents_tool_output_is_no_misroute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Another agent read this target's screen and its command output now shows the prompt, as
+    # when a coordinator greps a worker's pane. Typed input lands only in a composer or a user
+    # turn, so those words are no evidence of a misroute: the target shows it, and it is
+    # delivered.
+    manager, fake, _pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    text = "a long enough instruction for the worker only"
+    real = fake.read_scrollback
+    printed: list[bool] = []
+
+    def peer_reads_target(pane_id: str) -> str:
+        if pane_id == other and printed:
+            return ("● Bash(herdr pane read w1:p1 | grep instruction)\n"
+                    f"  ⎿  {text}\n{text} (quoted at the left edge)\n")
+        return real(pane_id)
+
+    def note_effect(effect_pane: str) -> None:
+        fake.before_effect = None
+        printed.append(True)
+
+    monkeypatch.setattr(fake, "read_scrollback", peer_reads_target)
+    fake.before_effect = note_effect
+    assert manager.send("worker", text).delivered
+    assert subagents.MISROUTE_NOTE not in fake.submitted
+
+
 def test_prompt_new_in_target_and_peer_is_quarantined_without_a_note(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -17,6 +17,7 @@ pub mod client;
 pub mod codex_goal;
 pub(crate) mod credentials;
 pub mod error;
+pub mod goal_command;
 pub mod harness;
 pub mod harness_tui;
 pub mod headless;

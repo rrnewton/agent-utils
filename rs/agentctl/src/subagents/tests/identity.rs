@@ -1068,6 +1068,11 @@ fn add_bystander(fixture: &Fixture) {
 
 const LONG: &str = "a long enough instruction for the worker only";
 
+/// `text` as a harness draws typed input: a user turn after its input marker.
+fn typed(text: &str) -> String {
+    format!("❯ {text}")
+}
+
 #[test]
 fn a_note_that_never_shows_in_the_wrong_pane_is_not_a_recovery() {
     TEST_COUNTERMAND.with(|enabled| enabled.set(Some(true)));
@@ -1130,11 +1135,11 @@ fn a_peer_window_moving_past_an_old_match_is_uncertain() {
     add_bystander(&fixture);
     fixture.client.scrollback.lock().unwrap().insert(
         "peer".to_owned(),
-        vec![LONG.to_owned(), "output after the old match".to_owned()],
+        vec![typed(LONG), "output after the old match".to_owned()],
     );
     *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
         "peer".to_owned(),
-        vec!["output after the old match".to_owned(), LONG.to_owned()],
+        vec!["output after the old match".to_owned(), typed(LONG)],
     ));
     let error = send(&fixture, "worker", LONG).expect_err("quarantined");
     assert!(
@@ -1152,7 +1157,7 @@ fn a_full_peer_window_with_an_old_match_is_uncertain() {
     let mut lines: Vec<String> = (0..SCROLLBACK_LINES - 1)
         .map(|index| format!("line {index}"))
         .collect();
-    lines.push(LONG.to_owned());
+    lines.push(typed(LONG));
     fixture
         .client
         .scrollback
@@ -1174,13 +1179,13 @@ fn a_peer_that_changed_after_an_old_match_is_uncertain() {
     add_bystander(&fixture);
     fixture.client.scrollback.lock().unwrap().insert(
         "peer".to_owned(),
-        vec![LONG.to_owned(), "output after the old match".to_owned()],
+        vec![typed(LONG), "output after the old match".to_owned()],
     );
     // The peer kept printing: same count, changed window, so the old copy proves nothing.
     *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
         "peer".to_owned(),
         vec![
-            LONG.to_owned(),
+            typed(LONG),
             "output after the old match".to_owned(),
             "more output".to_owned(),
         ],
@@ -1265,12 +1270,33 @@ fn a_prompt_the_target_never_shows_is_quarantined_as_unproven() {
 }
 
 #[test]
+fn the_prompt_printed_in_another_agents_tool_output_is_no_misroute() {
+    // Another agent read this target's screen and its command output now shows the prompt, as
+    // when a coordinator greps a worker's pane. Typed input lands only in a composer or a user
+    // turn, so those words are no evidence that the prompt went there: the target shows it, and
+    // it is delivered.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
+        "peer".to_owned(),
+        vec![
+            "● Bash(herdr pane read w1:p1 | grep instruction)".to_owned(),
+            format!("  ⎿  {LONG}"),
+            format!("{LONG} (quoted at the left edge)"),
+        ],
+    ));
+    send(&fixture, "worker", LONG).expect("delivered");
+    assert!(!runs(&fixture).contains(&MISROUTE_NOTE.to_owned()));
+}
+
+#[test]
 fn a_prompt_new_in_target_and_peer_is_quarantined_without_a_note() {
     let fixture = Fixture::new();
     fixture.start(None);
     add_bystander(&fixture);
     *fixture.client.scrollback_on_effect.lock().unwrap() =
-        Some(("peer".to_owned(), vec![LONG.to_owned()]));
+        Some(("peer".to_owned(), vec![typed(LONG)]));
     let error = send(&fixture, "worker", LONG).expect_err("quarantined");
     assert!(
         error.to_string().contains("cannot be attributed"),
@@ -1368,7 +1394,7 @@ fn a_peer_prompt_discovered_after_a_transient_read_failure_is_still_quarantined(
     fixture.start(None);
     add_bystander(&fixture);
     *fixture.client.scrollback_on_effect.lock().unwrap() =
-        Some(("peer".to_owned(), vec![LONG.to_owned()]));
+        Some(("peer".to_owned(), vec![typed(LONG)]));
     *fixture.client.fail_scrollback_after_effect.lock().unwrap() = Some(("peer".to_owned(), 1));
     let error = send(&fixture, "worker", LONG).expect_err("the peer also shows this prompt");
     assert!(

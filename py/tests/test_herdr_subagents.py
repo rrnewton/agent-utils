@@ -299,7 +299,9 @@ class FakeManagedClient:
 
     def read_scrollback(self, pane_id: str) -> str:
         assert pane_id in self.infos
-        return "\n".join(self.transcripts.get(pane_id, []))
+        # A harness draws typed input as a user turn after its input marker.
+        return "\n".join("❯ " + entry.replace("\n", "\n  ")
+                         for entry in self.transcripts.get(pane_id, []))
 
     def close_tab(self, tab_id: str) -> None:
         self.closed.append(tab_id)

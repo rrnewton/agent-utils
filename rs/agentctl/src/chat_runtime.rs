@@ -8228,6 +8228,17 @@ impl BridgeState {
         })
     }
 
+    /// The command to type raw for a request whose message is exactly one `/goal` command with
+    /// an argument (`/goal OBJECTIVE`, `/goal clear`, `/goal pause` and so on), trimmed; `None`
+    /// for any other message, and for a headless coordinator, which has no composer to take a
+    /// harness command. The sender was authorized at admission like any other.
+    fn goal_command(&self, record: &RequestRecord) -> Option<String> {
+        (!self.command_only_replies)
+            .then(|| crate::goal_command::argument(&record.message.text))
+            .flatten()
+            .map(|_| record.message.text.trim().to_owned())
+    }
+
     /// [`Self::prompt`] as it is queued for the coordinator: its opening is left for the queue to
     /// decide when the prompt is typed, which may be long after it is queued. See `prompt_time`.
     pub(crate) fn queued_prompt(&self, key: &str, screen: &str) -> Result<String> {
@@ -12684,6 +12695,17 @@ pub(crate) fn deliver_request_with(
             },
             Err(error) => Some(error),
         },
+        // A message that is exactly one `/goal` command is typed raw, as the harness's own
+        // command, rather than wrapped in a request prompt: see [`BridgeState::goal_command`].
+        None if state.goal_command(&record).is_some() => {
+            let command = state.goal_command(&record).unwrap_or_default();
+            match guard_typing(state, delivery, None) {
+                Ok(()) => delivery
+                    .submit(agent_name, &command, message_id, options)
+                    .err(),
+                Err(error) => Some(error),
+            }
+        }
         None => {
             offer_approval_answer(delivery, agent_name, &record);
             match prompt_screen(state, delivery, agent_name) {
@@ -12708,6 +12730,7 @@ pub(crate) fn deliver_request_with(
         // prompt only once the model started it.
         state.note_started(delivery, message_id);
         state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
+        confirm_goal_command(state, delivery, &record);
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
 
@@ -12715,6 +12738,7 @@ pub(crate) fn deliver_request_with(
         Ok(Some(QueueMessageState::Processed)) => {
             state.note_started(delivery, message_id);
             state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
+            confirm_goal_command(state, delivery, &record);
             Ok(CoordinatorDeliveryResult::Delivered)
         }
         Ok(Some(QueueMessageState::Cancelled)) => {
@@ -12747,6 +12771,53 @@ pub(crate) fn deliver_request_with(
             state.set_delivery_phase(key, RequestPhase::Submitting, Some(&detail))?;
             Ok(CoordinatorDeliveryResult::Pending(detail))
         }
+    }
+}
+
+/// After a `/goal` command typed raw reached the coordinator, send the request's one reply from
+/// the bridge itself, since the agent writes none: what the harness answered, which the queue's
+/// submission proof saw on its screen, read again here. The request's replies are then closed.
+/// Neither step can undo the delivery, so a failure is only logged; a reply refused or not sent
+/// leaves the request delivered without one.
+fn confirm_goal_command(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    record: &RequestRecord,
+) {
+    let Some(command) = state.goal_command(record) else {
+        return;
+    };
+    if !state.config.outbound_enabled {
+        return;
+    }
+    let agent_name = &state.config.agent_name;
+    let answer = delivery
+        .screen(agent_name)
+        .ok()
+        .and_then(|screen| crate::goal_command::latest_answer(&crate::harness_tui::plain(&screen)));
+    let body = match answer {
+        Some(answer) => {
+            format!("Typed `{command}` into {agent_name}'s composer. It answered: {answer}")
+        }
+        None => format!("Typed `{command}` into {agent_name}'s composer, and it took the command."),
+    };
+    let identifier = format!(
+        "{}_{}",
+        record.reply_nonce,
+        record.next_reply_ordinal.max(1)
+    );
+    let stored = state.submit_reply(&record.key, &identifier, &body);
+    if let Err(error) = &stored {
+        crate::chat_service::service_log(format_args!(
+            "agentctl: request {} typed its goal command, but its confirmation was not stored: {error}",
+            record.key
+        ));
+    }
+    if let Err(error) = state.close_replies(&record.key) {
+        crate::chat_service::service_log(format_args!(
+            "agentctl: request {} typed its goal command, but its replies could not be closed: {error}",
+            record.key
+        ));
     }
 }
 
@@ -32371,6 +32442,86 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             ]
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_goal_command_message_is_typed_raw_and_answered_by_the_bridge() {
+        // A message that is exactly one `/goal` command reaches the coordinator as that command,
+        // not wrapped in a request prompt, and the bridge itself replies with what the harness
+        // answered, then closes the request's replies, since the agent writes no reply to it.
+        let root = temporary("goal-command-raw");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&indexed_delivery_at(
+                1,
+                1,
+                "cursor-1",
+                "  /goal ship the release  ",
+            ))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let delivery = FakeDelivery::default();
+        *delivery.screen.lock().expect("screen") = format!(
+            "◆ earlier answer\n◆ Goal set — ship the release\n{}\n❯\n{}\n  model · xhigh · /work · \
+             YOLO   Goal (0s) 0% ░░░░░░░░░░\n",
+            "─".repeat(20),
+            "─".repeat(20)
+        );
+        assert_eq!(
+            deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(
+            *delivery.submitted_prompts.lock().expect("prompts"),
+            ["/goal ship the release"]
+        );
+        let request = state.read_request(&key).expect("request");
+        assert_eq!(request.phase, RequestPhase::Delivered);
+        assert!(request.reply_closed);
+        assert_eq!(request.next_reply_ordinal, 2);
+        let inspection = state.inspect_request(&key).expect("inspect");
+        let replies = inspection["replies"].as_array().expect("replies");
+        assert_eq!(replies.len(), 1, "{inspection}");
+        let stored = fs::read_dir(root.join("replies"))
+            .expect("reply directory")
+            .flatten()
+            .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+            .collect::<String>();
+        assert!(
+            stored.contains("Typed `/goal ship the release` into ")
+                && stored.contains("It answered: Goal set — ship the release"),
+            "{stored}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // Any other message, a slash command other than `/goal`, or `/goal` alone, is a request
+        // prompt as before.
+        for text in [
+            "please /goal ship it",
+            "/compact",
+            "/goal",
+            "/goal ship\nit",
+        ] {
+            let root = temporary("goal-command-not-raw");
+            let state = BridgeState::initialize(&root, config()).expect("initialize state");
+            let key = state
+                .admit_batch(&indexed_delivery_at(1, 1, "cursor-1", text))
+                .expect("admit request")
+                .new_request_keys[0]
+                .clone();
+            let delivery = FakeDelivery::default();
+            deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+                .expect("deliver request");
+            let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
+            assert!(prompts[0].contains("<CHAT_REPLY_"), "{text:?}: {prompts:?}");
+            assert!(
+                !state.read_request(&key).expect("request").reply_closed,
+                "{text:?}"
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
     }
 
     #[test]

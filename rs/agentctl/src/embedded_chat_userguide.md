@@ -1504,6 +1504,49 @@ without counting an attempt, so a later retry types it again. If the composer
 cannot be proved empty, the prompt is left there and the request is
 `delivery_uncertain`, as for any prompt left staged.
 
+### Setting a goal from chat
+
+A message that is exactly one `/goal` command with an argument, such as
+`/goal ship the release and report back`, `/goal clear`, `/goal pause` or
+`/goal resume`, is typed into the coordinator's composer as that command,
+raw, instead of being wrapped in a request prompt. Muse, Claude Code and Codex
+each run it as their native `/goal`. Only `/goal` is treated this way: `/goal`
+alone, a `/goal` command with more than one line or more than 2,000 characters
+after it, any other slash command, and a message that only mentions `/goal`
+are ordinary requests. The sender must be allowed exactly as for any request.
+A headless coordinator has no composer, so there such a message is an ordinary
+request too.
+
+Like any prompt that starts with `/`, the command is typed only while herdr
+reports the pane `idle` or `done`, never into a running turn, even with
+`--deliver-while-working`. Muse takes it through its editor like any prompt,
+which must be empty first; Claude Code and Codex through herdr's prompt, as
+before for slash commands. None of the three
+harnesses echoes the command as a user turn, and `/goal clear` starts no turn,
+so the proof that it was taken is the harness's answer on the screen:
+
+| Harness | `/goal OBJECTIVE` | `/goal clear` |
+|---|---|---|
+| Muse | `◆ Goal set — OBJECTIVE` | `◆ Goal cleared — OBJECTIVE` |
+| Claude Code | `⎿  Goal set: OBJECTIVE` | `⎿  No goal set` |
+| Codex | `• Goal active Objective: OBJECTIVE` | `• Goal cleared` |
+
+A new objective needs one more confirmation of exactly that objective than the
+screen showed before the command; a subcommand needs a new answer row that
+mentions a goal, such as Muse's `◆ completed goals cannot be resumed`. When a
+goal is already set, Muse and Codex first ask whether to replace it; with
+exactly the command's objective in the question and the replacement selected,
+Enter is pressed once to confirm it, since the command asked for it. With no
+answer within 20 seconds the request is `delivery_uncertain`: the harness may
+have taken the command, so it is never typed again.
+
+The agent writes no reply to a command, so the bridge sends one itself, in the
+request's thread, once the command is typed, quoting the answer the screen
+shows, for example: Typed `/goal ship it` into coord's composer. It answered:
+Goal set — ship it. The request's
+replies are then closed. The request gets its acknowledgement reaction like any
+other.
+
 ### A headless coordinator
 
 When the bridge's agent is headless (`agentctl start --mode headless`, run by

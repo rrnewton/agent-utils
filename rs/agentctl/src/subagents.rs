@@ -3144,6 +3144,8 @@ impl<A: ManagedApi + ?Sized> GuardedInput for GuardedTerminal<'_, '_, A> {
 
 /// Longest wait for a sent prompt to appear in the target pane's scrollback.
 const READBACK: Duration = Duration::from_secs(5);
+/// Longest wait for a harness's answer to a `/goal` command typed raw.
+const GOAL_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a withdrawn Muse paste is watched for drawing late before the editor counts as empty.
 const MUSE_LATE_PASTE: Duration = Duration::from_millis(500);
 
@@ -3272,6 +3274,57 @@ fn occurrences(screen: &str, text: &str) -> usize {
     readback_form(screen).matches(&tail).count()
 }
 
+/// Markers that start the rows where typed input lands in a harness pane: the composer and the
+/// user turns above it. Claude Code and Muse draw both after `❯`; Codex draws a user turn after
+/// `›`, input it holds for a running turn after `↳`, and its input box after `»`.
+const INPUT_MARKERS: [&str; 4] = ["❯", "›", "↳", "»"];
+
+/// How often `text` shows, compared as read-back compares it, only where typed input lands in
+/// another agent's pane: in a run of rows that starts with an [`INPUT_MARKERS`] row and goes on
+/// over the blank and indented rows under it, up to a row at the left edge, a rule, or a tool
+/// output row (`⎿` or `└`). The same words printed anywhere else, such as in the output of a
+/// command the agent ran that read this target's screen, were not typed into that pane, so they
+/// are no evidence that a prompt went there instead of to its target.
+fn input_occurrences(screen: &str, text: &str) -> usize {
+    let tail = readback_tail(text);
+    if tail.is_empty() {
+        return 0;
+    }
+    let mut regions = Vec::<String>::new();
+    let mut open = false;
+    for line in screen.lines() {
+        let stripped = line.trim_start();
+        let input = INPUT_MARKERS.iter().any(|marker| {
+            stripped
+                .strip_prefix(marker)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\u{a0}']))
+        });
+        if input {
+            regions.push(String::new());
+            open = true;
+        } else if stripped.is_empty() {
+            continue;
+        } else if !open
+            || stripped.len() == line.len()
+            || stripped.starts_with(['⎿', '└'])
+            || stripped
+                .chars()
+                .all(|value| matches!(value, '─' | '━' | '═'))
+        {
+            open = false;
+            continue;
+        }
+        if let Some(region) = regions.last_mut() {
+            region.push_str(line);
+            region.push('\n');
+        }
+    }
+    regions
+        .iter()
+        .map(|region| readback_form(region).matches(&tail).count())
+        .sum()
+}
+
 /// The read-back state of `pane` that shows the text `count` times now, against the counts
 /// `before` sending: see `WorkspaceClient::observe`.
 fn state_of(count: usize, pane: &str, before: &BTreeMap<String, usize>) -> &'static str {
@@ -3300,7 +3353,15 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let reads = self.client.read_scrollbacks(&panes);
         let mut windows = BTreeMap::new();
         for (pane, read) in panes.into_iter().zip(reads) {
-            match read.map(|screen| occurrences(&screen, text)) {
+            // Another agent's pane counts the prompt only where typed input lands in it.
+            let count = |screen: String| {
+                if pane == pane_id {
+                    occurrences(&screen, text)
+                } else {
+                    input_occurrences(&screen, text)
+                }
+            };
+            match read.map(count) {
                 Ok(window) => {
                     windows.insert(pane, window);
                 }
@@ -3385,7 +3446,8 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let first = self.client.read_scrollbacks(&peers);
         let mut states = BTreeMap::new();
         for (peer, read) in peers.iter().zip(first) {
-            let first_look = read.map(|screen| state_of(occurrences(&screen, text), peer, before));
+            let first_look =
+                read.map(|screen| state_of(input_occurrences(&screen, text), peer, before));
             // A transient read failure in another agent's pane is not evidence about this
             // submission. Retry only the observation, within one shared read-back deadline;
             // never type again or skip a peer whose outcome remains unknown.
@@ -3393,7 +3455,10 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             let state = loop {
                 let look = match first_look.take() {
                     Some(look) => look,
-                    None => self.observe(peer, text, before),
+                    None => self
+                        .client
+                        .read_scrollback(peer)
+                        .map(|screen| state_of(input_occurrences(&screen, text), peer, before)),
                 };
                 match look {
                     Ok(state) => break state,
@@ -3724,6 +3789,94 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     }
 
     /// Press Enter on a goal-replacement menu; a misroute is countermanded like a prompt's.
+    /// The visible screen of the pane as text: for a Muse pane read between two checks of its
+    /// pinned process.
+    fn goal_screen(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        let screen = if self.uses_muse_composer() {
+            self.verified_muse_screen(pane_id, runtime)?
+        } else {
+            self.client
+                .read_with_runtime(pane_id, "visible", Some(200), runtime)?
+        };
+        Ok(crate::harness_tui::plain(&screen))
+    }
+
+    /// Type the `/goal` command `text` raw into an idle pane and prove from the screen that the
+    /// harness took it: see [`crate::goal_command`]. Muse takes it through its guarded editor
+    /// (an exact paste, then Enter); Claude Code and Codex through the native prompt. When Muse
+    /// or Codex asks whether to replace a goal already set with exactly this objective, the
+    /// replacement is confirmed once, since the command asked for it. The receipt's evidence is
+    /// the harness's answer. With no answer within [`GOAL_ANSWER_TIMEOUT`] the outcome is
+    /// unknown: the command may have been taken, so it is never typed again.
+    fn submit_goal_command(
+        &self,
+        pane_id: &str,
+        text: &str,
+        argument: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        use crate::submission::SubmissionReceipt;
+        if runtime.cancelled() {
+            return Ok(Submission::NotStaged(
+                "delivery was cancelled before typing".to_owned(),
+            ));
+        }
+        let started = runtime.monotonic();
+        let before = self
+            .goal_screen(pane_id, runtime)
+            .map_err(|error| AdapterError::not_staged(format!("{error}; nothing was typed")))?;
+        let text = text.trim();
+        if self.uses_muse_composer() {
+            self.run_with_runtime(pane_id, text, runtime)?;
+            *self
+                .custom_submission
+                .lock()
+                .expect("custom submission lock poisoned") = None;
+        } else {
+            self.guarded(runtime)?.native_prompt(pane_id, text)?;
+        }
+        let objective = (!crate::goal_command::is_subcommand(argument)).then_some(argument);
+        let mut key_presses = 1;
+        let mut confirmed = false;
+        loop {
+            let screen = self.goal_screen(pane_id, runtime)?;
+            if let Some(answer) = crate::goal_command::taken(&before, &screen, argument) {
+                return Ok(Submission::Verified(SubmissionReceipt {
+                    key: "Enter",
+                    key_presses,
+                    elapsed: runtime.monotonic().saturating_sub(started),
+                    evidence: answer,
+                    printed: true,
+                    settled: true,
+                }));
+            }
+            if let Some(objective) = objective.filter(|_| !confirmed) {
+                if crate::goal_command::muse_replacement_pending(&screen, objective)
+                    || goal_replacement_selected(&screen, objective)
+                {
+                    self.confirm_goal_replacement(pane_id, runtime)?;
+                    key_presses += 1;
+                    confirmed = true;
+                    continue;
+                }
+            }
+            let now = runtime.monotonic();
+            if runtime.cancelled() || now.saturating_sub(started) >= GOAL_ANSWER_TIMEOUT {
+                return Err(AdapterError::unavailable(format!(
+                    "{} in pane {pane_id} showed no answer to the typed goal command within {}s; \
+                     it may have taken it",
+                    self.record.harness,
+                    GOAL_ANSWER_TIMEOUT.as_secs()
+                )));
+            }
+            runtime.sleep(Duration::from_millis(250));
+        }
+    }
+
     fn confirm_goal_replacement(
         &self,
         pane_id: &str,
@@ -3836,6 +3989,20 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         text: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Submission> {
+        // A `/goal` command typed raw, as a chat request that is one asks for, is proved by the
+        // harness's answer to it. A Codex goal that `agentctl goal` registered keeps its own
+        // path, which confirms a replacement through the working state.
+        if let Some(argument) = crate::goal_command::argument(text) {
+            if self.record.adapter != "herdr-relay"
+                && !self
+                    .record
+                    .goal_messages
+                    .values()
+                    .any(|objective| objective == argument)
+            {
+                return self.submit_goal_command(pane_id, text, argument, runtime);
+            }
+        }
         // A queue drain that found the pane working passes a follow-up key; a Muse pane then
         // takes an ordinary prompt by steering its running turn (#505 agentctl-muse-followup).
         if self.uses_muse_composer()
@@ -13123,10 +13290,13 @@ pub(crate) mod tests {
                 .remove(pane)
                 .unwrap_or_else(|| pane.to_owned());
             let dropped = self.printed_without.lock().unwrap().clone();
-            let printed: String = text
-                .chars()
-                .filter(|char| !dropped.contains(char))
-                .collect();
+            // A harness draws typed input as a user turn after its input marker.
+            let printed: String = format!(
+                "❯ {}",
+                text.chars()
+                    .filter(|char| !dropped.contains(char))
+                    .collect::<String>()
+            );
             match *self.print_after.lock().unwrap() {
                 None => self
                     .scrollback
@@ -18420,6 +18590,8 @@ fi
     mod control;
     /// Offline retirement of an exact adopted generation with no runtime mutation.
     mod dead_adoption;
+    /// `/goal` commands typed raw and proved by the harness's answer.
+    mod goal_command;
     /// Takeover and handback of a headless agent: one writer per session.
     mod headless_takeover;
     /// Herdr readiness and adopted Muse process ownership compatibility.
