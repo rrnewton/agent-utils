@@ -239,6 +239,20 @@ function el(id) {
 }
 
 /**
+ * The id of the channel chosen in the column being worked on, as its picker holds it ("" for none).
+ *
+ * `#624 voice-page-modularity`, plan step 9: every read of the selection goes through here, so the
+ * selection can move out of the DOM into one owner without touching each reader again. For now it
+ * still reads the picker, through {@link el}, so it follows the column being worked on exactly as
+ * the reads it replaced did.
+ *
+ * @returns {string}
+ */
+function selectedChannelId() {
+  return el("discord-channel").value;
+}
+
+/**
  * The element with this id in the LEFT column whichever column is being worked on: for the few
  * things that belong to the left column alone (the call's pane beside the channel's, the chips and
  * the pull gesture over #scroll-area, the keyboard's pane for it) and may be asked about from inside
@@ -1084,7 +1098,7 @@ function channelLevels() {
  * @returns {string[]}
  */
 function underThreadList() {
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   if (listBefore.layout === "two") return columnsFit && sideThreads.has(channel) ? ["side"] : [];
   const thread = listBefore.layout === "one" && listBefore.channel === channel && listBefore.view === "thread";
   return thread && listBefore.thread ? ["thread"] : [];
@@ -1386,7 +1400,7 @@ let placeArriving = false;
 function channelPlace() {
   if (sideActive) return inColumn(columns.main, channelPlace);
   if (currentView !== "discord") return null;
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   if (!channel) return null;
   /** @type {ChannelPlace} */
   const place = { screen: "main", channel, layout: "one", view: null, thread: null, origin: null, side: null };
@@ -1413,7 +1427,7 @@ function currentPlace() {
   const under = screenBeforeSettings === "main" ? channelPlace() : null;
   const open = currentScreen === "help" ? helpEntries().find((entry) => entry.open) : null;
   return {
-    screen: currentScreen, channel: String(el("discord-channel").value || ""), under,
+    screen: currentScreen, channel: String(selectedChannelId() || ""), under,
     from: currentScreen === "help" ? helpReturn : null, entry: open ? String(open.id).replace(/^help-/, "") : null,
   };
 }
@@ -1468,7 +1482,7 @@ function placeIsOver(place) {
 /** Whether channel place `place` can be shown now. */
 function channelPlaceShowable(place) {
   if (!place) return true;
-  if (place.channel !== String(el("discord-channel").value || "")) return false;
+  if (place.channel !== String(selectedChannelId() || "")) return false;
   if (place.layout === "two") return columnsFit && threadListOffered() && (!place.side || threadStillKnown(place.side));
   if (place.layout === "list") return threadListOffered();
   if (place.view === "thread") return Boolean(place.thread) && threadStillKnown(place.thread);
@@ -1478,7 +1492,7 @@ function channelPlaceShowable(place) {
 /** Whether `place` can be shown now: its channel the one chosen, and what it shows still there. */
 function placeShowable(place) {
   if (place.screen === "main") return channelPlaceShowable(place);
-  return place.channel === String(el("discord-channel").value || "") && channelPlaceShowable(place.under);
+  return place.channel === String(selectedChannelId() || "") && channelPlaceShowable(place.under);
 }
 
 /**
@@ -1702,7 +1716,7 @@ function deepLinkPart(params, key) {
 
 /** A message's durable identity as a link names it: its service, channel, id, and thread. */
 function deepLinkRefOf(message) {
-  const channel = String((message && message.channel_id) || el("discord-channel").value || "");
+  const channel = String((message && message.channel_id) || selectedChannelId() || "");
   const described = providerOfChannel(channel);
   const name = described && typeof described.name === "string" && described.name.trim()
     ? described.name.trim() : chatProviderName;
@@ -1856,7 +1870,7 @@ async function applyDeepLink() {
   // own open would simply overwrite it. Giving up here is not final — the next place noted
   // kicks this again (`scheduleBackSync`); applied is only ever set past this wait.
   if (!await waitForDeepLink(() => Boolean(token()) && knownChannels.length > 0 &&
-      Boolean(el("discord-channel").value) && currentScreen === "main" && currentView === "discord")) return;
+      Boolean(selectedChannelId()) && currentScreen === "main" && currentView === "discord")) return;
   deepLinkApplied = true;
   // A reader who chose a channel or a view while that wait ran is not moved at all — least
   // of all half-moved, onto the link's channel in a view of their own choosing.
@@ -1868,7 +1882,7 @@ async function applyDeepLink() {
       syncDeepLinkAddress();
       return;
     }
-    if (String(el("discord-channel").value) !== wantedChannel) {
+    if (String(selectedChannelId()) !== wantedChannel) {
       el("discord-channel").value = wantedChannel;
       // The link's own arrival on its channel is no choice of the reader's.
       const wasShowing = deepLinkShowing;
@@ -1881,16 +1895,16 @@ async function applyDeepLink() {
     }
   }
   if (currentView !== "discord") showView("discord");
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   const startPlace = channelPlace();
   const startVisit = { at: visitedAt, length: visited.length };
   // The channel's own first read decides its opening view as it lands; a place put on before
   // it would be decided over. Wait for that read, then put the link's place on — unless the
   // reader has navigated for themselves meanwhile: a link opened the page, it does not chase
   // a reader who has already gone somewhere of their own choosing.
-  await waitForDeepLink(() => String(el("discord-channel").value) !== channel ||
+  await waitForDeepLink(() => String(selectedChannelId()) !== channel ||
     (timelineReadsStarted > 0 && channelCanon.views.has(viewKey())));
-  if (epoch !== deepLinkEpoch || String(el("discord-channel").value) !== channel) return;
+  if (epoch !== deepLinkEpoch || String(selectedChannelId()) !== channel) return;
   const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
   /** @type {ChannelPlace | null} */
   let place = null;
@@ -1934,9 +1948,9 @@ async function applyDeepLink() {
   syncDeepLinkAddress();
   const movesBeforeSeek = deepLinkReaderMoves;
   // The first read of the view now open, waited for as a seek waits for All to land.
-  await waitForDeepLink(() => String(el("discord-channel").value) !== channel ||
+  await waitForDeepLink(() => String(selectedChannelId()) !== channel ||
     (channelCanon.views.has(viewKey()) && !discordFetchInFlight));
-  if (epoch !== deepLinkEpoch || String(el("discord-channel").value) !== channel) return;
+  if (epoch !== deepLinkEpoch || String(selectedChannelId()) !== channel) return;
   // Chosen while the read landed: the seek would walk views the reader just left.
   if (deepLinkReaderMoves !== movesBeforeSeek) {
     deepLinkFocus = null;
@@ -2167,9 +2181,9 @@ function ownLevel(tag) {
 
 /** Wait for the channel on screen to have read the view it shows, or to be left; false when it was left. */
 async function linkJumpRead(channel, ticket) {
-  await waitForDeepLink(() => ticket !== linkJumpTicket || String(el("discord-channel").value) !== channel ||
+  await waitForDeepLink(() => ticket !== linkJumpTicket || String(selectedChannelId()) !== channel ||
     (timelineReadsStarted > 0 && channelCanon.views.has(viewKey()) && !discordFetchInFlight));
-  return ticket === linkJumpTicket && String(el("discord-channel").value) === channel;
+  return ticket === linkJumpTicket && String(selectedChannelId()) === channel;
 }
 
 /** Choose channel `channel` as a link's arrival, which is no choice of the reader's (`#462`). */
@@ -2233,7 +2247,7 @@ async function jumpToSentMessage(ref) {
     uiStateSettled = true;
     showView("discord");
     // A channel the jump changes to is read as it is chosen; the one already chosen is read here.
-    if (String(el("discord-channel").value) === ref.channel) await readEnteredChannel(viewRestored);
+    if (String(selectedChannelId()) === ref.channel) await readEnteredChannel(viewRestored);
   } : null;
   return inColumn(columns.main, () => jumpFromSpot(ref, spot, { view: storedOpenInView(), center: true, enter }));
 }
@@ -2251,7 +2265,7 @@ async function jumpToSentMessage(ref) {
  * @param {{view?: "flat" | "main", center?: boolean, enter?: (() => Promise<void>) | null}} [options]
  */
 async function jumpFromSpot(ref, spot, options = {}) {
-  const here = String(el("discord-channel").value || "");
+  const here = String(selectedChannelId() || "");
   if (ref.channel === here && !ref.message && !ref.thread) {
     setStatus("That link is to this channel.");
     return;
@@ -2352,7 +2366,7 @@ async function returnToLinkSpot(spot) {
   const place = spot.place;
   if (!place || currentScreen !== "main" || currentView !== "discord") return;
   if (!knownChannels.some((channel) => String(channel.id) === place.channel)) return;
-  if (String(el("discord-channel").value) !== place.channel) {
+  if (String(selectedChannelId()) !== place.channel) {
     arriveOnChannel(place.channel);
     if (!await linkJumpRead(place.channel, ticket)) return;
   }
@@ -5026,7 +5040,7 @@ const summaryQueue = [];
  * thread would be the wrong one (`threadForMessageId` reads the current column).
  */
 function queueSummary(id, also, key) {
-  summaryQueue.push({ id, also, key, channel: el("discord-channel").value, thread: threadForMessageId(id) });
+  summaryQueue.push({ id, also, key, channel: selectedChannelId(), thread: threadForMessageId(id) });
   pumpSummaries();
 }
 
@@ -5034,7 +5048,7 @@ function queueSummary(id, also, key) {
 function pumpSummaries() {
   while (summariesInFlight < SUMMARY_IN_FLIGHT && summaryQueue.length > 0) {
     const next = summaryQueue.shift();
-    if (!summaryMode || next.channel !== el("discord-channel").value) {
+    if (!summaryMode || next.channel !== selectedChannelId()) {
       summariesAsked.delete(next.key);
       continue;
     }
@@ -5849,7 +5863,7 @@ function rowMatches(row, node, text) {
 function threadsWithHits(node) {
   /** @type {Set<string>} */
   const hits = new Set();
-  if (!node || !threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return hits;
+  if (!node || !threadingSupported || channelCanon.channel !== String(selectedChannelId())) return hits;
   for (const message of channelCanon.messages) {
     const id = threadOf(message);
     if (id && message.thread.is_root === false && messageMatches(node, message)) hits.add(String(id));
@@ -6741,7 +6755,7 @@ function openedGapIds(create) {
     openedGaps.clear();
     openedGapsFor = searches;
   }
-  const key = JSON.stringify([viewKey(), sideActive, String(el("discord-channel").value)]);
+  const key = JSON.stringify([viewKey(), sideActive, String(selectedChannelId())]);
   const held = openedGaps.get(key) || null;
   if (held || !create) return held;
   const made = new Set();
@@ -12399,13 +12413,13 @@ function readCollapseFromKeyboard(target) {
  * answered; nothing over another channel the reader has gone to meanwhile.
  */
 async function readAndCollapse(pane, row, ids) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   const folded = foldForRead(pane, row);
   const wasDone = ids.every((id) => archivedIds.has(id));
   if (!wasDone) await markRowDone(ids, row);
   if (!(await doneSaved(ids))) return;
   const mark = await markReadInService(channel, ids[ids.length - 1]);
-  if (channel !== String(el("discord-channel").value)) return;
+  if (channel !== String(selectedChannelId())) return;
   const also = folded ? ", and collapsed" : "";
   setStatus(wasDone ? doneReadWords(mark, also) : serviceReadWords(mark, also));
 }
@@ -12982,7 +12996,7 @@ function voiceFromKeyboard(repeat) {
 function viewFromKeyboard(which, repeat) {
   // A view is the page's, whichever column the keys are in.
   if (sideActive) return inColumn(columns.main, () => viewFromKeyboard(which, repeat));
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   const covering = currentScreen === "settings" || currentScreen === "help";
   // Settings and Help are left for the screen they were opened over, which is the channel's only when
   // that is the main screen.
@@ -14455,7 +14469,7 @@ function theServer() {
       asking: (type) => {
         if (type === "TimelineResponse") timelineAnswersAsked += 1;
       },
-      answerer: () => sentenceStart(chatServiceOf(el("discord-channel").value)),
+      answerer: () => sentenceStart(chatServiceOf(selectedChannelId())),
     });
   }
   return serverApi;
@@ -14529,7 +14543,7 @@ function chatServiceOf(channel) {
 
 /** {@link readableFailure} for the channel on screen. */
 function readableChannelFailure(error) {
-  return readableFailure(error, chatServiceOf(el("discord-channel").value));
+  return readableFailure(error, chatServiceOf(selectedChannelId()));
 }
 
 // --- confirming a post the assistant proposed ----------------------------------------------------
@@ -19844,7 +19858,7 @@ function watchPendingSummaries(choices, source) {
 /** A summary on its way is owed a read: the Threads list read now, past its spacing, and the cards drawn again. */
 async function summaryWatchFired() {
   if (currentView !== "discord") return;
-  threadDirectoryReadAt.delete(String(el("discord-channel").value));
+  threadDirectoryReadAt.delete(String(selectedChannelId()));
   await refreshThreadDirectory();
   renderThreadHeading();
   renderSideColumn();
@@ -20179,7 +20193,7 @@ function onVisibility() {
   // and after any absence the stream delivered something in, the poll came due in, or that let the
   // stream go.
   if ((away >= VISIBLE_REFRESH_MS || owed !== null || pollDue || resume !== null) &&
-      currentView === "discord" && threadingSupported && clientConfigApplied && el("discord-channel").value) {
+      currentView === "discord" && threadingSupported && clientConfigApplied && selectedChannelId()) {
     refreshQuietly(async () => {
       try {
         if (owed === "mutation") refreshAfterLiveMutation();
@@ -24052,7 +24066,7 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
  * @param {Map<string, any> | null} [held]
  */
 function foldTimelinePage(payload, older, view = channelView, thread = selectedThreadId, held = null) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   // `#529 page-build-stale-notice`.
   noteServerPageBuild(payload);
   // `#427 server-thread-hues`: the colours this read carries, taken before anything it brought
@@ -24524,7 +24538,7 @@ function deltaSideState(thread) {
  * copy add to its root's count of replies (`#328 removal-outside-window`).
  */
 function foldLiveMessage(message, live = false, replayed = false, read = null) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (channelCanon.channel !== channel) loadCanon(channel);
   // `#427 server-thread-hues`: a live message carries its thread's colour, taken before it is
   // drawn — a thread met first through the stream is the server's colour from its first row.
@@ -24611,7 +24625,7 @@ function projectView(view = channelView, thread = selectedThreadId) {
 
 /** The read state of the rows on screen is the store's read state for those rows. */
 function syncCanonDismissed() {
-  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
+  if (!threadingSupported || channelCanon.channel !== String(selectedChannelId())) return;
   // `#407 unpack-row-parity`. Over the cards the right column has no rows on screen to speak for.
   if (sideActive && columns.side.mode !== "thread") return;
   for (const message of timelineMessages) {
@@ -24666,7 +24680,7 @@ function loadCanon(channel) {
 function drawProjection() {
   const cover = channelCanon.views.get(viewKey());
   if (!cover) return false;
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   const payload = {
     channel: knownChannel(channel),
     thread: channelView === "thread"
@@ -24712,7 +24726,7 @@ function drawProjection() {
  * on from. `#220 view-switch-instant`.
  */
 function walkCursorOwed() {
-  if (discordOlderCursor || channelCanon.channel !== String(el("discord-channel").value)) {
+  if (discordOlderCursor || channelCanon.channel !== String(selectedChannelId())) {
     return false;
   }
   // A page that said more exists and carried no cursor, whatever the view's cover: one a
@@ -24739,7 +24753,7 @@ function walkCursorOwed() {
  */
 function heldViewRows() {
   if (!threadingSupported || (channelView !== "flat" && channelView !== "thread") ||
-      channelCanon.channel !== String(el("discord-channel").value)) return [];
+      channelCanon.channel !== String(selectedChannelId())) return [];
   const base = channelCanon.views.get(viewKey(channelView === "flat" ? "main" : "flat"));
   const rows = !base || (base.more && base.floor === null) ? [] : channelCanon.messages.filter((message) =>
     inView(message, channelView, selectedThreadId) && !(base.more && timeOf(message, "timestamp") < base.floor));
@@ -24757,7 +24771,7 @@ function heldViewRows() {
  */
 function drawHeldRows(rows, freshAt, freshness) {
   if (!rows.length) return false;
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   const payload = {
     channel: knownChannel(channel),
     thread: channelView === "thread"
@@ -24794,10 +24808,10 @@ function drawHeldRows(rows, freshAt, freshness) {
  * channel would show a reload a channel with its dealt-with messages missing.
  */
 function saveChannelScope() {
-  if (!el("discord-channel").value || (todoMode && !threadingSupported) || !screenBelongsToToken()) return;
+  if (!selectedChannelId() || (todoMode && !threadingSupported) || !screenBelongsToToken()) return;
   const cache = readMessageCache();
   if (!cache) return;
-  const key = String(el("discord-channel").value);
+  const key = String(selectedChannelId());
   const now = Date.now();
   let entry = null;
   if (threadingSupported) {
@@ -24858,7 +24872,7 @@ function saveChannelScope() {
  * current view in timeline mode, the saved page in legacy mode.
  */
 function hydrateChannelScope() {
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   if (!channel || (todoMode && !threadingSupported)) return false;
   screenBelongsToToken();
   if (threadingSupported) {
@@ -24918,7 +24932,7 @@ function hydrateFromCache() {
   // `#355 provider-grouped-channels`. Settings by service, from the saved shell as from client-config.
   fillServiceSelect();
   fillChannelSelect("settings-channel");
-  const provider = providerOfChannel(el("discord-channel").value);
+  const provider = providerOfChannel(selectedChannelId());
   if (provider) threadingSupported = provider.threading_supported === true;
   renderChannelBox();
   // Before the composer and the rows: both are the view's. `#189 restore-ui-state`.
@@ -25006,7 +25020,7 @@ function noteChannelReadFailure(error) {
     return;
   }
   if (error && error.status === 404 && error.code === "unknown_channel") {
-    const channel = String(el("discord-channel").value);
+    const channel = String(selectedChannelId());
     forgetChannelScopes((id) => id === channel);
     clearChannelScreen();
     return;
@@ -25081,7 +25095,7 @@ function staleWords(state, atMs, refreshing, noun = "messages") {
     return refreshing ? `Showing ${noun} from ${at} · refreshing…` : `Refresh failed · showing ${noun} from ${at}`;
   }
   if (state === "slow") {
-    return `${sentenceStart(chatServiceOf(el("discord-channel").value))} is slow to answer · showing ${noun} from ${at}`;
+    return `${sentenceStart(chatServiceOf(selectedChannelId()))} is slow to answer · showing ${noun} from ${at}`;
   }
   return "";
 }
@@ -25101,7 +25115,7 @@ function renderSideFreshness() {
     [state, text] = inColumn(columns.side, () =>
       [channelFreshness, staleWords(channelFreshness, channelFreshAt, channelRefreshing)]);
   } else if (sideColumnUp()) {
-    const channel = String(el("discord-channel").value);
+    const channel = String(selectedChannelId());
     state = threadListFailures.get(channel) || "fresh";
     const at = threadListLandedAt.get(channel) || inColumn(columns.main, () => channelFreshAt);
     // With no time to give, the state alone, rather than a time nothing was read at.
@@ -25462,7 +25476,7 @@ function forgetChosenViews(gone) {
  * page read for it. A thread the store has never heard of is not one to reopen into.
  */
 function threadStillKnown(id) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (channelCanon.channel !== channel) loadCanon(channel);
   if (id === channelCanon.scope) return false;
   return channelCanon.views.has(viewKey("thread", id)) ||
@@ -25480,7 +25494,7 @@ function threadStillKnown(id) {
  * of a provider `/client-config` then says has them.
  */
 function openingChannelView() {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   // `#462 webapp-deep-links`. A link's one-column view is decided HERE, with every other
   // opening decision, not put on later over the reopened one: an async apply racing the
   // reopen flow yanks a reader who has already settled. Layout views and the message
@@ -25539,7 +25553,7 @@ function openChannelView() {
 }
 
 /** The channel and view a measured place belongs to. */
-const placeKey = () => JSON.stringify([String(el("discord-channel").value), viewKey()]);
+const placeKey = () => JSON.stringify([String(selectedChannelId()), viewKey()]);
 
 /**
  * Note which message the reader's eye is on in the channel list, while there is one on screen to
@@ -25572,7 +25586,7 @@ function savedThreadSummary() {
 
 /** The view on screen as its channel's choice, or null for a view no channel is reopened in. */
 function viewOnScreen() {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (!channel || !REOPENED_VIEWS.includes(channelView) || (channelView === "thread" && !selectedThreadId)) return null;
   const thread = channelView === "thread" ? {
     id: String(selectedThreadId),
@@ -25591,7 +25605,7 @@ function saveUiState() {
   if (sideActive) return inColumn(columns.main, saveUiState);
   const identity = tokenFingerprint(token());
   if (!uiStateSettled || !identity) return;
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   const shown = viewOnScreen();
   const chosen = chosenView(channel);
   // The channel's choice, on screen: it is now the last to be given up, and an open thread's
@@ -25634,7 +25648,7 @@ function saveUiState() {
 function returnToSavedPlace() {
   const saved = savedUi;
   const place = saved ? saved.place : null;
-  if (!place || place.atNewest || !place.anchor || saved.channel !== String(el("discord-channel").value) ||
+  if (!place || place.atNewest || !place.anchor || saved.channel !== String(selectedChannelId()) ||
       place.view !== viewKey()) return;
   const row = [...visibleList().children].find((candidate) =>
     candidate.getAttribute("data-context-id") === place.anchor || idsOf(candidate).includes(place.anchor));
@@ -25651,7 +25665,7 @@ function returnToSavedPlace() {
 function reopenSavedView() {
   if (uiStateSettled) return;
   uiStateSettled = true;
-  if (savedUi && savedUi.view === "discord" && el("discord-channel").value && currentView !== "discord") {
+  if (savedUi && savedUi.view === "discord" && selectedChannelId() && currentView !== "discord") {
     showView("discord");
     returnToSavedPlace();
     holdChannelPlace();
@@ -25701,14 +25715,14 @@ function payReopenRead() {
 // --- channel views, threads and the channel composer ------------------------------------------
 
 function channelContextKey() {
-  const key = [el("discord-channel").value, channelView, selectedThreadId];
+  const key = [selectedChannelId(), channelView, selectedThreadId];
   // `#229 desktop-two-column`. The right column's views are its own: a thread shown there and the
   // same thread shown in one column are two lists of rows, never one held context moved between them.
   return JSON.stringify(sideActive ? [...key, "side"] : key);
 }
 
 function channelComposerKey() {
-  return JSON.stringify([el("discord-channel").value, selectedThreadId]);
+  return JSON.stringify([selectedChannelId(), selectedThreadId]);
 }
 
 function threadOf(message) {
@@ -25794,7 +25808,7 @@ function replyRoute(message, bound = false) {
   // starts the message's thread already, and a box whose two states post the same thing would say
   // one of them goes to Main.
   if (record) {
-    if (channelRepliesInThread(el("discord-channel").value)) return route;
+    if (channelRepliesInThread(selectedChannelId())) return route;
     if (unansweredThread(message, record)) return { ...route, branch: String(record.id) };
     return bound ? { ...route, into: String(record.id), note: REPLY_INTO_ANSWERED_THREAD } : route;
   }
@@ -26014,7 +26028,7 @@ const serverHuesProvisional = new Set();
  * sends in this load, for the purge reason above. Mirrored into `threadColors` at once, so a
  * fallback colour handed out for another thread is measured against it.
  */
-function noteServerThreadHue(id, hue, channel = String(el("discord-channel").value), provisional = false) {
+function noteServerThreadHue(id, hue, channel = String(selectedChannelId()), provisional = false) {
   if (!channel || !Number.isFinite(hue) || hue < 0 || hue >= 360) return;
   if (channel !== serverHuesChannel) {
     serverThreadHues.clear();
@@ -26031,7 +26045,7 @@ function noteServerThreadHue(id, hue, channel = String(el("discord-channel").val
 }
 
 /** Take the server's colours off a batch of messages and thread summaries, roots included. */
-function noteServerThreadHuesIn(messages, summaries, channel = String(el("discord-channel").value), provisional = false) {
+function noteServerThreadHuesIn(messages, summaries, channel = String(selectedChannelId()), provisional = false) {
   for (const summary of summaries || []) {
     if (!summary) continue;
     if (typeof summary.hue === "number") noteServerThreadHue(summary.id, summary.hue, channel, provisional);
@@ -26147,7 +26161,7 @@ function threadHue(id) {
   // channel — its remembered colours are in place before that thread is given one.
   // An empty picker — a list that emptied for a moment — is no channel: nothing is put back or
   // stored for it, and the channel it comes back to keeps the colours it had.
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (channel && channel !== threadColorsChannel) restoreThreadHues(channel);
   const key = String(id);
   const now = Date.now();
@@ -26358,7 +26372,7 @@ function rememberChannelDraft() {
 
 function restoreChannelComposer() {
   activeComposerKey = channelComposerKey();
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   const readOnly = knownChannel(channel)?.writable === false;
   el("channel-compose-text").value = channelDrafts.get(activeComposerKey) || "";
   el("channel-compose-state").textContent = readOnly
@@ -26572,7 +26586,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
     const chosen = viewOnScreen();
     if (chosen) rememberChosenView(chosen);
     // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
-    else forgetChosenViews((channel) => channel === String(el("discord-channel").value));
+    else forgetChosenViews((channel) => channel === String(selectedChannelId()));
   }
   uiStateSettled = true;
   saveUiState();
@@ -26583,7 +26597,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   // A thread opens at its newest, and Back returns to the place its view was left at, as before.
   const keepPlace = (view === "main" || view === "flat") &&
     (from === "main" || from === "flat" || (from === "thread" && !held));
-  const sameStore = threadingSupported && channelCanon.channel === String(el("discord-channel").value);
+  const sameStore = threadingSupported && channelCanon.channel === String(selectedChannelId());
   // `#222 unread-replies`. A thread whose root reports replies the store has not brought — the tap on
   // "1 new" — is drawn from what is held as any other, and read behind it however it is drawn: from
   // rows held since an earlier visit, or a cover saved on the device, neither of which has the reply
@@ -26715,7 +26729,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
  * True when it gave the view a cover or freshened one, which the snapshot then has to be told.
  */
 function inheritAllCover(view, threadId = null, summary = null) {
-  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return false;
+  if (!threadingSupported || channelCanon.channel !== String(selectedChannelId())) return false;
   const all = channelCanon.views.get(viewKey("flat"));
   if (!all || (view !== "main" && view !== "thread")) return false;
   const key = viewKey(view, threadId);
@@ -26832,7 +26846,7 @@ function catchUpHeldView(words = true) {
  */
 function catchUpFromAll() {
   if (!threadingSupported || (channelView !== "main" && channelView !== "thread") ||
-      channelCanon.channel !== String(el("discord-channel").value) || !channelCanon.views.has(viewKey())) return;
+      channelCanon.channel !== String(selectedChannelId()) || !channelCanon.views.has(viewKey())) return;
   if (inheritAllCover(channelView, selectedThreadId, selectedThread)) {
     channelFreshAt = channelCanon.views.get(viewKey()).at;
     setChannelFreshness("fresh");
@@ -27305,7 +27319,7 @@ function threadLabel(choice, chars = THREAD_TITLE_CHARS) {
 function threadIndex() {
   /** @type {Map<string, ReturnType<typeof threadChoice>>} */
   const byId = new Map();
-  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return byId;
+  if (!threadingSupported || channelCanon.channel !== String(selectedChannelId())) return byId;
   // `#466 reply-promotes-thread`. The threads sends in the outbox are going into, and when the newest
   // was written: a root a send answers is a thread to read, as new as that send. And so is one whose
   // reply the store holds, whatever its count still says: the reply just sent, before any read says so.
@@ -27374,7 +27388,7 @@ function openThreadChoice() {
 function knownThreadChoice(id, summary) {
   const listed = threadIndex().get(id);
   if (listed) return listed;
-  const root = channelCanon.channel === String(el("discord-channel").value)
+  const root = channelCanon.channel === String(selectedChannelId())
     ? channelCanon.messages.find((message) => threadOf(message) === id && message.thread.is_root === true) : null;
   return threadChoice(id, summary, root || null);
 }
@@ -27388,7 +27402,7 @@ function openThreadName() {
 
 /** Whether the server has said this channel has threads older than the ones read so far. */
 function olderThreadsOnServer() {
-  if (channelCanon.channel !== String(el("discord-channel").value)) return false;
+  if (channelCanon.channel !== String(selectedChannelId())) return false;
   const cover = channelCanon.views.get(viewKey("threads"));
   return Boolean(cover && cover.more);
 }
@@ -27519,7 +27533,7 @@ function onThreadSelect() {
 
 /** Read the channel's thread list in the background, so the selector names every thread. */
 async function refreshThreadDirectory() {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (!threadingSupported || !channel || channelCanon.scope) return;
   if (threadDirectoryInFlight === channel) return;
   if (Date.now() - (threadDirectoryReadAt.get(channel) || 0) < THREAD_DIRECTORY_REFRESH_MS) return;
@@ -27543,7 +27557,7 @@ async function refreshThreadDirectory() {
       sent = null;
       payload = await apiDecoded("TimelineResponse", base);
     }
-    if (String(el("discord-channel").value) !== channel) return;
+    if (String(selectedChannelId()) !== channel) return;
     if (sent && payload.delta) {
       if (!foldTimelineDelta(payload, sent, "threads", null)) return;
     } else {
@@ -27564,7 +27578,7 @@ async function refreshThreadDirectory() {
     // two columns the next poll, the right column's line saying meanwhile that the cards are as
     // they were. `#231 two-column-polish`.
     threadDirectoryReadAt.delete(channel);
-    if (String(el("discord-channel").value) === channel) {
+    if (String(selectedChannelId()) === channel) {
       threadListFailures.set(channel, error && error.network ? "offline" : "failed");
       renderSideFreshness();
     }
@@ -27633,7 +27647,7 @@ function noteNewestThreadPage(channel, payload) {
 
 /** Whether there are older threads to read from "Older threads…": the server said so, or a cursor says it. */
 function olderThreadsToRead() {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   return olderThreadsOnServer() || (threadPages.channel === channel && threadPages.cursor !== null);
 }
 
@@ -27645,7 +27659,7 @@ function olderThreadsToRead() {
  * stays, to try again.
  */
 async function loadOlderThreads() {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (!threadingSupported || !channel || channelCanon.scope) return;
   const pages = threadPagesFor(channel);
   if (pages.loading) return;
@@ -27653,7 +27667,7 @@ async function loadOlderThreads() {
   Object.assign(pages, { loading: true, failed: false, error: "" });
   renderSideColumn();
   const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
-  const stale = () => generation !== pages.generation || String(el("discord-channel").value) !== channel;
+  const stale = () => generation !== pages.generation || String(selectedChannelId()) !== channel;
   try {
     if (!pages.cursor) {
       // `remote-ops-audit`: the thread list's newest page, read for its cursor, says "threads"; the step back "older".
@@ -27685,7 +27699,7 @@ async function loadOlderThreads() {
 
 /** What the cards say of the walk back's last read, when it failed; else "". */
 function olderThreadsFailure() {
-  if (threadPages.channel !== String(el("discord-channel").value) || !threadPages.failed) return "";
+  if (threadPages.channel !== String(selectedChannelId()) || !threadPages.failed) return "";
   return `Could not load older threads: ${threadPages.error.replace(/[.\s]+$/, "")}.`;
 }
 
@@ -27921,7 +27935,7 @@ function paintThreadBadge(badge, id, replies, unanswered) {
   const text = !unanswered && replies ? `Thread(${replies})` : "Thread";
   const title = unanswered ? "Start a thread on this message" : "Open this thread";
   const label = unanswered ? title : replies ? `Open this thread, ${threadCount(replies, true)}` : null;
-  const hidden = unanswered && knownChannel(el("discord-channel").value)?.writable === false;
+  const hidden = unanswered && knownChannel(selectedChannelId())?.writable === false;
   if (badge.getAttribute("data-thread-state") !== state) {
     badge.setAttribute("data-thread-state", state);
     // The colour is the thread's, and there is no thread yet; it is given when there is.
@@ -28055,7 +28069,7 @@ function heldUnansweredRoot(id) {
 function replyTally() {
   /** @type {ReplyTally} */
   const tally = { threads: new Map(), records: new Map(), summaries: new Map(), byRoot: new Map() };
-  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return tally;
+  if (!threadingSupported || channelCanon.channel !== String(selectedChannelId())) return tally;
   for (const message of channelCanon.messages) {
     const id = threadOf(message);
     if (!id) continue;
@@ -28335,7 +28349,7 @@ const allThreadFocus = new Map();
 
 /** The thread selected in All on the channel on screen, or null. */
 function allThreadSelected() {
-  return allThreadFocus.get(String(el("discord-channel").value)) || null;
+  return allThreadFocus.get(String(selectedChannelId())) || null;
 }
 
 /** Whether the rows being drawn are All's, which only the left column shows: the only rows with strips. */
@@ -28410,7 +28424,7 @@ function threadStrip(row) {
 function paintAllThreadFocus() {
   if (sideActive) return;
   const list = el("discord-log");
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   let id = channelView === "flat" ? allThreadSelected() : null;
   if (id !== null && channelCanon.channel === channel && !channelCanon.messages.some((message) => threadOf(message) === id)) {
     allThreadFocus.delete(channel);
@@ -28442,7 +28456,7 @@ function paintAllThreadFocus() {
  * @param {string} id
  */
 function toggleAllThreadFocus(id) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   const letting = allThreadFocus.get(channel) === id;
   if (letting) allThreadFocus.delete(channel);
   else allThreadFocus.set(channel, id);
@@ -28464,7 +28478,7 @@ function toggleAllThreadFocus(id) {
 function clearAllThreadFocus() {
   return inColumn(columns.main, () => {
     if (!channelOnScreen() || threadListShown || pinnedOnly || channelView !== "flat") return false;
-    const channel = String(el("discord-channel").value);
+    const channel = String(selectedChannelId());
     if (!allThreadFocus.has(channel)) return false;
     allThreadFocus.delete(channel);
     paintAllThreadFocus();
@@ -28492,7 +28506,7 @@ function threadStripFromKeyboard(target) {
  * pass over the rows redraws the chips and decides the runs again.
  */
 function syncUnreadReplies() {
-  if (!threadingSupported || channelView !== "main" || channelCanon.channel !== String(el("discord-channel").value)) return;
+  if (!threadingSupported || channelView !== "main" || channelCanon.channel !== String(selectedChannelId())) return;
   if (hidingRead()) {
     const keeps = readFilterKeeps();
     const wanted = timelineMessages.filter((message) => !hiddenEmpty(message) && keeps(message))
@@ -28710,7 +28724,7 @@ let countsAllReadInFlight = null;
 
 /** `readAllForCounts`, once the read of Main being folded now has been drawn. */
 function queueReadAllForCounts() {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   Promise.resolve().then(() => readAllForCounts(channel)).catch(() => {});
 }
 
@@ -28740,7 +28754,7 @@ function outrunningThreads() {
  * late-counts-resurrect`).
  */
 async function readAllForCounts(channel, soon = false) {
-  if (!threadingSupported || !channel || String(el("discord-channel").value) !== channel || channelView !== "main" ||
+  if (!threadingSupported || !channel || String(selectedChannelId()) !== channel || channelView !== "main" ||
       channelCanon.channel !== channel || channelCanon.scope || countsAllReadInFlight !== null ||
       document.visibilityState === "hidden") return;
   const all = channelCanon.views.get(viewKey("flat"));
@@ -28769,7 +28783,7 @@ async function readAllForCounts(channel, soon = false) {
     // `#650 cache-first-older-reads`: ...and asks once more soon, for the read the server made behind it.
     else if (!soon) setTimeout(() => void readAllForCounts(channel, true).catch(() => {}), COUNTS_SOON_MS);
     const current = channelCanon === read.canon && read.canon.channel === channel &&
-      String(el("discord-channel").value) === channel;
+      String(selectedChannelId()) === channel;
     const number = sentNumberOf(payload);
     // Not over a newest page of All sent after this one — the reader switched to All, or tapped N
     // replies, and that read answered first: this answer is the older, and folded over it would put
@@ -29022,7 +29036,7 @@ function markHeldDone(ids, done, settles = false) {
     write.pending += 1;
     localReadWrites.set(id, write);
   }
-  const canon = threadingSupported && channelCanon.channel === String(el("discord-channel").value)
+  const canon = threadingSupported && channelCanon.channel === String(selectedChannelId())
     ? channelCanon : null;
   const flipped = canon ? marked.filter((id) => canon.dismissed.has(id) !== done) : [];
   for (const id of flipped) {
@@ -29197,7 +29211,7 @@ async function writeInBatches(route, ids, landed) {
  * @param {string | null} [reason]
  */
 function timelinePath(before = null, after = null, reason = null) {
-  let path = `/api/v1/channels/${encodeURIComponent(el("discord-channel").value)}/timeline` +
+  let path = `/api/v1/channels/${encodeURIComponent(selectedChannelId())}/timeline` +
     `?view=${channelView}&limit=${DISCORD_PAGE_LIMIT}`;
   path = withThreadQuery(path, selectedThreadId);
   if (before) path += `&before=${encodeURIComponent(before)}`;
@@ -29423,7 +29437,7 @@ function renderCachedTimeline() {
       loadedIsWhole(),
       channelView === "thread"
         ? openThreadName()
-        : channelName(knownChannel(el("discord-channel").value))
+        : channelName(knownChannel(selectedChannelId()))
     ));
   };
   holdingMessage(redraw);
@@ -29487,7 +29501,7 @@ function forwardCursor(reason) {
     return cursors.length > 0 && cursors.every((cursor) => cursor !== null) ? cursors[0] : null;
   }
   if (reason === undefined || !DELTA_REASONS.includes(reason)) return null;
-  if (channelCanon.channel !== String(el("discord-channel").value)) return null;
+  if (channelCanon.channel !== String(selectedChannelId())) return null;
   const cover = channelCanon.views.get(viewKey());
   if (!cover || !cover.live || !cover.newest) return null;
   if (Date.now() - (cover.fullAt || 0) >= TIMELINE_RECONCILE_MS) return null;
@@ -29578,7 +29592,7 @@ async function loadTimeline(options) {
   const steps = columnSteps();
   const context = channelContextKey();
   const holdKey = readHoldKey();
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   const [view, thread, canon] = [channelView, selectedThreadId, channelCanon];
   if (!channel) return;
   if (discordFetchInFlight) {
@@ -29608,7 +29622,7 @@ async function loadTimeline(options) {
   const record = { context, read, full: sent === null };
   columnReadsSent.set(steps.column, record);
   const sameStore = () => canon === channelCanon && canon.channel === channel &&
-    String(el("discord-channel").value) === channel;
+    String(selectedChannelId()) === channel;
   const stillCurrent = () =>
     inColumn(steps.column, () => generation === discordLoadGeneration && context === channelContextKey());
   // `#220 view-switch-instant`. Rows a switch drew from the store for a view no page has covered,
@@ -29831,7 +29845,7 @@ async function loadTimeline(options) {
  */
 function foldLateTimelinePage(payload, read) {
   if (!threadingSupported || channelCanon !== read.canon || read.canon.channel !== read.channel ||
-      String(el("discord-channel").value) !== read.channel) return;
+      String(selectedChannelId()) !== read.channel) return;
   // Asked in the column the read was for, which is the one whose view it may be. `#229`.
   if (read.column && read.column !== activeColumn) {
     inColumn(read.column, () => foldLateTimelinePage(payload, read));
@@ -30115,7 +30129,7 @@ function loadOutgoingMessages() {
 }
 
 function outgoingInView(entry) {
-  if (entry.channel !== el("discord-channel").value) return false;
+  if (entry.channel !== selectedChannelId()) return false;
   // `#466 reply-promotes-thread`: the thread it goes into, which a reply to a message on Slack is too.
   if (channelView === "thread") return outgoingThreadOf(entry) === String(selectedThreadId);
   if (channelView === "flat") return true;
@@ -30269,7 +30283,7 @@ function ownPostStands(id) {
 function storeKeepsOwnPosts(channel) {
   const provider = providerOfChannel(channel);
   return provider ? provider.threading_supported === true
-    : threadingSupported && channel === String(el("discord-channel").value);
+    : threadingSupported && channel === String(selectedChannelId());
 }
 
 /**
@@ -30300,7 +30314,7 @@ function sentReceiptRetires(entry, drawn) {
   const shown = Date.now() - (Number(entry.sentAt) || 0);
   if (shown >= OWN_POST_GRACE_MS) return true;
   if (shown < SENT_RECEIPT_MS || !storeKeepsOwnPosts(entry.channel)) return false;
-  const here = entry.channel === String(el("discord-channel").value);
+  const here = entry.channel === String(selectedChannelId());
   const stored = here && channelCanon.channel === entry.channel
     ? new Set(channelCanon.messages.map((held) => String(held.id))) : null;
   return here && entry.parts.every((part) => drawn.has(part.id) || Boolean(stored && stored.has(part.id)));
@@ -30352,7 +30366,7 @@ function observeOutgoingMessages(messages) {
 
 function renderOutgoingMessages() {
   const host = el("outgoing-log");
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   // `#491 threads-view-sent-receipt`. And the rows among the Threads view's cards, where that view
   // draws a reply sent from it: the owner, 2026-10-23, "After it sent there was still a card on the
   // bottom AND it rendered as a card under the thread. The same message is on the screen twice."
@@ -30676,7 +30690,7 @@ let drawnPendingThreads = "";
 function outgoingThreadOf(entry) {
   if (entry.continueIn) return String(entry.continueIn);
   if (entry.threadId) return String(entry.threadId);
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   if (!entry.replyTo || entry.channel !== viewing || channelCanon.channel !== viewing ||
       !channelRepliesInThread(entry.channel)) return null;
   // The store as it stands, never loaded from here: this runs in the passes that draw it.
@@ -30694,7 +30708,7 @@ function outgoingThreadOf(entry) {
  * @returns {Map<string, {count: number, at: number}>}
  */
 function pendingByThread() {
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   const key = `${viewing} ${outboxVersion} ${channelCanon.channel} ${channelCanon.messages.length}`;
   if (pendingCache.key === key) return pendingCache.threads;
   /** @type {Map<string, {count: number, at: number}>} */
@@ -30729,7 +30743,7 @@ function pendingThreadTimes() {
 
 /** Which threads of the channel on screen have sends counting in them, and how many: for redraws. */
 function pendingThreadsKey() {
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   return [viewing, ...[...pendingByThread()].sort().map(([thread, { count }]) => `${thread}=${count}`)].join(" ");
 }
 
@@ -30754,7 +30768,7 @@ function noteOutgoingEcho(id) {
  */
 function withPendingThreads(summaries) {
   const listed = new Set(summaries.map((summary) => String(summary.id)));
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   /** @type {Map<string, any>} */
   const added = new Map();
   // The threads sends are going into, and those a reply sent from here is held in, before a read of the
@@ -30797,7 +30811,7 @@ function withPendingThreads(summaries) {
  */
 async function placeReplyTarget(entry) {
   const id = String(entry.replyTo);
-  const current = () => String(el("discord-channel").value) === entry.channel;
+  const current = () => String(selectedChannelId()) === entry.channel;
   const refuseRemoved = () => {
     if (!current() || !removedUpstream(id)) return;
     const error = /** @type {Error & {removed?: boolean}} */ (new Error("the message you answered was removed from the channel"));
@@ -31034,7 +31048,7 @@ function removedSince(canon, id, number) {
 
 /** Whether message `id` of the selected channel is removed upstream, as far as this page knows (`noteRemoved`). */
 function removedUpstream(id) {
-  return channelCanon.channel === String(el("discord-channel").value) && channelCanon.removed.has(String(id));
+  return channelCanon.channel === String(selectedChannelId()) && channelCanon.removed.has(String(id));
 }
 
 /**
@@ -31079,7 +31093,7 @@ function queuePlaceUnplaced() {
  * late answer lands as one in time does (`landPlacingRead`).
  */
 async function placeUnplaced() {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (!threadingSupported || !channel || channelCanon.channel !== channel || channelCanon.scope ||
       placingReadInFlight !== null || discordFetchInFlight || document.visibilityState === "hidden" ||
       placeUnplacedWaits(channel)) return;
@@ -31118,7 +31132,7 @@ async function placeUnplaced() {
         }
         throw error;
       }
-      if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return;
+      if (channelCanon !== canon || canon.channel !== channel || String(selectedChannelId()) !== channel) return;
       if (sent && payload.delta && payload.delta.more) {
         sent = null;
         continue;
@@ -31163,7 +31177,7 @@ async function placeUnplaced() {
  */
 function landPlacingRead(payload, read) {
   const { canon, channel } = read;
-  if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return true;
+  if (channelCanon !== canon || canon.channel !== channel || String(selectedChannelId()) !== channel) return true;
   const delta = Boolean(read.sent && payload.delta);
   const quiet = (liveEventsSeen.get(channel) || 0) === read.live;
   const unremoved = (liveRemovalsSeen.get(channel) || 0) === read.removals;
@@ -31203,7 +31217,7 @@ function landPlacingRead(payload, read) {
  */
 function placeFromAnswer(payload, read) {
   const { canon, channel } = read;
-  if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return;
+  if (channelCanon !== canon || canon.channel !== channel || String(selectedChannelId()) !== channel) return;
   const placed = placeFromPage(payload, canon, read.number, read.held);
   if (!(read.sent && payload.delta && payload.delta.more)) answerUnplaced(canon, read.seen);
   if (placed) followPlacement();
@@ -31345,7 +31359,7 @@ function placeFromPage(payload, canon, number, held = null) {
  * thread is not news there. Main's counts, the thread picker, the cards and an open Reply follow.
  */
 function followPlacement() {
-  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
+  if (!threadingSupported || channelCanon.channel !== String(selectedChannelId())) return;
   eachColumn(() => {
     const projected = channelView === "threads" ? null : projectView();
     if (!projected) return;
@@ -31531,7 +31545,7 @@ function waitingBehind(ahead) {
   const choice = `${actions.join(", ")} or Dismiss it to let this one go.`;
   if (ahead.state === "unconfirmed") return `${which}, and its delivery is unconfirmed. ${choice}`;
   // `#315 removed-reply-target`. Refused, not undecided: Retry sends it nowhere either.
-  if (ahead.placement === "unknown" && ahead.replyTo && ahead.channel === String(el("discord-channel").value) &&
+  if (ahead.placement === "unknown" && ahead.replyTo && ahead.channel === String(selectedChannelId()) &&
       removedUpstream(ahead.replyTo)) {
     return `${which}, and was not sent: the message it answers was removed. ` +
       `${editableSend(ahead) ? "Edit or Dismiss" : "Dismiss"} it to let this one go.`;
@@ -31927,7 +31941,7 @@ async function dispatchOutgoingMessage(entry, job) {
     // replaced by Reply in the stream) caught it, on a channel whose folded rows carry the `#244
     // elision-word-count` line. Not while a filter
     // change holds a message in place (`#243 filter-keeps-selection`).
-    const here = entry.channel === el("discord-channel").value;
+    const here = entry.channel === selectedChannelId();
     const pinned = here && currentView === "discord" && followsNewest(el("scroll-area"));
     // `#229 desktop-two-column`. The right column's reader on its newest line follows it too.
     const sidePinned = here && sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")));
@@ -32415,7 +32429,7 @@ async function editOutgoingMessage(id) {
   }
   const key = JSON.stringify([entry.channel, entry.threadId || null]);
   // The column whose box that is now, if one is showing it: this one first, then the other.
-  const boxShown = () => String(el("discord-channel").value) === entry.channel && activeComposerKey === key;
+  const boxShown = () => String(selectedChannelId()) === entry.channel && activeComposerKey === key;
   const showing = () => [activeColumn, activeColumn === columns.main ? columns.side : columns.main]
     .find((column) => (column === columns.main || sideShowing()) && inColumn(column, boxShown)) || null;
   // From the store, which every keystroke in the box writes, and which holds the draft of a box no
@@ -32559,7 +32573,7 @@ function putBackDismissedSend(id) {
   renderOutgoingEverywhere();
   renderDismissedSends();
   if (!entry) return;
-  setStatus(entry.channel === String(el("discord-channel").value)
+  setStatus(entry.channel === String(selectedChannelId())
     ? `Put back: “${sendSnippet(unsentText(entry))}”.`
     : `Put back in the outbox of ${channelLabel(entry.channel)}.`);
 }
@@ -32854,7 +32868,7 @@ el("dismissed-send-restore").addEventListener("click", () => {
 
 async function sendChannelMessage() {
   const key = activeComposerKey;
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   const text = el("channel-compose-text").value;
   if (knownChannel(channel)?.writable === false) {
     el("channel-compose-state").textContent = "This channel is read-only.";
@@ -33430,7 +33444,7 @@ function seenIn(channelId) {
  * being viewed, which is where it must have come from.
  */
 function messageChannel(message) {
-  return String((message && message.channel_id) || el("discord-channel").value || "");
+  return String((message && message.channel_id) || selectedChannelId() || "");
 }
 
 /**
@@ -33930,7 +33944,7 @@ function renderChannelRows() {
   const rows = [...list.children];
   // The channel these rows belong to, read once. Every author learned on this pass was seen HERE,
   // and every bucket drawn on it is a statement about who is in THIS conversation.
-  const viewing = el("discord-channel").value;
+  const viewing = selectedChannelId();
   // Every message some LOADED message answers.
   const answered = answeredBy(rows, viewing);
   // The author census FIRST and in full, because `bucketFor` asks how many other bots there are —
@@ -34023,7 +34037,7 @@ function dressUnpackedRows() {
     const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
       .filter((row) => row.hasAttribute("data-unpack-thread") && row.hasAttribute("data-id"));
     if (rows.length === 0) return;
-    const viewing = String(el("discord-channel").value);
+    const viewing = String(selectedChannelId());
     const pass = { tally: replyTally(), answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
     for (const row of rows) dressChannelRow(row, pass);
   });
@@ -35255,7 +35269,7 @@ async function seekMessage(target, arrive, openAll) {
   endSearchWalks();
   try {
     const ticket = ++replyJumpTicket;
-    const channel = String(el("discord-channel").value);
+    const channel = String(selectedChannelId());
     if (arrive()) return;
     // The reader's own filter, said plainly rather than walked past: the message is loaded, read,
     // and Hide read is the reason it is not drawn. No walk would find it. Asked again wherever the
@@ -35282,7 +35296,7 @@ async function seekMessage(target, arrive, openAll) {
       setStatus("Not in this view — opening All…");
       // The reader went somewhere else while All was being read: the tap is over.
       const stillAll = () =>
-        ticket === replyJumpTicket && String(el("discord-channel").value) === channel && channelView === "flat";
+        ticket === replyJumpTicket && String(selectedChannelId()) === channel && channelView === "flat";
       try {
         const opening = changeChannelView("flat");
         steps.pause();
@@ -35622,7 +35636,7 @@ const fromGatheredThread = (row) => row.hasAttribute("data-gathered-thread");
 
 /** The store's copies of this channel's messages by id, for a pass that asks after many of them. */
 function heldMessagesById() {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (channelCanon.channel !== channel) loadCanon(channel);
   return new Map(channelCanon.messages.map((held) => [String(held.id), held]));
 }
@@ -36228,7 +36242,7 @@ const replyMarkerName = (at, of) =>
  * @returns {{replies: Map<string, Map<string, number>>, held: Map<string, any>}}
  */
 function heldReplies(rows) {
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   /** @type {Map<string, any>} */
   const held = new Map();
   if (threadingSupported && channelCanon.channel === viewing) {
@@ -36274,7 +36288,7 @@ function heldReplies(rows) {
  * counts again only when this has changed since the last count. `#228 reply-visible`.
  */
 function outgoingReplyKey() {
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   const parts = [viewing];
   for (const entry of outgoingMessages.values()) {
     if (entry.channel !== viewing || !entry.replyTo) continue;
@@ -36828,7 +36842,7 @@ async function applyOwnReadToExisting() {
     : `Marked ${count} of your message${count === 1 ? "" : "s"} read. Undo puts ${count === 1 ? "it" : "them"} back.`;
   el("own-read-state").textContent = said;
   setStatus(said);
-  if (count > 0 && el("discord-channel").value) {
+  if (count > 0 && selectedChannelId()) {
     guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
   }
 }
@@ -36861,7 +36875,7 @@ async function undoOwnReadApply() {
   const said = `Put ${count} of your message${count === 1 ? "" : "s"} back.`;
   el("own-read-state").textContent = said;
   setStatus(said);
-  if (el("discord-channel").value) {
+  if (selectedChannelId()) {
     guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
   }
 }
@@ -36899,7 +36913,7 @@ function noteStartsRead(messages) {
     !(threadingSupported && heldMessage(String(message.id))) && !localReadWrites.has(String(message.id)));
   if (fresh.length === 0) return;
   readStateEpoch += 1;
-  const here = String(el("discord-channel").value);
+  const here = String(selectedChannelId());
   for (const message of fresh) {
     const id = String(message.id);
     localReadWrites.set(id, { pending: 0, from: readStateEpoch });
@@ -37617,7 +37631,7 @@ async function prepareSpeechNow(signal) {
     return;
   }
   if (readAloudPlayback !== "audio") return;
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   if (!channel) {
     return;
   }
@@ -37723,7 +37737,7 @@ async function requestPreparedSpeech(channel, ids, signal = null) {
  * @param {Array<string>} ids the tapped row's message ids, oldest first.
  */
 async function prepareSpeechFor(ids) {
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   if (!channel || readAloudPlayback !== "audio") return;
   const missing = ids.map(String).filter((id) => id && !preparedEntry(id));
   if (missing.length === 0) return;
@@ -39608,7 +39622,7 @@ async function readAloud(ids, from = null) {
   if (already || parts.length === 0) {
     return;
   }
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   if (!channel) {
     return;
   }
@@ -41179,7 +41193,7 @@ async function markReadThroughHere(row, upstreamId) {
   if (at < 0) return;
   const covered = rows.slice(0, at + 1).flatMap(idsOf);
   const ids = covered.filter((id) => !archivedIds.has(id));
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   // `#327 done-races-remaining`. What the chat service's marker would pass, beyond the rows on
   // screen: a Done, or a put back, still on its way whose row is off the list — under Hide read a
   // Done takes its row off at once, and no order the page holds in every view says where it stood.
@@ -41211,8 +41225,8 @@ async function markReadThroughHere(row, upstreamId) {
     // again by what the page holds (`doneHeldHere`). One refused or put back, the marker is not moved.
     // The wait is for `waitingFor`: the rows covered, and a write on its way at the press for a
     // message the marker would pass whose row Hide read had already taken off the list.
-    if (!(await doneSaved(waitingFor, () => String(el("discord-channel").value) === channel && doneHeldHere(waitingFor)))) {
-      if (String(el("discord-channel").value) === channel) {
+    if (!(await doneSaved(waitingFor, () => String(selectedChannelId()) === channel && doneHeldHere(waitingFor)))) {
+      if (String(selectedChannelId()) === channel) {
         const why = "a Done it covers was refused or undone";
         setStatus(ids.length > 0 && doneHeldHere(ids) ? `Marked ${count} read here, not in ${service}: ${why}.`
           : `Not marked read in ${service}: ${why}.`);
@@ -41727,7 +41741,7 @@ function historyReach() {
   /** @type {number | null} below this instant, a row is scattered */
   let floor = null;
   if (threadingSupported) {
-    const cover = channelCanon.channel === String(el("discord-channel").value) ? channelCanon.views.get(viewKey()) : undefined;
+    const cover = channelCanon.channel === String(selectedChannelId()) ? channelCanon.views.get(viewKey()) : undefined;
     if (!cover) return reach;
     // Saved on this device and not read since: what it held when saved, and nothing it may have missed.
     reach.saved = !cover.live;
@@ -41809,7 +41823,7 @@ function reachClause(reach) {
 
 /** The chat service the channel on screen is read from, as a sentence names it: "Slack", or "the chat service". */
 function serviceWords() {
-  const provider = providerOfChannel(el("discord-channel").value);
+  const provider = providerOfChannel(selectedChannelId());
   const name = provider && typeof provider.name === "string" ? provider.name.trim() : "";
   return name || chatProviderName || "the chat service";
 }
@@ -42178,7 +42192,7 @@ const serverCopyOpen = () => Boolean(serverCache && serverCache.available) && to
 /** What identifies the server's search wanted now, or "" for none. */
 function serverSearchKeyNow() {
   if (!searchOpen || currentScreen !== "main" || currentView !== "discord" || !searchTyped(searchQuery)) return "";
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   if (!channel) return "";
   return JSON.stringify([searchAllChannels ? "*" : channel, searchIdentity(searchQuery)]);
 }
@@ -42226,7 +42240,7 @@ function readerZone() {
 async function runServerSearch(more) {
   const state = serverSearch;
   const ticket = state.ticket;
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   const zone = readerZone();
   const below = more ? state.resume : searchAllChannels ? null : oldestLoadedMs();
   const params = [`q=${encodeURIComponent(searchQuery)}`, ...(zone ? [`tz=${encodeURIComponent(zone)}`] : []),
@@ -42372,7 +42386,7 @@ function renderServerSearch() {
   setTextIfChanged(el("search-scope"), searchScopeLine());
   const checkbox = /** @type {HTMLInputElement} */ (el("search-all-channels"));
   if (checkbox.checked !== searchAllChannels) checkbox.checked = searchAllChannels;
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   const held = heldMessagesById();
   const fresh = serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
   const drawn = [...el("server-hits").children].map((li) => `${li.getAttribute("data-channel")} ${li.getAttribute("data-id")}`);
@@ -42407,7 +42421,7 @@ let searchFurtherRuns = 0;
 
 /** Whether a gathering this page asked for is under way in the channel on screen. */
 const searchFurtherRunning = () => searchFurther.channel !== "" &&
-  searchFurther.channel === String(el("discord-channel").value || "");
+  searchFurther.channel === String(selectedChannelId() || "");
 
 /** Whether Search further back is offered: one channel, a copy the server keeps, not yet whole. */
 function searchFurtherOffered() {
@@ -42441,7 +42455,7 @@ function renderSearchFurther() {
 
 /** The press: ask the server to gather this channel's older history next, or take that back. */
 async function searchFurtherPressed() {
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   if (!channel) return;
   if (searchFurtherRunning()) {
     stopSearchFurther();
@@ -42562,11 +42576,11 @@ let repliesWalk = null;
 let repliesNote = /** @type {{key: string, text: string} | null} */ (null);
 
 /** Everything the cards' walk depends on: a change in either ends it, and clears its note. */
-const repliesKey = () => JSON.stringify([String(el("discord-channel").value), searchOpen ? searchIdentity(searchQuery) : null]);
+const repliesKey = () => JSON.stringify([String(selectedChannelId()), searchOpen ? searchIdentity(searchQuery) : null]);
 
 /** All's cover in the selected channel's store, or null where no page of All has covered it. */
 function allCover() {
-  if (channelCanon.channel !== String(el("discord-channel").value)) return null;
+  if (channelCanon.channel !== String(selectedChannelId())) return null;
   return channelCanon.views.get(viewKey("flat")) || null;
 }
 
@@ -42582,7 +42596,7 @@ const sideCardsShown = () => cardsOnScreen() === leftEl("side-cards");
 /** Whether the cards offer to search their threads' older replies: see the head of this section. */
 function repliesSearchOffered() {
   return threadingSupported && sideCardsShown() && searchOpen && searchTyped(searchQuery) &&
-    channelCanon.channel === String(el("discord-channel").value) && !channelCanon.scope && !allLoaded();
+    channelCanon.channel === String(selectedChannelId()) && !channelCanon.scope && !allLoaded();
 }
 
 /** The instant All's pages reach back to, or null where that is not known. */
@@ -42669,7 +42683,7 @@ function renderRepliesSearch() {
  * @param {{channel: string, canon: any}} walk
  */
 function foldRepliesPage(payload, newest, held, walk) {
-  if (channelCanon !== walk.canon || String(el("discord-channel").value) !== walk.channel) return;
+  if (channelCanon !== walk.canon || String(selectedChannelId()) !== walk.channel) return;
   if (newest) {
     const number = sentNumberOf(payload);
     const read = { context: JSON.stringify([walk.channel, "flat", null]), channel: walk.channel, view: "flat",
@@ -42760,7 +42774,7 @@ function searchReplies() {
   const walk = {
     key: repliesKey(),
     canon: channelCanon,
-    channel: String(el("discord-channel").value),
+    channel: String(selectedChannelId()),
     // The cards found already, which nothing this walk reads is counted as having found.
     held: new Set(cardsFound()),
     // The threads the pages it read brought a message of: only their cards are its finds.
@@ -42982,7 +42996,7 @@ async function loadOlderPage(signal) {
   if (discordMoreAbove !== true || !discordOlderCursor || olderFetchInFlight) {
     return;
   }
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   const generation = discordLoadGeneration;
   if (!channel) {
     return;
@@ -43003,7 +43017,7 @@ async function loadOlderPage(signal) {
       if (signal && signal.aborted) return;
       throw error;
     }
-    if (generation !== discordLoadGeneration || channel !== el("discord-channel").value) return;
+    if (generation !== discordLoadGeneration || channel !== selectedChannelId()) return;
     // `#427 server-thread-hues`: the step back's colours, before its rows are built.
     noteServerThreadHuesIn(payload.messages || [], [], String(channel));
     observeOutgoingMessages(payload.messages || []);
@@ -43745,7 +43759,7 @@ async function loadDiscord(options) {
   if (readHeld(holdKey, options)) return;
   const generation = ++discordLoadGeneration;
   const keepPosition = Boolean(options && options.keepPosition);
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   if (!channel) {
     setStatus(NO_CHANNEL_TO_READ);
     return;
@@ -44395,7 +44409,7 @@ function noteArchived(payload, replace) {
   // copy takes its state for each such message from there. The walk visits every message this page has
   // written Done or put back since it was loaded (`localReadWrites` only grows): a few hundred at most in
   // a long session, against a read that has just drawn its page, so it is not bounded further.
-  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value)) {
+  if (threadingSupported && channelCanon.channel === String(selectedChannelId())) {
     for (const id of localReadWrites.keys()) {
       if (readSpeaksFor(payload, id)) continue;
       if (channelCanon.dismissed.has(id)) archivedIds.add(id);
@@ -44541,7 +44555,7 @@ async function loadTodo(options) {
   if (threadingSupported) return loadTimeline(options);
   const generation = ++discordLoadGeneration;
   const keepPosition = Boolean(options && options.keepPosition);
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   if (!channel) {
     setStatus(NO_CHANNEL_TO_READ);
     return;
@@ -45216,7 +45230,7 @@ async function doneSaved(ids, done = () => ids.every((id) => archivedIds.has(Str
  * when it fails, and remembered with it for Undo.
  */
 async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.messages) : null) {
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   // In time order, as the server resolves `through`: gathered replies (`#215 reply-coalesce`) are
   // above rows older than they are, and are not "before" them.
   const visible = listedMessages().map((message) => String(message.id));
@@ -45326,7 +45340,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
       for (const id of added) if (back.has(id)) archivedIds.delete(id);
       mirrorArchived(mirrored.filter((id) => back.has(id)), false);
       // ...and the rows it took off under Hide read without threads, while that list is still on screen.
-      if (listed && todoMode && !threadingSupported && String(el("discord-channel").value) === String(channel)) {
+      if (listed && todoMode && !threadingSupported && String(selectedChannelId()) === String(channel)) {
         putBackRowsOff(listed, back);
       }
       guardQuietly(refreshAfterInboxChange)();
@@ -45361,7 +45375,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
 
 /** Move the source provider's monotone read cursor without changing local Done/archive state. */
 async function markReadUpstream(messageId) {
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   const payload = await api(
     `/api/v1/channels/${encodeURIComponent(channel)}/upstream-read`,
     {
@@ -45386,7 +45400,7 @@ async function markReadUpstream(messageId) {
  * stop being true of it.
  */
 async function restoreMessages(ids) {
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   const restored = ids.map(String);
   const removed = restored.filter((id) => archivedIds.has(id));
   const previousDismissal = lastDismissal;
@@ -45586,7 +45600,7 @@ function caughtUpDone(copy, ids) {
  * @param {typeof activeColumn} madeIn
  */
 function followDoneEverywhere(ids, madeIn) {
-  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
+  if (!threadingSupported || channelCanon.channel !== String(selectedChannelId())) return;
   const named = ids.map(String);
   /** @param {Set<string>} copy */
   const caughtUp = (copy) => caughtUpDone(copy, named);
@@ -45797,7 +45811,7 @@ const keptByPin = new WeakSet();
  */
 let drawingPinnedRows = false;
 
-const currentChannelId = () => String(el("discord-channel").value || "");
+const currentChannelId = () => String(selectedChannelId() || "");
 
 /** Whether this message is pinned in the channel on screen. */
 function isPinnedId(id) {
@@ -46247,7 +46261,7 @@ async function saveNoiseRules(rules, said) {
   applyNoiseRules(payload);
   el("noise-state").textContent = said;
   setStatus(said);
-  if (el("discord-channel").value) {
+  if (selectedChannelId()) {
     guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
   }
 }
@@ -46276,7 +46290,7 @@ async function addNoiseRule() {
  * is still hiding it.
  */
 async function markNotNoise(ids) {
-  const channel = el("discord-channel").value;
+  const channel = selectedChannelId();
   const rescued = new Set(ids.map(String));
   if (!channel || rescued.size === 0) return;
   await api(`/api/v1/channels/${encodeURIComponent(channel)}/not-noise`, {
@@ -47621,7 +47635,7 @@ function openReply(messages, from = null, quote = "", focus = true) {
   }
   const message = messages[0];
   replyTarget = message;
-  replyChannelId = el("discord-channel").value;
+  replyChannelId = selectedChannelId();
   // `#185 reply-new-thread`. Offered only where a new thread is possible, and never carried over
   // from the last reply: the default is to answer where the message is. Only this message's own kept
   // draft brings its tick back (`draftStartsThread`) — or, where its thread has been answered since,
@@ -48348,7 +48362,7 @@ function answeredRow(id) {
  * @param {string} id
  */
 function doneWhereNotDrawn(id) {
-  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) &&
+  if (threadingSupported && channelCanon.channel === String(selectedChannelId()) &&
       channelCanon.dismissed.has(id)) return true;
   return inColumn(columns.main, () => archivedIds.has(id) || (todoMode && !threadingSupported));
 }
@@ -48375,7 +48389,7 @@ function answeredDone(id, found = answeredRow(id)) {
  * @param {string[]} ids
  */
 function doneHeldHere(ids) {
-  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value)) {
+  if (threadingSupported && channelCanon.channel === String(selectedChannelId())) {
     return ids.every((id) => channelCanon.dismissed.has(String(id)));
   }
   return inColumn(columns.main, () => ids.every((id) => archivedIds.has(String(id))));
@@ -48412,7 +48426,7 @@ function doneHeldHere(ids) {
  * @returns {Promise<boolean>}
  */
 async function markAnsweredDone(channel, id) {
-  if (channel !== String(el("discord-channel").value)) {
+  if (channel !== String(selectedChannelId())) {
     await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(channel)}/dismiss`,
       { method: "POST", body: { messages: [id] } }));
     return true;
@@ -48423,14 +48437,14 @@ async function markAnsweredDone(channel, id) {
     // No Done of its own on its way: saved, or made before this page was loaded or elsewhere and read
     // since, which no set here need name (under Hide read without threads it has left the list).
     if (!ids.some((one) => doneSaving.has(String(one)))) return true;
-    return doneSaved(ids, () => String(el("discord-channel").value) === channel && doneHeldHere(ids));
+    return doneSaved(ids, () => String(selectedChannelId()) === channel && doneHeldHere(ids));
   }
   await inColumn(found ? found.column : columns.main, () => toggleArchived(ids, found ? found.row : null));
   // `#240 reading-bookmark`. Send said where the way back is, and the Done's own words took the line.
   if (bookmarkAnchor(channel)) setStatus("b goes back to your bookmark.");
   // `#327 done-races-remaining`. Its own Done is saved, but Undo may have been pressed while it was:
   // a put back still on its way waited for, the message is looked at again as for a Done made before.
-  return doneSaved(ids, () => String(el("discord-channel").value) === channel && doneHeldHere(ids));
+  return doneSaved(ids, () => String(selectedChannelId()) === channel && doneHeldHere(ids));
 }
 
 /**
@@ -48590,7 +48604,7 @@ async function markSentRead(entry) {
   if (!mark.asked) return;
   // Said over the Done's own words, which say it was not marked in the chat service. Only for the
   // channel on screen: a reply that finished after the reader moved on says nothing over another.
-  if (entry.channel !== String(el("discord-channel").value)) return;
+  if (entry.channel !== String(selectedChannelId())) return;
   setStatus(serviceReadWords(mark) + (bookmarkAnchor(entry.channel) ? " b goes back to your bookmark." : ""));
 }
 
@@ -49070,7 +49084,7 @@ function followInOtherColumn() {
  * are offered by, in the picker and to the keys, on any screen.
  */
 function threadListOffered() {
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   return threadingSupported && channel !== "" && !(channelCanon.channel === channel && channelCanon.scope);
 }
 
@@ -49197,7 +49211,7 @@ function moveLayout(now, next, cards = null, left = null) {
   else if (next === "list") enterThreadList(now, left);
   const kept = now !== "one" && next !== "one" ? cards : null;
   const place = sideColumnUp() && columns.side.mode === "list" ? kept || cardAnchor() : null;
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   const back = place && kept && now === "two" && held && held.channel === channel && sameCardPlace(kept, held.placed)
     ? held.place : null;
   renderThreadSelect();
@@ -49242,7 +49256,7 @@ function leftColumnPlace() {
   return inColumn(columns.main, () => ({
     place: readerPlace(),
     view: channelView,
-    channel: String(el("discord-channel").value),
+    channel: String(selectedChannelId()),
   }));
 }
 
@@ -49263,7 +49277,7 @@ function keepLeftColumnPlace(left, back = null) {
   inColumn(columns.main, () => {
     if (currentScreen !== "main" || currentView !== "discord" || threadListShown) return;
     if (channelView !== "main" && channelView !== "flat") return;
-    const channel = String(el("discord-channel").value);
+    const channel = String(selectedChannelId());
     const kept = [back, left].find((one) => one !== null && one.view === channelView && one.channel === channel);
     if (kept) keepReaderPlace(kept.place);
   });
@@ -49344,7 +49358,7 @@ function noteListBefore() {
   if (channelView === "thread" && threadOrigin === "list") return;
   const thread = channelView === "thread" && selectedThreadId ? String(selectedThreadId) : null;
   listBefore = {
-    layout: "one", channel: String(el("discord-channel").value || ""),
+    layout: "one", channel: String(selectedChannelId() || ""),
     view: thread ? "thread" : channelView, thread, origin: thread ? threadOrigin : null,
   };
 }
@@ -49377,7 +49391,7 @@ function threadListBack() {
  * @returns {{view: string, thread: string | null, summary: any, origin: string | null}}
  */
 function oneColumnBeforeList(before) {
-  const channel = String(el("discord-channel").value || "");
+  const channel = String(selectedChannelId() || "");
   if (before.layout === "one" && before.channel === channel && REOPENED_VIEWS.includes(String(before.view))) {
     if (before.view !== "thread") return { view: String(before.view), thread: null, summary: null, origin: null };
     const id = String(before.thread || "");
@@ -49559,7 +49573,7 @@ function leftColumnToMain(place = null) {
  */
 function enterColumns(from = "one", left = null) {
   columnsShown = true;
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   const open = channelView === "thread" && selectedThreadId
     ? { id: String(selectedThreadId), summary: selectedThread }
     : sideThreads.get(channel) || null;
@@ -49656,7 +49670,7 @@ function enterThreadList(from = "one", left = null) {
   // before the layout changed (`left`, `leftColumnPlace`), where it did: from two columns, Main is drawn
   // across the window behind the list, its rows and the card at another width than the reader saw.
   listHeldPlace = inColumn(columns.main, () => (channelView === "main" || channelView === "flat"
-    ? { place: left ? left.place : readerPlace(), view: channelView, channel: String(el("discord-channel").value) } : null));
+    ? { place: left ? left.place : readerPlace(), view: channelView, channel: String(selectedChannelId()) } : null));
   // `#269 approval-card-inline`. A send card waiting at the foot of the left column, behind the list
   // now, is docked under the cards (`placePostCard`) BEFORE they are opened or put back, so that the
   // foot they are placed at is the one above it.
@@ -49713,7 +49727,7 @@ function leaveThreadList(next = "one") {
   placePostCard();
   const followed = inColumn(columns.main, () => {
     const holds = held !== null && currentScreen === "main" && currentView === "discord" &&
-      channelView === "main" && String(el("discord-channel").value) === held.channel;
+      channelView === "main" && String(selectedChannelId()) === held.channel;
     if (holds && keepReaderPlace(held.place)) return held.place.pinned;
     if (follows) scrollToNewest();
     return follows;
@@ -49721,7 +49735,7 @@ function leaveThreadList(next = "one") {
   if (next === "one") showOneColumnLeft();
   const backInAll = next === "one" && held !== null && held.view === "flat" && inColumn(columns.main, () =>
     currentScreen === "main" && currentView === "discord" && channelView === "flat" &&
-    String(el("discord-channel").value) === held.channel && keepReaderPlace(held.place));
+    String(selectedChannelId()) === held.channel && keepReaderPlace(held.place));
   if (carded && (backInAll ? !held.place.pinned : !followed && `${channelView}|${selectedThreadId}` === shown)) {
     inColumn(columns.main, () => followIfPinned(false, 0, "discord"));
   }
@@ -49797,7 +49811,7 @@ function renderSideColumn() {
  * else the one its rows are of. Null with neither.
  */
 function sideThreadChoice() {
-  const chosen = sideThreads.get(String(el("discord-channel").value));
+  const chosen = sideThreads.get(String(selectedChannelId()));
   return inColumn(columns.side, () => {
     if (!chosen) return openThreadChoice();
     const drawn = channelView === "thread" && String(selectedThreadId) === chosen.id;
@@ -50012,7 +50026,7 @@ function placeChildren(list, wanted) {
  * @param {ReplyTally} tally
  */
 function redressMainRows(rows, tally) {
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
   for (const row of rows) dressChannelRow(row, pass);
 }
@@ -50159,7 +50173,7 @@ function renderSideCards() {
     });
   }
   // `#281 view-keys`. It reads where it stands now, and says so while it does.
-  const loading = threadPages.loading && threadPages.channel === String(el("discord-channel").value);
+  const loading = threadPages.loading && threadPages.channel === String(selectedChannelId());
   setTextIfChanged(button, loading ? "Loading older threads…" : "Older threads…");
   if (button.disabled !== loading) button.disabled = loading;
   // `#491 threads-view-sent-receipt`. A sent reply these cards now draw takes its receipt away: the
@@ -50442,7 +50456,7 @@ const sideCardPlaces = new Map();
 /** Note where the reader is in the cards, before the right column shows something else. */
 function rememberCardPlace() {
   const anchor = cardAnchor();
-  if (anchor) sideCardPlaces.set(String(el("discord-channel").value), anchor);
+  if (anchor) sideCardPlaces.set(String(selectedChannelId()), anchor);
 }
 
 /** Show the cards in the right column, the reader placed in them as `placeOpenedCards` says. */
@@ -50466,8 +50480,8 @@ function openSideCards() {
  * up the list when a thread was selected from it — then back on the card they were on.
  */
 function placeOpenedCards() {
-  const anchor = sideCardPlaces.get(String(el("discord-channel").value));
-  sideCardPlaces.delete(String(el("discord-channel").value));
+  const anchor = sideCardPlaces.get(String(selectedChannelId()));
+  sideCardPlaces.delete(String(selectedChannelId()));
   // The foot, too, when the card the reader was on has gone.
   if (!(anchor && !anchor.newest && placeCardAnchor(anchor, true))) placeCardAnchor({ newest: true, id: null, offset: 0 });
 }
@@ -50612,7 +50626,7 @@ let openedCardGapState = null;
  * @returns {{threads: Set<string>, ids: Set<string>} | null}
  */
 function openedCardGaps(create) {
-  const key = JSON.stringify([searchKey(), String(el("discord-channel").value)]);
+  const key = JSON.stringify([searchKey(), String(selectedChannelId())]);
   // Forgotten the moment any filter changes, as among messages (`openedGapIds`): leaving the state
   // behind a mismatched key would bring its runs back when the reader typed their way back to the
   // same words, never having opened them under this search.
@@ -51018,7 +51032,7 @@ function keepThreadCardStates() {
 }
 
 /** Where thread `id` of the channel on screen keeps its choice in `threadCardStates`. */
-const cardStateKey = (id) => `${String(el("discord-channel").value)}\n${id}`;
+const cardStateKey = (id) => `${String(selectedChannelId())}\n${id}`;
 
 /** Whether the cards on screen are the Threads view's, where each thread is packed or unpacked from its card. */
 const cardsCycle = () => threadListOnScreen() && columns.side.mode === "list";
@@ -51057,7 +51071,7 @@ const cardIsSummarized = (choice) => {
  * thread unpacked by its own choice. Which threads are is each card's (`cardState`).
  */
 const unpackOnScreen = () => cardsCycle() && (unpackMode !== "packed" ||
-  [...threadCardStates].some(([key, state]) => state === "unpacked" && key.startsWith(`${String(el("discord-channel").value)}\n`)));
+  [...threadCardStates].some(([key, state]) => state === "unpacked" && key.startsWith(`${String(selectedChannelId())}\n`)));
 
 /** The Unpack chip: offered over the Threads view's cards, saying its state; `mixed` for Unpack unread. */
 function renderUnpackToggle() {
@@ -51086,7 +51100,7 @@ function setUnpackMode(mode) {
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
-  const prefix = `${String(el("discord-channel").value)}\n`;
+  const prefix = `${String(selectedChannelId())}\n`;
   for (const key of [...threadCardStates.keys()]) {
     if (key.startsWith(prefix)) threadCardStates.delete(key);
   }
@@ -51208,7 +51222,7 @@ function packButton(id) {
 
 /** The store's messages of thread `choice.id`, oldest first, its root among them where it is held. */
 function unpackHeldMessages(choice) {
-  if (channelCanon.channel !== String(el("discord-channel").value)) return [];
+  if (channelCanon.channel !== String(selectedChannelId())) return [];
   const held = channelCanon.messages.filter((message) => threadOf(message) === choice.id);
   const root = choice.root;
   if (root && !channelCanon.removed.has(String(root.id)) &&
@@ -51275,7 +51289,7 @@ function placeUnpackRuns(choice, rows) {
  */
 function redrawUnpackBlock(choice, drawn, tally) {
   const rows = drawn.filter((row) => row.hasAttribute("data-id"));
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
   for (const row of rows) dressChannelRow(row, pass);
   placeUnpackRuns(choice, rows);
@@ -51373,7 +51387,7 @@ function unpackBlock(choice, tally) {
     }
     return row;
   });
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
   rows.forEach((row, at) => {
     dressChannelRow(row, pass);
@@ -51465,14 +51479,14 @@ function pumpUnpackReads() {
 
 /** One thread's newest page, folded into the store, its block drawn again from what it brought. */
 async function readUnpackThread(id) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   try {
     if (channelCanon.channel !== channel) loadCanon(channel);
     const held = heldNow(channelCanon);
     const path = withThreadQuery(
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=thread&limit=${DISCORD_PAGE_LIMIT}&reason=threads`, id);
     const payload = await readTimeline(path, undefined);
-    if (String(el("discord-channel").value) !== channel) {
+    if (String(selectedChannelId()) !== channel) {
       unpackReads.delete(id);
       return;
     }
@@ -51690,7 +51704,7 @@ function orderFromKeyboard() {
  * @param {Set<string>} carded the threads the cards stand for, by id
  */
 function mainRowMessages(carded) {
-  if (channelCanon.channel !== String(el("discord-channel").value)) return [];
+  if (channelCanon.channel !== String(selectedChannelId())) return [];
   const messages = channelCanon.messages.filter((message) => {
     if (!inView(message, "main", null) || channelCanon.removed.has(String(message.id)) || hiddenEmpty(message)) return false;
     const thread = threadOf(message);
@@ -51750,7 +51764,7 @@ function mainRows(messages, tally) {
   } finally {
     drawingMainRows = false;
   }
-  const viewing = String(el("discord-channel").value);
+  const viewing = String(selectedChannelId());
   const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
   for (const row of rows) dressChannelRow(row, pass);
   return rows;
@@ -51790,7 +51804,7 @@ function placeMainCard() {
 // unpacked rows folded as a thread's are (`unpackBlock`).
 
 /** The key the cards' opened runs are kept under, by channel (`openedReadRuns`). */
-const cardRunKey = () => `cards:${String(el("discord-channel").value)}`;
+const cardRunKey = () => `cards:${String(selectedChannelId())}`;
 
 /** What an item of the cards stands for in a run: a card its thread, a Main row its messages. */
 const cardRunIds = (row) => (row.hasAttribute("data-card") ? [`card:${row.getAttribute("data-id")}`] : idsOf(row));
@@ -52035,7 +52049,7 @@ const litCards = new Map();
 function litCard() {
   // `#440 thread-card-pack-toggle`. The Threads view highlights no card: a press there packs and unpacks.
   if (cardsCycle()) return null;
-  return litCards.get(String(el("discord-channel").value)) || null;
+  return litCards.get(String(selectedChannelId())) || null;
 }
 
 /** The thread a card of either list stands for. */
@@ -52083,7 +52097,7 @@ function paintLitCards() {
  * @param {HTMLElement} row
  */
 function toggleLitCard(id, row) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (litCards.get(channel) === id) litCards.delete(channel);
   else litCards.set(channel, id);
   const pane = row.parentNode === leftEl("side-cards") ? sidePane : channelPane;
@@ -52620,7 +52634,7 @@ function showSideList() {
 function selectSideThread(id, summary = null) {
   noteDeepLinkReaderMove();
   const thread = String(id);
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (!columnsShown || !channel) return undefined;
   // Entered from its card, `enterCard` says so once this returns. `#277 thread-card-focus`.
   columns.side.fromCards = false;
@@ -52656,7 +52670,7 @@ function closeSideThread() {
   // `#262 search-load-older`. The thread's walk for the search goes with it: nothing else it asks
   // about changes when the cards come back.
   endSearchWalk(columns.side);
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   sideThreads.delete(channel);
   if (columns.side.mode === "thread") {
     inColumn(columns.side, () => {
@@ -52713,7 +52727,7 @@ function resetSideColumn(reopen = false) {
     showSideList();
     return;
   }
-  const open = sideThreads.get(String(el("discord-channel").value));
+  const open = sideThreads.get(String(selectedChannelId()));
   if (open) {
     columns.side.mode = "list";
     guardQuietly(() => selectSideThread(open.id, open.summary))();
@@ -53643,7 +53657,7 @@ function abandonRead(answer, read, land, settled = null) {
  * @param {AbandonedRead & {number?: number, generation?: number}} read
  */
 function abandonedReadStands(read) {
-  if (String(el("discord-channel").value) !== read.channel) return false;
+  if (String(selectedChannelId()) !== read.channel) return false;
   if ((liveEventsSeen.get(read.channel) || 0) !== read.live) return false;
   if (threadingSupported) {
     return read.canon === channelCanon && channelCanon.channel === read.channel &&
@@ -53779,7 +53793,7 @@ async function finishDiscordLoad(column = activeColumn) {
 function currentDiscordLoad(generation, channel, readingTodo) {
   return (
     generation === discordLoadGeneration &&
-    String(channel) === String(el("discord-channel").value) &&
+    String(channel) === String(selectedChannelId()) &&
     readingTodo === todoMode
   );
 }
@@ -53910,7 +53924,7 @@ function letStreamGoWhileHidden() {
 /** Follow the stream let go while hidden again, from its last event, unless something else has since. */
 function resumeLiveStream(resume) {
   if (resume === null || resume.generation !== liveGeneration || liveChannel !== null) return;
-  if (String(el("discord-channel").value) !== resume.channel || !token()) return;
+  if (String(selectedChannelId()) !== resume.channel || !token()) return;
   startChannelStream(resume.channel, resume.from);
 }
 
@@ -53944,7 +53958,7 @@ function catchUpHiddenArrivals() {
   mutationArrivedHidden = false;
   liveArrivedHidden = false;
   if (arrived && currentView === "discord" && threadingSupported &&
-      channelCanon.channel === String(el("discord-channel").value) && channelCanon.views.has(viewKey())) {
+      channelCanon.channel === String(selectedChannelId()) && channelCanon.views.has(viewKey())) {
     const area = el("scroll-area");
     const position = channelReadPosition(area);
     if (catchUpHeldView()) {
@@ -54861,7 +54875,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   if (selfPosted) {
     noteSelfAuthor(message.author_id);
   }
-  if (String(message.channel_id) !== String(el("discord-channel").value)) {
+  if (String(message.channel_id) !== String(selectedChannelId())) {
     renderOutgoingEverywhere();
     return;
   }
@@ -55007,7 +55021,7 @@ function followLiveArrival(pinned) {
  * at.
  */
 function heldMessage(id) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   if (channelCanon.channel !== channel) loadCanon(channel);
   return channelCanon.messages.find((held) => String(held.id) === String(id)) || null;
 }
@@ -55017,7 +55031,7 @@ function heldMessage(id) {
  * store holds without one: the copy that places it. `#308 live-reply-in-main`.
  */
 function placesHeld(message) {
-  if (!threadOf(message) || String(message.channel_id) !== String(el("discord-channel").value)) return false;
+  if (!threadOf(message) || String(message.channel_id) !== String(selectedChannelId())) return false;
   const held = heldMessage(message.id);
   return held !== null && !threadOf(held);
 }
@@ -55126,7 +55140,7 @@ function awaitReplayRead(key, channel, arrivedAfter) {
  *   and — when every one of them was a delta — whether all of those were complete
  */
 function settleReplays(read, page) {
-  const channel = String(el("discord-channel").value);
+  const channel = String(selectedChannelId());
   // A delta answers for what it carries: creations always, edits and removals only when complete.
   const answersMutations = Boolean(page) && (!page.delta || page.delta.complete === true);
   if (page) timelineReadsLanded = Math.max(timelineReadsLanded, read);
@@ -56071,7 +56085,7 @@ function settingsChannels() {
 
 /** The service Settings opens on with none chosen yet: the channel being read's, else the first with channels. */
 function defaultSettingsService() {
-  const reading = knownChannel(el("discord-channel").value);
+  const reading = knownChannel(selectedChannelId());
   if (reading) return providerDescriptions.has(reading.provider) ? reading.provider : NO_SERVICE;
   const keys = [...providerDescriptions.keys()];
   return keys.find((key) => knownChannels.some((channel) => channel.provider === key)) || keys[0] || null;
@@ -56178,7 +56192,7 @@ function pointSettingsAt(channelId) {
  */
 function pointSettingsAtReading() {
   if (!servicesInSettings()) return;
-  const reading = knownChannel(el("discord-channel").value);
+  const reading = knownChannel(selectedChannelId());
   if (!reading) return;
   const service = providerDescriptions.has(reading.provider) ? reading.provider : NO_SERVICE;
   if (service !== settingsService) chooseSettingsService(service, reading.id);
@@ -56233,7 +56247,7 @@ function resetChannelDirectory() {
  * history is exactly the kind of decision that must not be made with another service's answer.
  */
 function applyChannelProvider() {
-  const provider = providerOfChannel(el("discord-channel").value);
+  const provider = providerOfChannel(selectedChannelId());
   threadingSupported = provider
     ? provider.threading_supported === true
     : deploymentCapabilities.threading;
@@ -56322,7 +56336,7 @@ function storedActiveChannel() {
  * taken back by a window that merely reloaded. `#265 window-channel-memory`.
  */
 function rememberActiveChannel(chosen = false) {
-  const id = el("discord-channel").value;
+  const id = selectedChannelId();
   keepWindowItem(ACTIVE_CHANNEL_KEY, id || null);
   if (!chosen) return;
   try {
@@ -56471,12 +56485,12 @@ async function showChannelAgain(channel) {
     said.textContent = error.message;
     return;
   }
-  const previousChannel = el("discord-channel").value;
+  const previousChannel = selectedChannelId();
   adoptChannelList(payload);
   pointSettingsAt(channel.id);
   renderChannelBox();
   said.textContent = `Shown again. "${channelName(channel)}" is back in the picker.`;
-  if (el("discord-channel").value !== previousChannel) await changeSelectedChannel();
+  if (selectedChannelId() !== previousChannel) await changeSelectedChannel();
 }
 
 /** Add the channel named in the form, and put the answer where it can be read. */
@@ -56796,7 +56810,7 @@ async function removeChannel() {
     said.textContent = error.message;
     return;
   }
-  const previousChannel = el("discord-channel").value;
+  const previousChannel = selectedChannelId();
   forgetChannelScopes((channel) => channel === String(id));
   adoptChannelList(payload);
   // The directory is cached while Settings stays open. Put a removed source back into its real
@@ -56815,7 +56829,7 @@ async function removeChannel() {
       ? "Removed. It is no longer in the picker."
       : `Removed from your list. "${channelName(channel)}" is still in this server's ` +
         "configuration file, so it can be shown again below.";
-  if (el("discord-channel").value !== previousChannel) await changeSelectedChannel();
+  if (selectedChannelId() !== previousChannel) await changeSelectedChannel();
 }
 
 /**
@@ -57884,7 +57898,7 @@ function restateChannelSeam() {
     channelSummary(
       el("discord-log").children.length,
       loadedIsWhole(),
-      channelName(knownChannel(el("discord-channel").value))
+      channelName(knownChannel(selectedChannelId()))
     )
   );
 }
@@ -60181,10 +60195,10 @@ function changeSelectedChannel() {
   timelineThreads = [];
   channelContexts.clear();
   // `#396 thread-color-memory`. The channel's own colours, as this device last drew them.
-  restoreThreadHues(el("discord-channel").value);
+  restoreThreadHues(selectedChannelId());
   // `#427 server-thread-hues`: and offered to the server, as at sign-in — issued before this
   // channel's first read below, not awaited by it.
-  void seedServerThreadHues(el("discord-channel").value);
+  void seedServerThreadHues(selectedChannelId());
   el("thread-list").replaceChildren();
   restoreChannelComposer();
   discordMoreAbove = false;
@@ -60218,7 +60232,7 @@ function changeSelectedChannel() {
   renderColumns();
   // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
   // the same reason the walk-back cursor is dropped two lines above.
-  startChannelStream(el("discord-channel").value);
+  startChannelStream(selectedChannelId());
   return loadDiscord(saved && currentView === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
 }
 el("discord-channel").addEventListener("change", guardQuietly(changeSelectedChannel));

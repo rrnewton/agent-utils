@@ -22852,7 +22852,7 @@ test("`#402 who-is-who-channel-box`: the list follows the channel box's picker, 
   // The negative control: the list as `#349` drew it, following the channel being read. The box's picker
   // then leaves it where it was, which is how this test would fail.
   const before = newPage(new Map(), brokenScript('  const host = el("identity-list");\n  const channelId = el("settings-channel").value;',
-    '  const host = el("identity-list");\n  const channelId = el("discord-channel").value;'));
+    '  const host = el("identity-list");\n  const channelId = selectedChannelId();'));
   twoCasts(before);
   await signIn(before);
   await showDiscord(before, []);
@@ -75546,7 +75546,7 @@ test("`#306 done-stale-across-views`: a Reply sent from the right column on a me
 // already waited (`doneSaved`, #295); a confirmed send now waits the same way.
 
 /** The line in `markAnsweredDone` that waits for a Done still on its way and looks again, for negative controls. */
-const SENT_WAITS = "    return doneSaved(ids, () => String(el(\"discord-channel\").value) === channel && doneHeldHere(ids));\n";
+const SENT_WAITS = "    return doneSaved(ids, () => String(selectedChannelId()) === channel && doneHeldHere(ids));\n";
 
 /**
  * Message 3 of `conversation` marked Done with its Done button, the write held on its way to the server;
@@ -76232,17 +76232,17 @@ test("`#326 refused-undo-restores-done`: a put back from its row that the server
 //       list until the next read.
 
 /** The lines of `noteArchived` that give a copy the store's state for a message the read does not speak for, for a negative control. */
-const COPY_TAKES_STORE = ["  if (threadingSupported && channelCanon.channel === String(el(\"discord-channel\").value)) {\n    for (const id of localReadWrites.keys()) {",
+const COPY_TAKES_STORE = ["  if (threadingSupported && channelCanon.channel === String(selectedChannelId())) {\n    for (const id of localReadWrites.keys()) {",
   "  if (false) {\n    for (const id of localReadWrites.keys()) {"];
 /** The wait of Through here for a Done on its way on a row it covers, for a negative control. */
 const THROUGH_WAITS = [
-  "    if (!(await doneSaved(waitingFor, () => String(el(\"discord-channel\").value) === channel && doneHeldHere(waitingFor)))) {",
+  "    if (!(await doneSaved(waitingFor, () => String(selectedChannelId()) === channel && doneHeldHere(waitingFor)))) {",
   "    if (false) {"];
 /** Through here waiting only for the rows on screen, as first written, for a negative control. */
 const THROUGH_WAITS_ON_SCREEN = ["  const waitingFor = [...new Set([...covered, ...onTheirWay])];\n",
   "  const waitingFor = covered;\n"];
 /** The look of a confirmed send at its message once its own Done is saved, for a negative control. */
-const SENT_LOOKS_AGAIN = ["  return doneSaved(ids, () => String(el(\"discord-channel\").value) === channel && doneHeldHere(ids));\n}\n",
+const SENT_LOOKS_AGAIN = ["  return doneSaved(ids, () => String(selectedChannelId()) === channel && doneHeldHere(ids));\n}\n",
   "  return true;\n}\n"];
 /** The rows a refused Done put back under Hide read without threads, for a negative control. */
 const ROWS_PUT_BACK = ["        putBackRowsOff(listed, back);\n", ""];
