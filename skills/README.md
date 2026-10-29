@@ -14,6 +14,9 @@ copying its manual.
 - `agent-utils-coordinator` — the core operating rules for the coordinator: delegate through
   wrkslots and agentctl, supervise and verify, land under the project's own rules, keep durable
   records, and report substance to the owner.
+- `agent-harness-environment` — what an agent's tool commands inherit from its harness and
+  terminal host, and tested recipes for putting a team's own tool directory first on `PATH`, at
+  launch or for running agents.
 
 ## Core tool skills
 

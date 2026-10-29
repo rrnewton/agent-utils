@@ -35,3 +35,7 @@ python3 scripts/embed_userguides.py --check
 [RELATED_WORK.md](agentctl/RELATED_WORK.md) compares public open-source systems.
 The documentation link check also covers those package-owned assets, without
 creating another rendered operator manual here.
+
+[agent-harness-environment.md](agent-harness-environment.md) records what agent harnesses and
+terminal hosts pass to an agent's tool commands, and how to put a team's own tool directory first on
+`PATH`.
