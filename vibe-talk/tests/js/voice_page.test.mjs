@@ -7033,6 +7033,44 @@ test("`#624 voice-page-modularity`: the message boxes' drafts, saved and taken b
   assert.equal(damaged.get("a"), undefined);
 });
 
+test("`#624 voice-page-modularity`: what a send can do, and when its receipt goes, from the module alone", () => {
+  const { editableSend, waitingItsTurn, unsentText, underDraft, sendSnippet, sentReceiptRetires, SENT_RECEIPT_MS, OWN_POST_GRACE_MS } = OUTBOX;
+  const send = { id: "e", channel: "c", text: "all of it", parts: [], observedParts: [] };
+  assert.equal(unsentText({ ...send, postedCount: 1, remaining: "the rest" }), "the rest");
+  assert.equal(unsentText(send), "all of it");
+  const queued = { ...send, state: "sending", phase: "queued" };
+  assert.deepStrictEqual([waitingItsTurn(queued, false), waitingItsTurn(queued, true), waitingItsTurn({ ...queued, phase: "posting" }, false)],
+    [true, false, false]);
+  assert.deepStrictEqual([editableSend({ ...send, state: "failed" }, false), editableSend(queued, false), editableSend(queued, true)],
+    [true, true, false]);
+  assert.equal(editableSend({ ...send, state: "failed", mayHavePosted: true }, false), false, "a send that may have landed was editable");
+  assert.equal(editableSend({ ...send, state: "unconfirmed" }, false), false);
+  assert.deepStrictEqual([underDraft("draft  \n", "text"), underDraft("  ", "text"), underDraft(undefined, "text")],
+    ["draft\n\ntext", "text", "text"]);
+  assert.equal(sendSnippet("short  one"), "short one");
+  assert.equal(sendSnippet("the quick brown fox jumps over the lazy dog"), "the quick brown fox jumps…");
+  assert.equal(sendSnippet("abcdefghijklmnopqrstuvwxyz0123456789"), "abcdefghijklmnopqrstuvwxyz0…");
+  // A receipt: gone once read back whole, or past the grace; where the store keeps own posts, once
+  // shown long enough and every part is drawn or stored in the selected channel.
+  let now = 1000;
+  const view = (over = {}) => ({ now: () => now, keepsOwnPosts: () => true, selectedChannel: () => "c", storedIn: () => new Set(["p2"]), ...over });
+  const sent = { ...send, state: "sent", sentAt: 1000, parts: [{ id: "p1" }, { id: "p2" }] };
+  const none = new Set();
+  assert.equal(sentReceiptRetires({ ...sent, state: "failed" }, none, view()), false);
+  assert.equal(sentReceiptRetires({ ...sent, parts: [] }, none, view()), false);
+  assert.equal(sentReceiptRetires({ ...sent, observedParts: ["p1", "p2"] }, none, view()), true);
+  now = 1000 + SENT_RECEIPT_MS - 1;
+  assert.equal(sentReceiptRetires(sent, new Set(["p1"]), view()), false, "a receipt went before it was shown long enough");
+  now = 1000 + SENT_RECEIPT_MS;
+  assert.equal(sentReceiptRetires(sent, new Set(["p1"]), view()), true);
+  assert.equal(sentReceiptRetires(sent, none, view()), false, "a part neither drawn nor stored retired its receipt");
+  assert.equal(sentReceiptRetires(sent, new Set(["p1"]), view({ keepsOwnPosts: () => false })), false);
+  assert.equal(sentReceiptRetires(sent, new Set(["p1", "p2"]), view({ selectedChannel: () => "other" })), false);
+  assert.equal(sentReceiptRetires(sent, new Set(["p1"]), view({ storedIn: () => null })), false);
+  now = 1000 + OWN_POST_GRACE_MS;
+  assert.equal(sentReceiptRetires(sent, none, view({ keepsOwnPosts: () => false })), true);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

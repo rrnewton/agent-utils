@@ -55,9 +55,11 @@ RECEIPTS_JS = """() => [...document.querySelectorAll('.outgoing-message')]
 
 
 def receipt_ms(web_root: Path) -> int:
-    """The page's SENT_RECEIPT_MS, read from the page served: the walk waits it out for real. A page
-    without one (before #500) is given the 15 s this one has, and fails the walk by what it draws."""
-    found = re.search(r"^const SENT_RECEIPT_MS = (\d+);$", page_sources.source_text(web_root, "voice.js"), re.MULTILINE)
+    """The page's SENT_RECEIPT_MS, read from the page served: the walk waits it out for real. It is
+    web/src/core/outbox's since #624 voice-page-modularity. A page without one (before #500) is given
+    the 15 s this one has, and fails the walk by what it draws."""
+    found = re.search(r"^const SENT_RECEIPT_MS = (\d+);$",
+                      page_sources.source_text(web_root, "src/core/outbox/state.ts"), re.MULTILINE)
     return int(found.group(1)) if found else 15000
 
 

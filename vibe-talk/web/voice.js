@@ -2884,10 +2884,7 @@ const OUTGOING_PROGRESS_MS = 2000;
 // channel does not carry it (`ownPostStands`) is web/src/core/outbox's (`OWN_POST_GRACE_MS`, `#624
 // voice-page-modularity`).
 // `#500 sent-receipts-pile-up`. How long a confirmed send's "Sent." receipt is shown where the message
-// itself is not drawn — a reply into a thread, sent from Main or the Threads view's cards — before it
-// goes once the page holds the message (`sentReceiptRetires`); and it goes by OWN_POST_GRACE_MS after
-// confirmation whatever the page holds.
-const SENT_RECEIPT_MS = 15000;
+// itself is not drawn (`SENT_RECEIPT_MS`) is web/src/core/outbox's, with `sentReceiptRetires`.
 // `#195 send-resilience`. When a send whose answer was lost goes out again on its own, and the waits
 // before it, are web/src/core/outbox's (`nextRetryAt`, `#624 voice-page-modularity`).
 const outgoingMessages = new Map();
@@ -2931,8 +2928,7 @@ const unseenColumnReplies = { main: null, side: null };
 // (`DISMISSED_SENDS_LIMIT`, `DISMISSED_SENDS_DAYS`, `#624 voice-page-modularity`).
 /** How long the Undo chip offers to take a Dismiss back. */
 const SEND_UNDO_MS = 15000;
-/** How much of a message a control quotes to name it. */
-const SEND_SNIPPET_CHARS = 28;
+// How much of a message a control quotes to name it is web/src/core/outbox's (`sendSnippet`).
 /**
  * `#351 settings-polish`. How much of a message's first line names its row in Recently dismissed to a
  * screen reader (`dismissedRowLabel`): a line, not a paragraph.
@@ -29174,19 +29170,20 @@ function storeKeepsOwnPosts(channel) {
  * earlier build, is not loaded (`loadOutgoingMessages`). Not sent, unconfirmed or on its way, an entry
  * stays for the reader, as before.
  *
+ * Decided by web/src/core/outbox `sentReceiptRetires` (`#624 voice-page-modularity`), on what this page
+ * knows: the clock, the selected channel and its store.
+ *
  * @param {any} entry
  * @param {Set<string>} drawn the ids of the selected channel's messages drawn in this column
  */
 function sentReceiptRetires(entry, drawn) {
-  if (entry.state !== "sent" || !entry.parts.length) return false;
-  if (entry.parts.every((part) => entry.observedParts.includes(part.id))) return true;
-  const shown = Date.now() - (Number(entry.sentAt) || 0);
-  if (shown >= OWN_POST_GRACE_MS) return true;
-  if (shown < SENT_RECEIPT_MS || !storeKeepsOwnPosts(entry.channel)) return false;
-  const here = entry.channel === String(selectedChannelId());
-  const stored = here && channelStore.current().channel === entry.channel
-    ? new Set(channelStore.current().messages.map((held) => String(held.id))) : null;
-  return here && entry.parts.every((part) => drawn.has(part.id) || Boolean(stored && stored.has(part.id)));
+  return receiptRetires(entry, drawn, {
+    now: () => Date.now(),
+    keepsOwnPosts: storeKeepsOwnPosts,
+    selectedChannel: () => String(selectedChannelId()),
+    storedIn: (channel) => (channelStore.current().channel === channel
+      ? new Set(channelStore.current().messages.map((held) => String(held.id))) : null),
+  });
 }
 
 /**
@@ -31021,51 +31018,24 @@ function stopOutgoingSends() {
 // Every draft, and this copy, is this device's alone: nothing here is synced to another device. The
 // constants and the state are with the outbox's, at the head of the file.
 
-/** What a send has not delivered: all of it, or what a partial post left unsent. */
-function unsentText(entry) {
-  return entry.postedCount ? entry.remaining : entry.text;
-}
+// What a send has not delivered (`unsentText`), and whether Edit may take it back (`editableSend`) or it
+// waits its turn behind another message (`waitingItsTurn`, `#277 send-order`), are web/src/core/outbox's
+// (`#624 voice-page-modularity`); what this page adds is whether an attempt of its own is in progress.
 
-/**
- * Whether Edit may take `entry` back: refused, or never sent — failed, or still waiting its turn
- * behind another message (`#277 send-order`) — so that none of its unsent text can be in the channel
- * already. Not a send whose delivery is unconfirmed, or ever was (`mayHavePosted`, kept
- * through a later refusal): its outbox id is the idempotency key that lets Retry go again without
- * posting it twice, and Edit would drop it, so the same words sent again from the box would be a
- * second message wherever the first had landed after all — the `#195 send-resilience` incident.
- * Retry and Dismiss are its ways out.
- */
+/** Whether Edit may take `entry` back (web/src/core/outbox `editableSend`). */
 function editableSend(entry) {
-  return (entry.state === "failed" || waitingItsTurn(entry)) && entry.mayHavePosted !== true;
+  return outboxEditable(entry, outgoingJobs.has(entry.id));
 }
 
-/**
- * Whether `entry` is waiting behind another message to its destination, with no attempt of its own
- * in progress: nothing of it is on its way, so it can be taken back. `#277 send-order`.
- */
+/** Whether `entry` waits behind another message, with no attempt in progress (web/src/core/outbox `waitingItsTurn`). */
 function waitingItsTurn(entry) {
-  return entry.state === "sending" && entry.phase === "queued" && !outgoingJobs.has(entry.id);
+  return outboxWaitingItsTurn(entry, outgoingJobs.has(entry.id));
 }
 
 /** Said where Edit could not save the text as a draft, and so left the send where it was. */
 const EDIT_DRAFT_REFUSED = "This browser could not save a draft, so the message stays in the outbox.";
 
-/** `text` under `draft`, after a blank line, or `text` alone where there is no draft. */
-function underDraft(draft, text) {
-  const kept = String(draft || "").replace(/\s+$/, "");
-  return kept.trim() ? `${kept}\n\n${text}` : text;
-}
-
-/** The first few words of a message (`chars` at most), on one line, for a control that has to name it. */
-function sendSnippet(text, chars = SEND_SNIPPET_CHARS) {
-  const words = String(text).replace(/\s+/g, " ").trim();
-  if (words.length <= chars) return words;
-  let cut = words.slice(0, chars - 1);
-  // At the end of a word, where one ends in the second half, rather than in the middle of one.
-  const end = words[cut.length] === " " ? cut.length : cut.lastIndexOf(" ");
-  if (end > chars / 2) cut = cut.slice(0, end);
-  return `${cut.trimEnd()}…`;
-}
+// `text` under a draft (`underDraft`) and a message's first words (`sendSnippet`) are web/src/core/outbox's.
 
 /**
  * Take an entry out of the outbox, durably, in every column — and let the next message to its

@@ -11,3 +11,14 @@ export { outgoingFromSaved, savedWire } from "./saved.ts";
 export type { OutgoingEntry, OutgoingPart, OutgoingWire } from "./saved.ts";
 export { createChannelDrafts } from "./drafts.ts";
 export type { ChannelDrafts, ChannelDraftsDependencies } from "./drafts.ts";
+export {
+  SEND_SNIPPET_CHARS,
+  SENT_RECEIPT_MS,
+  editableSend,
+  sendSnippet,
+  sentReceiptRetires,
+  underDraft,
+  unsentText,
+  waitingItsTurn,
+} from "./state.ts";
+export type { ReceiptView, SendState } from "./state.ts";
