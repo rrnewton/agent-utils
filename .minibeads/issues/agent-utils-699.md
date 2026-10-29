@@ -1,10 +1,11 @@
 ---
 title: 'vt-send-priority: the owner''s sends go before background reads while Slack is limiting'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-10-29T20:57:25.873573252+00:00
-updated_at: 2026-10-29T20:57:25.873573252+00:00
+updated_at: 2026-10-29T21:37:51.225829847+00:00
+closed_at: 2026-10-29T21:37:51.225829426+00:00
 ---
 
 # Description
