@@ -23,6 +23,7 @@ export {
   allReachesThread,
   answeredThread,
   coverViewOf,
+  createChannelStore,
   createCopyOrder,
   createRemovals,
   deltaSideState,

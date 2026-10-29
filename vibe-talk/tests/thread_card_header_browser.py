@@ -658,7 +658,7 @@ def list_card(desk: Desk, thread_id: str) -> tuple[dict[str, float], str]:
     painted after the fold, says the summary.  `#389 gate-flakes`.
     """
     desk.wait_for(
-        "() => { const held = channelCanon.threads.find((entry) => String(entry.id) === '"
+        "() => { const held = channelStore.current().threads.find((entry) => String(entry.id) === '"
         + thread_id
         + "'); if (!held) return false;"
         + " const card = document.querySelector(\"#side-cards > li[data-id='"

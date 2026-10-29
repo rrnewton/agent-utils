@@ -6681,6 +6681,19 @@ test("`#624 voice-page-modularity`: what a store holds of every thread's replies
   assert.equal(replyTallyOf(canon, () => true).threads.has("t"), false);
 });
 
+test("`#624 voice-page-modularity`: the channel store's owner opens a channel afresh and answers the current store", () => {
+  const { createChannelStore } = CHANNELS;
+  const store = createChannelStore();
+  const first = store.current();
+  assert.equal(first.channel, "");
+  first.messages.push({ id: "1" });
+  const opened = store.open(42);
+  assert.equal(store.current(), opened);
+  assert.deepStrictEqual([opened.channel, opened.messages.length], ["42", 0], "a channel opened did not start afresh");
+  assert.equal(store.open().channel, "");
+  assert.notEqual(createChannelStore().current(), store.current(), "two owners share a store");
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -63796,7 +63809,7 @@ test("`#300 reply-marks-read`: a Reply in a channel that is one thread of a larg
   // The finding: every reply moved the provider's marker for the whole space, so on a registration
   // narrowed to one thread each Reply marked every earlier message of the space read in the service's
   // own app, messages vibe-talk never received. The timeline names such a channel's conversation as
-  // its `thread` (`#44 thread-scope-main-view`), and the page holds it as `channelCanon.scope`.
+  // its `thread` (`#44 thread-scope-main-view`), and the page holds it as `channelStore.current().scope`.
   const run = async (script = SCRIPT) => {
     const page = newPage(new Map(), script);
     page.upstreamReadMarkSupported = true;
@@ -74216,7 +74229,7 @@ function brokenAlso(script, [find, replace]) {
   return script.replace(find, replace);
 }
 /** A negative control: a read of All for Main's counts speaking for every message held when it lands. */
-const COUNTS_SPEAK_FOR_ALL = ["    held: heldNow(channelCanon) };", "    held: null };"];
+const COUNTS_SPEAK_FOR_ALL = ["    held: heldNow(channelStore.current()) };", "    held: null };"];
 /** A negative control: a read bringing back a message removed upstream after it was sent (`#316 late-counts-resurrect`). */
 const REMOVALS_FORGOTTEN = { file: "src/core/channels/fold.ts",
   find: "  return at !== undefined && at >= number;\n", replace: "  return false;\n" };
@@ -74951,8 +74964,8 @@ test("`#308 live-reply-in-main`: a read of All for Main's counts sent after a pl
 
   // THE CONTROL, as round 2 did: the placing page taken as the newer because it LANDED after the read
   // for the counts was sent.
-  const control = await run(brokenScript("    if (!newerPage(channelCanon, \"flat\", number)) {",
-    "    if (!(channelCanon.views.get(viewKey(\"flat\")) && channelCanon.views.get(viewKey(\"flat\")).fullAt > now)) {"));
+  const control = await run(brokenScript("    if (!newerPage(channelStore.current(), \"flat\", number)) {",
+    "    if (!(channelStore.current().views.get(viewKey(\"flat\")) && channelStore.current().views.get(viewKey(\"flat\")).fullAt > now)) {"));
   assert.notEqual(savedMessage(control.page, "202").content, edited, "the read for the counts was folded anyway, so this test cannot see it");
 });
 
@@ -75292,8 +75305,8 @@ for (const placing of ["newest", "delta"]) {
         const kept = savedMessage(control.page, "300");
         return Boolean(kept && kept.thread && kept.thread.id === control.first.id);
       };
-      const unplaced = await run(brokenScript("  if (channelCanon.channel !== String(channel)) return;\n  noteRemoved(channelCanon, String(id), observedMs);\n",
-        "  if (channelCanon.channel !== String(channel)) return;\n"));
+      const unplaced = await run(brokenScript("  if (channelStore.current().channel !== String(channel)) return;\n  noteRemoved(channelStore.current(), String(id), observedMs);\n",
+        "  if (channelStore.current().channel !== String(channel)) return;\n"));
       assert.ok(inThread(unplaced), "the reply stayed gone anyway, so this test cannot see it");
       if (placing === "delta") {
         // And a placing delta folded whatever the stream removed since it was sent, its copy of the reply
@@ -76906,7 +76919,7 @@ test("`#326 refused-undo-restores-done`: a put back from its row that the server
 //       list until the next read.
 
 /** The lines of `noteArchived` that give a copy the store's state for a message the read does not speak for, for a negative control. */
-const COPY_TAKES_STORE = ["  if (threadingSupported && channelCanon.channel === String(selectedChannelId())) {\n    for (const id of localReadWrites.keys()) {",
+const COPY_TAKES_STORE = ["  if (threadingSupported && channelStore.current().channel === String(selectedChannelId())) {\n    for (const id of localReadWrites.keys()) {",
   "  if (false) {\n    for (const id of localReadWrites.keys()) {"];
 /** The wait of Through here for a Done on its way on a row it covers, for a negative control. */
 const THROUGH_WAITS = [

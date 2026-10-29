@@ -152,3 +152,23 @@ export function inViewOf(message: Message, view: string, thread: string | null, 
 /** Whether `held` is `arriving`, word for word: the same message, to draw and to keep. */
 export const sameMessage = (held: unknown, arriving: unknown): boolean =>
   held !== undefined && JSON.stringify(held) === JSON.stringify(arriving);
+
+/** The store of the channel the page reads: which one is current, and opening another. */
+export interface ChannelStore {
+  /** The current channel's store. */
+  current(): ChannelCanon;
+  /** Start channel `channel`'s store afresh, empty, as the current one; answers it. */
+  open(channel?: unknown): ChannelCanon;
+}
+
+/** A store owner holding an empty store for no channel. */
+export function createChannelStore(): ChannelStore {
+  let canon = emptyCanon();
+  return {
+    current: () => canon,
+    open(channel: unknown = "") {
+      canon = emptyCanon(channel);
+      return canon;
+    },
+  };
+}

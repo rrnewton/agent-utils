@@ -1,8 +1,17 @@
 // One store per channel, and the views projected from it. Its public interface.
 // `#624 voice-page-modularity`.
 
-export { emptyCanon, inTimeOrder, inViewOf, sameMessage, threadOf, timeOf, viewOfKey } from "./canon.ts";
-export type { ChannelCanon, ViewCover } from "./canon.ts";
+export {
+  createChannelStore,
+  emptyCanon,
+  inTimeOrder,
+  inViewOf,
+  sameMessage,
+  threadOf,
+  timeOf,
+  viewOfKey,
+} from "./canon.ts";
+export type { ChannelCanon, ChannelStore, ViewCover } from "./canon.ts";
 export {
   allPageAnswersFor,
   deltaSideState,
