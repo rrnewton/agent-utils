@@ -30254,98 +30254,34 @@ function answerUnplaced(canon, seen) {
   }
 }
 
-/**
- * Message `id` is gone upstream — a removal from the stream (`noteLiveRemoval`), or a delta's
- * deletions (`foldTimelineDelta`) — so nothing left unplaced in store `canon` keeps it: no answer of
- * All sent before it was removed can put it back (`placeFromPage`), and none is asked for it. Not a
- * message a newest page of Main took out: Main never carries a thread reply, so that page cannot tell
- * one from a message removed, and the placing read is what puts such a reply back.
- *
- * @param {any} canon
- * @param {string} id
- */
-function forgetUnplaced(canon, id) {
-  canon.unplaced.delete(id);
-  canon.unplacedSince.delete(id);
-  canon.unplacedAnswered.delete(id);
-}
+// `forgetUnplaced` is web/src/core/channels's (`#624 voice-page-modularity`).
 
 /**
- * Message `id` is removed upstream — a removal from the stream (`noteLiveRemoval`), or a delta's
- * deletions (`foldTimelineDelta`): nothing left unplaced in store `canon` keeps it (`forgetUnplaced`),
- * and it is removed there (`canon.removed`) as of the read sent last. `#315 removed-reply-target`.
- *
- * NOT "NO LONGER UNPLACED". A message that is not unplaced is placed, to every other reader of that
- * set: the reply route took a bare copy the store still held, the read behind its removal not yet
- * landed, for a message on the main channel, and posted a reply to it there, with no read first —
- * during an outage, with no end to that window. Before `#308 live-reply-in-main` it was still
- * unplaced, and Send read All first, did not find it, and refused. Now a reply to a message removed
- * upstream is refused, saying so, wherever it was (`replyRoute`, `placeReplyTarget`), and nothing
- * places it (`placeFromPage`), until a read sent after the removal carries it after all
- * (`believeCarried`).
+ * Message `id` is removed upstream (web/src/core/channels `Removals.noteRemoved`, `#315
+ * removed-reply-target`), as of the read sent last (`timelineAnswersAsked`).
  *
  * @param {any} canon
  * @param {string} id
- * @param {number | null} [observedMs] when the server observed the removal (`removalsObserved`)
+ * @param {number | null} [observedMs] when the server observed the removal
  */
 function noteRemoved(canon, id, observedMs = null) {
-  forgetUnplaced(canon, id);
-  canon.removed.set(id, timelineAnswersAsked);
-  if (typeof observedMs === "number") removalObserved(canon.channel).set(String(id), observedMs);
+  removalRecord.noteRemoved(canon, id, timelineAnswersAsked, observedMs);
 }
 
 /**
- * `#473 replication-c7-server-versions`. By channel, then message id, when the server observed each
- * removal the page was told of, on the server's clock: a page whose read began before it never brings
- * the message back, however late it was sent (the replication model's rule 3). Kept beside `removed`,
- * which orders removals by when reads were sent, for a server that says neither.
- *
- * @type {Map<string, Map<string, number>>}
+ * The removals the page was told of, and when the server observed each (web/src/core/channels
+ * `createRemovals`, `#473 replication-c7-server-versions`). Here where the map it replaces stood.
  */
-const removalsObserved = new Map();
+const removalRecord = createRemovals();
 
-/** The removals of `channel` the server said when it observed (`removalsObserved`). */
-function removalObserved(channel) {
-  const key = String(channel);
-  let held = removalsObserved.get(key);
-  if (!held) {
-    held = new Map();
-    removalsObserved.set(key, held);
-  }
-  return held;
-}
-
-/**
- * Whether a page whose versions are `versions` (`serverVersions`) began before the server observed the
- * removal of message `id` of `canon`: it is older than that removal, and never brings the message back.
- */
+/** Whether a page with versions `versions` began before the server observed message `id`'s removal (`Removals.removedAfterRead`). */
 function removedAfterRead(canon, id, versions) {
-  if (!versions) return false;
-  const at = removalObserved(canon.channel).get(String(id));
-  return at !== undefined && versions.observed <= at;
+  return removalRecord.removedAfterRead(canon, id, versions);
 }
 
-/**
- * A read sent after a message was removed upstream that still carries it says the message is there
- * after all — as the server's own read cache believes a fetch begun after a removal — and it is no
- * longer taken for removed (`noteRemoved`). `#315 removed-reply-target`.
- *
- * @param {any} canon
- * @param {VibeTalk.TimelineResponse} payload
- */
+/** A read sent after a removal that still carries the message says it is there after all (`Removals.believeCarried`). */
 function believeCarried(canon, payload) {
-  if (canon.removed.size === 0) return;
-  const number = sentNumberOf(payload);
-  const versions = serverVersions(payload);
-  for (const message of payload.messages || []) {
-    const at = canon.removed.get(String(message.id));
-    // `#473`: not a page whose read began before the server observed the removal.
-    if (removedAfterRead(canon, String(message.id), versions)) continue;
-    if (at !== undefined && number > at) {
-      canon.removed.delete(String(message.id));
-      removalObserved(canon.channel).delete(String(message.id));
-    }
-  }
+  removalRecord.believeCarried(canon, payload, () => sentNumberOf(payload));
 }
 
 /** Whether message `id` of the selected channel is removed upstream, as far as this page knows (`noteRemoved`). */

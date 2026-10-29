@@ -26,3 +26,5 @@ export { allReachesThread, noteReplyGapsIn } from "./replies.ts";
 export type { GapPage } from "./replies.ts";
 export { createCopyOrder } from "./order.ts";
 export type { CopyOrder } from "./order.ts";
+export { createRemovals, forgetUnplaced } from "./removals.ts";
+export type { Removals } from "./removals.ts";

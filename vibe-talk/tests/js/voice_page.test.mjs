@@ -6508,6 +6508,32 @@ test("`#624 voice-page-modularity`: what a page may fold, from the module alone,
   assert.deepStrictEqual([removedLate.takes({ id: "x" }), removedLate.answers({ id: "x" })], [false, true]);
 });
 
+test("`#624 voice-page-modularity`: the record of removals, from the module alone: by the order of reads and by the server's clock", () => {
+  const { emptyCanon, createRemovals, forgetUnplaced } = CHANNELS;
+  const removals = createRemovals();
+  const canon = emptyCanon("c");
+  canon.unplaced.add("1");
+  canon.unplacedSince.set("1", 3);
+  removals.noteRemoved(canon, "1", 4, 1000);
+  assert.deepStrictEqual([canon.unplaced.has("1"), canon.unplacedSince.has("1"), canon.removed.get("1")], [false, false, 4]);
+  // The server observed the removal at 1000: a page whose read began at or before then is older than it.
+  assert.deepStrictEqual([removals.removedAfterRead(canon, "1", { observed: 900, settledBelow: null }),
+    removals.removedAfterRead(canon, "1", { observed: 1100, settledBelow: null }), removals.removedAfterRead(canon, "1", null)], [true, false, false]);
+  // A read sent after the removal that still carries the message believes it; one sent before does not.
+  let asked = 0;
+  removals.believeCarried(canon, { messages: [{ id: "1" }] }, () => { asked += 1; return 3; });
+  assert.equal(canon.removed.has("1"), true, "a read sent before the removal brought the message back");
+  removals.believeCarried(canon, { messages: [{ id: "1" }], observed_ms: 900 }, () => 9);
+  assert.equal(canon.removed.has("1"), true, "a read begun before the server observed the removal brought it back");
+  removals.believeCarried(canon, { messages: [{ id: "1" }], observed_ms: 1100 }, () => 9);
+  assert.equal(canon.removed.has("1"), false, "a read sent after the removal that carries the message was not believed");
+  assert.equal(removals.removedAfterRead(canon, "1", { observed: 900, settledBelow: null }), false, "the server's record of a believed message stayed");
+  // Nothing removed: the read's place in the order is not even asked.
+  removals.believeCarried(emptyCanon("d"), { messages: [{ id: "1" }] }, () => { asked += 1; return 0; });
+  assert.equal(asked, 1);
+  forgetUnplaced(canon, "nothing");
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
