@@ -342,13 +342,13 @@ impl ClaudeIdleSource for ClaudeAgents {
             // Another known harness (Codex, Muse) has no `agents --json` to ask: its pane's
             // Herdr status, which the caller has already required to read idle or done and
             // to show no running turn, is its answer. An unknown kind cannot be asked.
-            return Ok(
-                match info.agent.as_deref().and_then(crate::harness::adapter) {
-                    Some(_) if matches!(info.status.as_str(), "idle" | "done") => ClaudeState::Idle,
-                    Some(_) => ClaudeState::Busy(info.status.clone()),
-                    None => ClaudeState::NotClaude,
-                },
-            );
+            return Ok(match info.agent.as_deref() {
+                Some("codex" | "muse") if matches!(info.status.as_str(), "idle" | "done") => {
+                    ClaudeState::Idle
+                }
+                Some("codex" | "muse") => ClaudeState::Busy(info.status.clone()),
+                _ => ClaudeState::NotClaude,
+            });
         }
         let sessions = crate::inbox::claude_sessions_by_pane(
             &self.claude,

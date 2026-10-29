@@ -1573,7 +1573,10 @@ enum RetirementPhase {
 struct RetiredReplyReceipt {
     ordinal: u32,
     send_request_id: String,
-    provider_message_id: String,
+    /// The provider's message ID for a sent reply; `None` for a reply whose send failed
+    /// permanently, which retires with the request like a sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1659,8 +1662,9 @@ impl LegacyRetirementRecordV1 {
         if self.replies.iter().enumerate().any(|(index, reply)| {
             reply.ordinal != u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1)
                 || !valid_operation_uuid(&reply.send_request_id)
-                || reply.provider_message_id.is_empty()
-                || reply.provider_message_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+                || reply.provider_message_id.as_deref().is_none_or(|id| {
+                    id.is_empty() || id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+                })
         }) {
             return Err(ChatRuntimeError::invalid(
                 "legacy v1 retirement reply receipts are inconsistent or outside protocol bounds",
@@ -1734,8 +1738,9 @@ impl RetirementReceiptChunk {
                 .unwrap_or(0);
             if reply.ordinal != expected
                 || !valid_operation_uuid(&reply.send_request_id)
-                || reply.provider_message_id.is_empty()
-                || reply.provider_message_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+                || reply.provider_message_id.as_deref().is_some_and(|id| {
+                    id.is_empty() || id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+                })
             {
                 return Err(ChatRuntimeError::invalid(
                     "retirement receipt chunk contains an invalid provider receipt",
@@ -10080,15 +10085,15 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             Vec::with_capacity(usize::try_from(request.reply_count).unwrap_or(usize::MAX));
         for ordinal in 1..=request.reply_count {
             let reply = self.read_reply(key, ordinal)?;
-            if reply.phase != ReplyPhase::Sent {
+            // A permanently failed reply is terminal, like a sent one: it retires with
+            // the request, with no provider receipt.
+            if !matches!(reply.phase, ReplyPhase::Sent | ReplyPhase::Failed) {
                 return Ok(false);
             }
             replies.push(RetiredReplyReceipt {
                 ordinal,
                 send_request_id: reply.send_request_id,
-                provider_message_id: reply
-                    .provider_message_id
-                    .expect("validated sent reply has a provider message id"),
+                provider_message_id: reply.provider_message_id,
             });
         }
         let retirement_sequence = checkpoint
@@ -10372,17 +10377,20 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             Vec::with_capacity(usize::try_from(retirement.reply_count).unwrap_or(usize::MAX));
         for ordinal in 1..=retirement.reply_count {
             let reply = self.read_reply(&retirement.request_key, ordinal)?;
-            if reply.phase != ReplyPhase::Sent {
+            if !matches!(reply.phase, ReplyPhase::Sent | ReplyPhase::Failed) {
                 return Err(ChatRuntimeError::invalid(
                     "preparing retirement contains a nonterminal reply",
+                ));
+            }
+            if reply.phase == ReplyPhase::Sent && reply.provider_message_id.is_none() {
+                return Err(ChatRuntimeError::invalid(
+                    "sent retirement reply is missing its receipt",
                 ));
             }
             receipts.push(RetiredReplyReceipt {
                 ordinal,
                 send_request_id: reply.send_request_id,
-                provider_message_id: reply.provider_message_id.ok_or_else(|| {
-                    ChatRuntimeError::invalid("sent retirement reply is missing its receipt")
-                })?,
+                provider_message_id: reply.provider_message_id,
             });
         }
         let chunks = retirement_receipt_chunks(retirement.retirement_sequence, &receipts)?;
@@ -11101,8 +11109,14 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         reply.validate(key, ordinal)?;
         // The reservation is bookkeeping for the breaker; a reply that will never be sent
         // must not hold its thread's window open.
-        let _ = self
-            .complete_reply_reservation_locked(&request_snapshot.message, &reply.send_request_id);
+        if let Err(error) = self
+            .complete_reply_reservation_locked(&request_snapshot.message, &reply.send_request_id)
+        {
+            crate::chat_service::service_log(format_args!(
+                "agentctl: reply {ordinal} of request {key} failed permanently, but its \
+                 breaker reservation could not be released: {error}"
+            ));
+        }
         write_document(&self.reply_path(key, ordinal), &reply)?;
         let mut request = self.read_request(key)?;
         if request.next_send_ordinal == ordinal {
@@ -12231,6 +12245,9 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             }
             let mut request = self.read_request(&key)?;
             let mut expected = 1_u32;
+            // The first reply that is neither sent nor permanently failed: recovery puts
+            // the send pointer there. A failed reply is terminal, like a sent one, so a
+            // sent reply may follow it; neither may follow a reply still to send.
             let mut first_unsent = None;
             let mut bytes = 0_u64;
             for (reply, size) in &values {
@@ -12239,7 +12256,9 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                         "retained reply ordinals are not contiguous",
                     ));
                 }
-                if reply.phase != ReplyPhase::Sent && first_unsent.is_none() {
+                if !matches!(reply.phase, ReplyPhase::Sent | ReplyPhase::Failed)
+                    && first_unsent.is_none()
+                {
                     first_unsent = Some(reply.ordinal);
                 }
                 if first_unsent.is_some() && reply.phase == ReplyPhase::Sent {
@@ -13036,6 +13055,10 @@ pub(crate) fn deliver_request_with(
 /// pane do so within seconds; after this, waiting longer only loses the request.
 pub(crate) const UNCERTAIN_RESOLVE_AFTER_MILLIS: u64 = 30 * 60 * 1_000;
 
+/// How the bridge's own uncertain-delivery report opens, so a later pass can tell it from
+/// a reply the agent wrote.
+const UNCERTAIN_REPORT_PREFIX: &str = "The chat bridge could not confirm that this request reached";
+
 /// Resolve a request whose delivery is uncertain, so none is left uncertain forever.
 ///
 /// Before [`UNCERTAIN_RESOLVE_AFTER_MILLIS`] has passed since delivery started, the request
@@ -13065,16 +13088,25 @@ fn resolve_uncertain_delivery(
     if now.saturating_sub(since) < UNCERTAIN_RESOLVE_AFTER_MILLIS {
         return Ok(CoordinatorDeliveryResult::Uncertain(original));
     }
-    // A captured reply proves the prompt arrived, however uncertain its typing looked
-    // (a fresh pane's prompt can be quarantined as unattributable while the agent is
-    // already answering it): such a request is delivered, and is never reported as lost.
-    // (The bridge's own report is also a reply, so a request already reported is left
-    // as it is, above all by this check.)
+    // A request already reported is resolved: it stays uncertain, and is not reported
+    // again. The report itself is a reply, so this check comes before the reply check.
     if record.uncertain_reported_at_millis.is_some() {
         return Ok(CoordinatorDeliveryResult::Uncertain(original));
     }
-    if record.reply_count > 0 {
+    // A captured reply from the agent proves the prompt arrived, however uncertain its
+    // typing looked (a fresh pane's prompt can be quarantined as unattributable while
+    // the agent is already answering it): such a request is delivered, and is never
+    // reported as lost. The bridge's own report, stored by an earlier pass that crashed
+    // before recording it, does not count: it is recognized by its opening words.
+    let agent_answered = (1..=record.reply_count).any(|ordinal| {
+        state
+            .read_reply(key, ordinal)
+            .is_ok_and(|reply| !reply.body.starts_with(UNCERTAIN_REPORT_PREFIX))
+    });
+    if agent_answered {
+        state.note_started(delivery, &record.delivery_message_id);
         state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
+        reply_to_goal_command(state, delivery, record, None);
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
     let agent_name = &state.config.agent_name;
@@ -13094,9 +13126,6 @@ fn resolve_uncertain_delivery(
             state.set_delivery_phase(key, RequestPhase::Pending, Some(&detail))?;
             Ok(CoordinatorDeliveryResult::Pending(detail))
         }
-        Ok(_) | Err(_) if record.uncertain_reported_at_millis.is_some() => {
-            Ok(CoordinatorDeliveryResult::Uncertain(original))
-        }
         Ok(state_of_queue) => {
             let detail = format!(
                 "delivery has been uncertain for {} ({original}); the coordinator queue now \
@@ -13104,8 +13133,19 @@ fn resolve_uncertain_delivery(
                  and does not type it again",
                 format_age(now, since)
             );
+            // An earlier pass may have stored the report and crashed before recording it:
+            // then only the recording remains to be done, and no second report is stored.
+            let already_reported = (1..=record.reply_count).any(|ordinal| {
+                state
+                    .read_reply(key, ordinal)
+                    .is_ok_and(|reply| reply.body.starts_with(UNCERTAIN_REPORT_PREFIX))
+            });
+            if already_reported {
+                state.note_uncertain_reported(key, &detail)?;
+                return Ok(CoordinatorDeliveryResult::Uncertain(detail));
+            }
             let body = format!(
-                "The chat bridge could not confirm that this request reached {agent_name}: \
+                "{UNCERTAIN_REPORT_PREFIX} {agent_name}: \
                  its delivery has been uncertain for {}. It may not have been seen by the \
                  agent, and the bridge will not type it again. Please send the request again \
                  if it still needs an answer.",
@@ -13485,7 +13525,10 @@ fn retirement_receipts_digest(receipts: &[RetiredReplyReceipt]) -> Result<String
     );
     for receipt in receipts {
         digest.update(receipt.ordinal.to_be_bytes());
-        for value in [&receipt.send_request_id, &receipt.provider_message_id] {
+        // A permanently failed reply has no provider ID: it digests as the empty value,
+        // which a sent reply's ID (never empty) cannot collide with.
+        let provider_message_id = receipt.provider_message_id.as_deref().unwrap_or("");
+        for value in [&receipt.send_request_id, provider_message_id] {
             digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
             digest.update(value.as_bytes());
         }
@@ -16509,9 +16552,28 @@ mod tests {
         refuse_threaded: bool,
         refuse_top_level: bool,
         fail_threaded_once_retryable: bool,
+        /// Refuse every send, threaded or top-level, of a body holding this text.
+        refuse_text: Option<String>,
     }
 
     impl PermanentReplyTransport {
+        /// Whether this transport refuses a send of `body`: the global flags, or a body
+        /// holding the refused text.
+        fn refuses(&self, body: &str, top_level: bool) -> bool {
+            if self
+                .refuse_text
+                .as_deref()
+                .is_some_and(|text| body.contains(text))
+            {
+                return true;
+            }
+            if top_level {
+                self.refuse_top_level
+            } else {
+                self.refuse_threaded
+            }
+        }
+
         fn conflict() -> OutboundFailure {
             OutboundFailure {
                 code: "operation_conflict".to_owned(),
@@ -16536,7 +16598,7 @@ mod tests {
                     retryable: true,
                 });
             }
-            if self.refuse_threaded {
+            if self.refuses(submission.body, false) {
                 return Err(Self::conflict());
             }
             Ok("messages/threaded-reply".to_owned())
@@ -16547,7 +16609,7 @@ mod tests {
             submission: ReplySubmission<'_>,
         ) -> std::result::Result<String, OutboundFailure> {
             self.top_level_ids.push(submission.request_id.to_owned());
-            if self.refuse_top_level {
+            if self.refuses(submission.body, true) {
                 return Err(Self::conflict());
             }
             Ok("messages/top-level-reply".to_owned())
@@ -16644,6 +16706,46 @@ mod tests {
         );
         assert_eq!(transport.threaded_ids.len(), 1);
         assert_eq!(transport.top_level_ids.len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_failed_reply_blocks_no_later_reply_and_its_request_still_retires() {
+        let (state, key, root) = state_with_reply("failed-then-sent", "doomed body");
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        state
+            .submit_reply(&key, &format!("{nonce}_2"), "later body")
+            .expect("second reply");
+        let mut transport = PermanentReplyTransport {
+            refuse_text: Some("doomed body".to_owned()),
+            ..PermanentReplyTransport::default()
+        };
+        assert!(state.publish_one(&key, &mut transport).is_err());
+        assert_eq!(
+            state.read_reply(&key, 1).expect("first reply").phase,
+            ReplyPhase::Failed
+        );
+        let receipt = state
+            .publish_one(&key, &mut transport)
+            .expect("later reply publishes")
+            .expect("provider receipt");
+        assert_eq!(receipt, "messages/threaded-reply");
+        assert_eq!(
+            state.read_reply(&key, 2).expect("second reply").phase,
+            ReplyPhase::Sent
+        );
+        // Recovery must accept a sent reply following a permanently failed one.
+        let reopened = BridgeState::open(&root).expect("state reopens after failed then sent");
+        assert_eq!(
+            reopened.read_reply(&key, 1).expect("first reply").phase,
+            ReplyPhase::Failed
+        );
+        // And the request retires: a failed reply is terminal, not a leak.
+        state.close_replies(&key).expect("close replies");
+        assert!(
+            state.retired_key(&key).expect("retired guard").is_some(),
+            "a request whose only unsent reply failed permanently retires"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -17876,7 +17978,7 @@ mod tests {
             .map(|ordinal| RetiredReplyReceipt {
                 ordinal,
                 send_request_id: "123e4567-e89b-42d3-a456-426614174000".to_owned(),
-                provider_message_id: escaped_id.clone(),
+                provider_message_id: Some(escaped_id.clone()),
             })
             .collect::<Vec<_>>();
         let chunks = retirement_receipt_chunks(1, &receipts).expect("pack maximum receipts");
@@ -19227,7 +19329,7 @@ mod tests {
                 receipts.push(RetiredReplyReceipt {
                     ordinal,
                     send_request_id: reply.send_request_id,
-                    provider_message_id: provider_id.clone(),
+                    provider_message_id: Some(provider_id.clone()),
                 });
             }
             agent::sync_directory(&root.join("replies")).expect("sync reply fixtures");
@@ -19373,10 +19475,12 @@ mod tests {
             let reply = state.read_reply(&key, 1).expect("sent reply");
             let receipt = RetiredReplyReceipt {
                 ordinal: 1,
-                send_request_id: reply.send_request_id,
-                provider_message_id: reply
-                    .provider_message_id
-                    .expect("sent reply provider receipt"),
+                send_request_id: reply.send_request_id.clone(),
+                provider_message_id: Some(
+                    reply
+                        .provider_message_id
+                        .expect("sent reply provider receipt"),
+                ),
             };
             let legacy = LegacyRetirementRecordV1 {
                 version: STATE_VERSION,
@@ -19508,10 +19612,12 @@ mod tests {
         let reply = state.read_reply(&key, 1).expect("sent reply");
         let receipt = RetiredReplyReceipt {
             ordinal: 1,
-            send_request_id: reply.send_request_id,
-            provider_message_id: reply
-                .provider_message_id
-                .expect("sent reply provider receipt"),
+            send_request_id: reply.send_request_id.clone(),
+            provider_message_id: Some(
+                reply
+                    .provider_message_id
+                    .expect("sent reply provider receipt"),
+            ),
         };
         let prepared_at_millis = unix_millis();
         let message_fingerprint =
@@ -20389,10 +20495,8 @@ mod tests {
             assert_eq!(receipts.len(), 1);
             assert_eq!(receipts[0].send_request_id, expected_reply.send_request_id);
             assert_eq!(
-                receipts[0].provider_message_id,
-                expected_reply
-                    .provider_message_id
-                    .expect("provider receipt")
+                receipts[0].provider_message_id.as_deref(),
+                expected_reply.provider_message_id.as_deref()
             );
             assert!(reopened.retired_key(&key).expect("retired guard").is_some());
             let count = state
@@ -20922,6 +21026,42 @@ Lines between will be sent to the user as a chat message. Use the same two lines
         assert_eq!(record.phase, RequestPhase::Delivered);
         assert_eq!(record.reply_count, 1, "no report reply was added");
         assert!(record.uncertain_reported_at_millis.is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unrecorded_bridge_report_is_not_the_agents_answer() {
+        // A pass that stored its report and crashed before recording it: the report is
+        // the bridge's own reply, so it must not resolve the request as delivered, and
+        // no second report is stored; only the recording is completed.
+        let root = temporary("uncertain-unrecorded-report");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        backdate_uncertain(&state, key);
+        let nonce = state.read_request(key).expect("request").reply_nonce;
+        state
+            .submit_reply(
+                key,
+                &format!("{nonce}_1"),
+                &format!(
+                    "{UNCERTAIN_REPORT_PREFIX} coordinator: its delivery has been uncertain \
+                     for a while. Please send the request again."
+                ),
+            )
+            .expect("store the unrecorded report");
+        let target = FakeDelivery::default();
+        *target.queue_state.lock().expect("queue state lock") = Some(QueueMessageState::Failed);
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default()).expect("resolve"),
+            CoordinatorDeliveryResult::Uncertain(_)
+        ));
+        let record = state.read_request(key).expect("request");
+        assert_eq!(record.phase, RequestPhase::DeliveryUncertain);
+        assert!(record.uncertain_reported_at_millis.is_some());
+        assert_eq!(record.reply_count, 1, "no second report was stored");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
