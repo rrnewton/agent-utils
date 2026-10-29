@@ -71,6 +71,7 @@ mod record_holds;
 mod recover_absent_write;
 mod recover_cache_write;
 mod recover_clone_write;
+mod recover_main_write;
 mod recover_ownerless_write;
 mod recover_unbound_write;
 mod recover_validate_write;

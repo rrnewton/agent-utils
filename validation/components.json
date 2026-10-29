@@ -347,6 +347,7 @@
         "py/wrkslots/tests/test_recover_absent_write_rust.py",
         "py/wrkslots/tests/test_recover_cache_write_rust.py",
         "py/wrkslots/tests/test_recover_clone_write_rust.py",
+        "py/wrkslots/tests/test_recover_main_write_rust.py",
         "py/wrkslots/tests/test_recover_ownerless_write_rust.py",
         "py/wrkslots/tests/test_recover_unbound_write_rust.py",
         "py/wrkslots/tests/test_recover_validate_write_rust.py",

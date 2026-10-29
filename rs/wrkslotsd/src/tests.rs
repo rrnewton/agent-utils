@@ -5065,6 +5065,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "parse-state",
             "plan",
             "read-handoff",
+            "recover",
             "rebuild",
             "remove",
             "release",

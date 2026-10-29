@@ -590,6 +590,57 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Resume a journal or start bounded ownerless validation cleanup (writer; fixture registries only until cutover)
+    Recover {
+        /// Live current coordinator PID recorded with recovery
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Select one exact interrupted create or finish
+        #[arg(long, value_name = "SLOT")]
+        slot: Option<String>,
+        /// Required when starting ownerless validation cleanup
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Discard an incomplete temp write only when its prior durable file is valid
+        #[arg(long)]
+        discard_partial: bool,
+        /// Discard a stale image copy of an interrupted image-backed removal
+        #[arg(long)]
+        discard_stale_image_copy: bool,
+        /// Discard an interrupted import-existing journal
+        #[arg(long)]
+        abort_import: bool,
+        /// Compatibility spelling for an ownerless validate-fresh worktree
+        #[arg(long, value_name = "PATH")]
+        legacy_validate_checkout: Option<String>,
+        /// Project-relative unregistered validation Git worktree
+        #[arg(long, value_name = "PATH")]
+        ownerless_validate_checkout: Option<String>,
+        /// Project-relative unregistered validate-cargo directory
+        #[arg(long, value_name = "PATH")]
+        ownerless_validate_cargo_home: Option<String>,
+        /// Absolute frozen validation checkout
+        #[arg(long, value_name = "PATH")]
+        frozen_validate_checkout: Option<String>,
+        /// Project-relative terminal validation record
+        #[arg(long, value_name = "PATH")]
+        completed_record: Option<String>,
+        /// Project-relative source repository
+        #[arg(long, value_name = "PATH")]
+        repository: Option<String>,
+        /// Why no retained run record exists
+        #[arg(long, value_name = "TEXT")]
+        recovery_note: Option<String>,
+        /// Canonical validation proof manifest
+        #[arg(long, value_name = "PATH")]
+        validation_proof_manifest: Option<String>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
     Create {
         /// New slot name
@@ -1576,6 +1627,55 @@ pub fn run() -> u8 {
                 &completed_records,
                 &repositories,
                 &validation_proof_manifests,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::Recover {
+            coordinator_pid,
+            slot,
+            coordinator_authorized,
+            discard_partial,
+            discard_stale_image_copy,
+            abort_import,
+            legacy_validate_checkout,
+            ownerless_validate_checkout,
+            ownerless_validate_cargo_home,
+            frozen_validate_checkout,
+            completed_record,
+            repository,
+            recovery_note,
+            validation_proof_manifest,
+            root,
+            machine,
+        } => {
+            match crate::recover_main_write::recover_main(
+                root.as_deref(),
+                machine.as_deref(),
+                coordinator_pid,
+                slot.as_deref(),
+                coordinator_authorized,
+                discard_partial,
+                discard_stale_image_copy,
+                abort_import,
+                legacy_validate_checkout.as_deref(),
+                ownerless_validate_checkout.as_deref(),
+                ownerless_validate_cargo_home.as_deref(),
+                frozen_validate_checkout.as_deref(),
+                completed_record.as_deref(),
+                repository.as_deref(),
+                recovery_note.as_deref(),
+                validation_proof_manifest.as_deref(),
             ) {
                 Ok(value) => {
                     println!(
