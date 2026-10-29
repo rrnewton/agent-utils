@@ -70,7 +70,9 @@ export { createNavigation } from "../core/navigation/index.ts";
 export {
   DISMISSED_SENDS_DAYS,
   DISMISSED_SENDS_LIMIT,
+  OWN_POST_GRACE_MS,
   createDismissedSends,
+  createOwnPosts,
   nextRetryAt,
   retriesItself as outboxRetriesItself,
 } from "../core/outbox/index.ts";

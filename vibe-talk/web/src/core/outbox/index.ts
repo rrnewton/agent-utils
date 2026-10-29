@@ -5,3 +5,5 @@ export { OUTGOING_RETRY_ATTEMPTS, nextRetryAt, outgoingRetryWait, retriesItself 
 export type { RetryFacts } from "./retries.ts";
 export { DISMISSED_SENDS_DAYS, DISMISSED_SENDS_LIMIT, createDismissedSends } from "./dismissed.ts";
 export type { DismissedSend, DismissedSends, DismissedSendsDependencies } from "./dismissed.ts";
+export { OWN_POST_GRACE_MS, createOwnPosts } from "./own.ts";
+export type { OwnPosts, OwnPostsDependencies } from "./own.ts";

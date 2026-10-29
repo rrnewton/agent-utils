@@ -6911,6 +6911,58 @@ test("`#624 voice-page-modularity`: the recently dismissed, kept, pruned and sav
   assert.equal(late.clear(), true);
 });
 
+test("`#624 voice-page-modularity`: the page's own posts, kept in their grace and shared by the device's windows, from the module alone", () => {
+  const { createOwnPosts, OWN_POST_GRACE_MS } = OUTBOX;
+  const saved = new Map();
+  let full = false;
+  const storage = {
+    getItem: (key) => saved.get(key) ?? null,
+    setItem: (key, value) => { if (full) throw new Error("quota"); saved.set(key, value); },
+    removeItem: (key) => saved.delete(key),
+  };
+  let now = 1000;
+  const owner = () => createOwnPosts({ storage, now: () => now });
+  const page = owner();
+  page.noteSent(["a", "b"]);
+  assert.deepStrictEqual(JSON.parse(saved.get("vibe-talk.own-posts")), { a: 1000, b: 1000 });
+  // Another window adds its own to what this one saved; a reload takes back both.
+  now = 2000;
+  const other = owner();
+  other.noteSent(["c"]);
+  assert.deepStrictEqual(JSON.parse(saved.get("vibe-talk.own-posts")), { a: 1000, b: 1000, c: 2000 });
+  const reloaded = owner();
+  reloaded.load();
+  assert.equal(reloaded.stands("c"), true);
+  assert.equal(reloaded.sentAt("a"), 1000);
+  assert.equal(reloaded.sentFromHere("a"), false, "a post of an earlier page counted as sent from this one");
+  assert.equal(page.sentFromHere("a"), true);
+  // A removal upstream: kept no longer, here or on the device.
+  reloaded.removed("b");
+  assert.equal(reloaded.stands("b"), false);
+  assert.deepStrictEqual(Object.keys(JSON.parse(saved.get("vibe-talk.own-posts"))).sort(), ["a", "c"]);
+  // Past the grace: forgotten as it is asked, though sent from this page it still is.
+  now = 1000 + OWN_POST_GRACE_MS;
+  assert.equal(page.stands("a"), false);
+  assert.equal(page.sentAt("a"), undefined);
+  assert.equal(page.sentFromHere("a"), true);
+  const late = owner();
+  late.load();
+  assert.deepStrictEqual([late.stands("a"), late.stands("c")], [false, true]);
+  // A full quota or a damaged copy costs only the device's copy.
+  full = true;
+  page.noteSent(["d"]);
+  assert.equal(page.stands("d"), true);
+  full = false;
+  saved.set("vibe-talk.own-posts", "{not json");
+  const damaged = owner();
+  damaged.load();
+  assert.equal(damaged.stands("c"), false);
+  now += OWN_POST_GRACE_MS;
+  page.removed("zz");
+  damaged.noteSent([]);
+  assert.equal(saved.has("vibe-talk.own-posts"), false, "nothing in its grace was still saved");
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

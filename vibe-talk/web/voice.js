@@ -2876,9 +2876,8 @@ const OUTGOING_OUTCOME_MS = 120000;
 const OUTGOING_OUTCOME_WAIT_S = 20;
 const OUTGOING_PROGRESS_MS = 2000;
 // `#466 reply-promotes-thread`. How long a message this page posted is kept though a page of the
-// channel does not carry it (`ownPostStands`): a chat service answering from older state catches up
-// within seconds, and a reply deleted upstream meanwhile still goes by the removal the page is told of.
-const OWN_POST_GRACE_MS = 600000;
+// channel does not carry it (`ownPostStands`) is web/src/core/outbox's (`OWN_POST_GRACE_MS`, `#624
+// voice-page-modularity`).
 // `#500 sent-receipts-pile-up`. How long a confirmed send's "Sent." receipt is shown where the message
 // itself is not drawn — a reply into a thread, sent from Main or the Threads view's cards — before it
 // goes once the page holds the message (`sentReceiptRetires`); and it goes by OWN_POST_GRACE_MS after
@@ -2937,17 +2936,12 @@ const DISMISSED_LABEL_CHARS = 120;
 const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this page open until you send it.";
 /**
  * The sends dismissed from the outbox, newest first, each with when it was dismissed, and the device's
- * copy of them (web/src/core/outbox `createDismissedSends`, `#624 voice-page-modularity`). The device's
- * storage is looked up at each use, so this line makes no port early.
+ * copy of them (web/src/core/outbox `createDismissedSends`, `#624 voice-page-modularity`).
  *
  * @type {import("./src/core/outbox/index.ts").DismissedSends<any>}
  */
 const dismissedSends = createDismissedSends({
-  storage: {
-    getItem: (key) => deviceStorage().getItem(key),
-    setItem: (key, value) => deviceStorage().setItem(key, value),
-    removeItem: (key) => deviceStorage().removeItem(key),
-  },
+  storage: deviceStorageOnUse(),
   now: () => Date.now(),
   makeRoom: () => dropMessageCache(),
   decode: (saved) => outgoingFromSaved(saved),
@@ -14474,6 +14468,20 @@ function browserPorts() {
 /** The device's storage, `localStorage`, which every window of this origin shares. */
 function deviceStorage() {
   return browserPorts().deviceStorage;
+}
+
+/**
+ * {@link deviceStorage} for an owner made before the ports are: each call looks the port up, so making
+ * the owner makes no port early.
+ *
+ * @returns {import("./src/ports/index.ts").StoragePort}
+ */
+function deviceStorageOnUse() {
+  return {
+    getItem: (key) => deviceStorage().getItem(key),
+    setItem: (key, value) => deviceStorage().setItem(key, value),
+    removeItem: (key) => deviceStorage().removeItem(key),
+  };
 }
 
 /** This window's own storage, `sessionStorage`. */
@@ -28962,7 +28970,7 @@ function persistOutgoingMessages() {
   try {
     // `#500 sent-receipts-pile-up`. Never a confirmed send where the store keeps the page's own posts
     // (`sentReceiptRetires`): its receipt is a display aid for this page, and a reload keeps the post
-    // itself against a read from older state as this page does (`saveOwnPosts`). Saved, a receipt no
+    // itself against a read from older state as this page does (`ownPosts`). Saved, a receipt no
     // read of this page ever retired came back on every reload.
     const encoded = JSON.stringify([...outgoingMessages.values()]
       .filter((entry) => entry.state !== "sent" || !storeKeepsOwnPosts(entry.channel)));
@@ -29137,62 +29145,25 @@ function outgoingStatus(entry) {
  * it out; Main showed it only because its live append skips that filter, until its next redraw. So a
  * message sent from here is one the read filters keep (`readFilterKeeps`, `mainRowMessages`), in every
  * list alike, for the rest of the page's life: what the reader has just said never vanishes as they say it.
- */
-const sentFromHere = new Set();
-
-/** Whether `message` was sent from this page (`sentFromHere`). */
-const sentFromThisPage = (message) => sentFromHere.has(String(message.id));
-
-/**
- * `#466 reply-promotes-thread`. When each message this page sent was acknowledged, by id: see
- * `ownPostStands`.
  *
- * @type {Map<string, number>}
- */
-const sentFromHereAt = new Map();
-
-/**
- * `#500 sent-receipts-pile-up`. `sentFromHereAt` on the device, for OWN_POST_GRACE_MS: a confirmed send's
- * receipt is no longer saved, and a reload in the grace keeps the page's own post against a read from
- * older state as the page that sent it did. Every window of the origin writes it, each adding its own.
- */
-const OWN_POSTS_KEY = "vibe-talk.own-posts";
-
-/** The saved `sentFromHereAt` still in its grace, by id. */
-function savedOwnPosts() {
-  /** @type {Map<string, number>} */
-  const kept = new Map();
-  try {
-    const saved = JSON.parse(deviceStorage().getItem(OWN_POSTS_KEY) || "{}");
-    for (const [id, at] of Object.entries(saved && typeof saved === "object" ? saved : {})) {
-      if (typeof at === "number" && Date.now() - at < OWN_POST_GRACE_MS) kept.set(id, at);
-    }
-  } catch (_error) {
-    // Unreadable: nothing kept, as on a device that never sent.
-  }
-  return kept;
-}
-
-/**
- * Save `sentFromHereAt`, with what other windows saved, within the grace, and without `removed`.
+ * `#466 reply-promotes-thread`, `#500 sent-receipts-pile-up`. When each was acknowledged, too, kept on
+ * the device for OWN_POST_GRACE_MS, so a reload in the grace keeps the page's own post against a read
+ * from older state as the page that sent it did (`ownPostStands`). The owner is web/src/core/outbox
+ * `createOwnPosts` (`#624 voice-page-modularity`).
  *
- * @param {string | null} [removed] a post removed upstream (`noteLiveRemoval`)
+ * @type {import("./src/core/outbox/index.ts").OwnPosts}
  */
-function saveOwnPosts(removed = null) {
-  const all = savedOwnPosts();
-  for (const [id, at] of sentFromHereAt) if (Date.now() - at < OWN_POST_GRACE_MS) all.set(id, at);
-  if (removed !== null) all.delete(removed);
-  try {
-    if (all.size) deviceStorage().setItem(OWN_POSTS_KEY, JSON.stringify(Object.fromEntries(all)));
-    else deviceStorage().removeItem(OWN_POSTS_KEY);
-  } catch (_error) {
-    // A full quota: the page keeps them for itself, as before this was saved.
-  }
-}
+const ownPosts = createOwnPosts({
+  storage: deviceStorageOnUse(),
+  now: () => Date.now(),
+});
 
-/** Take back what earlier pages of the device sent in the grace (`saveOwnPosts`). */
+/** Whether `message` was sent from this page (`ownPosts`). */
+const sentFromThisPage = (message) => ownPosts.sentFromHere(String(message.id));
+
+/** Take back what earlier pages of the device sent in the grace (`ownPosts`). */
 function loadOwnPosts() {
-  for (const [id, at] of savedOwnPosts()) if (!sentFromHereAt.has(id)) sentFromHereAt.set(id, at);
+  ownPosts.load();
 }
 
 /**
@@ -29220,11 +29191,7 @@ function loadOwnPosts() {
  * sent-receipts-pile-up`).
  */
 function ownPostStands(id) {
-  const at = sentFromHereAt.get(String(id));
-  if (at === undefined) return false;
-  if (Date.now() - at < OWN_POST_GRACE_MS) return true;
-  sentFromHereAt.delete(String(id));
-  return false;
+  return ownPosts.stands(String(id));
 }
 
 /**
@@ -29732,7 +29699,7 @@ function withPendingThreads(summaries) {
   if (channelStore.current().channel === viewing) {
     for (const held of channelStore.current().messages) {
       if (threadOf(held) && held.thread.is_root !== true && sentFromThisPage(held)) {
-        starting.push([String(held.thread.id), sentFromHereAt.get(String(held.id)) || timeOf(held, "timestamp")]);
+        starting.push([String(held.thread.id), ownPosts.sentAt(String(held.id)) || timeOf(held, "timestamp")]);
       }
     }
   }
@@ -30688,11 +30655,7 @@ async function dispatchOutgoingMessage(entry, job) {
       ...part, id: String(part.id), channel_id: entry.channel, content: String(part.content || ""),
     }));
     // `#430 threads-main-own-sent`. Sent from here: the read filters keep it in sight from now on.
-    for (const part of entry.parts) {
-      sentFromHere.add(part.id);
-      sentFromHereAt.set(part.id, Date.now());
-    }
-    saveOwnPosts();
+    ownPosts.noteSent(entry.parts.map((part) => part.id));
     // `#263 post-split-per-provider`. The rest of a long post may have continued in its first
     // part's thread, where it is drawn rather than here; the receipt for it says which thread.
     if (!entry.threadId) entry.continueIn = entry.parts.slice(1).map(threadOf).find(Boolean) || entry.continueIn;
@@ -53676,7 +53639,7 @@ function noteLiveRemoval(channel, id, observedMs = null) {
   // `#466 reply-promotes-thread`. Heard of in any channel: a post of this page's removed upstream is no
   // longer kept against reads that do not carry it (`ownPostStands`).
   // `#500 sent-receipts-pile-up`: nor on the device, whichever of its windows sent it.
-  if (sentFromHereAt.delete(String(id)) || savedOwnPosts().has(String(id))) saveOwnPosts(String(id));
+  ownPosts.removed(String(id));
   if (channelStore.current().channel !== String(channel)) return;
   noteRemoved(channelStore.current(), String(id), observedMs);
   // `#315 removed-reply-target`. A reply open on it says so now, not when the read behind this lands,
