@@ -137,7 +137,7 @@ fn parse_tokens(segment: &str) -> Option<u64> {
     (value >= 0.0).then(|| (value * scale).round() as u64)
 }
 
-/// Glyphs that open a harness's running-turn row at column 0: Codex's `•`/`◦`, Muse's `◆`/`◇`,
+/// Glyphs that open a harness's running-turn row at column 0: Codex's `•`/`◦`, Muse's `◆`/`◇`/`◈`,
 /// and Claude Code's spinner frames ([`crate::harness::running_glyphs`]).
 use crate::harness::running_glyphs;
 
@@ -165,7 +165,7 @@ fn running_row(line: &str) -> Option<(Option<u64>, Option<u64>, &'static str)> {
     if timer.is_none() && !interrupt {
         return None;
     }
-    let scope = if matches!(glyph, '◆' | '◇') {
+    let scope = if matches!(glyph, '◆' | '◇' | '◈') {
         "step"
     } else {
         "turn"

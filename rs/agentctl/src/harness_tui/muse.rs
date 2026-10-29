@@ -322,4 +322,23 @@ mod tests {
             assert!(!MuseTui::approval_form(screen));
         }
     }
+
+    #[test]
+    fn a_quoted_or_indented_progress_row_is_not_a_running_turn() {
+        use crate::client::muse_verified_pane_status;
+        // A capture the agent printed or was sent, tool output under `└`, or an answer that
+        // mentions the phrase sits above an idle editor without making it a running turn.
+        for quoted in [
+            "└ ◇ Calling tools (30s · esc to interrupt)\n",
+            "  ◇ Calling tools (30s · esc to interrupt)\n",
+            "◆ The row reads `◇ Thinking (3s · esc to interrupt)` while it works.\n",
+        ] {
+            let screen = IDLE.replacen("────", &format!("{quoted}────"), 1);
+            assert_ne!(screen, IDLE);
+            for screen in [screen.clone(), headerless(&screen)] {
+                assert!(!muse_verified_process_turn_running(&screen), "{quoted}");
+                assert_eq!(muse_verified_pane_status("done", &screen), "idle", "{quoted}");
+            }
+        }
+    }
 }

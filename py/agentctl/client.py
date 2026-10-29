@@ -159,11 +159,14 @@ def _muse_turn_running(transcript: str) -> bool:
     turn is running. It is not always the last row: a foreground command's output and hint
     (``└ (ctrl+b to send to background)``) and a ``◆ Queued input`` block sit below it, and the
     post-turn ``◈ Double checking`` phase is a running turn too (#678 muse-bridge-latency).
+
+    The row starts at the left edge and ends with ``esc to interrupt)``, so tool output, a
+    quoted capture or an answer that mentions the phrase does not count.
     """
-    rows = [line.strip() for line in transcript.splitlines() if line.strip()]
+    rows = [line.rstrip() for line in transcript.splitlines() if line.strip()]
     return any(
         any(line == marker or line.startswith(marker + " ") for marker in _MUSE_PROGRESS_MARKERS)
-        and "esc to interrupt)" in line
+        and line.endswith("esc to interrupt)")
         for line in rows[-_MUSE_PROGRESS_ROWS:]
     )
 

@@ -2260,8 +2260,8 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     fn muse_journal(&self) -> Option<crate::harness::muse::JournalWatch> {
         let identity = match self.record.adapter.as_str() {
             "herdr-pane" => self.record.custom_process_identity.as_ref(),
-            "tmux" => self.record.harness_anchor(),
-            _ => None,
+            // An owned tmux pane and an adopted pane are pinned by their harness anchor.
+            _ => self.record.harness_anchor(),
         }?;
         crate::harness::muse::JournalWatch::start(u32::try_from(identity.pid).ok()?)
     }
@@ -2397,13 +2397,19 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             }
             let screen = self.verified_muse_screen(pane_id, runtime)?;
             let now = runtime.monotonic();
+            let left_editor = !muse_verified_process_paste_in_composer(&screen, text);
             let evidence = if screen != staged
+                && left_editor
                 && muse_verified_process_prompt_transcript_count(&screen, text) > prior
-                && !muse_verified_process_paste_in_composer(&screen, text)
             {
                 Some("prompt appeared above the Muse editor as a new user turn")
-            } else if journal.as_mut().is_some_and(|watch| watch.accepted(text)) {
+            } else if left_editor
+                && crate::harness_tui::muse::MuseTui::editor_empty(&screen)
+                && journal.as_mut().is_some_and(|watch| watch.accepted(text))
+            {
                 // Muse took the prompt but draws the turn only after the tool call in flight.
+                // The journal counts only once the editor is empty again: a prompt still there
+                // (or put back there, as Muse does with a steer it refuses) is not delivered.
                 Some("Muse's journal records the prompt as an accepted user intent")
             } else {
                 None
