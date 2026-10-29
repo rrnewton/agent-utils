@@ -1,10 +1,11 @@
 ---
 title: 'vt-timeline-latency: timeline requests take 40-65 s after a restart'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-29T15:23:44.387424470+00:00
-updated_at: 2026-10-29T15:23:44.387424470+00:00
+updated_at: 2026-10-29T15:53:56.883685087+00:00
+closed_at: 2026-10-29T15:53:56.883684115+00:00
 ---
 
 # Description
