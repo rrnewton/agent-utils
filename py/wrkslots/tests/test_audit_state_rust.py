@@ -358,6 +358,95 @@ def test_audit_validate_unregistered_matches_python(tmp_path: Path) -> None:
     assert by_slot["slot-u"]["cache_error"] is None
 
 
+def _validate_fixture(base: Path) -> Path:
+    root = _fixture(base)
+    upstream = base / "upstream-repo"
+    subprocess.run(
+        ["git", "-C", str(upstream), "worktree", "remove", "--force",
+         str(root / "worktrees" / "slot-a" / "repo")],
+        capture_output=True, check=False,
+    )
+    subprocess.run(
+        ["rm", "-rf", str(root / "worktrees" / "slot-a")], check=True
+    )
+    _git(
+        upstream, "worktree", "add", "-q", "-b", "suite/validate",
+        str(root / "worktrees" / "validate" / "slot-a" / "repo"), "HEAD",
+    )
+    active_path = root / "worktrees" / "ACTIVE.node-a.json"
+    doc = json.loads(active_path.read_text())
+    record = doc["slots"][0]
+    record["slot_type"] = "validate"
+    record["agent"] = "validate-slot-a"
+    record["checkouts"][0]["path"] = "worktrees/validate/slot-a/repo"
+    record["checkouts"][0]["branch"] = "suite/validate"
+    active_path.write_text(json.dumps(doc))
+    return root
+
+
+def test_audit_validate_deletable_matches_python(tmp_path: Path) -> None:
+    root = _validate_fixture(tmp_path)
+    actual = _check(root, tmp_path)
+    rows = _rows(actual)
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == "DELETABLE"
+    assert rows[0]["liveness_state"] == "dead"
+
+
+def test_audit_validate_absent_matches_python(tmp_path: Path) -> None:
+    root = _validate_fixture(tmp_path)
+    subprocess.run(
+        ["rm", "-rf", str(root / "worktrees" / "validate" / "slot-a")],
+        check=True,
+    )
+    _git(tmp_path / "upstream-repo", "worktree", "prune")
+    actual = _check(root, tmp_path)
+    rows = _rows(actual)
+    assert rows[0]["verdict"] == "RECOVERABLE"
+    assert "recover-absent-validate-rows" in str(rows[0]["reasons"])
+
+
+def test_audit_validate_foreign_machine_matches_python(tmp_path: Path) -> None:
+    root = _validate_fixture(tmp_path)
+    _git(
+        tmp_path / "upstream-repo", "worktree", "add", "-q", "-b",
+        "suite/validate-v", str(root / "worktrees" / "validate" / "slot-v" / "repo"),
+        "HEAD",
+    )
+    active_path = root / "worktrees" / "ACTIVE.node-a.json"
+    record = json.loads(active_path.read_text())["slots"][0]
+    foreign = json.loads(json.dumps(record))
+    foreign["slot"] = "slot-v"
+    foreign["agent"] = "validate-slot-v"
+    foreign["machine"] = "node-b"
+    foreign["checkouts"][0]["path"] = "worktrees/validate/slot-v/repo"
+    foreign["checkouts"][0]["branch"] = "suite/validate-v"
+    (root / "worktrees" / "ACTIVE.node-b.json").write_text(
+        json.dumps(
+            {"schema": 2, "machine": "node-b", "revision": 7, "slots": [foreign]}
+        )
+    )
+    (root / "worktrees" / "ARCHIVED.node-b.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-b", "revision": 3, "records": []})
+    )
+    actual = _check(root, tmp_path)
+    by_slot = {str(row["slot"]): row for row in _rows(actual)}
+    assert by_slot["slot-v"]["liveness_state"] == "unverifiable"
+    assert by_slot["slot-v"]["verdict"] == "BLOCKED"
+
+
+def test_audit_validate_run_handle_refuses_in_rust(tmp_path: Path) -> None:
+    root = _validate_fixture(tmp_path)
+    runs = root / "ignored" / "validate" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "some-unit.json").write_text(
+        json.dumps({"checkout": "/elsewhere", "unit": "some-unit.service"})
+    )
+    result = _rust(root)
+    assert result.returncode != 0
+    assert "validation-run handle evidence" in result.stderr
+
+
 def test_audit_journal_row_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     identity = _dead_identity()

@@ -5,7 +5,9 @@
 //! BLOCKED / UNKNOWN) with the oracle's reasons, unregistered
 //! on-disk directory rows, interrupted-journal rows, validation-batch
 //! seal evidence, stray Git registrations, cache byte accounting,
-//! and the disk/gate summary. Validation-row liveness and the
+//! and the disk/gate summary. Validation rows are judged by
+//! their run authority in the clean-evidence case; retained
+//! run-handle evidence, unreadable host evidence, and the
 //! bounded/cache-state census machinery stay with the Python
 //! edition for now and refuse by name. Read-only.
 
@@ -557,6 +559,415 @@ fn apply_overrides(
     }
 }
 
+/// The stable host identity (`/etc/machine-id`, then the D-Bus
+/// machine id), like `_host_id`.
+fn host_id() -> Result<String> {
+    let mut failures: Vec<String> = Vec::new();
+    for raw in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        let path = Path::new(raw);
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let value = text.trim().to_string();
+                if !value.is_empty() {
+                    return Ok(value);
+                }
+                failures.push(format!("{raw}: empty"));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => failures.push(format!("{raw}: {error}")),
+        }
+    }
+    let detail = if failures.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", failures.join("; "))
+    };
+    Err(format!(
+        "cannot establish the stable machine identity{detail}"
+    ))
+}
+
+/// `_liveness_batch_diagnostic`: bound and flatten one diagnostic.
+fn liveness_diagnostic(value: &str) -> String {
+    let limit = 4096;
+    let marker = " [truncated]";
+    let excerpt: String = value.chars().take(limit).collect();
+    let printable: String = excerpt
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{7f}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let collapsed = printable.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() > limit || collapsed.len() > limit {
+        let mut truncated: Vec<u8> = collapsed.as_bytes()[..limit - marker.len()].to_vec();
+        while !std::str::from_utf8(&truncated).is_ok() {
+            truncated.pop();
+        }
+        let text = String::from_utf8_lossy(&truncated).trim_end().to_string();
+        return format!("{text}{marker}");
+    }
+    if collapsed.is_empty() {
+        "no detail".to_string()
+    } else {
+        collapsed
+    }
+}
+
+struct SystemdUnit {
+    id: String,
+    object_path: String,
+    active_state: String,
+    job_id: i64,
+}
+
+/// The user-manager unit listing, parsed from the same `busctl`
+/// call the oracle makes.
+fn systemd_units() -> Result<Vec<SystemdUnit>> {
+    let output = std::process::Command::new("/usr/bin/busctl")
+        .args([
+            "--user",
+            "--json=short",
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "ListUnitsByPatterns",
+            "asas",
+            "0",
+            "2",
+            "*.service",
+            "*.scope",
+        ])
+        .output()
+        .map_err(|error| format!("cannot execute busctl: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "busctl unit listing failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let document: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("user-systemd unit listing is malformed: {error}"))?;
+    if document.get("type").and_then(Value::as_str) != Some("a(ssssssouso)") {
+        return Err("user-systemd unit listing has an unexpected signature".to_string());
+    }
+    let rows = document
+        .pointer("/data/0")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "user-systemd unit listing has an invalid shape".to_string())?;
+    let mut units = Vec::new();
+    for row in rows {
+        let fields = row
+            .as_array()
+            .ok_or_else(|| "user-systemd unit listing row is not a tuple".to_string())?;
+        if fields.len() != 10 {
+            return Err("user-systemd unit listing row is not a tuple".to_string());
+        }
+        let text = |index: usize| -> Result<String> {
+            fields[index]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "user-systemd unit listing field is not a string".to_string())
+        };
+        units.push(SystemdUnit {
+            id: text(0)?,
+            active_state: text(3)?,
+            object_path: text(6)?,
+            job_id: fields[7].as_i64().unwrap_or(0),
+        });
+    }
+    Ok(units)
+}
+
+/// Every string leaf of one unit's property replies, flattened:
+/// the Unit interface properties plus the Service (or Scope)
+/// properties, as the oracle's snapshot reads them.
+fn property_text(unit: &SystemdUnit) -> Result<String> {
+    fn collect(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            Value::Object(map) => map.values().for_each(|item| collect(item, out)),
+            _ => {}
+        }
+    }
+    fn read(unit: &SystemdUnit, interface: &str, properties: &[&str]) -> Result<Vec<String>> {
+        let mut args: Vec<String> = vec![
+            "--user".to_string(),
+            "--json=short".to_string(),
+            "get-property".to_string(),
+            "org.freedesktop.systemd1".to_string(),
+            unit.object_path.clone(),
+            interface.to_string(),
+        ];
+        args.extend(properties.iter().map(|item| item.to_string()));
+        let output = std::process::Command::new("/usr/bin/busctl")
+            .args(&args)
+            .output()
+            .map_err(|error| format!("cannot execute busctl: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "busctl property read for {} failed: {}",
+                unit.id,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let mut leaves: Vec<String> = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(document) = serde_json::from_str::<Value>(line) {
+                collect(&document, &mut leaves);
+            }
+        }
+        Ok(leaves)
+    }
+    let mut leaves = read(
+        unit,
+        "org.freedesktop.systemd1.Unit",
+        &[
+            "Id",
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "RequiresMountsFor",
+        ],
+    )?;
+    if unit.id.ends_with(".service") {
+        leaves.extend(read(
+            unit,
+            "org.freedesktop.systemd1.Service",
+            &[
+                "ControlGroup",
+                "MainPID",
+                "WorkingDirectory",
+                "ExecStart",
+                "ExecStartPre",
+                "ExecStartPost",
+                "ExecReload",
+                "ExecStop",
+                "ExecStopPost",
+                "Environment",
+                "EnvironmentFiles",
+                "RootDirectory",
+                "RootImage",
+                "BindPaths",
+                "BindReadOnlyPaths",
+                "ReadWritePaths",
+                "ReadOnlyPaths",
+                "InaccessiblePaths",
+                "StandardInput",
+                "StandardOutput",
+                "StandardError",
+            ],
+        )?);
+    } else {
+        leaves.extend(read(
+            unit,
+            "org.freedesktop.systemd1.Scope",
+            &["ControlGroup"],
+        )?);
+    }
+    Ok(leaves.join("\n"))
+}
+
+/// Whether one unit's property text names any row path: the path
+/// spelling appears in the text, or a path word in it is the row
+/// path or lies inside it.
+fn unit_names_path(text: &str, paths: &[PathBuf]) -> Option<PathBuf> {
+    let spellings: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    for (path, spelling) in paths.iter().zip(&spellings) {
+        if text.contains(spelling.as_str()) {
+            return Some(path.clone());
+        }
+    }
+    for word in text.split(|c: char| c.is_whitespace() || c == '\0') {
+        let word = word.trim_matches(|c| matches!(c, '"' | '\'' | ',' | ';'));
+        let Some(start) = word.find('/') else {
+            continue;
+        };
+        let candidate = PathBuf::from(&word[start..]);
+        let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+        for path in paths {
+            let root = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            if resolved == root || resolved.starts_with(&root) {
+                return Some(path.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Validation-row liveness from the run authority, for the
+/// clean-evidence case. Retained run handles and unreadable host
+/// evidence refuse by name rather than approximate the oracle's
+/// full evidence judgement.
+fn validation_liveness(
+    cfg: &Cfg,
+    config: &Value,
+    record: &Value,
+) -> Result<crate::remove_write::Liveness> {
+    use crate::remove_write::Liveness;
+    let machine = record
+        .get("machine")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let slot = record
+        .get("slot")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let selected = config
+        .get("machine")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let current_host = match host_id() {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Liveness {
+                state: "unverifiable".to_string(),
+                detail: liveness_diagnostic(&format!(
+                    "validation-run evidence is unverifiable: {error}"
+                )),
+            })
+        }
+    };
+    if machine != selected {
+        return Ok(Liveness {
+            state: "unverifiable".to_string(),
+            detail: format!(
+                "validation row is registered on machine {machine}, and run, process and user-systemd evidence is local to {selected}"
+            ),
+        });
+    }
+    let mut recorded: BTreeSet<String> = BTreeSet::new();
+    if let Some(lease_host) = record
+        .get("coordinator_lease")
+        .and_then(|lease| lease.get("host_id"))
+        .and_then(Value::as_str)
+    {
+        recorded.insert(lease_host.to_string());
+    } else {
+        recorded.insert(String::new());
+    }
+    if let Some(owner) = record.get("owner").filter(|owner| !owner.is_null()) {
+        recorded.insert(
+            owner
+                .get("host_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    let local_error = if recorded.contains("") || recorded.len() != 1 {
+        Some(format!(
+            "validation row {machine}/{slot} has missing or mixed stable host identities"
+        ))
+    } else {
+        let expected = recorded.iter().next().expect("one host identity");
+        if *expected != current_host {
+            Some(format!(
+                "validation row {machine}/{slot} belongs to stable host {expected}, not current host {current_host}"
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some(error) = local_error {
+        return Ok(Liveness {
+            state: "unverifiable".to_string(),
+            detail: format!(
+                "{error}, and run, process and user-systemd evidence is local to this host"
+            ),
+        });
+    }
+    // Any retained run handle is evidence this slice does not judge.
+    let handles = cfg.root.join("ignored").join("validate").join("runs");
+    if handles.is_symlink() || (handles.exists() && !handles.is_dir()) {
+        return Err(
+            "audit validation-run handle evidence stays with the Python edition for now"
+                .to_string(),
+        );
+    }
+    if handles.is_dir() {
+        let entries = std::fs::read_dir(&handles).map_err(|error| {
+            format!(
+                "cannot enumerate retained validation handles in {}: {error}",
+                handles.display()
+            )
+        })?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("cannot enumerate retained handles: {error}"))?;
+            if entry.file_name().to_string_lossy().ends_with(".json") {
+                return Err(
+                    "audit validation-run handle evidence stays with the Python edition for now"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let slot_path = slot_directory(cfg, slot, "validate")?;
+    let mut row_paths: Vec<PathBuf> = vec![slot_path.clone()];
+    if let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) {
+        for checkout in checkouts {
+            if let Some(raw) = checkout.get("path").and_then(Value::as_str) {
+                if let Ok(path) = stored_path(cfg, raw, "checkout path") {
+                    row_paths.push(path);
+                }
+            }
+        }
+    }
+    // Fenced siblings of the slot directory name the same row.
+    if let Some(parent) = slot_path.parent() {
+        let generation = record
+            .get("generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let prefix = format!(".{slot}.fenced.{generation}.");
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    row_paths.push(entry.path());
+                }
+            }
+        }
+    }
+    let units = systemd_units().map_err(|error| {
+        format!("audit validation-run host evidence stays with the Python edition for now: {error}")
+    })?;
+    for unit in &units {
+        let active = !matches!(unit.active_state.as_str(), "inactive" | "failed");
+        if !active && unit.job_id == 0 {
+            continue;
+        }
+        let text = property_text(unit).map_err(|error| {
+            format!(
+                "audit validation-run host evidence stays with the Python edition for now: {error}"
+            )
+        })?;
+        if let Some(named) = unit_names_path(&text, &row_paths) {
+            return Ok(Liveness {
+                state: "alive".to_string(),
+                detail: liveness_diagnostic(&format!(
+                    "validation run may still use the row: user-systemd unit {} names validation row {slot} path {}",
+                    unit.id,
+                    named.display()
+                )),
+            });
+        }
+    }
+    Ok(Liveness {
+        state: "dead".to_string(),
+        detail: "0 retained run handle(s) name this row, each with an inactive, unqueued unit with no live process and any recorded process generation dead since before the host evidence was read; no active or queued user-systemd unit names its paths".to_string(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn audit_record(
     root: Option<&Path>,
@@ -590,7 +1001,11 @@ fn audit_record(
     let owner_identity =
         crate::status_state::identity_from_value(record.get("owner").unwrap_or(&Value::Null));
     let (owner_state, owner_detail) = process_state(owner_identity.as_ref());
-    let liveness = liveness_answer(cfg, config, record)?;
+    let liveness = if slot_type == "validate" {
+        validation_liveness(cfg, config, record)?
+    } else {
+        liveness_answer(cfg, config, record)?
+    };
     let (heartbeat_age, heartbeat_expired) = heartbeat_diagnosis(record)?;
     let mut agent_running = !(liveness.state == "dead" && owner_state == "dead");
     let hold = current_hold(root, cfg, &machine, &slot)?;
@@ -783,8 +1198,13 @@ fn audit_record(
     }
     if slot_absent {
         let row_digest = record_digest(record)?;
-        let plan =
-            format!("wrkslots recover-absent-agent-rows --row {slot}={generation}={row_digest}");
+        let plan = if slot_type == "validate" {
+            format!(
+                "wrkslots recover-absent-validate-rows --input FILE', where FILE holds '{{\"rows\": [{{\"generation\": {generation}, \"machine\": \"{machine}\", \"record_sha256\": \"{row_digest}\", \"slot\": \"{slot}\"}}], \"schema\": 1}}"
+            )
+        } else {
+            format!("wrkslots recover-absent-agent-rows --row {slot}={generation}={row_digest}")
+        };
         reasons.push(format!(
             "slot directory is absent: {}; nothing occupies the path, so this row is retired by recovery, not removal: on machine {machine}, run '{plan}' for the read-only plan, then repeat it with '--apply --coordinator-authorized --coordinator-pid <coordinator-pid>'",
             slot_path.display()
@@ -1064,14 +1484,6 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
             Vec::new()
         };
         events_by_machine.insert(machine.clone(), events);
-    }
-    if records
-        .iter()
-        .any(|record| record.get("slot_type").and_then(Value::as_str) == Some("validate"))
-    {
-        return Err(
-            "audit validation-row liveness stays with the Python edition for now".to_string(),
-        );
     }
     let (seal_targets, seal_errors) = seal_evidence(&cfg);
     let mut seal_by_slot: BTreeMap<(String, String), (i64, PathBuf)> = BTreeMap::new();
