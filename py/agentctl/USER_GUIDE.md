@@ -421,6 +421,39 @@ otherwise the shared `subagents` workspace.
 The label must be 1–128 UTF-8 bytes, have no surrounding whitespace, and contain
 no control characters.
 
+The top-level `launch_env` is optional. It gives every interactive agent this
+registry starts or revives the team's own environment, whatever the profile:
+
+```json
+{
+  "schema": "agentctl-profiles/v1",
+  "launch_env": {
+    "env_file": "/srv/team/agent-env.sh",
+    "path_prepend": ["/srv/team/bin"]
+  },
+  "profiles": {}
+}
+```
+
+Before typing the harness command, `agentctl` types one line into the new
+pane's shell (and inside the slot box, after `--slot` enters it):
+`export BASH_ENV='<env_file>' PATH='<path_prepend joined by :>':"$PATH"`. The
+line runs after that shell's startup files, so the directories stay first on
+the harness `PATH` even when `~/.bashrc` reorders `PATH`, and it works the same
+under Herdr and tmux. `BASH_ENV` makes every non-interactive `bash -c` tool
+shell of Claude, Codex, and Muse source `env_file` before each command, so
+editing that file reaches running agents on their next tool call. Write it
+idempotently, for example
+`TEAM_BIN=/srv/team/bin; PATH="$TEAM_BIN:${PATH//$TEAM_BIN:/}"; export PATH`.
+With `path_prepend`, Codex starts with `-c allow_login_shell=false` unless
+your arguments already set that key, because its login-shell snapshot would
+otherwise put startup-file directories first. Either key may be omitted, but
+not both. Paths must be absolute, directories may not contain `:`, and at most
+16 directories are accepted. A start or revive refuses when `env_file` is not a
+regular file or a directory is missing, and refuses root slot isolation, whose
+relay runs the harness without an interactive shell. The pane shell must accept
+`export NAME=value` (bash, zsh, or another POSIX-style shell).
+
 Within each profile, `harness` and `mode` are required. `model`,
 `reasoning_effort`, `argv`, and `env` are optional, and so is `record_edges`:
 `false` makes `start` with this profile record no `created_by` or `managed_by`

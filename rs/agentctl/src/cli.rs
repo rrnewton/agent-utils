@@ -912,7 +912,7 @@ struct Start {
     /// Extra literal harness argument; repeat or use --harness-arg=--flag
     #[arg(long = "harness-arg", value_name = "ARG")]
     harness_args: Vec<String>,
-    /// Set a literal KEY=VALUE variable in the created interactive Herdr tab; repeatable and omitted from status
+    /// Set a literal KEY=VALUE variable in the created interactive Herdr tab; repeatable and omitted from status. A PATH set here is reordered by the pane shell's startup files (and replaced by tmux); give a team tool directory with the top-level launch_env key of profiles.json instead, which every interactive start and revive types into the pane after those files have run
     #[arg(long = "env", value_name = "KEY=VALUE", value_parser = environment_value)]
     environment: Vec<String>,
     /// Initial prompt to deliver after startup; conflicts with --file

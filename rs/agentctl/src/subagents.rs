@@ -1023,6 +1023,18 @@ pub trait ManagedApi: AgentApi {
             "slot sandbox entry is unavailable",
         ))
     }
+    /// Type one environment line into a fresh pane's interactive shell before the harness
+    /// starts (the registry's `launch_env`), and wait for the shell to take it.
+    fn prepare_launch_shell(
+        &self,
+        _pane: &str,
+        _command_line: &str,
+        _timeout: Duration,
+    ) -> crate::error::Result<()> {
+        Err(crate::error::AdapterError::unavailable(
+            "launch environment preparation is unavailable",
+        ))
+    }
     /// Start a custom harness through `pane run` and verify the foreground process.
     fn start_pane_agent(
         &self,
@@ -1466,6 +1478,14 @@ impl ManagedApi for HerdrClient {
         timeout: Duration,
     ) -> crate::error::Result<u64> {
         HerdrClient::enter_slot_sandbox(self, pane, command_line, timeout)
+    }
+    fn prepare_launch_shell(
+        &self,
+        pane: &str,
+        command_line: &str,
+        timeout: Duration,
+    ) -> crate::error::Result<()> {
+        HerdrClient::prepare_launch_shell(self, pane, command_line, timeout)
     }
     fn start_relay_agent(
         &self,
@@ -4901,6 +4921,10 @@ pub const RELAY_HARNESSES: [&str; 2] = ["claude", "codex"];
 /// Both relayed harnesses show this hint only while a turn is running.
 const RELAY_WORKING_MARKER: &str = "esc to interrupt";
 
+/// Why a registry `launch_env` cannot start a harness behind a root slot relay: the relay runs
+/// the boxed harness line directly, with no interactive shell to take the environment line.
+const LAUNCH_ENV_RELAY_REFUSAL: &str = "profile config launch_env does not apply under root slot isolation; use userns or cgroup isolation, or remove launch_env";
+
 /// Environment variable naming the wrkslots executable, overriding `PATH`.
 pub const WRKSLOTS_BIN_ENV: &str = "AGENTCTL_WRKSLOTS_BIN";
 
@@ -5145,6 +5169,9 @@ pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     lock_priority: bool,
     #[cfg(test)]
     revive_wrkslots_executable: Option<PathBuf>,
+    /// The registry launch environment as a test pretends it, instead of `profiles.json`.
+    #[cfg(test)]
+    launch_env_override: Option<Option<crate::profiles::LaunchEnv>>,
     /// The caller's process ancestry as tests pretend it; `Some(None)` is a caller that is no
     /// registered agent, the default, so fixtures that pin this test process record no edges.
     #[cfg(test)]
@@ -5172,6 +5199,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             lock_priority: false,
             #[cfg(test)]
             revive_wrkslots_executable: None,
+            #[cfg(test)]
+            launch_env_override: None,
             #[cfg(test)]
             caller_ancestry: Some(None),
         })
@@ -5218,6 +5247,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     #[cfg(test)]
+    fn with_launch_env(mut self, launch_env: Option<crate::profiles::LaunchEnv>) -> Self {
+        self.launch_env_override = Some(launch_env);
+        self
+    }
+
+    #[cfg(test)]
     fn with_project_workspace(mut self, workspace: Option<&str>) -> Self {
         self.project_workspace_override = workspace.map(|workspace| Some(workspace.to_owned()));
         self
@@ -5239,6 +5274,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     fn target(&self, record: &AgentRecord) -> Result<Target> {
         record.target()
+    }
+
+    /// The registry's `launch_env`, refusing one whose file or directories are missing.
+    fn project_launch_env(&self) -> Result<Option<crate::profiles::LaunchEnv>> {
+        #[cfg(test)]
+        if let Some(launch_env) = self.launch_env_override.as_ref() {
+            return Ok(launch_env.clone());
+        }
+        let launch_env = crate::profiles::launch_env_for_registry(&self.registry)?;
+        if let Some(launch_env) = launch_env.as_ref() {
+            launch_env.check_present()?;
+        }
+        Ok(launch_env)
     }
 
     fn project_workspace(&self) -> Result<Option<String>> {
@@ -7466,6 +7514,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut structured_arguments =
             crate::profiles::reasoning_arguments(&options.harness, reasoning_effort)?;
         structured_arguments.extend_from_slice(&options.harness_args);
+        // Load the launch environment before the name is taken, so a missing team file or
+        // directory refuses the start cleanly.
+        let launch_env = self.project_launch_env()?;
+        if options.harness == "codex"
+            && launch_env
+                .as_ref()
+                .is_some_and(crate::profiles::LaunchEnv::codex_needs_non_login_shell)
+            && !options
+                .harness_args
+                .iter()
+                .any(|argument| argument.contains("allow_login_shell"))
+        {
+            structured_arguments.extend(["-c".to_owned(), "allow_login_shell=false".to_owned()]);
+        }
         let native_session = match options.resume.as_deref() {
             Some(value) => Some(NativeSession::new(&options.harness, value, "asserted")),
             None if options.harness == "claude" => Some(NativeSession::new(
@@ -7588,6 +7650,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             None => (cwd, None),
         };
+        if launch_env.is_some() && relay_command.is_some() {
+            return Err(fail(LAUNCH_ENV_RELAY_REFUSAL));
+        }
         let _lock = self.lock(agent_name)?;
         let identity_lock = self.identity_lock()?;
         if let Some(resume) = options.resume.as_deref() {
@@ -8171,11 +8236,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         relay_command: Option<&str>,
         exclusion: Option<&revive::CensusExclusion>,
     ) -> Result<()> {
+        let launch_env = self.project_launch_env()?;
+        if launch_env.is_some() && relay_command.is_some() {
+            return Err(fail(LAUNCH_ENV_RELAY_REFUSAL));
+        }
         self.create_presentation(record, options, project_workspace)?;
         let pane_id = record.pane_id.clone().expect("new tab has pane");
         if let Some(line) = slot_command {
             self.client
                 .enter_slot_sandbox(&pane_id, line, options.startup_timeout)?;
+        }
+        if let Some(launch_env) = launch_env.as_ref() {
+            // After the pane's (and any slot box's) interactive shell has run its startup
+            // files, so the prefix stays first for the harness started next.
+            self.client.prepare_launch_shell(
+                &pane_id,
+                &launch_env.shell_line(),
+                options.startup_timeout,
+            )?;
         }
         if let Some(line) = relay_command {
             let harness = record.harness.clone();
@@ -12230,6 +12308,7 @@ pub(crate) mod tests {
                     pane_info_calls: AtomicU64::new(0),
                     runs: Mutex::new(Vec::new()),
                     slot_commands: Mutex::new(Vec::new()),
+                    launch_shell_lines: Mutex::new(Vec::new()),
                     environments: Mutex::new(Vec::new()),
                     closed: Mutex::new(Vec::new()),
                     focused: Mutex::new(Vec::new()),
@@ -12664,6 +12743,7 @@ pub(crate) mod tests {
         /// each agent state reported to herdr.
         pub(crate) runs: Mutex<Vec<String>>,
         slot_commands: Mutex<Vec<(String, String)>>,
+        launch_shell_lines: Mutex<Vec<(String, String)>>,
         environments: Mutex<Vec<Vec<String>>>,
         closed: Mutex<Vec<String>>,
         focused: Mutex<Vec<String>>,
@@ -13674,6 +13754,22 @@ pub(crate) mod tests {
                 .push((pane.to_owned(), command_line.to_owned()));
             Ok(4242)
         }
+        fn prepare_launch_shell(
+            &self,
+            pane: &str,
+            command_line: &str,
+            _: Duration,
+        ) -> AdapterResult<()> {
+            assert!(
+                !self.started.load(Ordering::Relaxed),
+                "the launch environment line must precede the harness"
+            );
+            self.launch_shell_lines
+                .lock()
+                .unwrap()
+                .push((pane.to_owned(), command_line.to_owned()));
+            Ok(())
+        }
         fn start_agent(
             &self,
             name: &str,
@@ -13973,6 +14069,110 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("environment variable name"));
         assert!(!fixture.root.join("registry").exists());
         assert!(fixture.client.environments.lock().unwrap().is_empty());
+    }
+
+    fn team_launch_env() -> crate::profiles::LaunchEnv {
+        crate::profiles::LaunchEnv {
+            env_file: Some("/team/it's/env.sh".to_owned()),
+            path_prepend: vec!["/team/bin".to_owned(), "/team/extra".to_owned()],
+        }
+    }
+
+    #[test]
+    fn launch_env_line_precedes_the_harness_and_codex_skips_its_login_shell() {
+        let fixture = Fixture::new();
+        let status = fixture
+            .manager()
+            .with_launch_env(Some(team_launch_env()))
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(status["lifecycle"], "running");
+        let lines = fixture.client.launch_shell_lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].1,
+            " export BASH_ENV='/team/it'\\''s/env.sh' PATH='/team/bin:/team/extra':\"$PATH\""
+        );
+        let (kind, arguments) = fixture.client.launches.lock().unwrap()[&lines[0].0].clone();
+        assert_eq!(kind, "codex");
+        let flag = arguments
+            .windows(2)
+            .position(|pair| pair == ["-c", "allow_login_shell=false"]);
+        assert!(flag.is_some(), "{arguments:?}");
+    }
+
+    #[test]
+    fn launch_env_without_path_prepend_keeps_codex_login_shell_and_absent_types_nothing() {
+        let fixture = Fixture::new();
+        fixture
+            .manager()
+            .with_launch_env(Some(crate::profiles::LaunchEnv {
+                env_file: Some("/team/env.sh".to_owned()),
+                path_prepend: Vec::new(),
+            }))
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let lines = fixture.client.launch_shell_lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].1, " export BASH_ENV='/team/env.sh'");
+        let (_, arguments) = fixture.client.launches.lock().unwrap()[&lines[0].0].clone();
+        assert!(!arguments
+            .iter()
+            .any(|value| value.contains("allow_login_shell")));
+
+        let plain = Fixture::new();
+        plain
+            .manager()
+            .with_launch_env(None)
+            .start(
+                "worker",
+                &plain.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(plain.client.launch_shell_lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn launch_env_is_refused_under_root_slot_isolation() {
+        let fixture = Fixture::new();
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
+        let error = fixture
+            .manager()
+            .with_launch_env(Some(team_launch_env()))
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    slot: Some(SlotLaunch {
+                        slot: "s1".to_owned(),
+                        executable: Some(executable),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("root slot isolation"), "{error}");
+        assert!(fixture.client.launch_shell_lines.lock().unwrap().is_empty());
     }
 
     fn relay_identity() -> CustomProcessIdentity {

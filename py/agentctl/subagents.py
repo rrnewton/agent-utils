@@ -57,6 +57,8 @@ from agentctl.errors import (
 from agentctl.profiles import (
     reasoning_arguments,
     validate_structured_harness_argument_conflicts,
+    LaunchEnv,
+    launch_env_for_registry,
     workspace_for_registry,
     wrkslots_for_registry,
 )
@@ -1959,6 +1961,20 @@ class ManagedAgents:
         # each operation that needs it, so a long-running manager cannot retain
         # a stale placement label.
         self.project_workspace: str | None = None
+        # Tests may set this explicit launch environment override (``None`` reads
+        # ``profiles.json``; use ``False`` for an explicit absence).
+        self.launch_env_override: LaunchEnv | None | bool = None
+
+    def _project_launch_env(self) -> LaunchEnv | None:
+        """The registry's ``launch_env``, refusing one whose file or directories are missing."""
+        if self.launch_env_override is False:
+            return None
+        if isinstance(self.launch_env_override, LaunchEnv):
+            return self.launch_env_override
+        launch_env = launch_env_for_registry(self.registry)
+        if launch_env is not None:
+            launch_env.check_present()
+        return launch_env
 
     def _project_workspace(self) -> str | None:
         return self.project_workspace or workspace_for_registry(self.registry)
@@ -3036,9 +3052,17 @@ class ManagedAgents:
                 structured_resume=resume is not None,
             )
         structured_effort = reasoning_arguments(harness, reasoning_effort)
+        # Load the launch environment before the name is taken, so a missing team
+        # file or directory refuses the start cleanly.
+        launch_env = self._project_launch_env()
+        login_shell: tuple[str, ...] = ()
+        if (harness == "codex" and launch_env is not None
+                and launch_env.codex_needs_non_login_shell()
+                and not any("allow_login_shell" in item for item in harness_args)):
+            login_shell = ("-c", "allow_login_shell=false")
         arguments = harness_arguments(
             harness, model=model, resume=resume,
-            extra=(*structured_effort, *harness_args),
+            extra=(*structured_effort, *harness_args, *login_shell),
         )
         conversation = resume
         if harness == "claude" and resume is None:
@@ -3088,6 +3112,8 @@ class ManagedAgents:
                 )
                 relay_executable = executable
                 slot_command = None
+        if launch_env is not None and relay_command is not None:
+            raise AgentDeliveryError(_LAUNCH_ENV_RELAY_REFUSAL)
         with self._lock(name):
             with self._identity_transaction():
                 if resume is not None:
@@ -3172,6 +3198,9 @@ class ManagedAgents:
     ) -> None:
         """Launch into the record's storage destination and capture independent anchors."""
         name, harness, arguments = record.name, record.harness, tuple(record.arguments)
+        launch_env = self._project_launch_env()
+        if launch_env is not None and relay_command is not None:
+            raise HerdrUnavailable(_LAUNCH_ENV_RELAY_REFUSAL)
         self._create_presentation(
             record, workspace_id, environment, project_workspace
         )
@@ -3179,6 +3208,12 @@ class ManagedAgents:
         if slot_command is not None:
             self.client.enter_slot_sandbox(
                 record.pane_id, slot_command, timeout=startup_timeout
+            )
+        if launch_env is not None:
+            # After the pane's (and any slot box's) interactive shell has run its
+            # startup files, so the prefix stays first for the harness started next.
+            self.client.prepare_launch_shell(
+                record.pane_id, launch_env.shell_line(), timeout=startup_timeout
             )
         if relay_command is not None:
             def persist_relay(identity: CustomProcessIdentity) -> None:
@@ -6163,6 +6198,10 @@ class ManagedAgents:
 SLOT_ISOLATIONS = ("userns", "cgroup", "root")
 #: Harnesses agentctl can drive behind a root slot relay: Herdr has screen rules
 #: for them and agentctl has verified composer models.
+_LAUNCH_ENV_RELAY_REFUSAL = (
+    "profile config launch_env does not apply under root slot isolation; "
+    "use userns or cgroup isolation, or remove launch_env"
+)
 RELAY_HARNESSES = ("claude", "codex")
 #: Both relayed harnesses show this hint only while a turn is running.
 RELAY_WORKING_MARKER = "esc to interrupt"

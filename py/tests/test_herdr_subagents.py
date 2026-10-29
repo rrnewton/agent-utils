@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -16,6 +17,7 @@ from agentctl.client import (
 from agentctl.errors import (
     AgentDeliveryError, AgentPending, HerdrUnavailable, InputExpectationFailed,
 )
+from agentctl.profiles import LaunchEnv, _launch_env
 from agentctl.submission import PromptNotStaged
 from agentctl.subagents import (
     ManagedAgents, _GuardedTerminal, _WorkspaceClient, environment_entries, harness_arguments,
@@ -33,6 +35,7 @@ class FakeManagedClient:
         self.moved_named_panes: dict[str, str] = {}
         self.moves: list[tuple[str, str, str]] = []
         self.environments: list[tuple[str, ...]] = []
+        self.launch_shell_lines: list[tuple[str, str]] = []
         self.closed: list[str] = []
         self.submitted: list[str] = []
         self.panes_calls = 0
@@ -178,6 +181,11 @@ class FakeManagedClient:
             environment=environment,
         )
         return tab, self.presentations[-1].pane_id
+
+    def prepare_launch_shell(self, pane_id: str, command_line: str, *, timeout: float) -> None:
+        assert timeout > 0
+        assert not any(launch[2] == pane_id for launch in self.launched), "line must precede the harness"
+        self.launch_shell_lines.append((pane_id, command_line))
 
     def start_agent(self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float) -> None:
         assert timeout > 0
@@ -382,6 +390,61 @@ def _nested_v2_record(flat: dict[str, object]) -> dict[str, object]:
         "runner_identity": None,
         "extensions": {},
     }
+
+
+def _team_launch_env() -> LaunchEnv:
+    return LaunchEnv("/team/it's/env.sh", ("/team/bin", "/team/extra"))
+
+
+def test_launch_env_line_precedes_the_harness_and_codex_skips_its_login_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.launch_env_override = _team_launch_env()
+    status = manager.start("one", cwd=str(tmp_path), harness="codex")
+    assert status["lifecycle"] == "running"
+    assert fake.launch_shell_lines == [(
+        cast(str, status["pane_id"]),
+        " export BASH_ENV='/team/it'\\''s/env.sh' PATH='/team/bin:/team/extra':\"$PATH\"",
+    )]
+    arguments = fake.launched[0][3]
+    assert ("-c", "allow_login_shell=false") in zip(arguments, arguments[1:])
+
+
+def test_launch_env_without_path_prepend_keeps_codex_login_shell_and_absent_types_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.launch_env_override = LaunchEnv("/team/env.sh", ())
+    manager.start("one", cwd=str(tmp_path), harness="codex")
+    assert [line for _pane, line in fake.launch_shell_lines] == [" export BASH_ENV='/team/env.sh'"]
+    assert not any("allow_login_shell" in item for item in fake.launched[0][3])
+    plain, plain_fake = setup(tmp_path / "plain", monkeypatch)
+    plain.launch_env_override = False
+    (tmp_path / "plain").mkdir()
+    plain.start("one", cwd=str(tmp_path / "plain"), harness="codex")
+    assert plain_fake.launch_shell_lines == []
+
+
+def test_launch_env_parsing_matches_the_rust_edition() -> None:
+    parsed = _launch_env({"env_file": "/team/env.sh", "path_prepend": ["/team/bin", "/team/more"]})
+    assert parsed == LaunchEnv("/team/env.sh", ("/team/bin", "/team/more"))
+    assert parsed.shell_line() == " export BASH_ENV='/team/env.sh' PATH='/team/bin:/team/more':\"$PATH\""
+    assert _launch_env(None) is None
+    for bad, needle in [
+        ("x", "must be an object"),
+        ({}, "must set env_file"),
+        ({"path": ["/a"]}, "unknown key"),
+        ({"env_file": "relative/env.sh"}, "absolute path"),
+        ({"env_file": "/a\nb"}, "absolute path"),
+        ({"path_prepend": "/a"}, "array"),
+        ({"path_prepend": []}, "1-16"),
+        ({"path_prepend": ["/a:/b"]}, "without ':'"),
+        ({"path_prepend": ["bin"]}, "absolute"),
+        ({"path_prepend": ["/a", "/a"]}, "twice"),
+    ]:
+        with pytest.raises(AgentDeliveryError, match=re.escape(needle)):
+            _launch_env(bad)
 
 
 def test_named_workers_share_workspace_but_never_reuse_tabs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

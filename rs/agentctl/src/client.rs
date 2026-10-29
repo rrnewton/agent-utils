@@ -146,6 +146,13 @@ fn process_children_map() -> HashMap<u64, Vec<u64>> {
 /// The pane's own shell PID is the sole foreground process, is a shell, and sits in a
 /// wrkslots slice.
 fn slot_boxed_shell(state: &PaneProcessState) -> bool {
+    shell_alone_in_foreground(state)
+        && fs::read_to_string(format!("/proc/{}/cgroup", state.shell_pid))
+            .is_ok_and(|cgroup| cgroup.contains("wrkslots"))
+}
+
+/// The pane's own shell is its only foreground process: it is back at its prompt.
+fn shell_alone_in_foreground(state: &PaneProcessState) -> bool {
     const SHELLS: [&str; 6] = ["bash", "zsh", "sh", "fish", "dash", "ksh"];
     let only_shell = !state.processes.is_empty()
         && state
@@ -167,10 +174,7 @@ fn slot_boxed_shell(state: &PaneProcessState) -> bool {
             })
             .is_some_and(|name| SHELLS.contains(&name))
     });
-    only_shell
-        && is_shell
-        && fs::read_to_string(format!("/proc/{}/cgroup", state.shell_pid))
-            .is_ok_and(|cgroup| cgroup.contains("wrkslots"))
+    only_shell && is_shell
 }
 
 fn bounded_file(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
@@ -1783,6 +1787,47 @@ impl HerdrClient {
         }
         Err(AdapterError::unavailable(format!(
             "pane {pane_id} did not return to a wrkslots-boxed shell within {}s; inspect the pane for the wrkslots error",
+            timeout.as_secs_f64()
+        )))
+    }
+
+    /// Type the registry's launch-environment line into a pane's interactive shell and wait
+    /// until that shell is alone in the foreground again, so the harness line that follows
+    /// starts from a prompt whose environment already holds it.
+    pub fn prepare_launch_shell(
+        &self,
+        pane_id: &str,
+        command_line: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(AdapterError::unavailable(
+                "launch environment timeout must be between 0 and 300 seconds",
+            ));
+        }
+        self.call_ok(
+            &[
+                "pane".to_owned(),
+                "run".to_owned(),
+                pane_id.to_owned(),
+                command_line.to_owned(),
+            ],
+            &format!("pane run launch environment {pane_id}"),
+        )?;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(state) = self.pane_process_state(pane_id, &|| false) {
+                if shell_alone_in_foreground(&state) {
+                    thread::sleep(Duration::from_millis(300)); // let the shell redraw its prompt
+                    return Ok(());
+                }
+            }
+            thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        Err(AdapterError::unavailable(format!(
+            "pane {pane_id} did not return to its shell prompt within {}s after the launch environment line; inspect the pane",
             timeout.as_secs_f64()
         )))
     }

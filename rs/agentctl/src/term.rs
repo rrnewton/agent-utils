@@ -1135,6 +1135,40 @@ impl crate::subagents::ManagedApi for TmuxBackend {
         "tmux"
     }
 
+    fn prepare_launch_shell(
+        &self,
+        pane: &str,
+        command_line: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(AdapterError::unavailable(
+                "launch environment timeout must be between 0 and 300 seconds",
+            ));
+        }
+        term_err(PaneTerminal::prompt(
+            self,
+            &PaneId::from(pane),
+            command_line,
+        ))?;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok((state, _)) = pane_state_and_processes(self, pane) {
+                if state.foreground == [state.shell_pid] {
+                    std::thread::sleep(Duration::from_millis(300)); // let the shell redraw its prompt
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        Err(AdapterError::unavailable(format!(
+            "tmux pane {pane} did not return to its shell prompt within {}s after the launch environment line",
+            timeout.as_secs_f64()
+        )))
+    }
+
     fn start_adapter(&self, _harness: &str, _relay: bool) -> String {
         "tmux".to_owned()
     }

@@ -495,6 +495,113 @@ def _wrkslots(value: object) -> str | None:
     return value
 
 
+_MAX_PATH_PREPEND = 16
+_MAX_LAUNCH_PATH_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class LaunchEnv:
+    """The registry-wide launch environment (``launch_env`` in ``profiles.json``).
+
+    Every interactive agent this registry starts or revives gets it: before the
+    harness command line, agentctl types one ``export`` line into the pane's
+    shell, after that shell's startup files have run, so ``path_prepend`` stays
+    first on the harness ``PATH`` under Herdr and tmux alike, and ``env_file``
+    becomes ``BASH_ENV``, which every non-interactive ``bash -c`` tool shell
+    sources afresh (editing the file reaches running agents on their next tool
+    call).
+    """
+
+    env_file: str | None
+    path_prepend: tuple[str, ...]
+
+    def shell_line(self) -> str:
+        """The one line typed before the harness; a leading space keeps it out of history."""
+        assignments = []
+        if self.env_file is not None:
+            assignments.append(f"BASH_ENV={_single_quote(self.env_file)}")
+        if self.path_prepend:
+            assignments.append(f'PATH={_single_quote(":".join(self.path_prepend))}:"$PATH"')
+        return " export " + " ".join(assignments)
+
+    def codex_needs_non_login_shell(self) -> bool:
+        """Codex's login-shell snapshot can reorder a PATH prefix; ``allow_login_shell=false`` keeps it."""
+        return bool(self.path_prepend)
+
+    def check_present(self) -> None:
+        """Refuse a launch whose configured file or directories do not exist."""
+        if self.env_file is not None and not os.path.isfile(self.env_file):
+            raise AgentDeliveryError(
+                f"profile config launch_env.env_file is not a readable regular file: {self.env_file}"
+            )
+        for directory in self.path_prepend:
+            if not os.path.isdir(directory):
+                raise AgentDeliveryError(
+                    f"profile config launch_env.path_prepend entry is not a directory: {directory}"
+                )
+
+
+def _single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _launch_path(value: object) -> str | None:
+    if (not isinstance(value, str) or not value
+            or len(value.encode("utf-8")) > _MAX_LAUNCH_PATH_BYTES
+            or not os.path.isabs(value)
+            or any(unicodedata.category(char) == "Cc" for char in value)):
+        return None
+    return value
+
+
+def _launch_env(value: object) -> LaunchEnv | None:
+    """The optional ``launch_env`` key: ``{"env_file": ABS, "path_prepend": [ABS, ...]}``."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise AgentDeliveryError(
+            "profile config launch_env must be an object with env_file and/or path_prepend"
+        )
+    for key in value:
+        if key not in ("env_file", "path_prepend"):
+            raise AgentDeliveryError(
+                f"profile config launch_env has unknown key {json.dumps(key)}; use env_file and/or path_prepend"
+            )
+    env_file = None
+    if value.get("env_file") is not None:
+        env_file = _launch_path(value["env_file"])
+        if env_file is None:
+            raise AgentDeliveryError(
+                "profile config launch_env.env_file must be an absolute path without control characters"
+            )
+    directories: list[str] = []
+    raw_prepend = value.get("path_prepend")
+    if raw_prepend is not None:
+        if not isinstance(raw_prepend, list):
+            raise AgentDeliveryError(
+                "profile config launch_env.path_prepend must be an array of absolute directories"
+            )
+        for entry in raw_prepend:
+            directory = _launch_path(entry)
+            if directory is None or ":" in directory:
+                raise AgentDeliveryError(
+                    "profile config launch_env.path_prepend entries must be absolute directories "
+                    "without ':' or control characters"
+                )
+            if directory in directories:
+                raise AgentDeliveryError(
+                    f"profile config launch_env.path_prepend names {directory} twice"
+                )
+            directories.append(directory)
+        if not directories or len(directories) > _MAX_PATH_PREPEND:
+            raise AgentDeliveryError(
+                f"profile config launch_env.path_prepend must list 1-{_MAX_PATH_PREPEND} directories"
+            )
+    if env_file is None and not directories:
+        raise AgentDeliveryError("profile config launch_env must set env_file and/or path_prepend")
+    return LaunchEnv(env_file, tuple(directories))
+
+
 def load_configuration(
     cwd: str | Path, *, absent_ok: bool = False,
 ) -> tuple[Path, dict[str, LaunchProfile], str | None]:
@@ -535,15 +642,16 @@ def load_configuration(
         raise AgentDeliveryError(f"cannot read profile config {path}: {exc}") from exc
     if (not isinstance(raw, dict)
             or not {"schema", "profiles"}.issubset(raw)
-            or set(raw) - {"schema", "profiles", "workspace", "wrkslots", "term_backend"}):
+            or set(raw) - {"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env"}):
         raise AgentDeliveryError(
-            "profile config must contain schema and profiles, with optional workspace, wrkslots and term_backend"
+            "profile config must contain schema and profiles, with optional workspace, wrkslots, term_backend and launch_env"
         )
     if raw.get("schema") != SCHEMA or not isinstance(raw.get("profiles"), dict):
         raise AgentDeliveryError(f"profile config must use schema {SCHEMA!r} and an object of profiles")
     profiles = {name: _profile(name, value) for name, value in cast(dict[str, object], raw["profiles"]).items()}
     _wrkslots(raw.get("wrkslots"))
     _term_backend(raw.get("term_backend"))
+    _launch_env(raw.get("launch_env"))
     return path, dict(sorted(profiles.items())), _workspace(raw.get("workspace"))
 
 
@@ -603,6 +711,12 @@ def wrkslots_for_registry(registry: str | Path) -> str | None:
     """Read only the configured wrkslots command for a conventional project registry."""
     raw = _registry_policy(registry)
     return None if raw is None else _wrkslots(raw.get("wrkslots"))
+
+
+def launch_env_for_registry(registry: str | Path) -> LaunchEnv | None:
+    """Read only the launch environment for a conventional project registry."""
+    raw = _registry_policy(registry)
+    return None if raw is None else _launch_env(raw.get("launch_env"))
 
 
 def _registry_policy(registry: str | Path) -> dict[str, object] | None:

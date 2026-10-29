@@ -7,20 +7,20 @@ behind `~/bin` by the time a tool command runs. This page records what reaches a
 commands, at launch and mid-session, for the harnesses and terminal hosts used with this suite,
 and gives tested recipes for putting a team's own tool directory first.
 
-Tested on 2026-10-29 with Claude Code 2.1.310, Codex CLI 0.163.0, Herdr 0.8.0, tmux 3.7b and
-bash 5. Harness internals change between releases; re-run [the verification
+Tested on 2026-10-29 with Claude Code 2.1.310, Codex CLI 0.163.0, Muse Code 1.4.15, Herdr 0.8.0,
+tmux 3.7b and bash 5. Harness internals change between releases; re-run [the verification
 recipe](#verify-any-harness) after an upgrade, and for any harness not listed here.
 
 ## Summary
 
-| | Claude Code | Codex | Plain `bash -c` harness |
+| | Claude Code | Codex | Muse |
 |---|---|---|---|
-| How a tool command runs | a fresh `bash -c` that sources a shell snapshot taken at start | a fresh `bash -c` that gets its environment from a **login**-shell snapshot taken at start | a fresh `bash -c` |
+| How a tool command runs | a fresh `bash -c` that sources a shell snapshot taken at start | a fresh `bash -c` that gets its environment from a **login**-shell snapshot taken at start | a fresh `bash -c` with the harness's own environment |
 | `PATH` exported before launch reaches tool commands | yes: the snapshot writes the launch `PATH` back verbatim | **no**: the login snapshot runs `~/.bash_profile`, which can put other directories first | yes |
 | `export` in one tool call is seen by the next | no | no | no |
 | `BASH_ENV=<file>` exported at launch | sourced before every command, so edits apply on the next call | same | same |
-| Harness-specific per-command env file | `CLAUDE_ENV_FILE` and hook-written env files (cached, see below) | its own snapshot file (undocumented) | none |
-| Change `PATH` of an agent that is already running | yes, through hooks in project settings (needs one `cd`) | only by editing its snapshot file (undocumented) | no |
+| Harness-specific per-command env file | `CLAUDE_ENV_FILE` and hook-written env files (cached, see below) | its own snapshot file (undocumented) | none found |
+| Change `PATH` of an agent that is already running | yes, through hooks in project settings (needs one `cd`) | only by editing its snapshot file (undocumented) | no; relaunch it with resume |
 
 Any of them, launched with `BASH_ENV` (or another per-command file that sources a team file), picks
 up an edit of that team file on its next tool call. The last row is about agents that were started
@@ -96,12 +96,25 @@ up. A running Codex sources its own snapshot file before every command. Appendin
 the team file apply too. Codex still puts its own bundled-tools directory first. The snapshot file
 is internal and undocumented: treat editing it as a last resort, and prefer relaunching.
 
-### Plain `bash -c` harnesses
+### Muse
 
-A harness that runs each command as a non-interactive `bash -c` with its own environment keeps a
-`PATH` exported before launch, and forgets an `export` made inside a command. Bash sources
-`$BASH_ENV` at the start of every non-interactive shell, which makes it the portable per-command
-env file.
+Each shell tool call runs a fresh non-interactive `bash -c` whose environment is the Muse
+process's own; no snapshot or login shell is involved. So:
+
+- A `PATH` exported before launch reaches every tool command unchanged.
+- `export` inside a tool call lasts only for that call.
+- `BASH_ENV` exported at launch is sourced before every command; edits apply on the next call.
+- No per-command env file or hook that changes the environment of later calls was found, and the
+  environment of a running Muse cannot be changed from outside. To give a running agent a new
+  `PATH`, relaunch it with resume (`muse resume <session>`, or `agentctl revive`) with the right
+  launch environment.
+
+### Other `bash -c` harnesses
+
+Any harness that runs each command as a non-interactive `bash -c` with its own environment
+behaves like Muse: it keeps a `PATH` exported before launch and forgets an `export` made inside a
+command. Bash sources `$BASH_ENV` at the start of every non-interactive shell, which makes it the
+portable per-command env file.
 
 ### Shell startup files: the usual trap
 
@@ -140,11 +153,33 @@ env BASH_ENV="$TEAM_ENV" PATH="$TEAM_BIN:$PATH" codex -c allow_login_shell=false
 ```
 
 `BASH_ENV` makes `TEAM_ENV` the source of truth for the whole session: edit it, and the next tool
-call of every agent launched this way sees the change. This was tested with Claude Code, Codex and a
-plain `bash -c` harness. In Codex, `BASH_ENV` runs after the login profile, so the prefix wins even
+call of every agent launched this way sees the change. This was tested with Claude Code, Codex and
+Muse. In Codex, `BASH_ENV` runs after the login profile, so the prefix wins even
 without `allow_login_shell=false`; the flag keeps the launch `PATH` order intact as well. For
 Claude Code, a `CLAUDE_ENV_FILE` that holds only the line `. "$TEAM_ENV"` is an alternative (see
 below).
+
+### agentctl: one launch environment for a whole registry
+
+`agentctl` does the above for every interactive agent a registry starts or revives when its
+`.agentctl/profiles.json` has a top-level `launch_env`:
+
+```json
+{
+  "schema": "agentctl-profiles/v1",
+  "launch_env": {"env_file": "/path/to/team-env.sh", "path_prepend": ["/path/to/team/bin"]},
+  "profiles": {}
+}
+```
+
+Before the harness starts, `agentctl` types
+`export BASH_ENV='<env_file>' PATH='<dirs>':"$PATH"` into the new pane's shell (inside the slot
+box, for `--slot`), after that shell's startup files have run. The prefix therefore survives
+`~/.bashrc` on Herdr and tmux alike, and `BASH_ENV` keeps later edits of the team file live. With
+`path_prepend`, Codex also gets `-c allow_login_shell=false`. A start refuses when the file or a
+directory is missing, and under root slot isolation. Tested end to end: on Herdr with Claude Code,
+Codex and Muse, the team directories came first in each agent's tool calls. On tmux, with Claude
+Code, they came first as well, and an edit of the env file applied on the agent's next call.
 
 ### Make later changes apply without a restart (Claude Code)
 

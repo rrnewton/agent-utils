@@ -1002,6 +1002,34 @@ class HerdrClient:
             "inspect the pane for the wrkslots error"
         )
 
+    def prepare_launch_shell(self, pane_id: str, command_line: str, *, timeout: float = 30.0) -> None:
+        """Type the registry's launch-environment line into a pane's interactive shell.
+
+        Waits until that shell is alone in the foreground again, so the harness line
+        that follows starts from a prompt whose environment already holds it.
+        """
+        if not 0 < timeout <= 300:
+            raise ValueError("launch environment timeout must be between 0 and 300 seconds")
+        self._call_ok(["pane", "run", pane_id, command_line], f"pane run launch environment {pane_id}")
+        deadline = time.monotonic() + timeout
+        shells = {"bash", "zsh", "sh", "fish", "dash", "ksh"}
+        while time.monotonic() < deadline:
+            try:
+                info = self.process_info(pane_id)
+            except HerdrUnavailable:
+                self._sleep(0.05)
+                continue
+            pids = {entry[0] for entry in info.foreground}
+            names = {os.path.basename(entry[3]).lstrip("-") for entry in info.foreground}
+            if pids == {info.shell_pid} and names & shells:
+                self._sleep(0.3)  # let the shell redraw its prompt
+                return
+            self._sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        raise HerdrUnavailable(
+            f"pane {pane_id} did not return to its shell prompt within {timeout:g}s after the "
+            "launch environment line; inspect the pane"
+        )
+
     def start_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
         *, timeout: float = 30.0,

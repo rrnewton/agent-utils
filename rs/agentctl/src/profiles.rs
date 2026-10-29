@@ -87,6 +87,8 @@ struct Document {
     wrkslots: Option<Value>,
     #[serde(default)]
     term_backend: Option<Value>,
+    #[serde(default)]
+    launch_env: Option<Value>,
     profiles: UniqueMap<RawProfile>,
 }
 
@@ -1061,6 +1063,7 @@ pub(crate) fn load_configuration(
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     wrkslots_value(document.wrkslots.as_ref())?;
     backend_value(document.term_backend.as_ref())?;
+    launch_env_value(document.launch_env.as_ref())?;
     Ok((path, profiles, workspace))
 }
 
@@ -1195,6 +1198,158 @@ pub(crate) fn wrkslots_for_registry(registry: &Path) -> Result<Option<String>, A
     }
 }
 
+/// Most directories `launch_env.path_prepend` may name.
+const MAX_PATH_PREPEND: usize = 16;
+/// Longest path `launch_env` accepts, in bytes.
+const MAX_LAUNCH_PATH_BYTES: usize = 4096;
+
+/// The registry-wide launch environment (`launch_env` in `profiles.json`).
+///
+/// Every interactive agent this registry starts or revives gets it: before the harness command
+/// line, agentctl types one `export` line into the pane's shell, after that shell's startup
+/// files have run, so `path_prepend` stays first on the harness `PATH` under Herdr and tmux
+/// alike, and `env_file` becomes `BASH_ENV`, which every non-interactive `bash -c` tool shell
+/// sources afresh (editing the file reaches running agents on their next tool call).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LaunchEnv {
+    /// Absolute path exported as `BASH_ENV`.
+    pub(crate) env_file: Option<String>,
+    /// Absolute directories prepended, in order, to the harness `PATH`.
+    pub(crate) path_prepend: Vec<String>,
+}
+
+impl LaunchEnv {
+    /// The one shell line agentctl types before the harness: a leading space keeps it out of a
+    /// `HISTCONTROL=ignorespace` history, values are single-quoted, and `"$PATH"` is expanded
+    /// by the pane's own shell.
+    pub(crate) fn shell_line(&self) -> String {
+        let mut assignments = Vec::new();
+        if let Some(file) = &self.env_file {
+            assignments.push(format!("BASH_ENV={}", single_quote(file)));
+        }
+        if !self.path_prepend.is_empty() {
+            assignments.push(format!(
+                "PATH={}:\"$PATH\"",
+                single_quote(&self.path_prepend.join(":"))
+            ));
+        }
+        format!(" export {}", assignments.join(" "))
+    }
+
+    /// Codex runs tool commands through a login-shell snapshot whose startup files can put
+    /// other directories ahead of a `PATH` prefix; `allow_login_shell=false` keeps the order.
+    pub(crate) fn codex_needs_non_login_shell(&self) -> bool {
+        !self.path_prepend.is_empty()
+    }
+
+    /// Refuse a launch whose configured file or directories do not exist, rather than start
+    /// an agent that silently runs the global tools.
+    pub(crate) fn check_present(&self) -> Result<(), AgentError> {
+        if let Some(file) = &self.env_file {
+            if !fs::metadata(file).is_ok_and(|metadata| metadata.is_file()) {
+                return Err(fail(format!(
+                    "profile config launch_env.env_file is not a readable regular file: {file}"
+                )));
+            }
+        }
+        for directory in &self.path_prepend {
+            if !fs::metadata(directory).is_ok_and(|metadata| metadata.is_dir()) {
+                return Err(fail(format!(
+                    "profile config launch_env.path_prepend entry is not a directory: {directory}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn launch_path(value: &Value) -> Option<String> {
+    let text = value.as_str()?;
+    (!text.is_empty()
+        && text.len() <= MAX_LAUNCH_PATH_BYTES
+        && Path::new(text).is_absolute()
+        && !text.chars().any(char::is_control))
+    .then(|| text.to_owned())
+}
+
+/// The optional `launch_env` key: `{"env_file": ABS, "path_prepend": [ABS, ...]}`, at least one.
+fn launch_env_value(value: Option<&Value>) -> Result<Option<LaunchEnv>, AgentError> {
+    let object = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(object)) => object,
+        Some(_) => {
+            return Err(fail(
+                "profile config launch_env must be an object with env_file and/or path_prepend",
+            ))
+        }
+    };
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "env_file" | "path_prepend"))
+    {
+        return Err(fail(format!(
+            "profile config launch_env has unknown key {key:?}; use env_file and/or path_prepend"
+        )));
+    }
+    let env_file = match object.get("env_file") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(launch_path(value).ok_or_else(|| {
+            fail("profile config launch_env.env_file must be an absolute path without control characters")
+        })?),
+    };
+    let path_prepend = match object.get("path_prepend") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(entries)) => {
+            let mut directories: Vec<String> = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let directory = launch_path(entry)
+                    .filter(|directory| !directory.contains(':'))
+                    .ok_or_else(|| {
+                        fail("profile config launch_env.path_prepend entries must be absolute directories without ':' or control characters")
+                    })?;
+                if directories.contains(&directory) {
+                    return Err(fail(format!(
+                        "profile config launch_env.path_prepend names {directory} twice"
+                    )));
+                }
+                directories.push(directory);
+            }
+            if directories.is_empty() || directories.len() > MAX_PATH_PREPEND {
+                return Err(fail(format!(
+                    "profile config launch_env.path_prepend must list 1-{MAX_PATH_PREPEND} directories"
+                )));
+            }
+            directories
+        }
+        Some(_) => {
+            return Err(fail(
+                "profile config launch_env.path_prepend must be an array of absolute directories",
+            ))
+        }
+    };
+    if env_file.is_none() && path_prepend.is_empty() {
+        return Err(fail(
+            "profile config launch_env must set env_file and/or path_prepend",
+        ));
+    }
+    Ok(Some(LaunchEnv {
+        env_file,
+        path_prepend,
+    }))
+}
+
+/// Read only the launch environment for a conventional project registry.
+pub(crate) fn launch_env_for_registry(registry: &Path) -> Result<Option<LaunchEnv>, AgentError> {
+    match registry_policy(registry)? {
+        Some(object) => launch_env_value(object.get("launch_env")),
+        None => Ok(None),
+    }
+}
+
 /// The raw project configuration object beside a conventional registry, if any.
 fn registry_policy(registry: &Path) -> Result<Option<BTreeMap<String, Value>>, AgentError> {
     if registry.file_name().and_then(|name| name.to_str()) != Some(".agentctl") {
@@ -1310,6 +1465,76 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn launch_env_accepts_files_and_directories_and_refuses_mistakes() {
+        use serde_json::json;
+        let parsed = launch_env_value(Some(&json!({
+            "env_file": "/team/env.sh",
+            "path_prepend": ["/team/bin", "/team/more"]
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.env_file.as_deref(), Some("/team/env.sh"));
+        assert_eq!(parsed.path_prepend, ["/team/bin", "/team/more"]);
+        assert!(parsed.codex_needs_non_login_shell());
+        assert_eq!(
+            parsed.shell_line(),
+            " export BASH_ENV='/team/env.sh' PATH='/team/bin:/team/more':\"$PATH\""
+        );
+        let only_file = launch_env_value(Some(&json!({"env_file": "/team/env.sh"})))
+            .unwrap()
+            .unwrap();
+        assert!(!only_file.codex_needs_non_login_shell());
+        assert_eq!(launch_env_value(None).unwrap(), None);
+        assert_eq!(launch_env_value(Some(&Value::Null)).unwrap(), None);
+        for (bad, needle) in [
+            (json!("x"), "must be an object"),
+            (json!({}), "must set env_file"),
+            (json!({"path": ["/a"]}), "unknown key"),
+            (json!({"env_file": "relative/env.sh"}), "absolute path"),
+            (json!({"env_file": "/a\nb"}), "absolute path"),
+            (json!({"path_prepend": "/a"}), "array"),
+            (json!({"path_prepend": []}), "1-16"),
+            (json!({"path_prepend": ["/a:/b"]}), "without ':'"),
+            (json!({"path_prepend": ["bin"]}), "absolute"),
+            (json!({"path_prepend": ["/a", "/a"]}), "twice"),
+        ] {
+            let error = launch_env_value(Some(&bad)).unwrap_err().to_string();
+            assert!(error.contains(needle), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn launch_env_presence_check_names_the_missing_path() {
+        let root = std::env::temp_dir().join(format!("agentctl-launch-env-{}", std::process::id()));
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("env.sh"), "export X=1\n").unwrap();
+        let good = LaunchEnv {
+            env_file: Some(root.join("env.sh").display().to_string()),
+            path_prepend: vec![root.join("bin").display().to_string()],
+        };
+        good.check_present().unwrap();
+        let missing = LaunchEnv {
+            env_file: Some(root.join("absent.sh").display().to_string()),
+            path_prepend: Vec::new(),
+        };
+        assert!(missing
+            .check_present()
+            .unwrap_err()
+            .to_string()
+            .contains("absent.sh"));
+        let not_dir = LaunchEnv {
+            env_file: None,
+            path_prepend: vec![root.join("env.sh").display().to_string()],
+        };
+        assert!(not_dir
+            .check_present()
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory"));
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn profile_resume_rejects_duplicate_native_subcommands_but_preserves_raw_only_policy() {

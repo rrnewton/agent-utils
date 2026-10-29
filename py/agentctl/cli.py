@@ -115,7 +115,10 @@ def parser() -> argparse.ArgumentParser:
         help="literal interactive harness argument; repeat and use = for flags")
     start.add_argument("--env", action="append", default=[], type=_environment_entry,
         metavar="KEY=VALUE",
-        help="interactive Herdr only: set a literal variable in the created tab; repeat; values are not shown by status")
+        help="interactive Herdr only: set a literal variable in the created tab; repeat; values are not shown by status. "
+             "A PATH set here is reordered by the pane shell's startup files; give a team tool directory with the "
+             "top-level launch_env key of profiles.json instead, which every interactive start and revive types into "
+             "the pane after those files have run")
     start.add_argument("--workspace-id", metavar="ID",
         help="interactive only: exact Herdr workspace; default: configured project workspace, else HERDR_WORKSPACE_ID, else shared subagents; an explicit ID must match configured policy")
     first = start.add_mutually_exclusive_group()
