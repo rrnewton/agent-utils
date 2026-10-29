@@ -349,17 +349,62 @@ fn handoff_read_reason(
     }
 }
 
-/// Allocated bytes (st_blocks * 512) of every cache directory the
-/// configured globs name inside one record's checkouts, with the
-/// fail-closed cache errors audit reports.
-fn cache_accounting(cfg: &Cfg, config: &Value, record: &Value) -> (Option<i64>, Option<String>) {
+/// One invocation's cache-census request, mirroring the Python
+/// audit options.
+#[derive(Default)]
+pub struct CensusRequest {
+    pub state: Option<String>,
+    pub work_limit: i64,
+    pub wall_seconds: f64,
+}
+
+type CensusSubject = (Vec<(PathBuf, PathBuf, u64)>, Option<String>, bool);
+
+#[derive(Clone)]
+struct CacheMeasurement {
+    bytes: Option<i64>,
+    status: &'static str,
+    error: Option<String>,
+}
+
+impl CacheMeasurement {
+    fn complete(bytes: i64) -> Self {
+        Self {
+            bytes: Some(bytes),
+            status: "complete",
+            error: None,
+        }
+    }
+    fn partial() -> Self {
+        Self {
+            bytes: None,
+            status: "partial",
+            error: None,
+        }
+    }
+    fn error(message: String) -> Self {
+        Self {
+            bytes: None,
+            status: "error",
+            error: Some(message),
+        }
+    }
+}
+
+/// Every cache directory the configured globs name inside one
+/// record's checkouts: (root, checkout, checkout device).
+fn cache_roots(
+    cfg: &Cfg,
+    config: &Value,
+    record: &Value,
+) -> (Vec<(PathBuf, PathBuf, u64)>, Option<String>) {
     use std::os::unix::fs::MetadataExt as _;
     let checkouts = record
         .get("checkouts")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut total: i64 = 0;
+    let mut roots: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
     for checkout in &checkouts {
         let name = checkout
             .get("name")
@@ -375,7 +420,7 @@ fn cache_accounting(cfg: &Cfg, config: &Value, record: &Value) -> (Option<i64>, 
             .unwrap_or_default();
         let checkout_path = match stored_path(cfg, raw_path, "checkout path") {
             Ok(path) => path,
-            Err(error) => return (None, Some(error)),
+            Err(error) => return (Vec::new(), Some(error)),
         };
         if !checkout_path.is_dir() {
             continue;
@@ -392,7 +437,35 @@ fn cache_accounting(cfg: &Cfg, config: &Value, record: &Value) -> (Option<i64>, 
                 let Ok(kind) = entry.file_type() else {
                     continue;
                 };
-                if kind.is_symlink() || !kind.is_dir() {
+                if kind.is_symlink() {
+                    // A symlinked cache candidate refuses the
+                    // subject, like the oracle's planning.
+                    if entry.path().is_dir() {
+                        let relative = entry
+                            .path()
+                            .strip_prefix(&checkout_path)
+                            .unwrap_or(&entry.path())
+                            .to_path_buf();
+                        let parts: Vec<String> = relative
+                            .components()
+                            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                            .collect();
+                        if patterns
+                            .iter()
+                            .any(|pattern| glob_parts_match(pattern, &parts))
+                        {
+                            return (
+                                Vec::new(),
+                                Some(format!(
+                                    "cache path crosses a symlink: {}",
+                                    entry.path().display()
+                                )),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                if !kind.is_dir() {
                     continue;
                 }
                 if directory == checkout_path && entry.file_name() == ".git" {
@@ -417,43 +490,698 @@ fn cache_accounting(cfg: &Cfg, config: &Value, record: &Value) -> (Option<i64>, 
             {
                 continue;
             }
-            match allocated_bytes(candidate, checkout_device) {
-                Ok(bytes) => total += bytes,
-                Err(error) => return (None, Some(error)),
+            roots.push((candidate.clone(), checkout_path.clone(), checkout_device));
+        }
+    }
+    // Overlapping globs must not count one directory twice: a
+    // candidate inside an already-selected candidate is dropped.
+    roots.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut deduped: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    for root in roots {
+        if deduped
+            .iter()
+            .any(|(selected, _, _)| root.0 != *selected && root.0.starts_with(selected))
+        {
+            continue;
+        }
+        deduped.push(root);
+    }
+    (deduped, None)
+}
+
+/// Mount identity of one path from /proc/self/mountinfo: the id of
+/// the longest mount point covering it.
+fn mount_id_of(path: &Path, mounts: &[(i64, PathBuf)]) -> Option<i64> {
+    let mut best: Option<(usize, i64)> = None;
+    for (id, point) in mounts {
+        if path.starts_with(point) {
+            let depth = point.components().count();
+            if best.is_none_or(|(current, _)| depth >= current) {
+                best = Some((depth, *id));
             }
         }
     }
-    (Some(total), None)
+    best.map(|(_, id)| id)
 }
 
-fn allocated_bytes(path: &Path, device: u64) -> Result<i64> {
+fn census_mounts() -> Result<Vec<(i64, PathBuf)>> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("cannot read /proc/self/mountinfo: {error}"))?;
+    let mut mounts = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let Ok(id) = fields[0].parse::<i64>() else {
+            continue;
+        };
+        mounts.push((id, PathBuf::from(audit_unescape_mount(fields[4]))));
+    }
+    Ok(mounts)
+}
+
+type CacheIdentity = (u64, u64, i64, i64);
+
+/// One bounded walk over a cache root: allocated bytes plus the
+/// identity of every directory and entry seen. Work is debited
+/// per directory opened and per entry from the shared invocation
+/// budget; budget exhaustion leaves the root partial, while wall
+/// expiry is the oracle's traversal-timeout error.
+fn walk_cache_root(
+    root: &Path,
+    device: u64,
+    mounts: &[(i64, PathBuf)],
+    budget: &mut i64,
+    deadline: std::time::Instant,
+    validation_complete: bool,
+) -> std::result::Result<(i64, BTreeMap<PathBuf, CacheIdentity>), CacheMeasurement> {
     use std::os::unix::fs::MetadataExt as _;
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect cache entry {}: {error}", path.display()))?;
-    if meta.dev() != device {
-        return Err(format!(
-            "cache path crossed onto another filesystem: {}",
-            path.display()
+    let timeout = || {
+        CacheMeasurement::error(
+            "cache census traversal exhausted the fixed wall allowance".to_string(),
+        )
+    };
+    let root_mount = mount_id_of(root, mounts);
+    let mut total: i64 = 0;
+    let mut seen: BTreeMap<PathBuf, CacheIdentity> = BTreeMap::new();
+    let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if std::time::Instant::now() >= deadline {
+            return Err(timeout());
+        }
+        if *budget <= 0 {
+            return Err(CacheMeasurement::partial());
+        }
+        *budget -= 1;
+        let meta = std::fs::symlink_metadata(&directory).map_err(|error| {
+            CacheMeasurement::error(format!(
+                "cannot inspect cache entry {}: {error}",
+                directory.display()
+            ))
+        })?;
+        if meta.dev() != device {
+            return Err(CacheMeasurement::error(format!(
+                "cache path crossed onto another filesystem: {}",
+                directory.display()
+            )));
+        }
+        if mount_id_of(&directory, mounts) != root_mount {
+            return Err(CacheMeasurement::error(format!(
+                "cache path crossed a mount point: {}",
+                directory.display()
+            )));
+        }
+        total += (meta.blocks() * 512) as i64;
+        seen.insert(
+            directory.clone(),
+            (
+                meta.dev(),
+                meta.ino(),
+                meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+            ),
+        );
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            CacheMeasurement::error(format!(
+                "cannot inspect cache entry {}: {error}",
+                directory.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                CacheMeasurement::error(format!("cannot inspect cache entry: {error}"))
+            })?;
+            if std::time::Instant::now() >= deadline {
+                return Err(timeout());
+            }
+            if *budget <= 0 {
+                return Err(CacheMeasurement::partial());
+            }
+            *budget -= 1;
+            let path = entry.path();
+            if entry.file_name() == ".git" && !validation_complete {
+                return Err(CacheMeasurement::error(format!(
+                    "cache directory contains nested Git metadata: {}",
+                    path.display()
+                )));
+            }
+            let child = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(CacheMeasurement::error(format!(
+                        "cannot inspect cache entry {}: {error}",
+                        path.display()
+                    )))
+                }
+            };
+            if child.dev() != device {
+                return Err(CacheMeasurement::error(format!(
+                    "cache path crossed onto another filesystem: {}",
+                    path.display()
+                )));
+            }
+            seen.insert(
+                path.clone(),
+                (
+                    child.dev(),
+                    child.ino(),
+                    child.mtime() * 1_000_000_000 + child.mtime_nsec(),
+                    child.ctime() * 1_000_000_000 + child.ctime_nsec(),
+                ),
+            );
+            let kind = entry.file_type().map_err(|error| {
+                CacheMeasurement::error(format!(
+                    "cannot inspect cache entry {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if kind.is_dir() && !kind.is_symlink() {
+                pending.push(path);
+            } else {
+                total += (child.blocks() * 512) as i64;
+            }
+        }
+    }
+    Ok((total, seen))
+}
+
+/// One cache root's bounded census: measure, re-verify the same
+/// identities and bytes, then re-stat every recorded identity
+/// before a total may publish as complete.
+fn traverse_cache_root(
+    root: &Path,
+    device: u64,
+    mounts: &[(i64, PathBuf)],
+    budget: &mut i64,
+    deadline: std::time::Instant,
+    validation_complete: bool,
+) -> CacheMeasurement {
+    use std::os::unix::fs::MetadataExt as _;
+    let (measured, seen) =
+        match walk_cache_root(root, device, mounts, budget, deadline, validation_complete) {
+            Ok(result) => result,
+            Err(measurement) => return measurement,
+        };
+    let (verified, seen_again) =
+        match walk_cache_root(root, device, mounts, budget, deadline, validation_complete) {
+            Ok(result) => result,
+            Err(measurement) => return measurement,
+        };
+    if verified != measured || seen_again != seen {
+        let changed = seen
+            .iter()
+            .find(|(path, identity)| seen_again.get(*path) != Some(*identity))
+            .map(|(path, _)| path.clone())
+            .unwrap_or_else(|| root.to_path_buf());
+        return CacheMeasurement::error(format!(
+            "cache census directory changed before final publication: {}",
+            changed.display()
         ));
     }
-    let mut total = (meta.blocks() * 512) as i64;
-    if !meta.is_dir() {
-        return Ok(total);
+    for (path, identity) in &seen {
+        if std::time::Instant::now() >= deadline {
+            return CacheMeasurement::error(
+                "cache census traversal exhausted the fixed wall allowance".to_string(),
+            );
+        }
+        if *budget <= 0 {
+            return CacheMeasurement::partial();
+        }
+        *budget -= 1;
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                let actual = (
+                    meta.dev(),
+                    meta.ino(),
+                    meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                    meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                );
+                if actual != *identity {
+                    return CacheMeasurement::error(format!(
+                        "cache census directory changed before final publication: {}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return CacheMeasurement::error(format!(
+                    "cache census directory changed before final publication: {}",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                return CacheMeasurement::error(format!(
+                    "cannot inspect cache entry {}: {error}",
+                    path.display()
+                ))
+            }
+        }
     }
-    let entries = std::fs::read_dir(path)
-        .map_err(|error| format!("cannot inspect cache entry {}: {error}", path.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("cannot inspect cache entry: {error}"))?;
-        if entry.file_name() == ".git" {
+    CacheMeasurement::complete(measured)
+}
+
+/// Whether `path` equals or lies inside `root` (lexically).
+fn path_within(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+/// Resolve the census state path like `_audit_cache_state_path`.
+/// Explicit-path violations are whole-audit refusals; default-home
+/// failures only make the accounting unavailable.
+fn census_state_path(cfg: &Cfg, explicit: Option<&str>) -> Result<PathBuf> {
+    if let Some(raw) = explicit {
+        let candidate = PathBuf::from(raw);
+        let normalized = PathBuf::from(normalize_absolute(&candidate));
+        if !candidate.is_absolute()
+            || candidate
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+            || normalized != candidate
+        {
+            return Err(
+                "--cache-census-state must be a canonical absolute path without '..'".to_string(),
+            );
+        }
+        if path_within(&candidate, &cfg.root) {
+            return Err(
+                "audit cache census state must be outside the managed project tree".to_string(),
+            );
+        }
+        let parent = candidate.parent().unwrap_or(Path::new("/"));
+        let resolved = std::fs::canonicalize(parent).map_err(|error| {
+            format!(
+                "audit cache census state parent must already exist: {}: {error}",
+                parent.display()
+            )
+        })?;
+        if resolved != parent || path_within(&resolved, &cfg.root) {
+            return Err(
+                "audit cache census state parent must be symlink-free and outside the managed project tree".to_string(),
+            );
+        }
+        return Ok(candidate);
+    }
+    Err("default census state path is resolved by the census driver".to_string())
+}
+
+fn normalize_absolute(path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::RootDir => {}
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// The default project-keyed state path below XDG_CACHE_HOME or
+/// ~/.cache, creating the symlink-free directory chain.
+fn default_census_state_path(cfg: &Cfg) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let cache_home = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(value) => {
+            let raw = PathBuf::from(value);
+            if let Ok(rest) = raw.strip_prefix("~") {
+                home.join(rest)
+            } else {
+                raw
+            }
+        }
+        _ => home.join(".cache"),
+    };
+    if !cache_home.is_absolute() {
+        return Err("XDG_CACHE_HOME must be absolute for audit cache state".to_string());
+    }
+    // Every existing component of the cache home itself must be a
+    // real directory, like the oracle's nofollow chain.
+    {
+        let mut prefix = PathBuf::from("/");
+        for part in cache_home.components() {
+            prefix.push(part);
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        return Err(format!(
+                            "audit cache home is unavailable: {}: not a symlink-free directory",
+                            cache_home.display()
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(format!(
+                        "audit cache home is unavailable: {}: {error}",
+                        cache_home.display()
+                    ))
+                }
+            }
+        }
+    }
+    if path_within(&cache_home, &cfg.root) {
+        return Err("audit cache home must be outside the managed project tree".to_string());
+    }
+    let mut parent = cache_home.clone();
+    for component in ["wrkslots", "audit-cache"] {
+        parent.push(component);
+        match std::fs::create_dir(&parent) {
+            Ok(()) => {
+                let _ = std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "audit cache home is unavailable: {}: {error}",
+                    cache_home.display()
+                ))
+            }
+        }
+        let meta = std::fs::symlink_metadata(&parent)
+            .map_err(|error| format!("cannot prepare audit cache state directory: {error}"))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(format!(
-                "cache {} contains nested Git repository at {}; nested-repository judging stays with the Python edition for now",
-                path.display(),
-                entry.path().display()
+                "audit cache home is unavailable: {}: not a symlink-free directory",
+                cache_home.display()
             ));
         }
-        total += allocated_bytes(&entry.path(), device)?;
     }
-    Ok(total)
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(cfg.root.to_string_lossy().as_bytes());
+    let project: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(parent.join(format!("{project}.json")))
+}
+
+/// Read or create the 32-byte owner-bound census key beside the
+/// state file, publishing it without replacing a concurrent key.
+fn establish_census_key(state_path: &Path) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    let parent = state_path.parent().unwrap_or(Path::new("/"));
+    let key_path = parent.join(format!(
+        "{}.key",
+        state_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let euid = std::fs::metadata("/proc/self")
+        .map(|meta| meta.uid())
+        .unwrap_or(0);
+    let read_key = |path: &Path| -> Result<Vec<u8>> {
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot read census key {}: {error}", path.display()))?;
+        if !meta.is_file()
+            || meta.file_type().is_symlink()
+            || meta.uid() != euid
+            || meta.nlink() != 1
+            || meta.permissions().mode() & 0o7777 != 0o600
+            || meta.len() != 32
+        {
+            return Err(
+                "audit cache census key must be one owner-bound 0600 regular file of exactly 32 bytes"
+                    .to_string(),
+            );
+        }
+        let contents = std::fs::read(path)
+            .map_err(|error| format!("cannot read census key {}: {error}", path.display()))?;
+        if contents.len() != 32 {
+            return Err("audit cache census key must contain exactly 32 bytes".to_string());
+        }
+        Ok(contents)
+    };
+    if key_path.exists() {
+        return read_key(&key_path);
+    }
+    // A per-process candidate plus a no-replace hard-link publish
+    // gives the same single-winner key without a shared lock file.
+    let candidate = parent.join(format!(
+        ".{}.key.pending-{}",
+        state_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(&candidate)
+        .map_err(|error| format!("cannot create census key candidate: {error}"))?;
+    // A pre-existing candidate is validated before it is truncated.
+    {
+        let meta = file
+            .metadata()
+            .map_err(|error| format!("cannot read census key candidate: {error}"))?;
+        if !meta.is_file()
+            || meta.uid() != euid
+            || meta.nlink() != 1
+            || meta.permissions().mode() & 0o7777 != 0o600
+            || meta.len() > 32
+        {
+            return Err(
+                "audit cache census key candidate must be one owner-bound 0600 regular file of at most 32 bytes"
+                    .to_string(),
+            );
+        }
+    }
+    if key_path.exists() {
+        let _ = std::fs::remove_file(&candidate);
+        return read_key(&key_path);
+    }
+    file.set_len(0)
+        .map_err(|error| format!("cannot create census key candidate: {error}"))?;
+    let mut generated = vec![0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| std::io::Read::read_exact(&mut source, &mut generated))
+        .map_err(|error| format!("cannot generate census key: {error}"))?;
+    file.write_all(&generated)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("cannot create census key candidate: {error}"))?;
+    match std::fs::hard_link(&candidate, &key_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("cannot publish census key: {error}")),
+    }
+    let _ = std::fs::remove_file(&candidate);
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    read_key(&key_path)
+}
+
+/// Run the bounded census over every registered subject. State
+/// establishment follows the oracle (an unavailable store makes
+/// accounting unavailable, never invented); traversal restarts
+/// each invocation rather than resuming persisted progress, so
+/// measurements for stable caches match while resume-state reuse
+/// stays with the Python edition.
+fn cache_state_mac(key: &[u8], payload: &Value) -> String {
+    use sha2::Digest as _;
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&sha2::Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let text = serde_json::to_string(payload).unwrap_or_default();
+    let inner: Vec<u8> = block
+        .iter()
+        .map(|byte| byte ^ 0x36)
+        .chain(text.bytes())
+        .collect();
+    let inner_hash = sha2::Sha256::digest(&inner);
+    let outer: Vec<u8> = block
+        .iter()
+        .map(|byte| byte ^ 0x5c)
+        .chain(inner_hash.iter().copied())
+        .collect();
+    sha2::Sha256::digest(&outer)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Persist the census state envelope (fresh roots; resuming
+/// persisted progress stays with the Python edition) and report
+/// failure exactly as the oracle's census does.
+fn write_census_state(state_path: &Path, key: &[u8], registry_revision: &str) -> Result<()> {
+    use std::io::Write as _;
+    let stored = json!({
+        "schema": "wrkslots-audit-cache-census/v6",
+        "registry_revision": registry_revision,
+        "roots": {},
+        "next_subject": Value::Null,
+    });
+    let mut envelope = stored.clone();
+    envelope.as_object_mut().expect("state object").insert(
+        "hmac_sha256".to_string(),
+        json!(cache_state_mac(key, &stored)),
+    );
+    let encoded = serde_json::to_string(&envelope).unwrap_or_default();
+    let parent = state_path.parent().unwrap_or(Path::new("/"));
+    let name = state_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary = parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let write = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(encoded.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, state_path)?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write.map_err(|error| format!("cannot persist audit cache census: {error}"))
+}
+
+fn cache_census(
+    cfg: &Cfg,
+    subjects: &[CensusSubject],
+    request: &CensusRequest,
+    registry_revision: &str,
+) -> Result<Vec<CacheMeasurement>> {
+    if request.work_limit < 1 {
+        return Err("--cache-work-limit must be positive".to_string());
+    }
+    if !request.wall_seconds.is_finite() || request.wall_seconds <= 0.0 {
+        return Err("--cache-wall-seconds must be finite and positive".to_string());
+    }
+    let unavailable = |detail: String| -> Vec<CacheMeasurement> {
+        subjects
+            .iter()
+            .map(|(roots, error, _validation)| {
+                if let Some(error) = error {
+                    CacheMeasurement::error(error.clone())
+                } else if roots.is_empty() {
+                    CacheMeasurement::complete(0)
+                } else {
+                    CacheMeasurement::error(detail.clone())
+                }
+            })
+            .collect()
+    };
+    if !subjects.iter().any(|(roots, _, _)| !roots.is_empty()) {
+        return Ok(subjects
+            .iter()
+            .map(|(_, error, _)| match error {
+                Some(error) => CacheMeasurement::error(error.clone()),
+                None => CacheMeasurement::complete(0),
+            })
+            .collect());
+    }
+    let state_path = match &request.state {
+        Some(raw) => Some(census_state_path(cfg, Some(raw))?),
+        None => match default_census_state_path(cfg) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                return Ok(unavailable(format!(
+                    "default audit cache storage is unavailable: {error}"
+                )))
+            }
+        },
+    };
+    let state_path = state_path.expect("census state path");
+    // The state store must be establishable exactly as the oracle
+    // establishes it; its progress contents are not consumed here.
+    let parent = state_path.parent().unwrap_or(Path::new("/"));
+    let parent_ok = std::fs::canonicalize(parent)
+        .is_ok_and(|resolved| resolved == parent && !path_within(&resolved, &cfg.root));
+    if !parent_ok {
+        return Ok(unavailable(
+            "cannot establish authenticated audit cache census state: audit cache census state parent is unsafe"
+                .to_string(),
+        ));
+    }
+    let census_key = match establish_census_key(&state_path) {
+        Ok(key) => key,
+        Err(error) => {
+            return Ok(unavailable(format!(
+                "cannot establish authenticated audit cache census state: {error}"
+            )))
+        }
+    };
+    let mounts = match census_mounts() {
+        Ok(mounts) => mounts,
+        Err(error) => return Ok(unavailable(error)),
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs_f64(request.wall_seconds);
+    let mut budget: i64 = request.work_limit;
+    let mut measurements = Vec::new();
+    for (roots, error, validation_complete) in subjects {
+        if let Some(error) = error {
+            measurements.push(CacheMeasurement::error(error.clone()));
+            continue;
+        }
+        if roots.is_empty() {
+            measurements.push(CacheMeasurement::complete(0));
+            continue;
+        }
+        let mut total: i64 = 0;
+        let mut outcome: Option<CacheMeasurement> = None;
+        for (root, _checkout, device) in roots {
+            let measured = traverse_cache_root(
+                root,
+                *device,
+                &mounts,
+                &mut budget,
+                deadline,
+                *validation_complete,
+            );
+            match measured.status {
+                "complete" => total += measured.bytes.unwrap_or(0),
+                "partial" => {
+                    outcome = Some(CacheMeasurement::partial());
+                    break;
+                }
+                _ => {
+                    outcome = Some(measured);
+                    break;
+                }
+            }
+        }
+        measurements.push(outcome.unwrap_or_else(|| CacheMeasurement::complete(total)));
+    }
+    if let Err(error) = write_census_state(&state_path, &census_key, registry_revision) {
+        for (index, measurement) in measurements.iter_mut().enumerate() {
+            if !subjects[index].0.is_empty() && measurement.status != "error" {
+                *measurement = CacheMeasurement::error(error.clone());
+            }
+        }
+    }
+    Ok(measurements)
 }
 
 /// The record digest the oracle publishes: `_event_digest` of
@@ -1946,6 +2674,7 @@ fn audit_record(
     strays: &BTreeMap<(String, String), Vec<String>>,
     sealed_generation: Option<i64>,
     validation_paths: &[PathBuf],
+    measurement: &CacheMeasurement,
 ) -> Result<(Value, bool)> {
     let slot = record
         .get("slot")
@@ -1988,13 +2717,13 @@ fn audit_record(
     };
     let slot_path = slot_directory(cfg, &slot, &slot_type)?;
     let slot_absent = !slot_path.exists() && !slot_path.is_symlink();
-    let (cache_bytes, cache_error) = cache_accounting(cfg, config, record);
     let (cache_bytes_value, cache_status, cache_error) = if slot_absent {
         (json!(0), "complete", None)
     } else {
-        match (&cache_bytes, &cache_error) {
-            (Some(bytes), None) => (json!(bytes), "complete", None),
-            _ => (Value::Null, "error", cache_error),
+        match measurement.status {
+            "complete" => (json!(measurement.bytes.unwrap_or(0)), "complete", None),
+            "partial" => (Value::Null, "partial", None),
+            _ => (Value::Null, "error", measurement.error.clone()),
         }
     };
     let record_sha256 = record_digest(record)?;
@@ -2182,6 +2911,9 @@ fn audit_record(
         if !slot_absent {
             reasons.push(format!("cache inspection failed: {error}"));
         }
+    }
+    if cache_status == "partial" && !slot_absent {
+        reasons.push("cache inspection incomplete: bounded census is partial".to_string());
     }
     let verdict = if slot_absent {
         if reasons.len() == 1 {
@@ -2431,7 +3163,11 @@ fn seal_evidence(cfg: &Cfg) -> (Vec<SealTarget>, SealErrors) {
 
 /// The audit payload (`{"schema": 2, ...}`), minus the metrics phase
 /// timings the oracle measures live.
-pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
+pub(crate) fn parse_audit(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    census: CensusRequest,
+) -> Result<Value> {
     let (cfg, selected) = load_cfg(root, machine_override)?;
     let config = load_config(root, machine_override)?;
     refuse_partial_state_allow_seals(&cfg.control)?;
@@ -2439,9 +3175,17 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
     let journals = journal_slots(&cfg)?;
     let machines = discover_machines(&cfg.control)?;
     let mut records: Vec<Value> = Vec::new();
+    let mut shard_revisions: Vec<(String, i64)> = Vec::new();
     let mut events_by_machine: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for machine in &machines {
         let document = active_document(root, &cfg, machine)?;
+        shard_revisions.push((
+            machine.clone(),
+            document
+                .get("revision")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        ));
         if let Some(slots) = document.get("slots").and_then(Value::as_array) {
             records.extend(slots.iter().cloned());
         }
@@ -2545,9 +3289,36 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
         .filter(|record| record.get("slot_type").and_then(Value::as_str) == Some("validate"))
         .flat_map(|record| validation_row_paths(&cfg, record))
         .collect();
+    let census_subjects: Vec<CensusSubject> = records
+        .iter()
+        .map(|record| {
+            let (roots, error) = cache_roots(&cfg, &config, record);
+            let validation = record.get("slot_type").and_then(Value::as_str) == Some("validate");
+            (roots, error, validation)
+        })
+        .collect();
+    let registry_revision = {
+        use sha2::Digest as _;
+        let mut shards = shard_revisions.clone();
+        shards.sort();
+        let identity: Vec<Value> = shards
+            .iter()
+            .map(|(machine, revision)| json!({"machine": machine, "revision": revision}))
+            .collect();
+        let digest = sha2::Sha256::digest(
+            serde_json::to_string(&Value::Array(identity))
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let census_measurements = cache_census(&cfg, &census_subjects, &census, &registry_revision)?;
     let mut rows: Vec<Value> = Vec::new();
     let mut running_agent_count: i64 = 0;
-    for record in &records {
+    for (index, record) in records.iter().enumerate() {
         let machine = record
             .get("machine")
             .and_then(Value::as_str)
@@ -2568,6 +3339,7 @@ pub(crate) fn parse_audit(root: Option<&Path>, machine_override: Option<&str>) -
             &strays,
             sealed.map(|(generation, _path)| *generation),
             &validation_paths,
+            &census_measurements[index],
         )?;
         running_agent_count += i64::from(running);
         if let Some((generation, _path)) = sealed {

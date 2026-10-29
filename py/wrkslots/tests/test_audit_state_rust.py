@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from wrkslots import cli as wrkslots_cli
 
 
@@ -157,11 +159,17 @@ def _scrub(payload: dict[str, object]) -> dict[str, object]:
     return payload
 
 
-def _python(root: Path, tmp_path: Path) -> dict[str, object]:
+def _python(
+    root: Path,
+    tmp_path: Path,
+    *,
+    work_limit: int = 100000,
+    state_name: str = "census-state.json",
+) -> dict[str, object]:
     args = argparse.Namespace(
         project_root=str(root), machine=None, format="json", gate=False,
-        cache_census_state=str(tmp_path / "census-state.json"),
-        cache_work_limit=100000, cache_wall_seconds=60.0, wait_lock=0.0,
+        cache_census_state=str(tmp_path / state_name),
+        cache_work_limit=work_limit, cache_wall_seconds=60.0, wait_lock=0.0,
     )
     stream = io.StringIO()
     with contextlib.redirect_stdout(stream):
@@ -170,10 +178,20 @@ def _python(root: Path, tmp_path: Path) -> dict[str, object]:
     return payload
 
 
-def _rust(root: Path) -> subprocess.CompletedProcess[str]:
+def _rust(
+    root: Path,
+    *,
+    census_state: Path | None = None,
+    work_limit: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command = ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
+               "-p", "wrkslotsd", "--", "parse-audit", "--root", str(root)]
+    if census_state is not None:
+        command += ["--cache-census-state", str(census_state)]
+    if work_limit is not None:
+        command += ["--cache-work-limit", str(work_limit), "--cache-wall-seconds", "60"]
     return subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "parse-audit", "--root", str(root)],
+        command,
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )
 
@@ -183,7 +201,7 @@ def _rows(payload: dict[str, object]) -> list[dict[str, object]]:
 
 
 def _check(root: Path, tmp_path: Path) -> dict[str, object]:
-    result = _rust(root)
+    result = _rust(root, census_state=tmp_path / "rust-census.json")
     assert result.returncode == 0, result.stderr
     actual = _scrub(json.loads(result.stdout))
     assert actual == _scrub(_python(root, tmp_path))
@@ -249,7 +267,7 @@ def test_audit_cache_bytes_match_python(tmp_path: Path) -> None:
     # the two editions' measurements on some filesystems.
     for index in range(40):
         (cache / f"f{index}.bin").write_bytes(b"x" * 64)
-    result = _rust(root)
+    result = _rust(root, census_state=tmp_path / "rust-census.json")
     assert result.returncode == 0, result.stderr
     rust_payload = json.loads(result.stdout)
     python_payload = _python(root, tmp_path)
@@ -261,6 +279,100 @@ def test_audit_cache_bytes_match_python(tmp_path: Path) -> None:
     row = _rows(rust_payload)[0]
     assert row["verdict"] == "DELETABLE"
     assert row["cache_status"] == "complete"
+
+
+def _cache_fixture(base: Path) -> Path:
+    root = _fixture(base)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    cache = root / "worktrees" / "slot-a" / "repo" / "cache"
+    for index in range(30):
+        directory = cache / f"d{index}"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "f.bin").write_bytes(b"x" * 1024)
+    return root
+
+
+def test_audit_census_partial_then_complete_matches_python(tmp_path: Path) -> None:
+    root = _cache_fixture(tmp_path)
+    python_first = _python(root, tmp_path, work_limit=1)
+    rust_first = _rust(
+        root, census_state=tmp_path / "rust-census.json", work_limit=1
+    )
+    assert rust_first.returncode == 0, rust_first.stderr
+    assert _scrub(json.loads(rust_first.stdout)) == _scrub(python_first)
+    assert _rows(python_first)[0]["cache_status"] == "partial"
+    assert _rows(python_first)[0]["verdict"] == "BLOCKED"
+
+    python_second = _python(root, tmp_path)
+    rust_second = _rust(root, census_state=tmp_path / "rust-census.json")
+    assert rust_second.returncode == 0, rust_second.stderr
+    assert _scrub(json.loads(rust_second.stdout)) == _scrub(python_second)
+    assert _rows(python_second)[0]["cache_status"] == "complete"
+    assert _rows(python_second)[0]["verdict"] == "DELETABLE"
+    rust_bytes = _rows(json.loads(rust_second.stdout))[0]["cache_bytes"]
+    python_bytes = _rows(python_second)[0]["cache_bytes"]
+    assert isinstance(rust_bytes, int) and isinstance(python_bytes, int)
+    assert rust_bytes > 30 * 1024
+    assert abs(rust_bytes - python_bytes) <= 4096
+
+
+def test_audit_census_flat_cache_small_limit_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    cache = root / "worktrees" / "slot-a" / "repo" / "cache"
+    cache.mkdir(parents=True)
+    for index in range(200):
+        (cache / f"f{index}.bin").write_bytes(b"x" * 64)
+    python_payload = _python(root, tmp_path, work_limit=5)
+    rust_result = _rust(
+        root, census_state=tmp_path / "rust-census.json", work_limit=5
+    )
+    assert rust_result.returncode == 0, rust_result.stderr
+    assert _scrub(json.loads(rust_result.stdout)) == _scrub(python_payload)
+    assert _rows(python_payload)[0]["cache_status"] == "partial"
+
+
+def test_audit_census_symlinked_candidate_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    real = checkout / "real-cache"
+    real.mkdir()
+    (real / "f.bin").write_bytes(b"x" * 4096)
+    (checkout / "cache").symlink_to(real, target_is_directory=True)
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["cache_status"] == "error"
+    assert "cache path crosses a symlink" in str(row["cache_error"])
+
+
+def test_audit_census_nested_git_matches_python(tmp_path: Path) -> None:
+    root = _cache_fixture(tmp_path)
+    nested = root / "worktrees" / "slot-a" / "repo" / "cache" / "nested" / ".git"
+    nested.mkdir(parents=True)
+    (nested / "HEAD").write_text("ref: refs/heads/main\n")
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["cache_status"] == "error"
+    assert row["verdict"] == "BLOCKED"
+    assert "nested Git metadata" in str(row["cache_error"])
+
+
+def test_audit_census_state_inside_project_refuses(tmp_path: Path) -> None:
+    root = _cache_fixture(tmp_path)
+    result = _rust(root, census_state=root / "census.json")
+    assert result.returncode != 0
+    assert "outside the managed project" in result.stderr
+    args = argparse.Namespace(
+        project_root=str(root), machine=None, format="json", gate=False,
+        cache_census_state=str(root / "census.json"),
+        cache_work_limit=100000, cache_wall_seconds=60.0, wait_lock=0.0,
+    )
+    with pytest.raises(wrkslots_cli.Refusal):
+        wrkslots_cli._cmd_audit(args)
 
 
 def _seal_target(slot: str, generation: int) -> dict[str, object]:

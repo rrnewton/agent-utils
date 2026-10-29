@@ -175,6 +175,15 @@ pub(crate) enum Command {
         /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
+        /// Resumable cache-accounting state path (default: a project-keyed file below XDG_CACHE_HOME or ~/.cache)
+        #[arg(long, value_name = "PATH")]
+        cache_census_state: Option<String>,
+        /// Maximum cache traversal work units for this invocation
+        #[arg(long, value_name = "ENTRIES", default_value_t = 100_000)]
+        cache_work_limit: i64,
+        /// Cache traversal wall budget in seconds for this invocation
+        #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+        cache_wall_seconds: f64,
     },
     /// Diagnose unpublished or stale-after-rebase HEADs for every checkout on the selected machine
     Unpushed {
@@ -1000,8 +1009,22 @@ pub fn run() -> u8 {
                 return 1;
             }
         },
-        Command::ParseAudit { root, machine } => {
-            match crate::audit_state::parse_audit(root.as_deref(), machine.as_deref()) {
+        Command::ParseAudit {
+            root,
+            machine,
+            cache_census_state,
+            cache_work_limit,
+            cache_wall_seconds,
+        } => {
+            match crate::audit_state::parse_audit(
+                root.as_deref(),
+                machine.as_deref(),
+                crate::audit_state::CensusRequest {
+                    state: cache_census_state,
+                    work_limit: cache_work_limit,
+                    wall_seconds: cache_wall_seconds,
+                },
+            ) {
                 Ok(value) => {
                     println!(
                         "{}",
