@@ -8,7 +8,7 @@
 //! twice), then rewrites `agent_name` in `bridge.json`, so a later restart keeps the new target,
 //! and records the outcome next to the request. With no service running, the command applies the
 //! request itself while it holds the runner lease. A request is applied once: its generation is
-//! recorded with its outcome, and a newer request supersedes an older one not yet applied.
+//! recorded with its outcome, and a newer request supersedes an older one still waiting.
 
 use super::*;
 
@@ -210,8 +210,8 @@ impl BridgeState {
         }
     }
 
-    /// Record a request to point the bridge at `agent_name`, superseding any request not yet
-    /// applied. The caller validated the agent; the applier validates it again.
+    /// Record a request to point the bridge at `agent_name`, superseding any request still
+    /// waiting. The caller validated the agent; the applier validates it again.
     pub fn request_repoint(
         &self,
         agent_name: &str,
@@ -241,7 +241,7 @@ impl BridgeState {
         Ok(request)
     }
 
-    /// The repoint request not yet applied, if any.
+    /// The repoint request still waiting to be applied, if any.
     pub fn pending_repoint(&self) -> Result<Option<RepointRequest>> {
         if fs::symlink_metadata(self.target_path()).is_err() {
             return Ok(None);
@@ -268,7 +268,7 @@ impl BridgeState {
             .cloned())
     }
 
-    /// `chat status`'s `repoint`: the request not yet applied and the latest outcome, each
+    /// `chat status`'s `repoint`: the request still waiting and the latest outcome, each
     /// `null` when there is none, or `unreadable` with the error. Caller holds the state lock.
     pub(super) fn repoint_status_locked(&self) -> Value {
         match self.read_target_locked() {
