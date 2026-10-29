@@ -154,7 +154,7 @@ use super::orphans::{self, Summaries};
 use super::shadow::{self, Ask, Decision, Differing, Miss, Upstream, View};
 use super::{
     lock, Account, CacheStats, ChanKey, Counts, MessageCache, Observation, Offered, Read,
-    RouteSnapshot, Scope, Stamp,
+    RouteSnapshot, Scope, Stamp, ThreadRecord,
 };
 use crate::chat::{ChatClient, ChatError, RecentRead};
 use crate::config::{Config, ProviderKind, RecentView};
@@ -1057,6 +1057,19 @@ pub enum ServeOutcome {
 /// The most replies of one thread a stale answer of Slack's All carries: the newest, as Slack's
 /// own All read brings a bounded number. `#611 timeline-read-failures`.
 const STALE_FLAT_REPLIES: usize = 20;
+
+/// Whether a thread's root, which its scope lacks, may go ahead of the `held` replies the scope
+/// answers a page of `asked` with ([`Sink::stale_timeline`]): only where it sits over no gap, alone
+/// or over at least as many replies as `record` counts exactly, with nothing more held below them
+/// (`more_held`), and within the page. Over some replies of more it would say nothing is older
+/// ([`super::below::reaches_start`]) above replies the file never held, and a step back would start
+/// below it. `#688 vt-timeline-latency`.
+fn root_over_no_gap(held: usize, asked: usize, more_held: bool, record: &ThreadRecord) -> bool {
+    let replies = u64::try_from(held).unwrap_or(u64::MAX);
+    let whole = held == 0
+        || (record.reply_count_exact && record.reply_count.is_some_and(|count| replies >= count));
+    whole && !more_held && held < asked
+}
 
 /// What the cache holds of a newest timeline page, handed back because upstream could not answer
 /// it in time ([`Sink::stale_timeline`]). `#611 timeline-read-failures`.
@@ -2249,8 +2262,8 @@ impl Sink {
     ///
     /// `#688 vt-timeline-latency`: a thread whose scope lacks its root (one nobody has read yet:
     /// the root is Main's, and only a read of the thread lists it in the thread's scope) is
-    /// answered with the root as Main holds it, ahead of any replies held, so a thread whose
-    /// replies Slack will not give out yet still has something to answer with.
+    /// answered with the root as Main holds it, alone or ahead of every reply its record counts,
+    /// so a thread whose replies Slack will not give out yet still has something to answer with.
     pub async fn stale_timeline(&self, channel: &ChannelId, ask: &Ask) -> Option<StaleTimeline> {
         if !self.serve_enabled() {
             return None;
@@ -2318,9 +2331,13 @@ impl Sink {
                     .as_ref()
                     .is_some_and(|thread| thread.is_root)
             };
-            // Not below a page that leaves older replies out: the root would sit over a gap.
-            if let Some(root_id) = record.as_ref().and_then(|record| record.root_id.as_ref()) {
-                if !more_held && !view.rows.iter().any(is_root) {
+            let held = view.rows.len();
+            if let Some(root_id) = record
+                .as_ref()
+                .filter(|found| root_over_no_gap(held, asked, more_held, found))
+                .and_then(|found| found.root_id.as_ref())
+            {
+                if !view.rows.iter().any(is_root) {
                     if let Read::Served(Some(root)) = cache.message(&chan, root_id) {
                         view.rows.insert(0, root);
                     }
@@ -3374,6 +3391,28 @@ mod tests {
     use super::super::{CacheOptions, Read, Scope};
     use super::*;
     use crate::auth::Scope as Caller;
+
+    #[test]
+    fn a_thread_s_root_goes_only_where_it_sits_over_no_gap() {
+        let record = |count: Option<u64>, exact: bool| ThreadRecord {
+            thread_id: "1700000060.000000".to_owned(),
+            root_id: Some(MessageId("1".to_owned())),
+            reply_count: count,
+            reply_count_exact: exact,
+            last_activity_ms: 0,
+        };
+        // Nothing held of the thread: the root alone has nothing older above it.
+        assert!(root_over_no_gap(0, 50, false, &record(Some(40), true)));
+        // Every reply the record counts: whole.
+        assert!(root_over_no_gap(3, 50, false, &record(Some(3), true)));
+        // Three replies live ingestion brought of forty: the root would sit over the other 37.
+        assert!(!root_over_no_gap(3, 50, false, &record(Some(40), true)));
+        assert!(!root_over_no_gap(3, 50, false, &record(Some(3), false)));
+        assert!(!root_over_no_gap(3, 50, false, &record(None, false)));
+        // More held below the page, or a page already full.
+        assert!(!root_over_no_gap(3, 50, true, &record(Some(3), true)));
+        assert!(!root_over_no_gap(3, 3, false, &record(Some(3), true)));
+    }
 
     #[test]
     fn a_sink_that_is_off_begins_no_fill_under_any_grant() {
