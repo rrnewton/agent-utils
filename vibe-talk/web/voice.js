@@ -28062,15 +28062,9 @@ async function readTimeline(path, options) {
 }
 
 /**
- * @typedef {object} HeldDoneMark
- * @property {string[]} ids the messages written
- * @property {boolean} done Done, or put back
- * @property {any} canon the store changed, or null
- * @property {string[]} flipped the ids whose state in that store this changed
- * @property {Array<[string, number]>} settled the threads whose unknown replies Done on their root
- *   settled, with the gap that set (`settleUnknownReplies`)
- * @property {Array<[string, number]>} unsettled the threads whose settling putting their root back
- *   took back, with the gap it took (`unsettleReplies`)
+ * What a Done or a put back changed in the store (web/src/core/channels `HeldDoneMark`).
+ *
+ * @typedef {import("./src/core/channels/index.ts").HeldDoneMark} HeldDoneMark
  */
 
 /**
@@ -28095,91 +28089,16 @@ function markHeldDone(ids, done, settles = false) {
   readLedger.writeStarted(marked);
   const canon = threadingSupported && channelStore.current().channel === String(selectedChannelId())
     ? channelStore.current() : null;
-  const flipped = canon ? marked.filter((id) => canon.dismissed.has(id) !== done) : [];
-  for (const id of flipped) {
-    if (done) canon.dismissed.add(id);
-    else canon.dismissed.delete(id);
-  }
-  const settled = canon && done && settles ? settleUnknownReplies(canon, marked) : [];
-  const unsettled = canon && !done ? unsettleReplies(canon, marked) : [];
-  return { ids: marked, done, canon, flipped, settled, unsettled };
+  // The store's part (web/src/core/channels `markDoneIn`): its read state, and the gaps Done settles.
+  return markDoneIn(canon, marked, done, settles, stillToDo);
 }
 
 /** Whether Done issued now is issued from Main's list, where roots say they have new replies (`markHeldDone`). */
 const doneSettlesHere = () => threadingSupported && channelView === "main" && !pinnedOnly;
 
-/**
- * Done on a root settles the replies of its thread that no read has said anything of: they are read
- * as old, and stop counting as new. `#222 unread-replies`. The gap is unknown only for a thread no
- * read has placed — Main opened cold, before All; or, on Slack, a thread past the ten All brings
- * replies for (`passedOver`), which no later read of All brings either while nothing new happens
- * in it. Such a root said "N new" until the reader opened its thread, and Done on the root did not
- * clear it; Done is the reader saying they have dealt with it. A read that brings the replies later
- * places them again, unread ones included; putting the root back, or Undo, takes the settling back
- * (`settledByDone`, `unsettleReplies`).
- *
- * WHAT DONE ON A ROOT DOES NOT SETTLE, and why it differs from what it does: Done on a root is Done on
- * that message, and it never stands for a reply the page knows may be unread. A reply the page holds
- * keeps its own read state, which the server keeps and other devices share, until it is marked
- * itself ("1 unread" stays). Replies its count reports beyond a known gap stay new ("1 new" stays):
- * they were posted since a read that brought the thread's newest, or they were unread when cut from
- * the device's copy (`trimCanonField`), so nothing suggests the reader has seen them. Only replies the
- * page cannot place at all — old and seen, or new, it cannot tell — are taken as the reader says.
- * Answers the threads settled, with the gap each was given, for a write that fails to take back.
- *
- * @param {any} canon
- * @param {string[]} ids
- * @returns {Array<[string, number]>}
- */
-function settleUnknownReplies(canon, ids) {
-  const wanted = new Set(ids);
-  const roots = canon.messages.filter((message) => wanted.has(String(message.id)) && threadOf(message) &&
-    message.thread.is_root === true && threadOf(message) !== canon.scope && !canon.replyGaps.has(threadOf(message)));
-  if (roots.length === 0) return [];
-  const tally = replyTally();
-  /** @type {Array<[string, number]>} */
-  const settled = [];
-  for (const root of roots) {
-    const id = String(threadOf(root));
-    const count = exactReplyCount(id, root, tally);
-    const entry = tally.threads.get(id);
-    const gap = count === null ? 0 : Math.max(0, count - (entry ? entry.held : 0));
-    if (gap === 0) continue;
-    canon.replyGaps.set(id, gap);
-    canon.settledByDone.set(id, gap);
-    settled.push([id, gap]);
-  }
-  return settled;
-}
+// `settleUnknownReplies` is web/src/core/channels's (`#624 voice-page-modularity`).
 
-/**
- * Putting a root back takes back what Done on it settled (`settleUnknownReplies`): its thread's gap
- * is unknown again, so its unplaced replies count as new as they did before the Done, and the root is
- * back under Hide read. Not once a read has set the gap (`noteReplyGaps` forgets Done's then): that
- * gap is the read's, and stands. Answers the threads it took back, with the gap each had, for a write
- * that fails to put back.
- *
- * @param {any} canon
- * @param {string[]} ids
- * @returns {Array<[string, number]>}
- */
-function unsettleReplies(canon, ids) {
-  if (canon.settledByDone.size === 0) return [];
-  const wanted = new Set(ids);
-  /** @type {Array<[string, number]>} */
-  const unsettled = [];
-  for (const message of canon.messages) {
-    const id = threadOf(message);
-    if (!id || message.thread.is_root !== true || !wanted.has(String(message.id))) continue;
-    const gap = canon.settledByDone.get(id);
-    if (gap === undefined) continue;
-    canon.settledByDone.delete(id);
-    if (canon.replyGaps.get(id) !== gap) continue;
-    canon.replyGaps.delete(id);
-    unsettled.push([id, gap]);
-  }
-  return unsettled;
-}
+// `unsettleReplies` is web/src/core/channels's (`#624 voice-page-modularity`).
 
 /**
  * The write `mark` stands for has settled, `ok` or not. Failed, exactly what it changed in the store
@@ -28192,22 +28111,8 @@ function unsettleReplies(canon, ids) {
 function settleHeldDone(mark, ok) {
   // The epoch moves, and each settles there once none is left on its way (`ReadLedger.writeSettled`).
   readLedger.writeSettled(mark.ids);
-  if (ok || mark.canon === null) return;
-  for (const id of mark.flipped) {
-    if (mark.done) mark.canon.dismissed.delete(id);
-    else mark.canon.dismissed.add(id);
-  }
-  // Still Done's, lowered or not: not once a read has set the gap since.
-  for (const [id] of mark.settled) {
-    if (!mark.canon.settledByDone.has(id)) continue;
-    if (mark.canon.replyGaps.get(id) === mark.canon.settledByDone.get(id)) mark.canon.replyGaps.delete(id);
-    mark.canon.settledByDone.delete(id);
-  }
-  for (const [id, gap] of mark.unsettled) {
-    if (mark.canon.replyGaps.has(id)) continue;
-    mark.canon.replyGaps.set(id, gap);
-    mark.canon.settledByDone.set(id, gap);
-  }
+  // Failed, exactly what it changed in the store goes back (web/src/core/channels `settleDoneIn`).
+  settleDoneIn(mark, ok);
 }
 
 /**

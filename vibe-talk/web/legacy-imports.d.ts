@@ -50,6 +50,8 @@ declare const exactReplyCount: LegacyImports["exactReplyCount"];
 declare const replyTallyOf: LegacyImports["replyTallyOf"];
 declare const tallyRecord: LegacyImports["tallyRecord"];
 declare const unseenRepliesIn: LegacyImports["unseenRepliesIn"];
+declare const markDoneIn: LegacyImports["markDoneIn"];
+declare const settleDoneIn: LegacyImports["settleDoneIn"];
 declare const namedRecord: LegacyImports["namedRecord"];
 declare const answeredThread: LegacyImports["answeredThread"];
 declare const newerPage: LegacyImports["newerPage"];

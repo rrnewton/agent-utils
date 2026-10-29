@@ -45,3 +45,5 @@ export type { LiveFoldDependencies } from "./live.ts";
 export { answeredThread, newerPage, newerPageSpeaksFor, placeFromPage as placeFromPageIn } from "./placement.ts";
 export { emptyTally, exactReplyCount, replyTallyOf, tallyRecord, unseenRepliesIn } from "./tally.ts";
 export type { ReplyTally } from "./tally.ts";
+export { markDoneIn, settleDoneIn, settleUnknownReplies, unsettleReplies } from "./done.ts";
+export type { HeldDoneMark } from "./done.ts";

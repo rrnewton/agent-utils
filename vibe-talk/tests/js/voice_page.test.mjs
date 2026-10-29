@@ -6788,6 +6788,35 @@ test("`#624 voice-page-modularity`: the pinned messages' owner, from the module 
   assert.deepStrictEqual([pins.channel(), pins.problem(), pins.inFlight(), pins.size()], ["d", "", null, 0]);
 });
 
+test("`#624 voice-page-modularity`: Done in the store at once, and taken back exactly when its write fails, from the module alone", () => {
+  const { emptyCanon, markDoneIn, settleDoneIn } = CHANNELS;
+  const unread = (message, done) => !done.has(String(message.id));
+  const canon = emptyCanon("c");
+  const root = { id: "r", thread: { id: "t", is_root: true, reply_count: 3, reply_count_exact: true } };
+  canon.messages = [root, { id: "1", thread: { id: "t", is_root: false } }];
+  canon.dismissed = new Set(["1"]);
+  // Done on the root, from Main: the store at once, and its thread's unplaced replies settled.
+  const mark = markDoneIn(canon, ["r", "1"], true, true, unread);
+  assert.deepStrictEqual([mark.flipped, [...canon.dismissed].sort(), mark.settled], [["r"], ["1", "r"], [["t", 2]]]);
+  assert.deepStrictEqual([canon.replyGaps.get("t"), canon.settledByDone.get("t")], [2, 2]);
+  // The write failed: exactly what it changed goes back.
+  settleDoneIn(mark, false);
+  assert.deepStrictEqual([[...canon.dismissed], canon.replyGaps.has("t"), canon.settledByDone.has("t")], [["1"], false, false]);
+  // Succeeded: nothing taken back.
+  const kept = markDoneIn(canon, ["r"], true, true, unread);
+  settleDoneIn(kept, true);
+  assert.equal(canon.dismissed.has("r"), true);
+  // Put back takes back what Done settled; failing, it is settled again.
+  const back = markDoneIn(canon, ["r"], false, false, unread);
+  assert.deepStrictEqual([canon.dismissed.has("r"), canon.replyGaps.has("t"), back.unsettled], [false, false, [["t", 2]]]);
+  settleDoneIn(back, false);
+  assert.deepStrictEqual([canon.dismissed.has("r"), canon.replyGaps.get("t")], [true, 2]);
+  // No store for the channel on screen: nothing changed, nothing to take back.
+  const none = markDoneIn(null, ["x"], true, true, unread);
+  assert.deepStrictEqual([none.flipped, none.settled, none.unsettled, none.canon], [[], [], [], null]);
+  settleDoneIn(none, false);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
