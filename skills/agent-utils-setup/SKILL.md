@@ -140,14 +140,18 @@ Ask as one or two batches:
 9. **Build caches.** Directories that are regenerable build output (for example `target`,
    `node_modules`, `.venv`, `build`), so wrkslots can reclaim them. Propose a list from the
    project's `.gitignore` and build files; ask the owner to confirm.
-10. **Chat bridge.** Connect chat now, or later? The working inbound transport is Google Chat
-    (`agentctl chat launch`, polling), which needs a space ID, the owner's user ID for the
-    allow-list, and an OAuth access token or a command that prints one. The polling bridge and
-    its launcher are Python-edition only: run its commands — including `chat quickstart`, which
-    lists the current requirements — with `DAGRUN_ENGINE=python`, since the dispatchers default
-    to Rust and the Rust edition refuses them with that instruction. Other providers need an
-    installed subscription plugin (`agentctl chat --help`). Without chat, the owner talks to the
-    coordinator in its Herdr tab.
+10. **Chat bridge.** Connect chat now, or later? Two providers work today:
+    - **Slack**, through the event-driven bridge (`agentctl chat init` / `chat run`) and the Slack
+      provider in `agent-utils/rs/chat-subscription-slack` (a subscription plugin plus an outbound
+      helper, built with `cargo`). It needs a Slack command-line client installed on the host (its
+      Web API transport is not implemented), a registered Slack app the replies post as, the
+      channel ID, and the owner's Slack user ID for the allow-list. `agentctl chat quickstart` and
+      the userguide's "Slack provider" section list the details.
+    - **Google Chat**, through the Python edition's polling bridge (`agentctl chat launch`), which
+      needs a space ID, the owner's user ID, and an OAuth access token or a command that prints
+      one. Run its commands, including `chat quickstart`, with `DAGRUN_ENGINE=python`; the Rust
+      `chat launch` takes only the plugin configuration above.
+    Without chat, the owner talks to the coordinator in its Herdr tab.
 
 Then present the optional tools in one short list and ask which, if any, to set up now (default:
 none; each can be added later by asking):
@@ -285,6 +289,21 @@ harness `AGENTS.md`.
 Each profile takes `harness` and `mode`, and optionally `model`, `reasoning_effort`, `argv`, and
 `env`, exactly as the owner specified. Verify with `"$H/agent-utils/bin/agentctl" profiles --cwd "$H"`.
 
+Offer one more key, `launch_env`, so that every agent this harness starts calls the harness's own
+tool versions rather than whatever a user-wide `bin` directory holds. Create `$H/bin` links named
+like the tools (for example `ln -s ../agent-utils/common/bin/agentctl "$H/bin/agentctl"`; a link
+must keep the tool's name), an idempotent `$H/.agentctl/team-env.sh` that puts `$H/bin` first
+(`TEAM_BIN=<H>/bin; PATH="$TEAM_BIN:${PATH//$TEAM_BIN:/}"; export PATH`), and add to
+`profiles.json`:
+
+```json
+"launch_env": {"env_file": "<H>/.agentctl/team-env.sh", "path_prepend": ["<H>/bin"]}
+```
+
+agentctl then types the environment into each new pane after the shell's startup files, and
+every tool call re-reads the env file. The agentctl userguide and
+`agent-utils/common/docs/agent-harness-environment.md` explain the mechanism.
+
 **5.6 Skills.** Link the suite skills into the harness, once, for every harness:
 
 ```sh
@@ -338,14 +357,22 @@ Sandbox on (`userns` or `root`):
   questions. The coordinator stops you and removes the slot after its time-to-live.
 ```
 
-**5.8 Chat bridge (if chosen now).** Write the configuration `DAGRUN_ENGINE=python agentctl chat
-quickstart` describes to `$H/chat.json` with mode 0600; it is ignored by the harness repository.
-The token stays in an environment variable or a token command, never in a tracked file. The
-coordinator is then launched with `DAGRUN_ENGINE=python agentctl chat launch --config chat.json
---harness <claude|codex>` from a Herdr shell tab in `$H` (phase 7); the polling launcher is
-Python-edition only, and the Rust default refuses it with that instruction. Note the default
-poll interval in `DAGRUN_ENGINE=python agentctl chat launch --help` and ask the owner whether to
-shorten it.
+**5.8 Chat bridge (if chosen now).** Write `$H/chat.json` with mode 0600; the harness repository
+ignores it, and tokens stay in an environment variable or a token command, never in a tracked file.
+
+- **Slack:** build the provider (`cargo build --release --manifest-path
+  "$H/agent-utils/rs/Cargo.toml" -p chat-subscription-slack`), then install the plugin binary and
+  its `manifest.json` into the agentctl plugin home, as the provider's README and `agentctl chat
+  userguide` ("Slack provider") describe. Confirm with `agentctl capabilities`. Fill `chat.json`
+  from `agentctl chat quickstart`: `subscription_plugin` `slack`, the channel ID, the owner's user
+  ID, `backend_configuration` (schema `agentctl.slack.v1`, the client's absolute path), and
+  `outbound_command` (the helper, with `--app-id` of the app replies post as). Then run `agentctl
+  chat init --config chat.json --bridge-state <state dir>`, outside every synced directory (for
+  example under `~/.local/state`). The bridge itself starts in phase 7.
+- **Google Chat:** write the configuration `DAGRUN_ENGINE=python agentctl chat quickstart`
+  describes. The coordinator is launched with `DAGRUN_ENGINE=python agentctl chat launch --config
+  chat.json --harness <claude|codex>` from a Herdr shell tab in `$H` (phase 7). Note the default
+  poll interval in its `--help` and ask the owner whether to shorten it.
 
 **5.9 Optional tools.** Follow "Add a tool later" for each one chosen.
 
@@ -419,9 +446,13 @@ addressable: tick-hub deliveries, other agents, and the owner's scripts reach it
 starts by hand in some terminal is not registered, so nothing can deliver to it.
 
 With chat configured, keep the coordinator registered: start it as above, then point the bridge at
-it with `DAGRUN_ENGINE=python agentctl chat run` (the polling bridge is Python-edition only),
-using the pane and workspace identity `agentctl status coordinator` reports (the agentctl chat
-guide's Setup section). `DAGRUN_ENGINE=python agentctl chat launch --config chat.json --harness
+it. For Slack, run `agentctl chat run --bridge-state <state dir>` (the config's `agent_name`
+names the coordinator). Add `--offer-reply-command` for a Claude Code coordinator, whose pane
+does not show reply text written in the middle of a turn: each prompt then carries an `agentctl
+chat reply` command the coordinator can run instead. `agentctl chat health --bridge-state DIR`
+gives a one-line verdict, and `agentctl chat repoint` moves a running bridge to another agent. For
+Google Chat, run `DAGRUN_ENGINE=python agentctl chat run` with the pane and workspace identity
+`agentctl status coordinator` reports (the agentctl chat guide's Setup section). `DAGRUN_ENGINE=python agentctl chat launch --config chat.json --harness
 <harness>`, run from a Herdr shell tab in `$H`, is shorter, but the coordinator it starts in that
 pane is not an agentctl session, so `agentctl send coordinator` (and so tick-hub delivery) cannot
 reach it; if the owner prefers it anyway, say so and record it in the harness `AGENTS.md`.
@@ -470,7 +501,9 @@ link to `.agents/skills/` if it has one, and commit the harness. For each tool, 
   v2 for its resource limits.
 - **wrkviz**: `wrkviz quickstart`; point it at the harness transcripts it lists.
 - **gh-paced**: needs `cargo`. Build it from `agent-utils/rs` as its quickstart shows
-  (`common/docs/gh-paced/QUICKSTART.md`), then put it in front of the real `gh` for agents.
+  (`common/docs/gh-paced/QUICKSTART.md`), then put it in front of the real `gh` for agents. To
+  have every agent act as one GitHub account, link `agent-utils/rs/gh-paced/gh-team` as
+  `$H/bin/gh` and export `GH_PACED_ACCOUNT` in the team env file (see 5.5 `launch_env`).
 - **minibeads**: needs `cargo`. `git -C agent-utils submodule update --init --checkout ext/minibeads`, then
   `cargo install --path agent-utils/ext/minibeads --bin mb` (or `cargo install minibeads --version '^0.29'`), and
   `mb init` in the primary checkout if it has no `.minibeads/` yet. Record in the harness

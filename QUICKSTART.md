@@ -196,6 +196,9 @@ triggered it once. The reminder arrived in its own queue through `agentctl send 
 and it answered with a status summary. It then recorded tick-hub in `AGENTS.md` and committed
 the harness. Other requests work the same way:
 
+- "Connect this to Slack." (It needs a Slack command-line client on the host, a registered Slack
+  app for the replies, the channel ID and your user ID; `agentctl chat quickstart` lists the
+  details.)
 - "Connect this to Google Chat." (It needs a space ID, your user ID, and an OAuth token or a
   command that prints one; `DAGRUN_ENGINE=python agentctl chat quickstart` lists the details —
   the polling bridge is Python-edition only.)
