@@ -158,7 +158,7 @@ def test_parse_states_event_log_refusals(tmp_path: Path) -> None:
     assert "append-only event log contains an unexpected entry" in result.stderr
 
 
-def test_parse_states_valid_event_log_refuses_toward_rebuild(tmp_path: Path) -> None:
+def test_parse_states_valid_event_log_matches_python(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _write(root, EMPTY_ACTIVE, archive=False)
     _write(root, EMPTY_ARCHIVE, archive=True)
@@ -176,9 +176,8 @@ def test_parse_states_valid_event_log_refuses_toward_rebuild(tmp_path: Path) -> 
     event = {**core, "sha256": wrkslots_cli._event_digest(core)}
     (events / "00000000000000000001.json").write_text(json.dumps(event))
     result = _rust(root)
-    assert result.returncode == 1
-    assert "is derived from the append-only event log" in result.stderr
-    assert "use rebuild" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
 
 
 @pytest.mark.parametrize(

@@ -221,3 +221,58 @@ def test_parse_status_no_records(tmp_path: Path) -> None:
     result = _rust(root)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"machines": ["node-a"], "records": []}
+
+
+def test_parse_status_reads_event_derived_state_like_python(
+    tmp_path: Path,
+) -> None:
+    """Regression for the live-registry trial stop: a machine whose
+    state is derived from the append-only event log must read through
+    the chain fold (active document and holds), not refuse toward
+    rebuild. The fixture copies the live registry's shape: a stale
+    snapshot shard beside a complete EVENTS chain."""
+    root = _root(tmp_path)
+    live = _record("slot-live", "agent-live", _live_identity())
+    stale = _record("slot-stale", "agent-stale", None)
+    (root / "worktrees" / "ACTIVE.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 7, "slots": [stale]})
+    )
+    (root / "worktrees" / "ARCHIVED.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 3, "records": []})
+    )
+    hold = {
+        "schema": 1,
+        "machine": "node-a",
+        "slot": "slot-live",
+        "held_at": "2026-10-26T03:00:00Z",
+        "reason": "waiting",
+    }
+    core: dict[str, object] = {
+        "schema": 1,
+        "machine": "node-a",
+        "sequence": 1,
+        "previous_sha256": "0" * 64,
+        "recorded_at": "2026-10-26T03:00:00Z",
+        "kind": "state-imported",
+        "payload": {
+            "active": {
+                "schema": 2, "machine": "node-a", "revision": 9, "slots": [live],
+            },
+            "archive": {
+                "schema": 2, "machine": "node-a", "revision": 3, "records": [],
+            },
+            "holds": [hold],
+        },
+    }
+    event = {**core, "sha256": wrkslots_cli._event_digest(core)}
+    events = root / "worktrees" / "EVENTS.node-a"
+    events.mkdir()
+    (events / "00000000000000000001.json").write_text(json.dumps(event))
+
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    doc = json.loads(result.stdout)
+    records = doc["records"]
+    assert [record["slot"] for record in records] == ["slot-live"]
+    assert records[0]["held"] is True
+    assert records[0]["hold_reason"] == "waiting"

@@ -263,7 +263,31 @@ def test_parse_global_refusals_name_the_same_problem(
     assert fragment in result.stderr
 
 
-def test_parse_global_refuses_event_derived_machine(tmp_path: Path) -> None:
+def test_parse_global_derived_machine_matches_python(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    _pair(root)
+    control = root / "worktrees"
+    active = json.loads((control / "ACTIVE.node-a.json").read_text())
+    archive = json.loads((control / "ARCHIVED.node-a.json").read_text())
+    core: dict[str, object] = {
+        "schema": 1,
+        "machine": "node-a",
+        "sequence": 1,
+        "previous_sha256": "0" * 64,
+        "recorded_at": "2026-10-26T03:00:00Z",
+        "kind": "state-imported",
+        "payload": {"active": active, "archive": archive, "holds": []},
+    }
+    event = {**core, "sha256": wrkslots_cli._event_digest(core)}
+    events = control / "EVENTS.node-a"
+    events.mkdir()
+    (events / "00000000000000000001.json").write_text(json.dumps(event))
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+
+
+def test_parse_global_corrupt_event_log_refuses_like_python(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _pair(root)
     events = root / "worktrees" / "EVENTS.node-c"
@@ -271,8 +295,7 @@ def test_parse_global_refuses_event_derived_machine(tmp_path: Path) -> None:
     (events / "00000000000000000001.json").write_text("{}")
     result = _rust(root)
     assert result.returncode == 1
-    assert "is derived from the append-only event log" in result.stderr
-    assert "use rebuild" in result.stderr
+    assert "append-only event" in result.stderr
 
 
 def test_parse_global_partial_event_write_stays_snapshot(tmp_path: Path) -> None:

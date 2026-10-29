@@ -1,13 +1,14 @@
-//! Per-record status diagnosis parity (snapshot scope).
+//! Per-record status diagnosis parity.
 //!
-//! Reproduces the existing per-record status object over snapshot
-//! states: the normalized record plus owner-process state, heartbeat
-//! age/expiry, and hold outcome. The owner diagnosis reads this host's
-//! `/proc`, boot id, and machine id exactly as the existing reader
-//! does. Registry storage inconsistencies and event-derived owner
-//! releases stay with the existing `status` command, so
-//! `storage_inconsistencies` is reported empty and a machine with a
-//! complete event log refuses toward `rebuild`. Read-only.
+//! Reproduces the existing per-record status object: the normalized
+//! record plus owner-process state, heartbeat age/expiry, and hold
+//! outcome. Machines whose state is derived from the append-only
+//! event log read their active document and holds from the chain
+//! fold, like the Python status. The owner diagnosis reads this
+//! host's `/proc`, boot id, and machine id exactly as the existing
+//! reader does. Registry storage inconsistencies and event-derived
+//! owner releases stay with the existing `status` command, so
+//! `storage_inconsistencies` is reported empty. Read-only.
 
 use std::path::Path;
 
@@ -226,7 +227,44 @@ pub(crate) fn status_records(
     let (_hold_machines, hold_entries) = load_record_holds(root)?;
     let mut records: Vec<Value> = Vec::new();
     for machine in &machines {
-        let (active, order) = parse_state_ordered(root, Some(machine))?;
+        // Event-log-derived machines read their active document from
+        // the chain fold, like the Python status; snapshot machines
+        // read the shard.
+        let events_dir = cfg.control.join(format!("EVENTS.{machine}"));
+        let (active, order) = if matches!(
+            crate::global_state::event_log_status(&events_dir),
+            crate::global_state::EventLogStatus::Derived
+        ) {
+            let document = crate::hold_write::active_document(root, &cfg, machine)?;
+            let order = document
+                .get("slots")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|slot| crate::active_state::RecordOrder {
+                    slot: slot
+                        .get("slot")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    agent: slot
+                        .get("agent")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    slot_type: slot
+                        .get("slot_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    imported: true,
+                })
+                .collect();
+            (document, order)
+        } else {
+            parse_state_ordered(root, Some(machine))?
+        };
         let slots = active
             .get("slots")
             .and_then(Value::as_array)

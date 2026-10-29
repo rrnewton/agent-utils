@@ -5,11 +5,9 @@
 (`_load_active_snapshot(..., require_repository=False)`) on fixture
 projects; the Rust command must report the same per-record hold (or
 captured error) read-only.
-Snapshot mode only: a machine with a complete EVENTS log derives its
-holds, and the Rust command refuses that case toward `rebuild` (the
-Python oracle would replay, so that case asserts the Rust refusal
-only). A log holding only in-progress `.tmp.` files stays in snapshot
-mode on both sides.
+A machine with a complete EVENTS log derives its holds from the
+chain on both sides. A log holding only in-progress `.tmp.` files
+stays in snapshot mode on both sides.
 """
 
 from __future__ import annotations
@@ -223,14 +221,19 @@ def _valid_event(root: Path, machine: str) -> None:
     (events / "00000000000000000001.json").write_text(json.dumps(event))
 
 
-def test_parse_holds_refuses_event_derived_machine(tmp_path: Path) -> None:
+def test_parse_holds_derived_machine_matches_python(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _fixture(root)
+    # Derived folds keep slot-sorted order, as real registries write it.
+    _write_machine(
+        root,
+        "node-a",
+        [_record("slot-a", "agent-a", "node-a"), _record("slot-b", "agent-b", "node-a")],
+    )
     _valid_event(root, "node-a")
     result = _rust(root)
-    assert result.returncode == 1
-    assert "is derived from the append-only event log" in result.stderr
-    assert "use rebuild" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
 
 
 @pytest.mark.parametrize("name", ["00000000000000000001.json", "00000000000000000002.json"])
@@ -247,7 +250,7 @@ def test_parse_holds_corrupt_event_log_is_captured_like_python(
     assert json.loads(result.stdout) == _expected(root)
 
 
-def test_parse_holds_shard_error_precedes_derived_refusal(tmp_path: Path) -> None:
+def test_parse_holds_shard_error_precedes_derived_replay(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _fixture(root)
     _valid_event(root, "node-a")

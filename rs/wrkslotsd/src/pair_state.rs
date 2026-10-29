@@ -37,9 +37,13 @@ pub(crate) fn parse_states(root: Option<&Path>, machine_override: Option<&str>) 
     match event_log_status(&events) {
         EventLogStatus::Derived => {
             validate_event_chain(&events, &selected)?;
-            return Err(format!(
-                "machine state for {selected} is derived from the append-only event log; use rebuild instead of snapshot pairing"
-            ));
+            let active = crate::hold_write::active_document(root, &cfg, &selected)?;
+            let archive = crate::recover_absent_write::archives_document(&cfg, &selected)?;
+            return Ok(json!({
+                "machine": selected,
+                "active": active,
+                "archive": archive,
+            }));
         }
         EventLogStatus::Invalid(message) => return Err(message),
         EventLogStatus::Snapshot => {}

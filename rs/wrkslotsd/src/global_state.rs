@@ -402,9 +402,37 @@ pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {
     let mut orders: Vec<Vec<crate::active_state::RecordOrder>> = Vec::new();
     for machine in &machines {
         if event_log_derived(&cfg.control.join(format!("EVENTS.{machine}")))? {
-            return Err(format!(
-                "machine state for {machine} is derived from the append-only event log; use rebuild instead of snapshot validation"
-            ));
+            // Derived machines validate through the chain fold, like
+            // the Python global reader.
+            let active = crate::hold_write::active_document(root, &cfg, machine)?;
+            let order = active
+                .get("slots")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|slot| crate::active_state::RecordOrder {
+                    slot: slot
+                        .get("slot")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    agent: slot
+                        .get("agent")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    slot_type: slot
+                        .get("slot_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    imported: true,
+                })
+                .collect();
+            actives.push(active);
+            orders.push(order);
+            continue;
         }
         let (active, order) = crate::active_state::parse_state_ordered(root, Some(machine))?;
         actives.push(active);
@@ -439,7 +467,13 @@ pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {
     }
     let mut archives: Vec<Value> = Vec::new();
     for machine in &machines {
-        archives.push(parse_archive(root, Some(machine))?);
+        if event_log_derived(&cfg.control.join(format!("EVENTS.{machine}")))? {
+            archives.push(crate::recover_absent_write::archives_document(
+                &cfg, machine,
+            )?);
+        } else {
+            archives.push(parse_archive(root, Some(machine))?);
+        }
     }
     let mut archived_owner: Vec<(&str, &str)> = Vec::new();
     for archive in &archives {

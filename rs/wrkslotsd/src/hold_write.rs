@@ -176,6 +176,43 @@ pub(crate) fn acquire_config_lock(cfg: &Cfg) -> Result<ConfigLock> {
     }
 }
 
+/// One slot's hold replayed from a machine event chain: the imported
+/// holds, then `slot-held` / `slot-hold-released` in chain order.
+/// Mirrors `_holds_from_events` for a single slot.
+pub(crate) fn hold_from_events(events: &[Value], machine: &str, slot: &str) -> Value {
+    let mut held: Option<Value> = None;
+    for event in events {
+        let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+        match event.get("kind").and_then(Value::as_str) {
+            Some("state-imported") => {
+                if let Some(holds) = payload.get("holds").and_then(Value::as_array) {
+                    for hold in holds {
+                        if hold.get("slot").and_then(Value::as_str) == Some(slot) {
+                            held = Some(hold.clone());
+                        }
+                    }
+                }
+            }
+            Some("slot-held") if payload.get("slot").and_then(Value::as_str) == Some(slot) => {
+                held = Some(json!({
+                    "schema": 1,
+                    "machine": machine,
+                    "slot": slot,
+                    "held_at": event.get("recorded_at").cloned().unwrap_or(Value::Null),
+                    "reason": payload.get("reason").cloned().unwrap_or(Value::Null),
+                }));
+            }
+            Some("slot-hold-released")
+                if payload.get("slot").and_then(Value::as_str) == Some(slot) =>
+            {
+                held = None;
+            }
+            _ => {}
+        }
+    }
+    held.unwrap_or(Value::Null)
+}
+
 /// The current hold for one slot: replayed from the event log when the
 /// log derives the machine, else the snapshot HOLD record.
 pub(crate) fn current_hold(
@@ -189,39 +226,7 @@ pub(crate) fn current_hold(
         EventLogStatus::Invalid(message) => return Err(message),
         EventLogStatus::Derived => {
             let events = load_event_chain(&directory, selected)?;
-            let mut held: Option<Value> = None;
-            for event in &events {
-                let payload = event.get("payload").cloned().unwrap_or(Value::Null);
-                match event.get("kind").and_then(Value::as_str) {
-                    Some("state-imported") => {
-                        if let Some(holds) = payload.get("holds").and_then(Value::as_array) {
-                            for hold in holds {
-                                if hold.get("slot").and_then(Value::as_str) == Some(slot) {
-                                    held = Some(hold.clone());
-                                }
-                            }
-                        }
-                    }
-                    Some("slot-held")
-                        if payload.get("slot").and_then(Value::as_str) == Some(slot) =>
-                    {
-                        held = Some(json!({
-                            "schema": 1,
-                            "machine": selected,
-                            "slot": slot,
-                            "held_at": event.get("recorded_at").cloned().unwrap_or(Value::Null),
-                            "reason": payload.get("reason").cloned().unwrap_or(Value::Null),
-                        }));
-                    }
-                    Some("slot-hold-released")
-                        if payload.get("slot").and_then(Value::as_str) == Some(slot) =>
-                    {
-                        held = None;
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(held.unwrap_or(Value::Null));
+            return Ok(hold_from_events(&events, selected, slot));
         }
         EventLogStatus::Snapshot => {}
     }
