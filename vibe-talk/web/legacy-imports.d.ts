@@ -18,6 +18,8 @@ declare const createNavigation: LegacyImports["createNavigation"];
 declare const createCredentials: LegacyImports["createCredentials"];
 declare const createSettingsSync: LegacyImports["createSettingsSync"];
 declare const IDENTITY_KEY: LegacyImports["IDENTITY_KEY"];
+declare const DEVICE_SETTINGS: LegacyImports["DEVICE_SETTINGS"];
+declare const createDeviceSettings: LegacyImports["createDeviceSettings"];
 declare const SLOW_WORDS: LegacyImports["SLOW_WORDS"];
 declare const isSlowFailure: LegacyImports["isSlowFailure"];
 declare const providerWords: LegacyImports["providerWords"];

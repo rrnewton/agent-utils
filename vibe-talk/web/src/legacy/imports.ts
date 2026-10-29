@@ -19,7 +19,13 @@ export {
 export { readPieces, sentenceEnds, speechSegments } from "../core/speech/index.ts";
 export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
 export { createNavigation } from "../core/navigation/index.ts";
-export { IDENTITY_KEY, createCredentials, createSettingsSync } from "../core/settings/index.ts";
+export {
+  DEVICE_SETTINGS,
+  IDENTITY_KEY,
+  createCredentials,
+  createDeviceSettings,
+  createSettingsSync,
+} from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   DEEP_LINK_PART_MAX,

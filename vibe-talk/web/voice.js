@@ -66,15 +66,15 @@ const WIDTH_KEY = "vibe-talk.voice.width";
 const MSG_SCALE_KEY = "vibe-talk.voice.msg-scale";
 const COLLAPSED_LINES_KEY = "vibe-talk.voice.collapsed-lines";
 const READ_SPEED_KEY = "vibe-talk.voice.read-speed";
-const MARK_OWN_KEY = "vibe-talk.voice.mark-own-read";
+const MARK_OWN_KEY = DEVICE_SETTINGS.markOwnRead.key;
 const MARKER_KEY = "vibe-talk.voice.place-marker";
-const COMBINE_KEY = "vibe-talk.voice.combine";
-const HIDE_EMPTY_KEY = "vibe-talk.voice.hide-empty";
-const RICH_HEADERS_KEY = "vibe-talk.voice.rich-headers";
-const IN_APP_LINKS_KEY = "vibe-talk.voice.in-app-links";
+const COMBINE_KEY = DEVICE_SETTINGS.combineMessages.key;
+const HIDE_EMPTY_KEY = DEVICE_SETTINGS.hideEmptyMessages.key;
+const RICH_HEADERS_KEY = DEVICE_SETTINGS.richHeaders.key;
+const IN_APP_LINKS_KEY = DEVICE_SETTINGS.inAppLinks.key;
 /** `#580 open-in-chat-jump`. The view a sent card's Open in channel lands in: "flat" (All) or "main". */
 const OPEN_IN_VIEW_KEY = "vibe-talk.voice.open-in-view";
-const SUMMARIZE_COLLAPSED_KEY = "vibe-talk.voice.summarize-collapsed";
+const SUMMARIZE_COLLAPSED_KEY = DEVICE_SETTINGS.summarizeCollapsed.key;
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
 // --- two columns on a desk: which column the code is working on -------------------------------
@@ -2049,7 +2049,7 @@ function applyInAppLinks(on) {
   inAppLinks = Boolean(on);
   el("in-app-links").checked = inAppLinks;
   try {
-    deviceStorage().setItem(IN_APP_LINKS_KEY, inAppLinks ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.inAppLinks, inAppLinks);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -2073,7 +2073,7 @@ function redrawMessageLinks() {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedInAppLinks() {
-  return deviceStorage().getItem(IN_APP_LINKS_KEY) !== "0";
+  return deviceSettings().get(DEVICE_SETTINGS.inAppLinks);
 }
 
 /**
@@ -4765,7 +4765,7 @@ function applySummarizeCollapsed(on) {
   const wanted = Boolean(on);
   el("summarize-collapsed").checked = wanted;
   try {
-    deviceStorage().setItem(SUMMARIZE_COLLAPSED_KEY, wanted ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.summarizeCollapsed, wanted);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -4774,11 +4774,8 @@ function applySummarizeCollapsed(on) {
 
 /** What was stored. ABSENT MEANS OFF: every summary is a paid model call, and the owner asked. */
 function storedSummarizeCollapsed() {
-  try {
-    return deviceStorage().getItem(SUMMARIZE_COLLAPSED_KEY) === "1";
-  } catch (_error) {
-    return false;
-  }
+  // A browser refusing storage reads as off (`DEVICE_SETTINGS.summarizeCollapsed.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.summarizeCollapsed);
 }
 
 /**
@@ -8447,18 +8444,15 @@ function setLinkKindShown(kind, shown) {
 // owner's other settings on the server (LINK_RAW_KEY in web/src/core/settings's `SYNCED_SETTING_KEYS`), as the kinds are, so
 // every device shows the links the same way; with nothing kept it is off.
 
-const LINK_RAW_KEY = "vibe-talk.voice.link-raw-urls";
+const LINK_RAW_KEY = DEVICE_SETTINGS.linksRaw.key;
 
 /** Whether the Links view writes each link as its address. */
 let linksRaw = storedLinksRaw();
 
 /** What this device kept: on only for the word this page writes, so anything else is off. */
 function storedLinksRaw() {
-  try {
-    return deviceStorage().getItem(LINK_RAW_KEY) === "on";
-  } catch (_error) {
-    return false;
-  }
+  // A browser refusing storage reads as off (`DEVICE_SETTINGS.linksRaw.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.linksRaw);
 }
 
 /** Write the links as their addresses, or as their names, keep the choice, and redraw them. */
@@ -8466,8 +8460,7 @@ function setLinksRaw(on) {
   keepingFilterPlace(() => {
     linksRaw = on;
     try {
-      if (on) deviceStorage().setItem(LINK_RAW_KEY, "on");
-      else deviceStorage().removeItem(LINK_RAW_KEY);
+      deviceSettings().keep(DEVICE_SETTINGS.linksRaw, on);
     } catch (_error) {
       // A browser that refuses storage still honours the choice for this page.
     }
@@ -10800,7 +10793,6 @@ function keepWrittenBox(area, seen, now) {
 //     checkbox kept where it was, under the pointer, and Send with it; one who scrolled it away is not
 //     moved. The checkbox ticked is the one the change came from, never read off the focus.
 
-const COMPOSER_GROW_KEY = "vibe-talk.voice.composer-grow";
 
 /**
  * The boxes that grow, and their Grow checkboxes in the same order. All left-column ids: see `el`. The
@@ -10821,11 +10813,8 @@ let composerGrow = false;
 
 /** What was stored. ABSENT MEANS OFF; a browser that refuses storage reads as nothing stored. */
 function storedComposerGrow() {
-  try {
-    return deviceStorage().getItem(COMPOSER_GROW_KEY) === "1";
-  } catch (_error) {
-    return false;
-  }
+  // A browser refusing storage reads as off (`DEVICE_SETTINGS.composerGrow.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.composerGrow);
 }
 
 /**
@@ -10850,7 +10839,7 @@ function storedComposerGrow() {
  */
 function applyComposerGrow(on, grow) {
   try {
-    deviceStorage().setItem(COMPOSER_GROW_KEY, on ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.composerGrow, on);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -10985,7 +10974,6 @@ function keepGrowingBoxInView(field) {
 // handler at all, so Enter there was a new line and sending took the mouse. ONE handler now decides
 // for all of them, and the reader decides what it decides: "Enter to send" on the Settings screen.
 
-const ENTER_SENDS_KEY = "vibe-talk.voice.enter-sends";
 
 /** The message boxes, each of which hands its Enter to `onComposerKey`. */
 const COMPOSER_FIELDS = ["compose-text", "channel-compose-text", "reply-text", "side-compose-text"];
@@ -11005,7 +10993,7 @@ let enterSends = true;
 function applyEnterSends(on) {
   enterSends = Boolean(on);
   try {
-    deviceStorage().setItem(ENTER_SENDS_KEY, enterSends ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.enterSends, enterSends);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -11014,7 +11002,7 @@ function applyEnterSends(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedEnterSends() {
-  return deviceStorage().getItem(ENTER_SENDS_KEY) !== "0";
+  return deviceSettings().get(DEVICE_SETTINGS.enterSends);
 }
 
 /**
@@ -14064,22 +14052,18 @@ const typesCharacter = (chord) => !chord.mod && !chord.alt && chord.key.length =
 /** Whether the single-key shortcuts are on. ON unless the reader turned them off: see `storedSingleKeys`. */
 let singleKeys = true;
 
-const SINGLE_KEYS_KEY = "vibe-talk.voice.single-keys";
 
 /** What was stored. ABSENT MEANS ON, as for Enter to send: the default is the behaviour. */
 function storedSingleKeys() {
-  try {
-    return deviceStorage().getItem(SINGLE_KEYS_KEY) !== "0";
-  } catch (_error) {
-    return true;
-  }
+  // A browser refusing storage reads as on (`DEVICE_SETTINGS.singleKeys.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.singleKeys);
 }
 
 /** Turn the single-key shortcuts on or off, keep the choice, and say the keys as they now are. */
 function applySingleKeys(on) {
   singleKeys = Boolean(on);
   try {
-    deviceStorage().setItem(SINGLE_KEYS_KEY, singleKeys ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.singleKeys, singleKeys);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -14506,6 +14490,20 @@ function deviceStorage() {
 /** This window's own storage, `sessionStorage`. */
 function windowStorage() {
   return browserPorts().windowStorage;
+}
+
+/**
+ * The settings this device keeps (web/src/core/settings `DEVICE_SETTINGS`), in its storage: each
+ * setting's key, encoding and default said once there. Made on first use, like `webPorts`.
+ *
+ * @type {import("./src/core/settings/index.ts").DeviceSettings | undefined}
+ */
+var pageDeviceSettings;
+
+/** {@link pageDeviceSettings}, made if it is not yet. */
+function deviceSettings() {
+  if (!pageDeviceSettings) pageDeviceSettings = createDeviceSettings(deviceStorage());
+  return pageDeviceSettings;
 }
 
 /**
@@ -33211,7 +33209,7 @@ function applyRichHeaders(on) {
   el("rich-headers").checked = shown;
   document.documentElement.setAttribute("data-rich-headers", shown ? "on" : "off");
   try {
-    deviceStorage().setItem(RICH_HEADERS_KEY, shown ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.richHeaders, shown);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -33219,11 +33217,8 @@ function applyRichHeaders(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedRichHeaders() {
-  try {
-    return deviceStorage().getItem(RICH_HEADERS_KEY) !== "0";
-  } catch (_error) {
-    return true;
-  }
+  // A browser refusing storage reads as on (`DEVICE_SETTINGS.richHeaders.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.richHeaders);
 }
 
 /**
@@ -36836,7 +36831,7 @@ function applyMarkOwnRead(on) {
   markOwnRead = Boolean(on);
   el("mark-own-read").checked = markOwnRead;
   try {
-    deviceStorage().setItem(MARK_OWN_KEY, markOwnRead ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.markOwnRead, markOwnRead);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -36844,7 +36839,7 @@ function applyMarkOwnRead(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedMarkOwnRead() {
-  return deviceStorage().getItem(MARK_OWN_KEY) !== "0";
+  return deviceSettings().get(DEVICE_SETTINGS.markOwnRead);
 }
 
 /** How long a first press of "Apply to existing messages" waits for the second, in milliseconds. */
@@ -37073,7 +37068,7 @@ function applyHideEmptyMessages(on) {
   hideEmptyMessages = Boolean(on);
   el("hide-empty-messages").checked = hideEmptyMessages;
   try {
-    deviceStorage().setItem(HIDE_EMPTY_KEY, hideEmptyMessages ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.hideEmptyMessages, hideEmptyMessages);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -37081,7 +37076,7 @@ function applyHideEmptyMessages(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedHideEmptyMessages() {
-  return deviceStorage().getItem(HIDE_EMPTY_KEY) !== "0";
+  return deviceSettings().get(DEVICE_SETTINGS.hideEmptyMessages);
 }
 
 /** Is `message` left out of the page: empty, while the reader has said to hide those? */
@@ -40459,7 +40454,7 @@ function applyCombineMessages(on) {
   combineMessages = Boolean(on);
   el("combine-messages").checked = combineMessages;
   try {
-    deviceStorage().setItem(COMBINE_KEY, combineMessages ? "1" : "0");
+    deviceSettings().keep(DEVICE_SETTINGS.combineMessages, combineMessages);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -40467,7 +40462,7 @@ function applyCombineMessages(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedCombineMessages() {
-  return deviceStorage().getItem(COMBINE_KEY) !== "0";
+  return deviceSettings().get(DEVICE_SETTINGS.combineMessages);
 }
 
 /**

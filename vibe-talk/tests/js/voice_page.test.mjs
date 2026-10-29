@@ -6188,6 +6188,40 @@ test("`#624 voice-page-modularity`: the settings sync runs on its own ports: the
   assert.equal(kept.get(KEY), "show", "a refusal cost this device its value");
 });
 
+test("`#624 voice-page-modularity`: each on/off setting reads, keeps and refuses as its own reader and writer always did", () => {
+  const { DEVICE_SETTINGS, createDeviceSettings } = SETTINGS;
+  // [name, key, nothing kept, what on keeps, what off keeps, a refused read (undefined: thrown)].
+  const table = [
+    ["inAppLinks", "vibe-talk.voice.in-app-links", true, "1", "0", undefined],
+    ["summarizeCollapsed", "vibe-talk.voice.summarize-collapsed", false, "1", "0", false],
+    ["linksRaw", "vibe-talk.voice.link-raw-urls", false, "on", null, false],
+    ["composerGrow", "vibe-talk.voice.composer-grow", false, "1", "0", false],
+    ["enterSends", "vibe-talk.voice.enter-sends", true, "1", "0", undefined],
+    ["singleKeys", "vibe-talk.voice.single-keys", true, "1", "0", true],
+    ["richHeaders", "vibe-talk.voice.rich-headers", true, "1", "0", true],
+    ["markOwnRead", "vibe-talk.voice.mark-own-read", true, "1", "0", undefined],
+    ["hideEmptyMessages", "vibe-talk.voice.hide-empty", true, "1", "0", undefined],
+    ["combineMessages", "vibe-talk.voice.combine", true, "1", "0", undefined],
+  ];
+  const refused = () => { throw new Error("SecurityError"); };
+  const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
+  for (const [name, key, absent, onKept, offKept, whenRefused] of table) {
+    const kept = new Map();
+    const settings = createDeviceSettings({ getItem: (k) => kept.get(k) ?? null, setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) });
+    const setting = DEVICE_SETTINGS[name];
+    assert.equal(setting.key, key, name);
+    assert.equal(settings.get(setting), absent, `${name}: nothing kept`);
+    settings.keep(setting, true);
+    assert.deepStrictEqual([kept.get(key) ?? null, settings.get(setting)], [onKept, true], `${name}: on`);
+    settings.keep(setting, false);
+    assert.deepStrictEqual([kept.get(key) ?? null, settings.get(setting)], [offKept, false], `${name}: off`);
+    if (whenRefused === undefined) assert.throws(() => off.get(setting), /SecurityError/, `${name}: a refusal was swallowed`);
+    else assert.equal(off.get(setting), whenRefused, `${name}: refused`);
+    assert.throws(() => off.keep(setting, true), /SecurityError/, `${name}: a refused write was swallowed`);
+  }
+  assert.deepStrictEqual(Object.keys(DEVICE_SETTINGS).sort(), table.map(([name]) => name).sort(), "a setting with no row here");
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
