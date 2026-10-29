@@ -204,7 +204,14 @@ def muse_verified_process_goal_paused(screen: str) -> bool:
         index for index, line in enumerate(lines)
         if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
     )
-    return any(line.strip() == "Goal (paused)" for line in lines[bottom + 1:])
+    # Muse draws it on a line of its own; the same notice right-aligned on the footer line counts
+    # too, so tolerating goal notices on the footer never turns a paused goal into an idle editor.
+    return any(
+        line.strip() == "Goal (paused)"
+        or (_muse_status_mode(line.strip()) is not None
+            and _muse_split_notice(line.strip())[1] == "Goal (paused)")
+        for line in lines[bottom + 1:]
+    )
 
 
 def _muse_composer_regions(
@@ -231,32 +238,15 @@ def _muse_composer_regions(
     return "\n".join(lines[:top]), "\n".join(lines[top + 1:bottom])
 
 
-def _muse_status_mode(line: str) -> str | None:
-    """Return the explicit mode from one structurally valid Muse footer.
+def _muse_split_notice(line: str) -> tuple[str, str | None]:
+    """Split one footer-region line into the footer and any notice Muse right-aligns on it.
 
-    Muse right-aligns transient notices on the footer line itself, after a gap of three or more
-    spaces: ``Paste again to expand for editing`` for a few seconds after a paste, and
-    ``Hook · UserPromptSubmit · ...`` after a submission. A line that is no footer as a whole is
-    read again without one of those notices; any other text keeps it no footer, so an unknown
-    status never passes for an idle editor.
+    Muse right-aligns transient notices on the footer line, after a gap of three or more
+    whitespace characters: ``Paste again to expand for editing`` after a paste, ``Hook ·
+    UserPromptSubmit · ...`` after a submission, and ``Goal (4h 28m) 86% ████████▋░`` or
+    ``Goal (blocked · 3m) 95% █████████▌`` while a goal is active. Whatever the notice says, the
+    footer is the text before the gap; a line with no such gap is all footer.
     """
-    mode = _muse_status_fields_mode(line)
-    if mode is None:
-        footer = _muse_without_notice(line)
-        if footer is not None:
-            mode = _muse_status_fields_mode(footer)
-    return mode
-
-
-# The notice Muse 1.4 right-aligns on its footer line for a few seconds after a paste, and how
-# the one it draws there after a submission starts.
-_MUSE_PASTE_NOTICE = "Paste again to expand for editing"
-_MUSE_HOOK_NOTICE = "Hook · "
-
-
-def _muse_without_notice(line: str) -> str | None:
-    """``line`` before its first run of three whitespace characters, when the rest of the line
-    is one of the notices Muse 1.4 was seen to draw there."""
     start: int | None = None
     for index, character in enumerate(line):
         if character.isspace():
@@ -264,25 +254,26 @@ def _muse_without_notice(line: str) -> str | None:
                 start = index
             continue
         if start is not None and index - start >= 3:
-            notice = line[index:]
-            if notice == _MUSE_PASTE_NOTICE or notice.startswith(_MUSE_HOOK_NOTICE):
-                return line[:start]
-            return None
+            return line[:start], line[index:]
         start = None
-    return None
+    return line, None
 
 
-def _muse_status_fields_mode(line: str) -> str | None:
-    """Return the mode of a line that is exactly one Muse footer."""
-    fields = [field.strip() for field in line.split("·")]
-    if (len(fields) not in (3, 4) or not all(fields)
-            or _MUSE_EFFORT.fullmatch(fields[1]) is None):
+def _muse_status_mode(line: str) -> str | None:
+    """Return the mode of one structurally valid Muse footer line, or ``None``.
+
+    The footer is recognized by its structure alone: at least three non-empty ``·``-separated
+    fields (``model · effort · dir``, then the approval mode when Muse shows one), optionally
+    followed by a right-aligned notice. The model name, the effort and the approval mode are
+    never checked against a list: the owner launches in YOLO as a matter of course, and an
+    unknown model, effort or mode must not make an idle editor read as busy. The mode returned is
+    the fourth field, or ``standard`` when Muse shows only three.
+    """
+    footer, _notice = _muse_split_notice(line.strip())
+    fields = [field.strip() for field in footer.split("·")]
+    if len(fields) < 3 or not all(fields):
         return None
-    if len(fields) == 3:
-        return "standard"
-    # A launch whose flags override saved settings reports Launch overrides
-    # instead of its approval mode (#382 muse-approval-never-ready).
-    return fields[3] if fields[3] in ("YOLO", "Auto-review", "Launch overrides") else None
+    return fields[3] if len(fields) > 3 else "standard"
 
 
 def _muse_footer_modes(lines: list[str]) -> tuple[str, ...]:

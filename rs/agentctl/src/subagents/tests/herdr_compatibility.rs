@@ -373,46 +373,55 @@ fn herdr_093_muse_adoption_archives_failed_final_generation_without_touching_run
     }
 }
 
+// Owner-directed: an adopted Muse pane takes input at whatever footer mode it shows, so an
+// adopted coordinator running in YOLO, which cannot be cycled to Auto-review, still receives
+// delivered messages. The process pin, the empty-editor baseline and the on-screen submission
+// proof stay exactly as for Auto-review.
 #[test]
-fn herdr_093_foreign_muse_current_yolo_mode_refuses_input_even_with_historical_auto_review() {
-    let fixture = Fixture::new();
-    let options = prepare_muse(&fixture, true);
-    let manager = fixture.manager();
-    manager.adopt("foreign", options).unwrap();
-    {
-        let mut editor = fixture.client.muse_editor.lock().unwrap();
-        let editor = editor.as_mut().unwrap();
-        editor
-            .history
-            .push("❯ a prior prompt mentions Auto-review\n◆ prior response".to_owned());
-        editor.mode = "YOLO".to_owned();
+fn herdr_093_foreign_muse_takes_input_at_every_footer_mode() {
+    for mode in ["YOLO", "", "Launch overrides"] {
+        let fixture = Fixture::new();
+        let options = prepare_muse(&fixture, true);
+        let manager = fixture.manager();
+        manager.adopt("foreign", options).unwrap();
+        {
+            let mut editor = fixture.client.muse_editor.lock().unwrap();
+            let editor = editor.as_mut().unwrap();
+            editor
+                .history
+                .push("❯ a prior prompt mentions Auto-review\n◆ prior response".to_owned());
+            editor.mode = mode.to_owned();
+        }
+        assert_eq!(
+            manager.status("foreign").unwrap()["agent_status"],
+            "idle",
+            "{mode:?}"
+        );
+        let prompt = "a message for an adopted coordinator";
+        let result = manager
+            .send_identified_with_runtime(
+                "foreign",
+                prompt,
+                quick_delivery(),
+                "message",
+                &Clock::default(),
+            )
+            .unwrap();
+        assert_eq!(result.delivered, ["message"], "{mode:?}");
+        assert_eq!(
+            *fixture.client.literal_pastes.lock().unwrap(),
+            [(
+                "owned".to_owned(),
+                format!("{BRACKETED_PASTE_START}{prompt}{BRACKETED_PASTE_END}")
+            )],
+            "{mode:?}"
+        );
+        assert_eq!(
+            *fixture.client.keys_sent.lock().unwrap(),
+            [("owned".to_owned(), "Enter".to_owned())],
+            "{mode:?}"
+        );
     }
-    assert_eq!(manager.status("foreign").unwrap()["agent_status"], "idle");
-    let error = manager
-        .send_identified_with_runtime(
-            "foreign",
-            "must remain untouched",
-            quick_delivery(),
-            "yolo",
-            &Clock::default(),
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("Auto-review"), "{error}");
-    // The refusal comes before any input, so the prompt stays pending (#395
-    // muse-launch-overrides-input), never quarantined as possibly submitted.
-    assert!(matches!(error, AgentError::Pending(_)), "{error}");
-    assert_eq!(error.exit_code(), 75);
-    assert!(error.to_string().contains("nothing was typed"), "{error}");
-    no_input(&fixture);
-    let retained = agent::read_private_json(&error.undelivered().unwrap().artifact).unwrap();
-    assert_eq!(retained["delivery_state"], "pending");
-    assert!(retained.get("possibly_submitted").is_none());
-    assert!(manager
-        .drain_with_runtime("foreign", quick_delivery(), &Clock::default())
-        .unwrap()
-        .delivered
-        .is_empty());
-    no_input(&fixture);
 }
 
 /// A runtime whose caller cancels it once text has been pasted into a pane, as a service stop

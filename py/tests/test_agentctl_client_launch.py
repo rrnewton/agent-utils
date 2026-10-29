@@ -22,6 +22,7 @@ from agentctl.client import (
     HerdrClient,
     ProcessInfo,
     muse_auto_review_idle_composer,
+    muse_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_in_transcript,
     muse_prompt_is_exact_composer,
@@ -35,6 +36,7 @@ from agentctl.client import (
     muse_verified_process_prompt_in_composer,
     muse_verified_process_prompt_is_exact_composer,
     muse_verified_process_prompt_transcript_count,
+    muse_verified_process_turn_running,
 )
 from agentctl.errors import HerdrUnavailable
 from agentctl.procstat import ProcessStat, parse_process_stat
@@ -393,22 +395,30 @@ def test_captured_headerless_frames_count_pastes_in_code_points() -> None:
     assert muse_verified_process_paste_is_exact_composer(hinted, hint_brief)
     assert muse_verified_process_composer(hinted)
     assert not muse_verified_process_idle_composer(hinted)
-    # Only a known notice after a gap of three spaces is set apart, and the footer still needs
-    # one mode; any other text keeps the line no footer at all.
+    # The footer is structural: whatever follows a gap of three spaces is a notice, and the text
+    # before it needs three non-empty fields, whatever they say.
     footer = "watermelon-full-preview · xhigh · ~/work/project · Launch overrides"
     for line in (
-        f"{footer}  Paste again to expand for editing",
-        f"{footer}X   Paste again to expand for editing",
+        f"{footer}   Paste again to expand for editing",
         f"{footer}   Goal (paused)",
         f"{footer}   Paste again to expand",
         f"{footer}   Hook",
-        "m · high · /my   dir · Auto-review   Paste again to expand for editing",
-        "   Paste again to expand for editing",
+        f"{footer}X   anything at all",
     ):
-        assert client_module._muse_status_mode(line.strip()) is None, line
+        assert client_module._muse_status_mode(line) is not None, line
     assert client_module._muse_status_mode(
         "model · high · /work · YOLO\u3000\t Hook · UserPromptSubmit"
     ) == "YOLO"
+    for line in (
+        "   Paste again to expand for editing",
+        "Goal (blocked · 3m) 95% █████████▌",
+        "◇ Thinking (16s · esc to interrupt)",
+        "model · · /work · YOLO",
+        "model · xhigh",
+        "Goal (paused)",
+        "",
+    ):
+        assert client_module._muse_status_mode(line) is None, line
 
     # 3175 code points, 3824 bytes and 3234 UTF-16 units with one CRLF: Muse shows 3174.
     unicode = briefs["unicode-crlf"]
@@ -457,6 +467,62 @@ def test_verified_muse_paused_goal_requires_footer_region() -> None:
     )
     assert muse_verified_process_goal_paused(paused)
     assert not muse_verified_process_goal_paused(transcript_echo)
+
+
+# Footers read from live Muse panes with an active goal (2026-10-28): Muse right-aligns the
+# goal's elapsed time, state and progress bar on the footer line itself.
+_GOAL_FOOTERS = (
+    "watermelon-full-preview · xhigh · ~/work/project · YOLO          Goal (4h 28m) 86% ████████▋░",
+    "watermelon-full-preview · xhigh · ~/work/project · Auto-review"
+    + " " * 77 + "Goal (blocked · 3m) 95% █████████▌",
+    "watermelon-full-preview · xhigh · ~/work/project · YOLO   Goal (45m) 47% ████▊░░░░░",
+    "watermelon-full-preview · xhigh · ~/work/project · YOLO   Goal (13m) 34% ███▍░░░░░░",
+)
+
+
+def test_an_active_goal_notice_on_the_footer_leaves_the_editor_readable() -> None:
+    divider = "─" * 40
+    for footer in _GOAL_FOOTERS:
+        idle = f"◆ prior answer\n{divider}\n❯\n{divider}\n  {footer}\n"
+        assert muse_verified_process_idle_composer(idle), footer
+        assert muse_idle_composer(f"Muse Code 1.4.0\n{idle}"), footer
+        assert not muse_verified_process_goal_paused(idle), footer
+        running = idle.replace(
+            "◆ prior answer\n", "◆ prior answer\n◇ Thinking (16s · esc to interrupt)\n",
+        )
+        assert not muse_verified_process_idle_composer(running), footer
+        assert muse_verified_process_turn_running(running), footer
+        doubled = idle.replace(f"  {footer}\n", f"  {footer}\n  kiki · high · /work · YOLO\n")
+        assert not muse_verified_process_idle_composer(doubled), footer
+    quoted = f"{_GOAL_FOOTERS[0]}\n{divider}\n❯\n{divider}\n"
+    assert not muse_verified_process_idle_composer(quoted)
+    alone = f"old\n{divider}\n❯\n{divider}\nGoal (45m) 47% ████▊░░░░░\n"
+    assert not muse_verified_process_idle_composer(alone)
+
+
+def test_a_footer_with_an_unknown_model_effort_or_mode_is_still_a_footer() -> None:
+    divider = "─" * 40
+    for footer in (
+        "some-future-model-v9 · turbo-max · /work/project · Dangerously skip everything",
+        "GPT-6.1 Sol ultra · ultra · ~/work/project · YOLO",
+        "m · e · /d",
+        "m · e · /d · Mode · and another field",
+    ):
+        idle = f"old transcript\n{divider}\n❯\n{divider}\n{footer}\n"
+        assert muse_verified_process_idle_composer(idle), footer
+    for not_footer in ("model · · /work · YOLO", "model · xhigh", "model with spaces · E · /w · "):
+        idle = f"old transcript\n{divider}\n❯\n{divider}\n{not_footer}\n"
+        assert not muse_verified_process_idle_composer(idle), not_footer
+
+
+def test_a_paused_goal_on_the_footer_line_still_pauses() -> None:
+    divider = "─" * 40
+    footer = "kiki · xhigh · /work/project · YOLO"
+    paused = f"old\n{divider}\n❯\n{divider}\n{footer}   Goal (paused)\n"
+    assert muse_verified_process_goal_paused(paused)
+    active = paused.replace("Goal (paused)", "Goal (45m) 47% ████▊░░░░░")
+    assert not muse_verified_process_goal_paused(active)
+    assert muse_verified_process_idle_composer(active)
 
 
 def test_muse_prompt_must_move_from_composer_to_transcript() -> None:

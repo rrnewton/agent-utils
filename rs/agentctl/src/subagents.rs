@@ -23,9 +23,8 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
-    muse_auto_review_idle_composer, muse_editor_rows_empty, muse_startup_metadata,
-    muse_trust_prompt, muse_verified_pane_status, muse_verified_process_editor_rows,
-    muse_verified_process_footer_mode, muse_verified_process_idle_composer,
+    muse_editor_rows_empty, muse_startup_metadata, muse_trust_prompt, muse_verified_pane_status,
+    muse_verified_process_editor_rows, muse_verified_process_idle_composer,
     muse_verified_process_paste_in_composer, muse_verified_process_paste_is_exact_composer,
     muse_verified_process_prompt_transcript_count, AgentIdentity, AgentPaneInfo,
     CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
@@ -2187,13 +2186,14 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     ///
     /// The pane must show Muse's empty editor with exactly one status footer, read between two
     /// checks of the pinned process. Muse 1.4 scrolls its versioned header away, so the process
-    /// pin, not the header, says the screen is Muse's. Any footer mode will do for a session agentctl launched, since its approval mode
-    /// is what the owner's launch profile chose: `YOLO`, `Auto-review`, the three-field standard
-    /// footer, or `Launch overrides` (#382 muse-approval-never-ready). An adopted pane was
-    /// launched by someone else, so it keeps taking input only at its `Auto-review` editor. The
-    /// mode never limits where a misroute lands: a program that replaces the pinned one between
-    /// a check and a write is not the one whose footer was read, so the process checks around
-    /// every effect, not the footer, are the misroute defense (#395 muse-launch-overrides-input).
+    /// pin, not the header, says the screen is Muse's. Any recognized footer mode will do:
+    /// `YOLO`, `Auto-review`, the three-field standard footer, or `Launch overrides` (#382
+    /// muse-approval-never-ready). That holds for an adopted pane too: the owner directed that
+    /// an adopted Muse coordinator running in `YOLO`, which cannot be cycled to `Auto-review`,
+    /// still take delivered messages, so the approval mode no longer gates input. The mode never
+    /// limited where a misroute lands: a program that replaces the pinned one between a check
+    /// and a write is not the one whose footer was read, so the process checks around every
+    /// effect, not the footer, are the misroute defense (#395 muse-launch-overrides-input).
     ///
     /// Nothing has been typed when this returns, so every refusal is `NotStaged`: the prompt
     /// stays pending instead of being quarantined as possibly submitted.
@@ -2226,11 +2226,6 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     "pane {pane_id} does not show an empty Muse editor with one status footer"
                 )));
             }
-            if self.record.is_foreign() && !muse_auto_review_idle_composer(&before) {
-                return Err(AdapterError::unavailable(
-                    "an adopted Muse pane takes input only at its Auto-review editor",
-                ));
-            }
             Ok(before)
         };
         baseline().map_err(|error| {
@@ -2262,7 +2257,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// As [`Self::muse_paste_baseline`], but the editor may sit below Muse's running-turn row:
     /// the pane must show Muse's empty editor above exactly one status footer, read between two
     /// checks of the pinned process. A draft in the editor, an approval form or a panel in its
-    /// place, or any other screen refuses. An adopted pane still needs its `Auto-review` footer.
+    /// place, or any other screen refuses. Any recognized footer mode will do, adopted or not.
     /// Nothing has been typed when this returns, so every refusal is `NotStaged`.
     fn muse_followup_baseline(
         &self,
@@ -2289,14 +2284,6 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     "pane {pane_id} does not show an empty Muse editor with one status footer \
                      (a draft, an approval form or a panel may be there)"
                 )));
-            }
-            if self.record.is_foreign()
-                && muse_verified_process_footer_mode(&crate::harness_tui::plain(&before))
-                    != Some("Auto-review")
-            {
-                return Err(AdapterError::unavailable(
-                    "an adopted Muse pane takes input only at its Auto-review editor",
-                ));
             }
             Ok(before)
         };

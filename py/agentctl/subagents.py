@@ -37,7 +37,6 @@ from agentctl.client import (
     Pane,
     PaneShellProof,
     herdr_error_code,
-    muse_auto_review_idle_composer,
     muse_idle_composer,
     muse_startup_metadata,
     muse_trust_prompt,
@@ -1809,14 +1808,15 @@ class _WorkspaceClient:
 
         The pane must show Muse's empty editor with exactly one status footer, read between two
         checks of the pinned process. Muse 1.4 scrolls its versioned header away, so the process
-        pin, not the header, says the screen is Muse's. Any footer mode will do for a session
-        agentctl launched, since its approval mode is what the owner's launch profile chose:
+        pin, not the header, says the screen is Muse's. Any recognized footer mode will do:
         ``YOLO``, ``Auto-review``, the three-field standard footer, or ``Launch overrides``
-        (#382 muse-approval-never-ready). An adopted pane was launched by someone else, so it
-        keeps taking input only at its ``Auto-review`` editor. The mode never limits where a
-        misroute lands: a program that replaces the pinned one between a check and a write is
-        not the one whose footer was read, so the process checks around every effect, not the
-        footer, are the misroute defense (#395 muse-launch-overrides-input).
+        (#382 muse-approval-never-ready). That holds for an adopted pane too: the owner directed
+        that an adopted Muse coordinator running in ``YOLO``, which cannot be cycled to
+        ``Auto-review``, still take delivered messages, so the approval mode no longer gates
+        input. The mode never limited where a misroute lands: a program that replaces the pinned
+        one between a check and a write is not the one whose footer was read, so the process
+        checks around every effect, not the footer, are the misroute defense (#395
+        muse-launch-overrides-input).
 
         Nothing has been typed when this returns, so every refusal is ``PromptNotStaged``: the
         prompt stays pending instead of being quarantined as possibly submitted.
@@ -1838,11 +1838,6 @@ class _WorkspaceClient:
             if not muse_verified_process_idle_composer(before):
                 raise HerdrUnavailable(
                     f"pane {pane_id} does not show an empty Muse editor with one status footer"
-                )
-            if (self.record.adapter == "herdr-foreign"
-                    and not muse_auto_review_idle_composer(before)):
-                raise HerdrUnavailable(
-                    "an adopted Muse pane takes input only at its Auto-review editor"
                 )
         except PromptNotStaged:
             raise

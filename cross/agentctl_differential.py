@@ -1650,22 +1650,20 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
             "foreign Muse bypassed staged input or changed runtime ownership")
         _change(case, {"custom_permission": "YOLO", "custom_submitted": False,
                        "custom_draft": ""})
-        # Refused before any input, so the prompt stays pending (#395
-        # muse-launch-overrides-input) rather than quarantined as possibly submitted.
-        _pair(harness, report, case, f"primary/adopt/muse/{label}/yolo-refusal", (
-            "send", "foreign", "must not bypass Auto-review", "--message-id", "foreign-yolo",
-            "--ready-timeout", "0", *_COMMON,
-        ), 75)
-        report.require(f"primary/adopt/muse/{label}/yolo-no-input", all(
-            _submission_count(root, "must not bypass Auto-review") == 0
-            and (root / "registry/agents/foreign/queue/inbox/foreign-yolo.json").is_file()
-            and not (root / "registry/agents/foreign/queue/failed/foreign-yolo.json").exists()
+        # Owner-directed: an adopted Muse pane takes input whatever its footer's approval mode,
+        # so an adopted coordinator in YOLO, the owner's normal launch mode, still receives
+        # messages, through the same staged-editor and on-screen submission proofs.
+        _pair(harness, report, case, f"primary/adopt/muse/{label}/yolo-delivery", (
+            "send", "foreign", "an adopted YOLO pane takes input", "--message-id",
+            "foreign-yolo", "--ready-timeout", "0", *_COMMON,
+        ))
+        report.require(f"primary/adopt/muse/{label}/yolo-input", all(
+            _submission_count(root, "an adopted YOLO pane takes input") == 1
+            and (root / "registry/agents/foreign/queue/processed/foreign-yolo.json").is_file()
             for root in (case.python_root, case.rust_root)),
-            "foreign Muse delivery ignored Auto-review policy")
-        for root in (case.python_root, case.rust_root):
-            (root / "registry/agents/foreign/queue/inbox/foreign-yolo.json").unlink()
-        _change(case, {"custom_permission": "Auto-review",
-                       "fixture_shell_pid": harness.replacement_shell.pid})
+            "foreign Muse delivery refused a YOLO footer")
+        _change(case, {"custom_permission": "Auto-review", "custom_submitted": False,
+                       "custom_draft": "", "fixture_shell_pid": harness.replacement_shell.pid})
         outcomes = harness.invoke(case, ("send", "foreign", "must not cross shell generation",
                                          "--message-id", "foreign-replacement", *_COMMON))
         report.require(f"primary/adopt/muse/{label}/shell-replacement-refusal",

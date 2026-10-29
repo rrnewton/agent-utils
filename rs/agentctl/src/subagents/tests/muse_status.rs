@@ -139,37 +139,41 @@ fn a_muse_refusal_before_any_input_keeps_the_prompt_pending() {
 }
 
 // Ported from py/tests/test_agentctl_adopt.py
-// test_suggestion13_foreign_muse_retains_current_composer_permission_policy, standard mode. Its
-// YOLO mode is herdr_compatibility.rs
-// herdr_093_foreign_muse_current_yolo_mode_refuses_input_even_with_historical_auto_review.
+// test_suggestion13_foreign_muse_takes_input_in_any_footer_mode, standard mode. Its YOLO and
+// Launch overrides modes are herdr_compatibility.rs
+// herdr_093_foreign_muse_takes_input_at_every_footer_mode.
 #[test]
-fn foreign_muse_standard_mode_retains_the_auto_review_input_policy() {
+fn foreign_muse_standard_mode_takes_input() {
     let fixture = Fixture::new();
     fixture.prepare_foreign();
     fixture
         .client
         .custom_reported
         .store(true, Ordering::Relaxed);
-    show(
-        &fixture,
-        "idle",
-        &format!(
-            "Muse Code 1.3.0\n❯ quoted prior model · high · /work · Auto-review\n◆ ok\n\
-             {DIVIDER}\n❯\n{DIVIDER}\nmodel · high · /work\n"
-        ),
-    );
+    *fixture.client.muse_editor.lock().unwrap() = Some(MuseEditor::new("", true, None));
     let mut options = fixture.adopt_options();
     options.harness = "muse".to_owned();
     let manager = fixture.manager();
     manager.adopt("foreign", options).unwrap();
     assert_eq!(manager.status("foreign").unwrap()["agent_status"], "idle");
-    let error = manager
-        .send("foreign", "must remain untyped", held())
-        .unwrap_err();
-    assert!(matches!(error, AgentError::Pending(_)), "{error}");
-    assert_eq!(error.exit_code(), 75);
-    assert!(error.to_string().contains("Auto-review"), "{error}");
-    no_input(&fixture);
+    let result = manager
+        .send("foreign", "typed at standard", held())
+        .unwrap();
+    assert_eq!(result.delivered.len(), 1, "{result:?}");
+    assert_eq!(
+        fixture
+            .client
+            .literal_pastes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>(),
+        [format!(
+            "{BRACKETED_PASTE_START}typed at standard{BRACKETED_PASTE_END}"
+        )]
+    );
+    assert_eq!(fixture.client.keys_sent.lock().unwrap().len(), 1);
     assert_eq!(manager.load("foreign").unwrap().adapter, "herdr-foreign");
 }
 

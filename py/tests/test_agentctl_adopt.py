@@ -22,7 +22,7 @@ from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
 from agentctl.errors import (
-    AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrRunError, HerdrUnavailable,
+    AgentDeliveryError, AgentPossiblySubmitted, HerdrRunError, HerdrUnavailable,
     RecoveryAction, _with_recovery,
 )
 from agentctl.sessions import Sessions
@@ -1662,20 +1662,21 @@ def test_suggestion13_adopted_muse_uses_pinned_guarded_editor_and_preserves_runt
     assert fake.launched == [] and fake.closed == []
 
 
-@pytest.mark.parametrize("mode", ["YOLO", "standard"])
-def test_suggestion13_foreign_muse_retains_current_composer_permission_policy(
+@pytest.mark.parametrize("mode", ["YOLO", "standard", "Launch overrides"])
+def test_suggestion13_foreign_muse_takes_input_in_any_footer_mode(
     mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Owner-directed: an adopted Muse coordinator running in YOLO, which cannot be cycled to
+    # Auto-review, still receives delivered messages. Every other proof stays in place.
     sessions, fake, pane, pastes = _suggestion13_foreign_muse(tmp_path, monkeypatch, mode=mode)
     fake.transcripts[pane] = ["quoted prior model · high · /work · Auto-review"]
     sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
                    expected_cwd=str(tmp_path), harness="muse")
-    # The refusal comes before any input, so the prompt stays pending (#395
-    # muse-launch-overrides-input), never quarantined as possibly submitted.
-    with pytest.raises(AgentPending, match="Auto-review") as raised:
-        sessions.send_session("foreign", "must remain untyped", ready_timeout=0)
-    assert raised.value.exit_code == 75
-    assert pastes == [] and fake.keys_sent == [] and fake.submitted == []
+    fake.expect_supported = True
+    assert sessions.send_session("foreign", "typed at any mode", ready_timeout=0)["delivered"]
+    assert fake.submitted == ["typed at any mode"]
+    assert pastes == ["\x1b[200~typed at any mode\x1b[201~"]
+    assert fake.keys_sent == [(pane, "Enter")]
     assert sessions.get("foreign").adapter == "herdr-foreign"
 
 

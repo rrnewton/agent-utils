@@ -142,13 +142,15 @@ mod tests {
         assert!(!MuseTui::editor_empty(APPROVAL));
         assert_eq!(state(HELP), State::MenuOrPicker);
         assert!(!MuseTui::editor_empty(HELP));
-        // For a few seconds after Enter, Tab or Esc Muse right-aligns a notice on the footer that
-        // the shared footer reader does not know, so no editor is recognised: nothing is typed
-        // into such a frame, and a submission's proof waits for the notice to go.
-        for screen in [STEER_NOTICE, QUEUED_NOTICE, INTERRUPTING] {
-            assert_eq!(state(screen), State::Unknown);
-            assert!(!MuseTui::editor_empty(screen));
+        // For a few seconds after Enter, Tab or Esc Muse right-aligns a notice on the footer.
+        // The footer is read by its structure, so the notice does not hide the editor: the turn
+        // still reads as running, an empty editor as empty, and a draft as a draft.
+        for screen in [STEER_NOTICE, QUEUED_NOTICE] {
+            assert_eq!(state(screen), State::Working);
+            assert!(MuseTui::editor_empty(screen));
         }
+        assert_eq!(state(INTERRUPTING), State::Working);
+        assert!(!MuseTui::editor_empty(INTERRUPTING));
         assert!(MuseTui
             .answer_plan(
                 &Question {

@@ -20,8 +20,6 @@
 
 use std::collections::BTreeSet;
 
-use super::muse_effort;
-
 /// Markers Muse draws in front of the editor's first line and in front of each user turn.
 const PROMPT_MARKERS: [&str; 2] = ["❯", "›"];
 /// Markers that end one rendered user turn: the answer marker, the next user turn, or the progress
@@ -112,25 +110,14 @@ fn starts_with_marker(line: &str, markers: &[&str]) -> bool {
     })
 }
 
-/// Return the explicit mode from one structurally valid Muse footer.
+/// Split one footer-region line into the footer itself and any notice Muse right-aligns on it.
 ///
-/// Muse right-aligns transient notices on the footer line itself, after a gap of three or more
-/// spaces: `Paste again to expand for editing` for a few seconds after a paste, and
-/// `Hook · UserPromptSubmit · ...` after a submission. A line that is no footer as a whole is
-/// read again without one of those notices; any other text keeps it no footer, so an unknown
-/// status never passes for an idle editor.
-fn muse_status_mode(line: &str) -> Option<&'static str> {
-    muse_status_fields_mode(line).or_else(|| without_notice(line).and_then(muse_status_fields_mode))
-}
-
-/// The notice Muse 1.4 right-aligns on its footer line for a few seconds after a paste.
-const PASTE_NOTICE: &str = "Paste again to expand for editing";
-/// How the notice Muse 1.4 right-aligns on its footer line after a submission starts.
-const HOOK_NOTICE: &str = "Hook · ";
-
-/// `line` before its first run of three whitespace characters, when the rest of the line is
-/// one of the notices Muse 1.4 was seen to draw there: [`PASTE_NOTICE`] or a [`HOOK_NOTICE`].
-fn without_notice(line: &str) -> Option<&str> {
+/// Muse right-aligns transient notices on the footer line, after a gap of three or more
+/// whitespace characters: `Paste again to expand for editing` after a paste, `Hook ·
+/// UserPromptSubmit · ...` after a submission, and `Goal (4h 28m) 86% ████████▋░` or `Goal
+/// (blocked · 3m) 95% █████████▌` while a goal is active. Whatever the notice says, the footer is
+/// the text before the gap; a line with no such gap is all footer.
+fn split_notice(line: &str) -> (&str, Option<&str>) {
     let (mut start, mut run) = (0, 0);
     for (index, value) in line.char_indices() {
         if is_space(value) {
@@ -141,43 +128,36 @@ fn without_notice(line: &str) -> Option<&str> {
             continue;
         }
         if run >= 3 {
-            let notice = &line[index..];
-            return (notice == PASTE_NOTICE || notice.starts_with(HOOK_NOTICE))
-                .then_some(&line[..start]);
+            return (&line[..start], Some(&line[index..]));
         }
         run = 0;
     }
-    None
+    (line, None)
 }
 
-/// Return the mode of a line that is exactly one Muse footer.
-fn muse_status_fields_mode(line: &str) -> Option<&'static str> {
-    let fields = line.split('·').map(strip).collect::<Vec<_>>();
-    if !matches!(fields.len(), 3 | 4)
-        || fields.iter().any(|field| field.is_empty())
-        || !muse_effort(fields[1])
-    {
+/// Return the mode of one structurally valid Muse footer line, or `None` for any other line.
+///
+/// The footer is recognized by its structure alone: at least three non-empty `·`-separated
+/// fields (`model · effort · dir`, then the approval mode when Muse shows one), optionally
+/// followed by a right-aligned notice (see [`split_notice`]). The model name, the effort and the
+/// approval mode are never checked against a list: the owner launches in YOLO as a matter of
+/// course, and an unknown model, effort or mode must not make an idle editor read as busy. The
+/// mode returned is the fourth field, or `standard` when Muse shows only three.
+fn muse_status_mode(line: &str) -> Option<String> {
+    let (footer, _) = split_notice(strip(line));
+    let fields = footer.split('·').map(strip).collect::<Vec<_>>();
+    if fields.len() < 3 || fields.iter().any(|field| field.is_empty()) {
         return None;
     }
-    if fields.len() == 3 {
-        return Some("standard");
-    }
-    match fields[3] {
-        "YOLO" => Some("YOLO"),
-        "Auto-review" => Some("Auto-review"),
-        // A launch whose flags override saved settings reports this instead of
-        // its approval mode (#382 muse-approval-never-ready).
-        "Launch overrides" => Some("Launch overrides"),
-        _ => None,
-    }
+    Some(fields.get(3).copied().unwrap_or("standard").to_owned())
 }
 
 /// Return all structurally valid footer modes; callers require one authority.
-fn muse_footer_modes(lines: &[&str]) -> Vec<&'static str> {
+fn muse_footer_modes(lines: &[&str]) -> Vec<String> {
     lines
         .iter()
         .filter(|line| !strip(line).is_empty())
-        .filter_map(|line| muse_status_mode(strip(line)))
+        .filter_map(|line| muse_status_mode(line))
         .collect()
 }
 
@@ -239,6 +219,16 @@ pub(crate) fn muse_idle_composer(screen: &str) -> bool {
 }
 
 /// Require the Auto-review footer on the active empty composer.
+// Delivery no longer requires this footer on an adopted pane (owner-directed, so an adopted
+// coordinator in YOLO still takes messages); the tests keep pinning what the footer proof means,
+// as py/agentctl/client.py does.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only tests call it since delivery accepts any footer mode"
+    )
+)]
 pub(crate) fn muse_auto_review_idle_composer(screen: &str) -> bool {
     let Some((transcript, composer)) = muse_composer_regions(screen, true) else {
         return false;
@@ -268,7 +258,9 @@ pub(crate) fn muse_verified_process_composer(screen: &str) -> bool {
 /// Recognize Muse's explicit paused-goal state in a verified UI frame.
 ///
 /// Only the footer region below the last rule counts, so a transcript line that merely quotes
-/// `Goal (paused)` never pauses delivery.
+/// `Goal (paused)` never pauses delivery. Muse draws it on a line of its own; the same notice
+/// right-aligned on the footer line counts too, so tolerating goal notices on the footer never
+/// turns a paused goal into an idle editor.
 pub(crate) fn muse_verified_process_goal_paused(screen: &str) -> bool {
     if muse_composer_regions(screen, false).is_none() {
         return false;
@@ -277,9 +269,14 @@ pub(crate) fn muse_verified_process_goal_paused(screen: &str) -> bool {
     let Some(bottom) = lines.iter().rposition(|line| is_divider(line)) else {
         return false;
     };
-    lines[bottom + 1..]
-        .iter()
-        .any(|line| strip(line) == GOAL_PAUSED)
+    lines[bottom + 1..].iter().any(|line| {
+        let line = strip(line);
+        line == GOAL_PAUSED
+            || (muse_status_mode(line).is_some()
+                && split_notice(line)
+                    .1
+                    .is_some_and(|notice| notice == GOAL_PAUSED))
+    })
 }
 
 /// The status a pinned Muse pane reports: paused, idle, staged or working, in that order.
@@ -544,17 +541,6 @@ pub(crate) fn muse_editor_rows_empty(rows: &str) -> bool {
     muse_editor_segments(rows).is_some_and(|segments| segments.is_empty())
 }
 
-/// The mode of the one status footer below Muse's editor, after live-Muse process verification.
-pub(crate) fn muse_verified_process_footer_mode(screen: &str) -> Option<&'static str> {
-    muse_composer_regions(screen, false)?;
-    let lines = splitlines(screen);
-    let bottom = lines.iter().rposition(|line| is_divider(line))?;
-    match muse_footer_modes(&lines[bottom + 1..]).as_slice() {
-        [mode] => Some(mode),
-        _ => None,
-    }
-}
-
 /// Whether the rows above Muse's editor show its running-turn row anywhere near the bottom.
 ///
 /// Unlike [`muse_verified_process_turn_running`], which reads only the last transcript row, this
@@ -749,24 +735,34 @@ mod tests {
             &hinted, hint_brief
         ));
         assert_eq!(muse_verified_pane_status("idle", &hinted), "staged");
-        // Only a known notice after a gap of three spaces is set apart, and the footer still
-        // needs one mode; any other text keeps the line no footer at all.
+        // The footer is structural: whatever follows a gap of three spaces is a notice, and
+        // the text before it needs three non-empty fields, whatever they say.
         let footer = "watermelon-full-preview · xhigh · ~/work/project · Launch overrides";
         for line in [
-            format!("{footer}  Paste again to expand for editing"),
-            format!("{footer}X   Paste again to expand for editing"),
+            format!("{footer}   Paste again to expand for editing"),
             format!("{footer}   Goal (paused)"),
             format!("{footer}   Paste again to expand"),
             format!("{footer}   Hook"),
-            "m · high · /my   dir · Auto-review   Paste again to expand for editing".to_owned(),
-            "   Paste again to expand for editing".to_owned(),
+            format!("{footer}X   anything at all"),
         ] {
-            assert_eq!(muse_status_mode(strip(&line)), None, "{line}");
+            assert!(muse_status_mode(&line).is_some(), "{line}");
         }
         assert_eq!(
-            muse_status_mode("model · high · /work · YOLO\u{3000}\t Hook · UserPromptSubmit"),
+            muse_status_mode("model · high · /work · YOLO\u{3000}\t Hook · UserPromptSubmit")
+                .as_deref(),
             Some("YOLO")
         );
+        for line in [
+            "   Paste again to expand for editing",
+            "Goal (blocked · 3m) 95% █████████▌",
+            "◇ Thinking (16s · esc to interrupt)",
+            "model · · /work · YOLO",
+            "model · xhigh",
+            "Goal (paused)",
+            "",
+        ] {
+            assert_eq!(muse_status_mode(line), None, "{line}");
+        }
 
         // 3175 code points, 3824 bytes and 3234 UTF-16 units with one CRLF: Muse shows 3174.
         let unicode = briefs["unicode-crlf"].as_str().unwrap();
@@ -815,6 +811,95 @@ mod tests {
             muse_verified_process_prompt_transcript_count(&accepted, prompt),
             1
         );
+    }
+
+    // Footers read from live Muse panes with an active goal (2026-10-28): Muse right-aligns the
+    // goal's elapsed time, state and progress bar on the footer line itself.
+    const GOAL_FOOTERS: [&str; 4] = [
+        "watermelon-full-preview · xhigh · ~/work/project · YOLO          Goal (4h 28m) 86% ████████▋░",
+        "watermelon-full-preview · xhigh · ~/work/project · Auto-review                                                                             Goal (blocked · 3m) 95% █████████▌",
+        "watermelon-full-preview · xhigh · ~/work/project · YOLO   Goal (45m) 47% ████▊░░░░░",
+        "watermelon-full-preview · xhigh · ~/work/project · YOLO   Goal (13m) 34% ███▍░░░░░░",
+    ];
+
+    #[test]
+    fn an_active_goal_notice_on_the_footer_leaves_the_editor_readable() {
+        let divider = "─".repeat(40);
+        for footer in GOAL_FOOTERS {
+            let idle = format!("◆ prior answer\n{divider}\n❯\n{divider}\n  {footer}\n");
+            assert!(muse_verified_process_idle_composer(&idle), "{footer}");
+            assert!(
+                muse_idle_composer(&format!("Muse Code 1.4.0\n{idle}")),
+                "{footer}"
+            );
+            assert_eq!(muse_verified_pane_status("idle", &idle), "idle", "{footer}");
+            assert!(!muse_verified_process_goal_paused(&idle), "{footer}");
+            assert_eq!(
+                muse_verified_process_editor_rows(&idle).as_deref(),
+                Some("❯"),
+                "{footer}"
+            );
+            // Muse's progress line above the editor is a running turn, goal or no goal.
+            let running = idle.replace(
+                "◆ prior answer\n",
+                "◆ prior answer\n◇ Thinking (16s · esc to interrupt)\n",
+            );
+            assert!(!muse_verified_process_idle_composer(&running), "{footer}");
+            assert!(muse_verified_process_turn_running(&running), "{footer}");
+            assert_eq!(muse_verified_pane_status("idle", &running), "working");
+            // A draft is still a draft.
+            let staged = idle.replace("❯\n", "❯ owner draft\n");
+            assert_eq!(muse_verified_pane_status("idle", &staged), "staged");
+            // Two footers are still no single authority.
+            let doubled = idle.replace(
+                &format!("  {footer}\n"),
+                &format!("  {footer}\n  kiki · high · /work · YOLO\n"),
+            );
+            assert!(!muse_verified_process_idle_composer(&doubled), "{footer}");
+        }
+        // A goal quoted in the transcript, or drawn alone below the rule, is no footer.
+        let quoted = format!("{}\n{divider}\n❯\n{divider}\n", GOAL_FOOTERS[0]);
+        assert!(!muse_verified_process_idle_composer(&quoted));
+        let alone = format!("old\n{divider}\n❯\n{divider}\nGoal (45m) 47% ████▊░░░░░\n");
+        assert!(!muse_verified_process_idle_composer(&alone));
+        assert_eq!(muse_verified_pane_status("idle", &alone), "working");
+    }
+
+    #[test]
+    fn a_footer_with_an_unknown_model_effort_or_mode_is_still_a_footer() {
+        // Detection must not depend on the model, the effort or the approval mode: none of these
+        // strings is known to agentctl, and each footer still frames an idle editor.
+        let divider = "─".repeat(40);
+        for footer in [
+            "some-future-model-v9 · turbo-max · /work/project · Dangerously skip everything",
+            "GPT-6.1 Sol ultra · ultra · ~/work/project · YOLO",
+            "model with spaces · EFFORT · /work · ",
+            "m · e · /d",
+            "m · e · /d · Mode · and another field",
+        ] {
+            let idle = format!("old transcript\n{divider}\n❯\n{divider}\n{footer}\n");
+            let footer = strip(footer);
+            if footer.ends_with('·') {
+                // An empty field is no footer.
+                assert!(!muse_verified_process_idle_composer(&idle), "{footer}");
+                continue;
+            }
+            assert!(muse_verified_process_idle_composer(&idle), "{footer}");
+            assert_eq!(muse_verified_pane_status("done", &idle), "idle", "{footer}");
+        }
+    }
+
+    #[test]
+    fn a_paused_goal_on_the_footer_line_still_pauses() {
+        let divider = "─".repeat(40);
+        let footer = "kiki · xhigh · /work/project · YOLO";
+        let paused = format!("old\n{divider}\n❯\n{divider}\n{footer}   Goal (paused)\n");
+        assert!(muse_verified_process_goal_paused(&paused));
+        assert_eq!(muse_verified_pane_status("idle", &paused), "paused");
+        // An active goal's notice is not a pause.
+        let active = paused.replace("Goal (paused)", "Goal (45m) 47% ████▊░░░░░");
+        assert!(!muse_verified_process_goal_paused(&active));
+        assert_eq!(muse_verified_pane_status("idle", &active), "idle");
     }
 
     #[test]

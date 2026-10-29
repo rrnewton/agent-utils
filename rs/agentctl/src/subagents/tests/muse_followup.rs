@@ -3,8 +3,6 @@
 use super::herdr_compatibility::{Clock, MuseEditor};
 use super::*;
 
-const DIVIDER: &str = "────────────────────────────────────────";
-
 fn start_busy_muse(fixture: &Fixture, header: bool) -> ManagedAgents<'_, Fake> {
     let manager = fixture.manager();
     manager
@@ -164,41 +162,56 @@ fn an_operator_draft_an_approval_form_or_a_slash_command_holds_the_prompt_untype
     no_input(&fixture);
 }
 
+// Owner-directed: an adopted Muse pane takes a follow-up at whatever footer mode it shows, so an
+// adopted coordinator running in YOLO still receives messages while it works.
 #[test]
-fn an_adopted_working_muse_takes_follow_ups_only_at_its_auto_review_editor() {
-    let fixture = Fixture::new();
-    fixture.prepare_foreign();
-    fixture
-        .client
-        .custom_reported
-        .store(true, Ordering::Relaxed);
-    let idle =
-        format!("Muse Code 1.3.0\n{DIVIDER}\n❯\n{DIVIDER}\nmodel · high · /work · Auto-review\n");
-    *fixture.client.status.lock().unwrap() = Some("idle".to_owned());
-    *fixture.client.screen.lock().unwrap() = Some(idle.clone());
-    let mut options = fixture.adopt_options();
-    options.harness = "muse".to_owned();
-    let manager = fixture.manager();
-    manager.adopt("foreign", options).unwrap();
-    let busy = idle
-        .replace("Muse Code 1.3.0\n", "")
-        .replace(
-            &format!("{DIVIDER}\n❯"),
-            &format!("◇ Thinking (3s · esc to interrupt)\n{DIVIDER}\n❯"),
-        )
-        .replace(" · Auto-review", "");
-    *fixture.client.status.lock().unwrap() = Some("working".to_owned());
-    *fixture.client.screen.lock().unwrap() = Some(busy);
-    assert_eq!(
-        manager.status("foreign").unwrap()["agent_status"],
-        "working"
-    );
-    let error = manager
-        .send("foreign", "must remain untyped", held())
-        .unwrap_err();
-    assert!(matches!(error, AgentError::Pending(_)), "{error}");
-    assert!(error.to_string().contains("Auto-review"), "{error}");
-    no_input(&fixture);
+fn an_adopted_working_muse_takes_follow_ups_at_any_footer_mode() {
+    for mode in ["YOLO", "", "Launch overrides", "Auto-review"] {
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        fixture
+            .client
+            .custom_reported
+            .store(true, Ordering::Relaxed);
+        *fixture.client.status.lock().unwrap() = Some("idle".to_owned());
+        *fixture.client.muse_editor.lock().unwrap() = Some(MuseEditor::new(mode, true, None));
+        let mut options = fixture.adopt_options();
+        options.harness = "muse".to_owned();
+        let manager = fixture.manager();
+        manager.adopt("foreign", options).unwrap();
+        *fixture.client.status.lock().unwrap() = Some("working".to_owned());
+        fixture
+            .client
+            .muse_editor
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .busy = true;
+        assert_eq!(
+            manager.status("foreign").unwrap()["agent_status"],
+            "working",
+            "{mode:?}"
+        );
+        let result = manager
+            .send_identified_with_runtime(
+                "foreign",
+                "steer the adopted turn",
+                held(),
+                "steer",
+                &Clock::default(),
+            )
+            .unwrap();
+        assert_eq!(result.delivered, ["steer"], "{mode:?}");
+        assert_eq!(keys(&fixture), ["Enter"], "{mode:?}");
+        let editor = fixture.client.muse_editor.lock().unwrap();
+        let screen = editor.as_ref().unwrap().screen();
+        assert!(screen.contains("❯ steer the adopted turn"), "{mode:?}");
+        assert!(
+            screen.contains("esc to interrupt"),
+            "{mode:?}: the turn kept running"
+        );
+    }
 }
 
 #[test]
