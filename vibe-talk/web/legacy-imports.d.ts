@@ -17,3 +17,7 @@ declare const WIDE_SCRIPT: LegacyImports["WIDE_SCRIPT"];
 declare const glyphEm: LegacyImports["glyphEm"];
 declare const linkKind: LegacyImports["linkKind"];
 declare const monoEm: LegacyImports["monoEm"];
+declare const DEEP_LINK_PART_MAX: LegacyImports["DEEP_LINK_PART_MAX"];
+declare const deepLinkRefFrom: LegacyImports["deepLinkRefFrom"];
+declare const deepLinkRefText: LegacyImports["deepLinkRefText"];
+declare const messageLinkRef: LegacyImports["messageLinkRef"];

@@ -17,4 +17,14 @@ export {
   searchSubject,
 } from "../core/search/index.ts";
 export { readPieces, sentenceEnds, speechSegments } from "../core/speech/index.ts";
-export { SPACE_EM, WIDE_SCRIPT, glyphEm, linkKind, monoEm } from "../foundation/index.ts";
+export {
+  DEEP_LINK_PART_MAX,
+  SPACE_EM,
+  WIDE_SCRIPT,
+  deepLinkRefFrom,
+  deepLinkRefText,
+  glyphEm,
+  linkKind,
+  messageLinkRef,
+  monoEm,
+} from "../foundation/index.ts";

@@ -1624,8 +1624,8 @@ function placeFromKeyboard(step) {
 
 /** The views a link may name (`voice` read only to refuse it: a link starts no call). */
 const DEEP_LINK_VIEWS = ["main", "all", "threads", "thread", "columns", "voice"];
-/** The longest query value read from a link: an id padded past this is not an id. */
-const DEEP_LINK_PART_MAX = 512;
+// DEEP_LINK_PART_MAX, the longest query value read from a link, is in web/src/foundation/ with the
+// link ref helpers deepLinkRefFrom, deepLinkRefText and messageLinkRef (`#624 voice-page-modularity`).
 /** How long opening from a link waits for sign-in and a first read, in `PULL_WAIT_MS` waits. */
 const DEEP_LINK_WAITS = 600;
 
@@ -1700,19 +1700,6 @@ function deepLinkPart(params, key) {
   return typeof value === "string" && value !== "" && value.length <= DEEP_LINK_PART_MAX ? value : null;
 }
 
-/** The message a link's `m` names, its parts unescaped; null for a shape no link of ours makes. */
-function deepLinkRefFrom(text) {
-  const parts = String(text || "").split(":");
-  if (parts.length < 3 || parts.length > 4) return null;
-  try {
-    const decoded = parts.map((part) => decodeURIComponent(part));
-    if (decoded.some((part) => !part || part.length > DEEP_LINK_PART_MAX)) return null;
-    return { provider: decoded[0].toLowerCase(), channel: decoded[1], message: decoded[2], thread: decoded[3] || null };
-  } catch (_error) {
-    return null;
-  }
-}
-
 /** A message's durable identity as a link names it: its service, channel, id, and thread. */
 function deepLinkRefOf(message) {
   const channel = String((message && message.channel_id) || el("discord-channel").value || "");
@@ -1726,12 +1713,6 @@ function deepLinkRefOf(message) {
     provider: String(name || "").toLowerCase(), channel, message: String(message.id),
     thread: thread && !root ? thread : null,
   };
-}
-
-/** A ref as the `m` value carries it: each part escaped, then joined. */
-function deepLinkRefText(ref) {
-  const parts = [ref.provider, ref.channel, ref.message, ...(ref.thread ? [ref.thread] : [])];
-  return parts.map((part) => encodeURIComponent(part)).join(":");
 }
 
 /**
@@ -2077,19 +2058,6 @@ function chooseOpenInView(view) {
  *   offset: number, focus: DeepLinkRef | null, call?: boolean}} LinkSpot
  * @typedef {{spot: LinkSpot, below: string[], landed: string[] | null}} LinkJump
  */
-
-/** What a link's `data-msg` names: `service:channel:message:thread`, each escaped; null for any other shape. */
-function messageLinkRef(text) {
-  const parts = String(text || "").split(":");
-  if (parts.length !== 4) return null;
-  try {
-    const [service, channel, message, thread] = parts.map((part) => decodeURIComponent(part));
-    if (!service || !channel || [channel, message, thread].some((part) => part.length > DEEP_LINK_PART_MAX)) return null;
-    return { service, channel, message: message || null, thread: thread || null };
-  } catch (_error) {
-    return null;
-  }
-}
 
 /** Whether a link to `ref` is this app's now: the switch on, and its channel one this server reads. */
 function keepsInApp(ref) {
