@@ -2665,6 +2665,9 @@ enum ReplyPhase {
     Pending,
     Sending,
     Sent,
+    /// The provider permanently refused this reply (and its top-level fallback, when one was
+    /// tried): it is never sent again, and later replies are not held behind it.
+    Failed,
 }
 
 pub(crate) fn request_phase_name(phase: &RequestPhase) -> &'static str {
@@ -2690,6 +2693,7 @@ fn reply_phase_name(phase: &ReplyPhase) -> &'static str {
         ReplyPhase::Pending => "pending",
         ReplyPhase::Sending => "sending",
         ReplyPhase::Sent => "sent",
+        ReplyPhase::Failed => "failed",
     }
 }
 
@@ -3147,6 +3151,24 @@ struct ReplyRecord {
     captured_at_millis: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sent_at_millis: Option<u64>,
+    /// Helper send attempts made for this reply, threaded and top-level fallback alike.
+    /// `chat health` flags an unsent reply with many attempts as a retry loop.
+    #[serde(default)]
+    send_attempts: u32,
+    /// The failure code of the most recent failed send attempt, such as `operation_conflict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_send_failure_code: Option<String>,
+    /// When the most recent failed send attempt happened, in milliseconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_send_failure_at_millis: Option<u64>,
+    /// Why this reply's send failed permanently (the provider proved it did not apply and
+    /// said repeating it cannot succeed), including what the fallback did, when one ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    send_permanent_failure: Option<String>,
+    /// The fresh operation ID of the top-level fallback send, once a threaded send has failed
+    /// permanently. Retries reuse it, so an uncertain fallback is never posted twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    send_fallback_request_id: Option<String>,
 }
 
 impl ReplyRecord {
@@ -3169,6 +3191,11 @@ impl ReplyRecord {
             provider_message_id: None,
             captured_at_millis: unix_millis(),
             sent_at_millis: None,
+            send_attempts: 0,
+            last_send_failure_code: None,
+            last_send_failure_at_millis: None,
+            send_permanent_failure: None,
+            send_fallback_request_id: None,
         };
         let initial = encoded_document_bytes(&record)?;
         let receipt_reservation = chat_subscription::MAX_RESOURCE_ID_BYTES
@@ -3225,6 +3252,20 @@ impl ReplyRecord {
                 chat_subscription::MAX_RESOURCE_ID_BYTES,
             )?;
         }
+        if self
+            .send_fallback_request_id
+            .as_deref()
+            .is_some_and(|id| !valid_operation_uuid(id))
+        {
+            return Err(ChatRuntimeError::invalid(
+                "saved reply fallback operation id is not an RFC 4122 UUID",
+            ));
+        }
+        if matches!(self.phase, ReplyPhase::Failed) && self.send_permanent_failure.is_none() {
+            return Err(ChatRuntimeError::invalid(
+                "failed reply is missing the reason its send failed permanently",
+            ));
+        }
         Ok(())
     }
 }
@@ -3249,6 +3290,31 @@ pub trait ReplyTransport {
         &mut self,
         submission: ReplySubmission<'_>,
     ) -> std::result::Result<String, OutboundFailure>;
+
+    /// Post the same body at the top level of its channel, in no thread, under
+    /// `submission.request_id`: the fallback when the threaded send failed permanently, as
+    /// when the thread's parent is a channel-level event rather than a message the provider
+    /// can thread under. A transport that cannot post top-level refuses as not applied and
+    /// not retryable, so the reply is then failed rather than retried.
+    fn send_top_level(
+        &mut self,
+        submission: ReplySubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let _ = submission;
+        Err(OutboundFailure {
+            code: "top_level_unsupported".to_owned(),
+            detail: "this transport cannot post a reply at the top level of a channel"
+                .to_owned(),
+            outcome: OutboundOutcome::NotApplied,
+            retryable: false,
+        })
+    }
+}
+
+/// Whether `failure` proves the provider did not apply the operation and repeating the
+/// identical operation cannot succeed: the class of failure a send must stop retrying.
+fn permanently_refused(failure: &OutboundFailure) -> bool {
+    failure.outcome == OutboundOutcome::NotApplied && !failure.retryable
 }
 
 /// One explicit operator-authored root message, independent of inbound request threads.
@@ -3773,6 +3839,21 @@ impl ReplyTransport for CommandOutboundTransport {
     ) -> std::result::Result<String, OutboundFailure> {
         let format = self.slack_format_for(submission.channel_id);
         let request = encode_send_request_with_format(&submission, format)?;
+        let response = self.exchange(&request)?;
+        decode_send_response(&response, &submission)
+    }
+
+    fn send_top_level(
+        &mut self,
+        submission: ReplySubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let format = self.slack_format_for(submission.channel_id);
+        let root = RootMessageSubmission {
+            channel_id: submission.channel_id,
+            body: submission.body,
+            request_id: submission.request_id,
+        };
+        let request = encode_root_message_request_with_format(&root, format)?;
         let response = self.exchange(&request)?;
         decode_send_response(&response, &submission)
     }
@@ -8505,6 +8586,7 @@ at the end of your turn instead."
             ReplyPhase::Pending => "pending",
             ReplyPhase::Sending => "sending",
             ReplyPhase::Sent => "sent",
+            ReplyPhase::Failed => "failed",
         };
         if json {
             let replies = entries
@@ -8520,6 +8602,10 @@ at the end of your turn instead."
                         "provider_message_id": reply.provider_message_id,
                         "captured_at_millis": reply.captured_at_millis,
                         "sent_at_millis": reply.sent_at_millis,
+                        "send_attempts": reply.send_attempts,
+                        "last_send_failure_code": reply.last_send_failure_code,
+                        "last_send_failure_at_millis": reply.last_send_failure_at_millis,
+                        "send_permanent_failure": reply.send_permanent_failure,
                         "body": reply.body,
                     })
                 })
@@ -8566,6 +8652,13 @@ complete record.\n",
                 (ReplyPhase::Sent, None, _) => "sent".to_owned(),
                 (ReplyPhase::Pending, _, _) => "captured, not yet sent".to_owned(),
                 (ReplyPhase::Sending, _, _) => "send in progress or outcome unknown".to_owned(),
+                (ReplyPhase::Failed, _, _) => format!(
+                    "send permanently failed: {}",
+                    reply
+                        .send_permanent_failure
+                        .as_deref()
+                        .unwrap_or("no reason was recorded")
+                ),
             };
             let when = entry.at();
             let mut preview: String = reply.body.chars().take(SENT_PREVIEW_CHARACTERS).collect();
@@ -8654,6 +8747,7 @@ complete record.\n",
                         (ReplyPhase::Sending, _) => {
                             "send in progress or outcome unknown".to_owned()
                         }
+                        (ReplyPhase::Failed, _) => "send permanently failed".to_owned(),
                     };
                     entries.push((
                         (at, admitted, request.key.clone(), ordinal),
@@ -10802,13 +10896,15 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             let original_send_ordinal = request.next_send_ordinal;
             while request.next_send_ordinal < request.next_reply_ordinal {
                 let mut reply = self.read_reply(key, request.next_send_ordinal)?;
-                if reply.phase != ReplyPhase::Sent {
+                if reply.phase != ReplyPhase::Sent && reply.phase != ReplyPhase::Failed {
                     // A tripped breaker holds the reply in its current phase; nothing is lost.
                     self.reserve_reply_send_locked(&request.message, &reply.send_request_id)?;
                     reply.phase = ReplyPhase::Sending;
                     write_document(&self.reply_path(key, reply.ordinal), &reply)?;
                     break;
                 }
+                // A permanently failed reply is terminal, like a sent one: later replies are
+                // not held behind it.
                 request.next_send_ordinal = request.next_send_ordinal.saturating_add(1);
             }
             let pointer_changed = request.next_send_ordinal != original_send_ordinal;
@@ -10833,20 +10929,77 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             (request, reply)
         };
 
-        let sent = transport.send(ReplySubmission {
-            channel_id: &request_snapshot.message.channel_id,
-            thread_id: &request_snapshot.message.thread_id,
-            body: &outbound_text(&self.config.agent_label, &reply.body),
-            request_id: &reply.send_request_id,
-        });
-        if let Err(failure) = &sent {
-            // The health record is bookkeeping: failing to update it never changes a send's
-            // result.
-            let _ = self.note_send_outcome(Err(failure));
-        }
-        let provider_message_id = sent.map_err(|error| {
-            ChatRuntimeError::invalid(format!("outbound chat send failed: {error}"))
-        })?;
+        // Send the reply in its thread, or, once that has failed permanently, at the top
+        // level of the channel under the fallback operation ID the reply records. A failure
+        // the provider proves did not apply and cannot succeed on a retry (for example
+        // `operation_conflict`, when the thread's parent is a channel-level event rather
+        // than a message) is never retried as-is: it used to be retried on every pass,
+        // hundreds of times, and the reply never posted.
+        let body_text = outbound_text(&self.config.agent_label, &reply.body);
+        let mut fallback = reply.send_fallback_request_id.is_some();
+        let mut active_request_id = reply
+            .send_fallback_request_id
+            .clone()
+            .unwrap_or_else(|| reply.send_request_id.clone());
+        let provider_message_id = loop {
+            let submission = ReplySubmission {
+                channel_id: &request_snapshot.message.channel_id,
+                thread_id: &request_snapshot.message.thread_id,
+                body: &body_text,
+                request_id: &active_request_id,
+            };
+            let sent = if fallback {
+                transport.send_top_level(submission)
+            } else {
+                transport.send(submission)
+            };
+            if let Err(failure) = &sent {
+                // The health record is bookkeeping: failing to update it never changes a
+                // send's result.
+                let _ = self.note_send_outcome(Err(failure));
+            }
+            match sent {
+                Ok(provider_message_id) => break provider_message_id,
+                Err(failure) if !permanently_refused(&failure) => {
+                    self.note_reply_attempt(key, reply.ordinal, &failure, None, None)?;
+                    return Err(ChatRuntimeError::invalid(format!(
+                        "outbound chat send failed: {failure}"
+                    )));
+                }
+                Err(failure) if !fallback => {
+                    let fallback_id = random_operation_uuid()?;
+                    let reason = format!(
+                        "the threaded send was permanently refused ({failure}); posting the \
+                         reply at the top level of the channel instead"
+                    );
+                    self.note_reply_attempt(
+                        key,
+                        reply.ordinal,
+                        &failure,
+                        Some(&reason),
+                        Some(&fallback_id),
+                    )?;
+                    fallback = true;
+                    active_request_id = fallback_id;
+                }
+                Err(failure) => {
+                    let reason = format!(
+                        "the threaded send and its top-level fallback were both permanently \
+                         refused; the fallback failed with: {failure}"
+                    );
+                    self.fail_reply_permanently(
+                        key,
+                        &request_snapshot,
+                        reply.ordinal,
+                        &failure,
+                        &reason,
+                    )?;
+                    return Err(ChatRuntimeError::invalid(format!(
+                        "outbound chat send failed permanently: {failure}"
+                    )));
+                }
+            }
+        };
         if let Err(error) = validate_single_line(
             &provider_message_id,
             "provider reply message id",
@@ -10869,6 +11022,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             ));
         }
         current.phase = ReplyPhase::Sent;
+        current.send_attempts = current.send_attempts.saturating_add(1);
         current.provider_message_id = Some(provider_message_id.clone());
         let sent_at_millis = causal_wall_millis(current.captured_at_millis);
         current.sent_at_millis = Some(sent_at_millis);
@@ -10889,6 +11043,74 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             self.persist_checkpoint(&mut checkpoint)?;
         }
         Ok(Some(provider_message_id))
+    }
+
+    /// Record one failed send attempt on reply `ordinal`: its count, the failure's code and
+    /// when it happened, and, for a permanent threaded failure, why and the fallback operation
+    /// ID the next attempt uses. The reply keeps its phase: a retryable failure is retried
+    /// with the same operation ID, and a permanent one is retried only as the fallback.
+    fn note_reply_attempt(
+        &self,
+        key: &str,
+        ordinal: u32,
+        failure: &OutboundFailure,
+        permanent_reason: Option<&str>,
+        fallback_request_id: Option<&str>,
+    ) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut reply = self.read_reply(key, ordinal)?;
+        reply.send_attempts = reply.send_attempts.saturating_add(1);
+        reply.last_send_failure_code = Some(bounded_detail(&failure.code, 200));
+        reply.last_send_failure_at_millis = Some(unix_millis());
+        if let Some(reason) = permanent_reason {
+            reply.send_permanent_failure = Some(bounded_detail(reason, 1_000));
+        }
+        if let Some(fallback) = fallback_request_id {
+            reply.send_fallback_request_id = Some(fallback.to_owned());
+        }
+        reply.validate(key, ordinal)?;
+        write_document(&self.reply_path(key, ordinal), &reply)
+    }
+
+    /// Mark reply `ordinal` permanently failed after `failure`: record the attempt and the
+    /// reason, release its breaker reservation, and advance the request's send pointer past
+    /// it, so it is never retried and later replies are not held behind it.
+    fn fail_reply_permanently(
+        &self,
+        key: &str,
+        request_snapshot: &RequestRecord,
+        ordinal: u32,
+        failure: &OutboundFailure,
+        reason: &str,
+    ) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut reply = self.read_reply(key, ordinal)?;
+        reply.send_attempts = reply.send_attempts.saturating_add(1);
+        reply.last_send_failure_code = Some(bounded_detail(&failure.code, 200));
+        reply.last_send_failure_at_millis = Some(unix_millis());
+        reply.send_permanent_failure = Some(bounded_detail(reason, 1_000));
+        reply.phase = ReplyPhase::Failed;
+        reply.validate(key, ordinal)?;
+        // The reservation is bookkeeping for the breaker; a reply that will never be sent
+        // must not hold its thread's window open.
+        let _ =
+            self.complete_reply_reservation_locked(&request_snapshot.message, &reply.send_request_id);
+        write_document(&self.reply_path(key, ordinal), &reply)?;
+        let mut request = self.read_request(key)?;
+        if request.next_send_ordinal == ordinal {
+            request.next_send_ordinal = request.next_send_ordinal.saturating_add(1);
+            request.validate(key)?;
+            let mut checkpoint = self.read_checkpoint()?;
+            self.write_request_accounted(&request, &mut checkpoint)?;
+            self.persist_checkpoint(&mut checkpoint)?;
+            let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
+            self.persist_checkpoint(&mut checkpoint)?;
+        }
+        Ok(())
     }
 
     fn read_request(&self, key: &str) -> Result<RequestRecord> {
@@ -16156,6 +16378,185 @@ mod tests {
             }
             Ok(format!("messages/reply-{}", self.submissions.len()))
         }
+    }
+
+    /// A reply transport whose threaded and top-level sends can each be refused the way a
+    /// provider refuses a reply whose thread parent is a channel-level event: proven not
+    /// applied, and not retryable (`operation_conflict`).
+    #[derive(Default)]
+    struct PermanentReplyTransport {
+        threaded_ids: Vec<String>,
+        top_level_ids: Vec<String>,
+        refuse_threaded: bool,
+        refuse_top_level: bool,
+        fail_threaded_once_retryable: bool,
+    }
+
+    impl PermanentReplyTransport {
+        fn conflict() -> OutboundFailure {
+            OutboundFailure {
+                code: "operation_conflict".to_owned(),
+                detail: "this operation id was already used for a different message".to_owned(),
+                outcome: OutboundOutcome::NotApplied,
+                retryable: false,
+            }
+        }
+    }
+
+    impl ReplyTransport for PermanentReplyTransport {
+        fn send(
+            &mut self,
+            submission: ReplySubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            self.threaded_ids.push(submission.request_id.to_owned());
+            if std::mem::take(&mut self.fail_threaded_once_retryable) {
+                return Err(OutboundFailure {
+                    code: "fixture_unknown".to_owned(),
+                    detail: "uncertain provider response".to_owned(),
+                    outcome: OutboundOutcome::Unknown,
+                    retryable: true,
+                });
+            }
+            if self.refuse_threaded {
+                return Err(Self::conflict());
+            }
+            Ok("messages/threaded-reply".to_owned())
+        }
+
+        fn send_top_level(
+            &mut self,
+            submission: ReplySubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            self.top_level_ids.push(submission.request_id.to_owned());
+            if self.refuse_top_level {
+                return Err(Self::conflict());
+            }
+            Ok("messages/top-level-reply".to_owned())
+        }
+    }
+
+    /// A bridge state holding one captured reply, ready to publish.
+    fn state_with_reply(name: &str, body: &str) -> (BridgeState, String, PathBuf) {
+        let (state, key, root) = state_with_old_request(name, config_without_reaction());
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(
+                &key,
+                &format!(
+                    "<CHAT_REPLY_{}>\n{body}\n</CHAT_REPLY_{}>",
+                    route.identifier, route.identifier
+                ),
+            )
+            .expect("capture reply");
+        (state, key, root)
+    }
+
+    #[test]
+    fn a_permanently_refused_threaded_reply_is_posted_at_the_top_level_once() {
+        let (state, key, root) = state_with_reply("permanent-fallback", "fallback body");
+        let mut transport = PermanentReplyTransport {
+            refuse_threaded: true,
+            ..PermanentReplyTransport::default()
+        };
+        let receipt = state
+            .publish_one(&key, &mut transport)
+            .expect("publish falls back")
+            .expect("provider receipt");
+        assert_eq!(receipt, "messages/top-level-reply");
+        assert_eq!(transport.threaded_ids.len(), 1);
+        assert_eq!(transport.top_level_ids.len(), 1);
+        let reply = state.read_reply(&key, 1).expect("reply");
+        assert_eq!(reply.phase, ReplyPhase::Sent);
+        assert_eq!(reply.send_attempts, 2);
+        assert_eq!(
+            reply.last_send_failure_code.as_deref(),
+            Some("operation_conflict")
+        );
+        assert!(reply.last_send_failure_at_millis.is_some());
+        let reason = reply
+            .send_permanent_failure
+            .as_deref()
+            .expect("permanent reason recorded");
+        assert!(reason.contains("operation_conflict"), "{reason}");
+        assert!(reason.contains("top level"), "{reason}");
+        // The fallback used its own operation ID, recorded on the reply, not the threaded one.
+        assert_eq!(
+            reply.send_fallback_request_id.as_deref(),
+            transport.top_level_ids.first().map(String::as_str)
+        );
+        assert_ne!(
+            transport.top_level_ids[0], transport.threaded_ids[0],
+            "the fallback must not reuse the refused operation id"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_refused_in_its_thread_and_at_the_top_level_is_failed_and_never_retried() {
+        let (state, key, root) = state_with_reply("permanent-failure", "doomed body");
+        let mut transport = PermanentReplyTransport {
+            refuse_threaded: true,
+            refuse_top_level: true,
+            ..PermanentReplyTransport::default()
+        };
+        let error = state
+            .publish_one(&key, &mut transport)
+            .expect_err("both sends refused");
+        assert!(error.to_string().contains("permanently"), "{error}");
+        let reply = state.read_reply(&key, 1).expect("reply");
+        assert_eq!(reply.phase, ReplyPhase::Failed);
+        assert_eq!(reply.send_attempts, 2);
+        assert!(reply
+            .send_permanent_failure
+            .as_deref()
+            .is_some_and(|reason| reason.contains("top-level fallback")));
+        // The send pointer moved past it, and a later pass makes no further attempt.
+        let request = state.read_request(&key).expect("request");
+        assert_eq!(request.next_send_ordinal, 2);
+        assert_eq!(
+            state.publish_one(&key, &mut transport).expect("later pass"),
+            None
+        );
+        assert_eq!(transport.threaded_ids.len(), 1);
+        assert_eq!(transport.top_level_ids.len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_retryable_reply_failure_keeps_its_operation_id_and_is_retried_in_its_thread() {
+        let (state, key, root) = state_with_reply("retryable-failure", "retry body");
+        let mut transport = PermanentReplyTransport {
+            fail_threaded_once_retryable: true,
+            ..PermanentReplyTransport::default()
+        };
+        assert!(state.publish_one(&key, &mut transport).is_err());
+        let reply = state.read_reply(&key, 1).expect("reply");
+        assert_eq!(reply.phase, ReplyPhase::Sending);
+        assert_eq!(reply.send_attempts, 1);
+        assert_eq!(
+            reply.last_send_failure_code.as_deref(),
+            Some("fixture_unknown")
+        );
+        assert!(reply.send_permanent_failure.is_none());
+        assert!(reply.send_fallback_request_id.is_none());
+        let receipt = state
+            .publish_one(&key, &mut transport)
+            .expect("retry publishes")
+            .expect("provider receipt");
+        assert_eq!(receipt, "messages/threaded-reply");
+        assert_eq!(transport.threaded_ids.len(), 2);
+        assert_eq!(
+            transport.threaded_ids[0], transport.threaded_ids[1],
+            "a retryable failure retries the identical operation id"
+        );
+        assert!(transport.top_level_ids.is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[derive(Default)]
