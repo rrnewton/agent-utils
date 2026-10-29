@@ -1855,6 +1855,11 @@ lock, so it is safe to send again. The deadline is `--deadline SECONDS` on the
 call, else `send_deadline_seconds` in the registry's `settings.json`, else 600
 seconds. `settings.json` is read tolerantly: keys a build does not know are
 ignored, and an unusable file or value falls back to 600 seconds with a warning.
+While the pane is not ready, a send or drain holds no lock: it queues the
+prompt and checks readiness under the locks, then releases them and checks
+again every half second until the pane is ready or the smaller of
+`--ready-timeout` and the deadline has passed, so `stop`, the chat bridge and
+other senders are never kept waiting behind it.
 
 ```json
 {"send_deadline_seconds": 300}

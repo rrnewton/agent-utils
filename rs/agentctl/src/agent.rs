@@ -1141,7 +1141,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         Some(limit) if lock_runtime.cancelled() && !runtime.cancelled() => {
             AgentError::Pending(UndeliveredMessage {
                 message: format!(
-                    "a lock of queue {} stayed held for the drain's {}s lock bound; nothing was typed: {error}",
+                    "a lock of queue {} {LOCK_BOUND_HELD} {}s lock bound; nothing was typed: {error}",
                     root.display(),
                     limit.as_secs_f64()
                 ),
@@ -2042,6 +2042,63 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
         allow_legacy_workspace_binding,
         priority.then(|| identifier.clone()),
     )?;
+    send_outcome(root, identifier, result)
+}
+
+/// Drain again for a send whose prompt `identifier` is already queued, and judge that prompt as
+/// the send that queued it does (#703 send-lock-free-wait): a manager that waited for readiness
+/// holding no lock takes its locks again and calls this. `priority` drains only that prompt, as
+/// an urgent send does.
+pub(crate) fn redrain_for_send_managed<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    options: DrainOptions,
+    identifier: &str,
+    priority: bool,
+) -> AgentResult<QueueResult> {
+    let result = drain_with_runtime_binding(
+        client,
+        target,
+        root,
+        options,
+        &SystemRuntime::default(),
+        true,
+        priority.then(|| identifier.to_owned()),
+    )?;
+    send_outcome(root, identifier.to_owned(), result)
+}
+
+/// The words a drain's readiness timeout uses: the pane was not ready yet.
+const NOT_READY: &str = "did not become idle/done within";
+/// The words a drain uses when another holder kept the queue or pane lock past its bound.
+const LOCK_BOUND_HELD: &str = "stayed held for the drain's";
+
+/// Whether a pending outcome (a drain's `blocked`, or a send's pending message) only says the
+/// pane was not ready yet, or that another drain held a lock, so that probing again later can
+/// type the prompt (#703 send-lock-free-wait). A blocked pane, a refused paste or an open
+/// dialog is not retried: it needs someone's attention.
+pub(crate) fn pending_retryable(detail: &str) -> bool {
+    detail.contains(NOT_READY) || detail.contains(LOCK_BOUND_HELD)
+}
+
+/// Whether the pending prompt `identifier` has used up `max_attempts`, so that probing again
+/// cannot type it (#703 send-lock-free-wait).
+pub(crate) fn pending_out_of_attempts(root: &Path, identifier: &str, max_attempts: u64) -> bool {
+    let filename = format!("{identifier}.json");
+    [root.join("inbox"), root.join(agent_queue::queue::INBOX_V2)]
+        .into_iter()
+        .map(|inbox| inbox.join(&filename))
+        .find_map(|path| {
+            load_message(&path)
+                .ok()
+                .and_then(|document| delivery_attempts(&document, &path).ok())
+        })
+        .is_some_and(|attempts| attempts >= max_attempts)
+}
+
+/// How a send's own prompt `identifier` came out of the drain that produced `result`.
+fn send_outcome(root: &Path, identifier: String, result: QueueResult) -> AgentResult<QueueResult> {
     let filename = format!("{identifier}.json");
     let cancelled_path = root.join(agent_queue::queue::CANCELLED).join(&filename);
     if result.cancelled.contains(&identifier) || fs::symlink_metadata(&cancelled_path).is_ok() {
@@ -2366,7 +2423,7 @@ fn wait_ready<A: AgentApi + ?Sized>(
         let now = runtime.monotonic();
         if now >= deadline {
             return Err(AgentError::delivery(format!(
-                "pane {} did not become idle/done within {}s; last status={}",
+                "pane {} {NOT_READY} {}s; last status={}",
                 info.pane_id,
                 timeout.as_secs_f64(),
                 info.status

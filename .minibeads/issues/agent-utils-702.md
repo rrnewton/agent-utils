@@ -1,10 +1,11 @@
 ---
 title: 'send-hard-timeout: agentctl send and drain give up after a configurable wall-clock deadline (default 10 min)'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-10-29T21:51:37.577251764+00:00
-updated_at: 2026-10-29T21:51:37.577251764+00:00
+updated_at: 2026-10-29T23:19:57.147948628+00:00
+closed_at: 2026-10-29T23:19:57.147948488+00:00
 ---
 
 # Description

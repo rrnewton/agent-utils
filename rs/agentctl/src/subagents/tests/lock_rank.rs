@@ -178,10 +178,8 @@ fn a_send_whose_pane_never_becomes_ready_gives_up_at_its_deadline_and_releases_e
     let elapsed = started.elapsed();
     assert!(matches!(error, AgentError::Pending(_)), "{error}");
     assert_eq!(error.exit_code(), 75);
-    assert!(
-        error.to_string().contains("send deadline passed"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("the send deadline"), "{error}");
+    assert!(error.to_string().contains("holding no lock"), "{error}");
     assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
     let queue = manager.queue("worker").unwrap();
     assert_eq!(
@@ -231,4 +229,53 @@ fn the_send_deadline_is_the_calls_then_the_registrys_then_ten_minutes() {
         manager.with_send_deadline(call).deadline,
         Some(Duration::from_secs(5))
     );
+}
+
+/// #703 send-lock-free-wait: a send waiting for its pane to become ready holds no lock, so
+/// another operation (here a plain lifecycle lock, as `stop` or the chat bridge takes) gets the
+/// agent meanwhile; once the pane is idle the waiting send types its prompt.
+#[test]
+fn a_send_waiting_for_readiness_holds_no_lock_and_types_once_the_pane_is_idle() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    *fixture.client.status.lock().unwrap() = Some("working".to_owned());
+    let runs_before = fixture.client.runs.lock().unwrap().len();
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            fixture.manager().send_identified(
+                "worker",
+                "/status",
+                DrainOptions {
+                    ready_timeout: Duration::from_secs(60),
+                    working_timeout: Duration::from_millis(50),
+                    deadline: Some(Duration::from_secs(60)),
+                    ..DrainOptions::default()
+                },
+                Some("lock-free-wait"),
+            )
+        });
+        // Wait until the prompt is queued and the first probe has found the pane busy.
+        let queue = fixture.manager().queue("worker").unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while agent::message_state(&queue, "lock-free-wait").unwrap()
+            != Some(agent::QueueMessageState::Pending)
+            && std::time::Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let system = agent::SystemRuntime::default();
+        let bounded = agent::UntilRuntime::after(&system, Duration::from_secs(5));
+        let other = fixture
+            .manager()
+            .lock_with_runtime("worker", &bounded)
+            .expect("the waiting send holds no lock");
+        drop(other);
+        assert!(!sender.is_finished());
+        *fixture.client.status.lock().unwrap() = Some("idle".to_owned());
+        let result = sender.join().unwrap().expect("typed once the pane is idle");
+        assert_eq!(result.message_id, "lock-free-wait");
+        assert!(result.delivered.contains(&"lock-free-wait".to_owned()));
+    });
+    assert!(fixture.client.runs.lock().unwrap().len() > runs_before);
 }

@@ -5030,6 +5030,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     }
 }
 
+/// How long a send or drain that found the pane not ready waits, holding no lock, before it
+/// takes its locks again and probes once more (#703 send-lock-free-wait).
+const READINESS_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Options for a new visible subagent; the working directory is always explicit.
 #[derive(Clone, Debug)]
 pub struct StartOptions {
@@ -5627,6 +5631,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent_name: &str,
         options: DrainOptions,
         message_id: Option<&str>,
+        queued: bool,
     ) -> Result<(LifecycleLock, DrainOptions)> {
         let options = self.with_send_deadline(options);
         let deadline = options
@@ -5639,11 +5644,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .lock_with_runtime(agent_name, &bounded)
             .map_err(|error| {
                 if agent::AgentRuntime::cancelled(&bounded) {
+                    let consequence = if queued {
+                        "the prompt stays pending, safe to send again"
+                    } else {
+                        "nothing was queued or typed, so the send is safe to retry"
+                    };
                     AgentError::Pending(agent::UndeliveredMessage {
                         message: format!(
-                            "agent {agent_name:?} stayed locked by another operation for the \
-                             whole {:.1}s send deadline; nothing was queued or typed, so the send \
-                             is safe to retry: {error}",
+                            "agent {agent_name:?} stayed locked by another operation until the \
+                             {:.1}s send deadline; {consequence}: {error}",
                             deadline.as_secs_f64()
                         ),
                         message_id: message_id.unwrap_or_default().to_owned(),
@@ -5663,6 +5672,126 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 ..options
             },
         ))
+    }
+
+    /// The readiness budget of a send or drain (#703 send-lock-free-wait): the smaller of its
+    /// readiness timeout and its hard deadline, with how a message names that bound.
+    fn readiness_budget(options: &DrainOptions) -> (Duration, &'static str) {
+        let deadline = options
+            .deadline
+            .unwrap_or(crate::profiles::DEFAULT_SEND_DEADLINE);
+        if deadline <= options.ready_timeout {
+            (
+                deadline,
+                "the send deadline: --deadline, or send_deadline_seconds in the registry's \
+                 settings.json, default 600 s",
+            )
+        } else {
+            (options.ready_timeout, "--ready-timeout")
+        }
+    }
+
+    /// Queue `text` for `agent_name` and type it once its pane is ready, holding no lock while
+    /// it waits (#703 send-lock-free-wait). The prompt is queued, and readiness probed once,
+    /// under the locks; while the pane is not ready every lock is released for
+    /// `READINESS_PROBE_INTERVAL` and then taken again for the next probe, which uses the drain's
+    /// own readiness checks. The send ends when its prompt is typed, set aside or quarantined, or
+    /// with exit 75 and the prompt pending once its readiness budget runs out. `priority` types
+    /// only this prompt, as an urgent send does.
+    fn send_holding_no_lock_while_waiting(
+        &self,
+        agent_name: &str,
+        text: &str,
+        options: DrainOptions,
+        message_id: Option<&str>,
+        priority: bool,
+    ) -> Result<QueueResult> {
+        let started = Instant::now();
+        let options = self.with_send_deadline(options);
+        let (budget, bound) = Self::readiness_budget(&options);
+        let deadline = options
+            .deadline
+            .unwrap_or(crate::profiles::DEFAULT_SEND_DEADLINE);
+        let probe = || DrainOptions {
+            ready_timeout: Duration::ZERO,
+            deadline: Some(
+                deadline
+                    .saturating_sub(started.elapsed())
+                    .max(Duration::from_millis(1)),
+            ),
+            ..options
+        };
+        let (first, headless) = {
+            let (_lock, probe_options) =
+                self.delivery_lock(agent_name, probe(), message_id, false)?;
+            let record = self.load(agent_name)?;
+            let result = if priority {
+                self.send_record_priority(&record, text, probe_options, message_id)
+            } else {
+                self.send_record(&record, text, probe_options, message_id, None)
+            };
+            (result, record.is_headless())
+        };
+        let mut pending = match first {
+            Err(AgentError::Pending(pending)) if !headless && !pending.message_id.is_empty() => {
+                pending
+            }
+            other => return other,
+        };
+        let identifier = pending.message_id.clone();
+        loop {
+            let queue = self.queue(agent_name)?;
+            if !agent::pending_retryable(&pending.message)
+                || agent::pending_out_of_attempts(&queue, &identifier, options.max_attempts)
+            {
+                return Err(AgentError::Pending(pending));
+            }
+            if budget.is_zero() {
+                // A zero readiness timeout asks for one probe: report it as the drain did.
+                return Err(AgentError::Pending(pending));
+            }
+            if started.elapsed() + READINESS_PROBE_INTERVAL > budget {
+                pending.message = format!(
+                    "{}; gave up after {:.1}s ({bound}), holding no lock while waiting for the pane",
+                    pending.message,
+                    budget.as_secs_f64()
+                );
+                return Err(AgentError::Pending(pending));
+            }
+            std::thread::sleep(READINESS_PROBE_INTERVAL);
+            let attempt = {
+                let (_lock, probe_options) =
+                    self.delivery_lock(agent_name, probe(), Some(&identifier), true)?;
+                let record = self.load(agent_name)?;
+                if record.is_headless() {
+                    return Err(AgentError::Pending(pending));
+                }
+                record.input_allowed()?;
+                let client = WorkspaceClient {
+                    client: self.client,
+                    record: &record,
+                    goal_objective: Mutex::new(None),
+                    custom_submission: Mutex::new(None),
+                    queue: Some(&queue),
+                    registry: Some(&self.registry),
+                    check_prompt: true,
+                    expected_workspace: self.project_workspace()?,
+                    readback: None,
+                };
+                agent::redrain_for_send_managed(
+                    &client,
+                    &self.target(&record)?,
+                    &queue,
+                    probe_options,
+                    &identifier,
+                    priority,
+                )
+            };
+            match attempt {
+                Err(AgentError::Pending(next)) => pending = next,
+                other => return other,
+            }
+        }
     }
 
     fn identity_lock(&self) -> Result<File> {
@@ -9526,9 +9655,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         options: DrainOptions,
         message_id: Option<&str>,
     ) -> Result<QueueResult> {
-        let (_lock, options) = self.delivery_lock(agent_name, options, message_id)?;
-        let record = self.load(agent_name)?;
-        self.send_record(&record, text, options, message_id, None)
+        self.send_holding_no_lock_while_waiting(agent_name, text, options, message_id, false)
     }
 
     /// Submit through an injected runtime that can interrupt bounded readiness waits.
@@ -9995,19 +10122,16 @@ its drain would also type, so it was not queued",
     ) -> Result<Value> {
         // Only the urgent prompt is typed, ahead of the queued backlog, which stays
         // pending for the normal paced path (#697 send-muse-while-working).
-        let result = {
-            let (_lock, options) = self.delivery_lock(agent_name, options, message_id)?;
-            let record = self.load(agent_name)?;
-            self.send_record_priority(
-                &record,
-                text,
-                DrainOptions {
-                    deliver_while_working: true,
-                    ..options
-                },
-                message_id,
-            )?
-        };
+        let result = self.send_holding_no_lock_while_waiting(
+            agent_name,
+            text,
+            DrainOptions {
+                deliver_while_working: true,
+                ..options
+            },
+            message_id,
+            true,
+        )?;
         let mut value = json!(result);
         if result.outcome != agent::QueueOutcome::Delivered {
             value["urgent"] = json!({
@@ -10335,28 +10459,100 @@ its drain would also type, so it was not queued",
 
     /// Drain only prompts known not to have been injected.
     pub fn drain(&self, agent_name: &str, options: DrainOptions) -> Result<QueueResult> {
-        let (lock, options) = self.delivery_lock(agent_name, options, None)?;
-        let record = self.load(agent_name)?;
-        if record.is_headless() {
-            return self.wake_headless_record(lock, &record);
+        // While the pane is not ready the drain holds no lock (#703 send-lock-free-wait): each
+        // probe takes the locks, types what it can, and releases them before the next.
+        let started = Instant::now();
+        let options = self.with_send_deadline(options);
+        let (budget, bound) = Self::readiness_budget(&options);
+        let deadline = options
+            .deadline
+            .unwrap_or(crate::profiles::DEFAULT_SEND_DEADLINE);
+        let mut total: Option<QueueResult> = None;
+        loop {
+            let typed = total
+                .as_ref()
+                .map_or(0, |total| total.delivered.len() + total.quarantined.len());
+            let probe = DrainOptions {
+                ready_timeout: Duration::ZERO,
+                deadline: Some(
+                    deadline
+                        .saturating_sub(started.elapsed())
+                        .max(Duration::from_millis(1)),
+                ),
+                max_items: options
+                    .max_items
+                    .map(|limit| limit.saturating_sub(typed).max(1)),
+                ..options
+            };
+            let queue = self.queue(agent_name)?;
+            let result = {
+                let (lock, probe) = self.delivery_lock(agent_name, probe, None, true)?;
+                let record = self.load(agent_name)?;
+                if record.is_headless() {
+                    return self.wake_headless_record(lock, &record);
+                }
+                record.input_allowed()?;
+                agent::drain_managed(
+                    &WorkspaceClient {
+                        client: self.client,
+                        record: &record,
+                        goal_objective: Mutex::new(None),
+                        custom_submission: Mutex::new(None),
+                        queue: Some(&queue),
+                        registry: Some(&self.registry),
+                        check_prompt: true,
+                        expected_workspace: self.project_workspace()?,
+                        readback: None,
+                    },
+                    &self.target(&record)?,
+                    &queue,
+                    probe,
+                )?
+            };
+            let mut merged = match total.take() {
+                None => result,
+                Some(mut earlier) => {
+                    earlier.delivered.extend(result.delivered);
+                    earlier.quarantined.extend(result.quarantined);
+                    earlier.cancelled.extend(result.cancelled);
+                    earlier.pending = result.pending;
+                    earlier.blocked = result.blocked;
+                    earlier
+                }
+            };
+            merged.outcome = if merged.blocked.is_some() {
+                agent::QueueOutcome::Pending
+            } else if merged.quarantined.is_empty() {
+                agent::QueueOutcome::Delivered
+            } else {
+                agent::QueueOutcome::PossiblySubmitted
+            };
+            let typed = merged.delivered.len() + merged.quarantined.len();
+            let finished = !merged
+                .blocked
+                .as_deref()
+                .is_some_and(agent::pending_retryable)
+                || merged.pending.is_empty()
+                || options.max_items.is_some_and(|limit| typed >= limit)
+                || merged.pending.first().is_some_and(|identifier| {
+                    agent::pending_out_of_attempts(&queue, identifier, options.max_attempts)
+                });
+            if finished || budget.is_zero() {
+                return Ok(merged);
+            }
+            if started.elapsed() + READINESS_PROBE_INTERVAL > budget {
+                merged.blocked = merged.blocked.map(|blocked| {
+                    format!(
+                        "{blocked}; gave up after {:.1}s ({bound}), holding no lock while \
+                         waiting for the pane",
+                        budget.as_secs_f64()
+                    )
+                });
+                return Ok(merged);
+            }
+            total = Some(merged);
+            std::thread::sleep(READINESS_PROBE_INTERVAL);
         }
-        record.input_allowed()?;
-        agent::drain_managed(
-            &WorkspaceClient {
-                client: self.client,
-                record: &record,
-                goal_objective: Mutex::new(None),
-                custom_submission: Mutex::new(None),
-                queue: Some(&self.queue(agent_name)?),
-                registry: Some(&self.registry),
-                check_prompt: true,
-                expected_workspace: self.project_workspace()?,
-                readback: None,
-            },
-            &self.target(&record)?,
-            &self.queue(agent_name)?,
-            options,
-        )
     }
 
     /// Drain through an injected runtime that can interrupt bounded readiness waits.
