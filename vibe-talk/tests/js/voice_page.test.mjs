@@ -38031,7 +38031,7 @@ async function reloadThreads(store, data, script = SCRIPT, days = 1) {
 }
 
 /** The negative control: a page that never stores a thread's colour, as before `#396`. */
-const forgetsHues = () => brokenScript("    localStorage.setItem(THREAD_HUES_KEY,", "    void (THREAD_HUES_KEY,");
+const forgetsHues = () => brokenScript("    deviceStorage().setItem(THREAD_HUES_KEY,", "    void (THREAD_HUES_KEY,");
 
 test("`#396 thread-color-memory`: every thread keeps its colour across a reload that draws them in another order", async () => {
   const run = async (script) => {
@@ -51096,7 +51096,7 @@ test("the kinds turned off are kept on this device, and with nothing kept every 
   }
 
   // THE CONTROL: with nothing written, there is nothing for the reload above to find.
-  const forgetful = newPage(new Map(), brokenScript("    localStorage.setItem(LINK_KINDS_KEY,", "    void (LINK_KINDS_KEY,"));
+  const forgetful = newPage(new Map(), brokenScript("    deviceStorage().setItem(LINK_KINDS_KEY,", "    void (LINK_KINDS_KEY,"));
   await signIn(forgetful);
   await showDiscord(forgetful, [message({ content: `${REPO}/pull/41` })]);
   await showLinks(forgetful);
@@ -59279,7 +59279,7 @@ test("`#388 thread-header-collapse`: the fold is kept on the device — a reload
   assert.deepStrictEqual(await reopened("off"), { right: [false, "true"], wide: [false, "true"] });
   assert.deepStrictEqual(await reopened(null), { right: [false, "true"], wide: [false, "true"] }, "with nothing kept the card is folded");
   // The control: a page that reads nothing kept draws the card open after the reload.
-  const forgot = await reopened("on", brokenScript("return localStorage.getItem(THREAD_CARD_FOLD_KEY) === \"on\";", "return false;"));
+  const forgot = await reopened("on", brokenScript("return deviceStorage().getItem(THREAD_CARD_FOLD_KEY) === \"on\";", "return false;"));
   assert.deepStrictEqual(forgot.right, [false, "true"], "the negative control kept the fold too, so the check above proves nothing");
   // Across the window: a thread from the picker, the card read from the same choice.
   const page = await threadPage("main");

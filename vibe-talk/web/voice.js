@@ -811,7 +811,7 @@ var pageCredentials;
 
 /** {@link pageCredentials}, made if it is not yet. */
 function credentialStore() {
-  if (!pageCredentials) pageCredentials = createCredentials(createWebPorts().deviceStorage);
+  if (!pageCredentials) pageCredentials = createCredentials(deviceStorage());
   return pageCredentials;
 }
 
@@ -2049,7 +2049,7 @@ function applyInAppLinks(on) {
   inAppLinks = Boolean(on);
   el("in-app-links").checked = inAppLinks;
   try {
-    localStorage.setItem(IN_APP_LINKS_KEY, inAppLinks ? "1" : "0");
+    deviceStorage().setItem(IN_APP_LINKS_KEY, inAppLinks ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -2073,7 +2073,7 @@ function redrawMessageLinks() {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedInAppLinks() {
-  return localStorage.getItem(IN_APP_LINKS_KEY) !== "0";
+  return deviceStorage().getItem(IN_APP_LINKS_KEY) !== "0";
 }
 
 /**
@@ -2084,7 +2084,7 @@ function storedInAppLinks() {
  * @returns {"flat" | "main"}
  */
 function storedOpenInView() {
-  return localStorage.getItem(OPEN_IN_VIEW_KEY) === "main" ? "main" : "flat";
+  return deviceStorage().getItem(OPEN_IN_VIEW_KEY) === "main" ? "main" : "flat";
 }
 
 /** Draw the choice as stored. Never writes it: an absent choice stays absent, so it syncs nothing. */
@@ -2095,7 +2095,7 @@ function renderOpenInView() {
 /** Keep the reader's choice, `view`, and draw it. */
 function chooseOpenInView(view) {
   try {
-    localStorage.setItem(OPEN_IN_VIEW_KEY, view === "main" ? "main" : "flat");
+    deviceStorage().setItem(OPEN_IN_VIEW_KEY, view === "main" ? "main" : "flat");
   } catch (_error) {
     // A browser that refuses storage keeps the shipped default.
   }
@@ -4765,7 +4765,7 @@ function applySummarizeCollapsed(on) {
   const wanted = Boolean(on);
   el("summarize-collapsed").checked = wanted;
   try {
-    localStorage.setItem(SUMMARIZE_COLLAPSED_KEY, wanted ? "1" : "0");
+    deviceStorage().setItem(SUMMARIZE_COLLAPSED_KEY, wanted ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -4775,7 +4775,7 @@ function applySummarizeCollapsed(on) {
 /** What was stored. ABSENT MEANS OFF: every summary is a paid model call, and the owner asked. */
 function storedSummarizeCollapsed() {
   try {
-    return localStorage.getItem(SUMMARIZE_COLLAPSED_KEY) === "1";
+    return deviceStorage().getItem(SUMMARIZE_COLLAPSED_KEY) === "1";
   } catch (_error) {
     return false;
   }
@@ -8402,7 +8402,7 @@ let hiddenLinkKinds = storedHiddenLinkKinds();
 function storedHiddenLinkKinds() {
   let stored = null;
   try {
-    stored = JSON.parse(localStorage.getItem(LINK_KINDS_KEY) || "[]");
+    stored = JSON.parse(deviceStorage().getItem(LINK_KINDS_KEY) || "[]");
   } catch (_error) {
     stored = null;
   }
@@ -8425,7 +8425,7 @@ function setLinkKindShown(kind, shown) {
     // In the order the buttons stand, so the same choice is always written the same way.
     const kept = LINK_KINDS.map((entry) => entry.kind).filter((one) => hidden.has(one));
     try {
-      localStorage.setItem(LINK_KINDS_KEY, JSON.stringify(kept));
+      deviceStorage().setItem(LINK_KINDS_KEY, JSON.stringify(kept));
     } catch (_error) {
       // A browser that refuses storage still honours the choice for this page.
     }
@@ -8455,7 +8455,7 @@ let linksRaw = storedLinksRaw();
 /** What this device kept: on only for the word this page writes, so anything else is off. */
 function storedLinksRaw() {
   try {
-    return localStorage.getItem(LINK_RAW_KEY) === "on";
+    return deviceStorage().getItem(LINK_RAW_KEY) === "on";
   } catch (_error) {
     return false;
   }
@@ -8466,8 +8466,8 @@ function setLinksRaw(on) {
   keepingFilterPlace(() => {
     linksRaw = on;
     try {
-      if (on) localStorage.setItem(LINK_RAW_KEY, "on");
-      else localStorage.removeItem(LINK_RAW_KEY);
+      if (on) deviceStorage().setItem(LINK_RAW_KEY, "on");
+      else deviceStorage().removeItem(LINK_RAW_KEY);
     } catch (_error) {
       // A browser that refuses storage still honours the choice for this page.
     }
@@ -10522,7 +10522,7 @@ function rememberComposeDraft() {
         setStatus("This browser could not save what you typed. Keep this page open until you send it.");
       }
     } else {
-      localStorage.removeItem(COMPOSE_DRAFT_KEY);
+      deviceStorage().removeItem(COMPOSE_DRAFT_KEY);
     }
   } catch (_error) {
     // Storage refused outright: the text is still in the field, which is all that can be kept.
@@ -10533,7 +10533,7 @@ function rememberComposeDraft() {
 
 function storedComposeDraft() {
   try {
-    return localStorage.getItem(COMPOSE_DRAFT_KEY) || "";
+    return deviceStorage().getItem(COMPOSE_DRAFT_KEY) || "";
   } catch (_error) {
     return "";
   }
@@ -10822,7 +10822,7 @@ let composerGrow = false;
 /** What was stored. ABSENT MEANS OFF; a browser that refuses storage reads as nothing stored. */
 function storedComposerGrow() {
   try {
-    return localStorage.getItem(COMPOSER_GROW_KEY) === "1";
+    return deviceStorage().getItem(COMPOSER_GROW_KEY) === "1";
   } catch (_error) {
     return false;
   }
@@ -10850,7 +10850,7 @@ function storedComposerGrow() {
  */
 function applyComposerGrow(on, grow) {
   try {
-    localStorage.setItem(COMPOSER_GROW_KEY, on ? "1" : "0");
+    deviceStorage().setItem(COMPOSER_GROW_KEY, on ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -11005,7 +11005,7 @@ let enterSends = true;
 function applyEnterSends(on) {
   enterSends = Boolean(on);
   try {
-    localStorage.setItem(ENTER_SENDS_KEY, enterSends ? "1" : "0");
+    deviceStorage().setItem(ENTER_SENDS_KEY, enterSends ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -11014,7 +11014,7 @@ function applyEnterSends(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedEnterSends() {
-  return localStorage.getItem(ENTER_SENDS_KEY) !== "0";
+  return deviceStorage().getItem(ENTER_SENDS_KEY) !== "0";
 }
 
 /**
@@ -14069,7 +14069,7 @@ const SINGLE_KEYS_KEY = "vibe-talk.voice.single-keys";
 /** What was stored. ABSENT MEANS ON, as for Enter to send: the default is the behaviour. */
 function storedSingleKeys() {
   try {
-    return localStorage.getItem(SINGLE_KEYS_KEY) !== "0";
+    return deviceStorage().getItem(SINGLE_KEYS_KEY) !== "0";
   } catch (_error) {
     return true;
   }
@@ -14079,7 +14079,7 @@ function storedSingleKeys() {
 function applySingleKeys(on) {
   singleKeys = Boolean(on);
   try {
-    localStorage.setItem(SINGLE_KEYS_KEY, singleKeys ? "1" : "0");
+    deviceStorage().setItem(SINGLE_KEYS_KEY, singleKeys ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -14363,7 +14363,7 @@ const CANNED_PROMPTS = [
 function storedPrompts() {
   let stored = null;
   try {
-    stored = JSON.parse(localStorage.getItem(PROMPTS_KEY) || "null");
+    stored = JSON.parse(deviceStorage().getItem(PROMPTS_KEY) || "null");
   } catch (_error) {
     stored = null;
   }
@@ -14382,13 +14382,13 @@ function persistPrompts() {
   }
   const encoded = JSON.stringify(prompts);
   try {
-    localStorage.setItem(PROMPTS_KEY, encoded);
+    deviceStorage().setItem(PROMPTS_KEY, encoded);
   } catch (_error) {
     return false;
   }
   // Read back rather than assume, for the third time in this file and for the same reason: private
   // browsing accepts setItem and stores nothing.
-  return localStorage.getItem(PROMPTS_KEY) === encoded;
+  return deviceStorage().getItem(PROMPTS_KEY) === encoded;
 }
 
 /**
@@ -14483,6 +14483,32 @@ function setPromptsOpen(open) {
 let timelineAnswersAsked = 0;
 
 /**
+ * The browser's capabilities as the page's modules take them (web/src/platform/web, `#624
+ * voice-page-modularity`): transport, timers, cancellation and storage. Each looks its browser
+ * global up at every call, as the page's own calls did, so a browser refusing storage throws at the
+ * same moment it always did. Made on first use; a `var` with no initialiser, like `serverApi`.
+ *
+ * @type {import("./src/platform/web/index.ts").WebPorts | undefined}
+ */
+var webPorts;
+
+/** {@link webPorts}, made if it is not yet. */
+function browserPorts() {
+  if (!webPorts) webPorts = createWebPorts();
+  return webPorts;
+}
+
+/** The device's storage, `localStorage`, which every window of this origin shares. */
+function deviceStorage() {
+  return browserPorts().deviceStorage;
+}
+
+/** This window's own storage, `sessionStorage`. */
+function windowStorage() {
+  return browserPorts().windowStorage;
+}
+
+/**
  * The page's requests to vibe-talk (web/src/core/api, `#624 voice-page-modularity`), on the
  * browser's transport, timers and cancellation, made the first time the page asks anything. A `var`
  * with no initialiser, so a request made before this line has run finds it undefined rather than in
@@ -14495,7 +14521,7 @@ var serverApi;
 /** {@link serverApi}, made if it is not yet. */
 function theServer() {
   if (!serverApi) {
-    serverApi = createApi(createWebPorts(), {
+    serverApi = createApi(browserPorts(), {
       token,
       // A token the server no longer accepts, or a read it refuses, ends this device's copy of
       // what that token read.
@@ -18459,7 +18485,7 @@ function storedMicSettings() {
   const settings = { ...DEFAULT_MIC_SETTINGS };
   let stored = null;
   try {
-    stored = JSON.parse(localStorage.getItem(MIC_SETTINGS_KEY) || "null");
+    stored = JSON.parse(deviceStorage().getItem(MIC_SETTINGS_KEY) || "null");
   } catch (_error) {
     stored = null;
   }
@@ -18500,13 +18526,13 @@ function audioConstraints(settings) {
 function persistMicSettings(settings) {
   const encoded = JSON.stringify(settings);
   try {
-    localStorage.setItem(MIC_SETTINGS_KEY, encoded);
+    deviceStorage().setItem(MIC_SETTINGS_KEY, encoded);
   } catch (_error) {
     return false;
   }
   // Read it back rather than assuming, exactly as saving the token does: private browsing accepts
   // setItem and stores nothing, and "saved" would then be a lie found out only after a reload.
-  return localStorage.getItem(MIC_SETTINGS_KEY) === encoded;
+  return deviceStorage().getItem(MIC_SETTINGS_KEY) === encoded;
 }
 
 // A toggle flipped mid-call does NOT reach the open microphone — the constraints were read when
@@ -18560,7 +18586,7 @@ let callAudioRoute = null;
 function storedAudioDevicePrefs() {
   let stored = null;
   try {
-    stored = JSON.parse(localStorage.getItem(AUDIO_DEVICES_KEY) || "null");
+    stored = JSON.parse(deviceStorage().getItem(AUDIO_DEVICES_KEY) || "null");
   } catch (_error) {
     stored = null;
   }
@@ -18575,11 +18601,11 @@ function storedAudioDevicePrefs() {
 function persistAudioDevicePrefs(prefs) {
   const encoded = JSON.stringify(prefs);
   try {
-    localStorage.setItem(AUDIO_DEVICES_KEY, encoded);
+    deviceStorage().setItem(AUDIO_DEVICES_KEY, encoded);
   } catch (_error) {
     return false;
   }
-  return localStorage.getItem(AUDIO_DEVICES_KEY) === encoded;
+  return deviceStorage().getItem(AUDIO_DEVICES_KEY) === encoded;
 }
 
 /** The Settings selects' word, falling back to storage before they exist. */
@@ -18867,7 +18893,7 @@ const PLACEMENTS = ["bottom", "top"];
 function storedPlacement() {
   let stored = null;
   try {
-    stored = localStorage.getItem(BAR_PLACEMENT_KEY);
+    stored = deviceStorage().getItem(BAR_PLACEMENT_KEY);
   } catch (_error) {
     stored = null;
   }
@@ -18876,13 +18902,13 @@ function storedPlacement() {
 
 function persistPlacement(where) {
   try {
-    localStorage.setItem(BAR_PLACEMENT_KEY, where);
+    deviceStorage().setItem(BAR_PLACEMENT_KEY, where);
   } catch (_error) {
     return false;
   }
   // Read back rather than assume, exactly as the microphone settings do: private browsing accepts
   // setItem and stores nothing, so "Saved" would be a lie discovered only after a reload.
-  return localStorage.getItem(BAR_PLACEMENT_KEY) === where;
+  return deviceStorage().getItem(BAR_PLACEMENT_KEY) === where;
 }
 
 let placement = DEFAULT_PLACEMENT;
@@ -19084,11 +19110,11 @@ function applyMsgScale(value) {
 function persistMsgScale(pct) {
   const encoded = String(pct);
   try {
-    localStorage.setItem(MSG_SCALE_KEY, encoded);
+    deviceStorage().setItem(MSG_SCALE_KEY, encoded);
   } catch (_error) {
     return false;
   }
-  return localStorage.getItem(MSG_SCALE_KEY) === encoded;
+  return deviceStorage().getItem(MSG_SCALE_KEY) === encoded;
 }
 
 /** Apply a new size and say, in Settings, whether it will survive a reload. */
@@ -19141,7 +19167,7 @@ function clampCollapsedLines(value) {
 
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedCollapsedLines() {
-  const stored = localStorage.getItem(COLLAPSED_LINES_KEY);
+  const stored = deviceStorage().getItem(COLLAPSED_LINES_KEY);
   return clampCollapsedLines(stored === null ? DEFAULT_COLLAPSED_LINES : stored);
 }
 
@@ -19165,11 +19191,11 @@ function applyCollapsedLines(value) {
 function persistCollapsedLines(n) {
   const encoded = String(n);
   try {
-    localStorage.setItem(COLLAPSED_LINES_KEY, encoded);
+    deviceStorage().setItem(COLLAPSED_LINES_KEY, encoded);
   } catch (_error) {
     return false;
   }
-  return localStorage.getItem(COLLAPSED_LINES_KEY) === encoded;
+  return deviceStorage().getItem(COLLAPSED_LINES_KEY) === encoded;
 }
 
 /** The count in words, as Settings and the status line say it. */
@@ -19350,7 +19376,7 @@ function clampCardMaxLines(value) {
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedCardMaxLines() {
   try {
-    const stored = localStorage.getItem(CARD_MAX_LINES_KEY);
+    const stored = deviceStorage().getItem(CARD_MAX_LINES_KEY);
     return clampCardMaxLines(stored === null ? DEFAULT_CARD_MAX_LINES : stored);
   } catch (_error) {
     return DEFAULT_CARD_MAX_LINES;
@@ -19381,11 +19407,11 @@ function applyCardMaxLines(value, redraw = true) {
 function persistCardMaxLines(n) {
   const encoded = String(n);
   try {
-    localStorage.setItem(CARD_MAX_LINES_KEY, encoded);
+    deviceStorage().setItem(CARD_MAX_LINES_KEY, encoded);
   } catch (_error) {
     return false;
   }
-  return localStorage.getItem(CARD_MAX_LINES_KEY) === encoded;
+  return deviceStorage().getItem(CARD_MAX_LINES_KEY) === encoded;
 }
 
 /** K in words, as Settings says it. */
@@ -19949,13 +19975,13 @@ function clampReadingWidth(value) {
 
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedMsgScale() {
-  const stored = localStorage.getItem(MSG_SCALE_KEY);
+  const stored = deviceStorage().getItem(MSG_SCALE_KEY);
   return clampMsgScale(stored === null ? DEFAULT_MSG_SCALE : stored);
 }
 
 /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
 function storedReadingWidth() {
-  const stored = localStorage.getItem(WIDTH_KEY);
+  const stored = deviceStorage().getItem(WIDTH_KEY);
   return clampReadingWidth(stored === null ? DEFAULT_READING_CH : stored);
 }
 
@@ -19988,11 +20014,11 @@ function applyReadingWidth(value) {
 function persistReadingWidth(ch) {
   const encoded = String(ch);
   try {
-    localStorage.setItem(WIDTH_KEY, encoded);
+    deviceStorage().setItem(WIDTH_KEY, encoded);
   } catch (_error) {
     return false;
   }
-  return localStorage.getItem(WIDTH_KEY) === encoded;
+  return deviceStorage().getItem(WIDTH_KEY) === encoded;
 }
 
 /** Apply a new width and say, in the settings screen, whether it will survive a reload. */
@@ -21463,7 +21489,7 @@ let unsettledWritten = false;
 /** Every page's written-down turns, by page; an empty object when there are none or storage is out. */
 function readUnsettled() {
   try {
-    const held = JSON.parse(localStorage.getItem(UNSETTLED_KEY) || "null");
+    const held = JSON.parse(deviceStorage().getItem(UNSETTLED_KEY) || "null");
     return held && typeof held === "object" && !Array.isArray(held) ? held : {};
   } catch (_error) {
     return {};
@@ -21473,8 +21499,8 @@ function readUnsettled() {
 /** Write every page's copies back, or take the key away when none is left. */
 function writeUnsettled(all) {
   try {
-    if (Object.keys(all).length === 0) localStorage.removeItem(UNSETTLED_KEY);
-    else localStorage.setItem(UNSETTLED_KEY, JSON.stringify(all));
+    if (Object.keys(all).length === 0) deviceStorage().removeItem(UNSETTLED_KEY);
+    else deviceStorage().setItem(UNSETTLED_KEY, JSON.stringify(all));
     return true;
   } catch (_error) {
     // Storage refused: the turn is stored at its end as ever, and only an app killed first loses it.
@@ -23660,8 +23686,8 @@ function tokenFingerprint(value) {
 /** Write and read back: private browsing and a full quota both refuse silently or by throwing. */
 function storedExactly(key, encoded) {
   try {
-    localStorage.setItem(key, encoded);
-    return localStorage.getItem(key) === encoded;
+    deviceStorage().setItem(key, encoded);
+    return deviceStorage().getItem(key) === encoded;
   } catch (_error) {
     return false;
   }
@@ -23669,7 +23695,7 @@ function storedExactly(key, encoded) {
 
 function dropMessageCache() {
   try {
-    localStorage.removeItem(MESSAGE_CACHE_KEY);
+    deviceStorage().removeItem(MESSAGE_CACHE_KEY);
   } catch (_error) {
     // Nothing was readable either, so nothing is left to disclose.
   }
@@ -23740,7 +23766,7 @@ function readMessageCache() {
   const identity = tokenFingerprint(token());
   let raw = null;
   try {
-    raw = localStorage.getItem(MESSAGE_CACHE_KEY);
+    raw = deviceStorage().getItem(MESSAGE_CACHE_KEY);
   } catch (_error) {
     return null;
   }
@@ -25285,7 +25311,7 @@ function reconcileChannelSnapshot(before) {
  */
 function windowItem(key) {
   try {
-    return sessionStorage.getItem(key);
+    return windowStorage().getItem(key);
   } catch (_error) {
     return null;
   }
@@ -25294,8 +25320,8 @@ function windowItem(key) {
 /** Keep `value` as this window's own `key`, or forget it for null. Nothing, where storage is refused. */
 function keepWindowItem(key, value) {
   try {
-    if (value === null) sessionStorage.removeItem(key);
-    else sessionStorage.setItem(key, value);
+    if (value === null) windowStorage().removeItem(key);
+    else windowStorage().setItem(key, value);
   } catch (_error) {
     // The device's copy is still written, and a reload of this window falls back on it.
   }
@@ -25303,12 +25329,12 @@ function keepWindowItem(key, value) {
 
 /** Where a UI record is kept: the device's storage, which every window shares... */
 function deviceStore() {
-  return localStorage;
+  return deviceStorage();
 }
 
-/** ...or this window's own. Asked for, not held: a browser refusing storage throws on the asking. */
+/** ...or this window's own. A browser refusing storage throws at the first call on it. */
 function windowStore() {
-  return sessionStorage;
+  return windowStorage();
 }
 
 const UI_STATE_KEY = "vibe-talk.voice.ui-state";
@@ -25953,7 +25979,7 @@ function newestThreadHues(entries, limit) {
 function readThreadHues() {
   let stored = null;
   try {
-    stored = JSON.parse(localStorage.getItem(THREAD_HUES_KEY) || "null");
+    stored = JSON.parse(deviceStorage().getItem(THREAD_HUES_KEY) || "null");
   } catch (_error) {
     return Object.create(null);
   }
@@ -26005,7 +26031,7 @@ function saveThreadHues() {
     }
   }
   try {
-    localStorage.setItem(THREAD_HUES_KEY, JSON.stringify({ v: THREAD_HUES_VERSION, channels }));
+    deviceStorage().setItem(THREAD_HUES_KEY, JSON.stringify({ v: THREAD_HUES_VERSION, channels }));
   } catch (_error) {
     // Private browsing or a full quota: the colours hold for this page, as they always did.
   }
@@ -26110,7 +26136,7 @@ const threadHuesSeeding = new Map();
 /** The scopes whose colours a server has taken, as {scope: when}. Unreadable is none taken. */
 function readSeededScopes() {
   try {
-    const stored = JSON.parse(localStorage.getItem(THREAD_HUES_SEEDED_KEY) || "null");
+    const stored = JSON.parse(deviceStorage().getItem(THREAD_HUES_SEEDED_KEY) || "null");
     if (stored && typeof stored === "object" && stored.v === 1 &&
         stored.scopes && typeof stored.scopes === "object" && !Array.isArray(stored.scopes)) {
       return stored.scopes;
@@ -26126,7 +26152,7 @@ function markSeededScope(scope) {
   const scopes = readSeededScopes();
   scopes[scope] = Date.now();
   try {
-    localStorage.setItem(THREAD_HUES_SEEDED_KEY, JSON.stringify({ v: 1, scopes }));
+    deviceStorage().setItem(THREAD_HUES_SEEDED_KEY, JSON.stringify({ v: 1, scopes }));
   } catch (_error) {
     // As `saveThreadHues`: the session's own record (`threadHuesSeedTried`) still holds.
   }
@@ -30125,7 +30151,7 @@ function savedWire(wire) {
 
 function loadOutgoingMessages() {
   try {
-    const saved = JSON.parse(localStorage.getItem(OUTGOING_KEY) || "[]");
+    const saved = JSON.parse(deviceStorage().getItem(OUTGOING_KEY) || "[]");
     if (!Array.isArray(saved)) return;
     const queued = [];
     let confirmed = false;
@@ -30245,7 +30271,7 @@ function savedOwnPosts() {
   /** @type {Map<string, number>} */
   const kept = new Map();
   try {
-    const saved = JSON.parse(localStorage.getItem(OWN_POSTS_KEY) || "{}");
+    const saved = JSON.parse(deviceStorage().getItem(OWN_POSTS_KEY) || "{}");
     for (const [id, at] of Object.entries(saved && typeof saved === "object" ? saved : {})) {
       if (typeof at === "number" && Date.now() - at < OWN_POST_GRACE_MS) kept.set(id, at);
     }
@@ -30265,8 +30291,8 @@ function saveOwnPosts(removed = null) {
   for (const [id, at] of sentFromHereAt) if (Date.now() - at < OWN_POST_GRACE_MS) all.set(id, at);
   if (removed !== null) all.delete(removed);
   try {
-    if (all.size) localStorage.setItem(OWN_POSTS_KEY, JSON.stringify(Object.fromEntries(all)));
-    else localStorage.removeItem(OWN_POSTS_KEY);
+    if (all.size) deviceStorage().setItem(OWN_POSTS_KEY, JSON.stringify(Object.fromEntries(all)));
+    else deviceStorage().removeItem(OWN_POSTS_KEY);
   } catch (_error) {
     // A full quota: the page keeps them for itself, as before this was saved.
   }
@@ -32634,7 +32660,7 @@ function persistDismissedSends() {
   pruneDismissedSends();
   try {
     if (dismissedSends.length === 0) {
-      localStorage.removeItem(DISMISSED_SENDS_KEY);
+      deviceStorage().removeItem(DISMISSED_SENDS_KEY);
       return true;
     }
     const encoded = JSON.stringify(dismissedSends);
@@ -32648,7 +32674,7 @@ function persistDismissedSends() {
 
 function loadDismissedSends() {
   try {
-    const saved = JSON.parse(localStorage.getItem(DISMISSED_SENDS_KEY) || "[]");
+    const saved = JSON.parse(deviceStorage().getItem(DISMISSED_SENDS_KEY) || "[]");
     if (!Array.isArray(saved)) return;
     dismissedSends = saved
       .map((held) => ({ entry: held && outgoingFromSaved(held.entry), at: Number(held && held.at) }))
@@ -33185,7 +33211,7 @@ function applyRichHeaders(on) {
   el("rich-headers").checked = shown;
   document.documentElement.setAttribute("data-rich-headers", shown ? "on" : "off");
   try {
-    localStorage.setItem(RICH_HEADERS_KEY, shown ? "1" : "0");
+    deviceStorage().setItem(RICH_HEADERS_KEY, shown ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -33194,7 +33220,7 @@ function applyRichHeaders(on) {
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedRichHeaders() {
   try {
-    return localStorage.getItem(RICH_HEADERS_KEY) !== "0";
+    return deviceStorage().getItem(RICH_HEADERS_KEY) !== "0";
   } catch (_error) {
     return true;
   }
@@ -33408,7 +33434,7 @@ function learnOwnerIds(list) {
 function loadIdentities() {
   const read = (key, fallback) => {
     try {
-      const held = JSON.parse(localStorage.getItem(key) || "null");
+      const held = JSON.parse(deviceStorage().getItem(key) || "null");
       return held && typeof held === "object" && !Array.isArray(held) ? held : fallback;
     } catch (_error) {
       return fallback;
@@ -33419,7 +33445,7 @@ function loadIdentities() {
   // Shed the flat census rather than leaving it to rot in the reader's storage under a key nothing
   // reads any more. Losing it costs one channel read; keeping it would cost an explanation.
   try {
-    localStorage.removeItem(LEGACY_AUTHORS_KEY);
+    deviceStorage().removeItem(LEGACY_AUTHORS_KEY);
   } catch (_error) {
     // A browser that refuses to remove it is one that refused to store it. Nothing reads it.
   }
@@ -33437,13 +33463,13 @@ function loadIdentities() {
       delete identities[id];
     }
   }
-  const held = localStorage.getItem(SELF_ID_KEY);
+  const held = deviceStorage().getItem(SELF_ID_KEY);
   selfAuthorId = held || null;
 }
 
 function persistJson(key, value) {
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    deviceStorage().setItem(key, JSON.stringify(value));
   } catch (_error) {
     // Shared origin storage, and this is a presentation preference: a browser that refuses it
     // still gets the guesses below, which are what an unconfigured reader sees anyway.
@@ -33458,7 +33484,7 @@ function noteSelfAuthor(id) {
   }
   selfAuthorId = found;
   try {
-    localStorage.setItem(SELF_ID_KEY, found);
+    deviceStorage().setItem(SELF_ID_KEY, found);
   } catch (_error) {
     // As above.
   }
@@ -34158,7 +34184,7 @@ let legacyMarkerReads = 0;
 /** The id the old place marker left in this browser, until it is adopted or dropped. */
 let legacyMarker = null;
 try {
-  legacyMarker = localStorage.getItem(MARKER_KEY);
+  legacyMarker = deviceStorage().getItem(MARKER_KEY);
 } catch (_error) {
   legacyMarker = null;
 }
@@ -34531,7 +34557,7 @@ function placeBookmarkLine() {
 function dropLegacyMarker() {
   legacyMarker = null;
   try {
-    localStorage.removeItem(MARKER_KEY);
+    deviceStorage().removeItem(MARKER_KEY);
   } catch (_error) {
     // A browser that refuses storage asks again next time, and the server already has it then.
   }
@@ -36709,9 +36735,9 @@ function applyReadSpeed(value) {
   el("read-speed-label").textContent = readSpeed === null ? "Pace" : `${readSpeed}%`;
   try {
     if (readSpeed === null) {
-      localStorage.removeItem(READ_SPEED_KEY);
+      deviceStorage().removeItem(READ_SPEED_KEY);
     } else {
-      localStorage.setItem(READ_SPEED_KEY, String(readSpeed));
+      deviceStorage().setItem(READ_SPEED_KEY, String(readSpeed));
     }
   } catch (_error) {
     // A browser that refuses storage still reads at the chosen pace for this session.
@@ -36782,7 +36808,7 @@ function commitReadSpeedBox() {
 
 /** What was stored, clamped. Absent means "as the agent speaks", which is not the same as 100%. */
 function storedReadSpeed() {
-  const held = localStorage.getItem(READ_SPEED_KEY);
+  const held = deviceStorage().getItem(READ_SPEED_KEY);
   return held === null ? null : clampReadSpeed(held);
 }
 
@@ -36810,7 +36836,7 @@ function applyMarkOwnRead(on) {
   markOwnRead = Boolean(on);
   el("mark-own-read").checked = markOwnRead;
   try {
-    localStorage.setItem(MARK_OWN_KEY, markOwnRead ? "1" : "0");
+    deviceStorage().setItem(MARK_OWN_KEY, markOwnRead ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -36818,7 +36844,7 @@ function applyMarkOwnRead(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedMarkOwnRead() {
-  return localStorage.getItem(MARK_OWN_KEY) !== "0";
+  return deviceStorage().getItem(MARK_OWN_KEY) !== "0";
 }
 
 /** How long a first press of "Apply to existing messages" waits for the second, in milliseconds. */
@@ -37047,7 +37073,7 @@ function applyHideEmptyMessages(on) {
   hideEmptyMessages = Boolean(on);
   el("hide-empty-messages").checked = hideEmptyMessages;
   try {
-    localStorage.setItem(HIDE_EMPTY_KEY, hideEmptyMessages ? "1" : "0");
+    deviceStorage().setItem(HIDE_EMPTY_KEY, hideEmptyMessages ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -37055,7 +37081,7 @@ function applyHideEmptyMessages(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedHideEmptyMessages() {
-  return localStorage.getItem(HIDE_EMPTY_KEY) !== "0";
+  return deviceStorage().getItem(HIDE_EMPTY_KEY) !== "0";
 }
 
 /** Is `message` left out of the page: empty, while the reader has said to hide those? */
@@ -37079,7 +37105,7 @@ let browserVoiceProblem = "";
 
 function storedReadAudioSource() {
   try {
-    const held = localStorage.getItem(READ_AUDIO_SOURCE_KEY);
+    const held = deviceStorage().getItem(READ_AUDIO_SOURCE_KEY);
     return held === "agent" || held === "device" || held === "wit" ? held : null;
   } catch (_error) {
     return null;
@@ -37121,7 +37147,7 @@ function readWithDeviceTail(parts, id, ticket) {
 
 function storedWitVoice() {
   try {
-    return localStorage.getItem(WIT_VOICE_KEY) || "";
+    return deviceStorage().getItem(WIT_VOICE_KEY) || "";
   } catch (_error) {
     return "";
   }
@@ -37131,8 +37157,8 @@ function storedWitVoice() {
 function setWitVoice(name, announce = true) {
   witVoice = String(name || "");
   try {
-    if (witVoice) localStorage.setItem(WIT_VOICE_KEY, witVoice);
-    else localStorage.removeItem(WIT_VOICE_KEY);
+    if (witVoice) deviceStorage().setItem(WIT_VOICE_KEY, witVoice);
+    else deviceStorage().removeItem(WIT_VOICE_KEY);
   } catch (_error) {
     // The choice still applies to this page when storage is unavailable.
   }
@@ -37193,7 +37219,7 @@ function setReadAudioSource(source, announce = true) {
     prepareBrowserSpeech();
   }
   try {
-    localStorage.setItem(READ_AUDIO_SOURCE_KEY, readAudioSource);
+    deviceStorage().setItem(READ_AUDIO_SOURCE_KEY, readAudioSource);
   } catch (_error) {
     // The selection still applies to this page when storage is unavailable.
   }
@@ -38976,7 +39002,7 @@ let readSteerDrag = null;
 
 function storedReadSteerOffset() {
   try {
-    const held = JSON.parse(localStorage.getItem(READ_STEER_OFFSET_KEY) || "null");
+    const held = JSON.parse(deviceStorage().getItem(READ_STEER_OFFSET_KEY) || "null");
     return held && Number.isFinite(held.x) && Number.isFinite(held.y) ? { x: held.x, y: held.y } : null;
   } catch (_error) {
     return null;
@@ -38985,8 +39011,8 @@ function storedReadSteerOffset() {
 
 function rememberReadSteerOffset() {
   try {
-    if (readSteerOffset === null) localStorage.removeItem(READ_STEER_OFFSET_KEY);
-    else localStorage.setItem(READ_STEER_OFFSET_KEY, JSON.stringify(readSteerOffset));
+    if (readSteerOffset === null) deviceStorage().removeItem(READ_STEER_OFFSET_KEY);
+    else deviceStorage().setItem(READ_STEER_OFFSET_KEY, JSON.stringify(readSteerOffset));
   } catch (_error) {
     // The strip still stays where it was put on this page when storage is unavailable.
   }
@@ -40433,7 +40459,7 @@ function applyCombineMessages(on) {
   combineMessages = Boolean(on);
   el("combine-messages").checked = combineMessages;
   try {
-    localStorage.setItem(COMBINE_KEY, combineMessages ? "1" : "0");
+    deviceStorage().setItem(COMBINE_KEY, combineMessages ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -40441,7 +40467,7 @@ function applyCombineMessages(on) {
 
 /** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
 function storedCombineMessages() {
-  return localStorage.getItem(COMBINE_KEY) !== "0";
+  return deviceStorage().getItem(COMBINE_KEY) !== "0";
 }
 
 /**
@@ -41305,7 +41331,7 @@ const SLACK_OPEN_KEY = "vibe-talk.voice.slack-open";
 function storedSlackOpen() {
   let stored = null;
   try {
-    stored = localStorage.getItem(SLACK_OPEN_KEY);
+    stored = deviceStorage().getItem(SLACK_OPEN_KEY);
   } catch (_error) {
     stored = null;
   }
@@ -41316,8 +41342,8 @@ function slackOpenChanged() {
   const chosen = el("slack-open-in").value === "app" ? "app" : "browser";
   let saved = false;
   try {
-    localStorage.setItem(SLACK_OPEN_KEY, chosen);
-    saved = localStorage.getItem(SLACK_OPEN_KEY) === chosen;
+    deviceStorage().setItem(SLACK_OPEN_KEY, chosen);
+    saved = deviceStorage().getItem(SLACK_OPEN_KEY) === chosen;
   } catch (_error) {
     saved = false;
   }
@@ -45759,7 +45785,7 @@ function setReadMode(mode) {
     uiStateSettled = true;
     saveUiState();
     try {
-      localStorage.setItem(READ_MODE_KEY, mode);
+      deviceStorage().setItem(READ_MODE_KEY, mode);
     } catch (_error) {
       // The UI-state record above is the restore; this copy is only the sync's.
     }
@@ -47230,7 +47256,7 @@ const drafts = new Map();
 function loadDrafts() {
   let stored = null;
   try {
-    stored = JSON.parse(localStorage.getItem(DRAFTS_KEY) || "null");
+    stored = JSON.parse(deviceStorage().getItem(DRAFTS_KEY) || "null");
   } catch (_error) {
     stored = null;
   }
@@ -48769,7 +48795,7 @@ const COLUMNS_KEY = "vibe-talk.voice.columns";
 function storedLayoutChoice() {
   let device = null;
   try {
-    device = localStorage.getItem(COLUMNS_KEY);
+    device = deviceStorage().getItem(COLUMNS_KEY);
   } catch (_error) {
     device = null;
   }
@@ -49346,7 +49372,7 @@ function sameLeftPlace(now, placed) {
 /** Keep `layout` as the one chosen: this window's, and the device's for the next new window. */
 function keepLayoutChoice(layout) {
   try {
-    localStorage.setItem(COLUMNS_KEY, layout);
+    deviceStorage().setItem(COLUMNS_KEY, layout);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -51024,7 +51050,7 @@ const UNPACK_NEAR_PX = 400;
 /** Unpack's state, kept on the server (`#457 settings-server-side`); an older page's "on" and "off" mean Unpack all and Pack all. */
 function storedUnpackMode() {
   try {
-    const kept = localStorage.getItem(THREADS_UNPACKED_KEY);
+    const kept = deviceStorage().getItem(THREADS_UNPACKED_KEY);
     if (kept === "on") return "all";
     return UNPACK_MODES.includes(String(kept)) ? String(kept) : "packed";
   } catch (_error) {
@@ -51046,7 +51072,7 @@ function storedThreadCardStates() {
   /** @type {Map<string, string>} */
   const states = new Map();
   try {
-    const kept = JSON.parse(localStorage.getItem(THREAD_CARD_STATES_KEY) || "[]");
+    const kept = JSON.parse(deviceStorage().getItem(THREAD_CARD_STATES_KEY) || "[]");
     if (Array.isArray(kept)) {
       for (const pair of kept) {
         if (Array.isArray(pair) && typeof pair[0] === "string" && CARD_STATES.includes(pair[1])) states.set(pair[0], pair[1]);
@@ -51061,7 +51087,7 @@ function storedThreadCardStates() {
 /** Keep the threads' choices, the most recent `THREAD_CARD_STATES_KEPT`. */
 function keepThreadCardStates() {
   try {
-    localStorage.setItem(THREAD_CARD_STATES_KEY, JSON.stringify([...threadCardStates].slice(-THREAD_CARD_STATES_KEPT)));
+    deviceStorage().setItem(THREAD_CARD_STATES_KEY, JSON.stringify([...threadCardStates].slice(-THREAD_CARD_STATES_KEPT)));
   } catch (_error) {
     // A browser that refuses storage still honours the choices for this session.
   }
@@ -51132,7 +51158,7 @@ const nextUnpackMode = () => UNPACK_MODES[(UNPACK_MODES.indexOf(unpackMode) + 1)
 function setUnpackMode(mode) {
   unpackMode = UNPACK_MODES.includes(mode) ? mode : "packed";
   try {
-    localStorage.setItem(THREADS_UNPACKED_KEY, unpackMode);
+    deviceStorage().setItem(THREADS_UNPACKED_KEY, unpackMode);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -51570,7 +51596,7 @@ const THREADS_MAIN_KEY = "vibe-talk.voice.threads-main";
 /** Whether Main channel is pressed, kept on the server (`#457 settings-server-side`). `#419 threads-view-main-messages`. */
 function storedMainRows() {
   try {
-    return localStorage.getItem(THREADS_MAIN_KEY) === "on";
+    return deviceStorage().getItem(THREADS_MAIN_KEY) === "on";
   } catch (_error) {
     return false;
   }
@@ -51595,7 +51621,7 @@ function renderMainToggle() {
 function setMainRowsShown(on) {
   mainRowsShown = on;
   try {
-    localStorage.setItem(THREADS_MAIN_KEY, on ? "on" : "off");
+    deviceStorage().setItem(THREADS_MAIN_KEY, on ? "on" : "off");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -51652,7 +51678,7 @@ const THREAD_ORDER_NAMES = Object.keys(THREAD_ORDERS);
 /** The order as kept, or the default where none is, or one this page no longer knows. */
 function storedThreadOrder() {
   try {
-    const kept = localStorage.getItem(THREAD_ORDER_KEY);
+    const kept = deviceStorage().getItem(THREAD_ORDER_KEY);
     return kept && Object.prototype.hasOwnProperty.call(THREAD_ORDERS, kept) ? kept : THREAD_ORDER_NAMES[0];
   } catch (_error) {
     return THREAD_ORDER_NAMES[0];
@@ -51702,7 +51728,7 @@ function renderOrderToggle() {
 function setThreadOrder(order) {
   threadOrder = Object.prototype.hasOwnProperty.call(THREAD_ORDERS, order) ? order : THREAD_ORDER_NAMES[0];
   try {
-    localStorage.setItem(THREAD_ORDER_KEY, threadOrder);
+    deviceStorage().setItem(THREAD_ORDER_KEY, threadOrder);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -52439,7 +52465,7 @@ const THREAD_CARD_LISTS = [["thread-card", "scroll-area"], ["side-thread-card", 
 /** What was stored. ABSENT MEANS OPEN; a browser that refuses storage reads as nothing stored. */
 function storedThreadCardFolded() {
   try {
-    return localStorage.getItem(THREAD_CARD_FOLD_KEY) === "on";
+    return deviceStorage().getItem(THREAD_CARD_FOLD_KEY) === "on";
   } catch (_error) {
     return false;
   }
@@ -52493,7 +52519,7 @@ function threadCardPressed(card, event) {
  */
 function setThreadCardFolded(folded) {
   try {
-    localStorage.setItem(THREAD_CARD_FOLD_KEY, folded ? "on" : "off");
+    deviceStorage().setItem(THREAD_CARD_FOLD_KEY, folded ? "on" : "off");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
@@ -54077,11 +54103,11 @@ function blankResumeLast() {
   };
 }
 
-const resumeWanted = () => localStorage.getItem(RESUME_KEY) === "on";
+const resumeWanted = () => deviceStorage().getItem(RESUME_KEY) === "on";
 
 function persistResume(on) {
   try {
-    localStorage.setItem(RESUME_KEY, on ? "on" : "off");
+    deviceStorage().setItem(RESUME_KEY, on ? "on" : "off");
   } catch (_error) {
     // Same as the relay toggle: honoured for this session, not remembered. Better than failing.
   }
@@ -54440,13 +54466,13 @@ let liveAttached = false;
  *   * absent falls through too, to the default the owner asked for.
  */
 function relayMode() {
-  const stored = localStorage.getItem(RELAY_KEY);
+  const stored = deviceStorage().getItem(RELAY_KEY);
   return RELAY_MODES.includes(stored) ? stored : RELAY_DEFAULT_MODE;
 }
 
 function persistRelay(mode) {
   try {
-    localStorage.setItem(RELAY_KEY, mode);
+    deviceStorage().setItem(RELAY_KEY, mode);
   } catch (_error) {
     // A browser that refuses to store it still honours the choice for this session; the setting
     // simply does not survive a reload. Failing the control over it would be worse.
@@ -56359,7 +56385,7 @@ function storedActiveChannel() {
   const own = windowItem(ACTIVE_CHANNEL_KEY);
   if (own) return own;
   try {
-    return localStorage.getItem(ACTIVE_CHANNEL_KEY) || "";
+    return deviceStorage().getItem(ACTIVE_CHANNEL_KEY) || "";
   } catch (_error) {
     return "";
   }
@@ -56376,8 +56402,8 @@ function rememberActiveChannel(chosen = false) {
   keepWindowItem(ACTIVE_CHANNEL_KEY, id || null);
   if (!chosen) return;
   try {
-    if (id) localStorage.setItem(ACTIVE_CHANNEL_KEY, id);
-    else localStorage.removeItem(ACTIVE_CHANNEL_KEY);
+    if (id) deviceStorage().setItem(ACTIVE_CHANNEL_KEY, id);
+    else deviceStorage().removeItem(ACTIVE_CHANNEL_KEY);
   } catch (_error) {
     // Switching spaces still works when this browser cannot retain the preference.
   }
@@ -58643,7 +58669,7 @@ let settingsPassesSinceRead = 0;
 /** This device's kept value for a synced key, or null where it holds none. */
 function localSettingValue(key) {
   try {
-    return localStorage.getItem(key);
+    return deviceStorage().getItem(key);
   } catch (_error) {
     return null;
   }
@@ -58652,8 +58678,8 @@ function localSettingValue(key) {
 /** Keep a synced value on this device, or forget it, exactly as the setting's own writer would. */
 function keepLocalSetting(key, value) {
   try {
-    if (value === null) localStorage.removeItem(key);
-    else localStorage.setItem(key, value);
+    if (value === null) deviceStorage().removeItem(key);
+    else deviceStorage().setItem(key, value);
   } catch (_error) {
     // A browser that refuses storage honours the applied value for this session only.
   }
@@ -59579,7 +59605,7 @@ el("undo-send-dismiss").addEventListener("click", () => {
 el("undo-bookmark").addEventListener("click", undoBookmarkRemoval);
 el("forget-dismissed-sends").addEventListener("click", forgetDismissedSends);
 try {
-  const saved = JSON.parse(localStorage.getItem(CHANNEL_DRAFTS_KEY) || "{}");
+  const saved = JSON.parse(deviceStorage().getItem(CHANNEL_DRAFTS_KEY) || "{}");
   for (const [key, value] of Object.entries(saved || {})) {
     if (typeof value === "string") channelDrafts.set(key, value);
   }
@@ -60023,7 +60049,7 @@ function tickKeyboardDebug() {
 /** What was stored. ABSENT MEANS OFF. */
 function storedKeyboardDebug() {
   try {
-    return localStorage.getItem(KEYBOARD_DEBUG_KEY) === "1";
+    return deviceStorage().getItem(KEYBOARD_DEBUG_KEY) === "1";
   } catch (_error) {
     return false;
   }
@@ -60032,8 +60058,8 @@ function storedKeyboardDebug() {
 /** The reader's choice, kept on this device. @param {boolean} on */
 function applyKeyboardDebug(on) {
   try {
-    if (on) localStorage.setItem(KEYBOARD_DEBUG_KEY, "1");
-    else localStorage.removeItem(KEYBOARD_DEBUG_KEY);
+    if (on) deviceStorage().setItem(KEYBOARD_DEBUG_KEY, "1");
+    else deviceStorage().removeItem(KEYBOARD_DEBUG_KEY);
   } catch (_error) {
     // A browser that refuses storage still draws it for this session.
   }
@@ -60905,7 +60931,7 @@ if (savedUi) {
   readMode = savedReadMode(savedUi);
   todoMode = readMode === "hide";
   try {
-    localStorage.setItem(READ_MODE_KEY, readMode);
+    deviceStorage().setItem(READ_MODE_KEY, readMode);
   } catch (_error) {
     // As in `setReadMode`: the record just read is the restore either way.
   }
