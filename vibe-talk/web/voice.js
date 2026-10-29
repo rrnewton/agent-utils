@@ -14518,58 +14518,13 @@ function within(ms, request, abandoned = null) {
 // most of what a slow service does — as "slow to answer". A network failure and a refusal are
 // already sentences, and keep them.
 
-/** Wording that marks a failure as a service that did not answer in time. */
-const SLOW_WORDS = /timed?[ -]?out|timeout|deadline/i;
+// `SLOW_WORDS`, `providerWords`, `isSlowFailure` and `readableFailure` are web/src/core/api's
+// (`#624 voice-page-modularity`).
 
 /** The chat service a channel is read through, as a noun phrase for a sentence. */
 function chatServiceOf(channel) {
   const provider = providerOfChannel(channel);
   return (provider && typeof provider.name === "string" && provider.name.trim()) || chatServiceName();
-}
-
-/**
- * The provider's own words inside a server detail such as `X returned HTTP 502: {"message":"…"}`,
- * or the detail itself when it is already prose.
- */
-function providerWords(detail) {
-  const text = String(detail || "").trim();
-  const brace = text.indexOf("{");
-  if (brace < 0) return text;
-  try {
-    const inner = JSON.parse(text.slice(brace));
-    const said = inner && [inner.message, inner.detail, inner.error].find((value) =>
-      typeof value === "string" && value.trim());
-    if (said) return said.trim();
-  } catch (_error) {
-    // A provider body the server cut short is not JSON any more; its message may still be whole.
-    // `\x22` is a double quote, spelled out so the page suite's scan for string literals does
-    // not read one opening here.
-    const quoted = /\x22(?:message|detail)\x22\s*:\s*\x22((?:[^\x22\\]|\\.)+)\x22/.exec(text);
-    if (quoted) return quoted[1].replace(/\\(.)/g, "$1");
-  }
-  return text.slice(0, brace).replace(/[:\s]+$/, "") || text;
-}
-
-/** Whether a failure is a service that did not answer in time, rather than one that said no. */
-function isSlowFailure(error) {
-  if (!error) return false;
-  if (error.timedOut) return true;
-  const status = Number(error.status) || 0;
-  return status === 504 || status === 408 || (status >= 500 && SLOW_WORDS.test(String(error.detail || "")));
-}
-
-/**
- * A failed request to `service`, in words for the reader. Only a 5xx is reworded: anything else is
- * this server's own sentence or the page's, and is returned as it was.
- */
-function readableFailure(error, service) {
-  if (!error) return "";
-  const status = Number(error.status) || 0;
-  if (error.network || error.timedOut || status < 500) return String(error.message || "");
-  const name = sentenceStart(service);
-  if (isSlowFailure(error)) return `${name} is slow to answer right now.`;
-  const said = providerWords(error.detail);
-  return said ? `${name} could not answer: ${said}` : `${name} could not answer (HTTP ${status}).`;
 }
 
 /** {@link readableFailure} for the channel on screen. */
@@ -56295,10 +56250,7 @@ function applyChannelProvider() {
   renderLiveState();
 }
 
-/** `text` with its first letter capitalised, for a name that opens a sentence. */
-function sentenceStart(text) {
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
+// `sentenceStart` is web/src/foundation's (`#624 voice-page-modularity`).
 
 /** How long typing pauses before a search is sent, so each keystroke is not its own request. */
 const DIRECTORY_SEARCH_DELAY_MS = 250;

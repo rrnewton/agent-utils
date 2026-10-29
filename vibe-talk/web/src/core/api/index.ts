@@ -3,3 +3,5 @@
 
 export { createApi } from "./client.ts";
 export type { ApiDependencies, ApiPorts, ApiRequestError, ApiRequestOptions, ServerApi } from "./client.ts";
+export { SLOW_WORDS, isSlowFailure, providerWords, readableFailure } from "./failures.ts";
+export type { FailureFacts } from "./failures.ts";

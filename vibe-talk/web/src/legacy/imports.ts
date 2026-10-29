@@ -17,7 +17,7 @@ export {
   searchSubject,
 } from "../core/search/index.ts";
 export { readPieces, sentenceEnds, speechSegments } from "../core/speech/index.ts";
-export { createApi } from "../core/api/index.ts";
+export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   DEEP_LINK_PART_MAX,
@@ -29,6 +29,7 @@ export {
   linkKind,
   messageLinkRef,
   monoEm,
+  sentenceStart,
 } from "../foundation/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
