@@ -261,7 +261,7 @@ def walk(page: "Page", api: FakeApi, url: str, shot: Callable[[str], None]) -> N
 
     # Reading asks for the picked voice, and a tap is heard.
     page.click("#read-aloud")
-    page.wait_for_function(f"() => preparedSpeech.size === {len(MESSAGES)}", timeout=10_000)
+    page.wait_for_function(f"() => preparedSpeech.size() === {len(MESSAGES)}", timeout=10_000)
     with api.lock:
         prepares = list(api.prepares)
     check(len(prepares) > 0 and all(p.get("voice") == "wit$Clara" for p in prepares),

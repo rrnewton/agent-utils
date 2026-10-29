@@ -16,7 +16,13 @@ export {
   searchQueryTree,
   searchSubject,
 } from "../core/search/index.ts";
-export { readPieces, sentenceEnds, speechSegments } from "../core/speech/index.ts";
+export {
+  createPreparedSpeech,
+  readPieces,
+  sentenceEnds,
+  speechSegments,
+  ticketLeftMs as preparedTicketLeftMs,
+} from "../core/speech/index.ts";
 export { SLOW_WORDS, createApi, isSlowFailure, providerWords, readableFailure } from "../core/api/index.ts";
 export {
   allPageAnswersFor,

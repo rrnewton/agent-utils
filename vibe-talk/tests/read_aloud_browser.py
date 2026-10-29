@@ -471,7 +471,7 @@ def main() -> int:
                 page.click("#view-switch")
                 page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=10_000)
                 page.click("#read-aloud")
-                page.wait_for_function(f"() => preparedSpeech.size === {len(MESSAGES)}", timeout=10_000)
+                page.wait_for_function(f"() => preparedSpeech.size() === {len(MESSAGES)}", timeout=10_000)
                 return context, page
 
             def tap(page: Page, message_id: str) -> None:

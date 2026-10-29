@@ -3,3 +3,5 @@
 // public interface. `#624 voice-page-modularity`.
 
 export { balanceSentences, pieceSkewPasses, readPieces, sentenceEnds, speechSegments } from "./pieces.ts";
+export { createPreparedSpeech, ticketLeftMs } from "./prepared.ts";
+export type { PreparedBlock, PreparedEntry, PreparedSpeech, PreparedSpeechDependencies, SpeechMoment } from "./prepared.ts";

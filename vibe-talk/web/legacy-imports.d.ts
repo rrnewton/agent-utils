@@ -12,6 +12,8 @@ declare const searchSubject: LegacyImports["searchSubject"];
 declare const readPieces: LegacyImports["readPieces"];
 declare const sentenceEnds: LegacyImports["sentenceEnds"];
 declare const speechSegments: LegacyImports["speechSegments"];
+declare const createPreparedSpeech: LegacyImports["createPreparedSpeech"];
+declare const preparedTicketLeftMs: LegacyImports["preparedTicketLeftMs"];
 declare const createApi: LegacyImports["createApi"];
 declare const createWebPorts: LegacyImports["createWebPorts"];
 declare const createNavigation: LegacyImports["createNavigation"];

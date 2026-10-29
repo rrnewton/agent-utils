@@ -258,7 +258,7 @@ def walk(page: Page, api: FakeApi, url: str, shot: Callable[[str], None]) -> Non
 
     # A tap is heard, and the page names the voice that spoke it.
     page.click("#read-aloud")
-    page.wait_for_function(f"() => preparedSpeech.size === {len(MESSAGES)}", timeout=10_000)
+    page.wait_for_function(f"() => preparedSpeech.size() === {len(MESSAGES)}", timeout=10_000)
     viewport = page.viewport_size or {"width": 1440, "height": 900}
     if viewport["width"] < 600:
         page.tap('#discord-log > li[data-id="401"] .body')

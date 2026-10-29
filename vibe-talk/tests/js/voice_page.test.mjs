@@ -7122,6 +7122,31 @@ test("`#624 voice-page-modularity`: the outbox's entries, order, changes and sav
   assert.throws(() => outbox.saved());
 });
 
+test("`#624 voice-page-modularity`: prepared read-aloud tickets end on either clock, from the module alone", () => {
+  const { createPreparedSpeech, ticketLeftMs } = SPEECH_PIECES;
+  let now = { mono: 100, wall: 5000 };
+  const prepared = createPreparedSpeech({ now: () => now });
+  const entry = { url: "/speech/a", until: { mono: 200, wall: 5100 }, blocks: null };
+  prepared.keep("7", entry);
+  assert.deepStrictEqual([prepared.has(7), prepared.size(), prepared.entry(7)], [true, 1, entry], "an id was not read as its string");
+  assert.equal(ticketLeftMs(entry, now), 100);
+  assert.equal(ticketLeftMs(entry, { mono: 150, wall: 5080 }), 20, "not the nearer of the two deadlines");
+  // The phone slept: the monotonic clock stood still while the wall clock, and the ticket, went on.
+  now = { mono: 150, wall: 5100 };
+  assert.equal(prepared.entry("7"), null, "a ticket past its wall-clock deadline was played");
+  assert.equal(prepared.has("7"), false, "an ended ticket was kept");
+  prepared.keep("8", { ...entry, until: { mono: 150, wall: 9999 } });
+  assert.equal(prepared.entry("8"), null, "a ticket past its monotonic deadline was played");
+  // `get` keeps what is past its deadline; `forget` and `clear` drop it.
+  prepared.keep("9", entry);
+  assert.equal(prepared.get("9"), entry);
+  prepared.forget("9");
+  assert.equal(prepared.get(9), undefined);
+  prepared.keep("10", entry);
+  prepared.clear();
+  assert.equal(prepared.size(), 0);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
@@ -14804,7 +14829,8 @@ test("`#290 speech-ticket-refresh`: a phone that slept through the ticket's end 
   assert.match(slept.url, new RegExp(`^/api/v1/speech/ticket-for-${ID}-again\\?selection=tap-`),
     `the URL whose ticket ended while the phone slept was played: ${slept.url}`);
   assert.deepEqual(slept.page.speakCalls, [], "a refresh that worked fell back to the slower route");
-  const control = await tap(brokenScript("now.mono < entry.until.mono && now.wall < entry.until.wall", "now.mono < entry.until.mono"));
+  const control = await tap(await brokenModule([{ file: "src/core/speech/prepared.ts",
+    find: "now.mono < entry.until.mono && now.wall < entry.until.wall", replace: "now.mono < entry.until.mono" }]));
   assert.match(control.url, new RegExp(`ticket-for-${ID}\\?selection=`),
     "the negative control, on the monotonic clock alone, did not play the dead URL, so the check above proves nothing");
 });

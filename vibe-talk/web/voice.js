@@ -36061,8 +36061,13 @@ function readWithBrowserSpeech(parts, id, ticket) {
  *
  * Empty is not an error. Anything missing falls back to fetching the audio as a blob, which is
  * exactly what this page did before and is still correct, only slower.
+ *
+ * The owner is web/src/core/speech `createPreparedSpeech` (`#624 voice-page-modularity`), on this page's
+ * two clocks.
+ *
+ * @type {import("./src/core/speech/index.ts").PreparedSpeech}
  */
-const preparedSpeech = new Map();
+const preparedSpeech = createPreparedSpeech({ now: () => speechDeadlineNow() });
 
 /**
  * The prepared entry for message `id` while its ticket may still be good, else null: an entry past
@@ -36073,12 +36078,7 @@ const preparedSpeech = new Map();
  * @param {string} id
  */
 function preparedEntry(id) {
-  const entry = preparedSpeech.get(String(id));
-  if (!entry) return null;
-  const now = speechDeadlineNow();
-  if (now.mono < entry.until.mono && now.wall < entry.until.wall) return entry;
-  preparedSpeech.delete(String(id));
-  return null;
+  return preparedSpeech.entry(id);
 }
 
 /**
@@ -36222,7 +36222,7 @@ async function requestPreparedSpeech(channel, ids, signal = null) {
       // `#376 read-aloud-blocks`. The blocks the server will read the message as, when it is more
       // than one: `[{kind, spoken}]`, in drawing order.
       const blocks = Array.isArray(entry.blocks) && entry.blocks.length > 1 ? entry.blocks : null;
-      preparedSpeech.set(String(entry.message_id), { url: entry.url, until, blocks });
+      preparedSpeech.keep(String(entry.message_id), { url: entry.url, until, blocks });
     }
   }
 }
@@ -36262,8 +36262,7 @@ async function prepareSpeechFor(ids) {
 
 /** How long a prepared entry's ticket has left, on the nearer of its two deadlines. */
 function ticketLeftMs(entry) {
-  const now = speechDeadlineNow();
-  return Math.min(entry.until.mono - now.mono, entry.until.wall - now.wall);
+  return preparedTicketLeftMs(entry, speechDeadlineNow());
 }
 
 /**
@@ -38157,7 +38156,7 @@ async function readAloud(ids, from = null) {
   // ticket with little life left is prepared again now rather than failing part-way through.
   for (const part of parts) {
     const entry = preparedEntry(part);
-    if (entry && entry.blocks && ticketLeftMs(entry) < BLOCK_READ_TICKET_MARGIN_MS) preparedSpeech.delete(part);
+    if (entry && entry.blocks && ticketLeftMs(entry) < BLOCK_READ_TICKET_MARGIN_MS) preparedSpeech.forget(part);
   }
   // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
