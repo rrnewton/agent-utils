@@ -15,7 +15,7 @@
 //!
 //! A subcommand Muse cannot apply is answered on a row of its own too, such as `◆ completed goals
 //! cannot be resumed`. When a goal is already set, Muse and Codex first ask whether to replace it;
-//! see [`muse_replacement_pending`].
+//! see [`MuseReplacement`].
 
 use crate::submission::compact;
 
@@ -124,24 +124,160 @@ pub fn taken(before: &str, after: &str, argument: &str) -> Option<String> {
         .or_else(|| Some(format!("Goal set: {argument}")))
 }
 
-/// Whether `screen` shows Muse's question whether to replace the current goal with
-/// `objective`, with `Replace with new goal` selected, so Enter confirms the replacement.
+/// Muse's question whether to replace the goal already set, as one screen shows it.
 ///
 /// ```text
 ///   Replace the current goal?
-///   Current  Wait for the user to send the word GO; …
-///   New      Say BYE once and consider the goal achieved.
+///   Current  Wait for the user to send the word GO before doing anything at all; until …
+///            paused · 0%
+///   New      Wait for the user to send the word GO before doing anything at all; until …
+///   Replacing ends the current goal. Its progress is not carried over.
 ///     1. Keep current goal
 ///   ⟩ 2. Replace with new goal
+///   To end it without a new goal: /goal clear · To reword it: /goal edit
 ///   Enter to confirm · Esc to cancel
 /// ```
+///
+/// Muse draws each objective on one row and cuts a long one: at a word, followed by `…`, or,
+/// as seen in a 170-column pane, mid-word at the pane's right edge with no `…` at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MuseReplacement {
+    /// The current objective as shown, without a trailing `…`.
+    pub current: String,
+    /// Whether the current objective was cut.
+    pub current_cut: bool,
+    /// The current goal's state as shown under it, such as `active · 90%`.
+    pub status: String,
+    /// The new objective as shown, without a trailing `…`.
+    pub new: String,
+    /// Whether the new objective was cut.
+    pub new_cut: bool,
+    /// The selected option: 1 keeps the current goal, 2 replaces it.
+    pub selected: Option<u8>,
+}
+
+/// What to do with Muse's replacement question for a `/goal OBJECTIVE` command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplacementChoice {
+    /// The new objective is the current one: keep the current goal, so its progress stays.
+    Keep,
+    /// The question names this new objective and `Replace with new goal` is selected: Enter.
+    Replace,
+    /// The question cannot be matched to the command: cancel it, for this reason.
+    Cancel(String),
+}
+
+/// `text` with runs of whitespace as single spaces.
+fn words(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether an objective Muse showed, cut or not, is `objective`. A cut one must be a nonempty
+/// prefix of it; an uncut one must equal it, whitespace aside.
+fn shows(shown: &str, cut: bool, objective: &str) -> bool {
+    let (shown, objective) = (words(shown), words(objective));
+    if cut {
+        !shown.is_empty() && objective.starts_with(&shown)
+    } else {
+        shown == objective
+    }
+}
+
+impl MuseReplacement {
+    /// Read Muse's replacement question from `screen`, if it shows one.
+    #[must_use]
+    pub fn read(screen: &str) -> Option<Self> {
+        let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        let start = lines
+            .iter()
+            .position(|line| line.trim() == "Replace the current goal?")?;
+        let rest = &lines[start + 1..];
+        if !rest
+            .iter()
+            .any(|line| line.trim().starts_with("Enter to confirm"))
+        {
+            return None;
+        }
+        let shown = |label: &str| -> Option<(usize, String, bool)> {
+            rest.iter().enumerate().find_map(|(index, line)| {
+                let text = line.trim_start().strip_prefix(label)?;
+                if !text.starts_with(' ') {
+                    return None;
+                }
+                let text = text.trim();
+                let cut_by_edge = line.chars().count() >= width;
+                let (text, cut_by_ellipsis) = match text.strip_suffix('…') {
+                    Some(text) => (text.trim_end(), true),
+                    None => (text, false),
+                };
+                Some((index, text.to_owned(), cut_by_edge || cut_by_ellipsis))
+            })
+        };
+        let (current_at, current, current_cut) = shown("Current")?;
+        let (_, new, new_cut) = shown("New")?;
+        let status = rest
+            .get(current_at + 1)
+            .map(|line| line.trim())
+            .filter(|line| !line.starts_with("New "))
+            .unwrap_or_default()
+            .to_owned();
+        let selected = rest.iter().find_map(|line| {
+            let line = line.trim();
+            if line.starts_with("⟩ 1.") {
+                Some(1)
+            } else if line.starts_with("⟩ 2.") {
+                Some(2)
+            } else {
+                None
+            }
+        });
+        Some(Self {
+            current,
+            current_cut,
+            status,
+            new,
+            new_cut,
+            selected,
+        })
+    }
+
+    /// What a `/goal OBJECTIVE` command should do with this question. The question must name
+    /// `objective` as the new goal; when it names it as the current goal too, the goal is
+    /// kept. Two objectives cut at the same place count as the same, which only the part Muse
+    /// shows can tell.
+    #[must_use]
+    pub fn choice(&self, objective: &str) -> ReplacementChoice {
+        if !shows(&self.new, self.new_cut, objective) {
+            return ReplacementChoice::Cancel(
+                "Muse asked about replacing the goal, but the new objective it showed is not the \
+                 one sent"
+                    .to_owned(),
+            );
+        }
+        if shows(&self.current, self.current_cut, objective) {
+            return ReplacementChoice::Keep;
+        }
+        if self.selected == Some(2) {
+            ReplacementChoice::Replace
+        } else {
+            ReplacementChoice::Cancel(
+                "Muse asked about replacing the goal with `Replace with new goal` not selected"
+                    .to_owned(),
+            )
+        }
+    }
+}
+
+/// Whether `screen` shows a question about replacing a goal, Muse's or Codex's, that a command
+/// left open.
 #[must_use]
-pub fn muse_replacement_pending(screen: &str, objective: &str) -> bool {
-    let screen = compact(screen);
-    screen.contains("Replacethecurrentgoal?")
-        && screen.contains(&compact(&format!("New {objective}")))
-        && screen.contains("⟩2.Replacewithnewgoal")
-        && screen.contains("Entertoconfirm")
+pub fn replacement_question_open(screen: &str) -> bool {
+    MuseReplacement::read(screen).is_some() || compact(screen).contains("Replacegoal?")
 }
 
 #[cfg(test)]
@@ -259,24 +395,82 @@ mod tests {
         assert_eq!(taken(&claude_before, &echoed, objective), None);
     }
 
+    /// The question Muse 1.4.15 drew in a 120-column pane for an objective it already had,
+    /// paused, both rows cut at a word and ended with `…`.
+    fn probe_question(objective_row: &str) -> String {
+        format!(
+            "{RULE}\n❯ /goal Wait for the user\n  Replace the current goal?\n  Current  Wait for \
+             the user to send the word GO before doing anything at all; until then say WAITING \
+             exactly once and …\n           paused · 0%\n  New      {objective_row}\n  Replacing \
+             ends the current goal. Its progress is not carried over.\n    1. Keep current goal\n  \
+             ⟩ 2. Replace with new goal\n  To end it without a new goal: /goal clear · To reword \
+             it: /goal edit\n  Enter to confirm · Esc to cancel\n{RULE}\n"
+        )
+    }
+
     #[test]
     fn muse_asks_before_replacing_a_goal() {
-        let screen = format!(
-            "{RULE}\n❯ /goal Say BYE once and consider the goal achieved.\n  Replace the current goal?\n  \
-             Current  Wait for the user to send the word GO.\n           blocked · 0%\n  \
-             New      Say BYE once and consider the goal achieved.\n  Replacing ends the current \
-             goal. Its progress is not carried over.\n    1. Keep current goal\n  ⟩ 2. Replace with \
-             new goal\n  To end it without a new goal: /goal clear · To reword it: /goal edit\n  \
-             Enter to confirm · Esc to cancel\n{RULE}\n"
+        let long =
+            "Wait for the user to send the word GO before doing anything at all; until then \
+                    say WAITING exactly once and report that you are blocked on the user.";
+        let same = probe_question(
+            "Wait for the user to send the word GO before doing anything at all; until then say \
+             WAITING exactly once and …",
         );
-        assert!(muse_replacement_pending(
-            &screen,
-            "Say BYE once and consider the goal achieved."
+        let question = MuseReplacement::read(&same).expect("question");
+        assert!(question.current_cut && question.new_cut);
+        assert_eq!(question.status, "paused · 0%");
+        assert_eq!(question.selected, Some(2));
+        assert_eq!(question.choice(long), ReplacementChoice::Keep);
+        let other = probe_question("Say BYE once and consider the goal achieved.");
+        let question = MuseReplacement::read(&other).expect("question");
+        assert!(!question.new_cut);
+        assert_eq!(
+            question.choice("Say BYE once and consider the goal achieved."),
+            ReplacementChoice::Replace
+        );
+        assert!(matches!(
+            question.choice("Say HI once."),
+            ReplacementChoice::Cancel(_)
         ));
-        assert!(!muse_replacement_pending(&screen, "Say HI once."));
-        assert!(!muse_replacement_pending(
-            &screen.replace("⟩ 2.", "  2.").replace("    1.", "  ⟩ 1."),
-            "Say BYE once and consider the goal achieved."
+        let keep_selected = other
+            .replace("⟩ 2.", "  2.")
+            .replace("    1. Keep", "  ⟩ 1. Keep");
+        assert!(matches!(
+            MuseReplacement::read(&keep_selected)
+                .expect("question")
+                .choice("Say BYE once and consider the goal achieved."),
+            ReplacementChoice::Cancel(_)
         ));
+        assert!(replacement_question_open(&other));
+        assert!(!replacement_question_open(&format!("{RULE}\n❯\n{RULE}\n")));
+    }
+
+    #[test]
+    fn the_question_from_a_live_coordinator_cut_mid_word_at_the_pane_edge_is_read() {
+        // The geometry of a question read from a live Muse coordinator's 170-column pane on
+        // 2026-10-28, its objective's private words replaced (testdata/muse-goal-replace-menu.txt
+        // is that redaction, not the capture itself): both objectives are cut mid-word at the
+        // right edge, with no `…`.
+        let screen = include_str!("../testdata/muse-goal-replace-menu.txt");
+        let objective = "Adopt ALL subagents and push all open workstreams to completion -- including \
+                         but not limited to the drain of the reviewer's PRs, linux kernel debugging, \
+                         reprobuilds of work, and the project test fixes plus split of the 3rd party \
+                         code and preparation of the 0.5.5 cutover of source of truth. Also get the \
+                         chat bridge debugged and functional until you can round trip a test \
+                         message.";
+        let question = MuseReplacement::read(screen).expect("question");
+        assert!(question.current_cut && question.new_cut, "{question:?}");
+        assert!(question.current.ends_with("linux kernel debugging, reprob"));
+        assert_eq!(question.status, "active · 90%");
+        assert_eq!(question.selected, Some(2));
+        // The same objective, as the owner sent it: keep the goal and its progress.
+        assert_eq!(question.choice(objective), ReplacementChoice::Keep);
+        // One that differs within the part shown is no match at all.
+        assert!(matches!(
+            question.choice(&objective.replace("ALL", "SOME")),
+            ReplacementChoice::Cancel(_)
+        ));
+        assert!(replacement_question_open(screen));
     }
 }

@@ -34,6 +34,13 @@ pub(super) struct MuseEditor {
     /// A staged paste draws with its last character missing, so it never shows as the exact
     /// prompt, as a wrap the proof cannot read once did.
     pub(super) garble: bool,
+    /// The goal set, if any, as Muse 1.4.15 keeps one: `/goal OBJECTIVE` with another goal set
+    /// asks whether to replace it.
+    pub(super) goal: Option<String>,
+    /// The open replacement question: the command, its new objective, and the selected option.
+    pub(super) question: Option<(String, String, u8)>,
+    /// The new objective the question shows, when it shows something other than the command's.
+    pub(super) question_shows: Option<String>,
 }
 
 impl Default for MuseEditor {
@@ -48,6 +55,9 @@ impl Default for MuseEditor {
             ignore_enter: false,
             approval: false,
             garble: false,
+            goal: None,
+            question: None,
+            question_shows: None,
         }
     }
 }
@@ -70,6 +80,20 @@ impl MuseEditor {
             .as_deref()
             .filter(|text| self.collapse_over.is_some_and(|limit| length(text) > limit));
         let editor = match (collapsed, self.staged.as_ref()) {
+            _ if self.question.is_some() => {
+                let (command, new, selected) = self.question.as_ref().expect("question");
+                let mark = |option: u8| if *selected == option { "⟩" } else { " " };
+                format!(
+                    "❯ {command}\n  Replace the current goal?\n  Current  {}\n           active · \
+                     40%\n  New      {}\n  Replacing ends the current goal. Its progress is not \
+                     carried over.\n  {} 1. Keep current goal\n  {} 2. Replace with new goal\n  \
+                     Enter to confirm · Esc to cancel",
+                    self.goal.as_deref().unwrap_or_default(),
+                    self.question_shows.as_deref().unwrap_or(new),
+                    mark(1),
+                    mark(2)
+                )
+            }
             _ if self.approval => "Would you like to run the following command?\n  $ date\n\
                                    ⟩ 1. Allow this stage once (y)\n  2. Abort the entire command (esc)"
                 .to_owned(),
@@ -114,10 +138,26 @@ impl MuseEditor {
         if self.ignore_enter || self.approval {
             return None;
         }
+        if let Some((command, new, selected)) = self.question.take() {
+            // Replace sets the new goal; Keep leaves the command's text in the editor.
+            if selected == 2 {
+                self.history.push(format!("◆ Goal set — {new}"));
+                self.goal = Some(new);
+            } else {
+                self.staged = Some(command);
+            }
+            return None;
+        }
         let prompt = self.staged.take()?;
         // Muse answers a `/goal` command on a row of its own and prints no user turn for it.
-        if let Some(argument) = crate::goal_command::argument(&prompt) {
+        if let Some(argument) = crate::goal_command::argument(&prompt).map(str::to_owned) {
+            let argument = argument.as_str();
+            if self.goal.is_some() && !crate::goal_command::is_subcommand(argument) {
+                self.question = Some((prompt.clone(), argument.to_owned(), 2));
+                return None;
+            }
             self.history.push(format!("◆ Goal set — {argument}"));
+            self.goal = Some(argument.to_owned());
             return Some(prompt);
         }
         if self.busy {
@@ -130,6 +170,18 @@ impl MuseEditor {
 
     /// `ctrl+u` deletes the editor's one row of text; `backspace` on an empty row does nothing.
     pub(super) fn key(&mut self, key: &str) {
+        if let Some((command, _, selected)) = self.question.as_mut() {
+            match key {
+                "Up" => *selected = 1,
+                "Down" => *selected = 2,
+                "Escape" => {
+                    self.staged = Some(command.clone());
+                    self.question = None;
+                }
+                _ => {}
+            }
+            return;
+        }
         if key == "ctrl+u" && !self.approval {
             self.staged = None;
         }

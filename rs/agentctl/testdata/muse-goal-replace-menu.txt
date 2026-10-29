@@ -1,0 +1,14 @@
+❯ /goal Adopt ALL subagents and push all open workstreams to completion -- including but not limited to the drain of the reviewer's PRs, linux kernel debugging,
+  reprobuilds of work, and the project test fixes plus split of the 3rd party code and preparation of the 0.5.5 cutover of source of truth. Also get the chat bridge
+  debugged and functional until you can round trip a test message.
+  Replace the current goal?
+  Current  Adopt ALL subagents and push all open workstreams to completion -- including but not limited to the drain of the reviewer's PRs, linux kernel debugging, reprob
+           active · 90%
+  New      Adopt ALL subagents and push all open workstreams to completion -- including but not limited to the drain of the reviewer's PRs, linux kernel debugging, reprob
+  Replacing ends the current goal. Its progress is not carried over.
+    1. Keep current goal
+  ⟩ 2. Replace with new goal
+  To end it without a new goal: /goal clear · To reword it: /goal edit
+  Enter to confirm · Esc to cancel
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  watermelon-full-preview · xhigh · ~/work/project · YOLO                                                                                     Goal (1h 31m) 90% ██████████

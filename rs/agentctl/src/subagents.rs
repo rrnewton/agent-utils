@@ -3146,6 +3146,8 @@ impl<A: ManagedApi + ?Sized> GuardedInput for GuardedTerminal<'_, '_, A> {
 const READBACK: Duration = Duration::from_secs(5);
 /// Longest wait for a harness's answer to a `/goal` command typed raw.
 const GOAL_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest wait for a goal question to change after a key: a selection, a close, an editor.
+const GOAL_SETTLE: Duration = Duration::from_secs(2);
 /// How long a withdrawn Muse paste is watched for drawing late before the editor counts as empty.
 const MUSE_LATE_PASTE: Duration = Duration::from_millis(500);
 
@@ -3807,11 +3809,18 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
 
     /// Type the `/goal` command `text` raw into an idle pane and prove from the screen that the
     /// harness took it: see [`crate::goal_command`]. Muse takes it through its guarded editor
-    /// (an exact paste, then Enter); Claude Code and Codex through the native prompt. When Muse
-    /// or Codex asks whether to replace a goal already set with exactly this objective, the
-    /// replacement is confirmed once, since the command asked for it. The receipt's evidence is
-    /// the harness's answer. With no answer within [`GOAL_ANSWER_TIMEOUT`] the outcome is
-    /// unknown: the command may have been taken, so it is never typed again.
+    /// (an exact paste, then Enter); Claude Code and Codex through the native prompt. The
+    /// receipt's evidence is the harness's answer.
+    ///
+    /// When Muse asks whether to replace a goal already set, its question is read
+    /// ([`crate::goal_command::MuseReplacement`]): the same objective keeps the current goal,
+    /// so its progress is not reset, and the receipt says `goal unchanged`; a different one
+    /// named exactly, with `Replace with new goal` selected, is confirmed with Enter and proved
+    /// by Muse's `Goal set` answer; anything else cancels the question. Codex's question is
+    /// confirmed only when it names exactly this objective. No question is ever left open: a
+    /// question this cannot settle, or one still open when [`GOAL_ANSWER_TIMEOUT`] passes, is
+    /// cancelled with Esc and the editor cleared, and the error says so. Any error after typing
+    /// leaves the outcome unknown to the queue, so the command is never typed again.
     fn submit_goal_command(
         &self,
         pane_id: &str,
@@ -3819,6 +3828,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         argument: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Submission> {
+        use crate::goal_command::{MuseReplacement, ReplacementChoice};
         use crate::submission::SubmissionReceipt;
         if runtime.cancelled() {
             return Ok(Submission::NotStaged(
@@ -3842,22 +3852,49 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let objective = (!crate::goal_command::is_subcommand(argument)).then_some(argument);
         let mut key_presses = 1;
         let mut confirmed = false;
+        let receipt = |evidence: String, key_presses: u32| {
+            Submission::Verified(SubmissionReceipt {
+                key: "Enter",
+                key_presses,
+                elapsed: runtime.monotonic().saturating_sub(started),
+                evidence,
+                printed: true,
+                settled: true,
+            })
+        };
         loop {
             let screen = self.goal_screen(pane_id, runtime)?;
             if let Some(answer) = crate::goal_command::taken(&before, &screen, argument) {
-                return Ok(Submission::Verified(SubmissionReceipt {
-                    key: "Enter",
-                    key_presses,
-                    elapsed: runtime.monotonic().saturating_sub(started),
-                    evidence: answer,
-                    printed: true,
-                    settled: true,
-                }));
+                return Ok(receipt(answer, key_presses));
             }
             if let Some(objective) = objective.filter(|_| !confirmed) {
-                if crate::goal_command::muse_replacement_pending(&screen, objective)
-                    || goal_replacement_selected(&screen, objective)
-                {
+                if let Some(question) = MuseReplacement::read(&screen) {
+                    match question.choice(objective) {
+                        ReplacementChoice::Replace => {
+                            self.confirm_goal_replacement(pane_id, runtime)?;
+                            key_presses += 1;
+                            confirmed = true;
+                            continue;
+                        }
+                        ReplacementChoice::Keep => {
+                            let state = question
+                                .status
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or("set")
+                                .to_owned();
+                            self.keep_current_goal(pane_id, question.selected == Some(1), runtime)?;
+                            return Ok(receipt(
+                                format!("goal unchanged (already {state})"),
+                                key_presses + 2,
+                            ));
+                        }
+                        ReplacementChoice::Cancel(reason) => {
+                            return Err(self.cancel_goal_question(pane_id, &reason, runtime));
+                        }
+                    }
+                }
+                if goal_replacement_selected(&screen, objective) {
                     self.confirm_goal_replacement(pane_id, runtime)?;
                     key_presses += 1;
                     confirmed = true;
@@ -3866,14 +3903,148 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             }
             let now = runtime.monotonic();
             if runtime.cancelled() || now.saturating_sub(started) >= GOAL_ANSWER_TIMEOUT {
-                return Err(AdapterError::unavailable(format!(
-                    "{} in pane {pane_id} showed no answer to the typed goal command within {}s; \
-                     it may have taken it",
+                let reason = format!(
+                    "{} in pane {pane_id} showed no answer to the typed goal command within {}s",
                     self.record.harness,
                     GOAL_ANSWER_TIMEOUT.as_secs()
+                );
+                if crate::goal_command::replacement_question_open(&screen) {
+                    return Err(self.cancel_goal_question(pane_id, &reason, runtime));
+                }
+                return Err(AdapterError::unavailable(format!(
+                    "{reason}; it may have taken it"
                 )));
             }
             runtime.sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Press `key` in the pane, through the recipient guard, as a goal command's follow-up key.
+    fn goal_key(
+        &self,
+        pane_id: &str,
+        key: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        match self.guarded(runtime)?.send_keys(pane_id, key) {
+            Err(error) if error.kind() == AdapterErrorKind::ProbableMisroute => Err(self
+                .countermand(
+                    pane_id,
+                    key,
+                    "identity-changed-after-write",
+                    &format!("goal command key {key}: {error}"),
+                    runtime,
+                )),
+            other => other,
+        }
+    }
+
+    /// Read the pane until `settled` holds for a read, for up to [`GOAL_SETTLE`]; the last read
+    /// when it does.
+    fn goal_screen_until(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+        settled: &dyn Fn(&str) -> bool,
+    ) -> crate::error::Result<Option<String>> {
+        let started = runtime.monotonic();
+        loop {
+            let screen = self.goal_screen(pane_id, runtime)?;
+            if settled(&screen) {
+                return Ok(Some(screen));
+            }
+            if runtime.cancelled() || runtime.monotonic().saturating_sub(started) >= GOAL_SETTLE {
+                return Ok(None);
+            }
+            runtime.sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// After Muse's question closed, take the command's text back out of the editor, where
+    /// Muse leaves it after Keep or Esc, and prove the editor empty. For a harness whose editor
+    /// this cannot read, only the question's closing is proved.
+    fn clear_goal_draft(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<bool> {
+        let closed = |screen: &str| !crate::goal_command::replacement_question_open(screen);
+        let Some(screen) = self.goal_screen_until(pane_id, runtime, &closed)? else {
+            return Ok(false);
+        };
+        if !self.uses_muse_composer() {
+            return Ok(true);
+        }
+        let empty = |screen: &str| crate::harness_tui::muse::MuseTui::editor_empty(screen);
+        if empty(&screen) {
+            return Ok(true);
+        }
+        self.goal_key(pane_id, "ctrl+u", runtime)?;
+        Ok(self.goal_screen_until(pane_id, runtime, &empty)?.is_some())
+    }
+
+    /// Choose `Keep current goal` in Muse's question: one Up from `Replace with new goal`, seen
+    /// selected, then Enter, then the command's text taken back out of the editor.
+    fn keep_current_goal(
+        &self,
+        pane_id: &str,
+        keep_selected_already: bool,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        use crate::goal_command::MuseReplacement;
+        let keep_selected =
+            |screen: &str| MuseReplacement::read(screen).is_some_and(|q| q.selected == Some(1));
+        if !keep_selected_already {
+            self.goal_key(pane_id, "Up", runtime)?;
+            if self
+                .goal_screen_until(pane_id, runtime, &keep_selected)?
+                .is_none()
+            {
+                return Err(self.cancel_goal_question(
+                    pane_id,
+                    "the goal sent is the current one, but `Keep current goal` could not be \
+                     selected",
+                    runtime,
+                ));
+            }
+        }
+        self.goal_key(pane_id, "Enter", runtime)?;
+        if self.clear_goal_draft(pane_id, runtime)? {
+            return Ok(());
+        }
+        Err(AdapterError::unavailable(
+            "the goal sent is the current one and `Keep current goal` was chosen, but the \
+             editor was not seen empty afterwards; inspect the pane",
+        ))
+    }
+
+    /// Cancel a goal question this cannot settle: Esc, then the command's text taken back out
+    /// of the editor. The error says why, and whether the pane was seen back at an empty editor.
+    fn cancel_goal_question(
+        &self,
+        pane_id: &str,
+        reason: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> AdapterError {
+        let cleared = self
+            .goal_key(pane_id, "Escape", runtime)
+            .and_then(|()| self.clear_goal_draft(pane_id, runtime));
+        match cleared {
+            Ok(true) => AdapterError::unavailable(format!(
+                "{reason}; the question was cancelled with Esc{}, so the goal is unchanged",
+                if self.uses_muse_composer() {
+                    " and the editor cleared"
+                } else {
+                    ""
+                }
+            )),
+            Ok(false) => AdapterError::unavailable(format!(
+                "{reason}; Esc was pressed, but the question or the command's text may still be \
+                 on screen; inspect the pane"
+            )),
+            Err(error) => AdapterError::unavailable(format!(
+                "{reason}; cancelling the question failed ({error}); inspect the pane"
+            )),
         }
     }
 
@@ -9611,6 +9782,36 @@ its drain would type first, so it was not queued",
         }
         record.supported()?;
         agent::message_state(&self.queue(agent_name)?, message_id)
+    }
+
+    /// What the queue of `agent_name` recorded for a typed `/goal` command `message_id`: the
+    /// harness's answer from a processed message, and the error from a failed one. Anything
+    /// that cannot be read is `None`.
+    pub(crate) fn goal_outcome(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+    ) -> (Option<String>, Option<String>) {
+        if message_id.is_empty()
+            || !message_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || message_id.starts_with('.')
+        {
+            return (None, None);
+        }
+        let Ok(queue) = self.queue(agent_name) else {
+            return (None, None);
+        };
+        let field = |phase: &str, key: &str| {
+            agent::read_private_json(&queue.join(phase).join(format!("{message_id}.json")))
+                .ok()
+                .and_then(|document| document.get(key).and_then(Value::as_str).map(str::to_owned))
+        };
+        (
+            field("processed", "goal_answer"),
+            field("failed", "delivery_error"),
+        )
     }
 
     fn send_record(

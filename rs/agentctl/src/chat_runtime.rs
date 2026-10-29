@@ -4843,6 +4843,14 @@ pub(crate) trait CoordinatorDelivery {
         let _ = (agent_name, text, sender, message_id);
         Ok(None)
     }
+    /// What the coordinator's queue recorded for a typed `/goal` command `message_id`: the
+    /// harness's answer that proved it was taken, and the error of a delivery that failed after
+    /// typing, such as a goal question cancelled. A delivery that records neither gives
+    /// `(None, None)`.
+    fn goal_outcome(&self, agent_name: &str, message_id: &str) -> (Option<String>, Option<String>) {
+        let _ = (agent_name, message_id);
+        (None, None)
+    }
 }
 
 /// The open requests whose prompt has not reached the coordinator, or may not have, among those
@@ -5027,6 +5035,10 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
     ) -> std::result::Result<Option<Value>, String> {
         ManagedAgents::headless_approval_reply(self, agent_name, text, sender, message_id)
             .map_err(|error| error.to_string())
+    }
+
+    fn goal_outcome(&self, agent_name: &str, message_id: &str) -> (Option<String>, Option<String>) {
+        self.goal_outcome(agent_name, message_id)
     }
 }
 
@@ -12674,6 +12686,7 @@ pub(crate) fn deliver_request_with(
         Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
             let detail = "coordinator queue reports a possibly submitted request";
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
+            reply_to_goal_command(state, delivery, &record, Some(detail));
             return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
         }
         // A request set aside untyped (cancelled or expired) is never queued again by itself;
@@ -12730,7 +12743,7 @@ pub(crate) fn deliver_request_with(
         // prompt only once the model started it.
         state.note_started(delivery, message_id);
         state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
-        confirm_goal_command(state, delivery, &record);
+        reply_to_goal_command(state, delivery, &record, None);
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
 
@@ -12738,7 +12751,7 @@ pub(crate) fn deliver_request_with(
         Ok(Some(QueueMessageState::Processed)) => {
             state.note_started(delivery, message_id);
             state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
-            confirm_goal_command(state, delivery, &record);
+            reply_to_goal_command(state, delivery, &record, None);
             Ok(CoordinatorDeliveryResult::Delivered)
         }
         Ok(Some(QueueMessageState::Cancelled)) => {
@@ -12755,6 +12768,7 @@ pub(crate) fn deliver_request_with(
                 "coordinator queue reports a possibly submitted request".to_owned()
             });
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(&detail))?;
+            reply_to_goal_command(state, delivery, &record, Some(&detail));
             Ok(CoordinatorDeliveryResult::Uncertain(detail))
         }
         Ok(Some(QueueMessageState::Pending) | None) => {
@@ -12774,15 +12788,19 @@ pub(crate) fn deliver_request_with(
     }
 }
 
-/// After a `/goal` command typed raw reached the coordinator, send the request's one reply from
-/// the bridge itself, since the agent writes none: what the harness answered, which the queue's
-/// submission proof saw on its screen, read again here. The request's replies are then closed.
-/// Neither step can undo the delivery, so a failure is only logged; a reply refused or not sent
-/// leaves the request delivered without one.
-fn confirm_goal_command(
+/// After a `/goal` command typed raw reached the coordinator, or failed after typing, send the
+/// request's one reply from the bridge itself, since the agent writes none, then close the
+/// request's replies. A delivered command's reply quotes the answer that proved it, which the
+/// queue recorded (`goal unchanged (already active)` when the coordinator already had that goal
+/// and kept it), or else the latest goal answer on screen. A failed command's reply says it was
+/// not applied, and why, from the queue's record of the failure when there is one: a question
+/// about replacing the goal that could not be settled was cancelled, for one. Neither step can
+/// change the delivery's outcome, so a failure here is only logged.
+fn reply_to_goal_command(
     state: &BridgeState,
     delivery: &dyn CoordinatorDelivery,
     record: &RequestRecord,
+    failure: Option<&str>,
 ) {
     let Some(command) = state.goal_command(record) else {
         return;
@@ -12791,31 +12809,49 @@ fn confirm_goal_command(
         return;
     }
     let agent_name = &state.config.agent_name;
-    let answer = delivery
-        .screen(agent_name)
-        .ok()
-        .and_then(|screen| crate::goal_command::latest_answer(&crate::harness_tui::plain(&screen)));
-    let body = match answer {
-        Some(answer) => {
-            format!("Typed `{command}` into {agent_name}'s composer. It answered: {answer}")
+    let (answer, error) = delivery.goal_outcome(agent_name, &record.delivery_message_id);
+    let body = match failure {
+        Some(detail) => {
+            let reason = error.unwrap_or_else(|| detail.to_owned());
+            let reason = reason
+                .rsplit_once("prompt may have been submitted: ")
+                .map_or(reason.as_str(), |(_, reason)| reason);
+            format!("Did not apply `{command}` in {agent_name}: {reason}")
         }
-        None => format!("Typed `{command}` into {agent_name}'s composer, and it took the command."),
+        None => match answer {
+            Some(answer) if answer.starts_with("goal unchanged") => format!(
+                "`{command}`: {answer}. {agent_name} kept its current goal, so its progress was \
+                 not reset."
+            ),
+            Some(answer) => {
+                format!("Typed `{command}` into {agent_name}'s composer. It answered: {answer}")
+            }
+            None => match delivery.screen(agent_name).ok().and_then(|screen| {
+                crate::goal_command::latest_answer(&crate::harness_tui::plain(&screen))
+            }) {
+                Some(answer) => {
+                    format!("Typed `{command}` into {agent_name}'s composer. It answered: {answer}")
+                }
+                None => format!(
+                    "Typed `{command}` into {agent_name}'s composer, and it took the command."
+                ),
+            },
+        },
     };
     let identifier = format!(
         "{}_{}",
         record.reply_nonce,
         record.next_reply_ordinal.max(1)
     );
-    let stored = state.submit_reply(&record.key, &identifier, &body);
-    if let Err(error) = &stored {
+    if let Err(error) = state.submit_reply(&record.key, &identifier, &body) {
         crate::chat_service::service_log(format_args!(
-            "agentctl: request {} typed its goal command, but its confirmation was not stored: {error}",
+            "agentctl: request {} typed a goal command, but its reply was not stored: {error}",
             record.key
         ));
     }
     if let Err(error) = state.close_replies(&record.key) {
         crate::chat_service::service_log(format_args!(
-            "agentctl: request {} typed its goal command, but its replies could not be closed: {error}",
+            "agentctl: request {} typed a goal command, but its replies could not be closed: {error}",
             record.key
         ));
     }
@@ -15914,9 +15950,19 @@ mod tests {
         /// Refuse the next read of the pane with this error.
         screen_error: Mutex<Option<String>>,
         screen_reads: Mutex<u64>,
+        /// What the queue recorded for a typed `/goal` command: its answer, or its failure.
+        goal: Mutex<(Option<String>, Option<String>)>,
     }
 
     impl CoordinatorDelivery for FakeDelivery {
+        fn goal_outcome(
+            &self,
+            _agent_name: &str,
+            _message_id: &str,
+        ) -> (Option<String>, Option<String>) {
+            self.goal.lock().expect("goal lock").clone()
+        }
+
         fn message_state(
             &self,
             _agent_name: &str,
@@ -32494,6 +32540,83 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 && stored.contains("It answered: Goal set — ship the release"),
             "{stored}"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // The queue's record of the answer is what the reply quotes, such as a goal the
+        // coordinator already had and kept.
+        let stored_reply = |root: &Path| {
+            fs::read_dir(root.join("replies"))
+                .expect("reply directory")
+                .flatten()
+                .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+                .collect::<String>()
+        };
+        let root = temporary("goal-command-kept");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&indexed_delivery_at(
+                1,
+                1,
+                "cursor-1",
+                "/goal ship the release",
+            ))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let delivery = FakeDelivery::default();
+        *delivery.goal.lock().expect("goal") =
+            (Some("goal unchanged (already active)".to_owned()), None);
+        deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+            .expect("deliver request");
+        let stored = stored_reply(&root);
+        assert!(
+            stored.contains("goal unchanged (already active)")
+                && stored.contains("kept its current goal, so its progress was not reset"),
+            "{stored}"
+        );
+        assert!(state.read_request(&key).expect("request").reply_closed);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // A command that failed after typing gets a reply that says it was not applied, and
+        // why, from the queue's record: here, a goal question cancelled.
+        let root = temporary("goal-command-cancelled");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&indexed_delivery_at(
+                1,
+                1,
+                "cursor-1",
+                "/goal ship the release",
+            ))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let delivery = FakeDelivery::default();
+        *delivery.queue_state.lock().expect("queue state") = Some(QueueMessageState::Failed);
+        *delivery.goal.lock().expect("goal") = (
+            None,
+            Some(
+                "pane w1:p1 agent-prompt outcome is unknown; prompt may have been submitted: \
+                 Muse asked about replacing the goal, but the new objective it showed is not the \
+                 one sent; the question was cancelled with Esc and the editor cleared, so the \
+                 goal is unchanged"
+                    .to_owned(),
+            ),
+        );
+        assert!(matches!(
+            deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Uncertain(_)
+        ));
+        let stored = stored_reply(&root);
+        assert!(
+            stored.contains("Did not apply `/goal ship the release` in ")
+                && stored.contains(": Muse asked about replacing the goal")
+                && stored.contains("cancelled with Esc")
+                && !stored.contains("agent-prompt outcome"),
+            "{stored}"
+        );
+        assert!(state.read_request(&key).expect("request").reply_closed);
         fs::remove_dir_all(root).expect("cleanup");
 
         // Any other message, a slash command other than `/goal`, or `/goal` alone, is a request

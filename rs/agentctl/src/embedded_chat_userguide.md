@@ -1533,18 +1533,37 @@ so the proof that it was taken is the harness's answer on the screen:
 
 A new objective needs one more confirmation of exactly that objective than the
 screen showed before the command; a subcommand needs a new answer row that
-mentions a goal, such as Muse's `◆ completed goals cannot be resumed`. When a
-goal is already set, Muse and Codex first ask whether to replace it; with
-exactly the command's objective in the question and the replacement selected,
-Enter is pressed once to confirm it, since the command asked for it. With no
-answer within 20 seconds the request is `delivery_uncertain`: the harness may
-have taken the command, so it is never typed again.
+mentions a goal, such as Muse's `◆ completed goals cannot be resumed`.
+
+When a goal is already set, Muse first asks whether to replace it, showing the
+current objective, its state (such as `active · 90%`) and the new objective,
+each on one row. A long objective is cut there: at a word and followed by `…`,
+or mid-word at the pane's right edge. A cut objective matches when the part
+shown is the start of the command's objective; an uncut one must equal it.
+
+- If the new objective shown is the current one, `Keep current goal` is chosen
+  (Up, then Enter), so the goal's progress is not reset, and the command's
+  text, which Muse puts back in its editor, is taken out again. Two objectives
+  cut at the same place count as the same, since only the part shown can be
+  compared.
+- If it is a different objective, named as sent, and `Replace with new goal`
+  is selected, Enter confirms the replacement, and Muse's `Goal set` answer is
+  the proof.
+- Otherwise the question is cancelled with Esc and the editor cleared.
+
+Codex's replacement question is confirmed only when it names exactly the
+command's objective. A question is never left open: one still open when 20
+seconds have passed with no answer is cancelled the same way. A command that
+failed after it was typed is `delivery_uncertain`, since the harness may have
+taken it, and it is never typed again.
 
 The agent writes no reply to a command, so the bridge sends one itself, in the
-request's thread, once the command is typed, quoting the answer the screen
-shows, for example: Typed `/goal ship it` into coord's composer. It answered:
-Goal set — ship it. The request's
-replies are then closed. The request gets its acknowledgement reaction like any
+request's thread, and then closes the request's replies. A command that was
+taken gets the harness's answer, for example: Typed `/goal ship it` into
+coord's composer. It answered: Goal set — ship it. A goal the coordinator
+already had gets `goal unchanged (already active)`. A command that failed gets
+`Did not apply` and the reason, such as a replacement question that was
+cancelled and why. The request gets its acknowledgement reaction like any
 other.
 
 ### A headless coordinator

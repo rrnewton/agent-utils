@@ -3174,6 +3174,10 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
             .headless_approval_reply(agent_name, text, sender, message_id)
             .map_err(|error| error.to_string())
     }
+
+    fn goal_outcome(&self, agent_name: &str, message_id: &str) -> (Option<String>, Option<String>) {
+        self.manager.goal_outcome(agent_name, message_id)
+    }
 }
 
 /// What a pass's deliveries did in the pane, as `TypingWatch` notes it.
@@ -3336,6 +3340,10 @@ impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
     ) -> std::result::Result<Option<Value>, String> {
         self.delivery
             .approval_reply(agent_name, text, sender, message_id)
+    }
+
+    fn goal_outcome(&self, agent_name: &str, message_id: &str) -> (Option<String>, Option<String>) {
+        self.delivery.goal_outcome(agent_name, message_id)
     }
 
     /// A headless agent's model started the prompt: the request earns its ✅ now, as a pane's

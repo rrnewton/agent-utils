@@ -1357,11 +1357,19 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     transition(&inflight_path, &path)?;
                     continue 'retry;
                 }
-                Ok(Delivered::Confirmed { verified }) => {
+                Ok(Delivered::Confirmed { verified, evidence }) => {
                     if verified {
                         runtime.prompt_printed(&identifier);
                     }
                     strip_paste_stamps(&mut document);
+                    // A `/goal` command typed raw is proved by the harness's answer, which the
+                    // chat bridge quotes in its reply: see `crate::goal_command`.
+                    if let Some(evidence) = evidence.filter(|_| {
+                        message_text(&document)
+                            .is_ok_and(|text| crate::goal_command::argument(&text).is_some())
+                    }) {
+                        document.insert("goal_answer".to_owned(), json!(evidence));
+                    }
                     document.insert("delivery_state".to_owned(), json!("processed"));
                     document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
                     atomic_json(&inflight_path, &Value::Object(document))?;
@@ -1919,6 +1927,8 @@ enum Delivered {
         /// Whether the submission was verified against the agent's composer, which the queue
         /// checked before typing: with printed evidence or with the prompt leaving the composer.
         verified: bool,
+        /// What the screen showed as the proof, for a verified submission.
+        evidence: Option<String>,
     },
     /// Nothing was typed, so the prompt remains safe to retry.
     NotStaged(String),
@@ -1991,7 +2001,12 @@ fn deliver_one<A: AgentApi + ?Sized>(
             ))
             .into())
         }
-        Submission::Verified(_) => return Ok(Delivered::Confirmed { verified: true }),
+        Submission::Verified(receipt) => {
+            return Ok(Delivered::Confirmed {
+                verified: true,
+                evidence: Some(receipt.evidence),
+            })
+        }
         Submission::NotStaged(reason) => return Ok(Delivered::NotStaged(reason)),
         Submission::Unconfirmed => {}
     }
@@ -2025,7 +2040,10 @@ fn deliver_one<A: AgentApi + ?Sized>(
             millis,
             runtime,
         ) {
-            Ok(()) => Ok(Delivered::Confirmed { verified: false }),
+            Ok(()) => Ok(Delivered::Confirmed {
+                verified: false,
+                evidence: None,
+            }),
             Err(error) => misrouted(&error).unwrap_or_else(|| {
                 Err(AgentError::delivery(format!(
                     "pane {} did not confirm idle/done -> working submission: {error}",
@@ -2057,7 +2075,12 @@ fn deliver_one<A: AgentApi + ?Sized>(
         let wait = chunk.min(remaining);
         let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
         match client.wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime) {
-            Ok(()) => return Ok(Delivered::Confirmed { verified: false }),
+            Ok(()) => {
+                return Ok(Delivered::Confirmed {
+                    verified: false,
+                    evidence: None,
+                })
+            }
             Err(error) => {
                 if let Some(outcome) = misrouted(&error) {
                     return outcome;
