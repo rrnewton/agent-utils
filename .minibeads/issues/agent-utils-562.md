@@ -499,3 +499,11 @@ instructed.
 - Differential: `py/wrkslots/tests/test_recover_cache_write_rust.py`, 8 tests. `wrkslotsd` 91 package tests pass; clippy/mypy clean.
 - Gate 63 (`/tmp/rust-campaign-gate63.log`): 200 steps passed; only infra and wrkslots-shard timeouts under load failed, each passing alone (infra 113; shard 1 570; shard 0 567 plus the known transfer load-flake passing 9/9 alone).
 - Next in #562: the main `recover`, then the opt-in edition switch.
+
+### Slice 44 landed: main `recover` dispatch outcomes (fixture-guarded)
+
+- Commit: `7bb11a10` (dispatch outcomes + differential + CLI surface).
+- Rust `wrkslotsd recover` covers the dispatcher's read-only outcomes: coordinator process capture, the flag-combination contract (legacy/ownerless/slot/discard-stale/abort-import combinations, exactly-one-target, frozen-checkout requirements), partial-state refusal, the no-journal refusal, the ownerless-cleanup already-recorded refusal, and journal schema/machine binding with kind-specific flag checks. Resuming a journal, recovering partial updates, and starting ownerless validation cleanup refuse explicitly as Python-owned.
+- Differential: `py/wrkslots/tests/test_recover_main_write_rust.py`, 6 tests. `wrkslotsd` 91 package tests pass; clippy/mypy clean.
+- Gate 64 (`/tmp/rust-campaign-gate64.log`): 199 steps passed; failures were infra and wrkslots-shard timeouts plus one vibe-talk browser flake, each passing alone (infra 113; shards 573 + 573; scroll-stability browser passes solo).
+- Next in #562: the opt-in edition switch (`WRKSLOTS_ENGINE=rust`, default still Python) and the switch plan to the coordinator; stop before any default flip.
