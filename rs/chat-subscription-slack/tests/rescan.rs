@@ -1007,3 +1007,45 @@ fn replies_left_out_of_a_full_queue_are_listed_again() {
     assert_eq!(delivered, expected);
     fs::remove_dir_all(&directory).unwrap();
 }
+
+clock!(yield_clock, YIELD_NOW);
+
+// #679 muse-bridge-study: a pass ran in the driver loop, so a live message that arrived while it
+// listed threads or waited out a rate limit waited for the whole pass (up to a minute in a
+// channel with many threads). After its first history listing a pass yields to a waiting event.
+#[test]
+fn a_rescan_pass_yields_to_a_live_message_waiting_on_the_stream() {
+    let directory = scratch("yield");
+    let fake = FakeTransport::new();
+    let root_ts = ts(T0 + 1_000);
+    let reply_ts = ts(T0 + 5_000);
+    let live_ts = ts(T0 + 6_000);
+    let mut script = heartbeats(1);
+    script.push(stream_message(43, &live_ts, None, "live"));
+    fake.push_script(script);
+    fake.push_history(listed(&root_ts, None, OWNER, "root", &[]));
+    fake.push_history(listed(&reply_ts, Some(&root_ts), BOT, "reply", &[]));
+    let mut backend = backend(&fake, yield_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, None, json!({}))).unwrap();
+    commit_next(&mut subscription);
+
+    // The heartbeat starts a pass; its history listing finds a thread to list, but the live
+    // message is already waiting, so the pass stops before listing the thread.
+    let live = next_batch_within(&mut subscription, 2).expect("the live message");
+    assert_eq!(single_message(&live).text(), "live");
+    assert_eq!(fake.state().scans.len(), 1, "only the history listing ran");
+    assert!(log(&directory).contains("rescan: yielded to a live event after 1 listings"));
+    subscription.commit_durable(&live).unwrap();
+
+    // The yield adds no pass of its own; the live message's channel activity pulls the next
+    // one forward as usual, and that pass lists the thread (and may rescue the root).
+    YIELD_NOW.store(T0 + 30_000, Ordering::SeqCst);
+    let _ = next_batch_within(&mut subscription, 2);
+    assert!(
+        fake.state().scans.len() >= 3,
+        "{:?}",
+        fake.state().scans.len()
+    );
+    subscription.close().unwrap();
+}

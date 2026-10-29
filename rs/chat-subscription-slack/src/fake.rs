@@ -291,6 +291,12 @@ impl EventStream for FakeStream {
         }
     }
 
+    /// A script is a timeline, so only its very next step counts as already arrived.
+    fn event_waiting(&mut self) -> bool {
+        matches!(self.steps.front(), Some(FakeStep::Line(line))
+            if matches!(parse_tail_line(line), StreamRecord::Event { .. }))
+    }
+
     fn canceller(&self) -> Arc<dyn StreamCancel> {
         Arc::new(FakeCancel {
             flag: Arc::clone(&self.flag),
