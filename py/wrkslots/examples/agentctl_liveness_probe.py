@@ -37,7 +37,10 @@ Active records are read from both agentctl registry layouts: ``REGISTRY/agents/<
 and ``REGISTRY/<name>/`` (layout 1, readable until 2026-11-26), skipping the registry's own
 ``archive``, ``agents`` and ``locks`` directories. A probe older than layout 2 sees a migrated
 registry's tripwire ``agents/agent.json`` as an unreadable record and answers unverifiable; copy
-this probe again before migrating a registry (#593 registry-agents-subdir).
+this probe again before migrating a registry (#593 registry-agents-subdir). An unreadable active
+record that does not claim the queried name is skipped with a warning on stderr, so one foreign
+agent's malformed record cannot make every verdict unverifiable (#295); the queried name's own
+record, and every archived record, stay fatal when unreadable.
 
 This is one input to removal, not the whole decision. wrkslots still requires its own census of
 processes using the slot, its time-to-live, and its Git and path checks.
@@ -165,16 +168,30 @@ def names_of(record: dict[str, object]) -> set[str]:
     return cast(set[str], names)
 
 
-def matching(paths: list[Path], agent: str) -> list[dict[str, object]]:
+def matching(
+    paths: list[Path], agent: str, *, skip_foreign: bool = False
+) -> list[dict[str, object]]:
     """Load every record and keep those that ever carried AGENT; an unreadable one is fatal.
 
     An active directory named AGENT is a claim on the name whatever its content says.
+    With `skip_foreign`, an unreadable record that does not claim AGENT is
+    skipped with a warning on stderr instead: one foreign agent's malformed
+    record must not make every other agent unverifiable (#295). The archive
+    scan stays strict, because a dead verdict is only as complete as the
+    archive it was read from.
     """
 
     found: list[dict[str, object]] = []
     for path in paths:
-        record = load_record(path)
-        if agent in names_of(record) or path.parent.name == agent:
+        try:
+            record = load_record(path)
+            names = names_of(record)
+        except Unverifiable as exc:
+            if skip_foreign and path.parent.name != agent:
+                print(f"agentctl-liveness-probe: skipping {path}: {exc}", file=sys.stderr)
+                continue
+            raise
+        if agent in names or path.parent.name == agent:
             found.append(record)
     return found
 
@@ -206,7 +223,7 @@ def check(agent: str, registry: Path) -> int:
             if NAME.fullmatch(path.name) and path.name not in RESERVED and (path / "agent.json").exists()
         )
     active_paths.sort()
-    active = matching(active_paths, agent)
+    active = matching(active_paths, agent, skip_foreign=True)
     for record in active:
         if identity_alive(record, current_boot):
             return verdict(agent, 1, "active-record-process-alive")

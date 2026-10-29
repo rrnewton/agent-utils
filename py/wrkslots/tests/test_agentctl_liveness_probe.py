@@ -306,13 +306,16 @@ def test_a_probe_older_than_layout_two_fails_closed_on_the_tripwire(
     and, with a stopped namesake archived, call it dead. The tripwire makes it refuse instead."""
     old_probe = PROBE.read_text(encoding="utf-8")
     start = old_probe.index("    # The top level first, then agents/")
-    end = old_probe.index("    active = matching(active_paths, agent)")
+    end = old_probe.index("    active = matching(active_paths, agent, skip_foreign=True)")
     legacy = old_probe[:start] + (
         "    active_paths = sorted(\n"
         "        path / \"agent.json\" for path in registry.iterdir()\n"
         "        if NAME.fullmatch(path.name) and path.name != \"archive\" and (path / \"agent.json\").exists()\n"
         "    )\n"
     ) + old_probe[end:]
+    legacy = legacy.replace(
+        "matching(active_paths, agent, skip_foreign=True)", "matching(active_paths, agent)"
+    )
     legacy_probe = tmp_path / "legacy_probe.py"
     legacy_probe.write_text(legacy, encoding="utf-8")
     project = tmp_path / "project"
@@ -330,3 +333,25 @@ def test_a_probe_older_than_layout_two_fails_closed_on_the_tripwire(
     )
     assert done.returncode == 2, done.stdout
     assert done.stdout.startswith("unverifiable agent=w1 rc=2"), done.stdout
+
+
+def test_a_foreign_nonobject_active_record_is_skipped_not_fatal(
+    tmp_path: Path, exited_identity: dict[str, object]
+) -> None:
+    """One foreign agent's malformed record must not block every verdict (#295)."""
+    registry = tmp_path / ".agentctl"
+    write_record(registry / "archive/w1-abc", "w1", custom_process_identity=exited_identity)
+    foreign = registry / "agents" / "foreign"
+    foreign.mkdir(parents=True)
+    (foreign / "agent.json").write_text('"not a record"\n', encoding="utf-8")
+    code, out = run(tmp_path, "w1")
+    assert code == 0, out
+
+
+def test_the_queried_agents_nonobject_record_stays_fatal(tmp_path: Path) -> None:
+    registry = tmp_path / ".agentctl"
+    own = registry / "agents" / "w1"
+    own.mkdir(parents=True)
+    (own / "agent.json").write_text('"not a record"\n', encoding="utf-8")
+    code, out = run(tmp_path, "w1")
+    assert code == 2 and "reason=error:" in out
