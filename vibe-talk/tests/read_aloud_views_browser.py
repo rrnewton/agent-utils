@@ -62,6 +62,7 @@ from offline_cache_browser import Json, check, handler_for
 from two_column_browser import CANARY, REPLICA, RUNNER, Desk
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -552,7 +553,7 @@ def main() -> int:
                          "python3 -m playwright install chromium") from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     report = []
     with sync_playwright() as playwright:
         for voice in (("agent", "device") if args.voice == "both" else (args.voice,)):

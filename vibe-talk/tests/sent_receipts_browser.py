@@ -80,7 +80,7 @@ def main() -> int:
                          "python3 -m playwright install chromium") from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     with sync_playwright() as playwright:
         print(walk(playwright.chromium, args))
     return 0

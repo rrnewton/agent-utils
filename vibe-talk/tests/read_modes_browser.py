@@ -821,7 +821,7 @@ def main() -> int:
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
 
-    web_root = args.web_root.resolve()
+    web_root = page_sources.served(args.web_root)
     api = FakeApi()
     # The old thread: All's newest page starts at the answer, and the thread's read waits at the gate.
     gate = threading.Event()

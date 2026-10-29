@@ -42,6 +42,7 @@ from inline_reply_browser import sign_in
 from offline_cache_browser import check, handler_for
 from threads_polish_browser import PolishApi, to_threads, unpack_to
 from two_column_browser import REPLICA, RUNNER, Desk
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -103,7 +104,7 @@ def main() -> int:
                          "python3 -m playwright install chromium") from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, touch in SIZES:

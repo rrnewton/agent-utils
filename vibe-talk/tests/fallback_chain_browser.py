@@ -296,7 +296,7 @@ def main() -> int:
     executable = args.browser_executable or os.environ.get("VIBE_TALK_CHROMIUM")
 
     api = FakeApi()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api, args.web_root.resolve()))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api, page_sources.served(args.web_root)))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_port}/"

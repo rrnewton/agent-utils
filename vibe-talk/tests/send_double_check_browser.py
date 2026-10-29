@@ -17,6 +17,7 @@ import offline_cache_browser as fixture
 from inline_reply_browser import ReplyColumnsApi, sign_in
 from offline_cache_browser import check, handler_for, said
 from two_column_browser import Desk
+import page_sources
 
 WIDTH, HEIGHT = 393, 852
 
@@ -51,7 +52,7 @@ def main() -> int:
     args = parser.parse_args()
     from playwright.sync_api import sync_playwright
     args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     api = TickApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True

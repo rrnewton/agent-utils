@@ -660,7 +660,7 @@ def main() -> int:
         ) from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    web_root = args.web_root.resolve()
+    web_root = page_sources.served(args.web_root)
     notes: list[str] = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, executable_path=args.browser_executable)

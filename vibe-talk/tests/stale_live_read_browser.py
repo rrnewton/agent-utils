@@ -175,7 +175,7 @@ def main() -> int:
         ) from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    root = args.web_root.resolve()
+    root = page_sources.served(args.web_root)
     with sync_playwright() as playwright, tempfile.TemporaryDirectory(prefix="vibe-talk-unfixed-") as copy:
         fixture.WEB_ROOT = root
         fixed = walk(playwright.chromium, args, "desk-1280")

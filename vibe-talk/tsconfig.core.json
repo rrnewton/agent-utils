@@ -16,6 +16,9 @@
     "verbatimModuleSyntax": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
+    // What the legacy script's own test held its top-level bindings to (unusedBindings), held here
+    // for the modules.
+    "noUnusedLocals": true,
     "skipLibCheck": false
   },
   "include": ["web/src/core/**/*.ts"]

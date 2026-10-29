@@ -6,12 +6,14 @@ path is the file of that name below it. They serve what the server serves: the p
 (`web/build.mjs`), whose shell names one minified script and one stylesheet under content-hashed
 names, so a minification or bundling fault fails a walk the way it would fail a phone.
 
-`served_root()` is the directory a walk serves unless its `--web-root` names another:
-`VIBE_TALK_WEB_ROOT` when that is set (a page build, or a directory of sources served as they are),
-else a page build of this checkout made for this process. `variant()` is the page with something
-changed on purpose, for a negative control, built the same way. `SOURCE_ROOT` is always the
-checked-out sources, and `source_text()` reads one of the page's own numbers from the sources a
-served directory was made from.
+`served(root)` is the page build a walk serves for a directory: the directory itself when it is a
+page build (it holds `assets.json`), else a build of the sources in it, made once per process. The
+sources are never served as written: the page's legacy script calls modules only a build gives it
+(`#624 voice-page-modularity`). Every walk passes its `--web-root` through it. `served_root()` is
+the default: `VIBE_TALK_WEB_ROOT` when that is set, else this checkout's `web/`, built. `variant()`
+is the page with something changed on purpose, for a negative control, built the same way.
+`SOURCE_ROOT` is always the checked-out sources, and `source_text()` reads one of the page's own
+numbers from the sources a served build was made from.
 """
 
 from __future__ import annotations
@@ -49,22 +51,39 @@ def build_page(into: Path, sources: Path = SOURCE_ROOT) -> Path:
     return into
 
 
+# Which sources each build `served` made was made from, for `source_text`.
+_BUILT_FROM: dict[Path, Path] = {}
+
+
 @functools.cache
-def served_root() -> Path:
-    """The directory the walks serve the page from: `VIBE_TALK_WEB_ROOT`, else a page build of this
-    checkout, made once per process in a directory of its own that goes when the process does."""
-    named = os.environ.get(ROOT_VARIABLE, "")
-    if named:
-        return Path(named).resolve()
+def served(root: Path) -> Path:
+    """The page build to serve for `root`: `root` itself when it is a page build, else a build of the
+    sources in `root`, made once per process in a directory of its own that goes when the process
+    does."""
+    root = root.resolve()
+    if (root / "assets.json").is_file():
+        return root
     scratch = Path(tempfile.mkdtemp(prefix="vibe-talk-walk-page-"))
     atexit.register(shutil.rmtree, scratch, True)
-    return build_page(scratch / "web").resolve()
+    built = build_page(scratch / "web", root).resolve()
+    _BUILT_FROM[built] = root
+    return built
+
+
+def served_root() -> Path:
+    """The page build the walks serve by default: `VIBE_TALK_WEB_ROOT`'s, else this checkout's."""
+    named = os.environ.get(ROOT_VARIABLE, "")
+    return served(Path(named) if named else SOURCE_ROOT)
 
 
 def _built_from(root: Path) -> Path:
-    """The sources the directory `root` serves were made from: `root` itself when it holds sources,
-    or, for a page build, this checkout's sources, refused unless they are the ones it was built from
-    (by the digests its `assets.json` records)."""
+    """The sources the directory `root` serves were made from: `root` itself when it holds sources;
+    for a build `served` made, the sources it was made from; for any other page build, this
+    checkout's sources, refused unless they are the ones it was built from (by the digests its
+    `assets.json` records)."""
+    root = root.resolve()
+    if root in _BUILT_FROM:
+        return _BUILT_FROM[root]
     manifest_path = root / "assets.json"
     if not manifest_path.is_file():
         return root
@@ -92,16 +111,14 @@ def source_text(root: Path, name: str) -> str:
 
 
 def variant(root: Path, into: Path, patches: Sequence[tuple[str, str, str]]) -> Path:
-    """The page `root` serves with `patches` applied to its sources, served from below `into`.
+    """The page `root` serves with `patches` applied to its sources, built below `into`.
 
     Each patch is (file, text, replacement), and `text` must occur in that file exactly once, so a
     control that no longer matches the page fails here instead of quietly testing the page unchanged.
-    A page build is rebuilt from patched copies of the sources it was made from, exactly as the page
-    is built; a directory of sources is patched and served as it is.
+    The sources the page was made from are copied, patched and built exactly as the page is.
     """
     sources = _built_from(root)
-    built = sources != root
-    copy = into / ("sources" if built else "web")
+    copy = into / "sources"
     shutil.copytree(sources, copy)
     for file, text, replacement in patches:
         body = (copy / file).read_text()
@@ -109,4 +126,4 @@ def variant(root: Path, into: Path, patches: Sequence[tuple[str, str, str]]) -> 
         if found != 1:
             raise SystemExit(f"the control patches {text!r}, which {sources / file} holds {found} times, not once")
         (copy / file).write_text(body.replace(text, replacement, 1))
-    return build_page(into / "web", copy).resolve() if built else copy.resolve()
+    return build_page(into / "web", copy).resolve()

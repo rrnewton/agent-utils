@@ -38,6 +38,7 @@ from urllib.parse import unquote, urlsplit
 
 import keyboard_browser as kb
 from keyboard_browser import CHANNEL, SECOND, TOKEN, Json, check
+import page_sources
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -328,7 +329,7 @@ def main() -> int:
     with sync_playwright() as playwright:
         # A server each, so the phone starts with the three hidden channels the desk's Show again took one of.
         for name, width, height, mobile in (("desk", 1280, 800, False), ("phone", 393, 852, True)):
-            api, server, thread, url = serve(args.web_root)
+            api, server, thread, url = serve(page_sources.served(args.web_root))
             try:
                 notes["browser"], notes[name] = browse(playwright, args, url, width, height, mobile)
             finally:

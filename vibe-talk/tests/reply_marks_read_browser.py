@@ -43,6 +43,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import CHANNEL, Json, check, handler_for, thread_of
 from inline_reply_browser import ReplyColumnsApi, open_columns, place_row, reply_button
 from two_column_browser import RUNNER, Desk
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -161,7 +162,7 @@ def main() -> int:
         ) from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     with sync_playwright() as playwright:
         print(walk(playwright.chromium, args))
     return 0

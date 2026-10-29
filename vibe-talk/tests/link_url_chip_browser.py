@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import search_dates_browser as week
 from bookmark_browser import AGENT, CHANNEL, TOKEN, FakeApi, Json, check, handler_for, message
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page, Playwright
@@ -356,7 +357,7 @@ def main() -> int:
         ) from error
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    web_root = args.web_root.resolve()
+    web_root = page_sources.served(args.web_root)
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, touch in SIZES:

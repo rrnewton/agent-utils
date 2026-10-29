@@ -540,7 +540,7 @@ def main() -> int:
         ) from error
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    web_root = args.web_root.resolve()
+    web_root = page_sources.served(args.web_root)
     sizes = (("412x915", 412, 915, True), ("1280x800", 1280, 800, False))
     report: list[str] = []
     with sync_playwright() as playwright:

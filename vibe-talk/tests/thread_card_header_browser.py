@@ -87,6 +87,7 @@ from offline_cache_browser import Json, check, handler_for, larger_root_font, sa
 from offline_cache_browser import TOKEN
 from thread_card_focus_browser import COLOURED, COLOURED_PIXEL, PIXELS_JS, chroma, open_two_columns
 from two_column_browser import FILLER, REPLICA, RUNNER, THREAD_ROWS, ColumnsApi, Desk
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -280,7 +281,7 @@ def main() -> int:
         ) from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, scheme, kind, root_percent in SIZES:

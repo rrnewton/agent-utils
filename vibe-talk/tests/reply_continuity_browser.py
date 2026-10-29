@@ -1084,7 +1084,7 @@ def main() -> int:
         ) from error
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    web_root = args.web_root.resolve()
+    web_root = page_sources.served(args.web_root)
     # (label, width, height, a phone, the scheme)
     runs: tuple[tuple[str, int, int, bool, Scheme], ...] = (
         ("1280x800-dark", 1280, 800, False, "dark"),

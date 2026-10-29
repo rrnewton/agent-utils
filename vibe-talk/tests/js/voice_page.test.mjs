@@ -4825,7 +4825,7 @@ const optionalSourceConstant = (name) => {
  */
 const sourceString = (name) =>
   new RegExp(`^const ${name} = "([^"]*)";$`, "m").exec(PAGE_CODE)?.[1] ??
-  assert.fail(`web/voice.js no longer states a ${name}`);
+  assert.fail(`the page's code (web/voice.js, web/src/) no longer states a ${name}`);
 
 const COLLAPSE_OVER_CHARS = sourceConstant("COLLAPSE_OVER_CHARS");
 const longMessage = (mark = "long") =>
@@ -16799,7 +16799,7 @@ test("the page has ONE html sink, and only a message's content_html ever reaches
   assert.match(SCRIPT_CODE, /const html = renderedHtmlOf\(message\);\s*if \(html !== ""\) \{\s*insertSanitizedHtml\(box, html\);/,
     "the one caller no longer passes a message's content_html");
   assert.match(SCRIPT_CODE, /const renderedHtmlOf = \(message\) =>\s*message && typeof message\.content_html === "string" \? message\.content_html : "";/);
-  assert.doesNotMatch(SCRIPT_CODE,
+  assert.doesNotMatch(PAGE_CODE,
     /outerHTML|insertAdjacentHTML|document\.write|createContextualFragment|DOMParser|srcdoc/);
 
   // Dynamic: every string the page parses is some message's content_html, and never its text.
@@ -33706,7 +33706,7 @@ test("the stream carries its credential in a header, never in the URL", async ()
   assert.doesNotMatch(opened.path, /token|authorization|bearer/i, opened.path);
   assert.ok(!opened.path.includes(page.storage.get("vibe-talk.token")), opened.path);
   assert.doesNotMatch(
-    SCRIPT_CODE,
+    PAGE_CODE,
     /new EventSource/,
     "EventSource cannot carry the bearer header; see the comment above openChannelStream"
   );

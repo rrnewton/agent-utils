@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 
 import keyboard_browser as kb
 from keyboard_browser import CHANNEL, SECOND, TOKEN, Json, check
+import page_sources
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -271,7 +272,7 @@ def main() -> int:
     kb.CHANNELS.update({str(SPACE_B["id"]): SPACE_B, str(TEAM_B["id"]): TEAM_B})
 
     api = GroupsApi()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), kb.handler_for(api, args.web_root.resolve()))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), kb.handler_for(api, page_sources.served(args.web_root)))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

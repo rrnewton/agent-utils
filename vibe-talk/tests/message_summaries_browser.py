@@ -45,6 +45,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import Json
 from threads_unpack_browser import ParityApi, UnpackApi, open_page, unpack_all
 from two_column_browser import RUNNER, Desk
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -353,7 +354,7 @@ def main() -> int:
                          "python3 -m playwright install chromium") from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, scheme, touch in SIZES:

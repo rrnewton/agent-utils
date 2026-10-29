@@ -48,6 +48,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import offline_cache_browser as fixture
 from offline_cache_browser import CACHE_KEY, TOKEN, FakeApi, Json, check, handler_for, said, thread_of
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Route
@@ -185,7 +186,7 @@ def main() -> int:
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     # The fake API's handler serves the page from this module attribute.
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     label, width, height = PHONE
     with sync_playwright() as playwright:
         version = walk(playwright.chromium, args, label, width, height)

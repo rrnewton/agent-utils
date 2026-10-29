@@ -294,7 +294,7 @@ def main() -> int:
         ) from error
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    servers = [serve(args.web_root, args.port)]
+    servers = [serve(page_sources.served(args.web_root), args.port)]
     if args.baseline_web_root is not None:
         servers.append(serve(args.baseline_web_root, args.port + 1 if args.port else 0))
     urls = [f"http://127.0.0.1:{server.server_port}/" for server, _, _ in servers]

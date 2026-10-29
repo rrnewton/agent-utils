@@ -19,7 +19,7 @@ import {
   build, decodeMappings, digest, encodeMappings, joinMaps, linkShell, loadTool, moduleForTests, parseScript, requireOutside,
   requireStrict,
 } from "../../web/build.mjs";
-import { SHELL, WEB, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
+import { SHELL, WEB, moduleSources, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
 
 const scratch = mkdtempSync(join(tmpdir(), "vibe-talk-page-build-"));
 process.on("exit", () => rmSync(scratch, { recursive: true, force: true }));
@@ -335,4 +335,10 @@ test("a module overlay whose text the module does not hold is refused, not built
   });
   const plan = patched.searchUpstreamPlan(patched.searchQueryParse("alpha OR bravo"));
   assert.equal(plan.scan, "too-many-alternatives", "the overlay did not reach the built module");
+});
+
+test("every handwritten module is TypeScript, so the strict and portable checks see all of them", () => {
+  const plain = moduleSources().map(({ name }) => name).filter((name) => !name.endsWith(".ts"));
+  assert.deepStrictEqual(plain, [], "a module below web/src is not .ts, so tsconfig.core.json and tsconfig.web.json skip it");
+  assert.ok(moduleSources().length > 0, "no module found, so this checks nothing");
 });

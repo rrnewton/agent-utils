@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import keyboard_browser as kb
 from keyboard_browser import CHANNEL, SECOND, TOKEN, Json, check
+import page_sources
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -206,7 +207,7 @@ def main() -> int:
     kb.CHANNELS.update({str(GENERAL["id"]): GENERAL, str(BUILDS["id"]): BUILDS})
 
     api = SearchApi()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api, args.web_root.resolve()))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api, page_sources.served(args.web_root)))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

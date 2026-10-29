@@ -252,7 +252,7 @@ function overlayPlugin(web, overlays) {
     const text = byPath.get(path) ?? readFileSync(path, "utf8");
     const found = find === "" ? 0 : text.split(find).length - 1;
     if (found !== count) throw new Error(`the overlay patches ${JSON.stringify(find)}, which ${file} holds ${found} times, not ${count}`);
-    byPath.set(path, text.replace(find, replace));
+    byPath.set(path, text.replace(find, () => replace));
   }
   return {
     name: "overlay",
@@ -270,7 +270,10 @@ async function exportedNames(esbuild, entry, plugins) {
     outfile: `${entry}.names.js`, plugins,
   });
   const [output] = Object.values(result.metafile.outputs);
-  return [...output.exports].sort();
+  const names = [...output.exports].sort();
+  const unusable = names.filter((name) => name === "default" || !/^[A-Za-z_$][\w$]*$/.test(name));
+  if (unusable.length > 0) throw new Error(`${entry} exports ${unusable.join(", ")}, which a constant cannot be named`);
+  return names;
 }
 
 /**

@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
 from offline_cache_browser import OWNER_ID, TOKEN, FakeApi, Json, check, handler_for, said
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
@@ -205,7 +206,7 @@ def arguments() -> argparse.Namespace:
 def unknown_build_root(source: Path, into: Path) -> Path:
     """The page at `source` served so that it does not know its own build, the state this walk has
     always measured Settings in: a page build's shell with its script named by the plain /voice.js
-    (the same bytes) rather than by its hash. A directory of sources already names it so.
+    (the same bytes) rather than by its hash.
 
     `#676 settings-head-page-build`: once the page knows its build, as production's does, Settings
     draws "This page is build ..." between the host line and the buttons on a phone, and the head
@@ -213,8 +214,7 @@ def unknown_build_root(source: Path, into: Path) -> Path:
     after `#624 voice-page-modularity`; until then this keeps the coverage this walk had, and the fix
     makes it serve the page build as every other walk does.
     """
-    if not (source / "assets.json").is_file():
-        return source
+    check((source / "assets.json").is_file(), f"{source} is not a page build (page_sources.served makes one)")
     shutil.copytree(source, into)
     shell = (into / "voice.html").read_text()
     named = re.findall(r'src="/assets/voice\.[0-9a-f]{32}\.js"', shell)
@@ -236,7 +236,7 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     report: list[str] = []
     with sync_playwright() as playwright, tempfile.TemporaryDirectory(prefix="vibe-talk-unknown-build-") as copy:
-        fixture.WEB_ROOT = unknown_build_root(args.web_root.resolve(), Path(copy) / "web")
+        fixture.WEB_ROOT = unknown_build_root(page_sources.served(args.web_root), Path(copy) / "web")
         for label, width, height, touch in SETTINGS_SIZES:
             report.append(run(playwright.chromium, args, LongReplyApi(), label, width, height, touch, settings_walk))
         for label, width, height in COLUMN_SIZES:

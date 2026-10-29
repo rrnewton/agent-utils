@@ -263,7 +263,7 @@ def main() -> int:
                          "python3 -m playwright install chromium") from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     report: list[str] = []
     parts = args.only or ["format", "pending", "load", "table", "build", "old-shell"]
     with sync_playwright() as playwright:
@@ -277,18 +277,12 @@ def main() -> int:
     return 0
 
 
-def hashed_web_root(source: Path, into: Path) -> Path:
-    """The page at `source` with its shell naming its script by its content hash, as the server's shell
-    does (src/http/assets.rs). A page build's shell already does (`/assets/voice.<hash>.js`, `#624
-    voice-page-modularity`); a directory of sources is copied and its `/voice.js` given a `?v=`."""
-    if (source / "assets.json").is_file():
-        return source
-    shutil.copytree(source, into)
-    script = (into / "voice.js").read_bytes()
-    build = hashlib.sha256(script).hexdigest()[:32]
-    shell = into / "voice.html"
-    shell.write_text(shell.read_text().replace('src="/voice.js"', f'src="/voice.js?v={build}"'))
-    return into
+def hashed_web_root(source: Path) -> Path:
+    """The page at `source`, whose shell names its script by its content hash, as the server's shell
+    does (src/http/assets.rs): a page build's names it `/assets/voice.<hash>.js` (`#624
+    voice-page-modularity`), and every walk serves one (page_sources.served)."""
+    check((source / "assets.json").is_file(), f"{source} is not a page build (page_sources.served makes one)")
+    return source
 
 
 def old_shell_root(source: Path, into: Path) -> tuple[Path, str, str]:
@@ -322,7 +316,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, part: str, label: str,
             root, OLD_SHELL_BUILD, PAGE_BUILD_SERVED = old_shell_root(served, Path(copy) / "web")
             fixture.WEB_ROOT = root.resolve()
         else:
-            fixture.WEB_ROOT = hashed_web_root(served, Path(copy) / "web").resolve()
+            fixture.WEB_ROOT = hashed_web_root(served).resolve()
         try:
             return walk_part(chromium, args, part, label, width, height, touch)
         finally:

@@ -442,7 +442,7 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
 
     api = kb.FakeApi()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), kb.handler_for(api, args.web_root.resolve()))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), kb.handler_for(api, page_sources.served(args.web_root)))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

@@ -314,7 +314,7 @@ def main() -> int:
         ) from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    root = args.web_root.resolve()
+    root = page_sources.served(args.web_root)
     # The rest a fling's gaps are judged by: the checked-out page's, whatever a control does to its copy.
     rest_ms = page_rest_ms(root)
     report: list[str] = []

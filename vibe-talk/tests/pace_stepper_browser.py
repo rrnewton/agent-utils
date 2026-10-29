@@ -33,6 +33,7 @@ from inline_reply_browser import PHONE, sign_in
 from offline_cache_browser import check
 from read_aloud_views_browser import VoicesApi, handler
 from two_column_browser import Desk
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
@@ -176,7 +177,7 @@ def main() -> int:
                          "python3 -m playwright install chromium") from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     report = []
     with sync_playwright() as playwright:
         for touch in (True, False):

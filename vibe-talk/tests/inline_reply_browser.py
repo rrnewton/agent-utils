@@ -73,6 +73,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for, said, thread_of
 from two_column_browser import RUNNER, THREAD_ROWS, ColumnsApi, Desk
+import page_sources
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -352,7 +353,7 @@ def main() -> int:
                          "python3 -m playwright install chromium") from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     report: list[str] = []
     with sync_playwright() as playwright:
         report.append(run(playwright.chromium, args, "desk-columns", DESK, False, columns_walk))

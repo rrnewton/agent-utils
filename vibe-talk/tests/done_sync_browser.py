@@ -57,6 +57,7 @@ from inline_reply_browser import place_row, reply_button
 from reply_marks_read_browser import MarkerApi, drawn_read
 from two_column_browser import CANARY, RUNNER, THREAD_ROWS, Desk
 from view_switch_browser import PHONE, SwitchApi
+import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Route
@@ -216,7 +217,7 @@ def main() -> int:
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     # The fake APIs' handler serves the page from this module attribute.
-    fixture.WEB_ROOT = args.web_root.resolve()
+    fixture.WEB_ROOT = page_sources.served(args.web_root)
     with sync_playwright() as playwright:
         phone = views_walk(playwright.chromium, args)
         desk = sends_walk(playwright.chromium, args)
