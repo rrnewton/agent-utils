@@ -22,3 +22,5 @@ export {
   waitingItsTurn,
 } from "./state.ts";
 export type { ReceiptView, SendState } from "./state.ts";
+export { createOutboxStore } from "./store.ts";
+export type { OutboxDependencies, OutboxEntry, OutboxStore } from "./store.ts";

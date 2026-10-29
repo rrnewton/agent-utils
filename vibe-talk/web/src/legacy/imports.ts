@@ -74,6 +74,7 @@ export {
   SENT_RECEIPT_MS,
   createChannelDrafts,
   createDismissedSends,
+  createOutboxStore,
   createOwnPosts,
   nextRetryAt,
   editableSend as outboxEditable,

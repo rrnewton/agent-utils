@@ -4,6 +4,7 @@
 // draft back. The boxes themselves, and when a draft is written, stay with the page.
 
 import type { StoragePort } from "../../ports/index.ts";
+import { storedExactly as storedExactlyIn } from "./storage.ts";
 
 /** Where the device keeps them, by box key. */
 const CHANNEL_DRAFTS_KEY = "vibe-talk.channel-drafts";
@@ -36,15 +37,7 @@ export interface ChannelDrafts {
 /** An owner holding no drafts. */
 export function createChannelDrafts(deps: ChannelDraftsDependencies): ChannelDrafts {
   const channelDrafts = new Map<string, string>();
-  /** `encoded` kept under the key, read back to be sure: a refusing browser may drop a write silently. */
-  const storedExactly = (encoded: string): boolean => {
-    try {
-      deps.storage.setItem(CHANNEL_DRAFTS_KEY, encoded);
-      return deps.storage.getItem(CHANNEL_DRAFTS_KEY) === encoded;
-    } catch (_error) {
-      return false;
-    }
-  };
+  const storedExactly = (encoded: string): boolean => storedExactlyIn(deps.storage, CHANNEL_DRAFTS_KEY, encoded);
   return {
     get: (key) => channelDrafts.get(key),
     set(key, text) {

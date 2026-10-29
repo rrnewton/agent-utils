@@ -4,6 +4,7 @@
 // Undo's chip and the Settings list stay with the page.
 
 import type { StoragePort } from "../../ports/index.ts";
+import { storedExactly as storedExactlyIn } from "./storage.ts";
 
 /** How many dismissed sends are kept, newest first, and for how many days. */
 const DISMISSED_SENDS_LIMIT = 10;
@@ -56,15 +57,7 @@ export function createDismissedSends<Entry>(deps: DismissedSendsDependencies<Ent
     const oldest = deps.now() - DISMISSED_SENDS_MAX_AGE_MS;
     dismissedSends = dismissedSends.filter((held) => held.at > oldest).slice(0, DISMISSED_SENDS_LIMIT);
   };
-  /** `encoded` kept under the key, read back to be sure: a refusing browser may drop a write silently. */
-  const storedExactly = (encoded: string): boolean => {
-    try {
-      deps.storage.setItem(DISMISSED_SENDS_KEY, encoded);
-      return deps.storage.getItem(DISMISSED_SENDS_KEY) === encoded;
-    } catch (_error) {
-      return false;
-    }
-  };
+  const storedExactly = (encoded: string): boolean => storedExactlyIn(deps.storage, DISMISSED_SENDS_KEY, encoded);
   /** Save the recently dismissed, giving up the saved channel rows first where the quota is full. */
   const persistDismissedSends = (): boolean => {
     pruneDismissedSends();

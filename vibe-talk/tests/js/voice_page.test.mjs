@@ -7071,6 +7071,57 @@ test("`#624 voice-page-modularity`: what a send can do, and when its receipt goe
   assert.equal(sentReceiptRetires(sent, none, view({ keepsOwnPosts: () => false })), true);
 });
 
+test("`#624 voice-page-modularity`: the outbox's entries, order, changes and saved copy, from the module alone", () => {
+  const { createOutboxStore } = OUTBOX;
+  const saved = new Map();
+  let refuse = 0;
+  let roomMade = 0;
+  const storage = {
+    getItem: (key) => saved.get(key) ?? null,
+    setItem: (key, value) => { if (refuse > 0) refuse -= 1; else saved.set(key, value); },
+    removeItem: (key) => saved.delete(key),
+  };
+  const outbox = createOutboxStore({ storage, makeRoom: () => { roomMade += 1; }, keepsOwnPosts: (channel) => channel === "threaded" });
+  const a = { id: "a", channel: "flat", state: "failed", createdAt: 1 };
+  const b = { id: "b", channel: "threaded", state: "sent", createdAt: 2 };
+  const c = { id: "c", channel: "threaded", state: "sending", createdAt: 3 };
+  outbox.add(a);
+  outbox.add(c);
+  outbox.add(b);
+  assert.deepStrictEqual([...outbox.ids()], ["a", "c", "b"], "not in the order written");
+  assert.equal(outbox.get("c"), c, "the outbox held a copy, not the page's own entry");
+  assert.deepStrictEqual([outbox.has("b"), outbox.size(), outbox.version()], [true, 3, 0]);
+  // A save moves the version and leaves out a confirmed send where the store keeps own posts.
+  assert.equal(outbox.save(), true);
+  assert.deepStrictEqual(JSON.parse(saved.get("vibe-talk.outgoing-messages")).map((entry) => entry.id), ["a", "c"]);
+  assert.deepStrictEqual([outbox.version(), outbox.storageOkay()], [1, true]);
+  outbox.touch();
+  assert.equal(outbox.version(), 2);
+  // Removing while walking passes the removed entry over; putting one back puts it where it was written.
+  for (const entry of outbox.values()) if (entry.id === "a") outbox.remove("c");
+  assert.deepStrictEqual([...outbox.ids()], ["a", "b"]);
+  outbox.remove("a");
+  outbox.putBackInOrder(a);
+  outbox.putBackInOrder(c);
+  assert.deepStrictEqual([...outbox.ids()], ["a", "b", "c"]);
+  // A full quota gives up the saved rows once; a second refusal is reported, and remembered. (The
+  // copy already there is cleared each time: a refused write that reads back the same copy stands.)
+  saved.clear();
+  refuse = 1;
+  assert.equal(outbox.save(), true);
+  assert.equal(roomMade, 1);
+  saved.clear();
+  refuse = 2;
+  assert.equal(outbox.save(), false);
+  assert.deepStrictEqual([roomMade, outbox.storageOkay()], [2, false]);
+  assert.equal(outbox.save(), true);
+  assert.deepStrictEqual(outbox.saved().map((entry) => entry.id), ["a", "c"]);
+  outbox.refused();
+  assert.equal(outbox.storageOkay(), false);
+  saved.set("vibe-talk.outgoing-messages", "{not json");
+  assert.throws(() => outbox.saved());
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
