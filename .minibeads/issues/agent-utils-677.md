@@ -1,13 +1,14 @@
 ---
 title: 'chat-bridge-repoint: retarget a running chat bridge to another agent or pane live, with health checks'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 - chat
 created_at: 2026-10-29T11:59:00.940749556+00:00
-updated_at: 2026-10-29T11:59:00.940749556+00:00
+updated_at: 2026-10-29T12:58:05.849222791+00:00
+closed_at: 2026-10-29T12:58:05.849222661+00:00
 ---
 
 # Description
