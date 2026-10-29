@@ -33,6 +33,9 @@ python3 scripts/embed_userguides.py --check
 `agentctl` keeps its maintained CLI guide, quickstart, and Chat guide directly in
 `py/agentctl/`; both implementations embed the same core guide. Its
 [RELATED_WORK.md](agentctl/RELATED_WORK.md) compares public open-source systems.
+[agentctl/services.md](agentctl/services.md) is the guide to building compiled snapshots and
+refreshing a team's long-running agentctl services onto them; the Rust edition embeds it as
+`agentctl services userguide`.
 The documentation link check also covers those package-owned assets, without
 creating another rendered operator manual here.
 

@@ -357,7 +357,7 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
 _RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "tree",
-              "progress")
+              "progress", "services")
 
 
 #: Commands that change agents' state, so idle layout-1 agents move to layout 2 first (not before a

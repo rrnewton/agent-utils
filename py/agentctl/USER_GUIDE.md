@@ -1031,6 +1031,31 @@ pass listing unrepaired findings it has not reported in the last hour.
 `--once` runs a single pass and exits 0 when every check passed, 1 otherwise;
 `--check-only` repairs, remounts, and sends nothing.
 
+### Refresh long-running services onto a compiled build (Rust edition)
+
+A chat bridge (`chat run`), the agent watcher (`watch-agents`), and a headless
+wrapper (`run-headless`) run for days as systemd user units, load their binary
+once, and start helpers that must match it, so they run a fixed, compiled
+binary rather than a source checkout. `agentctl services` builds such binaries
+and moves the services onto them:
+
+```sh
+agentctl --registry ~/project/.agentctl services list
+agentctl services build --from ~/project/tools-checkout
+agentctl --registry ~/project/.agentctl services refresh --dry-run
+agentctl --registry ~/project/.agentctl services refresh
+```
+
+`list` shows each unit whose agentctl command uses this registry: its binary
+and the commit that binary reports, the plugin home, state directories, and
+whether it runs the newest snapshot. `build` makes a locked release build of a
+clean `git archive` of one commit, into its own snapshot
+directory with the Slack plugin home and manifest. `refresh` handles one
+service at a time: it backs up the unit, writes rollback commands, restarts the
+service on the snapshot with every other argument and variable unchanged,
+checks its health, and rolls it back if the check fails. `agentctl services
+userguide` documents the whole flow.
+
 ### The coordinator and the control tree (Rust edition)
 
 One agent of a registry can be designated its coordinator, and every agent
