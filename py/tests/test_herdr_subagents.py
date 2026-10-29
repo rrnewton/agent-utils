@@ -1090,6 +1090,26 @@ def test_nested_launch_rejects_malformed_runtime_authority(
     assert fake.closed == []
 
 
+def test_a_record_keeps_any_well_formed_effective_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The effective effort a record saves, as Muse reported it falling back to, is checked by its
+    # shape only: an effort agentctl has never heard of must not make the record unreadable.
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "agents" / "worker" / "agent.json"
+    flat = json.loads(path.read_text(encoding="utf-8"))
+    for effort in ("turbo-9", "xhigh", "some_future_effort"):
+        flat["effective_reasoning_effort"] = effort
+        path.write_text(json.dumps(flat), encoding="utf-8")
+        assert manager.get("worker").effective_reasoning_effort == effort
+    for malformed in ("Turbo 9", "", "x\ny"):
+        flat["effective_reasoning_effort"] = malformed
+        path.write_text(json.dumps(flat), encoding="utf-8")
+        with pytest.raises(AgentDeliveryError, match="effective reasoning effort"):
+            manager.get("worker")
+
+
 def test_nested_launch_rejects_nonnull_interactive_permission_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

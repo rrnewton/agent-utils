@@ -445,7 +445,10 @@ fn pin_harness_executable(path: PathBuf) -> Result<PinnedHarnessExecutable> {
     })
 }
 
-fn muse_effort(value: &str) -> bool {
+/// Whether `value` has the shape of an effort word: 1-32 lowercase ASCII letters, digits, `_` or
+/// `-`. Only the shape is checked, never a list of known efforts, so a harness that reports an
+/// effort agentctl has not heard of is still read.
+pub(crate) fn muse_effort(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 32
         && value.bytes().all(|byte| {

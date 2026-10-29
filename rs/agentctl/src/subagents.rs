@@ -1989,12 +1989,10 @@ impl AgentRecord {
             || self
                 .effective_reasoning_effort
                 .as_deref()
-                .is_some_and(|effort| {
-                    !matches!(
-                        effort,
-                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-                    )
-                })
+                // The effort Muse said it fell back to: only its shape is checked, as when it
+                // was read from the screen, so an effort agentctl does not know never makes the
+                // record unreadable.
+                .is_some_and(|effort| !crate::client::muse_effort(effort))
             || self
                 .custom_process_identity
                 .as_ref()

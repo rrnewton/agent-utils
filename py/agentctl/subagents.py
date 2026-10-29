@@ -37,6 +37,7 @@ from agentctl.client import (
     Pane,
     PaneShellProof,
     herdr_error_code,
+    muse_effort_word,
     muse_idle_composer,
     muse_startup_metadata,
     muse_trust_prompt,
@@ -583,10 +584,9 @@ class AgentRecord:
                 and (len(warning) > 256 or not warning.isascii()
                      or any(character in warning for character in "\r\n\0"))):
             raise AgentDeliveryError(f"invalid startup warning in agent record: {path}")
-        if (isinstance(effective_effort, str)
-                and effective_effort not in (
-                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
-                )):
+        # The effort Muse said it fell back to: only its shape is checked, as when it was read
+        # from the screen, so an effort agentctl does not know never makes the record unreadable.
+        if isinstance(effective_effort, str) and not muse_effort_word(effective_effort):
             raise AgentDeliveryError(f"invalid effective reasoning effort in agent record: {path}")
         known = {key for key, field_info in cls.__dataclass_fields__.items() if field_info.init}
         fields = {key: document[key] for key in known if key in document}

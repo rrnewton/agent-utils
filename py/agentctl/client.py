@@ -66,6 +66,11 @@ _MAX_SHELL_TASKS = 4096
 _MAX_CHILDREN_BYTES = 64 << 10
 _MAX_PROC_ENTRIES = 1 << 20
 _MUSE_EFFORT = re.compile(r"[a-z0-9_-]{1,32}\Z")
+
+
+def muse_effort_word(value: str) -> bool:
+    """Whether ``value`` has the shape of an effort word; never a list of known efforts."""
+    return _MUSE_EFFORT.fullmatch(value) is not None
 _BOOT_ID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
 )
@@ -1816,8 +1821,8 @@ class HerdrClient:
                 raise HerdrUnavailable(
                     f"{kind} workspace trust prompt requires human attention; no input was submitted"
                 )
-            # An arrow alone is also used by choice dialogs. Muse's idle screen
-            # couples its composer marker with the Auto-review status label.
+            # An arrow alone is also used by choice dialogs. Muse's idle screen couples its
+            # composer marker with exactly one status footer, whatever its mode says.
             ready = muse_idle_composer(screen)
             if ready:
                 break

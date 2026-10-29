@@ -627,3 +627,30 @@ fn a_v2_row_without_a_session_queues_until_anchored_then_drains() {
         Some("queued until anchored")
     );
 }
+
+// New: the effective effort a record saves, as Muse reported it falling back to, is checked by
+// its shape only. An effort agentctl has never heard of must not make the record unreadable.
+#[test]
+fn a_record_keeps_any_well_formed_effective_effort() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut flat = stored(&fixture);
+    for effort in ["turbo-9", "xhigh", "some_future_effort"] {
+        flat["effective_reasoning_effort"] = json!(effort);
+        store(&fixture, &flat);
+        let record = fixture.manager().read_record("worker").unwrap();
+        assert_eq!(
+            record.effective_reasoning_effort.as_deref(),
+            Some(effort),
+            "{effort}"
+        );
+    }
+    for malformed in ["Turbo 9", "", "x\ny"] {
+        flat["effective_reasoning_effort"] = json!(malformed);
+        store(&fixture, &flat);
+        assert!(
+            fixture.manager().read_record("worker").is_err(),
+            "{malformed:?}"
+        );
+    }
+}
