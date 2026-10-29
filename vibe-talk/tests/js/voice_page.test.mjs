@@ -33,6 +33,7 @@ import { afterEach, beforeEach, test as nodeTest } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 import { LEGACY_SCRIPT, legacyPrelude, loadTool, moduleForTests } from "../../web/build.mjs";
@@ -177,6 +178,34 @@ const SCRIPT_CODE = stripJsComments(SCRIPT);
  * NOWHERE in the page reads PAGE_CODE, so code that moves out of web/voice.js stays under it.
  */
 const MODULE_CODE = moduleSources().map(({ text }) => stripJsComments(text)).join("\n");
+
+/**
+ * `code` with the text of every string and template literal blanked, found by the pinned TypeScript
+ * parser rather than by a pattern pairing quotes across a whole file, which a quote inside a regular
+ * expression literal throws off for everything after it (`#624 voice-page-modularity`, where moving
+ * such a regular expression out of voice.js turned its quoted copy into "code"). A template's
+ * substitutions stay; line breaks stay where they were.
+ */
+function withoutStrings(code) {
+  const ts = loadTool("typescript");
+  const file = ts.createSourceFile("scan.js", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const blank = [];
+  const visit = (node) => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || node.kind === ts.SyntaxKind.TemplateHead ||
+        node.kind === ts.SyntaxKind.TemplateMiddle || node.kind === ts.SyntaxKind.TemplateTail) {
+      blank.push([node.getStart(file), node.end]);
+    }
+    ts.forEachChild(node, visit);
+    if (ts.isTemplateExpression(node)) {
+      blank.push([node.head.getStart(file), node.head.end]);
+      for (const span of node.templateSpans) blank.push([span.literal.getStart(file), span.literal.end]);
+    }
+  };
+  visit(file);
+  const chars = code.split("");
+  for (const [from, to] of blank) for (let at = from; at < to; at += 1) if (chars[at] !== "\n") chars[at] = " ";
+  return chars.join("");
+}
 const PAGE_CODE = `${SCRIPT_CODE}\n${MODULE_CODE}`;
 
 /**
@@ -1808,6 +1837,19 @@ const COMPILED = new Map(PAGE_SCRIPTS.map((name) => [
  */
 const PRELUDE = await legacyPrelude(loadTool("esbuild"), WEB, { minify: false });
 const PRELUDE_COMPILED = PRELUDE && new vm.Script(PRELUDE.code, { filename: "prelude.js" });
+/**
+ * The page's modules, built for the tests that hold them directly (`#624 voice-page-modularity`).
+ * Loaded HERE, above every test, and never further down: node:test starts a test the moment it is
+ * defined, so a test defined above an `await` can run while this module waits there, and reach for a
+ * helper further down that does not exist yet ("Cannot access ... before initialization").
+ */
+/** The search language module, with `overlays` patched into its sources. */
+const searchLanguage = (overlays = []) => moduleForTests("src/core/search/index.ts", { overlays });
+const SEARCH_LANGUAGE = await searchLanguage();
+/** The speech module: what a read plays and how a block is cut. */
+const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
+/** The glyph widths the fold model counts lines by (web/src/foundation/). */
+const GLYPHS = await moduleForTests("src/foundation/index.ts");
 
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const elements = new Map();
@@ -4734,6 +4776,16 @@ function brokenScript(find, replace, count = 1) {
   assert.notEqual(mutated, SCRIPT, "the negative control changed nothing");
   return mutated;
 }
+
+test("`#624 voice-page-modularity`: nothing is awaited at the top of this file below its first test", () => {
+  // See the loads near PRELUDE: a test defined above a top-level await may run while the file waits
+  // there, before the helpers below it exist.
+  const lines = readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n");
+  const first = lines.findIndex((line) => /^test\(/.test(line));
+  const late = lines.slice(first).filter((line) => /^(?:const|let|var) \S+ = (?:\(\s*)?await\b|^await\b/.test(line));
+  assert.ok(first > 0, "the file defines no test");
+  assert.deepStrictEqual(late, []);
+});
 
 test("`#624 voice-page-modularity`: every page here runs the scripts the shell loads, in its order, and a control's needle is counted", () => {
   assert.deepStrictEqual(PAGE_SCRIPTS, ["contract.js", SCRIPT_FILE]);
@@ -7844,9 +7896,7 @@ test("the desktop layout is chosen by CAPABILITY, and no user-agent string decid
     assert.doesNotMatch(text, /userAgent|userAgentData/, `${name} sniffs the user agent`);
     // User-facing device-speech setup instructions may name Android. Quoted copy is not a
     // layout decision; a navigator.userAgent read remains forbidden by the assertion above.
-    const layoutCode = name.endsWith(".js")
-      ? text.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, "")
-      : text;
+    const layoutCode = name.endsWith(".js") ? withoutStrings(text) : text;
     assert.doesNotMatch(
       layoutCode,
       /\b(iPhone|iPad|Android|Macintosh|Windows NT)\b/,
@@ -9921,6 +9971,7 @@ const FOLD_WIDTHS_EM = JSON.parse(
 const PHONE_CLASS = FOLD_WIDTHS_EM.indexOf(28.5);
 /** ...and of a desk's default 72ch column. */
 const DESK_CLASS = FOLD_WIDTHS_EM.indexOf(45);
+// GLYPHS, the glyph widths the fold model counts by, is loaded near PRELUDE, above every test.
 /** `count` words of `letters` n's each, on one line: "n" is the model's ordinary lowercase letter. */
 const wordsOfLength = (count, letters) => Array(count).fill("n".repeat(letters)).join(" ");
 /** How many such words a line of `widthEm` holds, by the model's own glyph widths. */
@@ -10198,7 +10249,7 @@ test("A CODE BLOCK is counted in lines of its own, in code's face, and the line 
   const steps = Array.from({ length: 14 }, (_unused, i) => `step ${i}: ok checksum=abc${i}\n`).join("");
   // Ten lines of fifty m's and a number. In code's face a line is 50 × MONO_EM, well inside a phone's
   // line; at the proportional font's 0.72em an "m", each would be counted as wrapping onto two.
-  const mono = page.pure("MONO_EM");
+  const mono = GLYPHS.MONO_EM;
   assert.ok(50 * mono < 28.5 && 50 * page.pure('glyphEm("m")') > 28.5, "the fixture no longer tells the two faces apart");
   const wide = Array.from({ length: 10 }, (_unused, i) => `${"m".repeat(50)} ${i}\n`).join("");
   const rows = await showDiscord(page, [
@@ -13252,8 +13303,7 @@ test("A CARD WITH NO SUMMARY shows its first message line by line, as the messag
 
 // --- `#486 read-aloud-pieces`: a block read in pieces --------------------------------------------
 
-/** The speech module (`#624 voice-page-modularity`): what a read plays and how a block is cut. */
-const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
+// SPEECH_PIECES, the speech module, is loaded near PRELUDE, above every test.
 
 /** The cases src/render.rs `read_pieces` is held to: the page cuts each the same way. */
 const PIECES_FIXTURE = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "read_aloud_pieces.json"), "utf8"));
@@ -87376,9 +87426,7 @@ test("`#624 voice-page-modularity`: a page knows its build from the page build's
  */
 const SEARCH_CORPUS = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "search_query.json"), "utf8"));
 
-/** The search language module (`#624 voice-page-modularity`), with `overlays` patched into its sources. */
-const searchLanguage = (overlays = []) => moduleForTests("src/core/search/index.ts", { overlays });
-const SEARCH_LANGUAGE = await searchLanguage();
+// The search language module and searchLanguage() are loaded near PRELUDE, above every test.
 
 function searchCorpusDisagreements(language) {
   const fold = language.searchFold;

@@ -12,3 +12,7 @@ declare const searchSubject: LegacyImports["searchSubject"];
 declare const readPieces: LegacyImports["readPieces"];
 declare const sentenceEnds: LegacyImports["sentenceEnds"];
 declare const speechSegments: LegacyImports["speechSegments"];
+declare const SPACE_EM: LegacyImports["SPACE_EM"];
+declare const WIDE_SCRIPT: LegacyImports["WIDE_SCRIPT"];
+declare const glyphEm: LegacyImports["glyphEm"];
+declare const monoEm: LegacyImports["monoEm"];
