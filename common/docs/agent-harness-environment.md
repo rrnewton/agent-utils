@@ -246,8 +246,13 @@ and whether the per-command file is re-read.
 - The tracked launchers in `common/bin/` print one provenance line per call on stderr, for example
   `[agentctl] rust cache=verified source=<source fingerprint> binary=<binary sha256>`, so logs show
   which checkout and build ran.
-- A copied binary carries no build commit today (`agentctl --version` prints the package version
-  only). Compare `sha256sum` against the build you expect.
+- A copied `agentctl` names its source only if it was built with `AGENTCTL_SOURCE_COMMIT` (and
+  optionally `AGENTCTL_SOURCE_DIRTY`, `AGENTCTL_SOURCE_FP`) set: `agentctl --version` then prints
+  `commit <sha>` and `capabilities` reports `build.commit`. With `AGENT_UTILS_CHECKOUT` exported
+  (for example from the team env file), such a binary compares its commit with that checkout's
+  `HEAD` on every run, by reading Git's files only. It warns on a mismatch, and refuses commands
+  that change agents' state unless `AGENTCTL_ALLOW_STALE=1` is set. For other binaries, compare
+  `sha256sum` against the build you expect.
 - A symlink to a launcher works from any directory, because the launchers resolve their own real
   path. The link must have the tool's own name: the launchers dispatch on `basename "$0"`, so
   `agentctl-dev -> common/bin/agentctl` is refused.

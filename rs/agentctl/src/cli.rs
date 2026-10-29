@@ -32,7 +32,7 @@ fn parse_term_backend(raw: &str) -> std::result::Result<String, String> {
 #[derive(Parser)]
 #[command(
     name = "agentctl",
-    version,
+    version = crate::build_info::version_text(),
     about = "Manage persistent coding agents that you can message and inspect",
     long_about = "Manage named coding-agent sessions with durable prompt delivery and direct human access.\nThe Rust implementation controls interactive Codex, Claude, and Muse sessions through Herdr and can run a durable event-driven chat bridge through installed subscription plugins.",
     after_help = "Examples:\n  agentctl quickstart\n  agentctl start reviewer --cwd .\n  agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex\n  agentctl send reviewer 'Review the current changes'\n  agentctl chat status --bridge-state ~/.local/state/agentctl/chat\n  agentctl pause reviewer\n  agentctl attach reviewer\n  agentctl resume reviewer\n  agentctl stop reviewer"
@@ -2237,6 +2237,24 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     .to_owned(),
             ));
         }
+    }
+    // A binary that names its build commit is checked against the team's pinned agent-utils
+    // checkout (AGENT_UTILS_CHECKOUT), by reading files only: warn on a mismatch, and refuse to
+    // change agents' state unless AGENTCTL_ALLOW_STALE=1.
+    match crate::build_info::staleness(crate::build_info::SOURCE_COMMIT, environment) {
+        Ok(None) => {}
+        Ok(Some(stale)) => {
+            eprintln!("{}", stale.warning());
+            if writes_registry(&command)
+                && environment(crate::build_info::ALLOW_STALE_ENV).as_deref() != Some("1")
+            {
+                return Err(Failure::Agent(AgentError::Delivery(stale.refusal())));
+            }
+        }
+        Err(reason) => eprintln!(
+            "agentctl: warning: cannot compare this binary with {}: {reason}",
+            crate::build_info::CHECKOUT_ENV
+        ),
     }
     if writes_registry(&command) {
         // New writes use layout 2, and whatever layout-1 agents are idle move first (#593

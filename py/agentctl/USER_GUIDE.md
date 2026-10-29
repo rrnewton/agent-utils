@@ -454,6 +454,26 @@ regular file or a directory is missing, and refuses root slot isolation, whose
 relay runs the harness without an interactive shell. The pane shell must accept
 `export NAME=value` (bash, zsh, or another POSIX-style shell).
 
+A team that runs agentctl from its own pinned build can tell which source a
+binary came from, and catch a build left behind when the pin moves. Build with
+`AGENTCTL_SOURCE_COMMIT` (the 40-character commit of the checkout),
+`AGENTCTL_SOURCE_DIRTY` (`0` or `1`) and, optionally, `AGENTCTL_SOURCE_FP` set:
+
+```sh
+AGENTCTL_SOURCE_COMMIT="$(git -C CHECKOUT rev-parse HEAD)" \
+AGENTCTL_SOURCE_DIRTY="$(git -C CHECKOUT diff --quiet HEAD && echo 0 || echo 1)" \
+cargo build --release --locked -p agentctl
+```
+
+Such a binary prints `commit <sha>` (with `(dirty)` when set) on the line after
+its version, and `capabilities` reports `build.commit` and `build.dirty`. When
+`AGENT_UTILS_CHECKOUT` names the team's checkout (the team env file is a good
+place to export it), every command compares the binary's commit with that
+checkout's `HEAD`, reading Git's files directly without running Git. On a
+mismatch it prints a warning, and commands that change agents' state (`start`,
+`stop`, `send`, `revive`, and the like) refuse with exit status 75 unless
+`AGENTCTL_ALLOW_STALE=1` is set. A build that names no commit is never checked.
+
 Within each profile, `harness` and `mode` are required. `model`,
 `reasoning_effort`, `argv`, and `env` are optional, and so is `record_edges`:
 `false` makes `start` with this profile record no `created_by` or `managed_by`
