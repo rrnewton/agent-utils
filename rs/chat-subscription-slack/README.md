@@ -11,7 +11,10 @@ This crate holds two executables for an `agentctl chat` bridge:
   `rescan_interval_seconds`, 90 by default) delivers the messages the stream
   missed, once, with each file's ID and download command in the request text.
   Its ledger, `slack-rescan-ledger.json`, lives beside the plugin's
-  `diagnostics_log`; see `src/rescan.rs` and the userguide.
+  `diagnostics_log`; see `src/rescan.rs` and the userguide. Every bridge on a
+  host lists as the same person, so their listings share a per-minute budget
+  and a rate-limit back-off in a small state file under the user's runtime
+  directory (`src/budget.rs`).
 * `agentctl-slack-outbound`, the bridge's one-shot `outbound_command`. It posts
   replies into the request's Slack thread and adds the acknowledgement
   reactions, verifies human authors before rejection reactions, and supports

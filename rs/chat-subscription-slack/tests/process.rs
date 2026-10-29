@@ -90,6 +90,8 @@ fn plugin_process_delivers_a_slack_message() {
             json!({"FAKE_SLACK_DIR": root}),
         ),
         ("diagnostics_log".to_owned(), json!(root.join("plugin.log"))),
+        // A listing budget of this test's own, never the user's shared one.
+        ("rescan_budget_key".to_owned(), json!(root.join("budget"))),
     ]);
     let request = SubscribeRequest::new(
         vec![ChannelId::new(CHANNEL).unwrap()],
@@ -171,6 +173,8 @@ fn plugin_process_commits_a_proven_position_only_after_the_events_before_it() {
             json!({"FAKE_SLACK_DIR": root}),
         ),
         ("diagnostics_log".to_owned(), json!(root.join("plugin.log"))),
+        // A listing budget of this test's own, never the user's shared one.
+        ("rescan_budget_key".to_owned(), json!(root.join("budget"))),
     ]);
     let request = SubscribeRequest::new(
         vec![ChannelId::new(CHANNEL).unwrap()],

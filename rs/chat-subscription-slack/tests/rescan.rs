@@ -52,6 +52,8 @@ fn data(directory: &Path, extra: Value) -> Map<String, Value> {
     let mut data: Map<String, Value> = Map::from_iter([
         ("cli_path".to_owned(), json!("/opt/slack/bin/slack-cli")),
         ("heartbeat_interval_seconds".to_owned(), json!(1)),
+        // The host-wide listing budget is off: tests must not share the user's real one.
+        ("rescan_budget_key".to_owned(), json!("off")),
         (
             "diagnostics_log".to_owned(),
             json!(directory.join("plugin.log").to_str().unwrap()),
@@ -1023,12 +1025,15 @@ fn a_rescan_pass_yields_to_a_live_message_waiting_on_the_stream() {
     let mut script = heartbeats(1);
     script.push(stream_message(43, &live_ts, None, "live"));
     fake.push_script(script);
-    fake.push_history(listed(&root_ts, None, OWNER, "root", &[]));
+    // The bridge's own post and reply: nothing to rescue, but a thread a pass would list.
+    fake.push_history(listed(&root_ts, None, BOT, "root", &[]));
     fake.push_history(listed(&reply_ts, Some(&root_ts), BOT, "reply", &[]));
     let mut backend = backend(&fake, yield_clock);
     let mut subscription =
         ChatSubscription::open(&mut backend, &request(&directory, None, json!({}))).unwrap();
     commit_next(&mut subscription);
+    // Past the reply's grace period, so the thread is due for a listing.
+    YIELD_NOW.store(T0 + 30_000, Ordering::SeqCst);
 
     // The heartbeat starts a pass; its history listing finds a thread to list, but the live
     // message is already waiting, so the pass stops before listing the thread.
@@ -1039,8 +1044,8 @@ fn a_rescan_pass_yields_to_a_live_message_waiting_on_the_stream() {
     subscription.commit_durable(&live).unwrap();
 
     // The yield adds no pass of its own; the live message's channel activity pulls the next
-    // one forward as usual, and that pass lists the thread (and may rescue the root).
-    YIELD_NOW.store(T0 + 30_000, Ordering::SeqCst);
+    // one forward as usual, and that pass lists the thread.
+    YIELD_NOW.store(T0 + 60_000, Ordering::SeqCst);
     let _ = next_batch_within(&mut subscription, 2);
     assert!(
         fake.state().scans.len() >= 3,
@@ -1048,4 +1053,217 @@ fn a_rescan_pass_yields_to_a_live_message_waiting_on_the_stream() {
         fake.state().scans.len()
     );
     subscription.close().unwrap();
+}
+
+fn thread_scans(fake: &FakeTransport) -> usize {
+    fake.state()
+        .scans
+        .iter()
+        .filter(|scan| scan.1.is_some())
+        .count()
+}
+
+clock!(ripe_clock, RIPE_NOW);
+
+// #690 muse-bridge-rescan-intake: a thread whose newest reply is still in its grace period is
+// not listed (nothing in it could be rescued yet), a later pass lists it once, and a pass that
+// finds its history row unchanged does not list it again.
+#[test]
+fn a_thread_is_listed_once_its_newest_reply_is_ripe_and_not_again_while_unchanged() {
+    let directory = scratch("ripe");
+    let fake = FakeTransport::new();
+    let root_ts = ts(T0 + 1_000);
+    fake.push_history(listed(&root_ts, None, BOT, "root", &[]));
+    fake.push_history(listed(&ts(T0 + 5_000), Some(&root_ts), BOT, "reply", &[]));
+    fake.push_script(heartbeats(8));
+    let mut backend = backend(&fake, ripe_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, None, json!({}))).unwrap();
+    commit_next(&mut subscription);
+
+    assert!(next_batch_within(&mut subscription, 1).is_none());
+    assert_eq!(fake.state().scans.len(), 1, "only the history listing");
+    assert_eq!(thread_scans(&fake), 0);
+    assert!(log(&directory).contains("1 thread postponed"));
+
+    RIPE_NOW.store(T0 + 100_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut subscription, 1).is_none());
+    assert_eq!(thread_scans(&fake), 1, "listed once it was ripe");
+
+    RIPE_NOW.store(T0 + 200_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut subscription, 1).is_none());
+    assert_eq!(thread_scans(&fake), 1, "not listed again while unchanged");
+    assert!(fake.state().scans.len() >= 3);
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(carriedreply_clock, CARRIEDREPLY_NOW);
+
+// #690 muse-bridge-rescan-intake: once a thread was listed, new replies the stream carried
+// leave nothing to rescue in it, so its changed history row does not bring another listing.
+#[test]
+fn a_thread_whose_new_replies_the_stream_carried_is_not_listed_again() {
+    let directory = scratch("carriedreply");
+    let fake = FakeTransport::new();
+    let root_ts = ts(T0 + 1_000);
+    let first = ts(T0 + 5_000);
+    let second = ts(T0 + 150_000);
+    fake.push_history(listed(&root_ts, None, BOT, "root", &[]));
+    fake.push_history(listed(&first, Some(&root_ts), BOT, "first", &[]));
+    let mut script = heartbeats(3);
+    script.push(stream_message(7, &second, Some(&root_ts), "second"));
+    script.extend(heartbeats(6));
+    fake.push_script(script);
+    let mut backend = backend(&fake, carriedreply_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, None, json!({}))).unwrap();
+    commit_next(&mut subscription);
+
+    // The first pass postpones the thread; one later lists it.
+    assert!(next_batch_within(&mut subscription, 1).is_none());
+    CARRIEDREPLY_NOW.store(T0 + 100_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut subscription, 1).is_none());
+    assert_eq!(thread_scans(&fake), 1);
+
+    // The owner's reply arrives on the stream; history now shows it as the newest reply.
+    CARRIEDREPLY_NOW.store(T0 + 151_000, Ordering::SeqCst);
+    fake.push_history(listed(&second, Some(&root_ts), OWNER, "second", &[]));
+    let reply = next_batch_within(&mut subscription, 3).expect("the carried reply");
+    assert_eq!(single_message(&reply).text(), "second");
+    subscription.commit_durable(&reply).unwrap();
+
+    CARRIEDREPLY_NOW.store(T0 + 400_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut subscription, 2).is_none());
+    assert_eq!(
+        thread_scans(&fake),
+        1,
+        "the carried reply needed no listing"
+    );
+    assert!(log(&directory).contains("1 not listed (new replies all carried)"));
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(hostbudget_clock, HOSTBUDGET_NOW);
+
+// #690 muse-bridge-rescan-intake: the host-wide budget, shared by every bridge listing as one
+// identity, stops a pass that would exceed it; the next pass waits for the next minute.
+#[test]
+fn a_spent_host_budget_stops_the_pass_before_its_thread_listing() {
+    let directory = scratch("hostbudget");
+    let fake = FakeTransport::new();
+    let root_ts = ts(T0 + 1_000);
+    fake.push_history(listed(&root_ts, None, BOT, "root", &[]));
+    fake.push_history(listed(&ts(T0 + 5_000), Some(&root_ts), BOT, "reply", &[]));
+    fake.push_script(heartbeats(4));
+    let mut backend = backend(&fake, hostbudget_clock);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(
+            &directory,
+            None,
+            json!({
+                "rescan_budget_key": directory.join("budget"),
+                "rescan_calls_per_minute": 1
+            }),
+        ),
+    )
+    .unwrap();
+    commit_next(&mut subscription);
+    // Past the reply's grace period, so the thread is due for a listing.
+    HOSTBUDGET_NOW.store(T0 + 30_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut subscription, 1).is_none());
+    assert_eq!(
+        fake.state().scans.len(),
+        1,
+        "the thread listing was refused"
+    );
+    let text = log(&directory);
+    assert!(
+        text.contains("host budget 1 of 1 calls this minute"),
+        "{text}"
+    );
+    assert!(text.contains("is spent for this minute"), "{text}");
+    assert!(directory.join("budget/budget.json").is_file());
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(busy_clock, BUSY_NOW);
+
+// #690 muse-bridge-rescan-intake (review): a thread whose newest reply is always young, such as
+// one the agent keeps posting progress in, is postponed one pass at most, then listed anyway.
+#[test]
+fn a_busy_thread_is_postponed_one_pass_at_most() {
+    let directory = scratch("busythread");
+    let fake = FakeTransport::new();
+    let root_ts = ts(T0 + 1_000);
+    fake.push_history(listed(&root_ts, None, BOT, "root", &[]));
+    fake.push_history(listed(&ts(T0 + 5_000), Some(&root_ts), BOT, "first", &[]));
+    fake.push_script(heartbeats(8));
+    let mut backend = backend(&fake, busy_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, None, json!({}))).unwrap();
+    commit_next(&mut subscription);
+    assert!(next_batch_within(&mut subscription, 1).is_none());
+    assert_eq!(
+        thread_scans(&fake),
+        0,
+        "postponed: its newest reply is young"
+    );
+
+    // A new reply keeps the newest one young at the next pass; it is listed anyway.
+    fake.push_history(listed(
+        &ts(T0 + 95_000),
+        Some(&root_ts),
+        BOT,
+        "progress",
+        &[],
+    ));
+    BUSY_NOW.store(T0 + 100_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut subscription, 1).is_none());
+    assert_eq!(thread_scans(&fake), 1, "listed at the second pass");
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(budgetretry_clock, BUDGETRETRY_NOW);
+
+// #690 muse-bridge-rescan-intake (review): with a host budget, the back-off a rate-limited
+// listing records holds the other bridges, but not this bridge's own retry after the wait Slack
+// named, so #615's in-pass retry still rescues file messages.
+#[test]
+fn a_rate_limited_listing_is_retried_in_the_pass_with_a_host_budget() {
+    let directory = scratch("budgetretry");
+    let fake = FakeTransport::new();
+    fake.push_script(heartbeats(6));
+    fake.state()
+        .scan_failures
+        .push_back(TransportError::not_applied(
+            "slack_rate_limited",
+            "Slack rate-limited request conversations.history. Retry after 0 seconds. \
+             {\"retry_after_seconds\":0}",
+            true,
+        ));
+    let file_ts = ts(T0 + 10_000);
+    fake.push_history(listed(&file_ts, None, OWNER, "", &["F0KKKKKKKK1"]));
+    let mut backend = backend(&fake, budgetretry_clock);
+    let budget = directory.join("budget");
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(&directory, None, json!({"rescan_budget_key": budget})),
+    )
+    .unwrap();
+    commit_next(&mut subscription);
+    BUDGETRETRY_NOW.store(T0 + 100_000, Ordering::SeqCst);
+    let rescued = next_batch_within(&mut subscription, 2).expect("rescued after the retry");
+    assert!(single_message(&rescued).text().contains("F0KKKKKKKK1"));
+    subscription.commit_durable(&rescued).unwrap();
+    // The back-off it recorded holds any other bridge of this budget.
+    let state: Value =
+        serde_json::from_slice(&fs::read(budget.join("budget.json")).unwrap()).unwrap();
+    assert!(state["blocked_until_millis"].as_u64().unwrap() >= T0 + 100_000 + 30_000);
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
 }

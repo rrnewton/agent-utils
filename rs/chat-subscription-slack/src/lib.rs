@@ -23,6 +23,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod budget;
 pub mod cli;
 pub mod diag;
 pub mod fake;

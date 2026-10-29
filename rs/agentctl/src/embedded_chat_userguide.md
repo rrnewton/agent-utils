@@ -2245,7 +2245,14 @@ history from the last `rescan_window_seconds` (a day by default) with
 `slack.message list --content-format=mrkdwn`, as the same member the tail runs
 as. It also lists the replies of each thread in that history whose newest reply
 it has not yet listed, and of each thread the stream carried a reply in during
-the last 30 minutes, however old its root. A message at least 15 seconds old (younger ones
+the last 30 minutes whose root is older than that history. A thread whose
+newest reply is still inside the 15-second grace period below is left for the
+next pass, which lists it whatever its newest reply then is. A thread whose
+history row shows that its newest reply, and every reply it gained since its
+last listing, were carried by the stream is not listed; it is listed anyway
+once its last listing is 10 minutes old, since a deleted reply can make the
+count look right. A thread whose row has not changed is not listed again. So
+most passes make one history call. A message at least 15 seconds old (younger ones
 are left to the stream) that the stream did not carry and the rescan has not
 already delivered goes through the same filtering as a stream message (allowed
 senders and grants, subtypes, ignored prefixes, the lineage start) and becomes
@@ -2294,8 +2301,30 @@ again (a lost rather than a refused message), and the log says so.
 
 A pass reads at most 5 history pages of 20 messages, 8 threads of 2 pages each,
 and queues at most 32 messages; what it leaves is found by the next pass. It
-starts no listing after 60 seconds, and while a listing runs the plugin does not
-read the tail (events wait in the pipe). After a failed listing the next pass
+starts no listing after 60 seconds. While a listing runs the plugin does not
+read the tail (events wait in the pipe), so after its first history listing a
+pass stops, between listings and while it waits out a rate limit, as soon as a
+live event is waiting; the next pass comes on the usual schedule, and what the
+stopped pass already found is still delivered.
+
+Every bridge on a host lists as the same person, so their listings count
+together against that person's Slack limits (and the client's own limiter).
+The bridges therefore share a listing budget, a small state file under the
+user's runtime directory (`$XDG_RUNTIME_DIR/agentctl-slack/budget-<id>.json`,
+counters only), read and written under a file lock:
+`rescan_calls_per_minute` calls a minute (20 by default) across every bridge
+with the same `rescan_budget_key` (by default `user`, one budget for all of the
+user's bridges; an absolute directory keeps a budget of its own in
+`budget.json` there). A pass that would exceed it stops and the next waits for
+the next minute. When any bridge's listing is rate-limited, it records a
+back-off there (the wait Slack named, at least 30 seconds and at most 5
+minutes; 60 seconds when the client names none) and no other bridge of that
+budget lists until it ends, nor starts a pass before its usual interval; the
+bridge that was limited still retries that listing after Slack's wait, as
+below. A budget file that cannot be used refuses nothing, and the pass's log
+line says so. Each pass logs how many history and thread listing calls it
+made, how many threads it left alone and why, and the budget used this minute.
+After a failed listing the next pass
 waits twice as long, up to 30 minutes, and a success resets that; a transport
 that cannot list stops the rescan for the subscription. The diagnostics log
 records each rescued message and each failure. A reply is not found in a
@@ -2432,6 +2461,8 @@ Unknown keys are refused.
 | `diagnostics_log` | stderr | Private diagnostics file (identifiers and codes only, never message text). The rescan keeps its ledger beside it. |
 | `rescan_interval_seconds` | 90 | How often, while the tail is idle, to list recent history for messages the stream did not carry (see "Messages the event stream never carries"). 30–3600, or 0 to never rescan. |
 | `rescan_window_seconds` | 86400 | How far back a rescan lists, 600–604800. |
+| `rescan_calls_per_minute` | 20 | Listing calls a minute shared by every bridge on this host with the same `rescan_budget_key`, 0–600; 0 is unlimited. |
+| `rescan_budget_key` | `user` | Name of the shared listing budget; bridges that list as different people can use different keys. `off` gives this bridge no shared budget. |
 
 The host clears the plugin environment except `HOME`, `USER`, `LOGNAME`, `PATH`,
 `LANG`, `LC_ALL`, `TMPDIR` and `XDG_RUNTIME_DIR`. If the client needs another

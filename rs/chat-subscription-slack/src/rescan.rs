@@ -65,6 +65,8 @@ pub const MAX_THREADS_PER_PASS: usize = 8;
 pub const MAX_THREAD_PAGES: usize = 2;
 /// Messages one pass queues for delivery; the rest are found again by the next pass.
 pub const MAX_RESCUES_PER_PASS: usize = 32;
+/// Listing calls a minute every bridge sharing one host-wide budget may make together.
+pub const DEFAULT_CALLS_PER_MINUTE: u64 = 20;
 /// One pass stops starting listings after this long.
 pub const PASS_BUDGET: Duration = Duration::from_secs(60);
 /// The longest wait after consecutive failed passes.

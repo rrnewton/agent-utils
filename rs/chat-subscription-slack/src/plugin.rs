@@ -76,6 +76,14 @@
 //! and, when it has files, their IDs and the exact command to download each to a temporary path;
 //! a stream message with files gets the same file note.
 //!
+//! Listings cost the identity the stream runs as, shared with every other bridge of that person
+//! on the host (#690 muse-bridge-rescan-intake), so a pass lists a thread only when its history
+//! row says something could be rescued: its newest reply is past the grace period, and the
+//! replies it gained since its last listing were not all carried by the stream; an active
+//! thread whose root the history listing shows is decided by that row. Every listing call spends
+//! the host-wide budget in [`crate::budget`], and a rate-limited one makes every bridge of that
+//! budget back off; each pass logs its calls.
+//!
 //! A pass runs in the driver loop, so after its first history listing it stops, between
 //! listings and while it waits out a rate limit, as soon as a live stream event is waiting; the
 //! next pass comes after the usual interval. Listing threads and honouring Slack's rate-limit
@@ -170,6 +178,11 @@ pub struct PluginConfig {
     pub rescan_interval: Option<Duration>,
     /// How far back a rescan looks.
     pub rescan_window: Duration,
+    /// Listing calls per minute that every bridge sharing `rescan_budget_key` on this host may
+    /// make together; 0 is unlimited (#690 muse-bridge-rescan-intake).
+    pub rescan_calls_per_minute: u64,
+    /// The name of the host-wide listing budget, by default the user's one (`user`).
+    pub rescan_budget_key: String,
 }
 
 fn failure(code: &str, detail: impl Into<String>, retryable: bool) -> BackendFailure {
@@ -253,6 +266,8 @@ impl PluginConfig {
             "diagnostics_log",
             "rescan_interval_seconds",
             "rescan_window_seconds",
+            "rescan_calls_per_minute",
+            "rescan_budget_key",
         ];
         if let Some(unknown) = data.keys().find(|key| !KNOWN.contains(&key.as_str())) {
             return Err(invalid(format!(
@@ -386,6 +401,10 @@ impl PluginConfig {
             diagnostics_log: optional_string(data, "diagnostics_log")?.map(PathBuf::from),
             rescan_interval,
             rescan_window,
+            rescan_calls_per_minute: optional_seconds(data, "rescan_calls_per_minute", 0..=600)?
+                .unwrap_or(rescan::DEFAULT_CALLS_PER_MINUTE),
+            rescan_budget_key: optional_string(data, "rescan_budget_key")?
+                .unwrap_or_else(|| "user".to_owned()),
         })
     }
 }
@@ -771,12 +790,29 @@ fn open_rescan(
             diagnostics.log(&format!("rescan: the ledger could not be saved: {error}"));
         }
     }
+    let budget = crate::budget::CallBudget::for_identity(
+        &config.rescan_budget_key,
+        config.rescan_calls_per_minute,
+    );
     match config.rescan_interval {
         Some(interval) => diagnostics.log(&format!(
-            "rescan: every {} s over the last {} s, once the stream has caught up; ledger {}",
+            "rescan: every {} s over the last {} s, once the stream has caught up; ledger {}; \
+             host listing budget {}",
             interval.as_secs(),
             config.rescan_window.as_secs(),
-            ledger.path().display()
+            ledger.path().display(),
+            budget.as_ref().map_or_else(
+                || "unavailable (no runtime directory)".to_owned(),
+                |budget| format!(
+                    "{} calls a minute in {}",
+                    if config.rescan_calls_per_minute == 0 {
+                        "unlimited".to_owned()
+                    } else {
+                        config.rescan_calls_per_minute.to_string()
+                    },
+                    budget.path().display()
+                )
+            )
         )),
         None => diagnostics.log(&format!(
             "rescan is off (rescan_interval_seconds 0); ledger {} still records carried messages",
@@ -791,6 +827,10 @@ fn open_rescan(
         active_threads: BTreeMap::new(),
         ledger,
         threads: BTreeMap::new(),
+        seen: BTreeMap::new(),
+        postponed: BTreeSet::new(),
+        carried_replies: BTreeMap::new(),
+        budget,
         queue: VecDeque::new(),
         next_due_millis: now_millis,
         failures: 0,
@@ -817,6 +857,16 @@ struct Rescan {
     ledger: Ledger,
     // The newest reply each thread was listed through, by `C…/<root ts>`.
     threads: BTreeMap<String, u128>,
+    // Each thread's reply count and newest reply when it was last listed, or last found to hold
+    // nothing new, by `C…/<root ts>`: a history row that shows the same needs no listing.
+    seen: BTreeMap<String, (u64, u128, u64)>,
+    // Threads the last pass left for their grace period, listed by the next whatever it shows.
+    postponed: BTreeSet<String>,
+    // Replies the stream carried, by thread: a thread whose new replies were all carried holds
+    // nothing to rescue and is not listed.
+    carried_replies: BTreeMap<String, BTreeSet<u128>>,
+    // The host-wide listing budget this bridge shares, when one could be placed.
+    budget: Option<crate::budget::CallBudget>,
     // Messages found by the last pass and not yet offered, oldest first.
     queue: VecDeque<SlackMessage>,
     next_due_millis: u64,
@@ -835,6 +885,10 @@ struct Rescan {
 
 const MAX_NOTED: usize = 1_024;
 const MAX_TRACKED_THREADS: usize = 1_024;
+/// Carried replies remembered per thread.
+const MAX_CARRIED_REPLIES: usize = 256;
+/// A thread skipped because its new replies were all carried is listed anyway after this long.
+const SEEN_TTL_MILLIS: u64 = 10 * 60 * 1_000;
 /// Without a heartbeat, event or proof, a stream counts as caught up after this long.
 const SETTLE_FALLBACK_MILLIS: u64 = 10 * 60 * 1_000;
 /// A thread the stream carried a reply in is listed for this long after that reply.
@@ -842,6 +896,51 @@ const ACTIVE_THREAD_MILLIS: u64 = 30 * 60 * 1_000;
 /// After any stream-carried message, the next rescan pass is pulled to this far ahead, so a
 /// file message posted beside ordinary traffic is rescued within seconds (#615).
 const ACTIVITY_RESCAN_MILLIS: u64 = 20_000;
+
+/// What one rescan pass spent of the listing budget.
+#[derive(Default)]
+struct Spend<'a> {
+    budget: Option<&'a crate::budget::CallBudget>,
+    history_calls: usize,
+    thread_calls: usize,
+    usage: Option<crate::budget::Usage>,
+    refused: Option<crate::budget::Refusal>,
+}
+
+/// Whether every reply a thread gained since its last listing (`seen`, at most [`SEEN_TTL_MILLIS`]
+/// old) was carried by the stream, so the thread holds nothing a listing could rescue: its newest
+/// reply is one the stream carried, and its reply count grew by exactly the number of carried
+/// replies after the newest reply it was listed with. A count can be fooled by a deleted reply,
+/// so a thread skipped this way is listed anyway once its record expires.
+fn all_new_replies_carried(
+    rescan: &Rescan,
+    key: &str,
+    reply_count: u64,
+    latest: u128,
+    now: u64,
+) -> bool {
+    let Some(&(seen_count, seen_latest, seen_at)) = rescan.seen.get(key) else {
+        return false;
+    };
+    if now.saturating_sub(seen_at) > SEEN_TTL_MILLIS
+        || !rescan
+            .carried_replies
+            .get(key)
+            .is_some_and(|carried| carried.contains(&latest))
+    {
+        return false;
+    }
+    let new = reply_count.saturating_sub(seen_count);
+    let carried = rescan.carried_replies.get(key).map_or(0, |carried| {
+        carried
+            .range((
+                std::ops::Bound::Excluded(seen_latest),
+                std::ops::Bound::Included(latest),
+            ))
+            .count() as u64
+    });
+    new > 0 && new == carried && reply_count > seen_count
+}
 
 fn micros_ts(micros: u128) -> String {
     format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
@@ -1166,9 +1265,18 @@ impl SlackDriver {
             .as_deref()
             .filter(|root| *root != message.message_ts && ids::valid_ts(root))
         {
-            rescan
-                .active_threads
-                .insert(message_key(&message.channel_id, root), now);
+            let thread = message_key(&message.channel_id, root);
+            if let Some(at) = ids::ts_micros(&message.message_ts) {
+                let carried = rescan.carried_replies.entry(thread.clone()).or_default();
+                carried.insert(at);
+                while carried.len() > MAX_CARRIED_REPLIES {
+                    carried.pop_first();
+                }
+                while rescan.carried_replies.len() > MAX_TRACKED_THREADS {
+                    rescan.carried_replies.pop_first();
+                }
+            }
+            rescan.active_threads.insert(thread, now);
             if rescan.active_threads.len() > MAX_TRACKED_THREADS {
                 if let Some(stalest) = rescan
                     .active_threads
@@ -1305,6 +1413,7 @@ impl SlackDriver {
         query: &ScanQuery<'_>,
         started: &Instant,
         yielded: &mut bool,
+        spend: &mut Spend<'_>,
     ) -> Result<ScanPage, TransportError> {
         let mut retries = 0_usize;
         let mut pending: Option<(TransportError, Duration)> = None;
@@ -1330,12 +1439,48 @@ impl SlackDriver {
                     return Err(error);
                 }
             }
+            if let Some(budget) = spend.budget {
+                // This bridge's own retry after the wait Slack named is not held by the back-off
+                // it recorded for the others (#615 chat-file-messages); it still counts.
+                let taken = if retries > 0 {
+                    budget.take_ignoring_back_off((self.now_millis)())
+                } else {
+                    budget.take((self.now_millis)())
+                };
+                match taken {
+                    Ok(usage) => spend.usage = Some(usage),
+                    Err(refusal) => {
+                        spend.refused = Some(refusal);
+                        return Err(TransportError::not_applied(
+                            "rescan_budget",
+                            "the host-wide listing budget refused the call",
+                            true,
+                        ));
+                    }
+                }
+            }
+            if query.thread_ts.is_some() {
+                spend.thread_calls += 1;
+            } else {
+                spend.history_calls += 1;
+            }
             match self.transport.scan_messages(query) {
                 Ok(page) => return Ok(page),
                 Err(error) => {
                     let Some(delay) = rescan::rate_limit_delay(&error) else {
                         return Err(error);
                     };
+                    // Every bridge listing as this identity backs off with this one.
+                    if let Some(budget) = spend.budget {
+                        let wait = u64::try_from(delay.as_millis())
+                            .unwrap_or(u64::MAX)
+                            .max(crate::budget::MIN_BLOCK_MILLIS)
+                            .min(
+                                u64::try_from(rescan::MAX_RATE_LIMIT_BACKOFF.as_millis())
+                                    .unwrap_or(u64::MAX),
+                            );
+                        budget.block((self.now_millis)().saturating_add(wait));
+                    }
                     retries += 1;
                     pending = Some((error, delay));
                 }
@@ -1379,8 +1524,18 @@ impl SlackDriver {
         let mut failure: Option<TransportError> = None;
         let channels: Vec<String> = self.channels.iter().cloned().collect();
         let mut yielded = false;
+        let budget = rescan.budget.clone();
+        let mut spend = Spend {
+            budget: budget.as_ref(),
+            ..Spend::default()
+        };
+        // Skipped thread listings, for the pass's log line.
+        let mut postponed = 0_usize;
+        let mut unchanged = 0_usize;
         'pass: for channel in &channels {
             let mut due_threads: Vec<(u128, String)> = Vec::new();
+            // Each thread root the history listing showed, with its reply count and newest reply.
+            let mut history_roots: BTreeMap<String, (u64, u128)> = BTreeMap::new();
             let mut token: Option<String> = None;
             for page in 0..rescan::MAX_HISTORY_PAGES {
                 if self.rescan_stop(&started, &mut yielded, listings > 0) {
@@ -1393,8 +1548,9 @@ impl SlackDriver {
                     oldest: &oldest,
                     page_token: token.as_deref(),
                 };
-                let listed = match self.scan_listing(&query, &started, &mut yielded) {
+                let listed = match self.scan_listing(&query, &started, &mut yielded, &mut spend) {
                     Ok(listed) => listed,
+                    Err(_) if spend.refused.is_some() => break 'pass,
                     Err(error) => {
                         // A rate limit is global: firing more listings only deepens it,
                         // so it still ends the pass (#615).
@@ -1423,12 +1579,24 @@ impl SlackDriver {
                         .and_then(ids::ts_micros)
                         .filter(|_| row.reply_count > 0)
                     {
-                        let through = rescan
-                            .threads
-                            .get(&message_key(channel, root))
-                            .copied()
-                            .unwrap_or(0);
+                        let key = message_key(channel, root);
+                        history_roots.insert(root.clone(), (row.reply_count, latest));
+                        let through = rescan.threads.get(&key).copied().unwrap_or(0);
                         if latest >= floor && latest > through {
+                            if latest > ripe && rescan.postponed.insert(key.clone()) {
+                                // Its newest reply is still in its grace period, when a listing
+                                // could not rescue it; the next pass lists it whatever its
+                                // newest reply, so a busy thread waits one pass at most.
+                                postponed += 1;
+                                continue;
+                            }
+                            if all_new_replies_carried(rescan, &key, row.reply_count, latest, now) {
+                                // Nothing is advanced: the thread stays due, is checked again
+                                // for free, and is listed once its `seen` record expires.
+                                unchanged += 1;
+                                continue;
+                            }
+                            rescan.postponed.remove(&key);
                             due_threads.push((latest, root.clone()));
                         }
                     }
@@ -1453,7 +1621,10 @@ impl SlackDriver {
                 let Some(root) = key.strip_prefix(&prefix) else {
                     continue;
                 };
+                // A root the history listing showed is decided by its row above; only an older
+                // root, whose newest reply no row shows, is listed for its activity.
                 if now.saturating_sub(*at) <= ACTIVE_THREAD_MILLIS
+                    && !history_roots.contains_key(root)
                     && !due_threads.iter().any(|(_, due)| due == root)
                 {
                     due_threads.push((u128::from(*at) * 1_000, root.to_owned()));
@@ -1481,8 +1652,10 @@ impl SlackDriver {
                         oldest: &oldest,
                         page_token: token.as_deref(),
                     };
-                    let listed = match self.scan_listing(&query, &started, &mut yielded) {
+                    let listed = match self.scan_listing(&query, &started, &mut yielded, &mut spend)
+                    {
                         Ok(listed) => listed,
+                        Err(_) if spend.refused.is_some() => break 'pass,
                         Err(error) => {
                             // One thread's listing must not abort the pass: what the
                             // history listing already found is still delivered (#615).
@@ -1524,6 +1697,11 @@ impl SlackDriver {
                 if complete && latest <= ripe {
                     listed_through = listed_through.max(latest);
                 }
+                if complete && !overflowed && !thread_failed {
+                    if let Some(&(count, latest)) = history_roots.get(&root) {
+                        rescan.seen.insert(key.clone(), (count, latest, now));
+                    }
+                }
                 // A reply left out because the queue was full must be listed again.
                 if !overflowed && !thread_failed {
                     rescan.threads.insert(key, listed_through);
@@ -1536,6 +1714,40 @@ impl SlackDriver {
         rescan
             .active_threads
             .retain(|_, at| now.saturating_sub(*at) <= ACTIVE_THREAD_MILLIS);
+        rescan
+            .seen
+            .retain(|_, (_, latest, _)| *latest >= listing_floor);
+        while rescan.postponed.len() > MAX_TRACKED_THREADS {
+            rescan.postponed.pop_first();
+        }
+        for carried in rescan.carried_replies.values_mut() {
+            carried.retain(|at| *at >= listing_floor);
+        }
+        rescan
+            .carried_replies
+            .retain(|_, carried| !carried.is_empty());
+        while rescan.seen.len() > MAX_TRACKED_THREADS {
+            rescan.seen.pop_first();
+        }
+        self.diagnostics.log(&format!(
+            "rescan: pass made {} history and {} thread listing call{}; {postponed} thread{} \
+             postponed (newest reply in its grace period), {unchanged} not listed (new replies \
+             all carried); host budget {}",
+            spend.history_calls,
+            spend.thread_calls,
+            if spend.thread_calls == 1 { "" } else { "s" },
+            if postponed == 1 { "" } else { "s" },
+            spend.usage.map_or_else(
+                || "not used".to_owned(),
+                |usage| if !usage.available {
+                    "unavailable (its file could not be used; nothing was counted)".to_owned()
+                } else if usage.per_minute == 0 {
+                    format!("{} calls this minute", usage.used)
+                } else {
+                    format!("{} of {} calls this minute", usage.used, usage.per_minute)
+                }
+            )
+        ));
         while rescan.threads.len() > MAX_TRACKED_THREADS {
             rescan.threads.pop_first();
         }
@@ -1543,26 +1755,58 @@ impl SlackDriver {
             .queue
             .make_contiguous()
             .sort_by_key(|message| ids::ts_micros(&message.message_ts).unwrap_or(0));
-        if yielded {
+        let interval_millis = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+        if let Some(refusal) = spend.refused {
+            // Another bridge's back-off holds this one for at least the usual interval, never
+            // past the rate-limit cap; a spent minute waits for the next one.
+            let cap = u64::try_from(rescan::MAX_RATE_LIMIT_BACKOFF.as_millis()).unwrap_or(u64::MAX);
+            let until = match refusal {
+                crate::budget::Refusal::Blocked(until) => until
+                    .max(now.saturating_add(interval_millis))
+                    .min(now.saturating_add(cap)),
+                crate::budget::Refusal::Spent(until) => until,
+            };
+            rescan.next_due_millis = until.max(now.saturating_add(1_000));
+            self.diagnostics.log(&format!(
+                "rescan: the host listing budget {} after {listings} listings; next pass in {} s",
+                match refusal {
+                    crate::budget::Refusal::Blocked(_) =>
+                        "holds every bridge back after a rate limit",
+                    crate::budget::Refusal::Spent(_) => "is spent for this minute",
+                },
+                rescan.next_due_millis.saturating_sub(now) / 1_000
+            ));
+        } else if yielded {
             // A live message arrived: it is handled first, and the next pass comes after the
             // usual interval, so yielding never adds listings against Slack's rate limits. What
             // the pass already queued is delivered.
-            rescan.next_due_millis =
-                now.saturating_add(u64::try_from(interval.as_millis()).unwrap_or(u64::MAX));
+            rescan.next_due_millis = now.saturating_add(interval_millis);
             self.diagnostics.log(&format!(
                 "rescan: yielded to a live event after {listings} listings; next pass in {} s",
                 interval.as_secs()
             ));
-            if !found.is_empty() {
-                self.diagnostics.log(&format!(
-                    "rescan: {listings} listings found {} message{} the stream did not carry: {}",
-                    found.len(),
-                    if found.len() == 1 { "" } else { "s" },
-                    found.join(", ")
-                ));
-            }
-            return;
+        } else {
+            self.schedule_after_pass(rescan, failure, interval, now, listings);
         }
+        if !found.is_empty() {
+            self.diagnostics.log(&format!(
+                "rescan: {listings} listings found {} message{} the stream did not carry: {}",
+                found.len(),
+                if found.len() == 1 { "" } else { "s" },
+                found.join(", ")
+            ));
+        }
+    }
+
+    /// Schedule the next pass after one that neither yielded nor was stopped by the budget.
+    fn schedule_after_pass(
+        &mut self,
+        rescan: &mut Rescan,
+        failure: Option<TransportError>,
+        interval: Duration,
+        now: u64,
+        listings: usize,
+    ) {
         match failure {
             Some(error)
                 if matches!(
@@ -1612,14 +1856,6 @@ impl SlackDriver {
                 rescan.next_due_millis =
                     now.saturating_add(u64::try_from(interval.as_millis()).unwrap_or(u64::MAX));
             }
-        }
-        if !found.is_empty() {
-            self.diagnostics.log(&format!(
-                "rescan: {listings} listings found {} message{} the stream did not carry: {}",
-                found.len(),
-                if found.len() == 1 { "" } else { "s" },
-                found.join(", ")
-            ));
         }
     }
 

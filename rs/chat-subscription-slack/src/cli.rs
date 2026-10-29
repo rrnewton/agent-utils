@@ -53,6 +53,8 @@ pub const MAX_LINE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_STDERR_BYTES: usize = 64 * 1024;
 const TAIL_STOP_GRACE: Duration = Duration::from_secs(3);
+/// The wait assumed for a rate limit whose error document names none.
+const DEFAULT_RATE_LIMIT_WAIT_SECONDS: u64 = 60;
 
 /// Optional tail settings, passed through to the client when set.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -954,11 +956,36 @@ fn exit_failure(completed: &Completed, write: bool) -> TransportError {
     if let Some(code) = PERMANENT_ERRORS.iter().find(|code| lower.contains(**code)) {
         return TransportError::not_applied(code, message, false);
     }
+    // The client's own limiter (`MetaCLIRateLimitException`) and Slack's 429 both say so in
+    // the document's other fields even when the message does not; the wait it names is kept in
+    // the detail, where `rescan::rate_limit_delay` reads it (#690 muse-bridge-rescan-intake).
+    let document = parsed.as_ref();
+    let field = |key: &str| {
+        document
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
     if lower.contains("ratelimited")
         || lower.contains("rate_limited")
         || lower.contains("rate-limited")
+        || field("fault_domain") == "rate_limit"
+        || field("error_kind") == "slack_rate_limited"
+        || field("exception") == "metacliratelimitexception"
     {
-        return TransportError::not_applied("ratelimited", message, true);
+        // A rate limit that names no wait is given a conservative one, so the shared back-off
+        // and the pass's scheduling still apply rather than a generic failure's.
+        let wait = document
+            .and_then(|value| value.get("retry_after_seconds"))
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_RATE_LIMIT_WAIT_SECONDS);
+        let detail = if lower.contains("retry after") {
+            message
+        } else {
+            format!("{message} (retry_after_seconds: {wait})")
+        };
+        return TransportError::not_applied("ratelimited", detail, true);
     }
     let code = [
         "not_in_channel",
@@ -1636,6 +1663,42 @@ impl SlackTransport for CliTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed(stderr: &str) -> Completed {
+        use std::os::unix::process::ExitStatusExt;
+        Completed {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_clients_rate_limit_documents_are_rate_limits_with_their_wait() {
+        // The live document (2026-10-29): Slack's 429 through the client's own limiter.
+        let slack = failed(
+            r#"{"status":"error","message":"Slack rate-limited request conversations.replies. Retry after 1 seconds.","error_kind":"slack_rate_limited","operation":"conversations.replies","http_status":429,"retry_after_seconds":1,"exception":"MetaCLIRateLimitException","fault_domain":"rate_limit"}"#,
+        );
+        let error = exit_failure(&slack, false);
+        assert_eq!(error.code, "ratelimited");
+        assert_eq!(
+            crate::rescan::rate_limit_delay(&error),
+            Some(Duration::from_secs(1))
+        );
+        // The limiter's own refusal names the wait only in its fields.
+        let limiter = failed(
+            r#"{"status":"error","message":"Too many requests for this identity","exception":"MetaCLIRateLimitException","fault_domain":"rate_limit","retry_after_seconds":20}"#,
+        );
+        let error = exit_failure(&limiter, false);
+        assert_eq!(error.code, "ratelimited");
+        assert_eq!(
+            crate::rescan::rate_limit_delay(&error),
+            Some(Duration::from_secs(20))
+        );
+        // Any other error stays what it was.
+        let other = failed(r#"{"status":"error","message":"channel_not_found"}"#);
+        assert_ne!(exit_failure(&other, false).code, "ratelimited");
+    }
 
     #[test]
     fn parses_a_message_event() {
