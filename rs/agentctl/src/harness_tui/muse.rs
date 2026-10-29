@@ -28,11 +28,35 @@ const FORM_MARKERS: [&str; 4] = [
 
 pub struct MuseTui;
 
+/// Lowercase phrases of Muse 1.4's command approval form, which takes the editor's place.
+const APPROVAL_MARKERS: [&str; 2] = [
+    "would you like to run the following command?",
+    "allow this stage once",
+];
+
 impl MuseTui {
     /// Whether the editor is empty: the screen's editor rows hold only the prompt marker.
     pub(crate) fn editor_empty(screen: &str) -> bool {
         muse_verified_process_editor_rows(&plain(screen))
             .is_some_and(|rows| muse_editor_rows_empty(&rows))
+    }
+
+    /// Whether a command approval form stands where the editor would be, so the pane waits for
+    /// a person: `agentctl status` reports it `blocked` rather than `working` (#678
+    /// muse-bridge-latency).
+    pub(crate) fn approval_form(screen: &str) -> bool {
+        let clean = plain(screen);
+        if muse_verified_process_editor_rows(&clean).is_some() {
+            return false;
+        }
+        let rows: Vec<_> = clean.lines().collect();
+        let Some(last) = rows.iter().rposition(|row| !row.trim().is_empty()) else {
+            return false;
+        };
+        let tail = rows[(last + 1).saturating_sub(FORM_ROWS)..=last]
+            .join("\n")
+            .to_lowercase();
+        APPROVAL_MARKERS.iter().any(|marker| tail.contains(marker))
     }
 }
 
@@ -288,5 +312,14 @@ mod tests {
         assert!(muse_verified_process_paste_is_exact_composer(STEER_FAILED, &prompt));
         assert!(!MuseTui::editor_empty(STEER_FAILED));
         assert_eq!(state(STEER_FAILED), State::Working);
+    }
+
+    #[test]
+    fn an_approval_form_blocks_and_a_panel_or_an_editor_does_not() {
+        assert!(MuseTui::approval_form(APPROVAL));
+        assert!(!MuseTui::approval_form(HELP));
+        for screen in [IDLE, THINKING, COMMAND, STEER_FAILED] {
+            assert!(!MuseTui::approval_form(screen));
+        }
     }
 }

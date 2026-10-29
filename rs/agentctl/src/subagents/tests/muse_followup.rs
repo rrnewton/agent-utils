@@ -150,7 +150,9 @@ fn an_operator_draft_an_approval_form_or_a_slash_command_holds_the_prompt_untype
         .send("worker", "at an approval", held())
         .unwrap_err();
     assert!(matches!(error, AgentError::Pending(_)), "{error}");
-    assert!(error.to_string().contains("last status=working"), "{error}");
+    // The approval form waits for a person, so the pane reads blocked, not working (#678).
+    assert!(error.to_string().contains("is blocked"), "{error}");
+    assert_eq!(manager.status("worker").unwrap()["agent_status"], "blocked");
     no_input(&fixture);
     fs::remove_file(&error.undelivered().unwrap().artifact).unwrap();
 
