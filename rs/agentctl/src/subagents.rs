@@ -2200,7 +2200,9 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         self.record.harness == "muse"
             && matches!(
                 self.record.adapter.as_str(),
-                "herdr-pane" | "herdr-foreign" | "tmux" | "tmux-foreign"
+                // `herdr` covers an adopted Muse after revive, which re-owns the pane
+                // under the native adapter (#697 send-muse-while-working).
+                "herdr" | "herdr-pane" | "herdr-foreign" | "tmux" | "tmux-foreign"
             )
     }
 
@@ -9904,15 +9906,21 @@ its drain would type first, so it was not queued",
         message_id: Option<&str>,
         boundary_wait: Duration,
     ) -> Result<Value> {
-        let result = self.send_identified(
-            agent_name,
-            text,
-            DrainOptions {
-                deliver_while_working: true,
-                ..options
-            },
-            message_id,
-        )?;
+        // Only the urgent prompt is typed, ahead of the queued backlog, which stays
+        // pending for the normal paced path (#697 send-muse-while-working).
+        let result = {
+            let _lock = self.lock(agent_name)?;
+            let record = self.load(agent_name)?;
+            self.send_record_priority(
+                &record,
+                text,
+                DrainOptions {
+                    deliver_while_working: true,
+                    ..options
+                },
+                message_id,
+            )?
+        };
         let mut value = json!(result);
         if result.outcome != agent::QueueOutcome::Delivered {
             value["urgent"] = json!({
@@ -10128,6 +10136,41 @@ its drain would type first, so it was not queued",
             ),
             None => agent::send_managed(&client, &self.target(record)?, &queue, text, options),
         }
+    }
+
+    /// [`Self::send_record`] for an urgent prompt: only this prompt is typed, ahead of
+    /// everything already queued (#697 send-muse-while-working).
+    fn send_record_priority(
+        &self,
+        record: &AgentRecord,
+        text: &str,
+        options: DrainOptions,
+        message_id: Option<&str>,
+    ) -> Result<QueueResult> {
+        if record.is_headless() {
+            return self.send_headless_record(record, text, message_id, &options);
+        }
+        record.input_allowed()?;
+        let queue = self.queue(&record.name)?;
+        let client = WorkspaceClient {
+            client: self.client,
+            record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: Some(&queue),
+            registry: Some(&self.registry),
+            check_prompt: true,
+            expected_workspace: self.project_workspace()?,
+            readback: None,
+        };
+        agent::send_priority_managed(
+            &client,
+            &self.target(record)?,
+            &queue,
+            text,
+            options,
+            message_id,
+        )
     }
 
     /// Hand input ownership to a human, without signaling or suspending the harness.

@@ -748,6 +748,51 @@ impl AgentRuntime for PasteTrackingRuntime<'_> {
     }
 }
 
+/// Stamps `paste_started_at` on every inflight item of one combined batch prompt when its
+/// first terminal input happens, as [`PasteTrackingRuntime`] does for a single prompt.
+struct BatchTrackingRuntime<'a> {
+    inner: &'a dyn AgentRuntime,
+    inflight_paths: Vec<PathBuf>,
+}
+
+impl AgentRuntime for BatchTrackingRuntime<'_> {
+    fn followup_key(&self) -> Option<&'static str> {
+        self.inner.followup_key()
+    }
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        self.inner.delivery_wait_chunk()
+    }
+    fn prompt_printed(&self, message_id: &str) {
+        self.inner.prompt_printed(message_id);
+    }
+    fn withdraw_unaccepted_prompt(&self) -> bool {
+        self.inner.withdraw_unaccepted_prompt()
+    }
+    fn withdraws_unaccepted(&self, message_id: &str) -> bool {
+        self.inner.withdraws_unaccepted(message_id)
+    }
+    fn input_started(&self) {
+        self.inner.input_started();
+        for path in &self.inflight_paths {
+            if let Ok(mut document) = load_message(path) {
+                if !document.contains_key("paste_started_at") {
+                    document.insert("paste_started_at".to_owned(), json!(unix_seconds()));
+                    let _ = atomic_json(path, &Value::Object(document));
+                }
+            }
+        }
+    }
+}
+
 /// Remove the paste-tracking stamps before an item reaches a terminal
 /// phase: they are recovery evidence for `inflight/` only, and terminal
 /// queue documents must stay in the shared format (no other writer of
@@ -1010,7 +1055,7 @@ pub fn drain_with_runtime<A: AgentApi + ?Sized>(
     options: DrainOptions,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<QueueResult> {
-    drain_with_runtime_binding(client, target, root, options, runtime, false)
+    drain_with_runtime_binding(client, target, root, options, runtime, false, None)
 }
 
 pub(crate) fn drain_managed<A: AgentApi + ?Sized>(
@@ -1026,6 +1071,7 @@ pub(crate) fn drain_managed<A: AgentApi + ?Sized>(
         options,
         &SystemRuntime::default(),
         true,
+        None,
     )
 }
 
@@ -1036,7 +1082,7 @@ pub(crate) fn drain_managed_with_runtime<A: AgentApi + ?Sized>(
     options: DrainOptions,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<QueueResult> {
-    drain_with_runtime_binding(client, target, root, options, runtime, true)
+    drain_with_runtime_binding(client, target, root, options, runtime, true, None)
 }
 
 fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
@@ -1046,6 +1092,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     options: DrainOptions,
     runtime: &dyn AgentRuntime,
     allow_legacy_workspace_binding: bool,
+    priority_only: Option<String>,
 ) -> AgentResult<QueueResult> {
     let started = runtime.monotonic();
     // Lock waits end at the lock timeout, and never later than the drain's deadline.
@@ -1106,7 +1153,22 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     let mut locked_pane_id: Option<String> = None;
     let mut initial_info: Option<AgentPaneInfo> = None;
     let deadline = options.deadline.map(|limit| started.saturating_add(limit));
-    'message: for path in pending_in_queue_order(&directories)? {
+    // An urgent send drains only its own prompt (#697 send-muse-while-working): the backlog
+    // stays pending for the normal paced path instead of flushing ahead of it.
+    let pending_paths: Vec<PathBuf> = match &priority_only {
+        Some(identifier) => pending_in_queue_order(&directories)?
+            .into_iter()
+            .filter(|path| message_id_from_path(path).is_ok_and(|id| id == *identifier))
+            .collect(),
+        None => pending_in_queue_order(&directories)?,
+    };
+    // Prompts a working-pane batch already typed as one combined prompt.
+    let mut batched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    'message: for path_ref in &pending_paths {
+        let path = path_ref.clone();
+        if batched.contains(&path) {
+            continue 'message;
+        }
         if options.max_items.is_some_and(|limit| typed >= limit) {
             blocked = Some(format!(
                 "the drain typed its limit of {typed} prompt(s); the rest stay pending"
@@ -1226,6 +1288,325 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     break 'message;
                 }
             };
+
+            // Backlog into a working pane is typed as one combined prompt, not a burst of
+            // separate steers (#697 send-muse-while-working): every prompt a drain would
+            // type into this working pane, oldest first, up to BATCH_MAX, with each stored
+            // text (and its sender header) intact. Slash commands, set-aside prompts and
+            // prompts out of attempts end the batch and keep their own path. A drain with
+            // an explicit --max-items, and an urgent priority drain, never batch.
+            if info.status == "working"
+                && priority_only.is_none()
+                && options.max_items.is_none()
+                && message_text(&document).is_ok_and(|text| !text.trim_start().starts_with('/'))
+            {
+                type BatchMember = (PathBuf, Map<String, Value>, u64, String, String);
+                let mut members: Vec<BatchMember> = vec![(
+                    path.clone(),
+                    document.clone(),
+                    attempts,
+                    identifier.clone(),
+                    filename_id.clone(),
+                )];
+                if let Some(position) = pending_paths.iter().position(|p| p == &path) {
+                    for candidate in &pending_paths[position + 1..] {
+                        if members.len() >= BATCH_MAX || batched.contains(candidate) {
+                            break;
+                        }
+                        let Ok(candidate_document) = load_message(candidate) else {
+                            break;
+                        };
+                        let Ok(candidate_attempts) =
+                            delivery_attempts(&candidate_document, candidate)
+                        else {
+                            break;
+                        };
+                        let Ok(candidate_filename) = message_id_from_path(candidate) else {
+                            break;
+                        };
+                        let candidate_id = candidate_document
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map_or(candidate_filename.clone(), str::to_owned);
+                        if candidate_attempts >= options.max_attempts
+                            || set_aside_reason(
+                                &directories,
+                                &candidate_filename,
+                                &candidate_document,
+                                now_millis(),
+                            )
+                            .is_some()
+                            || !message_text(&candidate_document)
+                                .is_ok_and(|text| !text.trim_start().starts_with('/'))
+                        {
+                            break;
+                        }
+                        members.push((
+                            candidate.clone(),
+                            candidate_document,
+                            candidate_attempts,
+                            candidate_id,
+                            candidate_filename,
+                        ));
+                    }
+                }
+                if members.len() >= 2 {
+                    // Move every member behind the inflight barrier before typing.
+                    let mut staged: Vec<(BatchMember, PathBuf)> = Vec::new();
+                    let mut setup_error: Option<AgentError> = None;
+                    for member in members {
+                        let inflight = directories
+                            .inflight
+                            .join(member.0.file_name().expect("validated queued filename"));
+                        if let Err(error) = transition(&member.0, &inflight) {
+                            setup_error = Some(error.into());
+                            break;
+                        }
+                        staged.push((member, inflight));
+                    }
+                    if let Some(error) = setup_error {
+                        for (member, inflight) in staged {
+                            let _ = transition(&inflight, &member.0);
+                        }
+                        return Err(error);
+                    }
+                    let mut active: Vec<(BatchMember, PathBuf)> = Vec::new();
+                    for (member, inflight) in staged {
+                        if let Some((reason, detail)) =
+                            set_aside_reason(&directories, &member.4, &member.1, now_millis())
+                        {
+                            let mut document = member.1.clone();
+                            cancelled.push(set_aside(
+                                root,
+                                &directories,
+                                &inflight,
+                                std::mem::take(&mut document),
+                                reason,
+                                &detail,
+                            )?);
+                            // Its inbox path is gone; never revisit it as a prompt.
+                            batched.insert(member.0.clone());
+                            continue;
+                        }
+                        active.push((member, inflight));
+                    }
+                    if active.len() >= 2 || (active.len() == 1 && info.status == "working") {
+                        if !std::mem::replace(&mut counted, true) {
+                            typed += 1;
+                        }
+                        let mut texts: Vec<String> = Vec::new();
+                        let mut documents: Vec<Map<String, Value>> = Vec::new();
+                        for (member, inflight) in &active {
+                            let mut document = member.1.clone();
+                            document.insert("possibly_submitted".to_owned(), Value::Bool(true));
+                            document.insert("delivery_state".to_owned(), json!("inflight"));
+                            document.insert("inflight_at".to_owned(), json!(unix_seconds()));
+                            document.insert("paste_tracking".to_owned(), Value::Bool(true));
+                            let lane = if member.0.starts_with(&directories.inbox_v2) {
+                                "inbox.v2"
+                            } else {
+                                "inbox"
+                            };
+                            document.insert("inflight_from".to_owned(), json!(lane));
+                            document.remove("paste_started_at");
+                            atomic_json(inflight, &Value::Object(document.clone()))?;
+                            texts.push(typed_text(&document)?);
+                            documents.push(document);
+                        }
+                        let combined = if texts.len() == 1 {
+                            texts.remove(0)
+                        } else {
+                            format!("{} queued messages:\n\n{}", texts.len(), texts.join("\n\n"))
+                        };
+                        let followup_key = crate::harness_tui::followup_tui(info.agent.as_deref())
+                            .map(|adapter| adapter.working_submit_key());
+                        let withdrawing = WithdrawingRuntime {
+                            inner: runtime,
+                            followup_key,
+                        };
+                        let batch_tracking = BatchTrackingRuntime {
+                            inner: &withdrawing,
+                            inflight_paths: active.iter().map(|(_, p)| p.clone()).collect(),
+                        };
+                        let batch_runtime: &dyn AgentRuntime = &batch_tracking;
+                        let revert = |active: &[(BatchMember, PathBuf)],
+                                      documents: &mut [Map<String, Value>],
+                                      detail: &str,
+                                      delivered: &mut Vec<String>|
+                         -> AgentResult<()> {
+                            let _ = delivered;
+                            for (index, (member, inflight)) in active.iter().enumerate() {
+                                let document = &mut documents[index];
+                                document.remove("possibly_submitted");
+                                document.remove("inflight_at");
+                                document.remove("paste_tracking");
+                                document.remove("inflight_from");
+                                document.remove("paste_started_at");
+                                document.insert("delivery_state".to_owned(), json!("pending"));
+                                document.insert("delivery_error".to_owned(), json!(detail));
+                                document.insert(
+                                    "delivery_blocked_at".to_owned(),
+                                    json!(unix_seconds()),
+                                );
+                                atomic_json(inflight, &Value::Object(document.clone()))?;
+                                transition(inflight, &member.0)?;
+                            }
+                            Ok(())
+                        };
+                        match deliver_one(
+                            client,
+                            &info,
+                            &combined,
+                            options.working_timeout,
+                            batch_runtime,
+                        ) {
+                            Ok(Delivered::Confirmed { verified, .. }) => {
+                                for (index, (member, inflight)) in active.iter().enumerate() {
+                                    if verified {
+                                        runtime.prompt_printed(&member.3);
+                                    }
+                                    let document = &mut documents[index];
+                                    strip_paste_stamps(document);
+                                    document
+                                        .insert("delivery_state".to_owned(), json!("processed"));
+                                    document
+                                        .insert("confirmed_at".to_owned(), json!(unix_seconds()));
+                                    atomic_json(inflight, &Value::Object(document.clone()))?;
+                                    transition(
+                                        inflight,
+                                        &directories.processed.join(
+                                            member
+                                                .0
+                                                .file_name()
+                                                .expect("validated queued filename"),
+                                        ),
+                                    )?;
+                                    delivered.push(member.3.clone());
+                                    batched.insert(member.0.clone());
+                                }
+                            }
+                            Ok(Delivered::NotStaged(detail)) => {
+                                revert(&active, &mut documents, &detail, &mut delivered)?;
+                                blocked = Some(detail);
+                                // As a single prompt that never reached the composer:
+                                // stop this drain instead of retrying every later
+                                // prompt against the same unready pane.
+                                break 'message;
+                            }
+                            Ok(Delivered::Misrouted(detail)) => {
+                                // Mirror the single-prompt path: count the misroute
+                                // on every member, return unexhausted members to
+                                // pending, and quarantine any member that has now
+                                // misrouted MAX_MISROUTES times, so a pane that
+                                // keeps taking the combined paste into the wrong
+                                // program does not receive it on every drain.
+                                for (index, (member, inflight)) in active.iter().enumerate() {
+                                    let document = &mut documents[index];
+                                    let mut misroutes = document
+                                        .get("misroutes")
+                                        .and_then(Value::as_array)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    misroutes.push(json!({"at": unix_seconds(), "error": detail}));
+                                    let exhausted = misroutes.len() >= MAX_MISROUTES;
+                                    document
+                                        .insert("misroutes".to_owned(), Value::Array(misroutes));
+                                    if exhausted {
+                                        let attempts = member.2.saturating_add(1);
+                                        document.insert(
+                                            "delivery_attempts".to_owned(),
+                                            json!(attempts),
+                                        );
+                                        document.insert(
+                                            "tui_delivery_attempts".to_owned(),
+                                            json!(attempts),
+                                        );
+                                        document.insert("delivery_error".to_owned(), json!(detail));
+                                        document.insert(
+                                            "probable_misroute".to_owned(),
+                                            Value::Bool(true),
+                                        );
+                                        document.insert(
+                                            "delivery_failed_at".to_owned(),
+                                            json!(unix_seconds()),
+                                        );
+                                        strip_paste_stamps(document);
+                                        atomic_json(inflight, &Value::Object(document.clone()))?;
+                                        let failed_path = directories.failed.join(
+                                            member
+                                                .0
+                                                .file_name()
+                                                .expect("validated queued filename"),
+                                        );
+                                        transition(inflight, &failed_path)?;
+                                        failed_metadata(
+                                            &failed_path,
+                                            "possibly_submitted",
+                                            &detail,
+                                        )?;
+                                        quarantined.push(member.3.clone());
+                                        batched.insert(member.0.clone());
+                                    } else {
+                                        document.remove("possibly_submitted");
+                                        document.remove("inflight_at");
+                                        document.remove("paste_tracking");
+                                        document.remove("inflight_from");
+                                        document.remove("paste_started_at");
+                                        document
+                                            .insert("delivery_state".to_owned(), json!("pending"));
+                                        document.insert("delivery_error".to_owned(), json!(detail));
+                                        atomic_json(inflight, &Value::Object(document.clone()))?;
+                                        transition(inflight, &member.0)?;
+                                    }
+                                }
+                                blocked = Some(detail);
+                                break 'message;
+                            }
+                            Err(Undelivered {
+                                error,
+                                probable_misroute,
+                            }) => {
+                                let detail = error.to_string();
+                                for (index, (member, inflight)) in active.iter().enumerate() {
+                                    let document = &mut documents[index];
+                                    let attempts = member.2.saturating_add(1);
+                                    document
+                                        .insert("delivery_attempts".to_owned(), json!(attempts));
+                                    document.insert(
+                                        "tui_delivery_attempts".to_owned(),
+                                        json!(attempts),
+                                    );
+                                    document.insert("delivery_error".to_owned(), json!(detail));
+                                    document
+                                        .insert("possibly_submitted".to_owned(), Value::Bool(true));
+                                    if probable_misroute {
+                                        document.insert(
+                                            "probable_misroute".to_owned(),
+                                            Value::Bool(true),
+                                        );
+                                    }
+                                    document.insert(
+                                        "delivery_failed_at".to_owned(),
+                                        json!(unix_seconds()),
+                                    );
+                                    strip_paste_stamps(document);
+                                    atomic_json(inflight, &Value::Object(document.clone()))?;
+                                    let failed_path = directories.failed.join(
+                                        member.0.file_name().expect("validated queued filename"),
+                                    );
+                                    transition(inflight, &failed_path)?;
+                                    failed_metadata(&failed_path, "possibly_submitted", &detail)?;
+                                    quarantined.push(member.3.clone());
+                                    batched.insert(member.0.clone());
+                                }
+                            }
+                        }
+                        break 'retry;
+                    }
+                    // Every batch member was set aside untyped: move to the next prompt.
+                    break 'retry;
+                }
+            }
 
             let inflight_path = directories.inflight.join(path.file_name().ok_or_else(|| {
                 AgentError::delivery(format!(
@@ -1496,6 +1877,7 @@ pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized>(
         options,
         message_id,
         (runtime, false),
+        false,
     )
 }
 
@@ -1514,6 +1896,29 @@ pub(crate) fn send_managed<A: AgentApi + ?Sized>(
         options,
         None,
         (&SystemRuntime::default(), true),
+        false,
+    )
+}
+
+/// Send one prompt ahead of everything already queued (#697 send-muse-while-working): the
+/// drain types only this prompt and leaves the backlog pending for the normal paced path.
+pub(crate) fn send_priority_managed<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    text: &str,
+    options: DrainOptions,
+    message_id: Option<&str>,
+) -> AgentResult<QueueResult> {
+    send_identified_with_runtime_binding(
+        client,
+        target,
+        root,
+        text,
+        options,
+        message_id,
+        (&SystemRuntime::default(), true),
+        true,
     )
 }
 
@@ -1533,6 +1938,7 @@ pub(crate) fn send_identified_managed<A: AgentApi + ?Sized>(
         options,
         Some(message_id),
         (&SystemRuntime::default(), true),
+        false,
     )
 }
 
@@ -1553,9 +1959,11 @@ pub(crate) fn send_identified_managed_with_runtime<A: AgentApi + ?Sized>(
         options,
         message_id,
         (runtime, true),
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
@@ -1564,6 +1972,7 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
     options: DrainOptions,
     message_id: Option<&str>,
     runtime_and_binding_mode: (&dyn AgentRuntime, bool),
+    priority: bool,
 ) -> AgentResult<QueueResult> {
     let (runtime, allow_legacy_workspace_binding) = runtime_and_binding_mode;
     bind_queue_with_runtime(root, target, runtime, allow_legacy_workspace_binding)?;
@@ -1585,6 +1994,7 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
         options,
         runtime,
         allow_legacy_workspace_binding,
+        priority.then(|| identifier.clone()),
     )?;
     let filename = format!("{identifier}.json");
     let cancelled_path = root.join(agent_queue::queue::CANCELLED).join(&filename);
@@ -1938,6 +2348,10 @@ enum Delivered {
 
 /// Misroutes tolerated for one message before it is quarantined instead of retried.
 pub const MAX_MISROUTES: usize = 2;
+
+/// Most prompts one working-pane batch types as a single combined prompt (#697
+/// send-muse-while-working).
+const BATCH_MAX: usize = 20;
 
 /// A delivery that failed after typing may have begun; the prompt is quarantined.
 struct Undelivered {
@@ -2939,6 +3353,7 @@ mod tests {
         receipt: Option<crate::submission::SubmissionReceipt>,
         codex_ready: bool,
         readiness_checks: usize,
+        misroute_submit: bool,
     }
 
     struct FakeAgent {
@@ -3070,6 +3485,11 @@ mod tests {
             text: &str,
             runtime: &dyn AgentRuntime,
         ) -> crate::error::Result<Submission> {
+            if self.state.lock().expect("fake state").misroute_submit {
+                return Err(AdapterError::misroute_recovered(
+                    "prompt reached the wrong program",
+                ));
+            }
             match &self.screen {
                 // Mirrors the production override: the composer is driven directly, for the
                 // harness the screen draws.
@@ -3898,12 +4318,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.delivered.len(), 2);
+        // Backlog into a working pane is one combined prompt, not a burst of steers
+        // (#697 send-muse-while-working).
         assert_eq!(
             fake.screen.as_ref().unwrap().state().steered,
             [
                 "codex receives a follow-up",
-                "second follow-up",
-                "third follow-up"
+                "2 queued messages:\n\nsecond follow-up\n\nthird follow-up"
             ]
         );
 
@@ -3924,6 +4345,126 @@ mod tests {
         assert_eq!(
             fake.screen.as_ref().unwrap().state().composer,
             "an operator's draft"
+        );
+    }
+
+    #[test]
+    fn a_working_pane_backlog_is_typed_as_one_combined_prompt() {
+        // #697 send-muse-while-working: queued prompts behind a running turn arrive as a
+        // single readable batch with every sender text intact, not a burst of steers.
+        let directory = TestDirectory::new("working-batch");
+        let (fake, target) =
+            working_claude(crate::submission::fake::FakeScreen::new("claude", true));
+        enqueue(
+            directory.path(),
+            "[from a via agentctl] first note",
+            Some("batch-a"),
+        )
+        .unwrap();
+        enqueue(
+            directory.path(),
+            "[from b via agentctl] second note",
+            Some("batch-b"),
+        )
+        .unwrap();
+        enqueue(directory.path(), "/model", Some("batch-slash")).unwrap();
+        let result = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            while_working(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered, ["batch-a", "batch-b"], "{result:?}");
+        assert_eq!(result.pending, ["batch-slash"], "{result:?}");
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.pastes.len(), 1);
+        assert_eq!(
+            screen.queued,
+            ["2 queued messages:\n\n[from a via agentctl] first note\n\n[from b via agentctl] second note"]
+        );
+        assert_eq!(
+            json_paths(&directory.path().join("processed"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_batched_misroute_is_counted_and_a_second_one_quarantines_every_member() {
+        // #697 send-muse-while-working: a combined paste that reaches the wrong
+        // program must count against every member like a single prompt does, or a
+        // misrouting pane would receive the whole batch again on every drain.
+        let directory = TestDirectory::new("working-batch-misroute");
+        let (fake, target) =
+            working_claude(crate::submission::fake::FakeScreen::new("claude", true));
+        fake.state.lock().expect("fake state").misroute_submit = true;
+        enqueue(directory.path(), "first astray", Some("astray-a")).unwrap();
+        enqueue(directory.path(), "second astray", Some("astray-b")).unwrap();
+        let runtime = FakeRuntime::default();
+        let first = drain_with_runtime(&fake, &target, directory.path(), while_working(), &runtime)
+            .unwrap();
+        assert_eq!(first.quarantined, Vec::<String>::new(), "{first:?}");
+        assert_eq!(first.pending, ["astray-a", "astray-b"], "{first:?}");
+        let pending = json_paths(&directory.path().join("inbox")).unwrap();
+        assert_eq!(pending.len(), 2);
+        for path in &pending {
+            let document = read_json(path).unwrap();
+            assert_eq!(
+                document["misroutes"].as_array().unwrap().len(),
+                1,
+                "{document}"
+            );
+            assert_eq!(document["delivery_state"], "pending", "{document}");
+        }
+        let second =
+            drain_with_runtime(&fake, &target, directory.path(), while_working(), &runtime)
+                .unwrap();
+        assert_eq!(second.quarantined, ["astray-a", "astray-b"], "{second:?}");
+        let failed = json_paths(&directory.path().join("failed")).unwrap();
+        assert_eq!(failed.len(), 2);
+        for path in &failed {
+            let document = read_json(path).unwrap();
+            assert_eq!(
+                document["misroutes"].as_array().unwrap().len(),
+                2,
+                "{document}"
+            );
+            assert_eq!(document["probable_misroute"], true, "{document}");
+        }
+        assert!(json_paths(&directory.path().join("inbox"))
+            .unwrap_or_default()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_priority_send_types_only_its_own_prompt_and_leaves_the_backlog() {
+        // #697 send-muse-while-working: an urgent send jumps the queue instead of first
+        // flushing everything queued ahead of it.
+        let directory = TestDirectory::new("priority-send");
+        let (fake, target) =
+            working_claude(crate::submission::fake::FakeScreen::new("claude", true));
+        enqueue(directory.path(), "older backlog one", Some("back-1")).unwrap();
+        enqueue(directory.path(), "older backlog two", Some("back-2")).unwrap();
+        let result = send_priority_managed(
+            &fake,
+            &target,
+            directory.path(),
+            "urgent: jump the queue",
+            while_working(),
+            Some("urgent-1"),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered, "{result:?}");
+        assert_eq!(result.delivered, ["urgent-1"], "{result:?}");
+        assert_eq!(result.pending, ["back-1", "back-2"], "{result:?}");
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.queued, ["urgent: jump the queue"]);
+        assert_eq!(
+            json_paths(&directory.path().join("inbox")).unwrap().len(),
+            2
         );
     }
 

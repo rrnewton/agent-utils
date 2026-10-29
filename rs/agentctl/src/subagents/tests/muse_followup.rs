@@ -217,6 +217,18 @@ fn an_adopted_working_muse_takes_follow_ups_at_any_footer_mode() {
 }
 
 #[test]
+fn a_revived_adopted_muse_on_the_native_adapter_still_verifies_follow_ups() {
+    // #697 send-muse-while-working: revive re-owns an adopted pane under adapter `herdr`;
+    // a Muse record there must keep the verified-composer path or busy sends wait.
+    let fixture = Fixture::new();
+    let manager = start_busy_muse(&fixture, true);
+    let mut record = manager.load("worker").unwrap();
+    record.adapter = "herdr".to_owned();
+    let client = manager.workspace_client(&record);
+    assert!(agent::AgentApi::verifies_muse_followups(&client));
+}
+
+#[test]
 fn a_paste_never_seen_as_the_exact_editor_is_taken_back_out_and_quarantined() {
     // Idle and running turns alike: no Enter is sent, and the paste is cleared out of the editor
     // rather than left there unsubmitted. The prompt is quarantined as possibly submitted, so it

@@ -222,3 +222,35 @@ fn an_urgent_send_the_harness_takes_at_once_interrupts_nothing() {
         .iter()
         .any(|(_, key)| key == "Escape"));
 }
+
+#[test]
+fn an_urgent_send_jumps_the_backlog_and_leaves_it_pending() {
+    // #697 send-muse-while-working: --urgent types its own prompt first; the queued
+    // backlog stays for the normal paced path instead of flushing ahead of it.
+    let fixture = Fixture::new();
+    let manager = start(&fixture, "codex");
+    show(&fixture, "idle", "• done\n\n» Ask Codex to do anything\n");
+    let queue = manager.queue("worker").unwrap();
+    agent::enqueue(&queue, "backlog one", Some("back-1")).unwrap();
+    agent::enqueue(&queue, "backlog two", Some("back-2")).unwrap();
+    fixture.client.keys_sent.lock().unwrap().clear();
+    let result = manager
+        .send_urgent(
+            "worker",
+            "urgent: switch now",
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                working_timeout: Duration::from_millis(50),
+                ..DrainOptions::default()
+            },
+            Some("urgent-9"),
+            Duration::ZERO,
+        )
+        .unwrap();
+    assert_eq!(result["outcome"], "delivered", "{result}");
+    assert_eq!(result["delivered"], json!(["urgent-9"]), "{result}");
+    assert_eq!(agent::queued_prompts(&queue).unwrap(), ["back-1", "back-2"]);
+    let runs = fixture.client.runs.lock().unwrap().clone();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert!(runs[0].contains("urgent: switch now"), "{runs:?}");
+}
