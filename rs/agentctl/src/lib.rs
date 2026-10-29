@@ -34,6 +34,7 @@ pub(crate) mod prompt_time;
 pub mod registry_layout;
 pub mod restore;
 pub mod sender_header;
+pub mod services;
 pub(crate) mod skill_install;
 pub mod stale_composer;
 pub mod stuck;
@@ -56,6 +57,8 @@ pub const AGENT_USER_GUIDE: &str = include_str!("embedded_agent_userguide.md");
 pub const CHAT_USER_GUIDE: &str = include_str!("embedded_chat_userguide.md");
 /// One-screen setup for the Rust chat subscription service.
 pub const CHAT_QUICKSTART: &str = include_str!("embedded_chat_quickstart.md");
+/// Operator guide for building snapshots and refreshing long-running services.
+pub const SERVICES_USER_GUIDE: &str = include_str!("embedded_services_userguide.md");
 /// Harness skill installed by `agentctl skill install`.
 pub const AGENTCTL_SKILL: &str = include_str!("embedded_agentctl_skill.md");
 /// Operator reference for the coordinator inbox.

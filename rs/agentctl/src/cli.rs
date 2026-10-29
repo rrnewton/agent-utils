@@ -144,6 +144,11 @@ enum Commands {
         after_help = "Example:\n  agentctl --registry ~/project/.agentctl --herdr-bin ~/bin/herdr install-units --dest ~/.config/systemd/user --bridge-unit chat-bridge.service --dry-run\n\nPaths are rendered absolute: --agentctl (default: this executable), --herdr-bin (looked up on PATH\nwhen it is a bare name), and --registry. A file that exists with different contents is refused\nunless --force. The output lists the files and the systemctl commands an operator runs next."
     )]
     InstallUnits(InstallUnits),
+    /// Build compiled snapshots of agentctl and move this registry's long-running services (chat bridges, the agent watcher, headless wrappers run as systemd user units) onto them: list, build, refresh
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services list\n  agentctl services build --from ~/project/agent-utils\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge\n\nA service is a systemd user unit whose one ExecStart= command runs an agentctl binary, directly\nor as the command of a `sh -c` script, with --registry resolving to this registry and the\nsubcommand chat run, watch-agents, or run-headless NAME. Snapshots and refresh records live under\n--root (default $XDG_STATE_HOME/agentctl/services): ROOT/snapshots/COMMIT12/ and\nROOT/refreshes/STAMP-COMMIT12/. `agentctl services userguide` explains the whole flow."
+    )]
+    Services(Services),
     /// Check and repair, every interval: the Herdr server (start herdr_unit), each configured unit (reset-failed and start), each configured timer (restart it; start its service when it still never fires; report, never repair, a service that failed on its last run), slot images (wrkslots image status, on the first pass and every tenth), this boot's restore, and the coordinator's harness. A unit or timer that systemctl could not check, even after one retry 5 seconds later, is a warning: never repaired and never alerted on. Writes health.json and tells the coordinator, at most hourly per problem, about anything it could not repair
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch --once\n  agentctl --registry ~/project/.agentctl watch --interval 60\n\nConfiguration is REGISTRY/restore.json (herdr_unit, units, timers [{unit, max_age_seconds}],\ncoordinator). health.json goes to --state-dir (default $XDG_STATE_HOME/agentctl/watch). With --once,\nexit 0 when every check passed and 1 otherwise. Without it the watch runs until stopped."
@@ -397,6 +402,109 @@ struct Restore {
     /// Startup-readiness deadline for each revived harness in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
+}
+
+#[derive(Args)]
+struct Services {
+    /// Directory holding snapshots (ROOT/snapshots/COMMIT12/) and refresh records
+    /// (ROOT/refreshes/STAMP-COMMIT12/) (default: $XDG_STATE_HOME/agentctl/services, else
+    /// ~/.local/state/agentctl/services)
+    #[arg(long, global = true, value_name = "DIR")]
+    root: Option<PathBuf>,
+    /// systemctl executable, name on PATH or an explicit path; always run with --user
+    #[arg(long, global = true, default_value = "systemctl", value_name = "PATH")]
+    systemctl: PathBuf,
+    /// systemd-run executable, name on PATH or an explicit path; always run with --user
+    #[arg(
+        long,
+        global = true,
+        default_value = "systemd-run",
+        value_name = "PATH"
+    )]
+    systemd_run: PathBuf,
+    #[command(subcommand)]
+    command: ServicesCommand,
+}
+
+#[derive(Subcommand)]
+enum ServicesCommand {
+    /// Show each service of this registry: unit, binary and the commit it reports, the process
+    /// running now, plugin home, outbound helper, state directories, log, and whether it runs the
+    /// newest snapshot. Reads systemd and files; changes nothing
+    #[command(
+        after_help = "Example: agentctl --registry ~/project/.agentctl services list\n\nThe commit is what the binary prints on --version (a build that names no commit shows none).\nThe running process is checked against the unit's binary, so a service still running a binary\nreplaced on disk, or one whose unit changed without a restart, is called out. A service is on the\nnewest snapshot when it runs that snapshot's bin/agentctl and, for a bridge, its AGENTCTL_HOME is\nthe snapshot's plugin home. --json prints schema agentctl-services-list/v1. Exit status 0."
+    )]
+    List(ServicesList),
+    /// Build a snapshot: a normal `cargo build --release --locked` of agentctl and the Slack
+    /// plugin package from a clean `git archive` of one commit, installed into ROOT/snapshots/COMMIT12/
+    /// with the Slack plugin home and its manifest. Prints the snapshot as JSON
+    #[command(
+        after_help = "Examples:\n  agentctl services build --from ~/project/agent-utils\n  agentctl services build --from ~/project/agent-utils --revision origin/main\n\nOnly the committed tree is built: uncommitted edits and untracked files never reach a snapshot.\nThe build runs in a fresh directory under --work-dir with AGENTCTL_SOURCE_COMMIT set, so the\nbinary reports its commit on --version, and no earlier target directory is reused. The snapshot is\nstaged under a dot name, checked (its agentctl must report the commit; plugin discovery must\naccept its plugin home), described in snapshot.json with every file's SHA-256, and renamed into\nplace. A complete snapshot of the same commit is reused (built: false). Snapshots are never\nchanged after they are written. Cargo's progress goes to standard error. Exit status 0 when the\nsnapshot exists; 75 when the build or a check failed (nothing is left in place)."
+    )]
+    Build(ServicesBuild),
+    /// Move each service onto a snapshot, one at a time: back up its unit, write rollback commands,
+    /// restart it on the snapshot's binary with every argument and environment variable kept,
+    /// check its health, and roll it back automatically when the check fails. Prints old -> new
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge --snapshot 1a2b3c4d\n\nOnly the agentctl binary changes, and for a bridge AGENTCTL_HOME, pointed at the snapshot's plugin\nhome so its Slack plugin matches. The outbound helper is part of the bridge's configuration\n(bridge.json) and is left alone; `services list` says when it differs from the snapshot's.\n\nA transient unit (made by systemd-run) is stopped and made again by systemd-run from its own\ndefinition, line for line. First, the same properties start a check unit whose shell only sleeps,\ngiven the planned command as arguments; it must read back as planned, so neither the change nor\nthe rollback can trip on a property systemd-run cannot express. A transient unit with drop-ins is\nrefused. A unit file gets the drop-in DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf, then a daemon\nreload and a restart.\n\nEach service must pass the same health check before it is touched, or it is left alone. After the\nchange, for 30 seconds or more within --health-timeout (a watcher gets at least its pass budget\nplus 90 s), the unit must stay active with the same main process running the new binary, then a\nbridge's `chat health` (run with the new binary) must not say DOWN, must see that process, which must\nrun with the snapshot's AGENTCTL_HOME, and its event stream must have delivered something since\nthe restart; a watcher must complete a pass\n(agent-watch.json checked_at after the restart); a headless wrapper must answer status on its\ncontrol socket from that process. A headless agent in a turn is waited for (--headless-wait), then\nskipped. Watchers go first, bridges next, headless wrappers last; the first failure stops the run.\n\nBefore changing a unit, ROOT/refreshes/STAMP-COMMIT12/ gets UNIT.before (its `systemctl cat`) and\nthe unit's commands in ROLLBACK.sh; report.json follows. Units that are not active are skipped.\nAn interrupt, hangup or termination signal does not stop a service halfway: the one in hand is\nfinished or rolled back, and the rest are not attempted. A SIGKILL can still leave a service\nstopped: run refresh in a terminal or a pane, not under a tool's timeout.\nExit status: 0 every selected service runs the snapshot and passed; 1 a service was refused or\nfailed and was rolled back (later services untouched); 4 a rollback failed too: run ROLLBACK.sh."
+    )]
+    Refresh(ServicesRefresh),
+    /// Print the services guide
+    Userguide,
+}
+
+#[derive(Args)]
+struct ServicesList {
+    /// Print the report as JSON (schema agentctl-services-list/v1) instead of text
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ServicesBuild {
+    /// The Git checkout to build (default: $AGENT_UTILS_CHECKOUT, else the checkout containing the current directory)
+    #[arg(long = "from", value_name = "CHECKOUT")]
+    from: Option<PathBuf>,
+    /// The commit to build, any revision Git accepts (default: HEAD)
+    #[arg(long, default_value = "HEAD", value_name = "REV")]
+    revision: String,
+    /// cargo executable (default: cargo on PATH, else ~/.cargo/bin/cargo)
+    #[arg(long, value_name = "PATH")]
+    cargo: Option<PathBuf>,
+    /// Parent of the temporary source and target directory, which is removed afterwards (default: the system temporary directory)
+    #[arg(long, value_name = "DIR")]
+    work_dir: Option<PathBuf>,
+    /// Keep the temporary directory, for inspecting a failed build
+    #[arg(long)]
+    keep_work: bool,
+}
+
+#[derive(Args)]
+struct ServicesRefresh {
+    /// Refresh only this unit (with or without .service); repeat for several (default: every service of the registry)
+    #[arg(long, value_name = "UNIT")]
+    only: Vec<String>,
+    /// Print the plan and the commands it would run; change and write nothing
+    #[arg(long)]
+    dry_run: bool,
+    /// The snapshot to move onto, by at least 7 characters of its commit (default: the snapshot of the newest commit, by commit time)
+    #[arg(long, value_name = "COMMIT")]
+    snapshot: Option<String>,
+    /// Restart a service that already runs the snapshot
+    #[arg(long)]
+    force: bool,
+    /// Seconds a restarted service has to pass its health check, 10-3600 (default: 120)
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(10..=3600), value_name = "SECONDS")]
+    health_timeout: u64,
+    /// Seconds to wait for a headless agent in a turn to go idle before skipping it, 0-86400 (default: 600)
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
+    headless_wait: u64,
+    /// Where drop-ins for unit-file services go (default: $XDG_CONFIG_HOME/systemd/user, else ~/.config/systemd/user)
+    #[arg(long, value_name = "DIR")]
+    drop_in_dir: Option<PathBuf>,
+    /// Print the report as JSON (schema agentctl-services-refresh/v1) instead of text
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -2251,6 +2359,194 @@ fn tail_record_is_headless(directory: &Path) -> bool {
 }
 
 /// `agentctl tail NAME`: read the agent's event log without touching the agent.
+/// The real option tables for reading a service unit's agentctl arguments: the long options that
+/// take a value at each subcommand path, global options included.
+struct CliOptionTables;
+
+impl crate::services::discover::OptionTables for CliOptionTables {
+    fn canonical(&self, name: &str) -> String {
+        let command = Cli::command();
+        let canonical = command
+            .get_arguments()
+            .find(|argument| {
+                argument
+                    .get_all_aliases()
+                    .is_some_and(|aliases| aliases.contains(&name))
+            })
+            .and_then(|argument| argument.get_long())
+            .unwrap_or(name)
+            .to_owned();
+        canonical
+    }
+
+    fn value_options(&self, path: &[&str]) -> std::collections::HashSet<String> {
+        let mut command = Cli::command();
+        command.build();
+        let mut current = &command;
+        for name in path {
+            match current.find_subcommand(name) {
+                Some(subcommand) => current = subcommand,
+                None => return std::collections::HashSet::new(),
+            }
+        }
+        current
+            .get_arguments()
+            .filter(|argument| argument.get_action().takes_values())
+            .flat_map(|argument| {
+                argument
+                    .get_long()
+                    .into_iter()
+                    .chain(argument.get_all_aliases().unwrap_or_default())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+}
+
+/// The first file named `name` in a directory of PATH.
+fn on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
+    let failed = |message: String| Failure::Agent(AgentError::Delivery(message));
+    let absolute =
+        |path: &Path| std::path::absolute(path).map_err(|error| Failure::Usage(error.to_string()));
+    let root = match &value.root {
+        Some(root) => absolute(root)?,
+        None => crate::services::default_root().ok_or_else(|| {
+            Failure::Usage("neither XDG_STATE_HOME nor HOME is set; pass --root".to_owned())
+        })?,
+    };
+    let host = crate::services::host::SystemHost {
+        systemctl: value.systemctl,
+        systemd_run: value.systemd_run,
+    };
+    let registry = absolute(registry)?;
+    match value.command {
+        ServicesCommand::Userguide => {
+            print!("{}", crate::SERVICES_USER_GUIDE);
+            Ok(0)
+        }
+        ServicesCommand::List(list) => {
+            let (document, text) =
+                crate::services::list(&host, &CliOptionTables, &registry, &root).map_err(failed)?;
+            if list.json {
+                write_json(&document).map_err(Failure::Output)?;
+            } else {
+                write_text(&text).map_err(Failure::Output)?;
+            }
+            Ok(0)
+        }
+        ServicesCommand::Build(build) => {
+            let checkout = match build.from {
+                Some(checkout) => absolute(&checkout)?,
+                None => match std::env::var_os(crate::build_info::CHECKOUT_ENV)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(checkout) => PathBuf::from(checkout),
+                    None => {
+                        let output = std::process::Command::new("git")
+                            .args(["rev-parse", "--show-toplevel"])
+                            .output()
+                            .map_err(|error| failed(format!("cannot run git: {error}")))?;
+                        if !output.status.success() {
+                            return Err(Failure::Usage(
+                                "not inside a Git checkout; pass --from CHECKOUT".to_owned(),
+                            ));
+                        }
+                        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+                    }
+                },
+            };
+            let cargo = match build.cargo {
+                Some(cargo) => cargo,
+                None => on_path("cargo")
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|home| PathBuf::from(home).join(".cargo/bin/cargo"))
+                            .filter(|cargo| cargo.is_file())
+                    })
+                    .ok_or_else(|| {
+                        Failure::Usage(
+                            "cargo is not on PATH or in ~/.cargo/bin; pass --cargo".to_owned(),
+                        )
+                    })?,
+            };
+            let work_dir = match build.work_dir {
+                Some(directory) => absolute(&directory)?,
+                None => std::env::temp_dir(),
+            };
+            let document = crate::services::build(
+                &host,
+                &crate::services::snapshot::BuildOptions {
+                    root,
+                    checkout,
+                    revision: build.revision,
+                    cargo,
+                    work_dir,
+                    keep_work: build.keep_work,
+                },
+            )
+            .map_err(failed)?;
+            write_json(&document).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ServicesCommand::Refresh(refresh) => {
+            let snapshot = crate::services::snapshot::select(&root, refresh.snapshot.as_deref())
+                .map_err(failed)?;
+            let drop_in_dir = match refresh.drop_in_dir {
+                Some(directory) => absolute(&directory)?,
+                None => crate::services::default_drop_in_dir().ok_or_else(|| {
+                    Failure::Usage(
+                        "neither XDG_CONFIG_HOME nor HOME is set; pass --drop-in-dir".to_owned(),
+                    )
+                })?,
+            };
+            let options = crate::services::refresh::RefreshOptions {
+                snapshot,
+                only: refresh.only,
+                dry_run: refresh.dry_run,
+                force: refresh.force,
+                health_timeout: Duration::from_secs(refresh.health_timeout),
+                headless_wait: Duration::from_secs(refresh.headless_wait),
+                refreshes_dir: root.join("refreshes"),
+                drop_in_dir,
+                interrupted: None,
+            };
+            // From here an interrupt, a hangup or a termination request no longer kills the
+            // command between stopping a service and starting or restoring it: the service in
+            // hand is finished (or rolled back) and the rest are not attempted.
+            let mut options = options;
+            if !options.dry_run {
+                let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                for signal in [
+                    signal_hook::consts::SIGINT,
+                    signal_hook::consts::SIGTERM,
+                    signal_hook::consts::SIGHUP,
+                ] {
+                    signal_hook::flag::register(signal, std::sync::Arc::clone(&flag)).map_err(
+                        |error| failed(format!("cannot handle signal {signal}: {error}")),
+                    )?;
+                }
+                options.interrupted = Some(flag);
+            }
+            let report =
+                crate::services::refresh(&host, &CliOptionTables, &registry, &root, &options)
+                    .map_err(failed)?;
+            if refresh.json {
+                write_json(&report.document).map_err(Failure::Output)?;
+            } else {
+                write_text(&report.text).map_err(Failure::Output)?;
+            }
+            Ok(report.exit_code)
+        }
+    }
+}
+
 fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
     let name = &value.agent.name;
     if name.is_empty()
@@ -2632,6 +2928,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             write_json(&queue).map_err(Failure::Output)?;
             return Ok(i32::from(!found));
         }
+        Commands::Services(value) => return run_services(&args.registry, value),
         Commands::InstallUnits(value) => {
             let absolute = |path: &Path| {
                 std::path::absolute(path).map_err(|error| Failure::Usage(error.to_string()))
@@ -3425,6 +3722,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::CodexGoal(_)
         | Commands::Restore(_)
         | Commands::InstallUnits(_)
+        | Commands::Services(_)
         | Commands::Watch(_)
         | Commands::WatchAgents(_)
         | Commands::Hold(_)
