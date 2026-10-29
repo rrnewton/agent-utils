@@ -5,12 +5,15 @@ export { emptyCanon, inTimeOrder, inViewOf, sameMessage, threadOf, timeOf, viewO
 export type { ChannelCanon, ViewCover } from "./canon.ts";
 export {
   allPageAnswersFor,
+  deltaSideState,
   exactCount,
   goneByAbsence,
   heldCopies,
+  heldNow,
   mergeIntoCanon,
   pageCopyNewer,
   refreshFailed,
+  removedSince,
   serverVersions,
   upsertThreadSummary,
 } from "./fold.ts";

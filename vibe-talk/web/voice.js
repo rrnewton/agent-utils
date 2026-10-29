@@ -24107,7 +24107,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
   const cover = channelCanon.views.get(key);
   if (!cover || !sent || cover.newest !== sent) return false;
   const delta = payload.delta;
-  const sideBefore = deltaSideState(payload.thread);
+  const sideBefore = deltaSideState(channelCanon, payload.thread);
   const gone = new Set((delta.deleted || []).map(String));
   if (gone.size) {
     channelCanon.messages = channelCanon.messages.filter((message) => !gone.has(String(message.id)));
@@ -24154,7 +24154,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
   }
   noteReplyGaps(payload, view, false, true, before);
   if (!gone.size && !fresh.length && !readChanged && !(payload.threads || []).length && !removed.size &&
-      (payload.notice || "") === (cover.notice || "") && deltaSideState(payload.thread) === sideBefore) {
+      (payload.notice || "") === (cover.notice || "") && deltaSideState(channelCanon, payload.thread) === sideBefore) {
     unchangedDeltas.add(payload);
   }
   const asOf = staleAsOf(payload);
@@ -24177,18 +24177,6 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
 
 /** The delta pages `foldTimelineDelta` found changed nothing. `#226 page-energy-profile`. */
 const unchangedDeltas = new WeakSet();
-
-/**
- * What a delta can change in the store besides its rows — the counts of replies the store lacks,
- * what Done settled of them, the threads passed over, what the channel is scoped to, whether it has
- * threads, and the summary of thread `thread` it carries — to be compared before and after one is
- * folded.
- */
-function deltaSideState(thread) {
-  const summary = thread ? channelCanon.threads.find((held) => String(held.id) === String(thread.id)) : null;
-  return JSON.stringify([[...channelCanon.replyGaps], [...channelCanon.settledByDone], [...channelCanon.passedOver],
-    channelCanon.scope, channelCanon.hasThreads, summary || null]);
-}
 
 /**
  * A live arrival or an acknowledged send: every view it belongs to has it from now on. Answers
@@ -30660,20 +30648,6 @@ function believeCarried(canon, payload) {
   }
 }
 
-/**
- * Whether message `id` was removed upstream (`noteRemoved`) after the read numbered `number`
- * (`sentNumberOf`) was sent: that read is older than the removal, and never brings the message back.
- * `#316 late-counts-resurrect`.
- *
- * @param {any} canon
- * @param {string} id
- * @param {number} number
- */
-function removedSince(canon, id, number) {
-  const at = canon.removed.get(id);
-  return at !== undefined && at >= number;
-}
-
 /** Whether message `id` of the selected channel is removed upstream, as far as this page knows (`noteRemoved`). */
 function removedUpstream(id) {
   return channelCanon.channel === String(selectedChannelId()) && channelCanon.removed.has(String(id));
@@ -30884,18 +30858,6 @@ function newerPage(canon, view, number, thread = null) {
 function newerPageSpeaksFor(canon, message, number) {
   const thread = answeredThread(message);
   return thread === null ? newerPage(canon, "main", number) : newerPage(canon, "thread", number, thread);
-}
-
-/**
- * The store's copy of each message store `canon` holds now, by id: what a placing read sent now is
- * folded over only if the store still holds it when the read lands (`heldAsSent`), and what tells a
- * page sent now whether a copy with no place in the order of reads is older than it (`copyOlderThan`).
- *
- * @param {any} canon
- * @returns {Map<string, any>}
- */
-function heldNow(canon) {
-  return new Map(canon.messages.map((message) => [String(message.id), message]));
 }
 
 /**

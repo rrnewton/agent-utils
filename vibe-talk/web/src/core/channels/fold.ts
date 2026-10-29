@@ -224,3 +224,34 @@ export function exactCount(record: unknown): number | null {
   return held && typeof held.reply_count === "number" && held.reply_count_exact !== false
     ? held.reply_count : null;
 }
+
+/**
+ * What a delta can change in the store besides its rows — the counts of replies the store lacks,
+ * what Done settled of them, the threads passed over, what the channel is scoped to, whether it has
+ * threads, and the summary of thread `thread` it carries — in store `canon`, to be compared before and
+ * after one is folded.
+ */
+export function deltaSideState(canon: ChannelCanon, thread: { id: unknown } | null | undefined): string {
+  const summary = thread ? canon.threads.find((held) => String(held.id) === String(thread.id)) : null;
+  return JSON.stringify([[...canon.replyGaps], [...canon.settledByDone], [...canon.passedOver],
+    canon.scope, canon.hasThreads, summary || null]);
+}
+
+/**
+ * Whether message `id` was removed upstream (`noteRemoved`) after the read numbered `number`
+ * (`sentNumberOf`) was sent: that read is older than the removal, and never brings the message back.
+ * `#316 late-counts-resurrect`.
+ */
+export function removedSince(canon: ChannelCanon, id: string, number: number): boolean {
+  const at = canon.removed.get(id);
+  return at !== undefined && at >= number;
+}
+
+/**
+ * The store's copy of each message store `canon` holds now, by id: what a placing read sent now is
+ * folded over only if the store still holds it when the read lands (`heldAsSent`), and what tells a
+ * page sent now whether a copy with no place in the order of reads is older than it (`copyOlderThan`).
+ */
+export function heldNow(canon: ChannelCanon): Map<string, Message> {
+  return new Map(canon.messages.map((message) => [String(message.id), message]));
+}

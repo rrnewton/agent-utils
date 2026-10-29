@@ -6347,6 +6347,15 @@ test("`#624 voice-page-modularity`: the server's versions decide copies and abse
   assert.equal(answers({ ...t("c", false, 4), id: "c1" }), false, "a thread the page carries nothing of was answered for");
   canon.scope = "c";
   assert.equal(answers({ ...t("c", false, 4), id: "c1" }), true, "the scope was not read when the question was asked");
+  // A removal as of the read numbered 5 is newer than reads up to 5, and older than read 6.
+  const { removedSince, heldNow, deltaSideState } = CHANNELS;
+  canon.removed.set("9", 5);
+  assert.deepStrictEqual([removedSince(canon, "9", 5), removedSince(canon, "9", 6), removedSince(canon, "8", 0)], [true, false, false]);
+  canon.messages = [{ id: 1 }, { id: "2" }];
+  assert.deepStrictEqual([...heldNow(canon).keys()], ["1", "2"]);
+  const before = deltaSideState(canon, { id: "t" });
+  canon.replyGaps.set("t", 1);
+  assert.notEqual(deltaSideState(canon, { id: "t" }), before, "a changed gap was not part of what a delta can change");
 });
 
 test("`#624 voice-page-modularity`: a view shows the store only from where its own pages reached, from the module alone", () => {
@@ -73948,7 +73957,8 @@ function brokenAlso(script, [find, replace]) {
 /** A negative control: a read of All for Main's counts speaking for every message held when it lands. */
 const COUNTS_SPEAK_FOR_ALL = ["    held: heldNow(channelCanon) };", "    held: null };"];
 /** A negative control: a read bringing back a message removed upstream after it was sent (`#316 late-counts-resurrect`). */
-const REMOVALS_FORGOTTEN = ["  return at !== undefined && at >= number;\n", "  return false;\n"];
+const REMOVALS_FORGOTTEN = { file: "src/core/channels/fold.ts",
+  find: "  return at !== undefined && at >= number;\n", replace: "  return false;\n" };
 
 for (const mode of ["delta", "newest"]) {
   test(`\`#308 live-reply-in-main\`: a thread reply the stream delivers without its thread leaves Main for its thread once Main's ${mode} read behind it is done`, async () => {
@@ -75028,8 +75038,8 @@ for (const placing of ["newest", "delta"]) {
         // if also folded whatever the store has lost since (`heldAsSent`).
         const unremoved = ["  const unremoved = (liveRemovalsSeen.get(channel) || 0) === read.removals;\n",
           "  const unremoved = true;\n"];
-        const folded = await run(landsFirst === "placing" ? brokenScriptEach(unremoved, REMOVALS_FORGOTTEN)
-          : brokenScriptEach(unremoved, REMOVALS_FORGOTTEN, FOLD_OVER_ANY_STORE));
+        const folded = await run(await brokenModule([REMOVALS_FORGOTTEN], landsFirst === "placing"
+          ? brokenScriptEach(unremoved) : brokenScriptEach(unremoved, FOLD_OVER_ANY_STORE)));
         assert.ok(inThread(folded), "the placing delta left the reply gone anyway, so this test cannot see it");
       }
     });
@@ -77481,7 +77491,7 @@ for (const via of ["stream", "poll"]) {
 
     // THE CONTROL, as #308 left it: folded whatever the store has lost since it was sent, and whatever was
     // removed after, the read for the counts puts the message back, and the poll leaves it there.
-    const control = await run(brokenScriptEach(COUNTS_SPEAK_FOR_ALL, REMOVALS_FORGOTTEN));
+    const control = await run(await brokenModule([REMOVALS_FORGOTTEN], brokenScriptEach(COUNTS_SPEAK_FOR_ALL)));
     assert.deepStrictEqual(control.landed.shown, ["200", "201", "203"],
       "the read for the counts left the message out anyway, so this test cannot see it");
     assert.deepStrictEqual(shownIds(control.page), ["200", "201", "203"]);
@@ -77518,7 +77528,7 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
 
   // THE CONTROL: the store never held the reply as the read was sent, nor holds it now, so only the
   // removal says the read is older than it; forgotten, the read puts the reply back in its thread.
-  const control = await run(brokenScript(...REMOVALS_FORGOTTEN));
+  const control = await run(await brokenModule([REMOVALS_FORGOTTEN]));
   assert.ok(savedMessage(control.page, "300"), "the reply stayed gone anyway, so this test cannot see it");
   assert.ok((await threadFromStore(control.page, control.first.id)).includes("300"));
 });
