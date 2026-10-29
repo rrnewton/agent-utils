@@ -400,8 +400,8 @@ impl CacheMeasurement {
 type PlanMounts = std::result::Result<Vec<(i64, PathBuf)>, String>;
 
 fn read_plan_mounts() -> PlanMounts {
-    let text = std::fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|error| error.to_string())?;
+    let text =
+        std::fs::read_to_string("/proc/self/mountinfo").map_err(|error| error.to_string())?;
     let mut mounts = Vec::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -578,9 +578,7 @@ fn plan_cache_candidates(
 
 /// Overlapping globs must not count one directory twice: a
 /// candidate inside an already-selected candidate is dropped.
-fn dedup_cache_roots(
-    mut roots: Vec<(PathBuf, PathBuf, u64)>,
-) -> Vec<(PathBuf, PathBuf, u64)> {
+fn dedup_cache_roots(mut roots: Vec<(PathBuf, PathBuf, u64)>) -> Vec<(PathBuf, PathBuf, u64)> {
     roots.sort_by(|a, b| a.0.cmp(&b.0));
     let mut deduped: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
     for root in roots {
@@ -650,10 +648,7 @@ fn cache_roots(
 /// The Git worktree root containing `path`, with the oracle's
 /// runner and refusal spellings.
 fn repository_root(path: &Path) -> Result<PathBuf> {
-    let stdout = crate::git_storage_state::git_run(
-        path,
-        &["rev-parse", "--show-toplevel"],
-    )?;
+    let stdout = crate::git_storage_state::git_run(path, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(stdout.trim());
     let unsafe_root = root
         .symlink_metadata()
@@ -3580,10 +3575,7 @@ pub(crate) fn parse_audit(
         if slot_type != "agent" || journals.contains_key(slot) {
             continue;
         }
-        unregistered_subjects.insert(
-            (slot_type.clone(), slot.clone()),
-            census_subjects.len(),
-        );
+        unregistered_subjects.insert((slot_type.clone(), slot.clone()), census_subjects.len());
         census_subjects.push(unregistered_cache_subject(
             &cfg,
             &config,
@@ -3686,7 +3678,11 @@ pub(crate) fn parse_audit(
             .map(|index| &census_measurements[*index])
         {
             match measurement.status {
-                "complete" => (json!(measurement.bytes.unwrap_or(0)), Value::Null, "complete"),
+                "complete" => (
+                    json!(measurement.bytes.unwrap_or(0)),
+                    Value::Null,
+                    "complete",
+                ),
                 "partial" => (Value::Null, Value::Null, "partial"),
                 _ => (
                     Value::Null,
