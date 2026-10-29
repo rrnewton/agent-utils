@@ -2183,6 +2183,15 @@ async fn read_or_stand_in(
                 Some(crate::cache_first::LandedAnswer::Refused(error)) => return Err(error),
                 None => {}
             }
+            if !behind_read_wanted(state, channel, request, &held) {
+                drop(read);
+                crate::cache_first::note(crate::cache_first::Source::CacheFirst);
+                return Ok(Answered::StandIn(StoodIn {
+                    held,
+                    why: Some(CACHE_FIRST),
+                    dated: true,
+                }));
+            }
             match state.message_cache.claim_refresh(key.clone()) {
                 Some(claim) => spawn_behind_cache_first(
                     state,
@@ -2308,6 +2317,41 @@ async fn read_or_stand_in(
             }
         }
     }
+}
+
+/// How lately the message cache must have listed a view's newest end, by any read of it (the live
+/// poller's every minute, the relist's, a page's), for a page's read of a live-fed channel answered
+/// from the cache to begin no upstream read behind it ([`behind_read_wanted`]). Inside the page's two
+/// minutes before it calls a copy stale, so such an answer never shows as one.
+pub const LISTED_FRESH: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Whether a page's read answered from the cache first begins an upstream read of its view behind
+/// the answer. Not for a live-fed channel's message view whose newest end the cache listed within
+/// [`LISTED_FRESH`]: the live feed and that listing already brought what the read would, and each
+/// such read spent a call of the provider's rate limit per page poll. `#695 vt-behind-reads`: on the
+/// live Slack instance they were the largest single caller of a 120-a-minute budget the owner's other
+/// tools share. Always for the thread list, whose way back only an upstream list gives, and for a view
+/// no read has listed or none lately. The answer is marked as the cache's either way
+/// (`refresh_failed`), so the page answers for nothing it lacks.
+fn behind_read_wanted(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    held: &crate::cache::sink::StaleTimeline,
+) -> bool {
+    if request.view == crate::threads::TimelineView::Threads
+        || !crate::recent::live_fed(state, channel)
+    {
+        return true;
+    }
+    let Some(checked_ms) = held.checked_ms else {
+        return true;
+    };
+    let now_ms = state
+        .message_cache
+        .cache()
+        .map_or_else(crate::store::now_ms, |cache| cache.now_ms());
+    now_ms.saturating_sub(checked_ms) > i64::try_from(LISTED_FRESH.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Read `read` upstream behind a page answered from the cache first, under `claim`, and keep its

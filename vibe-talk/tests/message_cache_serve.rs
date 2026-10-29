@@ -2175,8 +2175,10 @@ async fn landed(state: &AppState, key: &RefreshKey, after: Option<&str>) {
 #[tokio::test]
 async fn slack_s_all_the_cache_holds_is_answered_at_once_and_the_read_behind_it_lands_for_the_next()
 {
-    let (state, fake, _clock, _dir) = slack_threads_deployment("cache-first-all", true).await;
+    let (state, fake, clock, _dir) = slack_threads_deployment("cache-first-all", true).await;
     state.message_cache.set_serve(true);
+    // Listed longer ago than a poll reads nothing behind (`#695 vt-behind-reads`).
+    clock.advance(vibe_talk::ops::LISTED_FRESH.as_millis() as i64 + SECOND);
     // Every Slack call now takes three seconds: an answer within one never waited on one.
     fake.with(|fixture| fixture.delay = Some(Duration::from_secs(3)));
     let history = fake.calls("conversations.history");
@@ -2445,8 +2447,11 @@ async fn no_page_read_of_a_view_the_cache_holds_waits_on_slack() {
 
 #[tokio::test]
 async fn placing_a_live_message_while_slack_is_limiting_is_answered_from_the_cache_at_once() {
-    let (state, fake, _clock, _dir) = slack_threads_deployment("place-limited", true).await;
+    let (state, fake, clock, _dir) = slack_threads_deployment("place-limited", true).await;
     state.message_cache.set_serve(true);
+    // Listed longer ago than a read from the cache reads nothing behind (`#695
+    // vt-behind-reads`), so the counts read below reads behind and meets the rate limit.
+    clock.advance(vibe_talk::ops::LISTED_FRESH.as_millis() as i64 + SECOND);
     let all = path(SLACK_CH, "/timeline?view=flat&limit=50&reason=place");
     // Slack answering: placement reads it first, as ever, and is answered by it.
     let body = ok(&state, &all, WRITE_TOKEN).await;
@@ -2481,6 +2486,63 @@ async fn placing_a_live_message_while_slack_is_limiting_is_answered_from_the_cac
         "{}",
         capture.text()
     );
+}
+
+// --- `#695 vt-behind-reads`: no Slack read behind a poll the live feed already answers ----------
+
+#[tokio::test]
+async fn a_poll_of_a_live_fed_view_listed_lately_spends_no_slack_call() {
+    // Main and both threads were just read upstream, so the cache listed each one's newest end now.
+    let (state, fake, clock, _dir) = slack_threads_deployment("behind-fresh", true).await;
+    state.message_cache.set_serve(true);
+    let (history, replies) = (
+        fake.calls("conversations.history"),
+        fake.calls("conversations.replies"),
+    );
+    let thread = format!("view=thread&thread_id={}", slack_fake::ts(60, 0));
+    for view in ["view=main", "view=flat", thread.as_str()] {
+        let body = ok(
+            &state,
+            &path(SLACK_CH, &format!("/timeline?{view}&limit=50&reason=poll")),
+            WRITE_TOKEN,
+        )
+        .await;
+        assert!(
+            body["refresh_failed"].is_string(),
+            "still the cache's answer, answering for nothing it lacks: {body}"
+        );
+        assert!(body["as_of"].is_string(), "{body}");
+    }
+    settled(&state).await;
+    assert_eq!(
+        (
+            fake.calls("conversations.history"),
+            fake.calls("conversations.replies")
+        ),
+        (history, replies),
+        "no read behind a poll of a view the live feed and a listing just brought"
+    );
+
+    // The thread list's way back is Slack's own: it is still read behind.
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=threads&limit=50&reason=poll"),
+        WRITE_TOKEN,
+    )
+    .await;
+    quiet(&state, &threads_key(50)).await;
+    assert_eq!(fake.calls("conversations.history"), history + 1);
+
+    // Past the window, a poll reads behind its answer again.
+    clock.advance(vibe_talk::ops::LISTED_FRESH.as_millis() as i64 + SECOND);
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50&reason=poll"),
+        WRITE_TOKEN,
+    )
+    .await;
+    quiet(&state, &newest_key(SLACK_CH, TimelineView::Main, 50)).await;
+    assert_eq!(fake.calls("conversations.history"), history + 2);
 }
 
 /// A server voice that answers at once.
