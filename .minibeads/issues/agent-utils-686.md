@@ -1,12 +1,12 @@
 ---
 title: 'agent-turnover: one named agent, a lineage of sessions, and a deterministic handoff-and-replace command'
-status: open
+status: in_progress
 priority: 2
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-10-29T13:20:59.460112161+00:00
-updated_at: 2026-10-29T13:20:59.460112161+00:00
+updated_at: 2026-10-29T13:58:48.127744705+00:00
 ---
 
 # Description
