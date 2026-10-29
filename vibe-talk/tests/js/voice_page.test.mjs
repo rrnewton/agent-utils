@@ -4818,9 +4818,9 @@ test("`#624 voice-page-modularity`: every page here runs the scripts the shell l
  * What `newPage` takes in place of a script, for a negative control of code that moved out of
  * voice.js but is still exercised through the whole page.
  */
-async function brokenModule(overlays) {
+async function brokenModule(overlays, script = SCRIPT) {
   const built = await legacyPrelude(loadTool("esbuild"), WEB, { minify: false, overlays });
-  return { prelude: new vm.Script(built.code, { filename: "prelude.js" }), script: SCRIPT };
+  return { prelude: new vm.Script(built.code, { filename: "prelude.js" }), script };
 }
 
 /**
@@ -6284,6 +6284,69 @@ test("`#624 voice-page-modularity`: the channel store's rules hold from the modu
   assert.equal(sameMessage({ id: "1", content: "x" }, { id: "1", content: "x" }), true);
   assert.equal(sameMessage({ content: "x", id: "1" }, { id: "1", content: "x" }), false, "fields in another order are another copy");
   assert.equal(sameMessage(undefined, undefined), false, "nothing held is never the arriving copy");
+});
+
+test("`#624 voice-page-modularity`: folding a page into a store, from the module alone: a newest page's window, older pages, removals below it", () => {
+  const { emptyCanon, mergeIntoCanon, upsertThreadSummary, heldCopies } = CHANNELS;
+  const at = (s) => `2026-10-01T00:00:${String(s).padStart(2, "0")}Z`;
+  const m = (id, s) => ({ id, timestamp: at(s), content: `m${id}` });
+  const canon = emptyCanon("c");
+  canon.messages = [m("1", 1), m("2", 2), m("3", 3), m("4", 4)];
+  const kept = canon.messages[2];
+  // A newest page reaching back to 3 that says there is more: 4 is gone upstream; 1 and 2 are below it.
+  mergeIntoCanon(canon, "messages", [m("3", 3), m("5", 5)], false, true, () => true);
+  assert.deepStrictEqual(canon.messages.map((x) => x.id), ["1", "2", "3", "5"]);
+  assert.equal(canon.messages[2], kept, "a copy held word for word did not keep the store's object");
+  // ...but a message removed upstream below the window goes with the next newest page.
+  canon.removed.set("1", 9);
+  mergeIntoCanon(canon, "messages", [m("3", 3), m("5", 5)], false, true, () => true);
+  assert.deepStrictEqual(canon.messages.map((x) => x.id), ["2", "3", "5"]);
+  // An older page only adds; a newest page with nothing more answers for everything of its view.
+  mergeIntoCanon(canon, "messages", [m("0", 0)], true, true, () => true);
+  assert.deepStrictEqual(canon.messages.map((x) => x.id), ["0", "2", "3", "5"]);
+  mergeIntoCanon(canon, "messages", [m("5", 5)], false, false, (x) => x.id !== "2");
+  assert.deepStrictEqual(canon.messages.map((x) => x.id), ["2", "5"], "rows of another view were taken, or rows of this one kept");
+  // A copy that lost its upstream address keeps the held one's.
+  canon.messages = [{ ...m("7", 7), upstream_url: "https://example.com/7" }];
+  mergeIntoCanon(canon, "messages", [{ ...m("7", 7), content: "edited" }], false, false, () => true);
+  assert.deepStrictEqual([canon.messages[0].content, canon.messages[0].upstream_url], ["edited", "https://example.com/7"]);
+  assert.deepStrictEqual([...heldCopies(canon, [{ id: "7" }, { id: "8" }]).keys()], ["7"]);
+  // A thread summary replaces the one held by id, in time order.
+  upsertThreadSummary(canon, { id: "t1", updated_at: at(5) });
+  upsertThreadSummary(canon, { id: "t2", updated_at: at(3) });
+  upsertThreadSummary(canon, { id: "t1", updated_at: at(1) });
+  assert.deepStrictEqual(canon.threads.map((t) => t.id), ["t1", "t2"]);
+});
+
+test("`#624 voice-page-modularity`: the server's versions decide copies and absences, from the module alone", () => {
+  const { serverVersions, pageCopyNewer, goneByAbsence, refreshFailed, exactCount, allPageAnswersFor, emptyCanon } = CHANNELS;
+  assert.equal(serverVersions({}), null, "an older server's page has versions");
+  assert.deepStrictEqual(serverVersions({ observed_ms: 10, settled_below_ms: 5 }), { observed: 10, settledBelow: 5 });
+  assert.deepStrictEqual(serverVersions({ observed_ms: 10 }), { observed: 10, settledBelow: null });
+  const versions = { observed: 100, settledBelow: Date.parse("2026-10-01T00:00:10Z") };
+  assert.equal(pageCopyNewer(undefined, {}, versions), null);
+  assert.equal(pageCopyNewer({ id: "1" }, {}, versions), null, "a copy that does not say how new it is was decided");
+  assert.equal(pageCopyNewer({ observed_ms: 50, edited_timestamp: "2026-10-01T00:00:09Z" },
+    { edited_timestamp: "2026-10-01T00:00:08Z" }, versions), false, "an earlier edit replaced a later one");
+  assert.equal(pageCopyNewer({ observed_ms: 150 }, {}, versions), false);
+  assert.equal(pageCopyNewer({ observed_ms: 50 }, {}, versions), true);
+  assert.equal(goneByAbsence({ observed_ms: 50, timestamp: "2026-10-01T00:00:05Z" }, versions), true);
+  assert.equal(goneByAbsence({ observed_ms: 150, timestamp: "2026-10-01T00:00:05Z" }, versions), false, "a copy newer than the read was taken away");
+  assert.equal(goneByAbsence({ observed_ms: 50, timestamp: "2026-10-01T00:00:15Z" }, versions), false, "the unsettled band was taken as settled");
+  assert.equal(goneByAbsence({ observed_ms: 50 }, { observed: 100, settledBelow: null }), false);
+  assert.deepStrictEqual([refreshFailed({ refresh_failed: "x" }), refreshFailed({}), refreshFailed(null)], [true, false, false]);
+  assert.deepStrictEqual([exactCount({ reply_count: 3 }), exactCount({ reply_count: 3, reply_count_exact: false }), exactCount(null)], [3, null, null]);
+  // All's page answers for every reply of a thread it carries whole, and for the rest from its oldest carried reply up.
+  const canon = emptyCanon("c");
+  const t = (id, root, s, count) => ({ id, timestamp: `2026-10-01T00:00:0${s}Z`,
+    thread: { id, is_root: root, reply_count: count ?? null, reply_count_exact: count !== undefined } });
+  const page = [t("a", true, 1, 1), { ...t("a", false, 2), id: "a1" }, t("b", true, 3, 5), { ...t("b", false, 6), id: "b2" }];
+  const answers = allPageAnswersFor(canon, page, true);
+  assert.equal(answers({ ...t("a", false, 1), id: "a0" }), true, "a thread carried whole was not answered for");
+  assert.equal(answers({ ...t("b", false, 4), id: "b1" }), false, "a reply below the oldest carried was answered for");
+  assert.equal(answers({ ...t("c", false, 4), id: "c1" }), false, "a thread the page carries nothing of was answered for");
+  canon.scope = "c";
+  assert.equal(answers({ ...t("c", false, 4), id: "c1" }), true, "the scope was not read when the question was asked");
 });
 
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
@@ -77697,7 +77760,8 @@ for (const removal of ["after", "before", "tail"]) {
 // read of All (`reason=reply-place`) as a new reply, and counted again on its root.
 
 /** The line of `mergeIntoCanon` that drops a held message removed upstream below a newest page's window, for a negative control. */
-const REMOVED_BELOW_WINDOW = ["timeOf(item, timeField) < edge && !removed(item))", "timeOf(item, timeField) < edge)"];
+const REMOVED_BELOW_WINDOW = { file: "src/core/channels/fold.ts",
+  find: "timeOf(item, timeField) < edge && !removed(item))", replace: "timeOf(item, timeField) < edge)" };
 /** The thread the device's copy of message `id` is in, or null. */
 const threadOfSaved = (page, id) => {
   const saved = savedMessage(page, id);
@@ -77730,7 +77794,7 @@ test("`#328 removal-outside-window`: a message the stream reports removed is tak
   await pollOnce(page);
   assert.deepStrictEqual(shownIds(page), ["201", "203"]);
   // THE CONTROL: below the window every held message stays, removed or not, until a read reaches it.
-  const control = await run(brokenScript(...REMOVED_BELOW_WINDOW));
+  const control = await run(await brokenModule([REMOVED_BELOW_WINDOW]));
   assert.deepStrictEqual(shownIds(control), ["200", "201", "203"], "below the window the removed message went anyway, so this test cannot see it");
   assert.notEqual(savedMessage(control, "200"), null);
 });
@@ -86846,7 +86910,9 @@ const storedText = (page, id) => {
 };
 
 /** `#473`: the page deciding by read-send order alone, as before C7. */
-const SERVER_VERSIONS_IGNORED = ["function serverVersions(payload) {\n", "function serverVersions(payload) {\n  return null;\n"];
+const SERVER_VERSIONS_IGNORED = { file: "src/core/channels/fold.ts",
+  find: "export function serverVersions(payload: unknown): ServerVersions | null {\n",
+  replace: "export function serverVersions(payload: unknown): ServerVersions | null {\n  return null;\n" };
 
 test("`#473 replication-c7-server-versions`: a newest page answered from older state cannot take away a reply observed after its read began, without the interim grace", async () => {
   const run = async (script) => {
@@ -86885,7 +86951,7 @@ test("`#473 replication-c7-server-versions`: a newest page answered from older s
   assert.ok(!shownIds(page).includes(mine.id), "a page begun after the reply that lacks it did not take it away");
 
   // THE CONTROL: deciding by read-send order, with the interim grace gone too, the stale page takes it away.
-  const control = await run(brokenAlso(noGrace, SERVER_VERSIONS_IGNORED));
+  const control = await run(await brokenModule([SERVER_VERSIONS_IGNORED], noGrace));
   assert.ok(!(control.afterEcho && control.afterReread),
     "without the server's versions the reply still survived, so this test cannot see them");
 });
@@ -87062,9 +87128,10 @@ test("`#469 replication-model-tests`: the page agrees with the service under ran
   }
   // THE CONTROL: ordering copies by read-send order alone, some seed breaks a property.
   let caught = null;
+  const ignored = await brokenModule([SERVER_VERSIONS_IGNORED]);
   for (let seed = 1; seed <= 12 && caught === null; seed += 1) {
     try {
-      await pageModelRun(seed, brokenAlso(SCRIPT, SERVER_VERSIONS_IGNORED));
+      await pageModelRun(seed, ignored);
     } catch (error) {
       caught = error.message;
     }

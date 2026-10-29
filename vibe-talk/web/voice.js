@@ -23873,50 +23873,8 @@ function inView(message, view, thread, scope = channelCanon.scope) {
   return inViewOf(message, view, thread, scope);
 }
 
-/**
- * Fold one page into the store. A NEWEST page is the truth for its view from its oldest row up, so
- * a row of that view it does not carry there was deleted upstream and goes; an older page only
- * adds. Rows another view holds are untouched either way. `page` is every row the page carries, where
- * it reaches back to, when `arriving` is only the rows the store takes of it (`pageFold`).
- *
- * `#328 removal-outside-window`. Below the page's oldest row a newest page speaks for nothing, so a row
- * held there stays, except one removed upstream (`noteRemoved`): the stream has said it is gone, and
- * the page, which answers for its view, does not bring it back. It used to stay, shown and saved, until
- * a read reached back to it, which a removed message never does: the README's "the first newest page to
- * land takes the message out" was true only within that page's window.
- */
-function mergeIntoCanon(field, arriving, older, hasMore, belongs, page = arriving) {
-  const timeField = field === "threads" ? "updated_at" : "timestamp";
-  // A message the store holds word for word keeps the store's object, the one the rows on screen
-  // were drawn from, as a delta's does (`foldTimelineDelta`). `#229 desktop-two-column`: a thread's
-  // page carries its root, which Main shows too, and replacing that object would make Main's next
-  // refresh that brings nothing redraw its rows all the same (`rowsAsDrawn` compares objects).
-  if (field === "messages") {
-    const held = heldCopies(arriving);
-    arriving = arriving.map((item) => {
-      const copy = held.get(String(item.id));
-      if (copy && sameMessage(copy, item)) return copy;
-      // `#408 copy-upstream-link`: as in `foldLiveMessage`, a copy formed without the
-      // message's upstream address — a read answered before the server learned its workspace
-      // — does not take a held copy's away.
-      if (copy && copy.upstream_url && !item.upstream_url) return { ...item, upstream_url: copy.upstream_url };
-      return item;
-    });
-  }
-  const incoming = new Set(arriving.map((item) => String(item.id)));
-  const edge = page.length ? timeOf(page[0], timeField) : NaN;
-  const removed = (/** @type {any} */ item) => field === "messages" && channelCanon.removed.has(String(item.id));
-  const kept = channelCanon[field].filter((item) => !incoming.has(String(item.id)) &&
-    (older || !belongs(item) || (hasMore && Number.isFinite(edge) && timeOf(item, timeField) < edge && !removed(item))));
-  channelCanon[field] = inTimeOrder(older ? [...arriving, ...kept] : [...kept, ...arriving], timeField);
-}
-
-/** A thread's summary, from a thread page or a live reply, replacing the one held by id. */
-function upsertThreadSummary(summary) {
-  const id = String(summary.id);
-  channelCanon.threads = inTimeOrder(
-    [...channelCanon.threads.filter((held) => String(held.id) !== id), summary], "updated_at");
-}
+// `mergeIntoCanon` and `upsertThreadSummary` are web/src/core/channels's, and take the store they
+// fold into (`#624 voice-page-modularity`).
 
 /** Record what one page proved about its view's coverage. `lower` of two floors: null is "unknown". */
 function coverView(arriving, older, hasMore, notice, view = channelView, thread = selectedThreadId) {
@@ -24002,7 +23960,7 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   if (view !== "thread") channelCanon.scope = payload.thread ? String(payload.thread.id) : null;
   // A channel that is one thread has no other thread to show beside it. `#229 desktop-two-column`.
   if (channelCanon.scope !== scopeWas) Promise.resolve().then(renderColumns);
-  const before = view === "threads" ? new Map() : heldCopies(payload.messages || []);
+  const before = view === "threads" ? new Map() : heldCopies(channelCanon, payload.messages || []);
   const fold = pageFold(channelCanon, payload, held);
   // `#611 timeline-read-failures`. A page the server answered from its own copy, the chat service
   // having failed or kept it waiting, adds and updates rows and answers for nothing it lacks: the
@@ -24014,16 +23972,16 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   if (view === "threads") {
     // `#614 timeline-read-failures`: a thread list from the server's own copy answers for no card
     // it lacks either.
-    mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => !failed);
+    mergeIntoCanon(channelCanon, "threads", payload.threads || [], older, hasMore, () => !failed);
   } else {
-    const inPage = view === "flat" ? allPageAnswersFor(payload.messages || [], Boolean(payload.notice))
+    const inPage = view === "flat" ? allPageAnswersFor(channelCanon, payload.messages || [], Boolean(payload.notice))
       : (message) => inView(message, view, thread);
-    mergeIntoCanon("messages", taken, older, hasMore,
+    mergeIntoCanon(channelCanon, "messages", taken, older, hasMore,
       (message) => !failed && fold.answers(message) && inPage(message), payload.messages || []);
     // What it took stands where it was sent (`copyOrder`).
     orderCopiesRead(taken, sentNumberOf(payload));
   }
-  if (payload.thread) upsertThreadSummary(payload.thread);
+  if (payload.thread) upsertThreadSummary(channelCanon, payload.thread);
   if (view !== "thread") channelCanon.hasThreads = payload.has_threads === true;
   if (!failed || !covered) {
     coverView(view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore, payload.notice || "",
@@ -24152,137 +24110,6 @@ function pageFold(canon, payload, held) {
 }
 
 /**
- * `#473 replication-c7-server-versions`. How new a page of the server's is, on the server's clock: when
- * its read began (`observed_ms`), and on a newest page the provider time below which its absence of a
- * message proves the message gone (`settled_below_ms`). Null from an older server, which says neither:
- * the page then orders copies by when it sent its reads (`copyOrder`), as before.
- *
- * @param {any} payload
- * @returns {{observed: number, settledBelow: number | null} | null}
- */
-function serverVersions(payload) {
-  if (!payload || typeof payload.observed_ms !== "number") return null;
-  return {
-    observed: payload.observed_ms,
-    settledBelow: typeof payload.settled_below_ms === "number" ? payload.settled_below_ms : null,
-  };
-}
-
-/**
- * `#473`. Whether a page whose versions are `versions` takes its copy of a message, `offered`, over the
- * store's, `held`: true when the store holds none; by edit time where both say one (an earlier edit
- * never replaces a later one, however late it was seen); otherwise by the server's observation of each,
- * the page's being when its read began. Null where the store's copy does not say how new it is (saved
- * by an older build, or put together by one): the caller decides as before.
- *
- * @param {any} held
- * @param {any} offered
- * @param {{observed: number}} versions
- * @returns {boolean | null}
- */
-function pageCopyNewer(held, offered, versions) {
-  if (!held) return null;
-  if (typeof held.observed_ms !== "number") return null;
-  const heldEdit = held.edited_timestamp ? Date.parse(held.edited_timestamp) : NaN;
-  const offeredEdit = offered.edited_timestamp ? Date.parse(offered.edited_timestamp) : NaN;
-  if (Number.isFinite(heldEdit) && Number.isFinite(offeredEdit) && heldEdit !== offeredEdit) {
-    return offeredEdit > heldEdit;
-  }
-  const seen = typeof offered.observed_ms === "number" ? offered.observed_ms : versions.observed;
-  return seen >= held.observed_ms;
-}
-
-/**
- * `#473`. Whether a page whose versions are `versions`, which does not carry the store's copy `held` of a
- * message, says the message is gone: only a newest page (one that says where its proven stretch ends),
- * only for a copy the server observed before the page's read began, and only for a message created
- * below that stretch. A copy observed after the read began — the reply just sent, a message the stream
- * delivered — is newer than the page; one created in the unsettled band may simply not be listed yet.
- * Null where the store's copy does not say how new it is: the caller decides as before.
- *
- * @param {any} held
- * @param {{observed: number, settledBelow: number | null}} versions
- * @returns {boolean | null}
- */
-function goneByAbsence(held, versions) {
-  if (typeof held.observed_ms !== "number") return null;
-  if (versions.settledBelow === null) return false;
-  const created = timeOf(held, "timestamp");
-  return held.observed_ms < versions.observed && Number.isFinite(created) && created < versions.settledBelow;
-}
-
-/**
- * Which held messages a newest page of All answers for, `messages` being the page's and `bounded`
- * whether it carries a notice: `mergeIntoCanon` drops one of those that the page does not carry, as
- * deleted upstream. `#222 unread-replies`.
- *
- * NOT EVERY REPLY ITS WINDOW SPANS. Slack's All is Main's page with the replies of at most ten of
- * its threads, those with the latest activity, and the newest fifty of each, and when that leaves
- * anything out the page's notice says so. A thread outside those ten has nothing on the page, though
- * its replies are as new as the rows around them, and dropping the ones held — from an earlier page
- * of All, the thread's own read — took an unread answer out of the count on its root: the chip went,
- * and Hide read hid the root, after nothing more than a look at All.
- *
- * So a page answers for EVERY reply of a thread whose root it carries when it says nothing of
- * leaving anything out — a backend whose All is the whole channel by time carries every reply posted
- * since the root, and Slack's carries every reply of each root when it reads them all — or when it
- * carries as many replies as that root says the thread has, none included: then a reply held and not
- * carried was deleted upstream, and goes (it used to stay counted as unread, and keep its root, until
- * the thread was read). Otherwise it answers for a thread's replies from the oldest one it carries
- * up, and for none of a thread it carries nothing of. Every other message — a root, a message in no
- * thread, a reply in the one thread a channel is — is answered for as before. What this still keeps
- * that was dropped before is, on a backend whose All is the whole channel by time, a reply deleted
- * upstream of a thread whose root is older than the page, until the thread is read.
- *
- * @param {any[]} messages
- * @param {boolean} bounded
- * @returns {(message: any) => boolean}
- */
-function allPageAnswersFor(messages, bounded) {
-  /** @type {Map<string, number>} by thread id, the time of the oldest reply the page carries */
-  const oldest = new Map();
-  /** @type {Map<string, number>} by thread id, how many of its replies the page carries */
-  const carried = new Map();
-  /** @type {Map<string, number | null>} the threads whose root the page carries, to the count it gives */
-  const roots = new Map();
-  for (const message of messages) {
-    const id = threadOf(message);
-    if (!id) continue;
-    if (message.thread.is_root === true) {
-      roots.set(id, message.thread.reply_count === 0 ? 0 : exactCount(message.thread));
-      continue;
-    }
-    carried.set(id, (carried.get(id) || 0) + 1);
-    const at = timeOf(message, "timestamp");
-    const known = oldest.get(id);
-    oldest.set(id, known === undefined || at < known ? at : known);
-  }
-  /** @type {Set<string>} the threads every reply of which the page answers for */
-  const whole = new Set();
-  for (const [id, count] of roots) {
-    if (!bounded || (count !== null && (carried.get(id) || 0) >= count)) whole.add(id);
-  }
-  return (message) => {
-    const id = threadOf(message);
-    if (!id || message.thread.is_root === true || id === channelCanon.scope || whole.has(id)) return true;
-    const from = oldest.get(id);
-    return from !== undefined && !(timeOf(message, "timestamp") < from);
-  };
-}
-
-/** The store's copies of `messages`, by id, for those it holds. One walk over the store. */
-function heldCopies(messages) {
-  const wanted = new Set(messages.map((message) => String(message.id)));
-  /** @type {Map<string, any>} */
-  const found = new Map();
-  if (wanted.size === 0) return found;
-  for (const held of channelCanon.messages) {
-    if (wanted.has(String(held.id))) found.set(String(held.id), held);
-  }
-  return found;
-}
-
-/**
  * When the server says it could not bring this page up to date: the instant it is complete up to,
  * as a time, if that is old enough to say so — or null, which means now. `#203 incremental-refresh`.
  * A bridge serving a snapshot it failed to refresh sends `as_of`; a page that took it for a fresh
@@ -24294,18 +24121,6 @@ function staleAsOf(payload) {
   // having failed or kept it waiting, is as old as that copy, however recent.
   if (refreshFailed(payload)) return Number.isFinite(asOf) ? Math.min(asOf, Date.now()) : Date.now();
   return Number.isFinite(asOf) && Date.now() - asOf > STALE_AS_OF_MS ? asOf : null;
-}
-
-/**
- * Whether the server says it could not read the chat service for this page and answered from its own
- * copy instead (`refresh_failed`, `#611 timeline-read-failures`). Its rows are added and updated as any
- * page's are, but it answers for nothing it lacks and moves no cover, cursor or full read
- * (`foldTimelinePage`); the pill says "Refresh failed · showing messages from …", quietly, over them.
- *
- * @param {any} payload
- */
-function refreshFailed(payload) {
-  return Boolean(payload) && typeof payload.refresh_failed === "string";
 }
 
 /**
@@ -24349,7 +24164,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
   // Never a message removed upstream after it was sent (`removedSince`, `#316 late-counts-resurrect`).
   const number = sentNumberOf(payload);
   const unfiltered = (payload.messages || []).filter((message) => !removedSince(channelCanon, String(message.id), number));
-  const before = heldCopies(unfiltered);
+  const before = heldCopies(channelCanon, unfiltered);
   // `#408 copy-upstream-link`: as in `foldLiveMessage`, a copy formed without the message's
   // upstream address does not take a held copy's away. Before anything compares or orders
   // them, so the copy that is kept is the copy that is counted.
@@ -24370,10 +24185,10 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
   for (const message of arriving) channelCanon.unplaced.delete(String(message.id));
   believeCarried(channelCanon, payload);
   const readChanged = foldReadState(payload, view);
-  for (const summary of payload.threads || []) upsertThreadSummary(summary);
+  for (const summary of payload.threads || []) upsertThreadSummary(channelCanon, summary);
   const removed = new Set((delta.removed_threads || []).map(String));
   if (removed.size) channelCanon.threads = channelCanon.threads.filter((held) => !removed.has(String(held.id)));
-  if (payload.thread) upsertThreadSummary(payload.thread);
+  if (payload.thread) upsertThreadSummary(channelCanon, payload.thread);
   for (const summary of [...(payload.threads || []), payload.thread]) {
     if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
   }
@@ -24512,7 +24327,7 @@ function foldLiveMessage(message, live = false, replayed = false, read = null) {
   const summary = thread && channelCanon.threads.find((candidate) => String(candidate.id) === thread);
   if (summary && timeOf(kept, "timestamp") > timeOf(summary, "updated_at")) {
     const count = withReply(summary);
-    upsertThreadSummary({ ...summary, updated_at: kept.timestamp, ...(count === null ? {} : { reply_count: count }) });
+    upsertThreadSummary(channelCanon, { ...summary, updated_at: kept.timestamp, ...(count === null ? {} : { reply_count: count }) });
   }
   const root = fresh
     ? channelCanon.messages.find((candidate) => threadOf(candidate) === thread && candidate.thread.is_root === true)
@@ -25461,7 +25276,7 @@ function openChannelView() {
   // record goes into it when the store has none: the heading has its name before any read.
   const summary = opening.summary;
   if (summary && !channelCanon.threads.some((held) => String(held.id) === String(summary.id))) {
-    upsertThreadSummary(summary);
+    upsertThreadSummary(channelCanon, summary);
   }
   // `#304 back-gesture-in-app`. A thread reopened has an entry to go back through, as one entered has.
   scheduleBackSync();
@@ -28019,12 +27834,6 @@ function rootThreadOf(message, tally) {
     ? String(record.id) : null;
 }
 
-/** A record's or a summary's reply count when it says the count is exact, or null. */
-function exactCount(record) {
-  return record && typeof record.reply_count === "number" && record.reply_count_exact !== false
-    ? record.reply_count : null;
-}
-
 /**
  * The most replies thread `id`, headed by `message`, is reported to have, by an exact count: the
  * summary's or the root's record's, whichever is higher, because either may be the older — a summary
@@ -28570,7 +28379,7 @@ function noteReplyGaps(payload, view, older, delta, before) {
     if (count === null) continue;
     const summary = summaries.get(id);
     if (summary && exactCount(summary) !== count) {
-      upsertThreadSummary({ ...summary, reply_count: count, reply_count_exact: true });
+      upsertThreadSummary(channelCanon, { ...summary, reply_count: count, reply_count_exact: true });
     }
     const short = shortfall(id, count);
     const allNewest = view === "flat" && !older && !delta;
