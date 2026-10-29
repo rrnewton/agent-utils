@@ -2233,6 +2233,20 @@ fn run_history(registry: &Path, value: &History) -> Result<i32, Failure> {
     Ok(i32::from(!found))
 }
 
+/// Whether an agent's record says it is headless, so an event log can still
+/// appear. Anything else — an interactive mode, a foreign adoption, or a
+/// record that cannot be read — will never write one.
+fn tail_record_is_headless(directory: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(directory.join("agent.json")) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    record["adapter"].as_str() == Some(crate::headless::ADAPTER)
+        && record["mode"].as_str() != Some("interactive")
+}
+
 /// `agentctl tail NAME`: read the agent's event log without touching the agent.
 fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
     let name = &value.agent.name;
@@ -2255,11 +2269,20 @@ fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
         )));
     }
     let events = crate::headless::events::directory(&directory);
-    if !events.is_dir() && !value.follow {
-        return Err(Failure::Usage(format!(
-            "agent {name:?} has no event log ({}); only headless agents write one",
-            events.display()
-        )));
+    if !events.is_dir() {
+        // --follow must refuse the same agents plain tail refuses: an
+        // interactive or foreign agent will never write an event log, so
+        // following one polls forever in silence (a stray `tail -f` tab
+        // against a coordinator, 2026-10-29). Only a headless record may
+        // be followed before its first event exists.
+        if value.follow && tail_record_is_headless(&directory) {
+            eprintln!("agentctl tail: waiting for {name}'s first event (no event log yet)");
+        } else {
+            return Err(Failure::Usage(format!(
+                "agent {name:?} has no event log ({}); only headless agents write one",
+                events.display()
+            )));
+        }
     }
     let terminal = io::stdout().is_terminal();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
@@ -4015,6 +4038,33 @@ mod tests {
     use super::*;
     use crate::agent;
     use clap::CommandFactory;
+
+    #[test]
+    fn tail_follow_refuses_agents_that_will_never_write_an_event_log() {
+        // `tail -f` on an interactive or foreign agent used to poll a
+        // nonexistent log forever (2026-10-29); only a headless record may
+        // be followed before its first event exists.
+        let directory =
+            std::env::temp_dir().join(format!("agentctl-tail-record-{}", std::process::id()));
+        let write = |record: &str| {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("agent.json"), record).unwrap();
+        };
+        write(r#"{"adapter":"herdr-pane","mode":"interactive"}"#);
+        assert!(!tail_record_is_headless(&directory));
+        write(r#"{"adapter":"herdr-foreign","mode":"interactive"}"#);
+        assert!(!tail_record_is_headless(&directory));
+        write(r#"{"adapter":"herdr-foreign"}"#);
+        assert!(!tail_record_is_headless(&directory));
+        write(r#"{"adapter":"harness-wrapper","mode":"interactive"}"#);
+        assert!(!tail_record_is_headless(&directory));
+        write(r#"{"adapter":"harness-wrapper","mode":"headless"}"#);
+        assert!(tail_record_is_headless(&directory));
+        write("not json");
+        assert!(!tail_record_is_headless(&directory));
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(!tail_record_is_headless(&directory));
+    }
 
     #[test]
     fn a_send_into_a_harness_queue_says_so_and_names_the_backlog() {
