@@ -5051,6 +5051,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "unpushed",
             "write-handoff",
             "parse-archive",
+            "parse-audit",
             "parse-handoff",
             "parse-hold",
             "parse-holds",

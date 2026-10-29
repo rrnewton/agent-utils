@@ -309,6 +309,7 @@
         "py/wrkslots/tests/test_adopt_write_rust.py",
         "py/wrkslots/tests/test_agentctl_liveness_probe.py",
         "py/wrkslots/tests/test_archive_state_rust.py",
+        "py/wrkslots/tests/test_audit_state_rust.py",
         "py/wrkslots/tests/test_cache_plan_budget.py",
         "py/wrkslots/tests/test_census_binding_deadline.py",
         "py/wrkslots/tests/test_census_cost.py",

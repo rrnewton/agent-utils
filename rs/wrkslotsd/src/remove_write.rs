@@ -386,7 +386,7 @@ fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<b
     }
 }
 
-fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
+pub(crate) fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot establish the current working directory: {error}"))?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);

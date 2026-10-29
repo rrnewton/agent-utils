@@ -204,7 +204,7 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
     }
 }
 
-fn identity_from_value(value: &Value) -> Option<Identity> {
+pub(crate) fn identity_from_value(value: &Value) -> Option<Identity> {
     let raw = value.as_object()?;
     Some(Identity {
         pid: raw.get("pid")?.as_i64()?,
