@@ -29,6 +29,8 @@ declare const savedTimelineOf: LegacyImports["savedTimelineOf"];
 declare const deltaSideState: LegacyImports["deltaSideState"];
 declare const heldNow: LegacyImports["heldNow"];
 declare const removedSince: LegacyImports["removedSince"];
+declare const allReachesThread: LegacyImports["allReachesThread"];
+declare const noteReplyGapsIn: LegacyImports["noteReplyGapsIn"];
 declare const allPageAnswersFor: LegacyImports["allPageAnswersFor"];
 declare const exactCount: LegacyImports["exactCount"];
 declare const goneByAbsence: LegacyImports["goneByAbsence"];

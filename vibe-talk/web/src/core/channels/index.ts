@@ -21,3 +21,5 @@ export type { ServerVersions } from "./fold.ts";
 export { coverViewOf, projectionOf } from "./views.ts";
 export { restoreCanon, savedTimelineOf } from "./saved.ts";
 export type { SavedCover, SavedTimeline } from "./saved.ts";
+export { allReachesThread, noteReplyGapsIn } from "./replies.ts";
+export type { GapPage } from "./replies.ts";

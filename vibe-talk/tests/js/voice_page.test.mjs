@@ -6420,6 +6420,39 @@ test("`#624 voice-page-modularity`: a channel's store saved and restored, from t
   assert.deepStrictEqual([older.replyGaps.size, older.settledByDone.size, older.views.has("flat"), older.views.has("main")], [0, 0, false, true]);
 });
 
+test("`#624 voice-page-modularity`: the replies a store lacks for being old, by thread, from the module alone", () => {
+  const { emptyCanon, noteReplyGapsIn, allReachesThread } = CHANNELS;
+  const at = (s) => `2026-10-01T00:00:${String(s).padStart(2, "0")}Z`;
+  const root = (id, s, count) => ({ id: `r${id}`, timestamp: at(s), thread: { id, is_root: true, reply_count: count, reply_count_exact: true } });
+  const reply = (id, n, s) => ({ id: `${id}-${n}`, timestamp: at(s), thread: { id, is_root: false, reply_count: null, reply_count_exact: false } });
+  const canon = emptyCanon("c");
+  let asked = 0;
+  const readAll = () => { asked += 1; };
+  // A thread's own newest page with its count sets the gap: its count less the replies held.
+  canon.messages = [root("t", 1, 5), reply("t", 1, 2), reply("t", 2, 3)];
+  noteReplyGapsIn(canon, { messages: [], thread: { id: "t", reply_count: 5, reply_count_exact: true } }, "thread", false, false, new Map(), readAll);
+  assert.equal(canon.replyGaps.get("t"), 3);
+  // A step back that brings one more reply lowers it by one.
+  canon.messages.push(reply("t", 3, 1));
+  noteReplyGapsIn(canon, { messages: [reply("t", 3, 1)] }, "thread", true, false, new Map(), readAll);
+  assert.equal(canon.replyGaps.get("t"), 2);
+  // Main's newest page, with no read of All: no gap is set for a thread it is first to name, and All is read behind it.
+  canon.messages.push(root("u", 6, 4));
+  noteReplyGapsIn(canon, { messages: [root("u", 6, 4)] }, "main", false, false, new Map(), readAll);
+  assert.deepStrictEqual([canon.replyGaps.has("u"), asked], [false, 1]);
+  // A scoped channel, or the thread list, says nothing of gaps.
+  canon.scope = "u";
+  noteReplyGapsIn(canon, { messages: [root("u", 6, 4)] }, "main", false, false, new Map(), readAll);
+  assert.equal(asked, 1, "a scoped channel asked for All");
+  canon.scope = null;
+  // All's cover reaches a thread whose root is no older than its floor, or All is the whole channel.
+  assert.equal(allReachesThread(canon, "u", null), false, "All reached a thread with no read of All");
+  canon.views.set("flat", { floor: Date.parse(at(4)), more: true, notice: "", top: null, dense: null, at: 0, live: true, cursor: null });
+  assert.deepStrictEqual([allReachesThread(canon, "u", null), allReachesThread(canon, "t", null)], [true, false]);
+  canon.views.get("flat").more = false;
+  assert.equal(allReachesThread(canon, "t", null), true);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
