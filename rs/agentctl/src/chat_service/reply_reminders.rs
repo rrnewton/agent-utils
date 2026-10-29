@@ -344,9 +344,7 @@ impl ClaudeIdleSource for ClaudeAgents {
             // to show no running turn, is its answer. An unknown kind cannot be asked.
             return Ok(
                 match info.agent.as_deref().and_then(crate::harness::adapter) {
-                    Some(_) if matches!(info.status.as_str(), "idle" | "done") => {
-                        ClaudeState::Idle
-                    }
+                    Some(_) if matches!(info.status.as_str(), "idle" | "done") => ClaudeState::Idle,
                     Some(_) => ClaudeState::Busy(info.status.clone()),
                     None => ClaudeState::NotClaude,
                 },
@@ -1128,10 +1126,7 @@ sends that reply once the pane shows it",
                 false
             }
             Err(error) => {
-                self.failed(
-                    "asking the coordinator's harness whether it is idle",
-                    error,
-                );
+                self.failed("asking the coordinator's harness whether it is idle", error);
                 self.claude_wait = Some(wait);
                 self.period.end();
                 false

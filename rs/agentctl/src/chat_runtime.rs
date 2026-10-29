@@ -3308,8 +3308,7 @@ pub trait ReplyTransport {
         let _ = submission;
         Err(OutboundFailure {
             code: "top_level_unsupported".to_owned(),
-            detail: "this transport cannot post a reply at the top level of a channel"
-                .to_owned(),
+            detail: "this transport cannot post a reply at the top level of a channel".to_owned(),
             outcome: OutboundOutcome::NotApplied,
             retryable: false,
         })
@@ -11102,8 +11101,8 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         reply.validate(key, ordinal)?;
         // The reservation is bookkeeping for the breaker; a reply that will never be sent
         // must not hold its thread's window open.
-        let _ =
-            self.complete_reply_reservation_locked(&request_snapshot.message, &reply.send_request_id);
+        let _ = self
+            .complete_reply_reservation_locked(&request_snapshot.message, &reply.send_request_id);
         write_document(&self.reply_path(key, ordinal), &reply)?;
         let mut request = self.read_request(key)?;
         if request.next_send_ordinal == ordinal {
@@ -20840,8 +20839,7 @@ Lines between will be sent to the user as a chat message. Use the same two lines
             .set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some("maybe typed"))
             .expect("mark uncertain");
         let target = FakeDelivery::default();
-        *target.queue_state.lock().expect("queue state lock") =
-            Some(QueueMessageState::Processed);
+        *target.queue_state.lock().expect("queue state lock") = Some(QueueMessageState::Processed);
         // Within the bound nothing changes, however the queue answers.
         assert!(matches!(
             deliver_request_with(&state, &target, key, DrainOptions::default())
@@ -20872,11 +20870,9 @@ Lines between will be sent to the user as a chat message. Use the same two lines
         let key = &admission.new_request_keys[0];
         backdate_uncertain(&state, key);
         let target = FakeDelivery::default();
-        *target.queue_state.lock().expect("queue state lock") =
-            Some(QueueMessageState::Pending);
+        *target.queue_state.lock().expect("queue state lock") = Some(QueueMessageState::Pending);
         assert!(matches!(
-            deliver_request_with(&state, &target, key, DrainOptions::default())
-                .expect("resolve"),
+            deliver_request_with(&state, &target, key, DrainOptions::default()).expect("resolve"),
             CoordinatorDeliveryResult::Pending(_)
         ));
         let record = state.read_request(key).expect("request");
@@ -20917,11 +20913,9 @@ Lines between will be sent to the user as a chat message. Use the same two lines
             .expect("capture reply");
         backdate_uncertain(&state, key);
         let target = FakeDelivery::default();
-        *target.queue_state.lock().expect("queue state lock") =
-            Some(QueueMessageState::Failed);
+        *target.queue_state.lock().expect("queue state lock") = Some(QueueMessageState::Failed);
         assert!(matches!(
-            deliver_request_with(&state, &target, key, DrainOptions::default())
-                .expect("resolve"),
+            deliver_request_with(&state, &target, key, DrainOptions::default()).expect("resolve"),
             CoordinatorDeliveryResult::Delivered
         ));
         let record = state.read_request(key).expect("request");
@@ -20941,17 +20935,18 @@ Lines between will be sent to the user as a chat message. Use the same two lines
         let key = &admission.new_request_keys[0];
         backdate_uncertain(&state, key);
         let target = FakeDelivery::default();
-        *target.queue_state.lock().expect("queue state lock") =
-            Some(QueueMessageState::Failed);
+        *target.queue_state.lock().expect("queue state lock") = Some(QueueMessageState::Failed);
         assert!(matches!(
-            deliver_request_with(&state, &target, key, DrainOptions::default())
-                .expect("resolve"),
+            deliver_request_with(&state, &target, key, DrainOptions::default()).expect("resolve"),
             CoordinatorDeliveryResult::Uncertain(_)
         ));
         let record = state.read_request(key).expect("request");
         assert_eq!(record.phase, RequestPhase::DeliveryUncertain);
         assert!(record.uncertain_reported_at_millis.is_some());
-        assert_eq!(record.reply_count, 1, "the report is the request's one reply");
+        assert_eq!(
+            record.reply_count, 1,
+            "the report is the request's one reply"
+        );
         let reply = state.read_reply(key, 1).expect("report reply");
         assert!(reply.body.contains("could not confirm"), "{}", reply.body);
         // A later pass does not report it a second time.
