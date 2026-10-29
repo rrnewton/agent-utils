@@ -518,6 +518,78 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Relocate the exact ownerless agent cache tree (writer; fixture registries only until cutover)
+    RecoverOwnerlessAgentCache {
+        /// Apply instead of planning
+        #[arg(long = "apply")]
+        apply_mode: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID (required with --apply)
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Recover one bounded batch of private ownerless validation checkouts (writer; fixture registries only until cutover)
+    RecoverOwnerlessValidateBatch {
+        /// Project-relative private ownerless validation checkout (repeatable)
+        #[arg(long = "checkout", value_name = "PATH")]
+        checkouts: Vec<String>,
+        /// Absolute frozen validation checkout (repeatable)
+        #[arg(long = "frozen-validate-checkout", value_name = "PATH")]
+        frozen_validate_checkouts: Vec<String>,
+        /// Aligned terminal validation record (repeatable)
+        #[arg(long = "completed-record", value_name = "PATH")]
+        completed_records: Vec<String>,
+        /// Aligned source repository (repeatable)
+        #[arg(long = "repository", value_name = "PATH")]
+        repositories: Vec<String>,
+        /// Proof manifest aligned with each checkout (repeatable)
+        #[arg(long = "validation-proof-manifest", value_name = "PATH")]
+        validation_proof_manifests: Vec<String>,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Classify retained validation checkouts without removing them (writer; fixture registries only until cutover)
+    ClassifyOwnerlessValidateBatch {
+        /// Project-relative private ownerless validation checkout (repeatable)
+        #[arg(long = "checkout", value_name = "PATH")]
+        checkouts: Vec<String>,
+        /// Absolute frozen validation checkout (repeatable)
+        #[arg(long = "frozen-validate-checkout", value_name = "PATH")]
+        frozen_validate_checkouts: Vec<String>,
+        /// Aligned terminal validation record (repeatable)
+        #[arg(long = "completed-record", value_name = "PATH")]
+        completed_records: Vec<String>,
+        /// Aligned source repository (repeatable)
+        #[arg(long = "repository", value_name = "PATH")]
+        repositories: Vec<String>,
+        /// Proof manifest aligned with each checkout (repeatable)
+        #[arg(long = "validation-proof-manifest", value_name = "PATH")]
+        validation_proof_manifests: Vec<String>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Create linked worktrees and register a slot (writer; fixture registries only until cutover)
     Create {
         /// New slot name
@@ -1411,6 +1483,99 @@ pub fn run() -> u8 {
                 apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverOwnerlessAgentCache {
+            apply_mode,
+            coordinator_authorized,
+            coordinator_pid,
+            root,
+            machine,
+        } => {
+            match crate::recover_cache_write::recover_ownerless_agent_cache(
+                root.as_deref(),
+                machine.as_deref(),
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::RecoverOwnerlessValidateBatch {
+            checkouts,
+            frozen_validate_checkouts,
+            completed_records,
+            repositories,
+            validation_proof_manifests,
+            coordinator_authorized,
+            coordinator_pid,
+            root,
+            machine,
+        } => {
+            match crate::recover_cache_write::recover_ownerless_validate_batch(
+                root.as_deref(),
+                machine.as_deref(),
+                &checkouts,
+                &frozen_validate_checkouts,
+                &completed_records,
+                &repositories,
+                &validation_proof_manifests,
+                coordinator_authorized,
+                coordinator_pid,
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            }
+        }
+        Command::ClassifyOwnerlessValidateBatch {
+            checkouts,
+            frozen_validate_checkouts,
+            completed_records,
+            repositories,
+            validation_proof_manifests,
+            root,
+            machine,
+        } => {
+            match crate::recover_cache_write::classify_ownerless_validate_batch(
+                root.as_deref(),
+                machine.as_deref(),
+                &checkouts,
+                &frozen_validate_checkouts,
+                &completed_records,
+                &repositories,
+                &validation_proof_manifests,
             ) {
                 Ok(value) => {
                     println!(
