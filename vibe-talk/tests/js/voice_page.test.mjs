@@ -6654,6 +6654,33 @@ test("`#624 voice-page-modularity`: a page folded into a store, from the module 
   assert.deepStrictEqual(seen.map(([what]) => what), ["fold", "read", "gaps"], "a scope that did not change asked for columns");
 });
 
+test("`#624 voice-page-modularity`: what a store holds of every thread's replies, and what their counts say, from the module alone", () => {
+  const { emptyCanon, replyTallyOf, exactReplyCount, tallyRecord, unseenRepliesIn, emptyTally } = CHANNELS;
+  const canon = emptyCanon("c");
+  const root = { id: "r", thread: { id: "t", is_root: true, reply_count: 4, reply_count_exact: true } };
+  const reply = (id) => ({ id, thread: { id: "t", is_root: false } });
+  canon.messages = [root, reply("1"), reply("2")];
+  canon.threads = [{ id: "t", reply_count: 3, reply_count_exact: true, root: { id: "r" } }];
+  canon.dismissed = new Set(["1"]);
+  const tally = replyTallyOf(canon, (message, done) => !done.has(String(message.id)));
+  assert.deepStrictEqual(tally.threads.get("t"), { held: 2, unread: 1 });
+  assert.equal(tally.byRoot.get("r").id, "t");
+  // The highest exact count of summary, the store's record and the one given; a count not said exact is none.
+  assert.equal(exactReplyCount("t", root, tally), 4);
+  assert.equal(exactReplyCount("t", root, tally, { reply_count: 9, reply_count_exact: true }), 9);
+  assert.equal(exactReplyCount("x", null, emptyTally()), null);
+  // Unseen: the count less what is held and what is known old.
+  assert.equal(unseenRepliesIn(canon, "t", root, tally), 2);
+  canon.replyGaps.set("t", 1);
+  assert.equal(unseenRepliesIn(canon, "t", root, tally), 1);
+  // A root whose copy came without a record has its summary's.
+  assert.deepStrictEqual(tallyRecord({ id: "r" }, { ...emptyTally(), byRoot: new Map([["r", { id: "t", reply_count: 3, reply_count_exact: true }]]) }),
+    { id: "t", root_message_id: "r", is_root: true, reply_count: 3, reply_count_exact: true });
+  // A scoped channel's replies are not a thread's.
+  canon.scope = "t";
+  assert.equal(replyTallyOf(canon, () => true).threads.has("t"), false);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

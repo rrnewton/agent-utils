@@ -27379,56 +27379,25 @@ function heldUnansweredRoot(id) {
 // ONLY ON MAIN. In All and in a thread the replies are rows of the list, and speak for themselves.
 
 /**
- * @typedef {object} ReplyTally
- * @property {Map<string, {held: number, unread: number}>} threads each thread's replies the store
- *   holds, by thread id: how many, and how many are unread
- * @property {Map<string, any>} records the thread record of every message the store holds with one,
- *   by message id
- * @property {Map<string, any>} summaries the thread summaries the store holds, by thread id
- * @property {Map<string, any>} byRoot the same summaries, by their root's message id
+ * What the store holds of every thread's replies (web/src/core/channels `ReplyTally`).
+ *
+ * @typedef {import("./src/core/channels/index.ts").ReplyTally} ReplyTally
  */
 
 /**
- * What the store holds of every thread's replies (`ReplyTally`). One walk over the store, for a
- * pass over the rows that asks after every thread on screen.
+ * What the store holds of every thread's replies (web/src/core/channels `replyTallyOf`), unread by
+ * `stillToDo` over the store's read state: nothing for a store that is not the channel on screen, or
+ * a service with no threads. One walk over the store, for a pass over the rows that asks after every
+ * thread on screen.
  *
  * @returns {ReplyTally}
  */
 function replyTally() {
-  /** @type {ReplyTally} */
-  const tally = { threads: new Map(), records: new Map(), summaries: new Map(), byRoot: new Map() };
-  if (!threadingSupported || channelCanon.channel !== String(selectedChannelId())) return tally;
-  for (const message of channelCanon.messages) {
-    const id = threadOf(message);
-    if (!id) continue;
-    tally.records.set(String(message.id), message.thread);
-    if (message.thread.is_root === true || id === channelCanon.scope) continue;
-    const entry = tally.threads.get(id) || { held: 0, unread: 0 };
-    entry.held += 1;
-    if (stillToDo(message, channelCanon.dismissed)) entry.unread += 1;
-    tally.threads.set(id, entry);
-  }
-  for (const summary of channelCanon.threads) {
-    tally.summaries.set(String(summary.id), summary);
-    if (summary.root) tally.byRoot.set(String(summary.root.id), summary);
-  }
-  return tally;
+  if (!threadingSupported || channelCanon.channel !== String(selectedChannelId())) return emptyTally();
+  return replyTallyOf(channelCanon, stillToDo);
 }
 
-/**
- * The thread record the store holds for `message`, by `tally`: `heldThreadRecord`'s answer — the
- * store's copy's, the row's own, or the summary of the thread it starts — without a walk per row.
- */
-function tallyRecord(message, tally) {
-  const id = String(message.id);
-  const record = tally.records.get(id) || (threadOf(message) ? message.thread : null);
-  if (record) return record;
-  const summary = tally.byRoot.get(id);
-  return summary ? {
-    id: String(summary.id), root_message_id: id, is_root: true,
-    reply_count: summary.reply_count, reply_count_exact: summary.reply_count_exact,
-  } : null;
-}
+// `tallyRecord` is web/src/core/channels's (`#624 voice-page-modularity`).
 
 /** The thread `message` heads, when it is a root Main shows and the channel is not that thread, or null. */
 function rootThreadOf(message, tally) {
@@ -27437,33 +27406,14 @@ function rootThreadOf(message, tally) {
     ? String(record.id) : null;
 }
 
-/**
- * The most replies thread `id`, headed by `message`, is reported to have, by an exact count: the
- * summary's or the root's record's, whichever is higher, because either may be the older — a summary
- * from a thread read an hour ago, a root as Main last read it. A read that carries the root puts the
- * summary to its count (`noteReplyGaps`), so a count that dropped — a reply deleted upstream — is the
- * count from the next read of Main or All on. Null when neither is exact (Discord's own threads give
- * an estimate, from which no reply can be inferred).
- */
-function exactReplyCount(id, message, tally, summary = null) {
-  // The store's copy of the root before the row's own, which can be older: a view held since before
-  // the last read (`#222 unread-replies`, a count that dropped kept its old value on the row).
-  const record = message ? tally.records.get(String(message.id)) || message.thread : null;
-  const counts = [tally.summaries.get(id), record, summary].map(exactCount).filter((count) => count !== null);
-  return counts.length ? Math.max(...counts) : null;
-}
+// `exactReplyCount` is web/src/core/channels's (`#624 voice-page-modularity`).
 
 /**
- * How many of thread `id`'s replies were posted since the last read that brought its newest, and
- * are not held: its exact count, less the replies held and the ones it lacks for being old
- * (`noteReplyGaps`). Not one of them is known to be read, so each may be unread. Zero without an
- * exact count. `message` is its root, when held; `summary` one more summary to take a count from.
+ * How many of thread `id`'s replies were posted since the last read that brought its newest, in the
+ * selected channel's store (web/src/core/channels `unseenRepliesIn`).
  */
 function unseenReplies(id, message, tally, summary = null) {
-  const count = exactReplyCount(id, message, tally, summary);
-  if (count === null) return 0;
-  const entry = tally.threads.get(id);
-  return Math.max(0, count - (entry ? entry.held : 0) - (channelCanon.replyGaps.get(id) || 0));
+  return unseenRepliesIn(channelCanon, id, message, tally, summary);
 }
 
 /**

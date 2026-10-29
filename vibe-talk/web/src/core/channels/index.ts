@@ -34,3 +34,5 @@ export type { Removals } from "./removals.ts";
 export { foldLiveIn, namedRecord } from "./live.ts";
 export type { LiveFoldDependencies } from "./live.ts";
 export { answeredThread, newerPage, newerPageSpeaksFor, placeFromPage as placeFromPageIn } from "./placement.ts";
+export { emptyTally, exactReplyCount, replyTallyOf, tallyRecord, unseenRepliesIn } from "./tally.ts";
+export type { ReplyTally } from "./tally.ts";
