@@ -107,6 +107,13 @@ pub trait StreamCancel: Send + Sync {
 pub trait EventStream: Send {
     /// Wait up to `wait` for the next record.
     fn next(&mut self, wait: Duration) -> StreamWait;
+    /// Whether an event record has already arrived and waits to be returned by
+    /// [`Self::next`], without blocking. A rescan pass checks it between listings so that
+    /// live messages never wait behind one. The default, for a stream that cannot tell, is
+    /// `false`.
+    fn event_waiting(&mut self) -> bool {
+        false
+    }
     /// Cancellation authority for a blocked [`Self::next`].
     fn canceller(&self) -> Arc<dyn StreamCancel>;
     /// Stop the stream and release its resources.

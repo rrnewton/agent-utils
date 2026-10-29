@@ -541,6 +541,8 @@ pub struct CliStream {
     _stdin: Option<ChildStdin>,
     receiver: Receiver<Pumped>,
     sender: Sender<Pumped>,
+    /// What [`EventStream::event_waiting`] took off the channel, in order, for `next`.
+    looked: std::collections::VecDeque<Pumped>,
     cancelled: bool,
     proof: PositionProof,
     proven: Option<u64>,
@@ -554,7 +556,11 @@ impl EventStream for CliStream {
         if let Some(position) = self.proven.take() {
             return StreamWait::Record(StreamRecord::Position(position));
         }
-        match self.receiver.recv_timeout(wait) {
+        let received = match self.looked.pop_front() {
+            Some(pumped) => Ok(pumped),
+            None => self.receiver.recv_timeout(wait),
+        };
+        match received {
             Ok(Pumped::Record(record)) => {
                 self.proven = self.proof.stdout(&record);
                 StreamWait::Record(record)
@@ -573,6 +579,15 @@ impl EventStream for CliStream {
                 StreamWait::Closed("stream readers ended".to_owned())
             }
         }
+    }
+
+    fn event_waiting(&mut self) -> bool {
+        while let Ok(pumped) = self.receiver.try_recv() {
+            self.looked.push_back(pumped);
+        }
+        self.looked
+            .iter()
+            .any(|pumped| matches!(pumped, Pumped::Record(StreamRecord::Event { .. })))
     }
 
     fn canceller(&self) -> Arc<dyn StreamCancel> {
@@ -1334,6 +1349,7 @@ impl SlackTransport for CliTransport {
             _stdin: stdin,
             receiver,
             sender,
+            looked: std::collections::VecDeque::new(),
             cancelled: false,
             proof: PositionProof::new(spec, self.options.tail.mode.as_deref()),
             proven: None,

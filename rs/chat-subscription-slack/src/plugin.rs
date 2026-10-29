@@ -76,6 +76,11 @@
 //! and, when it has files, their IDs and the exact command to download each to a temporary path;
 //! a stream message with files gets the same file note.
 //!
+//! A pass runs in the driver loop, so after its first history listing it stops, between
+//! listings and while it waits out a rate limit, as soon as a live stream event is waiting, and
+//! the next pass starts [`rescan::YIELD_RETRY`] later: listing threads and honouring Slack's
+//! rate-limit waits once held live messages for up to a minute (#679 muse-bridge-study).
+//!
 //! A rescued batch's cursor is the cursor before it with `;rescued:<channel>/<ts>` appended, so a
 //! subscription resumed from it resumes the stream where the cursor before it did. Which messages
 //! the stream carried and the rescan delivered, and the one rescued batch not yet acknowledged,
@@ -1299,6 +1304,7 @@ impl SlackDriver {
         &mut self,
         query: &ScanQuery<'_>,
         started: &Instant,
+        yielded: &mut bool,
     ) -> Result<ScanPage, TransportError> {
         let mut retries = 0_usize;
         let mut pending: Option<(TransportError, Duration)> = None;
@@ -1311,9 +1317,7 @@ impl SlackDriver {
                 }
                 let wait_start = Instant::now();
                 while wait_start.elapsed() < delay {
-                    if self.cancel.cancelled.load(Ordering::SeqCst)
-                        || started.elapsed() >= rescan::PASS_BUDGET
-                    {
+                    if self.rescan_stop(started, yielded, true) {
                         return Err(error);
                     }
                     std::thread::sleep(
@@ -1339,6 +1343,27 @@ impl SlackDriver {
         }
     }
 
+    /// Whether a rescan pass must stop starting listings, or stop waiting out a rate limit:
+    /// the subscription was cancelled, the pass used its budget, or a live stream event is
+    /// waiting, which must never wait behind a pass (`yielded` is then set). A pass that ran
+    /// in the driver loop with Slack's rate-limit waits held live messages for up to a minute
+    /// in a channel with many threads (#679 muse-bridge-study).
+    ///
+    /// A pass always makes its first history listing, which is one call and finds what the
+    /// stream never carries, such as a file message; it yields only after that, between
+    /// listings and while it waits out a rate limit (`may_yield`).
+    fn rescan_stop(&mut self, started: &Instant, yielded: &mut bool, may_yield: bool) -> bool {
+        if self.cancel.cancelled.load(Ordering::SeqCst) || started.elapsed() >= rescan::PASS_BUDGET
+        {
+            return true;
+        }
+        if may_yield && self.stream.event_waiting() {
+            *yielded = true;
+            return true;
+        }
+        false
+    }
+
     fn rescan_pass(&mut self, rescan: &mut Rescan, interval: Duration, now: u64) {
         let now_micros = u128::from(now) * 1_000;
         // History is listed over the whole window, so a thread whose root predates the ledger is
@@ -1353,15 +1378,12 @@ impl SlackDriver {
         let mut found = Vec::new();
         let mut failure: Option<TransportError> = None;
         let channels: Vec<String> = self.channels.iter().cloned().collect();
-        let stop = |driver: &Self| {
-            driver.cancel.cancelled.load(Ordering::SeqCst)
-                || started.elapsed() >= rescan::PASS_BUDGET
-        };
+        let mut yielded = false;
         'pass: for channel in &channels {
             let mut due_threads: Vec<(u128, String)> = Vec::new();
             let mut token: Option<String> = None;
             for page in 0..rescan::MAX_HISTORY_PAGES {
-                if stop(self) {
+                if self.rescan_stop(&started, &mut yielded, listings > 0) {
                     break 'pass;
                 }
                 let oldest = micros_ts(listing_floor);
@@ -1371,7 +1393,7 @@ impl SlackDriver {
                     oldest: &oldest,
                     page_token: token.as_deref(),
                 };
-                let listed = match self.scan_listing(&query, &started) {
+                let listed = match self.scan_listing(&query, &started, &mut yielded) {
                     Ok(listed) => listed,
                     Err(error) => {
                         // A rate limit is global: firing more listings only deepens it,
@@ -1450,7 +1472,7 @@ impl SlackDriver {
                 let mut overflowed = false;
                 let mut thread_failed = false;
                 for _ in 0..rescan::MAX_THREAD_PAGES {
-                    if stop(self) {
+                    if self.rescan_stop(&started, &mut yielded, true) {
                         break 'pass;
                     }
                     let query = ScanQuery {
@@ -1459,7 +1481,7 @@ impl SlackDriver {
                         oldest: &oldest,
                         page_token: token.as_deref(),
                     };
-                    let listed = match self.scan_listing(&query, &started) {
+                    let listed = match self.scan_listing(&query, &started, &mut yielded) {
                         Ok(listed) => listed,
                         Err(error) => {
                             // One thread's listing must not abort the pass: what the
@@ -1521,6 +1543,25 @@ impl SlackDriver {
             .queue
             .make_contiguous()
             .sort_by_key(|message| ids::ts_micros(&message.message_ts).unwrap_or(0));
+        if yielded {
+            // A live message arrived: it is handled first, and the pass starts again soon
+            // rather than after a whole interval. What it already queued is delivered.
+            rescan.next_due_millis = now
+                .saturating_add(u64::try_from(rescan::YIELD_RETRY.as_millis()).unwrap_or(u64::MAX));
+            self.diagnostics.log(&format!(
+                "rescan: yielded to a live event after {listings} listings; next pass in {} s",
+                rescan::YIELD_RETRY.as_secs()
+            ));
+            if !found.is_empty() {
+                self.diagnostics.log(&format!(
+                    "rescan: {listings} listings found {} message{} the stream did not carry: {}",
+                    found.len(),
+                    if found.len() == 1 { "" } else { "s" },
+                    found.join(", ")
+                ));
+            }
+            return;
+        }
         match failure {
             Some(error)
                 if matches!(

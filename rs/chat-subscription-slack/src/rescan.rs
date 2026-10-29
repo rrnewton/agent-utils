@@ -67,6 +67,8 @@ pub const MAX_THREAD_PAGES: usize = 2;
 pub const MAX_RESCUES_PER_PASS: usize = 32;
 /// One pass stops starting listings after this long.
 pub const PASS_BUDGET: Duration = Duration::from_secs(60);
+/// The next pass after one that yielded to a live event starts this soon.
+pub const YIELD_RETRY: Duration = Duration::from_secs(15);
 /// The longest wait after consecutive failed passes.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
 /// In-pass retries of one rate-limited listing.
