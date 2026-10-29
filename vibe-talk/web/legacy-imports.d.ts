@@ -15,6 +15,7 @@ declare const speechSegments: LegacyImports["speechSegments"];
 declare const createApi: LegacyImports["createApi"];
 declare const createWebPorts: LegacyImports["createWebPorts"];
 declare const createNavigation: LegacyImports["createNavigation"];
+declare const createCredentials: LegacyImports["createCredentials"];
 declare const SLOW_WORDS: LegacyImports["SLOW_WORDS"];
 declare const isSlowFailure: LegacyImports["isSlowFailure"];
 declare const providerWords: LegacyImports["providerWords"];

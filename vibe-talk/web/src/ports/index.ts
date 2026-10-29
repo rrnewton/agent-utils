@@ -46,3 +46,14 @@ export interface ClockPort {
   setTimeout(run: () => void, ms: number): TimerHandle;
   clearTimeout(handle: TimerHandle): void;
 }
+
+/**
+ * A small string store that outlives the page: the device's (kept across visits) or one window's.
+ * Any call may throw, where the platform refuses storage (private browsing, a full quota, storage
+ * turned off), and a write may also be silently dropped; callers that must know read it back.
+ */
+export interface StoragePort {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}

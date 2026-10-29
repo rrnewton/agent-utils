@@ -24,7 +24,6 @@
 //   belongs to the transcript and the controls.
 
 // The older page at / shared this key, so a browser signed in to either one holds its token here.
-const TOKEN_KEY = "vibe-talk.token";
 
 // `#369 pairing-link`. A pairing link is the app's address with `#pair=CODE`: a single-use code,
 // good for a few minutes, that the server trades once for the write token. The code is a
@@ -62,7 +61,6 @@ function takePairingCode() {
 // option and is deliberately not taken: a token that was revoked in the meantime would produce a
 // refusal loop nobody could see the cause of, and silently reusing a credential the owner cannot
 // see is worse than asking for it once.
-const RENAMED_FROM_KEY = "gent-talk.token";
 const MIC_SETTINGS_KEY = "vibe-talk.voice.mic";
 const WIDTH_KEY = "vibe-talk.voice.width";
 const MSG_SCALE_KEY = "vibe-talk.voice.msg-scale";
@@ -558,7 +556,7 @@ const setState = (name) => {
 // error message leaked the key" from being possible at all.
 function redact(text) {
   let out = String(text);
-  const secrets = [localStorage.getItem(TOKEN_KEY) || "", el("api-token").value || ""];
+  const secrets = [token(), el("api-token").value || ""];
   for (const secret of secrets) {
     // Short strings are not credentials, and blanket-replacing one would mangle ordinary words.
     if (secret.length >= 8) {
@@ -803,20 +801,29 @@ const session = {
 // where it can be read afterwards. It never reaches `teardown()` and never ends a call.
 let recordingBroken = false;
 
-const token = () => localStorage.getItem(TOKEN_KEY) || "";
+/**
+ * The device's API token, on its own handle (web/src/core/settings, `#624 voice-page-modularity`),
+ * kept in the device's storage. Made on first use; a `var` with no initialiser, like `serverApi`.
+ *
+ * @type {import("./src/core/settings/index.ts").Credentials | undefined}
+ */
+var pageCredentials;
+
+/** {@link pageCredentials}, made if it is not yet. */
+function credentialStore() {
+  if (!pageCredentials) pageCredentials = createCredentials(createWebPorts().deviceStorage);
+  return pageCredentials;
+}
+
+/** The token, or "" for none. Throws where the browser refuses storage. */
+const token = () => credentialStore().token();
 
 /**
  * True when this browser has no token under the current key but does have one under the key this
- * page used before the rename. Every read is guarded: a browser with storage disabled throws on
- * `getItem` rather than returning null, and this runs on the sign-in path, so an exception here
- * would replace the sign-in screen with nothing.
+ * page used before the rename. Never throws (`Credentials.signedOutByRename`).
  */
 function signedOutByRename() {
-  try {
-    return !localStorage.getItem(TOKEN_KEY) && !!localStorage.getItem(RENAMED_FROM_KEY);
-  } catch (_error) {
-    return false;
-  }
+  return credentialStore().signedOutByRename();
 }
 
 /**
@@ -58316,10 +58323,10 @@ async function saveToken() {
     // Another credential may not be able to read what this one did.
     forgetMessages();
   }
-  localStorage.setItem(TOKEN_KEY, value);
+  credentialStore().keep(value);
   // Read it back rather than assuming: private browsing and a full quota both make setItem throw
   // or silently do nothing, and "saved" would then be a lie the owner only discovers later.
-  if (localStorage.getItem(TOKEN_KEY) !== value) {
+  if (token() !== value) {
     markSave(SAVE_LABEL, "", false);
     setTokenState(NO_TOKEN_YET);
     showError(
@@ -58508,7 +58515,7 @@ function forgetToken() {
   stopChannelStream();
   stopOutgoingSends();
   forgetMessages();
-  localStorage.removeItem(TOKEN_KEY);
+  credentialStore().forget();
   el("api-token").value = "";
   markSave(SAVE_LABEL, "", false);
   setTokenState(NO_TOKEN_YET);

@@ -160,9 +160,16 @@ test("an error the page throws is reported at the line of its source it was thro
     `the bundle's ${fromBundle.message} maps to line ${found.originalLine + 1}, not ${fromSource.line + 1}`);
 });
 
+/**
+ * The name of voice.js's first top-level constant: a marker for the tests that find a line of the
+ * legacy script in the bundle, taken afresh because `#624 voice-page-modularity` moves what was
+ * once there out into modules.
+ */
+const FIRST_CONST = /^const (\w+) = /m.exec(readWeb("voice.js"))[1];
+
 test("a position in the minified files maps back to the line of the source it came from", () => {
   const probes = [
-    [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "const TOKEN_KEY="],
+    [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", `const ${FIRST_CONST}=`],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "const PAGE_BUILD="],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "function fmtDuration("],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "src/contract/validators.js", "function decodeTagged("],
@@ -199,11 +206,11 @@ test("a copy of the sources changed on purpose builds the same way, and is refus
   const copy = join(scratch, "patched-sources");
   cpSync(WEB, copy, { recursive: true });
   const voice = join(copy, "voice.js");
-  writeFileSync(voice, readFileSync(voice, "utf8").replace("const TOKEN_KEY = ", "const TOKEN_KEY_PATCHED = "));
+  writeFileSync(voice, readFileSync(voice, "utf8").replace(`const ${FIRST_CONST} = `, `const ${FIRST_CONST}_PATCHED = `));
   const out = join(scratch, "patched");
   const patched = await build(out, { web: copy });
   assert.notEqual(patched.page_build, MANIFEST.page_build);
-  assert.match(readFileSync(join(out, relativePath(patched.assets.script.path)), "utf8"), /const TOKEN_KEY_PATCHED=/);
+  assert.match(readFileSync(join(out, relativePath(patched.assets.script.path)), "utf8"), new RegExp(`const ${FIRST_CONST}_PATCHED=`));
   assert.notEqual(patched.inputs["vibe-talk/web/voice.js"], MANIFEST.inputs["vibe-talk/web/voice.js"]);
   assert.throws(() => requireOutside(join(copy, "out"), copy), /inside/);
 });

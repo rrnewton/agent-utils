@@ -1853,6 +1853,8 @@ const SPEECH_PIECES = await moduleForTests("src/core/speech/index.ts");
 const GLYPHS = await moduleForTests("src/foundation/index.ts");
 /** Where the reader is: the selection's one owner (web/src/core/navigation). */
 const NAVIGATION = await moduleForTests("src/core/navigation/index.ts");
+/** The device's settings and, on its own handle, its token (web/src/core/settings). */
+const SETTINGS = await moduleForTests("src/core/settings/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -6095,6 +6097,28 @@ test("`#624 voice-page-modularity`: the bar's picker shows the selection, and a 
   // A channel the picker does not list, as a link can name, chooses none, as a <select> does.
   page.pure("(chooseChannel('9990000000000000009'), 0)");
   assert.deepStrictEqual([page.pure("selectedChannelId()"), page.el("discord-channel").value], ["", ""]);
+});
+
+test("`#624 voice-page-modularity`: the token is kept, read and forgotten on its own handle, and a refusing device says so the way the page relies on", () => {
+  const kept = new Map();
+  const storage = { getItem: (key) => kept.get(key) ?? null, setItem: (key, value) => kept.set(key, value), removeItem: (key) => kept.delete(key) };
+  const credentials = SETTINGS.createCredentials(storage);
+  assert.equal(credentials.token(), "", "no token reads as none");
+  assert.equal(credentials.signedOutByRename(), false);
+  kept.set("gent-talk.token", "old-token-aaaaaaaaaaaa");
+  assert.equal(credentials.signedOutByRename(), true, "a token under the old name is a sign-out by the rename");
+  credentials.keep("write-token-aaaaaaaaaaaaaaaa");
+  assert.deepStrictEqual([credentials.token(), kept.get("vibe-talk.token"), credentials.signedOutByRename()],
+    ["write-token-aaaaaaaaaaaaaaaa", "write-token-aaaaaaaaaaaaaaaa", false]);
+  credentials.forget();
+  assert.deepStrictEqual([credentials.token(), kept.has("vibe-talk.token")], ["", false]);
+  // Storage turned off: reading the token throws, as the page's callers expect; the sign-in path's
+  // question does not.
+  const refused = () => { throw new Error("SecurityError"); };
+  const off = SETTINGS.createCredentials({ getItem: refused, setItem: refused, removeItem: refused });
+  assert.throws(() => off.token(), /SecurityError/);
+  assert.throws(() => off.keep("x"), /SecurityError/);
+  assert.equal(off.signedOutByRename(), false);
 });
 
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
