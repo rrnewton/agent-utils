@@ -138,11 +138,11 @@ pub fn latency(
             .map(|since| format!(" admitted since {}", chat_runtime::utc_timestamp(since)))
             .unwrap_or_default()
     );
-    let _ = writeln!(
-        text,
+    let header = format!(
         "{:<42} {:>5} {:>8} {:>8} {:>8} {:>8}",
         "stage", "n", "p50", "p90", "p99", "max"
     );
+    let _ = writeln!(text, "{header}");
     for stage in &STAGES {
         let values: Vec<u64> = times.iter().filter_map(stage.interval).collect();
         let summarized = summary(values);
@@ -161,11 +161,11 @@ pub fn latency(
     }
     if !times.is_empty() {
         let _ = writeln!(text, "\nnewest first:");
-        let _ = writeln!(
-            text,
+        let header = format!(
             "{:<20} {:<12} {:>8} {:>8} {:>8} {:>8} {:>8}  {}",
             "admitted", "request", "intake", "ack", "deliver", "reply", "total", "phase"
         );
+        let _ = writeln!(text, "{header}");
         for request in times.iter().rev().take(options.last) {
             let _ = writeln!(
                 text,

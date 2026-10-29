@@ -21,6 +21,11 @@ const MAX_LISTED_KEYS: usize = 256;
 const MAX_TARGET_DOCUMENT_BYTES: usize = 1 << 20;
 const MAX_REQUESTED_BY_BYTES: usize = 256;
 
+/// Checks that an agent can be the bridge's target and gives the pane it is in, or why not: see
+/// [`BridgeState::apply_repoint`].
+pub(crate) type ValidateTarget<'a> =
+    dyn Fn(&str, Option<&str>) -> std::result::Result<Option<String>, String> + 'a;
+
 /// One request to point the bridge at another agent, as `chat repoint` records it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -320,7 +325,7 @@ impl BridgeState {
         &self,
         request: &RepointRequest,
         delivery: &dyn CoordinatorDelivery,
-        validate: &dyn Fn(&str, Option<&str>) -> std::result::Result<Option<String>, String>,
+        validate: &ValidateTarget<'_>,
         applied_by: &str,
     ) -> Result<RepointOutcome> {
         let previous = self.config.agent_name.clone();

@@ -9775,7 +9775,7 @@ its drain would type first, so it was not queued",
             };
             queues.push((started, entry.path().join("queue")));
         }
-        queues.sort_by(|left, right| right.0.cmp(&left.0));
+        queues.sort_by_key(|(started, _)| std::cmp::Reverse(*started));
         Ok(Some(queues.into_iter().map(|(_, queue)| queue).collect()))
     }
 
