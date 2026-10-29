@@ -33,6 +33,11 @@ def _git(cwd: Path, *args: str) -> str:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
+            # Deterministic fixture commits: the two fixture clones must
+            # produce identical HEADs, or digests over records naming
+            # them can never agree between the editions.
+            "GIT_AUTHOR_DATE": "2026-10-26T00:00:00Z",
+            "GIT_COMMITTER_DATE": "2026-10-26T00:00:00Z",
         }
     )
     result = subprocess.run(
@@ -202,6 +207,11 @@ def _events(root: Path) -> list[dict[str, object]]:
         event.pop("previous_sha256")
         payload = event.get("payload")
         if isinstance(payload, dict):
+            # A digest of the previous record, whose heartbeat the
+            # transfer refreshes from the wall clock: the two editions
+            # run seconds apart, so the digest itself is not compared.
+            # The record it binds is compared field by field below.
+            payload.pop("previous_record_sha256", None)
             records: list[dict[str, object]] = []
             record = payload.get("record")
             if isinstance(record, dict):
