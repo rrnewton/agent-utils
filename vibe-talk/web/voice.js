@@ -2862,9 +2862,14 @@ let timelineMessages = [];
 let timelineThreads = [];
 const channelContexts = new Map();
 const threadColors = new Map();
-const channelDrafts = new Map();
+/**
+ * What the reader has typed in each message box, by box key, and the device's copy (web/src/core/outbox
+ * `createChannelDrafts`, `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/outbox/index.ts").ChannelDrafts}
+ */
+const channelDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache() });
 let activeComposerKey = "";
-const CHANNEL_DRAFTS_KEY = "vibe-talk.channel-drafts";
 
 // Local send records never enter the provider message list or its read/archive/reply machinery.
 const OUTGOING_KEY = "vibe-talk.outgoing-messages";
@@ -25705,16 +25710,9 @@ function renderColumnLists() {
   renderOutgoingMessages();
 }
 
+/** Write the boxes' drafts to the device (`channelDrafts`); whether it kept them. */
 function saveChannelDrafts() {
-  try {
-    const encoded = JSON.stringify(Object.fromEntries(channelDrafts));
-    if (storedExactly(CHANNEL_DRAFTS_KEY, encoded)) return true;
-    // Saved messages can be fetched again; what the reader typed cannot.
-    dropMessageCache();
-    return storedExactly(CHANNEL_DRAFTS_KEY, encoded);
-  } catch (_error) {
-    return false;
-  }
+  return channelDrafts.save();
 }
 
 function rememberChannelDraft() {
@@ -57714,14 +57712,7 @@ el("undo-send-dismiss").addEventListener("click", () => {
 // `#420 bookmark-clear`.
 el("undo-bookmark").addEventListener("click", undoBookmarkRemoval);
 el("forget-dismissed-sends").addEventListener("click", forgetDismissedSends);
-try {
-  const saved = JSON.parse(deviceStorage().getItem(CHANNEL_DRAFTS_KEY) || "{}");
-  for (const [key, value] of Object.entries(saved || {})) {
-    if (typeof value === "string") channelDrafts.set(key, value);
-  }
-} catch (_error) {
-  // Storage may be absent or contain a interrupted write; composing still works in this page.
-}
+channelDrafts.load();
 for (const view of ["main", "threads", "flat"]) {
   el(`channel-view-${view}`).addEventListener("click", guardQuietly(() => changeChannelView(view)));
 }

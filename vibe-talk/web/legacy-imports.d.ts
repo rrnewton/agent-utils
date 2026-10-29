@@ -20,6 +20,7 @@ declare const outboxRetriesItself: LegacyImports["outboxRetriesItself"];
 declare const entryFromSaved: LegacyImports["entryFromSaved"];
 declare const DISMISSED_SENDS_DAYS: LegacyImports["DISMISSED_SENDS_DAYS"];
 declare const DISMISSED_SENDS_LIMIT: LegacyImports["DISMISSED_SENDS_LIMIT"];
+declare const createChannelDrafts: LegacyImports["createChannelDrafts"];
 declare const createDismissedSends: LegacyImports["createDismissedSends"];
 declare const OWN_POST_GRACE_MS: LegacyImports["OWN_POST_GRACE_MS"];
 declare const createOwnPosts: LegacyImports["createOwnPosts"];

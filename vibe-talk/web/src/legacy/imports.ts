@@ -71,6 +71,7 @@ export {
   DISMISSED_SENDS_DAYS,
   DISMISSED_SENDS_LIMIT,
   OWN_POST_GRACE_MS,
+  createChannelDrafts,
   createDismissedSends,
   createOwnPosts,
   nextRetryAt,

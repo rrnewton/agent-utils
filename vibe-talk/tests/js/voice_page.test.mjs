@@ -6996,6 +6996,43 @@ test("`#624 voice-page-modularity`: an outbox entry read back from the device, f
   assert.equal(savedWire({ text: 3 }), null);
 });
 
+test("`#624 voice-page-modularity`: the message boxes' drafts, saved and taken back, from the module alone", () => {
+  const { createChannelDrafts } = OUTBOX;
+  const saved = new Map();
+  let refuse = 0;
+  let roomMade = 0;
+  const storage = {
+    getItem: (key) => saved.get(key) ?? null,
+    setItem: (key, value) => { if (refuse > 0) refuse -= 1; else saved.set(key, value); },
+    removeItem: (key) => saved.delete(key),
+  };
+  const make = () => createChannelDrafts({ storage, makeRoom: () => { roomMade += 1; } });
+  const drafts = make();
+  drafts.set('["c",null]', "hello");
+  drafts.set('["c","t"]', "in a thread");
+  assert.equal(saved.has("vibe-talk.channel-drafts"), false, "a set wrote to the device before a save");
+  assert.equal(drafts.save(), true);
+  assert.deepStrictEqual(JSON.parse(saved.get("vibe-talk.channel-drafts")), { '["c",null]': "hello", '["c","t"]': "in a thread" });
+  // A full quota: the saved channel rows go once, and a second refusal is reported.
+  drafts.delete('["c","t"]');
+  refuse = 1;
+  assert.equal(drafts.save(), true);
+  assert.equal(roomMade, 1);
+  refuse = 2;
+  drafts.set('["d",null]', "lost");
+  assert.equal(drafts.save(), false);
+  assert.equal(roomMade, 2);
+  // Another page takes back what the device kept; anything not a string is not a draft.
+  saved.set("vibe-talk.channel-drafts", JSON.stringify({ a: "kept", b: 3, c: "" }));
+  const again = make();
+  again.load();
+  assert.deepStrictEqual([again.get("a"), again.get("b"), again.get("c")], ["kept", undefined, ""]);
+  saved.set("vibe-talk.channel-drafts", "{not json");
+  const damaged = make();
+  damaged.load();
+  assert.equal(damaged.get("a"), undefined);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**

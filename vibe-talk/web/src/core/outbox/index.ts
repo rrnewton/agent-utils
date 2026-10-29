@@ -9,3 +9,5 @@ export { OWN_POST_GRACE_MS, createOwnPosts } from "./own.ts";
 export type { OwnPosts, OwnPostsDependencies } from "./own.ts";
 export { outgoingFromSaved, savedWire } from "./saved.ts";
 export type { OutgoingEntry, OutgoingPart, OutgoingWire } from "./saved.ts";
+export { createChannelDrafts } from "./drafts.ts";
+export type { ChannelDrafts, ChannelDraftsDependencies } from "./drafts.ts";
