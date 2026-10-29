@@ -707,15 +707,24 @@ described below. A prompt starts at a row whose text after its indentation is
 wrapped rows continue two or more columns further right. Claude Code draws a
 prompt and its input box after `❯`; Codex draws a prompt after `›`, a prompt it
 holds until a running tool call ends and a hook's notice after `↳`, and its
-input box after `»`. Tool output starts at a row whose text after its
-indentation begins with `⎿`, or is `└` alone or followed by a space, and its
-later rows continue right of that character. Codex draws `└` alone when the
-output's first line is empty. A code fence in tool output neither opens nor
-closes a fence.
+input box after `»`; Muse draws a prompt after `❯`. Tool output starts at a row
+whose text after its indentation begins with `⎿`, or is `└` alone or followed by
+a space, and its later rows continue right of that character. Codex draws `└`
+alone when the output's first line is empty, and Muse draws its tool output
+after `└` too. A code fence in tool output neither opens nor closes a fence.
+
+Each harness starts a message of its own at the left edge with a bullet and a
+space, and the rows after it are indented to line up with the text after the
+bullet: Claude Code's `⏺` or `●`, Codex's `•`, and Muse's `◆`. A reply marker
+right after that bullet counts as a marker alone on its row, so Muse's answer
+`◆ <CHAT_REPLY_017>`, then `  PINEAPPLE` and `  </CHAT_REPLY_017>` indented two
+columns, is one block whose text is `PINEAPPLE`. Muse also draws each tool call
+as such a message, `◆ Ran command · … · ctrl+o`, with its output after `└`, as
+Codex draws `• Ran …`.
 
 Inside an open block these characters are reply text, such as a tree drawn with
 `└`, except on a row that starts a new item: a row whose text starts with a
-prompt character or a bullet (`•`, `⏺` or `●`) left of the column where the
+prompt character or a bullet (`•`, `⏺`, `●` or `◆`) left of the column where the
 block's opening marker starts, or with `⎿` at or left of that column. Claude
 Code's compact view draws a tool call as a row at the margin of the message,
 with no bullet, and its output after `⎿` at the same column. The block then ends
@@ -1221,7 +1230,7 @@ leaving the top of the screen is not reported again while at least 64 characters
 of it are in view, and what is left of it after that is not reported if an
 unopened block under its ID was already reported. The rows of an unopened block
 begin no higher than the last row above its closing line that starts at the left
-edge with a bullet (`•`, `⏺` or `●`) and a space, as the first row of a message
+edge with a bullet (`•`, `⏺`, `●` or `◆`) and a space, as the first row of a message
 does, so while that row is in view, rows of an earlier item are not counted,
 even once the prompt or tool output row that started that item has left the
 screen or reads as Claude Code's copy of a prompt. Two different blocks under

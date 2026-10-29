@@ -2816,7 +2816,7 @@ impl RouteCache {
     }
 
     fn patterns(&self) -> Result<Vec<String>, ChatServiceError> {
-        const PREFIX: &str = r"^[^\S\r\n]*(?:[•⏺●][ \t]+)?</(?:GCHAT|CHAT)_REPLY_";
+        const PREFIX: &str = r"^[^\S\r\n]*(?:[•⏺●◆][ \t]+)?</(?:GCHAT|CHAT)_REPLY_";
         const SUFFIX: &str = r">[^\S\r\n]*$";
         let mut patterns = Vec::new();
         let mut alternatives = String::new();
@@ -2864,7 +2864,7 @@ impl RouteCache {
 
 fn matched_identifier(line: &str) -> Option<&str> {
     let stripped = line.trim();
-    let stripped = ["• ", "⏺ ", "● "]
+    let stripped = ["• ", "⏺ ", "● ", "◆ "]
         .into_iter()
         .find_map(|prefix| stripped.strip_prefix(prefix))
         .unwrap_or(stripped)

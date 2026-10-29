@@ -14875,10 +14875,12 @@ fn read_under_fence(fence: &mut Option<(char, usize)>, row: &str) -> bool {
     false
 }
 
+/// Split a row into its text, the margin its text starts at, and whether it carried a native
+/// reply bullet: Codex's `•`, Claude Code's `⏺` or `●`, or Muse's `◆`, each followed by a space.
 fn undecorate(line: &str) -> (String, String, bool) {
     let stripped = line.trim_start_matches([' ', '\t']);
     let mut margin = line[..line.len() - stripped.len()].to_owned();
-    let (stripped, decorated) = ["• ", "⏺ ", "● "]
+    let (stripped, decorated) = ["• ", "⏺ ", "● ", "◆ "]
         .into_iter()
         .find_map(|prefix| stripped.strip_prefix(prefix).map(|value| (value, true)))
         .unwrap_or((stripped, false));
@@ -32368,6 +32370,98 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 "[codex coordinator] real answer 5",
             ]
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_muse_reply_block_after_its_response_glyph_is_posted() {
+        // Read from a live Muse coordinator's pane on 2026-10-28 (reply ID renumbered): Muse
+        // echoes the request prompt as a user turn after `❯`, its continuation rows indented two
+        // columns, and draws its answer after the `◆ ` response glyph at the left edge, the body
+        // and the closing marker indented two columns, as Codex does after `•`. Its next message
+        // and its tool calls (`◆ Ran command · … · ctrl+o`, output after `└`) start with the same
+        // glyph.
+        let open = |name: &str| {
+            let root = temporary(name);
+            let state = BridgeState::initialize(&root, config()).expect("initialize state");
+            let key = admitted(&state, 1).remove(0);
+            let prompt = prompted(&state, &key);
+            assert!(prompt.contains("Include the line <CHAT_REPLY_001> at the beginning"));
+            (root, state, key, prompt)
+        };
+        let (root, state, key, prompt) = open("muse-reply-glyph");
+        let echo = prompt
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 0 {
+                    format!("❯ {line}\n")
+                } else if line.is_empty() {
+                    "\n".to_owned()
+                } else {
+                    format!("  {line}\n")
+                }
+            })
+            .collect::<String>();
+        let earlier = rows(&[
+            "  No build is running.",
+            "",
+            "◆ Ran command · Approve three source-only dispositions · ✓ · 0.3s · ctrl+o",
+            "└ {",
+            "    \"error\": \"pane did not become idle/done within 0s; last status=working\",",
+            "",
+        ]);
+        let reply = rows(&["◆ <CHAT_REPLY_001>", "  PINEAPPLE", "  </CHAT_REPLY_001>"]);
+        let after = rows(&[
+            "◆ Ran command · Check the bridge · ✓ · 0.4s · ctrl+o",
+            "└ ok",
+        ]);
+        // The prompt echo alone, which quotes both marker lines, posts nothing.
+        let capture = state
+            .capture_snapshot(&format!("{earlier}{echo}\n"))
+            .expect("capture the echo");
+        assert!(capture.replies.is_empty(), "{:?}", capture.replies);
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        // The answer below it is posted, and only once.
+        let answered = format!("{earlier}{echo}\n{reply}");
+        let capture = state
+            .capture_snapshot(&answered)
+            .expect("capture the answer");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])], "{answered}");
+        assert!(capture.refused.is_empty(), "{capture:?}");
+        let again = state
+            .capture_snapshot(&format!("{answered}\n{after}"))
+            .expect("capture the answer again");
+        assert!(again.replies.is_empty(), "{:?}", again.replies);
+        assert_eq!(
+            state
+                .read_request(&key)
+                .expect("request")
+                .next_reply_ordinal,
+            2
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+        // Muse's next message, a tool call at the left edge, does not keep it from being posted.
+        let (root, state, key, _) = open("muse-reply-glyph-after");
+        let capture = state
+            .capture_snapshot(&format!("{earlier}{echo}\n{reply}\n{after}"))
+            .expect("capture the answer with a later tool call");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // A tool call between the two marker lines ends the block unsent, as in every harness.
+        let (root, state, _key, _) = open("muse-reply-tool-call");
+        let split = rows(&[
+            "◆ <CHAT_REPLY_001>",
+            "  PINEAPPLE",
+            "◆ Ran command · Check the bridge · ✓ · 0.4s · ctrl+o",
+            "└ ok",
+            "  </CHAT_REPLY_001>",
+        ]);
+        let capture = state
+            .capture_snapshot(&split)
+            .expect("capture the split block");
+        assert!(capture.replies.is_empty(), "{:?}", capture.replies);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
