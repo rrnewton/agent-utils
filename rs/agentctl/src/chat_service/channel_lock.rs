@@ -1,6 +1,6 @@
 //! One bridge per channel (#677 chat-bridge-repoint). `chat run` holds a host-wide lock for each
 //! configured channel for as long as it runs, so a second `chat run` on a channel that already has
-//! a live bridge is refused at startup, whichever state directory, registry or build it uses. Two
+//! a live bridge is refused at startup, whichever state directory or registry it uses. Two
 //! bridges on one channel each admit every message, and the second can type them into another
 //! agent's pane.
 //!
@@ -47,8 +47,8 @@ fn lock_directory_from(configured: Option<OsString>) -> PathBuf {
 }
 
 /// `/run/user/UID/agentctl/chat-channels` when the user's runtime directory exists, else
-/// `/tmp/agentctl-UID/chat-channels`. Both depend only on the user ID, never on the environment,
-/// so a service unit and a shell agree on them.
+/// `/tmp/agentctl-UID/chat-channels`. Neither depends on the environment, so a service unit and a
+/// shell of the same user agree on them while the runtime directory exists.
 #[must_use]
 pub fn default_lock_directory() -> PathBuf {
     // SAFETY: geteuid takes no arguments and cannot fail.

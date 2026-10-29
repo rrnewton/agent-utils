@@ -2629,17 +2629,26 @@ With no `chat run` holding the state, the command applies the request itself. A
 service whose wake socket cannot be reached (outbound replies off) applies it at
 its next reconciliation, and a service that starts with a request waiting
 applies it before it types anything. A newer request supersedes one not yet
-applied.
+applied. The request is applied even when the previous agent's pane is gone:
+the service applies it before each pass starts, after any failure, and, if it
+had to exit, as soon as it starts again, before it checks its agent. The reply
+reminder and stale-composer settings stay as `chat run` chose them at startup.
+A `chat run` built before `chat repoint` existed ignores the request:
+the command exits 75 after `--wait`, `chat health` reports the repoint as not
+applied, and the service applies it once it is restarted on a newer build.
 
 Applying a request settles each request whose prompt has not reached the
-previous agent, by asking that agent's queue:
+previous agent. A request whose delivery never started moves to the new agent
+at once, even when the previous agent is no longer registered. For the others
+the previous agent's queue decides, a headless agent's included:
 
 - a prompt it never held, or set aside untyped, moves to the new agent;
 - a prompt waiting in its inbox is taken back out and moves too;
 - a prompt it has already typed is recorded as delivered and stays there;
-- a prompt it may be typing, or whose queue entry cannot be read, is marked
-  `delivery_uncertain` and listed. It is never typed into the new agent as
-  well, and never dropped: settle it as any uncertain request.
+- a prompt it may be typing, or whose queue entry cannot be read (as when the
+  previous agent's registration is gone), is marked `delivery_uncertain` and
+  listed. It is never typed into the new agent as well, and never dropped:
+  settle it as any uncertain request.
 
 Requests the previous agent received and has not answered are listed as
 `awaiting_reply_from_previous`. The bridge no longer reads that agent's screen,
@@ -2654,8 +2663,10 @@ The command prints one JSON object: the `request`, whether a service was
 running and woken, `applied`, and once applied the `outcome` (`moved`,
 `delivered_to_previous`, `awaiting_reply_from_previous`, `uncertain` with each
 reason, `pane_id`, `applied_by`) and its `summary`. It waits up to `--wait`
-seconds (default 30) for a running service; when that passes it exits 75 and
-the service still applies the request. `chat status` reports the request not
+seconds (default 30) for a running service, and applies the request itself if
+the service exits meanwhile; when the wait passes it exits 75 and the request
+stays recorded for the service, which `chat health` reports until it is
+applied. `chat status` reports the request not
 yet applied and the latest outcome under `repoint`, and `target.json` keeps the
 last 16 outcomes.
 
@@ -2757,7 +2768,8 @@ channel before its provider subscribes and holds it until it exits, so a second
 `chat run` naming a channel that already has a live bridge exits at startup with
 an error such as `channel C0123456789 already has a live bridge (process 4242,
 serving bridge state /home/USER/.local/state/agentctl/project-chat; ...)`,
-whichever state directory, registry or build it uses. Two bridges on one channel
+whichever state directory or registry it uses (a `chat run` built before this
+check takes no lock, so it is neither refused nor detected). Two bridges on one channel
 would each admit every message, and the second could type them into another
 agent's pane. To move a channel's bridge to another agent, repoint the running
 bridge (see "Repointing a running bridge") rather than starting a second one.
@@ -2766,7 +2778,9 @@ or `/tmp/agentctl-UID/chat-channels/` when the user has no runtime directory;
 `AGENTCTL_CHAT_CHANNEL_LOCK_DIR` names another directory, for an isolated
 installation or test. A bridge that exits for any reason, a crash included,
 releases its locks. They are host-local: a bridge for the same channel on
-another host is not detected.
+another host is not detected. The user's runtime directory is removed when the
+user logs out unless lingering is enabled, which a service that outlives the
+login needs anyway.
 
 Slow or briefly failing local tools do not stop `chat run`. A Herdr call that
 fails or times out, or finds Herdr unavailable, ends only the loop that types

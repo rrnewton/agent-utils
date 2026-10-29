@@ -1047,6 +1047,20 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
 ) -> Result<Value, ChatServiceError> {
     let offer_reply_command = settings.offer_reply_command;
     let state = BridgeState::open(state_root)?;
+    // A repoint request waiting since before this start is applied first, so that a bridge whose
+    // agent is gone starts on the agent named to replace it (#677 chat-bridge-repoint). Applying
+    // it needs the runner lease, which this service holds from here until it exits.
+    let _lease = state.acquire_runner_lease()?;
+    let state = match state.pending_repoint()? {
+        Some(_) => {
+            let mut transport = state.outbound_transport()?;
+            match repoint::apply_pending(&state, manager, manager, transport.as_mut(), "service")? {
+                Some((_, Some(next))) => next,
+                _ => state,
+            }
+        }
+        None => state,
+    };
     // A headless coordinator has no screen to read or composer to type into: its requests go to
     // its queue, which its wrapper drains, and it replies only through `chat reply` (#594
     // headless-slack-trial).
@@ -1133,7 +1147,6 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     if !headless {
         let _target = manager.pane_info(&state.config().agent_name)?;
     }
-    let _lease = state.acquire_runner_lease()?;
     // Before the provider subscribes: a second bridge on a channel would admit every message
     // there too (#677 chat-bridge-repoint).
     let _channels = channel_lock::acquire(state_root, state.config())?;
@@ -4007,10 +4020,6 @@ where
     // When `provider-alive` was last touched; see `BridgeState::note_provider_alive`.
     let mut alive_noted: Option<Instant> = None;
     loop {
-        if alive_noted.is_none_or(|at| at.elapsed() >= PROVIDER_ALIVE_INTERVAL) {
-            state.note_provider_alive();
-            alive_noted = Some(Instant::now());
-        }
         if stop.is_stopped() {
             cancel_provider(cancellation)
                 .map_err(|error| ProviderGenerationError::Cleanup(error.to_string()))?;
@@ -4090,6 +4099,14 @@ where
                 ))
             }
         };
+        // Only an item the stream delivered counts: a subscription that opens and fails again
+        // proves nothing about the stream.
+        if !matches!(consumed, chat_runtime::ConsumedItem::End)
+            && alive_noted.is_none_or(|at| at.elapsed() >= PROVIDER_ALIVE_INTERVAL)
+        {
+            state.note_provider_alive();
+            alive_noted = Some(Instant::now());
+        }
         match consumed {
             chat_runtime::ConsumedItem::Heartbeat => {}
             chat_runtime::ConsumedItem::End => return Ok(()),
@@ -4434,16 +4451,26 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let mut backoff = ProviderBackoff::new();
     // The state of the agent the bridge serves now: a repoint replaces it between passes.
     let mut state = state.clone();
-    // A request recorded while no service ran, or before a restart, applies before the first
-    // pass types anything.
-    apply_waiting_repoint(&mut state, manager, stop, transport, &mut reminders);
     let result = loop {
+        // A repoint request applies before the next pass starts, whatever ended the last one: a
+        // pass on an agent whose pane is gone fails at its start, before it can look (#677
+        // chat-bridge-repoint).
+        if stop.repoint.swap(false, Ordering::SeqCst)
+            || state
+                .pending_repoint()
+                .is_ok_and(|request| request.is_some())
+        {
+            *output_wake
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            apply_waiting_repoint(&mut state, manager, stop, transport, &mut reminders);
+        }
         let state = &mut state;
         let started = Instant::now();
         health.pass_started(started);
         // A headless coordinator has no pane for the pane loop to read. The prompts' reply
-        // instructions are chosen at startup, so a coordinator restarted in the other mode needs
-        // `chat run` restarted too.
+        // instructions are chosen at startup and at a repoint, so a coordinator restarted in the
+        // other mode under the same name needs `chat run` restarted too.
         let pass = match manager.is_headless(&state.config().agent_name) {
             Err(error) => Err(error.into()),
             Ok(true) => headless_owner_loop_pass(
@@ -4477,16 +4504,9 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         };
         let result = owner_loop_end(stop, pass);
         let error = match result {
-            // The pass ended for a repoint request: apply it and start the next pass at once,
-            // while the provider and reaction workers keep running (#677 chat-bridge-repoint).
-            Ok(()) if !stop.is_stopped() && stop.repoint_requested() => {
-                stop.repoint.store(false, Ordering::SeqCst);
-                *output_wake
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                apply_waiting_repoint(state, manager, stop, transport, &mut reminders);
-                continue;
-            }
+            // The pass ended for a repoint request: the next round applies it and starts the
+            // next pass at once, while the provider and reaction workers keep running.
+            Ok(()) if !stop.is_stopped() && stop.repoint_requested() => continue,
             Ok(()) => break Ok(()),
             Err(error) if stop.is_stopped() || !error.restarts_owner_loop() => break Err(error),
             Err(error) => error,
@@ -4610,7 +4630,8 @@ fn backoff_wait(
         }
         health.sync_profile_policy(state);
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if stop.is_stopped() || remaining.is_zero() {
+        // A repoint request does not wait out the backoff: the failure may be the old agent's.
+        if stop.is_stopped() || remaining.is_zero() || stop.repoint_requested() {
             return Ok(());
         }
         stop.wait(remaining.min(BACKOFF_NOTICE_POLL));

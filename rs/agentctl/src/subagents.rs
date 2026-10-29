@@ -9725,8 +9725,58 @@ its drain would type first, so it was not queued",
     ) -> Result<bool> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
-        record.supported()?;
+        // A headless agent's wrapper drains its queue under the same delivery lock, so a prompt
+        // still in its inbox can be taken back as safely as a pane agent's (#677
+        // chat-bridge-repoint).
+        if !record.is_headless() {
+            record.supported()?;
+        }
         agent::withdraw(&self.queue(agent_name)?, message_id, runtime)
+    }
+
+    /// The queues of `agent_name`'s archived records, newest first, when the name is not
+    /// registered any more, as after `stop`; `None` while it is registered. An archived queue is
+    /// never drained again. The chat bridge reads them to tell whether a prompt queued for an
+    /// agent that has since stopped was typed (#677 chat-bridge-repoint).
+    pub(crate) fn archived_queues(&self, agent_name: &str) -> Result<Option<Vec<PathBuf>>> {
+        if self.directory(agent_name)?.exists() {
+            return Ok(None);
+        }
+        let archive = self.registry.join("archive");
+        let entries = match fs::read_dir(&archive) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some(Vec::new()))
+            }
+            Err(error) => return Err(fail(format!("read {}: {error}", archive.display()))),
+        };
+        let prefix = format!("{agent_name}-");
+        let mut queues = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| fail(error.to_string()))?;
+            let name = entry.file_name();
+            let Some(token) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+                continue;
+            };
+            // The rest is the record's token, `<digits>-<digits>`, so `a-b` never matches `a`.
+            let mut parts = token.split('-');
+            let started = match (parts.next(), parts.next(), parts.next()) {
+                (Some(first), Some(second), None)
+                    if !first.is_empty()
+                        && !second.is_empty()
+                        && first
+                            .bytes()
+                            .chain(second.bytes())
+                            .all(|byte| byte.is_ascii_digit()) =>
+                {
+                    first.parse::<u128>().unwrap_or(0)
+                }
+                _ => continue,
+            };
+            queues.push((started, entry.path().join("queue")));
+        }
+        queues.sort_by(|left, right| right.0.cmp(&left.0));
+        Ok(Some(queues.into_iter().map(|(_, queue)| queue).collect()))
     }
 
     /// Write the tombstone that keeps every drain from typing `message_id` in the agent's queue.

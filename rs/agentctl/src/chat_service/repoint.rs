@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::agent::{DrainOptions, QueueMessageState};
 use crate::chat_runtime::{
     self, BridgeState, CommandOutboundTransport, RepointOutcome, RootMessageSubmission,
     RootMessageTransport,
@@ -78,6 +79,77 @@ pub fn validate_target<A: ManagedApi + ?Sized>(
     }
 }
 
+/// The previous agent's queue as a repoint reads it. While the agent is registered, `inner`
+/// answers. Once it has stopped, its queue lives on only in its archived records, which nothing
+/// drains again: a prompt found processed there was typed, one in flight or failed may have been,
+/// and one still waiting, or not there at all, never will be, so it moves.
+struct PreviousQueue<'a, A: ManagedApi + ?Sized> {
+    inner: &'a dyn chat_runtime::CoordinatorDelivery,
+    manager: &'a ManagedAgents<'a, A>,
+}
+
+impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for PreviousQueue<'_, A> {
+    fn message_state(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+    ) -> Result<Option<QueueMessageState>, String> {
+        let Some(queues) = self
+            .manager
+            .archived_queues(agent_name)
+            .map_err(|error| error.to_string())?
+        else {
+            return self.inner.message_state(agent_name, message_id);
+        };
+        let mut found = None;
+        for queue in queues {
+            match crate::agent::message_state(&queue, message_id) {
+                Ok(Some(state)) => {
+                    found = Some(state);
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "{agent_name} is stopped and its archived queue {} cannot be read: {error}",
+                        queue.display()
+                    ))
+                }
+            }
+        }
+        Ok(match found {
+            Some(QueueMessageState::Pending) => Some(QueueMessageState::Cancelled),
+            state => state,
+        })
+    }
+
+    fn submit(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+    ) -> Result<(), String> {
+        self.inner.submit(agent_name, prompt, message_id, options)
+    }
+
+    fn drain(&self, agent_name: &str, options: DrainOptions) -> Result<(), String> {
+        self.inner.drain(agent_name, options)
+    }
+
+    fn screen(&self, agent_name: &str) -> Result<String, String> {
+        self.inner.screen(agent_name)
+    }
+
+    fn prompt_started(&self, message_id: &str) {
+        self.inner.prompt_started(message_id);
+    }
+
+    fn withdraw(&self, agent_name: &str, message_id: &str) -> Result<bool, String> {
+        self.inner.withdraw(agent_name, message_id)
+    }
+}
+
 /// Apply the pending repoint request of `state`, if any, through `delivery`, which reads and
 /// edits the previous agent's queue, and post its notice through `transport`. Gives the outcome
 /// and, when the target changed, the state serving the new agent.
@@ -91,8 +163,19 @@ pub(super) fn apply_pending<A: ManagedApi + ?Sized>(
     let Some(request) = state.pending_repoint()? else {
         return Ok(None);
     };
-    let validate = |agent: &str, pane: Option<&str>| validate_target(manager, agent, pane);
-    let outcome = state.apply_repoint(&request, delivery, &validate, applied_by)?;
+    // Whether the new agent is headless, learned while validating it, so the retargeted state
+    // does not depend on a second registry read after the outcome is recorded.
+    let headless = std::cell::Cell::new(false);
+    let validate = |agent: &str, pane: Option<&str>| {
+        let pane_id = validate_target(manager, agent, pane)?;
+        headless.set(pane_id.is_none());
+        Ok(pane_id)
+    };
+    let previous = PreviousQueue {
+        inner: delivery,
+        manager,
+    };
+    let outcome = state.apply_repoint(&request, &previous, &validate, applied_by)?;
     let summary = outcome.summary();
     service_log(format_args!("agentctl: {summary}"));
     for entry in &outcome.uncertain {
@@ -107,7 +190,7 @@ pub(super) fn apply_pending<A: ManagedApi + ?Sized>(
     if !outcome.changed_target() {
         return Ok(Some((outcome, None)));
     }
-    let headless = manager.is_headless(&outcome.agent_name)?;
+    let headless = headless.get();
     let next = state
         .retargeted(&outcome.agent_name)
         .with_command_only_replies(headless)
@@ -166,28 +249,35 @@ pub fn repoint<A: ManagedApi + ?Sized>(
         ));
     }
     let request = state.request_repoint(agent, pane, requested_by)?;
-    let (outcome, service, woken) = match state.acquire_runner_lease() {
-        Ok(_lease) => {
-            // No service runs on this state: apply the request here, as the service would. The
-            // lease is held until the outcome is recorded.
-            let mut transport = state.outbound_transport()?;
-            let applied = apply_pending(&state, manager, manager, transport.as_mut(), "command")?;
-            (applied.map(|(outcome, _)| outcome), false, false)
+    let deadline = Instant::now() + wait;
+    let mut woken = false;
+    let mut service = false;
+    // Until the request has an outcome: whenever no service holds the runner lease, apply the
+    // request here, as the service would, holding the lease until the outcome is recorded; while
+    // one does, wake it (once) and wait. A service that exits meanwhile, or a second command that
+    // held the lease, leaves the request to this loop.
+    let outcome = loop {
+        if let Some(outcome) = state.repoint_outcome(request.generation)? {
+            break Some(outcome);
         }
-        Err(_) => {
-            let woken = super::wake_service_with(state_root, REPOINT_WAKE);
-            let deadline = Instant::now() + wait;
-            let outcome = loop {
-                if let Some(outcome) = state.repoint_outcome(request.generation)? {
-                    break Some(outcome);
+        match state.acquire_runner_lease() {
+            Ok(_lease) => {
+                service = false;
+                let mut transport = state.outbound_transport()?;
+                apply_pending(&state, manager, manager, transport.as_mut(), "command")?;
+                continue;
+            }
+            Err(_) => {
+                service = true;
+                if !woken {
+                    woken = super::wake_service_with(state_root, REPOINT_WAKE);
                 }
-                if Instant::now() >= deadline {
-                    break None;
-                }
-                std::thread::sleep(OUTCOME_POLL);
-            };
-            (outcome, true, woken)
+            }
         }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(OUTCOME_POLL);
     };
     let mut result = json!({
         "request": request,

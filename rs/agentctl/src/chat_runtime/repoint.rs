@@ -258,8 +258,13 @@ impl BridgeState {
         Ok(document
             .applied
             .iter()
-            .rev()
-            .find(|outcome| outcome.generation >= generation)
+            .find(|outcome| outcome.generation == generation)
+            .or_else(|| {
+                document
+                    .applied
+                    .iter()
+                    .find(|outcome| outcome.generation > generation)
+            })
             .cloned())
     }
 
@@ -409,7 +414,13 @@ impl BridgeState {
         for record in waiting {
             let key = record.key.clone();
             let message_id = &record.delivery_message_id;
-            let observed = delivery.message_state(previous, message_id);
+            // A request whose delivery never started was never queued anywhere: it moves without
+            // asking the previous agent's queue, which may be gone with its registration.
+            let observed = if record.delivery_started_at_millis.is_none() {
+                Ok(None)
+            } else {
+                delivery.message_state(previous, message_id)
+            };
             let settled = match observed {
                 Ok(None | Some(QueueMessageState::Cancelled)) => Settled::Moved,
                 Ok(Some(QueueMessageState::Processed)) => Settled::Typed,
@@ -947,6 +958,62 @@ mod tests {
             .expect("candidates")
             .candidates
             .is_empty());
+    }
+
+    #[test]
+    fn a_request_never_queued_moves_even_when_the_previous_queue_is_gone() {
+        let fixture = fixture("gone");
+        let state = &fixture.state;
+        let never_started = admit(state, 1);
+        let started = admit(state, 2);
+        state
+            .set_delivery_phase(&started, RequestPhase::Submitting, None)
+            .expect("submitting");
+        let queues = Queues::default();
+        // The previous agent's registration is gone: its queue cannot be read at all.
+        queues
+            .unreadable
+            .lock()
+            .expect("lock")
+            .extend([format!("chat-{never_started}"), format!("chat-{started}")]);
+        let request = state
+            .request_repoint("new-agent", None, "cl-test")
+            .expect("request");
+        let outcome = state
+            .apply_repoint(&request, &queues, &accept, "command")
+            .expect("apply");
+        assert_eq!(outcome.moved, vec![never_started.clone()]);
+        assert_eq!(phase(state, &never_started).0, RequestPhase::Pending);
+        // One whose prompt may be queued there cannot be proved untyped.
+        assert_eq!(
+            outcome
+                .uncertain
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect::<Vec<_>>(),
+            vec![started]
+        );
+    }
+
+    #[test]
+    fn each_request_reports_its_own_outcome() {
+        let fixture = fixture("own");
+        let state = &fixture.state;
+        for (agent, generation) in [("agent-a", 1), ("agent-b", 2)] {
+            let request = state
+                .request_repoint(agent, None, "cl-test")
+                .expect("request");
+            assert_eq!(request.generation, generation);
+            state
+                .apply_repoint(&request, &Queues::default(), &accept, "service")
+                .expect("apply");
+        }
+        let first = state.repoint_outcome(1).expect("outcome").expect("first");
+        assert_eq!(
+            (first.generation, first.agent_name.as_str()),
+            (1, "agent-a")
+        );
+        assert_eq!(state.repoint_outcome(3).expect("outcome"), None);
     }
 
     #[test]
