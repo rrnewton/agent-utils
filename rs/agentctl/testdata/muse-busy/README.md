@@ -34,3 +34,4 @@ directory was replaced by `~/work/project`.
 |---|---|
 | `muse-foreground-hint.txt` | A foreground command inside the goal turn: its progress row, then `└ (ctrl+b to send to background)` as the last transcript row. |
 | `muse-steer-failed.txt` | A 1635-character prompt steered during that command: Muse reported `! steer failed: ...` and put the prompt back in the editor as `[Pasted Content 1635 chars]`. |
+| `muse-subagent-panel.txt` | A sub-agent started in the turn: the terminals panel lists it as `└ ◇ counter ·3  shared · Run the shell command ...` between the bottom rule and the footer. |

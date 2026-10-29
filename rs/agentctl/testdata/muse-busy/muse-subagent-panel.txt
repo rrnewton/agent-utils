@@ -1,0 +1,24 @@
+  between the two lines that did not reach the chat, write its text to a file, without the two lines, and run this command with the file's path in place of PATH_TO_YOUR_REPLY:
+  /home/newton/.local/state/agentctl-slack-musetest/bin/agentctl-a1f5f7cb chat reply --bridge-state /home/newton/.local/state/agentctl-slack-musetest/bridges/mt-med --request
+  82209e13c41ed5a1120b0b26ef7b2d80d12a3d3192daec8c5d7ff712078230b1 --reply-id 013 --file PATH_TO_YOUR_REPLY
+  Run it once for each reply; running it again with the same text does not send that text twice. Send each reply one way only, by this command or between the two lines, not both.
+  If the command fails twice for a reply, print that reply between the two lines at the end of your turn instead.
+
+◆ <CHAT_REPLY_013>
+  PONG zz79262
+  </CHAT_REPLY_013>
+
+❯ [from cl-musetest via agentctl · reply: agentctl send cl-musetest]
+  Benchmark turn, not a chat request: start one sub-agent (your sub-agent or task tool) and have it run `sleep 30` and then count the files under /usr/share/doc; wait for it,
+  then say SUB-DONE with the count.
+
+◆ Spawned subagent · counter ·3
+
+◈ Thinking (3s · esc to interrupt)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+main · ↓ to select
+└ ◇ counter ·3  shared · Run the shell command `sleep 30` (as a single muse.bash tool call), then count the files under /usr/share/doc (e.g. run `find /usr/share/doc -type f…  0s
+  watermelon-full-preview · medium · ~/work/project · Launch overrides

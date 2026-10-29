@@ -127,6 +127,7 @@ mod tests {
     // Muse 1.4.15, 2026-10-29, inside a /goal turn (#678 muse-bridge-latency).
     const FOREGROUND_HINT: &str = include_str!("../../testdata/muse-busy/muse-foreground-hint.txt");
     const STEER_FAILED: &str = include_str!("../../testdata/muse-busy/muse-steer-failed.txt");
+    const SUBAGENT: &str = include_str!("../../testdata/muse-busy/muse-subagent-panel.txt");
 
     const ALPHA: &str = "FOLLOWUP-ALPHA: when you reply, also include the word ALPHA.";
     const BETA: &str = "FOLLOWUP-BETA: also include the word BETA.";
@@ -340,5 +341,18 @@ mod tests {
                 assert_eq!(muse_verified_pane_status("done", &screen), "idle", "{quoted}");
             }
         }
+    }
+
+    #[test]
+    fn a_running_sub_agent_in_the_terminals_panel_does_not_hide_the_editor() {
+        use crate::client::muse_verified_pane_status;
+        // The panel's tree row for a sub-agent has `·` fields, like a footer; read as one, it
+        // made two footers, no editor, and a pane that took no message while the sub-agent ran.
+        assert!(SUBAGENT.contains("└ ◇ counter ·3  shared · Run the shell command"));
+        assert_eq!(state(SUBAGENT), State::Working);
+        assert!(MuseTui::editor_empty(SUBAGENT));
+        assert_eq!(muse_verified_pane_status("done", SUBAGENT), "working");
+        let finished = SUBAGENT.replace("◈ Thinking (3s · esc to interrupt)", "◆ Worked for 40s");
+        assert_eq!(muse_verified_pane_status("done", &finished), "idle");
     }
 }
