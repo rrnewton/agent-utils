@@ -4101,8 +4101,11 @@
     -->
     <pre id="keyboard-debug-readout" aria-hidden="true" hidden></pre>
 
-    <!-- The generated wire-contract validators first: voice.js checks what it receives with them. -->
-    <script src="/contract.js"></script>
+    <!--
+      The page's script. The page build (web/build.mjs) bundles it with the modules it calls, the wire
+      contract's validators among them (`#624 voice-page-modularity`): /contract.js is still served,
+      for a page cached before, but this shell no longer loads it.
+    -->
     <script src="/voice.js"></script>
   </body>
 </html>

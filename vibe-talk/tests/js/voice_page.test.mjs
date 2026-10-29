@@ -123,8 +123,9 @@ const HTML = readWeb(SHELL);
 /**
  * The scripts every page here runs, in order: the ones the shell loads, as it loads them
  * (`#624 voice-page-modularity`). A negative control replaces `SCRIPT_FILE`'s text with its own.
- * The first is the generated wire-contract validators: every payload this fixture's fake server
- * sends is decoded by them before the page reads it.
+ * The page build's prelude runs just before the legacy script and gives it the wire contract's
+ * validators: every payload this fixture's fake server sends is decoded by them before the page
+ * reads it.
  */
 const PAGE_SCRIPTS = shellScripts(HTML);
 /**
@@ -4791,7 +4792,9 @@ test("`#624 voice-page-modularity`: nothing is awaited at the top of this file b
 });
 
 test("`#624 voice-page-modularity`: every page here runs the scripts the shell loads, in its order, and a control's needle is counted", () => {
-  assert.deepStrictEqual(PAGE_SCRIPTS, ["contract.js", SCRIPT_FILE]);
+  // `#624 voice-page-modularity`: the shell loads the page's script alone; the contract's validators
+  // come to it through the prelude, with the other modules.
+  assert.deepStrictEqual(PAGE_SCRIPTS, [SCRIPT_FILE]);
   // The tags, not the prose: a commented-out tag loads nothing, and a version query is not the name.
   assert.deepStrictEqual(shellScripts('<!-- <script src="/old.js"></script> --><script src="/a.js?v=1"></script>'), ["a.js"]);
   assert.throws(() => shellScripts("<script>inline();</script>"), /names no local file/);

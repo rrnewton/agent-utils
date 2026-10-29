@@ -287,16 +287,21 @@ def hashed_web_root(source: Path) -> Path:
 
 def old_shell_root(source: Path, into: Path) -> tuple[Path, str, str]:
     """A copy of the page build at `source` served with the shell from before the page build: the
-    source shell, its script named `/voice.js?v=<hash>` as that server named it, with the hash of the
-    script it served then. Returns the directory, that hash, and the page build's own."""
+    source shell as it was then, loading the standalone validators at /contract.js and then its script
+    named `/voice.js?v=<hash>` as that server named it, with the hash of the script it served then.
+    Returns the directory, that hash, and the page build's own."""
     if not (source / "assets.json").is_file():
         raise SystemExit(f"the old-shell part needs a page build to serve, and {source} is not one")
     shutil.copytree(source, into)
     script = page_sources.source_text(source, "voice.js").encode()
     build = hashlib.sha256(script).hexdigest()[:32]
     shell = page_sources.source_text(source, "voice.html")
-    check(shell.count('src="/voice.js"') == 1, "the source shell no longer loads /voice.js by a plain tag")
-    (into / "voice.html").write_text(shell.replace('src="/voice.js"', f'src="/voice.js?v={build}"'))
+    tag = '<script src="/voice.js"></script>'
+    check(shell.count(tag) == 1, "the source shell no longer loads /voice.js by a plain tag")
+    # Today's source shell loads the script alone (`#624 voice-page-modularity`); a shell cached
+    # before loaded the validators first, as their own script, and that is the shell this serves.
+    old = f'<script src="/contract.js"></script>\n    <script src="/voice.js?v={build}"></script>'
+    (into / "voice.html").write_text(shell.replace(tag, old))
     return into, build, str(json.loads((source / "assets.json").read_text())["page_build"])
 
 

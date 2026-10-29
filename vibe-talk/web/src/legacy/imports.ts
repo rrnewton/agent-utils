@@ -28,3 +28,12 @@ export {
   messageLinkRef,
   monoEm,
 } from "../foundation/index.ts";
+
+import { decode, decodeTagged, is, roots } from "../contract/index.ts";
+
+/**
+ * The wire contract's validators as the legacy script has always called them: one frozen object
+ * with `roots`, `is`, `decode` and `decodeTagged`, the shape web/contract.js publishes as a global.
+ * The prelude's constant of this name is what voice.js reads; web/contract.d.ts types it.
+ */
+export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });

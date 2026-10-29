@@ -165,7 +165,7 @@ test("a position in the minified files maps back to the line of the source it ca
     [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "const TOKEN_KEY="],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "const PAGE_BUILD="],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "function fmtDuration("],
-    [SCRIPT_PATH, MANIFEST.assets.script.map, "contract.js", "function decodeTagged("],
+    [SCRIPT_PATH, MANIFEST.assets.script.map, "src/contract/validators.js", "function decodeTagged("],
     [STYLE_PATH, MANIFEST.assets.style.map, "voice.css", ".send-tick{"],
     [STYLE_PATH, MANIFEST.assets.style.map, "style.css", "body{"],
   ];
@@ -286,7 +286,11 @@ test("the prelude gives the legacy script exactly what web/src/legacy/imports.ts
   assert.ok(names.length > 0, "nothing has moved, so this checks nothing");
   const declared = [...readWeb("legacy-imports.d.ts").matchAll(/^declare const (\w+): LegacyImports\["(\w+)"\];$/gm)]
     .map(([, name, key]) => (assert.equal(name, key), name));
-  assert.deepStrictEqual(declared.sort(), [...names].sort(), "web/legacy-imports.d.ts and imports.ts name different things");
+  // VibeTalkContract keeps the declaration web/contract.d.ts has always given it, for the global.
+  assert.match(readWeb("contract.d.ts"), /^declare const VibeTalkContract: \{/m);
+  const expected = names.filter((name) => name !== "VibeTalkContract");
+  assert.ok(names.includes("VibeTalkContract"), "the legacy script no longer takes the contract from the prelude");
+  assert.deepStrictEqual(declared.sort(), [...expected].sort(), "web/legacy-imports.d.ts and imports.ts name different things");
 });
 
 test("the bundle declares nothing of the modules but what the legacy script takes, strictly, just before it", () => {
