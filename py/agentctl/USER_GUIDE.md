@@ -457,13 +457,10 @@ relay runs the harness without an interactive shell. The pane shell must accept
 A team that runs agentctl from its own pinned build can tell which source a
 binary came from, and catch a build left behind when the pin moves. Build with
 `AGENTCTL_SOURCE_COMMIT` (the 40-character commit of the checkout),
-`AGENTCTL_SOURCE_DIRTY` (`0` or `1`) and, optionally, `AGENTCTL_SOURCE_FP` set:
-
-```sh
-AGENTCTL_SOURCE_COMMIT="$(git -C CHECKOUT rev-parse HEAD)" \
-AGENTCTL_SOURCE_DIRTY="$(git -C CHECKOUT diff --quiet HEAD && echo 0 || echo 1)" \
-cargo build --release --locked -p agentctl
-```
+`AGENTCTL_SOURCE_DIRTY` (`0` or `1`) and, optionally, `AGENTCTL_SOURCE_FP` set in
+the build environment, for example from
+`git -C CHECKOUT rev-parse HEAD` and
+`git -C CHECKOUT diff --quiet HEAD && echo 0 || echo 1`.
 
 Such a binary prints `commit <sha>` (with `(dirty)` when set) on the line after
 its version, and `capabilities` reports `build.commit` and `build.dirty`. When

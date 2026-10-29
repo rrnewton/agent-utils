@@ -23,7 +23,7 @@ pub(crate) const SOURCE_COMMIT: Option<&str> = option_env!("AGENTCTL_BUILD_SOURC
 /// `"1"` when the build's checkout had uncommitted tracked changes, `"0"` when clean.
 pub(crate) const SOURCE_DIRTY: Option<&str> = option_env!("AGENTCTL_BUILD_SOURCE_DIRTY");
 
-/// Names the agent-utils checkout whose HEAD the caller's team pins (set in the team env file).
+/// Names the source checkout whose HEAD the caller's team pins (set in the team env file).
 pub(crate) const CHECKOUT_ENV: &str = "AGENT_UTILS_CHECKOUT";
 
 /// `1` lets a binary built from another commit run commands that write agents' state.
@@ -84,7 +84,7 @@ pub(crate) struct Stale {
 impl Stale {
     pub(crate) fn warning(&self) -> String {
         format!(
-            "agentctl: warning: this binary was built from agent-utils {} but {CHECKOUT_ENV} ({}) is at {}; rebuild the team's tools from that checkout",
+            "agentctl: warning: this binary was built from source commit {} but {CHECKOUT_ENV} ({}) is at {}; rebuild the team's tools from that checkout",
             short(&self.built),
             self.checkout.display(),
             short(&self.pinned)
@@ -93,7 +93,7 @@ impl Stale {
 
     pub(crate) fn refusal(&self) -> String {
         format!(
-            "refusing to change agents' state with a binary built from agent-utils {} while {CHECKOUT_ENV} ({}) is at {}; rebuild, or set {ALLOW_STALE_ENV}=1 to proceed once",
+            "refusing to change agents' state with a binary built from source commit {} while {CHECKOUT_ENV} ({}) is at {}; rebuild, or set {ALLOW_STALE_ENV}=1 to proceed once",
             short(&self.built),
             self.checkout.display(),
             short(&self.pinned)
@@ -108,7 +108,7 @@ fn short(commit: &str) -> &str {
 /// Compare the embedded commit with the team checkout named by [`CHECKOUT_ENV`].
 ///
 /// `Ok(None)` when either is absent or they match; an unreadable checkout is an `Err` the
-/// caller reports as a warning. Reads files only: no Git or Cargo process runs.
+/// caller reports as a warning. Reads files only: no Git or build process runs.
 pub(crate) fn staleness(
     built: Option<&str>,
     environment: &dyn Fn(&str) -> Option<String>,
