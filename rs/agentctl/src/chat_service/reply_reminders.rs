@@ -1,4 +1,4 @@
-//! When `chat run` reminds a Claude Code coordinator of a delivered chat request it has not
+//! When `chat run` reminds the coordinator of a delivered chat request it has not
 //! answered (#292 reply-in-thinking-block).
 //!
 //! A check runs at each scan of the request records (every `DeliveryTiming::retry_interval`).
@@ -135,14 +135,29 @@ most {}h",
     Ok(Some(idle))
 }
 
-/// What Claude Code says about the session in the coordinator's pane.
+/// The display name of the harness Herdr reports in the pane `info` describes, such as
+/// `Muse` for a Muse pane: the name reminder text uses for the coordinator's harness,
+/// never a hardcoded one.
+pub(crate) fn harness_display_name(info: &AgentPaneInfo) -> String {
+    match info.agent.as_deref() {
+        Some(kind) => crate::harness::adapter(kind).map_or_else(
+            || kind.to_owned(),
+            |adapter| adapter.display_name().to_owned(),
+        ),
+        None => "an unrecognized harness".to_owned(),
+    }
+}
+
+/// What the coordinator's harness says about the session in its pane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClaudeState {
     /// The session waits at its prompt.
     Idle,
-    /// Any other state Claude Code reports, such as `busy`.
+    /// Any other state the harness reports, such as `busy`.
     Busy(String),
-    /// Herdr does not report the pane as running Claude Code.
+    /// Herdr does not report the pane as running a harness whose idleness reminders can ask
+    /// about (a Claude Code pane is asked through its own CLI; a known harness's pane is
+    /// read from its Herdr status).
     NotClaude,
     /// Claude Code lists no session in the pane.
     NoSession,
@@ -324,7 +339,18 @@ impl ClaudeIdleSource for ClaudeAgents {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClaudeState, String> {
         if info.agent.as_deref() != Some("claude") {
-            return Ok(ClaudeState::NotClaude);
+            // Another known harness (Codex, Muse) has no `agents --json` to ask: its pane's
+            // Herdr status, which the caller has already required to read idle or done and
+            // to show no running turn, is its answer. An unknown kind cannot be asked.
+            return Ok(
+                match info.agent.as_deref().and_then(crate::harness::adapter) {
+                    Some(_) if matches!(info.status.as_str(), "idle" | "done") => {
+                        ClaudeState::Idle
+                    }
+                    Some(_) => ClaudeState::Busy(info.status.clone()),
+                    None => ClaudeState::NotClaude,
+                },
+            );
         }
         let sessions = crate::inbox::claude_sessions_by_pane(
             &self.claude,
@@ -356,6 +382,11 @@ impl ClaudeIdleSource for ClaudeAgents {
         info: &AgentPaneInfo,
         reply_ids: &BTreeSet<String>,
     ) -> Result<BTreeSet<String>, String> {
+        if info.agent.as_deref() != Some("claude") {
+            // Only a Claude Code transcript is read for printed replies; another harness's
+            // pane is captured by the check itself, so there is nothing more to leave out.
+            return Ok(BTreeSet::new());
+        }
         let found = self
             .found
             .lock()
@@ -544,9 +575,10 @@ impl ReplyReminders {
     /// What the service logs at startup about these reminders.
     pub(super) fn describe(settings: &ReplyReminderSettings) -> String {
         format!(
-            "agentctl: reply reminders: a Claude Code coordinator idle for {}s after a request's \
-prompt was typed, with no reply to it, is reminded once of that request; `{} agents --json` \
-tells whether it is idle",
+            "agentctl: reply reminders: a coordinator idle for {}s after a request's \
+prompt was typed, with no reply to it, is reminded once of that request; the harness in \
+its pane tells whether it is idle (`{} agents --json` for a Claude Code pane, the pane's \
+status for the others)",
             settings.idle.as_secs(),
             settings.claude_bin.display()
         )
@@ -977,14 +1009,11 @@ seen working and is idle again, or for {}s if it is not seen working",
             .collect::<BTreeSet<_>>();
         let printed = match self.source.printed_replies(info, &reply_ids) {
             Ok(printed) => {
-                self.worked("the read of the coordinator's Claude Code transcript");
+                self.worked("the read of the coordinator's transcript");
                 printed
             }
             Err(error) => {
-                self.failed(
-                    "the read of the coordinator's Claude Code transcript",
-                    error,
-                );
+                self.failed("the read of the coordinator's transcript", error);
                 return due;
             }
         };
@@ -994,10 +1023,12 @@ seen working and is idle again, or for {}s if it is not seen working",
         for candidate in left_out {
             self.say(format_args!(
                 "agentctl: reply reminders: request {} (reply ID {}) is not reminded: the \
-coordinator's Claude Code transcript holds a complete reply block under that ID that no read of \
+coordinator's {} transcript holds a complete reply block under that ID that no read of \
 its pane has captured yet, as when the pane's view is scrolled away from its end; the bridge \
 sends that reply once the pane shows it",
-                candidate.key, candidate.reply_id
+                candidate.key,
+                candidate.reply_id,
+                harness_display_name(info)
             ));
             self.printed.insert(candidate.key);
         }
@@ -1066,28 +1097,30 @@ sends that reply once the pane shows it",
         self.claude_wait = slow.then_some(wait);
         match answer {
             Ok(ClaudeState::Idle) => {
-                self.worked("asking Claude Code whether the coordinator is idle");
+                self.worked("asking the coordinator's harness whether it is idle");
                 self.wait_because(None);
                 true
             }
             Ok(ClaudeState::Busy(_)) => {
-                self.worked("asking Claude Code whether the coordinator is idle");
+                self.worked("asking the coordinator's harness whether it is idle");
                 self.wait_because(None);
                 self.period.end();
                 false
             }
             Ok(ClaudeState::NotClaude) => {
-                self.wait_because(Some(
-                    "the coordinator's pane does not run Claude Code, so it is not reminded"
-                        .to_owned(),
-                ));
+                self.wait_because(Some(format!(
+                    "the coordinator's pane runs {}, whose idleness reply reminders cannot \
+                     ask about, so it is not reminded",
+                    harness_display_name(info)
+                )));
                 self.period.end();
                 false
             }
             Ok(ClaudeState::NoSession) => {
-                self.worked("asking Claude Code whether the coordinator is idle");
+                self.worked("asking the coordinator's harness whether it is idle");
                 self.wait_because(Some(format!(
-                    "Claude Code lists no session in the coordinator's pane {}",
+                    "{} lists no session in the coordinator's pane {}",
+                    harness_display_name(info),
                     info.pane_id
                 )));
                 self.claude_wait = Some(wait);
@@ -1095,7 +1128,10 @@ sends that reply once the pane shows it",
                 false
             }
             Err(error) => {
-                self.failed("asking Claude Code whether the coordinator is idle", error);
+                self.failed(
+                    "asking the coordinator's harness whether it is idle",
+                    error,
+                );
                 self.claude_wait = Some(wait);
                 self.period.end();
                 false
@@ -1457,8 +1493,34 @@ mod tests {
         );
         assert_eq!(
             source.state(&pane("codex", "w:coordinator"), &|| false),
+            Ok(ClaudeState::Idle),
+            "a Codex pane's own status answers instead of Claude Code's CLI"
+        );
+        assert_eq!(
+            source.state(&pane("muse", "w:coordinator"), &|| false),
+            Ok(ClaudeState::Idle),
+            "a Muse pane's own status answers instead of Claude Code's CLI"
+        );
+        let mut working = pane("muse", "w:coordinator");
+        working.status = "working".to_owned();
+        assert_eq!(
+            source.state(&working, &|| false),
+            Ok(ClaudeState::Busy("working".to_owned())),
+            "a working Muse pane is not idle"
+        );
+        assert_eq!(
+            source.state(&pane("something-else", "w:coordinator"), &|| false),
             Ok(ClaudeState::NotClaude),
-            "a pane that does not run Claude Code is never reminded"
+            "a harness reminders cannot ask about is never reminded"
+        );
+        assert_eq!(
+            harness_display_name(&pane("muse", "w:coordinator")),
+            "Muse",
+            "reminder text names the detected harness"
+        );
+        assert_eq!(
+            harness_display_name(&pane("claude", "w:coordinator")),
+            "Claude Code"
         );
         fs::remove_dir_all(directory).expect("cleanup");
 
