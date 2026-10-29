@@ -491,3 +491,11 @@ instructed.
 - Gate 62 (`/tmp/rust-campaign-gate62.log`): 200 steps passed; the only failures were infra and wrkslots-shard timeouts under load, each passing alone (infra 113; shards 565+1 heartbeat flake and 565+1 liveness flake, both passing alone).
 - Also landed since slice 41: #651 part 2 (`1b3e01d2`, closed) — find-census ENAMETOOLONG diagnostics now use the #618 device proof; standalone and lifecycle host steps pass in-gate on the loaded host.
 - Next in #562: `recover-ownerless-agent-cache` and `recover-ownerless-validate-batch` plan outcomes, the main `recover`, then the opt-in edition switch.
+
+### Slice 43 landed: `recover-ownerless-agent-cache` and validate-batch plan outcomes (fixture-guarded)
+
+- Commit: `4c72b5ad` (plans + differential + CLI surface).
+- Rust `wrkslotsd recover-ownerless-agent-cache` covers the plan outcomes: local-machine check, interrupted-journal resume planning, registry collision, destination-exists refusal, and the exact cache tree shape (validate/cache/rust-script only, no symlinks, special files, or authored-work markers). The relocation and the process/systemd censuses in the tree proof refuse explicitly as Python-owned. For `recover-ownerless-validate-batch` and `classify-ownerless-validate-batch`, Rust reproduces the argument-shape contract (exactly one target kind, aligned counts, proof alignment, batch limit of 8, duplicate checkouts, coordinator authorization shape) and then refuses explicitly; their shared census and recovery stay Python-owned.
+- Differential: `py/wrkslots/tests/test_recover_cache_write_rust.py`, 8 tests. `wrkslotsd` 91 package tests pass; clippy/mypy clean.
+- Gate 63 (`/tmp/rust-campaign-gate63.log`): 200 steps passed; only infra and wrkslots-shard timeouts under load failed, each passing alone (infra 113; shard 1 570; shard 0 567 plus the known transfer load-flake passing 9/9 alone).
+- Next in #562: the main `recover`, then the opt-in edition switch.
