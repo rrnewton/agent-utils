@@ -4544,7 +4544,15 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
-                info.status = muse_verified_pane_status(&info.status, &screen).to_owned();
+                let status = muse_verified_pane_status(&info.status, &screen);
+                info.status = if status == "working"
+                    && crate::harness_tui::muse::MuseTui::approval_form(&screen)
+                {
+                    "blocked"
+                } else {
+                    status
+                }
+                .to_owned();
             }
         }
         Ok(info)
@@ -4721,7 +4729,15 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
-                info.status = muse_verified_pane_status(&info.status, &screen).to_owned();
+                let status = muse_verified_pane_status(&info.status, &screen);
+                info.status = if status == "working"
+                    && crate::harness_tui::muse::MuseTui::approval_form(&screen)
+                {
+                    "blocked"
+                } else {
+                    status
+                }
+                .to_owned();
             }
         }
         Ok(info)
