@@ -2923,14 +2923,10 @@ const columnReplies = new Map();
 const unseenColumnReplies = { main: null, side: null };
 
 // `#193 compose-draft-loss`. A send dismissed from the outbox, kept for Undo and then for a while
-// longer. See "taking a send back".
-const DISMISSED_SENDS_KEY = "vibe-talk.dismissed-sends";
+// longer. See "taking a send back"; how many are kept, for how long and where are web/src/core/outbox's
+// (`DISMISSED_SENDS_LIMIT`, `DISMISSED_SENDS_DAYS`, `#624 voice-page-modularity`).
 /** How long the Undo chip offers to take a Dismiss back. */
 const SEND_UNDO_MS = 15000;
-/** How many dismissed sends are kept, newest first, and for how many days. */
-const DISMISSED_SENDS_LIMIT = 10;
-const DISMISSED_SENDS_DAYS = 7;
-const DISMISSED_SENDS_MAX_AGE_MS = DISMISSED_SENDS_DAYS * 24 * 60 * 60 * 1000;
 /** How much of a message a control quotes to name it. */
 const SEND_SNIPPET_CHARS = 28;
 /**
@@ -2940,11 +2936,22 @@ const SEND_SNIPPET_CHARS = 28;
 const DISMISSED_LABEL_CHARS = 120;
 const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this page open until you send it.";
 /**
- * The sends dismissed from the outbox, newest first, each with when it was dismissed.
+ * The sends dismissed from the outbox, newest first, each with when it was dismissed, and the device's
+ * copy of them (web/src/core/outbox `createDismissedSends`, `#624 voice-page-modularity`). The device's
+ * storage is looked up at each use, so this line makes no port early.
  *
- * @type {Array<{entry: any, at: number}>}
+ * @type {import("./src/core/outbox/index.ts").DismissedSends<any>}
  */
-let dismissedSends = [];
+const dismissedSends = createDismissedSends({
+  storage: {
+    getItem: (key) => deviceStorage().getItem(key),
+    setItem: (key, value) => deviceStorage().setItem(key, value),
+    removeItem: (key) => deviceStorage().removeItem(key),
+  },
+  now: () => Date.now(),
+  makeRoom: () => dropMessageCache(),
+  decode: (saved) => outgoingFromSaved(saved),
+});
 /**
  * `#348 settings-dynamic-lists`. The dismissed send the pop-out over Recently dismissed shows, and the row that opened it, which takes the focus back.
  * `inert` is what the pop-out made inert behind it while it is up, and dimmed where its shadow does not reach (`#351 settings-polish`, `inertAround`, `dimBoxOf`).
@@ -13066,7 +13073,7 @@ function liveUndos() {
   if (lastDismissal !== null) {
     held.push({ at: lastDismissal.at || 0, run: () => guardQuietly(undoDismissal)() });
   }
-  if (sendUndo && dismissedSends.some((item) => item.entry.id === sendUndo.id)) {
+  if (sendUndo && dismissedSends.find(sendUndo.id)) {
     held.push({ at: sendUndo.at || 0, run: () => { if (sendUndo) putBackDismissedSend(sendUndo.id); } });
   }
   if (bookmarkUndo && bookmarkUndo.channel === currentChannelId()) {
@@ -31268,9 +31275,7 @@ function dismissOutgoingMessage(id) {
       ? { ...entry, state: "unconfirmed", phase: "",
         detail: "Dismissed while it waited its turn to go again, after a try whose delivery was not confirmed." }
       : { ...entry, state: "failed", phase: "", detail: "Dismissed while it waited its turn, so it was not sent." };
-  dismissedSends = [{ entry: copy, at: Date.now() },
-    ...dismissedSends.filter((held) => held.entry.id !== id)];
-  const kept = persistDismissedSends();
+  const kept = dismissedSends.add(copy);
   // A send waiting to go again on its own, for Undo to set waiting again. Never saved, as the wait
   // itself is not: Put back after a reload, or from Settings later, leaves it to Retry.
   const waiting = outgoingRetries.get(id);
@@ -31295,7 +31300,7 @@ function endSendUndo() {
 /** The Undo chip: up while a Dismiss can be taken back from it, naming the message dismissed. */
 function renderSendUndo() {
   const chip = el("undo-send-dismiss");
-  const held = sendUndo ? dismissedSends.find((item) => item.entry.id === sendUndo.id) : null;
+  const held = sendUndo ? dismissedSends.find(sendUndo.id) : null;
   chip.hidden = !held || currentView !== "discord";
   const label = held ? `Undo dismiss: “${sendSnippet(unsentText(held.entry))}”` : "Undo dismiss";
   if (chip.textContent !== label) chip.textContent = label;
@@ -31306,7 +31311,7 @@ function renderSendUndo() {
  * the wait for an automatic send as well, for the credential it was armed under.
  */
 function putBackDismissedSend(id) {
-  const held = dismissedSends.find((item) => item.entry.id === id);
+  const held = dismissedSends.find(id);
   if (!held) return;
   const entry = outgoingFromSaved(held.entry);
   if (entry && !outgoingMessages.has(entry.id)) {
@@ -31324,8 +31329,7 @@ function putBackDismissedSend(id) {
   }
   // The outbox holds it again before the copy goes.
   persistOutgoingMessages();
-  dismissedSends = dismissedSends.filter((item) => item !== held);
-  persistDismissedSends();
+  dismissedSends.remove(held);
   if (sendUndo && sendUndo.id === id) endSendUndo();
   renderOutgoingEverywhere();
   renderDismissedSends();
@@ -31337,50 +31341,15 @@ function putBackDismissedSend(id) {
 
 /** Forget every dismissed send now, rather than when its days are up. */
 function forgetDismissedSends() {
-  dismissedSends = [];
-  persistDismissedSends();
+  dismissedSends.clear();
   endSendUndo();
   renderDismissedSends();
   setStatus("Forgot the dismissed messages.");
 }
 
-/** Only the newest DISMISSED_SENDS_LIMIT, and none older than DISMISSED_SENDS_DAYS. */
-function pruneDismissedSends() {
-  const oldest = Date.now() - DISMISSED_SENDS_MAX_AGE_MS;
-  dismissedSends = dismissedSends.filter((held) => held.at > oldest).slice(0, DISMISSED_SENDS_LIMIT);
-}
-
-/** Save the recently dismissed, giving up the saved channel rows first where the quota is full. */
-function persistDismissedSends() {
-  pruneDismissedSends();
-  try {
-    if (dismissedSends.length === 0) {
-      deviceStorage().removeItem(DISMISSED_SENDS_KEY);
-      return true;
-    }
-    const encoded = JSON.stringify(dismissedSends);
-    if (storedExactly(DISMISSED_SENDS_KEY, encoded)) return true;
-    dropMessageCache();
-    return storedExactly(DISMISSED_SENDS_KEY, encoded);
-  } catch (_error) {
-    return false;
-  }
-}
-
+/** What the device kept of the recently dismissed, pruned; a damaged copy is nothing. */
 function loadDismissedSends() {
-  try {
-    const saved = JSON.parse(deviceStorage().getItem(DISMISSED_SENDS_KEY) || "[]");
-    if (!Array.isArray(saved)) return;
-    dismissedSends = saved
-      .map((held) => ({ entry: held && outgoingFromSaved(held.entry), at: Number(held && held.at) }))
-      .filter((held) => held.entry && Number.isFinite(held.at))
-      .sort((a, b) => b.at - a.at);
-    const before = dismissedSends.length;
-    pruneDismissedSends();
-    if (dismissedSends.length !== before) persistDismissedSends();
-  } catch (_error) {
-    dismissedSends = [];
-  }
+  dismissedSends.load();
 }
 
 /** Where a dismissed send was going, and how long ago it was dismissed, as one line. */
@@ -31415,8 +31384,8 @@ function dismissedRowLabel(held) {
  * `dismissedRowLabel`, rather than everything in it.
  */
 function renderDismissedSends() {
-  pruneDismissedSends();
-  const items = dismissedSends.map((held) => {
+  dismissedSends.prune();
+  const items = dismissedSends.list().map((held) => {
     const entry = held.entry;
     const item = document.createElement("li");
     item.className = "dismissed-send";
@@ -31444,7 +31413,7 @@ function renderDismissedSends() {
     : `Nothing dismissed in the last ${DISMISSED_SENDS_DAYS} days. A message you dismiss from the ` +
       "outbox unsent is kept here that long, in case you want it back.";
   // The pop-out is about one of them: gone from the list, it goes too.
-  if (dismissedPopout && !dismissedSends.some((held) => held.entry.id === dismissedPopout.id)) closeDismissedSend(false);
+  if (dismissedPopout && !dismissedSends.find(dismissedPopout.id)) closeDismissedSend(false);
 }
 
 // --- the pop-out over Recently dismissed ----------------------------------------------------------
@@ -31541,7 +31510,7 @@ function inertAround(node) {
 
 /** Open the pop-out on the dismissed send `id`, from the row `opener`. */
 function openDismissedSend(id, opener) {
-  const held = dismissedSends.find((one) => one.entry.id === id);
+  const held = dismissedSends.find(id);
   if (!held) return;
   // One at a time: what the one before made inert is given back before this one makes its own.
   closeDismissedSend(false);
@@ -31609,7 +31578,7 @@ function focusDismissedAt(at) {
 
 el("dismissed-send-close").addEventListener("click", () => closeDismissedSend());
 el("dismissed-send-copy").addEventListener("click", async () => {
-  const held = dismissedPopout && dismissedSends.find((one) => one.entry.id === dismissedPopout?.id);
+  const held = dismissedPopout && dismissedSends.find(dismissedPopout.id);
   if (!held) return;
   const copied = await writeClipboardText(unsentText(held.entry));
   el("dismissed-send-popout-state").textContent = copied ? "Copied the whole message." : COPY_REFUSED;
@@ -31617,7 +31586,7 @@ el("dismissed-send-copy").addEventListener("click", async () => {
 el("dismissed-send-restore").addEventListener("click", () => {
   if (!dismissedPopout) return;
   const id = dismissedPopout.id;
-  const at = dismissedSends.findIndex((held) => held.entry.id === id);
+  const at = dismissedSends.list().findIndex((held) => held.entry.id === id);
   closeDismissedSend(false);
   putBackDismissedSend(id);
   focusDismissedAt(at);

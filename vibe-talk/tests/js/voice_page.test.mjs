@@ -6853,6 +6853,64 @@ test("`#624 voice-page-modularity`: when a lost send goes out again by itself, a
   assert.equal(nextRetryAt({ channel: "c" }, 0, 0, never, true), 3000, "an attempt that posted nothing did not go again");
 });
 
+test("`#624 voice-page-modularity`: the recently dismissed, kept, pruned and saved, from the module alone", () => {
+  const { createDismissedSends, DISMISSED_SENDS_LIMIT, DISMISSED_SENDS_DAYS } = OUTBOX;
+  const day = 24 * 60 * 60 * 1000;
+  const saved = new Map();
+  const record = { refuse: 0, roomMade: 0 };
+  const storage = {
+    getItem: (key) => saved.get(key) ?? null,
+    // A full quota refuses the next `refuse` writes without a word; the read back is what notices.
+    setItem: (key, value) => { if (record.refuse > 0) record.refuse -= 1; else saved.set(key, value); },
+    removeItem: (key) => saved.delete(key),
+  };
+  let now = 100 * day;
+  const owner = () => createDismissedSends({
+    storage, now: () => now, makeRoom: () => { record.roomMade += 1; },
+    decode: (entry) => (entry && typeof entry.id === "string" ? { ...entry } : null),
+  });
+  const sends = owner();
+  assert.equal(sends.add({ id: "a", text: "one" }), true);
+  now += 1;
+  assert.equal(sends.add({ id: "b", text: "two" }), true);
+  now += 1;
+  assert.equal(sends.add({ id: "a", text: "one again" }), true);
+  assert.deepStrictEqual(sends.list().map((held) => held.entry.text), ["one again", "two"], "not newest first, or a copy kept twice");
+  assert.equal(sends.find("b").at, 100 * day + 1);
+  assert.deepStrictEqual(JSON.parse(saved.get("vibe-talk.dismissed-sends")), sends.list());
+  // Another page of the same device reads it back.
+  const again = owner();
+  again.load();
+  assert.deepStrictEqual(again.list(), sends.list());
+  // The quota full once: the saved rows go, and the second write stands.
+  record.refuse = 1;
+  assert.equal(sends.remove(sends.find("b")), true);
+  assert.equal(record.roomMade, 1);
+  record.refuse = 2;
+  assert.equal(sends.add({ id: "c" }), false, "a copy the device refused was reported kept");
+  assert.equal(record.roomMade, 2);
+  // Only the newest DISMISSED_SENDS_LIMIT, none older than DISMISSED_SENDS_DAYS.
+  for (let i = 0; i < DISMISSED_SENDS_LIMIT + 3; i += 1) sends.add({ id: `n${i}` });
+  assert.equal(sends.list().length, DISMISSED_SENDS_LIMIT);
+  assert.equal(sends.list()[0].entry.id, `n${DISMISSED_SENDS_LIMIT + 2}`);
+  now += DISMISSED_SENDS_DAYS * day;
+  sends.prune();
+  assert.deepStrictEqual(sends.list(), [], "a send past its days was kept");
+  assert.notEqual(saved.get("vibe-talk.dismissed-sends"), undefined, "a prune alone rewrote the device's copy");
+  // Loading prunes, and saves what it pruned; a damaged entry or copy is nothing.
+  const late = owner();
+  late.load();
+  assert.deepStrictEqual(late.list(), []);
+  assert.equal(saved.has("vibe-talk.dismissed-sends"), false);
+  saved.set("vibe-talk.dismissed-sends", JSON.stringify([{ entry: { id: "x" }, at: now }, { entry: null, at: now }, { entry: { id: "y" }, at: "soon" }]));
+  late.load();
+  assert.deepStrictEqual(late.list().map((held) => held.entry.id), ["x"]);
+  saved.set("vibe-talk.dismissed-sends", "{not json");
+  late.load();
+  assert.deepStrictEqual(late.list(), []);
+  assert.equal(late.clear(), true);
+});
+
 // --- the requests module, on its own ports (`#624 voice-page-modularity`) -----------------------
 
 /**
