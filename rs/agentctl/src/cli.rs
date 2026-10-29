@@ -1245,6 +1245,9 @@ enum ChatCommand {
     /// Run event-driven provider and Herdr subscriptions until SIGINT or SIGTERM; the bridge's
     /// sends wait for the agent's lifecycle lock as priority senders, ahead of ordinary agentctl
     /// sends, so a person's message waits at most for the delivery in progress
+    #[command(
+        after_help = "Example:\n  agentctl --registry ~/project/.agentctl chat run --bridge-state ~/.local/state/agentctl/chat\n\nOnly one bridge may serve a channel: chat run holds a lock for each configured channel while it\nruns, and refuses to start, naming the live bridge, when another chat run on this host already\nholds one. The locks live in /run/user/UID/agentctl/chat-channels/ (or\n/tmp/agentctl-UID/chat-channels/ without a user runtime directory); AGENTCTL_CHAT_CHANNEL_LOCK_DIR\nnames another directory."
+    )]
     Run(ChatRun),
     /// Store one reply for an open request from a file, and wake a running service to send it.
     /// Normally an agent replies between the prompt's two marker lines instead

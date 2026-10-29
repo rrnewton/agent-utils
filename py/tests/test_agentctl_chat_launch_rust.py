@@ -177,6 +177,8 @@ class Fixture:
                 "FAKE_HERDR_DIR": str(self.control),
                 "FAKE_PANE_CWD": str(self.root),
                 "AGENTCTL_HOME": str(self.home),
+                # One bridge per channel is host-wide; concurrent test runs share channel IDs.
+                "AGENTCTL_CHAT_CHANNEL_LOCK_DIR": str(self.root / "channel-locks"),
                 "PATH": f"{self.bin_dir}:{env['PATH']}",
             }
         )

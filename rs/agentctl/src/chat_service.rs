@@ -39,6 +39,7 @@ use crate::error::AdapterErrorKind;
 use crate::stale_composer::{HerdrComposerPane, StaleComposer};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
+pub mod channel_lock;
 #[cfg(test)]
 mod grant_refresh_tests;
 #[cfg(test)]
@@ -1108,6 +1109,9 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         let _target = manager.pane_info(&state.config().agent_name)?;
     }
     let _lease = state.acquire_runner_lease()?;
+    // Before the provider subscribes: a second bridge on a channel would admit every message
+    // there too (#677 chat-bridge-repoint).
+    let _channels = channel_lock::acquire(state_root, state.config())?;
 
     if let Some(queue) = ack_queue.as_ref() {
         queue.enqueue(state.pending_ack_keys()?);
