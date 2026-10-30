@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -352,3 +353,263 @@ def test_root_helper_carries_the_callers_dash_b_across_sudo_by_argv(
     argv = json.loads(completed.stdout)
     assert argv[4 : 4 + len(expected)] == expected
     assert argv[4 + len(expected)].endswith("sandbox.py")
+
+
+# ----------------------------------------------- run --place-only (slices once)
+
+
+def _fake_systemd_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Put recording systemctl, systemd-escape and sudo first on PATH; return the call log.
+
+    FAKE_SLEEP makes systemctl and sudo hang, for the deadline cases. Nothing
+    here reaches a real user manager or sudo.
+    """
+
+    tools = tmp_path / "fake-tools"
+    tools.mkdir()
+    log = tmp_path / "calls.log"
+    record = '#!/bin/sh\nprintf \'%s %s\\n\' "$(basename "$0")" "$*" >> "$FAKE_LOG"\n'
+    hang = 'if [ -n "$FAKE_SLEEP" ]; then sleep "$FAKE_SLEEP"; fi\nexit 0\n'
+    (tools / "systemctl").write_text(record + hang)
+    (tools / "sudo").write_text(record + hang)
+    (tools / "systemd-escape").write_text(
+        record + 'printf \'%s\\n\' "$2" | sed \'s/-/\\\\x2d/g\'\n'
+    )
+    for tool in tools.iterdir():
+        tool.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.delenv("FAKE_SLEEP", raising=False)
+    return log
+
+
+def _calls(log: Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _slot_view(tmp_path: Path, slot: str = "s1") -> sandbox.SlotView:
+    return sandbox.SlotView(
+        slot=slot,
+        slot_type="agent",
+        slot_path=tmp_path / "slot",
+        state_directory=tmp_path / "state",
+        git_directories=(),
+        control_directory=tmp_path / "control",
+        representation="image",
+        project_root=tmp_path / "project",
+    )
+
+
+_LIMITS = sandbox.SandboxLimits(memory_max="8G", tasks_max=512, all_slots_memory_max="64G")
+
+
+def _count_parent_slice_calls(monkeypatch: pytest.MonkeyPatch, cgroup: Path) -> list[int]:
+    """Read the caller's slice from ``cgroup`` once; any second reading fails the test."""
+
+    calls: list[int] = []
+    real = sandbox.parent_slice
+
+    def once(cgroup_file: Path = cgroup) -> str | None:
+        calls.append(1)
+        assert len(calls) == 1, "the caller's slice was read again after placement"
+        return real(cgroup)
+
+    monkeypatch.setattr(sandbox, "parent_slice", once)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("cgroup_line", "triple"),
+    [
+        # The caller is already inside a named slice (T3b).
+        (
+            "0::/user.slice/user-1.slice/user@1.service/app.slice/agent-7.scope",
+            ("app.slice", "app-wrkslots.slice", "app-wrkslots-s1.slice"),
+        ),
+        # A nested enclosing slice: the innermost one is the parent.
+        (
+            "0::/user.slice/user-1.slice/user@1.service/app.slice/app-jail.slice/x.scope",
+            ("app-jail.slice", "app-jail-wrkslots.slice", "app-jail-wrkslots-s1.slice"),
+        ),
+        # No enclosing slice, represented explicitly rather than rediscovered.
+        (
+            "0::/user.slice/user-1.slice/user@1.service/app.scope",
+            (None, "wrkslots.slice", "wrkslots-s1.slice"),
+        ),
+    ],
+)
+def test_place_only_reads_the_slice_once_and_limits_exactly_those_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cgroup_line: str,
+    triple: tuple[str | None, str, str],
+) -> None:
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text(cgroup_line + "\n")
+    calls = _count_parent_slice_calls(monkeypatch, cgroup)
+
+    placement, applied = sandbox.place_only(_slot_view(tmp_path), _LIMITS, cgroup_file=cgroup)
+
+    assert (placement.enclosing, placement.all_slots, placement.slot) == triple
+    assert placement.to_obj() == dict(zip(("enclosing", "all_slots", "slot"), triple))
+    assert calls == [1]  # one reading; a second one would have failed inside the wrapper
+    _enclosing, all_slots, slot = triple
+    systemctl = [line for line in _calls(log) if line.startswith("systemctl ")]
+    assert systemctl == [
+        f"systemctl --user start {all_slots}",
+        f"systemctl --user set-property --runtime {all_slots} MemoryMax=64G MemorySwapMax=0",
+        f"systemctl --user start {slot}",
+        f"systemctl --user set-property --runtime {slot} MemoryMax=8G MemorySwapMax=0 TasksMax=512",
+    ]
+    assert applied == [
+        f"{all_slots}: MemoryMax=64G MemorySwapMax=0",
+        f"{slot}: MemoryMax=8G MemorySwapMax=0 TasksMax=512",
+    ]
+    assert not any("-wrkslots-s1-wrkslots" in line for line in _calls(log))
+
+
+def test_explicit_absent_parent_is_not_rediscovered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox, "parent_slice", lambda cgroup_file=None: "moved.slice")
+
+    # None still means "rediscover", exactly as before.
+    assert sandbox.root_slice() == "moved-wrkslots.slice"
+    assert sandbox.root_slice(None) == "moved-wrkslots.slice"
+    # The explicit absent value and an explicit name are taken as given.
+    assert sandbox.root_slice(sandbox.NO_ENCLOSING_SLICE) == "wrkslots.slice"
+    assert sandbox.root_slice("app.slice") == "app-wrkslots.slice"
+
+
+def test_ordinary_slice_limits_still_rediscover_the_callers_slice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    monkeypatch.setattr(sandbox, "parent_slice", lambda cgroup_file=None: "jail.slice")
+
+    sandbox.apply_slice_limits(_slot_view(tmp_path), _LIMITS)
+
+    assert "systemctl --user start jail-wrkslots.slice" in _calls(log)
+    assert "systemctl --user start jail-wrkslots-s1.slice" in _calls(log)
+
+
+def test_place_only_deadline_kills_a_hung_systemctl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_systemd_tools(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_SLEEP", "30")
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text("0::/user.slice/user-1.slice/user@1.service/app.scope\n")
+    started = time.monotonic()
+
+    with pytest.raises(sandbox.SandboxError, match="the deadline passed during setting limits on wrkslots.slice"):
+        sandbox.place_only(
+            _slot_view(tmp_path),
+            _LIMITS,
+            cgroup_file=cgroup,
+            deadline_ns=time.monotonic_ns() + 500_000_000,
+        )
+
+    assert time.monotonic() - started < 10
+
+
+def test_a_passed_deadline_starts_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text("0::/user.slice/user-1.slice/user@1.service/app.scope\n")
+
+    with pytest.raises(sandbox.SandboxError, match="the deadline passed before systemd-escape"):
+        sandbox.place_only(
+            _slot_view(tmp_path), _LIMITS, cgroup_file=cgroup, deadline_ns=time.monotonic_ns() - 1
+        )
+    with pytest.raises(sandbox.SandboxError, match=r"the deadline passed before `sudo -n true`"):
+        sandbox.check_sudo(deadline_ns=time.monotonic_ns() - 1)
+
+    assert _calls(log) == []
+
+
+def test_check_sudo_deadline_kills_a_hung_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_SLEEP", "30")
+    started = time.monotonic()
+
+    with pytest.raises(sandbox.SandboxError, match=r"the deadline passed during `sudo -n true`"):
+        sandbox.check_sudo(deadline_ns=time.monotonic_ns() + 300_000_000)
+
+    assert time.monotonic() - started < 10
+    assert _calls(log) == ["sudo -n true"]
+    # Without a deadline the probe is unchanged: it simply runs.
+    monkeypatch.delenv("FAKE_SLEEP")
+    sandbox.check_sudo()
+    assert _calls(log) == ["sudo -n true", "sudo -n true"]
+
+
+def _registered_slot(tmp_path: Path) -> Path:
+    root = _create_fixture(tmp_path)
+    assert cli._cmd_create(_create_args(root, representation="worktree")) == 0
+    return root
+
+
+def test_run_place_only_prints_the_captured_slices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _registered_slot(tmp_path)
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text("0::/user.slice/user-1.slice/user@1.service/app.slice/agent.scope\n")
+    real = sandbox.place_only
+    monkeypatch.setattr(
+        sandbox,
+        "place_only",
+        lambda view, limits, *, deadline_ns=None: real(
+            view, limits, deadline_ns=deadline_ns, cgroup_file=cgroup
+        ),
+    )
+    capsys.readouterr()
+
+    assert cli.main(
+        ["--project-root", str(root), "run", "slot-b", "--place-only", "--format", "json",
+         "--memory-max", "8G", "--deadline-monotonic-ns", str(time.monotonic_ns() + 60 * 10**9)]
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "enclosing": "app.slice",
+        "all_slots": "app-wrkslots.slice",
+        "slot": "app-wrkslots-slot\\x2db.slice",
+    }
+    assert "wrkslots run: limits app-wrkslots-slot\\x2db.slice: MemoryMax=8G" in captured.err
+    assert not any(line.startswith(("busctl", "systemd-run")) for line in _calls(log))
+
+    assert cli.main(["--project-root", str(root), "run", "slot-b", "--place-only"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "enclosing: app.slice",
+        "all_slots: app-wrkslots.slice",
+        "slot: app-wrkslots-slot\\x2db.slice",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--place-only", "--", "true"], "--place-only runs nothing and takes no COMMAND"),
+        (["--place-only", "--print"], "--place-only runs nothing and takes no --print"),
+        (["--place-only", "--cwd", "/"], "--place-only runs nothing and takes no --cwd"),
+        (["--format", "json", "--", "true"], "--format applies only with --place-only"),
+        (["--deadline-monotonic-ns", "1", "--", "true"], "--deadline-monotonic-ns applies only with --place-only"),
+    ],
+)
+def test_run_refuses_place_only_options_it_cannot_honour(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+    message: str,
+) -> None:
+    root = _registered_slot(tmp_path)
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["--project-root", str(root), "run", "slot-b", *extra]) != 0
+
+    assert message in capsys.readouterr().err
+    assert _calls(log) == []

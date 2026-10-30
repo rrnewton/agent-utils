@@ -2207,6 +2207,16 @@ its bound paths behind the fresh `/tmp`.
 `wrkslots run SLOT --print -- COMMAND` shows the scope, slice limits, environment additions, and
 the helper command (for `root`, the view spec) without running anything.
 
+`wrkslots run SLOT --place-only [--format json]` is for a caller that creates and owns its own
+transient scope instead of letting `run` create one. Run it before creating that scope, from the
+caller's own cgroup. It reads the caller's slice once, derives the all-slots and slot slices from
+that single reading, applies the limits to exactly those two names, and prints the enclosing,
+all-slots and slot slice names (`enclosing` is `null` when the caller is in no slice). It joins no
+scope and runs nothing. Reading the slice again from inside the new scope would instead nest a
+second `…-wrkslots-<slot>-wrkslots…` tree. `--deadline-monotonic-ns NS` bounds every
+`systemd-escape` and `systemctl` call by an absolute `CLOCK_MONOTONIC` time; a call still running
+at the deadline is killed and the command is refused.
+
 ### Limits of the box
 
 The box stops accidents, not a process that sets out to leave it:

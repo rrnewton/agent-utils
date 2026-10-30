@@ -217,7 +217,13 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "  wrkslots run slot01 --memory-max 32G --cpu-quota 800% -- claude\n"
             "  wrkslots run slot01 --isolation root -- claude\n"
             "  wrkslots run slot01 --home hidden --home-expose .gitconfig -- bash\n"
-            "  wrkslots run slot01 --print -- bash"
+            "  wrkslots run slot01 --print -- bash\n"
+            "  wrkslots run slot01 --place-only --format json\n\n"
+            "Placing your own scope: --place-only is for a caller that creates and owns its own "
+            "transient scope instead of letting run create one. Run it BEFORE creating the scope, "
+            "from the caller's own cgroup: it reads the caller's slice once, applies the slot "
+            "limits to the all-slots and slot slices derived from that one reading, and prints "
+            "the three names. Pass the slot slice to `systemd-run --scope --slice=...`."
         ),
         formatter_class=formatter,
     )
@@ -226,6 +232,37 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     _view_arguments(run)
     run.add_argument("--cwd", metavar="PATH", help="working directory (default: the slot directory)")
     run.add_argument("--print", action="store_true", dest="print_only", help="print the scope, slice limits, environment additions, and helper command or view; run nothing")
+    run.add_argument(
+        "--place-only",
+        action="store_true",
+        help=(
+            "apply the slot's slice limits and print the enclosing, all-slots and slot slice "
+            "names, computed from ONE reading of this process's cgroup; join no scope and run "
+            "nothing. Takes no COMMAND, --print or --cwd"
+        ),
+    )
+    run.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default=None,
+        help=(
+            "with --place-only: human prints one NAME: VALUE line per slice; json prints "
+            "{enclosing, all_slots, slot}, where enclosing is null when the caller is in no "
+            "slice of the user manager (default: human)"
+        ),
+    )
+    run.add_argument(
+        "--deadline-monotonic-ns",
+        type=int,
+        default=None,
+        metavar="NS",
+        help=(
+            "with --place-only: an absolute CLOCK_MONOTONIC time in nanoseconds (the value "
+            "time.monotonic_ns() would return then). Every systemd-escape, systemctl and sudo "
+            "probe gets only the time left, is killed at the deadline, and the command is "
+            "refused; one already past is refused before it starts (default: no deadline)"
+        ),
+    )
     run.add_argument("command", nargs="*", help="command to run, after a literal -- (default: $SHELL)")
     run.set_defaults(handler=_cmd_run)
 
@@ -1057,8 +1094,15 @@ def _cmd_box(args: argparse.Namespace) -> int:
 def _cmd_run(args: argparse.Namespace) -> int:
     config = _config(args)
     view = slot_view(config, args.slot, args.slot_type)
+    deadline_ns: int | None = getattr(args, "deadline_monotonic_ns", None)
+    output_format: str | None = getattr(args, "format", None)
     try:
         settings = _override_settings(config.sandbox_settings, args)
+        if getattr(args, "place_only", False):
+            return _place_only(args, view, settings, deadline_ns, output_format or "human")
+        for option, value in (("--deadline-monotonic-ns", deadline_ns), ("--format", output_format)):
+            if value is not None:
+                raise _refuse(f"{option} applies only with --place-only")
         command = list(args.command)
         if not command:
             command = [os.environ.get("SHELL", "/bin/sh")]
@@ -1071,6 +1115,36 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
     except sandbox.SandboxError as exc:
         raise _refuse(str(exc)) from exc
+
+
+def _place_only(
+    args: argparse.Namespace,
+    view: sandbox.SlotView,
+    settings: sandbox.SandboxSettings,
+    deadline_ns: int | None,
+    output_format: str,
+) -> int:
+    """``run --place-only``: apply the slot's slice limits and print the names; run nothing."""
+
+    import sys
+
+    for option, given in (
+        ("COMMAND", bool(args.command)),
+        ("--print", bool(args.print_only)),
+        ("--cwd", args.cwd is not None),
+    ):
+        if given:
+            raise _refuse(f"--place-only runs nothing and takes no {option}")
+    placement, applied = sandbox.place_only(view, settings.limits, deadline_ns=deadline_ns)
+    for line in applied:
+        print(f"wrkslots run: limits {line}", file=sys.stderr)
+    if output_format == "json":
+        print(json.dumps(placement.to_obj(), sort_keys=True))
+    else:
+        print(f"enclosing: {placement.enclosing or '-'}")
+        print(f"all_slots: {placement.all_slots}")
+        print(f"slot: {placement.slot}")
+    return 0
 
 
 def _cmd_sandbox_help(args: argparse.Namespace) -> int:

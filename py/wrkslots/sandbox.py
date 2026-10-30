@@ -498,12 +498,38 @@ class SlotView:
 # ------------------------------------------------------------------ slices
 
 
-def systemd_escape(value: str) -> str:
+def _timeout(deadline_ns: int | None, what: str) -> float | None:
+    """Seconds left before ``deadline_ns`` (CLOCK_MONOTONIC), or None for no deadline.
+
+    A deadline that has already passed refuses the step instead of starting it.
+    """
+
+    if deadline_ns is None:
+        return None
+    remaining = deadline_ns - time.monotonic_ns()
+    if remaining <= 0:
+        raise SandboxError(f"the deadline passed before {what}")
+    return remaining / 1_000_000_000
+
+
+def _deadline_refusal(what: str) -> SandboxError:
+    return SandboxError(f"the deadline passed during {what}; it was stopped")
+
+
+def systemd_escape(value: str, *, deadline_ns: int | None = None) -> str:
     """Escape a string for use inside a systemd unit name."""
 
-    result = subprocess.run(
-        ["systemd-escape", "--", value], capture_output=True, text=True, check=False
-    )
+    what = f"systemd-escape {value!r}"
+    try:
+        result = subprocess.run(
+            ["systemd-escape", "--", value],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_timeout(deadline_ns, what),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _deadline_refusal(what) from exc
     if result.returncode != 0:
         raise SandboxError(f"systemd-escape failed for {value!r}: {result.stderr.strip()}")
     return result.stdout.strip()
@@ -534,24 +560,38 @@ def parent_slice(cgroup_file: Path = Path("/proc/self/cgroup")) -> str | None:
     return None
 
 
+#: ``parent`` value meaning "the caller is in no slice of the user manager",
+#: decided by the caller. ``None`` instead means "look at /proc/self/cgroup now",
+#: which inside a scope the caller has just joined would find a different answer.
+NO_ENCLOSING_SLICE = ""
+
+
 def root_slice(parent: str | None = None) -> str:
-    """The slice holding every slot's slice (the all-slots guard)."""
+    """The slice holding every slot's slice (the all-slots guard).
+
+    ``parent`` is the enclosing slice, :data:`NO_ENCLOSING_SLICE` for none, or
+    None to rediscover it with :func:`parent_slice`.
+    """
 
     enclosing = parent if parent is not None else parent_slice()
-    prefix = "" if enclosing is None else enclosing.removesuffix(".slice") + "-"
+    prefix = "" if not enclosing else enclosing.removesuffix(".slice") + "-"
     return f"{prefix}wrkslots.slice"
 
 
-def slice_name(slot_type: str, slot: str, parent: str | None = None) -> str:
+def slice_name(
+    slot_type: str, slot: str, parent: str | None = None, *, deadline_ns: int | None = None
+) -> str:
     """The slice for one slot, nested under the caller's slice unless ``parent`` is given."""
 
     # A dash in a slice name means nesting, so the slot name is escaped: slot
     # "kvm-foo" becomes one child of the wrkslots slice, not three levels.
     if slot_type == "box":
         # Coordinator boxes nest under <root>-box.slice, apart from the slots.
-        return root_slice(parent).removesuffix(".slice") + f"-box-{systemd_escape(slot)}.slice"
+        escaped = systemd_escape(slot, deadline_ns=deadline_ns)
+        return root_slice(parent).removesuffix(".slice") + f"-box-{escaped}.slice"
     label = slot if slot_type == "agent" else f"{slot_type}:{slot}"
-    return root_slice(parent).removesuffix(".slice") + f"-{systemd_escape(label)}.slice"
+    escaped = systemd_escape(label, deadline_ns=deadline_ns)
+    return root_slice(parent).removesuffix(".slice") + f"-{escaped}.slice"
 
 
 def slice_limit_properties(limits: SandboxLimits) -> list[str]:
@@ -572,8 +612,19 @@ def slice_limit_properties(limits: SandboxLimits) -> list[str]:
     return properties
 
 
-def apply_slice_limits(view: SlotView, limits: SandboxLimits) -> list[str]:
-    """Set runtime limits on the slot's slice (and the all-slots slice)."""
+def apply_slice_limits(
+    view: SlotView,
+    limits: SandboxLimits,
+    *,
+    parent: str | None = None,
+    deadline_ns: int | None = None,
+) -> list[str]:
+    """Set runtime limits on the slot's slice (and the all-slots slice).
+
+    ``parent`` names the enclosing slice exactly as :func:`root_slice` takes it
+    (None rediscovers it). ``deadline_ns`` (CLOCK_MONOTONIC) bounds every
+    systemctl call; a call still running at the deadline is killed and refused.
+    """
 
     applied: list[str] = []
     root_limits: list[str] = []
@@ -582,24 +633,80 @@ def apply_slice_limits(view: SlotView, limits: SandboxLimits) -> list[str]:
     if limits.all_slots_cpu_quota:
         root_limits.append(f"CPUQuota={limits.all_slots_cpu_quota}")
     for unit, properties in (
-        (root_slice(), root_limits),
-        (slice_name(view.slot_type, view.slot), slice_limit_properties(limits)),
+        (root_slice(parent), root_limits),
+        (
+            slice_name(view.slot_type, view.slot, parent, deadline_ns=deadline_ns),
+            slice_limit_properties(limits),
+        ),
     ):
         if not properties:
             continue
         # A slice has to be loaded before its properties can be set; starting
         # it is idempotent and leaves no process behind.
-        subprocess.run(["systemctl", "--user", "start", unit], capture_output=True, check=False)
-        result = subprocess.run(
-            ["systemctl", "--user", "set-property", "--runtime", unit, *properties],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        what = f"setting limits on {unit}"
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "start", unit],
+                capture_output=True,
+                check=False,
+                timeout=_timeout(deadline_ns, what),
+            )
+            result = subprocess.run(
+                ["systemctl", "--user", "set-property", "--runtime", unit, *properties],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_timeout(deadline_ns, what),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise _deadline_refusal(what) from exc
         if result.returncode != 0:
             raise SandboxError(f"cannot set limits on {unit}: {result.stderr.strip()}")
         applied.append(f"{unit}: {' '.join(properties)}")
     return applied
+
+
+@dataclasses.dataclass(frozen=True)
+class SlicePlacement:
+    """The three slice names a caller places its own scope under, captured once."""
+
+    #: The caller's innermost user-manager slice, or None when it is in none.
+    enclosing: str | None
+    #: The all-slots slice (aggregate limits), a child of ``enclosing``.
+    all_slots: str
+    #: This slot's slice (per-slot limits), a child of ``all_slots``.
+    slot: str
+
+    def to_obj(self) -> dict[str, str | None]:
+        return {"enclosing": self.enclosing, "all_slots": self.all_slots, "slot": self.slot}
+
+
+def place_only(
+    view: SlotView,
+    limits: SandboxLimits,
+    *,
+    deadline_ns: int | None = None,
+    cgroup_file: Path = Path("/proc/self/cgroup"),
+) -> tuple[SlicePlacement, list[str]]:
+    """Apply the slot's slice limits and return the slice names, joining nothing.
+
+    For a caller that creates its own scope (``systemd-run --scope
+    --slice=SLOT``) and later enters the box from inside it. The caller's slice
+    is read ONCE, here, outside any scope; the all-slots and slot slices are
+    derived from that one answer and the limits are applied to exactly those
+    names, so nothing is rediscovered from a cgroup the caller has since moved
+    into. Returns the placement and the limit lines applied.
+    """
+
+    enclosing = parent_slice(cgroup_file)
+    parent = NO_ENCLOSING_SLICE if enclosing is None else enclosing
+    placement = SlicePlacement(
+        enclosing=enclosing,
+        all_slots=root_slice(parent),
+        slot=slice_name(view.slot_type, view.slot, parent, deadline_ns=deadline_ns),
+    )
+    applied = apply_slice_limits(view, limits, parent=parent, deadline_ns=deadline_ns)
+    return placement, applied
 
 
 # ------------------------------------------------------------ the view spec
@@ -1480,12 +1587,26 @@ def root_helper(spec_file: str) -> list[str]:
     return ["sudo", "-n", "--", _interpreter(), *flags, str(Path(__file__).resolve()), "enter-root", spec_file]
 
 
-def check_sudo() -> None:
-    """Fail clearly, never prompt, when ``sudo -n`` cannot run without a password."""
+def check_sudo(*, deadline_ns: int | None = None) -> None:
+    """Fail clearly, never prompt, when ``sudo -n`` cannot run without a password.
+
+    ``deadline_ns`` (CLOCK_MONOTONIC) bounds the probe; a probe still running
+    at the deadline is killed and refused.
+    """
 
     if shutil.which("sudo") is None:
         raise SandboxError("isolation root needs sudo, which is not installed")
-    result = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True, check=False)
+    what = "`sudo -n true`"
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "true"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_timeout(deadline_ns, what),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _deadline_refusal(what) from exc
     if result.returncode != 0:
         detail = result.stderr.strip() or f"exit {result.returncode}"
         raise SandboxError(
