@@ -1864,6 +1864,7 @@ const OUTBOX = await moduleForTests("src/core/outbox/index.ts");
 const CALL = await moduleForTests("src/core/call/index.ts");
 const WEB_PLATFORM = await moduleForTests("src/platform/web/index.ts");
 const SYNC = await moduleForTests("src/core/sync/index.ts");
+const VIEW_DOM = await moduleForTests("src/view/dom/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
@@ -7368,6 +7369,30 @@ test("`#624 voice-page-modularity`: the quick retries after a stand-in read, fro
   assert.equal(retries.take(1000), 1000);
   assert.equal(retries.noteRead(false), false);
   assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS, "a retry wanted before a current read was still taken");
+});
+
+test("`#624 voice-page-modularity`: the DOM walks, on plain nodes, from the module alone", () => {
+  const { nodeWithin, shownNode, childByClass } = VIEW_DOM;
+  const node = (className, children = [], extra = {}) => {
+    const made = { className, children, nodeType: 1, hidden: false, parentNode: null, ...extra };
+    for (const child of children) child.parentNode = made;
+    return made;
+  };
+  const author = node("msg-author reading-mark");
+  const inText = node("archive");
+  const body = node("md", [inText]);
+  const meta = node("meta", [author]);
+  const row = node("row", [meta, body]);
+  assert.deepStrictEqual([nodeWithin(row, author), nodeWithin(meta, inText), nodeWithin(row, row), nodeWithin(row, null)], [true, false, true, false]);
+  assert.equal(childByClass(row, "reading-mark"), author, "a class among others was not found");
+  assert.equal(childByClass(row, "archive"), null, "a part was looked for inside the message's own text");
+  assert.equal(row.partsFound.get("reading-mark"), author, "what was found was not remembered");
+  // Remembered, but no longer carrying the class: walked for again.
+  author.className = "msg-author";
+  assert.equal(childByClass(row, "reading-mark"), null);
+  assert.equal(shownNode(author), true);
+  meta.hidden = true;
+  assert.equal(shownNode(author), false, "a node inside a hidden one counted as shown");
 });
 
 test("`#624 voice-page-modularity`: which read a refresh makes, and how fresh it is, from the module alone", () => {

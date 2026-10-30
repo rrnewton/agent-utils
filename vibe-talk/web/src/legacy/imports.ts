@@ -156,6 +156,7 @@ export {
   createSettingsSync,
 } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
+export { childByClass, nodeWithin, shownNode } from "../view/dom/index.ts";
 export {
   DEEP_LINK_PART_MAX,
   SPACE_EM,

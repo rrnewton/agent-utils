@@ -11291,13 +11291,7 @@ function focusLost() {
   return !held || held === document.body || held === document.documentElement;
 }
 
-/** Whether `node` and every element around it are shown, as far as their `hidden` says. */
-function shownNode(node) {
-  for (let at = node; at && at.nodeType === 1; at = at.parentNode) {
-    if (at.hidden === true) return false;
-  }
-  return true;
-}
+// Whether a node and everything around it is shown (`shownNode`) is web/src/view/dom's.
 
 /** The message boxes are where Escape leaves the field before it goes Back. See `onEscape`. */
 const isComposer = (node) => Boolean(node) && COMPOSER_FIELDS.includes(String(node.id || ""));
@@ -32121,52 +32115,7 @@ function noteAuthor(channelId, id, name, isBot) {
  *
  * Deciding either per row at construction time would be right only until the next thing happened.
  */
-/**
- * The row's own archive control, found by walking the row rather than by selector.
- *
- * A row is a small tree this file built itself — a meta line and a body — so a walk is exact. It is
- * also the only lookup here that does not go through `el`, and going through `children` keeps it to
- * the same handful of DOM operations the rest of this page uses.
- *
- * `#226 page-energy-profile`. NOT INTO THE MESSAGE'S OWN TEXT. Since the server renders bodies
- * (`#217 markdown-blocks`) a row's text is most of its tree — paragraphs, lists, code — and none of
- * the parts this looks for is ever in it: a `.md` box holds the message and nothing of this file's,
- * and the sanitizer lets no class through that could pass for one of them. Every pass over the rows
- * asks this six to eight times a row, so walking every word of every message, splitting each class
- * attribute on the way, was a quarter of the page's work in live traffic. A class attribute that does
- * not even contain the name is passed over without being split.
- */
-function childByClass(row, className) {
-  // Matched among the element's classes rather than against the whole attribute. The row being
-  // read carries `msg-author reading-mark`, and an exact-string match stopped finding it the
-  // moment the second class was added -- so the label could be set to "reading" and never set
-  // back, which is precisely the bug that reached the suite.
-  const has = (name) => name === className || (name.includes(className) && name.split(/\s+/).includes(className));
-  // `#532 shift-o-latency`. Found before, and still in the row with the class: a pass dressing every row
-  // unpacked under the cards asks this for each part of every row, and walked them all each time.
-  const parts = /** @type {any} */ (row).partsFound;
-  const known = parts ? parts.get(className) : undefined;
-  if (known && has(String(known.className || "")) && nodeWithin(row, known)) return known;
-  const stack = [];
-  const push = (node) => {
-    const kids = node.children;
-    if (kids) for (let at = 0; at < kids.length; at += 1) stack.push(kids[at]);
-  };
-  push(row);
-  while (stack.length > 0) {
-    const node = stack.pop();
-    const name = String(node.className || "");
-    if (has(name)) {
-      if (!parts) /** @type {any} */ (row).partsFound = new Map();
-      /** @type {any} */ (row).partsFound.set(className, node);
-      return node;
-    }
-    if (name !== "md") {
-      push(node);
-    }
-  }
-  return null;
-}
+// A row's own part, found by walking the row (`childByClass`), is web/src/view/dom's.
 
 const doneButtonOf = (row) => childByClass(row, "done-button");
 const notNoiseButtonOf = (row) => childByClass(row, "not-noise-button");
@@ -39476,13 +39425,7 @@ function discordNode(messages) {
  */
 let openRowMenu = null;
 
-/** Whether `node` is `root` or inside it. Walked by hand so it holds for any element. */
-function nodeWithin(root, node) {
-  for (let at = node; at; at = at.parentNode) {
-    if (at === root) return true;
-  }
-  return false;
-}
+// Whether a node is inside another (`nodeWithin`) is web/src/view/dom's.
 
 /** A tap anywhere outside the open ⋯ menu (or its button) closes it. */
 function closeRowMenuOutside(event) {
