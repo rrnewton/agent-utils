@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists and rows, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists, rows and selection, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7246,6 +7246,9 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   // And the rows its list was drawn from: a fresh pair of lists for each column.
   assert.equal(same("columns.side.rows.messages !== columns.main.rows.messages"), true, "the columns shared one list of rows");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshTimelineRows())")), { messages: [], threads: [] });
+  // And what it shows: the right column starts on a thread, as its swapped fields did.
+  assert.equal(same("inColumn(columns.side, () => selection()) === columns.side.selection && selection() === columns.main.selection"), true);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshSelection())")), { view: "thread", threadId: null, thread: null, origin: "main" });
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
@@ -52744,7 +52747,7 @@ test("Links over a channel with no link shows the sentence, and off puts the rea
 test("the channel composer says where the message goes in its placeholder, not in a heading line", () => {
   assert.doesNotMatch(HTML_CODE, /id="channel-compose-label"/, "the composer's heading line came back");
   assert.match(HTML_CODE, /id="channel-compose-text"[^>]*placeholder="Message the main channel…"[^>]*aria-label="Message the main channel"/);
-  assert.match(SCRIPT_CODE, /const destination = selectedThreadId \? "Reply in this thread" : "Message the main channel";/);
+  assert.match(SCRIPT_CODE, /const destination = selection\(\)\.threadId \? "Reply in this thread" : "Message the main channel";/);
   assert.match(SCRIPT_CODE, /el\("channel-compose-text"\)\.placeholder = `\$\{destination\}…`;/);
   assert.doesNotMatch(SCRIPT_CODE, /Write a message…|Write a thread reply…/, "the old, less informative hint came back");
 });
@@ -61071,7 +61074,7 @@ test("`#298 thread-card-header`: the card across the window counts the thread's 
   const always = await run(brokenScript("  if (threadCardsDrawn.get(card.id) === signature) return;\n", ""));
   assert.ok(always.writes > 0, "the negative control wrote nothing either, so the check above proves nothing");
   const heading = await run(brokenScript(
-    "  if (!sideActive && channelView === \"thread\") paintThreadCard(leftEl(\"thread-card\"), openThreadChoice(), tally);\n", ""));
+    "  if (!sideActive && selection().view === \"thread\") paintThreadCard(leftEl(\"thread-card\"), openThreadChoice(), tally);\n", ""));
   assert.notDeepStrictEqual(heading.counted, counted, "the negative control counted the Done anyway, so the check above proves nothing");
 });
 
@@ -64461,7 +64464,7 @@ async function writeInThread(page, text, side = false) {
 }
 
 /** The rule's own line in `sendChannelMessage`, taken out for a negative control. */
-const STARTS_THREAD = "    marksRead: rootThisStarts(channel, selectedThreadId),\n";
+const STARTS_THREAD = "    marksRead: rootThisStarts(channel, selection().threadId),\n";
 
 test("`#300 reply-marks-read`: the first reply written in a thread nobody has answered marks its root read, here and at the provider; the next marks nothing", async () => {
   const { page, data } = await markerPage();
@@ -74646,7 +74649,7 @@ test("`#304 back-gesture-in-app`: CTRL+1 TO CTRL+4 between Main, All and two col
   assert.equal(thread.left, false);
 
   // NEGATIVE CONTROL: a page that takes every view but Main for a thread pushes for All.
-  const pushy = await viewKeyWalk(brokenScript('} else if (channelView === "thread") {', '} else if (channelView !== "main") {'));
+  const pushy = await viewKeyWalk(brokenScript('} else if (selection().view === "thread") {', '} else if (selection().view !== "main") {'));
   assert.ok(pushy.seen.slice(0, 6).some((step) => step.pushed > 0), "the control that takes All for a screen pushed nothing");
 });
 
@@ -80147,9 +80150,9 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
 
 /** The parts of a broken copy that put the page back as it was before review's second round. */
 const CAME_UNDER = "  if (coming) cardCameUnderLists(gap);\n";
-const HELD_ALWAYS = '  listHeldPlace = inColumn(columns.main, () => (channelView === "main" || channelView === "flat"\n';
+const HELD_ALWAYS = '  listHeldPlace = inColumn(columns.main, () => (selection().view === "main" || selection().view === "flat"\n';
 const HELD_WITH_CARD = "  listHeldPlace = inColumn(columns.main, () => (postWatch.shown !== null && " +
-  'leftEl("post-confirm").getAttribute("data-place") === "channel" && (channelView === "main" || channelView === "flat")\n';
+  'leftEl("post-confirm").getAttribute("data-place") === "channel" && (selection().view === "main" || selection().view === "flat")\n';
 
 test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: A DRAFT ARRIVING UNDER THE THREAD LIST leaves a Main reader up the list on their row, behind the cards and back by Cmd-1, Esc and Cmd-4, offered the jump — the box at Main's foot shrinking to one line in the same layout not taken for their being at the foot — and keeps one at Main's foot at it", async () => {
   const DOCKED = 200;
