@@ -295,14 +295,19 @@ before a tool call in the same turn as one summary line. `run` therefore also
 follows the transcript the coordinator's harness writes (Claude Code's session
 file, Codex's rollout, or Muse's session journal), found from the processes
 whose `HERDR_PANE_ID` names the coordinator's pane and looked for again every 30
-seconds. A captured block takes the text of the transcript block under the same
-reply ID when the screen's block renders it: the same characters apart from
-whitespace, box drawing, Markdown markup, link targets and list bullets, or the
-same characters in another order, as when a table's cells wrap. A block whose
-ordinal is already stored keeps its stored text when the screen renders that
-text. A complete transcript block for the request's next ordinal, recorded
-after the request arrived, is stored even when no snapshot shows it. Each
-change in what is read is logged once to standard error. With no transcript, or
+seconds. Only transcript blocks recorded after the request arrived count. A
+protocol-v3 reply ID names one block, so a captured block takes the text of the
+one transcript block under its ID; an ID the transcript holds twice keeps its
+screen text unless one of the two renders as it: the same characters once
+whitespace, box drawing, inline Markdown markup, link targets, the markers that
+open a quote, heading or list item, and code fence and table delimiter lines are
+set aside, or the same characters in another order, as when a table's cells
+wrap. A block whose ordinal is already stored keeps its stored text when the
+screen shows that text, renders it, or the transcript holds it under the ID. The
+transcript's blocks for ordinals that no snapshot shows, from the next one up,
+are stored in order even when a later block is visible, as when Claude Code
+collapsed the earlier one before a tool call. Each change in what is read is
+logged once to standard error. With no transcript, or
 with `AGENTCTL_CHAT_REPLY_TEXT=screen` in `run`'s environment, every reply keeps
 the text read from the screen; `tick` reads only the screen.
 

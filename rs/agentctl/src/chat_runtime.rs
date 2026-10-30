@@ -2144,8 +2144,6 @@ impl WithheldReply {
             plain: parse_hex_digest(&self.plain)?,
             by_column: parse_hex_digest(&self.by_column)?,
             layout: parse_hex_digest(&self.layout)?,
-            // The record keeps no rendered view: a withheld block matches by the other views.
-            rendered: None,
         })
     }
 }
@@ -5855,26 +5853,6 @@ impl BridgeState {
         settled.extend(bodies.iter().map(|body| transcript_digest(key, body)));
     }
 
-    /// The ordinals among `ordinals` of request `key` whose stored text is one of `bodies`.
-    fn ordinals_with_bodies(
-        &self,
-        key: &str,
-        ordinals: &[u32],
-        bodies: &BTreeSet<String>,
-    ) -> Vec<u32> {
-        if bodies.is_empty() {
-            return Vec::new();
-        }
-        ordinals
-            .iter()
-            .copied()
-            .filter(|ordinal| {
-                self.read_reply(key, *ordinal)
-                    .is_ok_and(|reply| bodies.contains(&reply.body))
-            })
-            .collect()
-    }
-
     /// Borrow the immutable authority configuration.
     pub fn config(&self) -> &BridgeConfiguration {
         &self.config
@@ -9557,15 +9535,16 @@ and the replies captured for them. The provider's own thread is the complete rec
         let open_since = records
             .iter()
             .filter(|(record, _)| !record.reply_closed)
-            .map(|(record, _)| {
-                (
+            .filter_map(|(record, _)| {
+                Some((
                     record.reply_nonce.clone(),
-                    (record.key.clone(), record.admitted_at_millis),
-                )
+                    (record.key.clone(), answerable_since(record)?),
+                ))
             })
             .collect::<BTreeMap<_, _>>();
-        let transcript_merge = merge_transcript_blocks(
+        let mut transcript_text = merge_transcript_blocks(
             &mut scan.by_nonce,
+            rendered,
             &transcript,
             &open_since,
             &known_nonces,
@@ -9616,23 +9595,17 @@ and the replies captured for them. The provider's own thread is the complete rec
                 .as_ref()
                 .and_then(|record| Some(record.withheld_identities(record.alias_of(key)?)))
                 .unwrap_or_default();
-            let added = transcript_merge
-                .added
-                .get(&nonce)
-                .cloned()
-                .unwrap_or_default();
+            let text = transcript_text.remove(&nonce).unwrap_or_default();
             let capture = self.capture_scanned_replies_locked(
                 key,
                 &found.blocks,
                 found.refused,
                 &withheld,
-                &added,
+                &text,
             )?;
-            self.settle_transcript_bodies(key, &added);
-            let from_transcript =
-                self.ordinals_with_bodies(key, &capture.ordinals, &transcript_merge.used);
-            if !from_transcript.is_empty() {
-                transcript_replies.push((key.clone(), from_transcript));
+            self.settle_transcript_bodies(key, &text.consumed);
+            if !capture.transcript_ordinals.is_empty() {
+                transcript_replies.push((key.clone(), capture.transcript_ordinals.clone()));
             }
             if let Some(last) = capture.ordinals.last() {
                 next_by_nonce.insert(nonce, last.saturating_add(1));
@@ -10692,7 +10665,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             }],
             Vec::new(),
             &withheld,
-            &BTreeSet::new(),
+            &TranscriptText::default(),
         )?;
         if let Some(refusal) = capture.refused.first() {
             return Err(ChatRuntimeError::invalid(refusal.reason.clone()));
@@ -10712,10 +10685,10 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     /// The ordinal of the newest reply of `key` with the text of `body`, as a capture compares
     /// texts.
     fn stored_ordinal_locked(&self, key: &str, body: &str) -> Result<u32> {
-        let identity = ReplyIdentity::of(body);
+        let plain = ReplyIdentity::of(body).plain;
         let request = self.read_request(key)?;
         for ordinal in (1..request.next_reply_ordinal).rev() {
-            if ReplyIdentity::of(&self.read_reply(key, ordinal)?.body).same_text(&identity) {
+            if ReplyIdentity::of(&self.read_reply(key, ordinal)?.body).plain == plain {
                 return Ok(ordinal);
             }
         }
@@ -11282,13 +11255,14 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             &self.config.reply_alias_numbers(),
             &BTreeSet::new(),
         )?;
-        let transcript_merge = merge_transcript_blocks(
+        let mut transcript_text = merge_transcript_blocks(
             &mut scan.by_nonce,
+            rendered,
             &transcript,
-            &BTreeMap::from([(
-                request.reply_nonce.clone(),
-                (key.to_owned(), request.admitted_at_millis),
-            )]),
+            &answerable_since(&request)
+                .map(|since| (request.reply_nonce.clone(), (key.to_owned(), since)))
+                .into_iter()
+                .collect(),
             &expected,
             &alias_routes,
             &self.settled_transcript(),
@@ -11330,21 +11304,17 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     .zip(aliases.as_ref())
                     .map(|(alias, record)| record.withheld_identities(alias))
                     .unwrap_or_default();
-                let added = transcript_merge
-                    .added
-                    .get(&request.reply_nonce)
-                    .cloned()
+                let text = transcript_text
+                    .remove(&request.reply_nonce)
                     .unwrap_or_default();
-                let mut capture = self.capture_scanned_replies_locked(
+                let capture = self.capture_scanned_replies_locked(
                     key,
                     &found.blocks,
                     found.refused,
                     &withheld,
-                    &added,
+                    &text,
                 )?;
-                self.settle_transcript_bodies(key, &added);
-                capture.transcript_ordinals =
-                    self.ordinals_with_bodies(key, &capture.ordinals, &transcript_merge.used);
+                self.settle_transcript_bodies(key, &text.consumed);
                 capture
             }
         };
@@ -11362,13 +11332,20 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     /// before its prompt reached the coordinator, is refused and reported to the coordinator. A
     /// block that cannot be stored is refused for the log, and the rest continue; only state and
     /// I/O faults are errors.
+    ///
+    /// `transcript` holds what the coordinator's transcript gives this request (#710
+    /// chat-transcript-extraction). A screen block it pairs with a transcript text is checked
+    /// under both texts: skipped if the request holds either, and otherwise stored with the
+    /// transcript's text. A block only the transcript holds is skipped if a stored reply reads the
+    /// same once rendered (see `same_rendered_text`), as a reply stored from the screen before
+    /// the transcript held it does.
     fn capture_scanned_replies_locked(
         &self,
         key: &str,
         blocks: &[ScannedReply],
         mut refused: Vec<ReplyRefusal>,
         withheld: &[ReplyIdentity],
-        transcript_only: &BTreeSet<String>,
+        transcript: &TranscriptText,
     ) -> Result<ReplyCapture> {
         let mut request = self.read_request(key)?;
         if request.reply_closed {
@@ -11384,6 +11361,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let mut expected = request.next_reply_ordinal;
         let mut captured = Vec::new();
         let mut unwritten: Vec<(PathBuf, ReplyRecord)> = Vec::new();
+        let mut transcript_ordinals = Vec::new();
         let mut checkpoint = self.read_checkpoint()?;
         // The texts this request stored before this capture, read only when a block that only
         // the transcript holds is about to be stored.
@@ -11426,9 +11404,16 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 }
                 None => {}
             }
-            if transcript_only.contains(&block.body) {
-                // A block only the transcript holds is not stored beside a stored reply it most
-                // likely is, drawn differently: see `near_duplicate`.
+            // The text to store: the transcript's, when it pairs this screen block with one the
+            // request does not hold either.
+            let mut body = &block.body;
+            if let Some(clean) = transcript.clean.get(&block.body) {
+                if known.find(self, key, &ReplyIdentity::of(clean))?.is_some() {
+                    continue;
+                }
+                body = clean;
+            }
+            if transcript.only.contains(&block.body) {
                 if stored_bodies.is_none() {
                     let mut bodies = Vec::new();
                     for ordinal in 1..request.next_reply_ordinal {
@@ -11442,11 +11427,12 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     .chain(unwritten.iter().map(|(_, reply)| &reply.body));
                 if earlier
                     .into_iter()
-                    .any(|body| near_duplicate(body, &block.body))
+                    .any(|earlier| same_rendered_text(earlier, body))
                 {
                     continue;
                 }
             }
+            let from_transcript = body != &block.body || transcript.only.contains(body);
             if expected > MAX_REPLY_ORDINAL {
                 refused.push(refusal(&"reply ordinal space is exhausted"));
                 continue;
@@ -11455,11 +11441,11 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 refused.push(refusal(&"request reply count limit reached"));
                 continue;
             }
-            if let Err(error) = validate_outbound_body(&self.config.agent_label, &block.body) {
+            if let Err(error) = validate_outbound_body(&self.config.agent_label, body) {
                 refused.push(refusal(&error));
                 continue;
             }
-            let reply = match ReplyRecord::new(key, expected, block.body.clone()) {
+            let reply = match ReplyRecord::new(key, expected, body.clone()) {
                 Ok(reply) => reply,
                 Err(error) => {
                     refused.push(refusal(&error));
@@ -11505,6 +11491,10 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             checkpoint.reply_count = next_state_count;
             checkpoint.reply_bytes = next_state_bytes;
             known.insert(identity);
+            if from_transcript {
+                known.insert(ReplyIdentity::of(body));
+                transcript_ordinals.push(expected);
+            }
             captured.push(expected);
             expected = expected.saturating_add(1);
         }
@@ -11538,7 +11528,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             ordinals: captured,
             unknown_ids,
             refused,
-            transcript_ordinals: Vec::new(),
+            transcript_ordinals,
         })
     }
 
@@ -15823,34 +15813,22 @@ fn wrapped_row(run: &[Vec<&str>]) -> bool {
 
 /// SHA-256 digests of a reply's text views. The plain view survives re-wrapped text and
 /// redrawn borders. The column view also survives table cells that wrap at another width, and
-/// the layout tells whether they did. The rendered view, the text's letters and digits alone
-/// without its Markdown link targets, also survives Markdown drawn as styles, so a reply stored from the coordinator's transcript
-/// and the same reply read from its screen are one text (#710 chat-transcript-extraction); a text
-/// with no letters or digits has none.
+/// the layout tells whether they did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReplyIdentity {
     plain: [u8; 32],
     by_column: [u8; 32],
     layout: [u8; 32],
-    rendered: Option<[u8; 32]>,
 }
 
 impl ReplyIdentity {
     fn of(text: &str) -> Self {
         let columns = ColumnView::of(text);
-        let rendered = agent_harness::replies::label_key(text);
         Self {
             plain: Sha256::digest(plain_view(text).as_bytes()).into(),
             by_column: Sha256::digest(columns.text.as_bytes()).into(),
             layout: Sha256::digest(columns.layout.as_bytes()).into(),
-            rendered: (!rendered.is_empty()).then(|| Sha256::digest(rendered.as_bytes()).into()),
         }
-    }
-
-    /// Whether `other` is the same text as far as a store is concerned: the same plain view, or
-    /// the same rendered view.
-    fn same_text(&self, other: &Self) -> bool {
-        self.plain == other.plain || (self.rendered.is_some() && self.rendered == other.rendered)
     }
 }
 
@@ -15870,7 +15848,6 @@ struct KnownReplies {
     /// Highest stored ordinal not read yet, or zero once every stored reply is read.
     unread: u32,
     plain: BTreeSet<[u8; 32]>,
-    rendered: BTreeSet<[u8; 32]>,
     /// Each column-view digest, with the table layouts stored under it.
     by_column: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>>,
 }
@@ -15880,16 +15857,12 @@ impl KnownReplies {
         Self {
             unread: next_reply_ordinal.saturating_sub(1),
             plain: BTreeSet::new(),
-            rendered: BTreeSet::new(),
             by_column: BTreeMap::new(),
         }
     }
 
     fn insert(&mut self, identity: ReplyIdentity) {
         self.plain.insert(identity.plain);
-        if let Some(rendered) = identity.rendered {
-            self.rendered.insert(rendered);
-        }
         self.by_column
             .entry(identity.by_column)
             .or_default()
@@ -15903,11 +15876,7 @@ impl KnownReplies {
         key: &str,
         identity: &ReplyIdentity,
     ) -> Result<Option<IdentityMatch>> {
-        while !self.plain.contains(&identity.plain)
-            && !identity
-                .rendered
-                .is_some_and(|rendered| self.rendered.contains(&rendered))
-        {
+        while !self.plain.contains(&identity.plain) {
             if self.unread == 0 {
                 // A column view that matches only at the same cell widths is different text: a
                 // renderer wraps the same text at the same widths the same way.
@@ -15925,60 +15894,83 @@ impl KnownReplies {
     }
 }
 
-/// Bring the coordinator's transcript into one capture's scan (#710 chat-transcript-extraction),
-/// and return the texts it put there.
+/// Weigh the coordinator's transcript against one capture's scan (#710
+/// chat-transcript-extraction), for the requests in `open_since` (open requests' nonces, with
+/// each one's key and `answerable_since`). Only transcript blocks recorded after their request's
+/// prompt reached the coordinator count: the agent cannot have answered an ID it had not seen,
+/// so an earlier block under the same ID answered something else (another request whose retired
+/// alias was reused) or guessed the ID before the prompt arrived.
 ///
-/// Each block the screen shows takes the text of the newest transcript block under the same ID
-/// that it renders: the same letters and digits, whatever the wrapping, styles, borders or table
-/// layout. Then each complete transcript
-/// block of a request in `open_since` (open requests' nonces, with each one's key and when it was
-/// admitted) that no earlier capture settled (`settled`, see `transcript_digest`) is added when
-/// the scan holds no block with its text: one the screen never showed, or showed only
-/// in part, whose partial blocks it replaces. A transcript block recorded before its request was
-/// admitted, or with no time, is not added: reply aliases are reused once their requests retire,
-/// so an older block under the same alias answered another request. What the transcript adds
-/// goes through every check a screen block does.
+/// A block the screen shows is paired with the newest such transcript block under the same ID
+/// that it renders: the same characters once whitespace, box drawing and Markdown markup are set
+/// aside, or the same characters in another order, as when a table's cells wrap. Every other such
+/// transcript block is one only the transcript holds, unless its text is visible somewhere on
+/// the screen in another form (as a screen block the rendering rules did not pair, a quotation,
+/// or one partly drawn), which the screen path handles. The store decides what each pairing
+/// and each such block means: see `capture_scanned_replies_locked`.
 fn merge_transcript_blocks(
     by_nonce: &mut BTreeMap<String, NonceScan>,
+    rendered: &str,
     transcript: &[TranscriptBlock],
     open_since: &BTreeMap<String, (String, u64)>,
     expected_nonces: &BTreeSet<String>,
     aliases: &BTreeMap<String, String>,
     settled: &BTreeSet<[u8; 32]>,
-) -> TranscriptMerge {
-    use agent_harness::replies::rendered_equivalent;
-    let mut merge = TranscriptMerge::default();
+) -> BTreeMap<String, TranscriptText> {
+    use agent_harness::replies::{rendered_equivalent, rendered_key};
+    let mut merged: BTreeMap<String, TranscriptText> = BTreeMap::new();
     if transcript.is_empty() {
-        return merge;
+        return merged;
     }
-    for found in by_nonce.values_mut() {
-        for block in &mut found.blocks {
-            if let Some(source) = transcript.iter().rev().find(|source| {
-                source.identifier == block.identifier
+    // The transcript blocks that count, with their request nonce and whether a capture settled
+    // them already. A settled block still pairs with the screen block it renders, so that block
+    // is checked under the text stored for it, but it is not added again.
+    let candidates: Vec<(&str, &TranscriptBlock, bool)> = transcript
+        .iter()
+        .filter_map(|source| {
+            let nonce = recognized_reply_marker(&source.identifier, expected_nonces, aliases)?;
+            let (key, admitted) = open_since.get(nonce)?;
+            let at = source.at_millis?;
+            (at >= *admitted).then(|| {
+                let seen = settled.contains(&transcript_digest(key, &source.body));
+                (nonce, source, seen)
+            })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return merged;
+    }
+    let mut paired = vec![false; candidates.len()];
+    for (nonce, found) in by_nonce.iter() {
+        for block in &found.blocks {
+            if let Some(index) = candidates.iter().rposition(|(owner, source, _)| {
+                *owner == nonce.as_str()
+                    && source.identifier == block.identifier
                     && (source.body == block.body || rendered_equivalent(&block.body, &source.body))
             }) {
-                block.body.clone_from(&source.body);
-                merge.used.insert(source.body.clone());
+                paired[index] = true;
+                let text = merged.entry(nonce.clone()).or_default();
+                text.clean
+                    .insert(block.body.clone(), candidates[index].1.body.clone());
+                text.consumed.insert(candidates[index].1.body.clone());
             }
         }
     }
-    for source in transcript {
-        let Some(nonce) = recognized_reply_marker(&source.identifier, expected_nonces, aliases)
-        else {
-            continue;
-        };
-        let (Some((key, admitted)), Some(at)) = (open_since.get(nonce), source.at_millis) else {
-            continue;
-        };
-        if at < *admitted || settled.contains(&transcript_digest(key, &source.body)) {
+    let shown = rendered_key(rendered);
+    for (index, (nonce, source, seen)) in candidates.iter().enumerate() {
+        if paired[index] || *seen {
             continue;
         }
-        let found = by_nonce.entry(nonce.to_owned()).or_default();
-        if found.blocks.iter().any(|block| {
-            block.body == source.body
-                || rendered_equivalent(&block.body, &source.body)
-                || near_duplicate(&block.body, &source.body)
-        }) {
+        let key = rendered_key(&source.body);
+        let label = agent_harness::replies::label_key(&source.body);
+        if [key, label]
+            .iter()
+            .any(|key| !key.is_empty() && shown.contains(key.as_str()))
+        {
+            continue;
+        }
+        let found = by_nonce.entry((*nonce).to_owned()).or_default();
+        if found.blocks.iter().any(|block| block.body == source.body) {
             continue;
         }
         found
@@ -15988,14 +15980,44 @@ fn merge_transcript_blocks(
             identifier: source.identifier.clone(),
             body: source.body.clone(),
         });
-        merge.used.insert(source.body.clone());
-        merge
-            .added
-            .entry(nonce.to_owned())
-            .or_default()
-            .insert(source.body.clone());
+        let text = merged.entry((*nonce).to_owned()).or_default();
+        text.only.insert(source.body.clone());
+        text.consumed.insert(source.body.clone());
     }
-    merge
+    merged
+}
+
+/// Since when the coordinator can have answered `record`, in Unix milliseconds: when its prompt's
+/// delivery was confirmed, or, for a prompt typed but never confirmed, when typing started.
+/// `None` while its prompt has not reached the coordinator.
+fn answerable_since(record: &RequestRecord) -> Option<u64> {
+    record.delivered_at_millis.or(match record.phase {
+        RequestPhase::DeliveryUncertain => record.delivery_started_at_millis,
+        _ => None,
+    })
+}
+
+/// What the coordinator's transcript gives one request's capture.
+#[derive(Debug, Default)]
+struct TranscriptText {
+    /// The transcript's text for each screen block it renders, by the screen block's text.
+    clean: BTreeMap<String, String>,
+    /// The texts of blocks only the transcript holds, added to the scan.
+    only: BTreeSet<String>,
+    /// Every transcript text this capture weighed for the request, settled once it is stored.
+    consumed: BTreeSet<String>,
+}
+
+/// Whether `left` and `right` read the same once rendered: the same characters once whitespace,
+/// box drawing and Markdown markup are set aside, with or without Markdown link targets. Unlike
+/// the pairing of a screen block with its source, the same characters in another order do not
+/// count: here two stored texts are compared.
+fn same_rendered_text(left: &str, right: &str) -> bool {
+    use agent_harness::replies::{label_key, rendered_key};
+    let keys = |text: &str| [rendered_key(text), label_key(text)];
+    let (left, right) = (keys(left), keys(right));
+    left.iter()
+        .any(|key| !key.is_empty() && right.contains(key))
 }
 
 /// The most transcript blocks remembered as settled before the memory starts over.
@@ -16008,43 +16030,6 @@ fn transcript_digest(key: &str, body: &str) -> [u8; 32] {
     hasher.update([0]);
     hasher.update(body.as_bytes());
     hasher.finalize().into()
-}
-
-/// The texts a capture took from the coordinator's transcript.
-#[derive(Debug, Default)]
-struct TranscriptMerge {
-    /// Every text it put in place of a screen block's, or added.
-    used: BTreeSet<String>,
-    /// The texts of the blocks it added, which no screen block rendered, by request nonce.
-    added: BTreeMap<String, BTreeSet<String>>,
-}
-
-/// The lowercase word triples of `text`'s letters and digits, or its words when it has fewer
-/// than three.
-fn word_shingles(text: &str) -> BTreeSet<String> {
-    let words: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    if words.len() < 3 {
-        return words.into_iter().collect();
-    }
-    words.windows(3).map(|triple| triple.join(" ")).collect()
-}
-
-/// Whether two reply texts are most likely one reply drawn two ways that the rendered view does
-/// not equate, as when a terminal renumbers a Markdown list: most of their word triples are
-/// shared (#710 chat-transcript-extraction). A block that only the transcript holds is not
-/// added beside such a block, so one reply is never sent twice.
-fn near_duplicate(left: &str, right: &str) -> bool {
-    let (left, right) = (word_shingles(left), word_shingles(right));
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    let shared = left.intersection(&right).count();
-    let all = left.union(&right).count();
-    shared * 5 >= all * 3
 }
 
 /// The request nonce of a marker identifier: a reply alias that `aliases` maps to an expected
@@ -26789,11 +26774,7 @@ they were not typed: pane is gone"
                 body: format!("guessed answer {index}"),
             })
             .collect::<Vec<_>>();
-        // A withheld block's record keeps no rendered view.
-        let identity = |index: usize| ReplyIdentity {
-            rendered: None,
-            ..ReplyIdentity::of(&blocks[index].body)
-        };
+        let identity = |index: usize| ReplyIdentity::of(&blocks[index].body);
         assert!(record.withhold(alias, &blocks[..MAX_WITHHELD_REPLIES]));
         assert_eq!(
             record.withheld_identities(alias),
@@ -27936,8 +27917,16 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
         }
     }
 
-    /// `state` reading `blocks` as the coordinator's transcript.
+    /// `state` reading `blocks` as the coordinator's transcript, with every request's prompt
+    /// delivered, so its transcript blocks can answer it.
     fn with_transcript(state: &BridgeState, blocks: Vec<TranscriptBlock>) -> BridgeState {
+        for (record, _) in state.request_records().expect("records") {
+            if record.delivered_at_millis.is_none() {
+                state
+                    .set_delivery_phase(&record.key, RequestPhase::Delivered, None)
+                    .expect("deliver");
+            }
+        }
         state
             .clone()
             .with_transcript_replies(Box::new(FixedTranscript {
@@ -28065,14 +28054,11 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
             .expect("command reply");
         let capture = reader.capture_snapshot("").expect("transcript capture");
         assert!(capture.replies.is_empty(), "{capture:?}");
-        // The command stores a text the request holds in another rendering once.
-        let outcome = reader
-            .submit_reply(&key, &id, WRITTEN)
-            .expect("same reply by command");
-        let ReplyStoreOutcome::Stored(stored) = outcome else {
-            panic!("{outcome:?}");
-        };
-        assert_eq!((stored.ordinal, stored.already_stored), (1, true));
+        // Nor once the screen shows the reply again.
+        let capture = reader
+            .capture_snapshot(&reply_block(&id, DRAWN))
+            .expect("screen again");
+        assert!(capture.replies.is_empty(), "{capture:?}");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -28091,6 +28077,102 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
         assert_eq!(capture.transcript_ordinals, [1]);
         assert_eq!(state.read_reply(&key, 1).expect("reply").body, WRITTEN);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_code_block_drawn_without_its_fence_pairs_with_its_source_and_is_stored_once() {
+        // The screen draws a code block's lines without the fence and its info string, and a
+        // list renumbered; the transcript's text pairs with it all the same.
+        let (state, key, nonce, root) = open_request("transcript-fence");
+        let id = format!("{nonce}_1");
+        let written =
+            "Pushed. Verify with:\n```sh\ngit log -1\n```\n1. first check\n1. second check";
+        let drawn = "Pushed. Verify with:\n  git log -1\n1. first check\n2. second check";
+        let state = with_transcript(&state, Vec::new());
+        let later = Some(unix_millis() + 1_000);
+        let reader = with_transcript(&state, vec![transcript_block(&id, written, later)]);
+        let capture = reader
+            .capture_snapshot(&reply_block(&id, drawn))
+            .expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, written);
+        assert!(reader
+            .capture_snapshot("")
+            .expect("empty")
+            .replies
+            .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn progress_updates_that_differ_only_in_numbers_are_each_stored() {
+        // The first update was read from the screen; the second, written before a tool call,
+        // only the transcript holds. They share most of their words, and both go out.
+        let (state, key, nonce, root) = open_request("transcript-progress");
+        let id = format!("{nonce}_1");
+        let update = |done: u32| {
+            format!(
+                "Progress on the release checks: {done} of 12 suites have passed so far, and the \
+                 rest are still running on the shared host; I will report again when they finish."
+            )
+        };
+        assert_eq!(
+            state
+                .capture_snapshot(&reply_block(&id, &update(3)))
+                .expect("screen")
+                .replies,
+            [(key.clone(), vec![1])]
+        );
+        let later = Some(unix_millis() + 1_000);
+        let reader = with_transcript(&state, vec![transcript_block(&id, &update(9), later)]);
+        let capture = reader.capture_snapshot("").expect("transcript");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])]);
+        assert_eq!(state.read_reply(&key, 2).expect("reply").body, update(9));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_transcript_block_written_before_its_prompt_was_delivered_is_not_sent() {
+        // The agent guessed the next reply ID before the request's prompt reached it, and the
+        // block scrolled away; the transcript still holds it, written before delivery.
+        let (state, key, nonce, root) = open_request("transcript-before-delivery");
+        let id = format!("{nonce}_1");
+        let early = Some(unix_millis());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let reader = with_transcript(
+            &state,
+            vec![transcript_block(&id, "a guessed reply", early)],
+        );
+        let capture = reader.capture_snapshot("").expect("capture");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        // A request whose prompt has not reached the coordinator takes no transcript block.
+        let (pending, pending_key, pending_nonce, pending_root) =
+            open_request("transcript-undelivered");
+        let reader = pending
+            .clone()
+            .with_transcript_replies(Box::new(FixedTranscript {
+                blocks: vec![transcript_block(
+                    &format!("{pending_nonce}_1"),
+                    "too early",
+                    Some(unix_millis() + 60_000),
+                )],
+                ..FixedTranscript::default()
+            }));
+        assert!(reader
+            .capture_snapshot("")
+            .expect("capture")
+            .replies
+            .is_empty());
+        assert_eq!(
+            pending
+                .read_request(&pending_key)
+                .expect("request")
+                .next_reply_ordinal,
+            1
+        );
+        let _ = key;
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(pending_root).expect("cleanup");
     }
 
     #[test]
@@ -28113,17 +28195,6 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
         state.settle_transcript(&reply_block(&id, "no transcript, no call"));
         assert_eq!(*settled.lock().unwrap(), [vec![id, "002".to_owned()]]);
         fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn near_duplicates_share_most_word_triples_and_distinct_replies_do_not() {
-        assert!(near_duplicate(&steps("1", "1", "1"), &steps("1", "2", "3")));
-        assert!(!near_duplicate(
-            "Update 1: the build is running on the new host.",
-            "Update 2: the build passed and the deploy starts now."
-        ));
-        assert!(!near_duplicate("", "anything"));
-        assert!(near_duplicate("Done.", "done"));
     }
 
     #[test]

@@ -137,33 +137,84 @@ fn dedent(lines: &[&str]) -> String {
         .join("\n")
 }
 
-/// Characters a terminal draws as style or layout rather than as text: Markdown's emphasis, code,
-/// heading, quote, strike-through, table and link punctuation, and list bullets in either form.
-const MARKUP: &[char] = &[
-    '*', '_', '`', '#', '>', '~', '|', '[', ']', '(', ')', '-', '+', '•', '·', '●', '◦', '▪',
-];
+/// Characters Markdown uses inside a line for emphasis, code, strike-through, tables and links,
+/// which a terminal draws as style or layout rather than as text.
+const INLINE_MARKUP: &[char] = &['*', '_', '`', '~', '|', '[', ']', '(', ')'];
 
-/// Whether `line` is a Markdown table's delimiter row, such as `|---|:---:|`, which a terminal
-/// draws as a rule.
-fn table_delimiter(line: &str) -> bool {
+/// Bullets that open a list item, as Markdown writes them and as terminals draw them.
+const BULLETS: &[char] = &['-', '*', '+', '•', '·', '●', '◦', '▪', '‣'];
+
+/// Whether `line` is drawn as a rule or not at all: a table's delimiter row such as
+/// `|---|:---:|`, a thematic break such as `---` or `***`, or a code fence's opening or closing
+/// line, with or without its info string.
+fn layout_line(line: &str) -> bool {
     let line = line.trim();
-    line.contains("---")
+    let table = line.contains("---")
         && line
             .chars()
-            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'));
+    let rule = line.chars().count() >= 3
+        && ['-', '*', '_']
+            .iter()
+            .any(|mark| line.chars().all(|c| c == *mark || c == ' '));
+    table || rule || fence(line).is_some()
+}
+
+/// `line` without what opens it as a quote, heading or list item: `>` markers, `#` markers, a
+/// bullet, or a number or letter followed by `.` or `)`, each followed by a space. A terminal
+/// redraws or renumbers these.
+fn line_content(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    loop {
+        let before = rest;
+        if let Some(after) = rest.strip_prefix('>') {
+            rest = after.trim_start();
+        }
+        let hashes = rest.chars().take_while(|c| *c == '#').count();
+        if hashes > 0 && rest[hashes..].starts_with(' ') {
+            rest = rest[hashes..].trim_start();
+        }
+        if let Some(after) = rest
+            .strip_prefix(BULLETS)
+            .filter(|after| after.starts_with(' '))
+        {
+            rest = after.trim_start();
+        }
+        let marker = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count()
+            .max(usize::from(
+                rest.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                    && rest[1..].starts_with(['.', ')']),
+            ));
+        if marker > 0
+            && rest[marker..].starts_with(['.', ')'])
+            && rest[marker + 1..].starts_with(' ')
+        {
+            rest = rest[marker + 1..].trim_start();
+        }
+        if rest == before {
+            return rest;
+        }
+    }
 }
 
 /// What survives every way a terminal renders `text`: its characters in order, without
-/// whitespace, box drawing (U+2500 to U+257F), Markdown markup and list bullets, or table
-/// delimiter rows. Letters, digits, other punctuation and symbols such as a progress bar's `█`
-/// and `░` stay.
+/// whitespace, box drawing (U+2500 to U+257F), inline Markdown markup, the markers that open a
+/// quote, heading or list item, or lines a terminal draws as rules (table delimiter rows,
+/// thematic breaks, code fence lines). Letters, digits, other punctuation such as `-` and `+`
+/// inside a line, and symbols such as a progress bar's `█` and `░` stay.
 #[must_use]
 pub fn rendered_key(text: &str) -> String {
     text.lines()
-        .filter(|line| !table_delimiter(line))
+        .filter(|line| !layout_line(line))
+        .map(line_content)
         .flat_map(str::chars)
         .filter(|c| {
-            !c.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(c) && !MARKUP.contains(c)
+            !c.is_whitespace()
+                && !('\u{2500}'..='\u{257f}').contains(c)
+                && !INLINE_MARKUP.contains(c)
         })
         .collect()
 }
@@ -321,6 +372,21 @@ mod tests {
             "Rollout: ████████░░"
         ));
         assert_eq!(rendered_key("| a | b |\n|---|:--:|\n| 1 | 2 |"), "ab12");
+        // A fence's info string, a renumbered list and nested bullets are layout.
+        assert!(rendered_equivalent(
+            "Pushed. Verify with:\n  git log -1",
+            "Pushed. Verify with:\n```sh\ngit log -1\n```"
+        ));
+        assert!(rendered_equivalent(
+            "1. first step\n2. second step\n  ◦ detail",
+            "1. first step\n1. second step\n   - detail"
+        ));
+        // Signs inside a line are text.
+        assert!(!rendered_equivalent("Delta: -3", "Delta: +3"));
+        assert_eq!(
+            rendered_key("> ## Title\n- a-b\n10. c+d\n---"),
+            "Titlea-bc+d"
+        );
         assert_eq!(without_link_targets("a](b"), "a](b");
         assert_eq!(without_link_targets("[x](y)\n[z](w\n)"), "[x]\n[z](w\n)");
     }

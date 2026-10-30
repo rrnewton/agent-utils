@@ -370,21 +370,20 @@ def test_transcript_blocks_keep_their_markdown_and_skip_quoted_partial_and_inlin
 
 
 def test_a_screen_rendering_matches_its_transcript_source_and_other_text_does_not() -> None:
-    from agentctl.chat_transcript import label_key, near_duplicate, rendered_equivalent, rendered_key
+    from agentctl.chat_transcript import label_key, rendered_equivalent, rendered_key, same_rendered_text
     assert rendered_equivalent(DRAWN, WRITTEN)
     assert rendered_equivalent("│ admitted → │ 5.6s │\n│ delivered  │      │", "| admitted → delivered | 5.6s |")
     assert rendered_equivalent("status page (https://example.com/s)", "[status page](https://example.com/s)")
+    assert rendered_equivalent("Pushed. Verify with:\n  git log -1", "Pushed. Verify with:\n```sh\ngit log -1\n```")
+    assert rendered_equivalent("1. first step\n2. second step\n  ◦ detail", "1. first step\n1. second step\n   - detail")
     assert not rendered_equivalent("Rollout: ███░░░░░░░", "Rollout: ████████░░")
+    assert not rendered_equivalent("Delta: -3", "Delta: +3")
     assert not rendered_equivalent("- **`#`** -", "---")
     assert rendered_key("| a | b |\n|---|:--:|\n| 1 | 2 |") == "ab12"
+    assert rendered_key("> ## Title\n- a-b\n10. c+d\n---") == "Titlea-bc+d"
     assert label_key("See [the page](https://x.test/p).") == "Seethepage."
-    steps = ("Steps taken on the voice stack this morning:\n"
-             "{0}. restarted the voice server after it stopped accepting new connections at dawn\n"
-             "{1}. rebuilt the browser bridge from a clean copy of main and started it again\n"
-             "{2}. checked both probes, conversation and read-aloud, and both of them passed")
-    assert near_duplicate(steps.format(1, 1, 1), steps.format(1, 2, 3))
-    assert not near_duplicate("Update 1: the build is running on the new host.",
-                              "Update 2: the build passed and the deploy starts now.")
+    assert same_rendered_text(DRAWN, WRITTEN)
+    assert not same_rendered_text("| A | ✓ | - |", "| A | - | ✓ |")
 
 
 def test_transcript_lines_of_each_harness_decode_to_the_models_text() -> None:

@@ -162,12 +162,17 @@ impl CoordinatorTranscript {
                 continue;
             };
             for block in replies::complete_blocks(&text) {
-                self.bytes += block.body.len();
-                self.blocks.push_back(TranscriptBlock {
+                let block = TranscriptBlock {
                     identifier: block.identifier,
                     body: block.body,
                     at_millis: at.filter(|at| *at >= 0.0).map(|at| (at * 1000.0) as u64),
-                });
+                };
+                // A tail read again, after a failure or a switch back, repeats blocks.
+                if self.blocks.contains(&block) {
+                    continue;
+                }
+                self.bytes += block.body.len();
+                self.blocks.push_back(block);
             }
         }
         while self.blocks.len() > MAX_BLOCKS || self.bytes > MAX_BLOCK_BYTES {
@@ -227,9 +232,16 @@ fn record_hints(registry: &Path, name: &str) -> Option<(String, Hints)> {
         .join("agent.json");
     let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let harness = record["harness"].as_str()?.to_owned();
+    // A conversation id is recorded as a string, or as an object holding it under `value`.
     let session = ["native_session", "session_value", "resume"]
         .iter()
-        .find_map(|key| record[*key].as_str().filter(|value| !value.is_empty()))
+        .find_map(|key| {
+            let value = &record[*key];
+            value
+                .as_str()
+                .or_else(|| value["value"].as_str())
+                .filter(|value| !value.is_empty())
+        })
         .map(str::to_owned);
     let hints = Hints {
         pid: record
@@ -370,7 +382,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(
             directory.join("agent.json"),
-            r#"{"name":"coord","harness":"muse","cwd":"/work","native_session":null,"session_value":"s-9","harness_identity":{"pid":4242}}"#,
+            r#"{"name":"coord","harness":"muse","cwd":"/work","native_session":{"agent":"muse","value":"s-9"},"session_value":null,"harness_identity":{"pid":4242}}"#,
         )
         .unwrap();
         let (harness, hints) = record_hints(&registry, "coord").unwrap();

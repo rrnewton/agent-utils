@@ -131,23 +131,54 @@ def complete_blocks(text: str) -> list[tuple[str, str]]:
     return blocks
 
 
-#: Characters a terminal draws as style or layout rather than as text.
-_MARKUP = frozenset("*_`#>~|[]()-+•·●◦▪")
+#: Characters Markdown uses inside a line for emphasis, code, strike-through, tables and links.
+_INLINE_MARKUP = frozenset("*_`~|[]()")
+_BULLETS = "-*+•·●◦▪‣"
 _TABLE_DELIMITER = re.compile(r"[|\-: \t]*\Z")
+_LIST_NUMBER = re.compile(r"(?:[0-9]+|[a-z])[.)] ")
+
+
+def _layout_line(line: str) -> bool:
+    """Whether ``line`` is drawn as a rule or not at all: a table delimiter row, a thematic break,
+    or a code fence's opening or closing line."""
+    text = line.strip()
+    table = "---" in text and _TABLE_DELIMITER.match(text) is not None
+    rule = len(text) >= 3 and any(all(character in (mark, " ") for character in text) for mark in "-*_")
+    return table or rule or _fence(text) is not None
+
+
+def _line_content(line: str) -> str:
+    """``line`` without what opens it as a quote, heading or list item."""
+    rest = line.lstrip()
+    while True:
+        before = rest
+        if rest.startswith(">"):
+            rest = rest[1:].lstrip()
+        hashes = len(rest) - len(rest.lstrip("#"))
+        if hashes and rest[hashes:hashes + 1] == " ":
+            rest = rest[hashes:].lstrip()
+        if rest[:1] and rest[0] in _BULLETS and rest[1:2] == " ":
+            rest = rest[1:].lstrip()
+        number = _LIST_NUMBER.match(rest)
+        if number is not None:
+            rest = rest[number.end():].lstrip()
+        if rest == before:
+            return rest
 
 
 def rendered_key(text: str) -> str:
     """What survives every way a terminal renders ``text``.
 
-    Its characters in order, without whitespace, box drawing, Markdown markup and list bullets, or
-    table delimiter rows; letters, digits, other punctuation and symbols stay.
+    Its characters in order, without whitespace, box drawing, inline Markdown markup, the markers
+    that open a quote, heading or list item, or lines drawn as rules (table delimiter rows,
+    thematic breaks, code fence lines). Letters, digits, other punctuation and symbols stay.
     """
     return "".join(
         character
-        for line in text.splitlines()
-        if not ("---" in line and _TABLE_DELIMITER.match(line.strip()))
-        for character in line
-        if not character.isspace() and not "\u2500" <= character <= "\u257f" and character not in _MARKUP)
+        for line in text.splitlines() if not _layout_line(line)
+        for character in _line_content(line)
+        if not character.isspace() and not "\u2500" <= character <= "\u257f"
+        and character not in _INLINE_MARKUP)
 
 
 _LINK_TARGET = re.compile(r"\]\([^)\n]*\)")
@@ -173,19 +204,10 @@ def rendered_equivalent(screen: str, source: str) -> bool:
     return any(sorted(shown) == sorted(key) for key in candidates)
 
 
-def _shingles(text: str) -> set[str]:
-    words = [word.lower() for word in re.split(r"[^\w]|_", text) if word]
-    if len(words) < 3:
-        return set(words)
-    return {" ".join(words[index:index + 3]) for index in range(len(words) - 2)}
-
-
-def near_duplicate(left: str, right: str) -> bool:
-    """Whether two texts share at least three fifths of their word triples."""
-    first, second = _shingles(left), _shingles(right)
-    if not first or not second:
-        return False
-    return len(first & second) * 5 >= len(first | second) * 3
+def same_rendered_text(left: str, right: str) -> bool:
+    """Whether two stored texts read the same once rendered, with or without link targets."""
+    first, second = (rendered_key(left), label_key(left)), (rendered_key(right), label_key(right))
+    return any(key and key in second for key in first)
 
 
 def _parse_utc(text: object) -> float | None:
@@ -267,6 +289,15 @@ def decode_texts(harness: str, line: bytes) -> list[tuple[float | None, str]]:
                 out.append((at, str(event["text"])))
         return out
     return []
+
+
+def _start_ticks(proc_root: Path, pid: int) -> int | None:
+    try:
+        stat = (proc_root / str(pid) / "stat").read_text()
+    except OSError:
+        return None
+    fields = stat[stat.rfind(")") + 1:].split()
+    return int(fields[19]) if len(fields) > 19 and fields[19].isdigit() else None
 
 
 def _pane_processes(proc_root: Path, pane_id: str) -> list[int]:
@@ -356,6 +387,10 @@ def locate(harness: str, pids: list[int], cwd: str | None, proc_root: Path = Pat
             session = record.get("sessionId") if isinstance(record, dict) else None
             if not isinstance(session, str) or not session or "/" in session:
                 continue
+            started = record.get("procStart")
+            actual = _start_ticks(proc_root, pid)
+            if started is not None and actual is not None and str(started) != str(actual):
+                continue  # a record left by an earlier process that had this id
             directory = record.get("cwd") if isinstance(record.get("cwd"), str) else cwd
             candidates = [config / "projects" / project_name(str(directory)) / f"{session}.jsonl"] if directory else []
             try:
@@ -366,18 +401,25 @@ def locate(harness: str, pids: list[int], cwd: str | None, proc_root: Path = Pat
                 if path.is_file():
                     return path, f"process {pid} names it in sessions/{pid}.json"
         return None
-    files = _open_files(proc_root, pids)
-    if harness == "codex":
-        rollouts = [path for path in files if path.name.startswith("rollout-")
-                    and path.name.endswith(".jsonl") and "/sessions/" in str(path)]
-        newest = _newest(rollouts)
-        return (newest, "the process holds it open") if newest else None
-    if harness == "muse":
-        journals = [path.parent / "session.jsonl" for path in files
-                    if path.name == ".session.lock" and "/muse/sessions/" in str(path)
-                    and "/subagent/" not in str(path)]
-        newest = _newest([path for path in journals if path.is_file()])
-        return (newest, "the process holds its session lock") if newest else None
+    # The oldest process holding a matching file is the harness itself; a child it started (a
+    # sub-agent, another agent run from its shell) starts later.
+    for pid in pids:
+        files = _open_files(proc_root, [pid])
+        if harness == "codex":
+            rollouts = [path for path in files if path.name.startswith("rollout-")
+                        and path.name.endswith(".jsonl") and "/sessions/" in str(path)]
+            newest = _newest(rollouts)
+            if newest is not None:
+                return newest, f"process {pid} holds it open"
+        elif harness == "muse":
+            journals = [path.parent / "session.jsonl" for path in files
+                        if path.name == ".session.lock" and "/muse/sessions/" in str(path)
+                        and "/subagent/" not in str(path)]
+            newest = _newest([path for path in journals if path.is_file()])
+            if newest is not None:
+                return newest, f"process {pid} holds its session lock"
+        else:
+            return None
     return None
 
 
@@ -464,7 +506,9 @@ class CoordinatorTranscript:
             for at, text in decode_texts(self._harness, line) if line else []:
                 for identifier, body in complete_blocks(text):
                     millis = int(at * 1000) if at is not None and at >= 0 else None
-                    self._blocks.append(TranscriptBlock(identifier, body, millis))
+                    block = TranscriptBlock(identifier, body, millis)
+                    if block not in self._blocks:  # a tail read again after a failure
+                        self._blocks.append(block)
         while self._blocks and (len(self._blocks) > _MAX_BLOCKS
                                 or sum(len(block.body) for block in self._blocks) > _MAX_BLOCK_BYTES):
             self._blocks.pop(0)

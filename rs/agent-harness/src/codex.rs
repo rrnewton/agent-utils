@@ -52,16 +52,24 @@ impl Transcript for Codex {
                 });
             }
         }
-        let main: Vec<PathBuf> = open
-            .iter()
-            .filter(|path| main_thread(path))
-            .cloned()
-            .collect();
-        if let Some(path) = newest(if main.is_empty() { open } else { main }) {
-            return Some(Located {
-                path,
-                evidence: "the process holds it open".into(),
-            });
+        // The nearest process holding a main rollout is the harness: a descendant's rollout can
+        // be a sub-agent's or that of another Codex run from its shell.
+        for (pid, files) in hints.open_files_by_process() {
+            let held: Vec<PathBuf> = files
+                .into_iter()
+                .filter(|path| open.contains(path))
+                .collect();
+            let main: Vec<PathBuf> = held
+                .iter()
+                .filter(|path| main_thread(path))
+                .cloned()
+                .collect();
+            if let Some(path) = newest(if main.is_empty() { held } else { main }) {
+                return Some(Located {
+                    path,
+                    evidence: format!("process {pid} holds it open"),
+                });
+            }
         }
         let session = session?;
         let sessions = hints

@@ -1909,3 +1909,24 @@ def test_capture_stores_the_next_transcript_block_the_screen_never_showed(tmp_pa
     assert _records(tmp_path)["one"]["reply_next_ordinal"] == 2
     assert bridge.capture_output(_snapshot("")) == {"captured": [], "errors": []}
     assert len(chat.sent) == 1
+
+
+def test_a_block_collapsed_before_a_visible_later_one_fills_its_ordinal(tmp_path: Path) -> None:
+    # Claude Code collapsed reply _1 (a tool call followed it); _2 is on screen. The transcript
+    # fills _1, so _2 is not refused for skipping it.
+    from agentctl.chat_transcript import TranscriptBlock
+    bridge, _, chat = setup(tmp_path)
+    chat.message()
+    bridge.tick()
+    record = _records(tmp_path)["one"]
+    nonce = record["reply_nonce"]
+    later = int((datetime.now(timezone.utc) + timedelta(seconds=5)).timestamp() * 1000)
+    bridge._transcript = _FixedTranscript([  # type: ignore[assignment]
+        TranscriptBlock(f"{nonce}_1", "**Started** the checks.", later),
+        TranscriptBlock(f"{nonce}_2", "All `12` checks passed.", later),
+    ])
+    outcome = bridge.capture_output(_snapshot(_block(record, "All 12 checks passed.", ordinal=2)))
+    assert outcome["errors"] == []
+    texts = [str(request["text"]) for request in chat.sent.values()]
+    assert texts[0].endswith("**Started** the checks.") and texts[1].endswith("All `12` checks passed.")
+    assert _records(tmp_path)["one"]["reply_next_ordinal"] == 3
