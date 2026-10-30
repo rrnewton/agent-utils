@@ -132,7 +132,7 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter`, `list`, `rows`, `selection`, `composer`, `done` and `place` are the column's own records of its older pages
+ * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter`, `list`, `rows`, `selection`, `composer`, `done`, `place` and `gather` are the column's own records of its older pages
  * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
  * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`), its Pinned
  * filter (`freshPinsView`, `pinsView`), its scroll tools' pass (`freshScrollTools`, `scrollTools`) and
@@ -140,8 +140,9 @@ const COLUMN_IDS = {
  * `listState`), the rows it was drawn from (`freshTimelineRows`, `timelineRows`) and what it shows
  * (`freshSelection`, `selection`), its message box (`freshComposerState`, `composerState`) and what it
  * shows as Done (`freshDoneState`, `doneState`) and where its list stands against its newest message
- * (`freshScrollPlace`, `scrollPlace`; `#624 voice-page-modularity`, plan step 15): field groups kept on
- * the column rather than in `state`.
+ * (`freshScrollPlace`, `scrollPlace`) and what is gathered in its list (`freshGatherState`,
+ * `gatherState`; `#624 voice-page-modularity`, plan step 15): field groups kept on the column rather
+ * than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
@@ -152,19 +153,19 @@ const COLUMN_IDS = {
  *   filter: ReturnType<typeof freshFilterState>, list: ReturnType<typeof freshListState>,
  *   rows: ReturnType<typeof freshTimelineRows>, selection: ReturnType<typeof freshSelection>,
  *   composer: ReturnType<typeof freshComposerState>, done: ReturnType<typeof freshDoneState>,
- *   place: ReturnType<typeof freshScrollPlace>}} ColumnFields
+ *   place: ReturnType<typeof freshScrollPlace>, gather: ReturnType<typeof freshGatherState>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
     load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools(),
     filter: freshFilterState(), list: freshListState(), rows: freshTimelineRows(), selection: freshSelection("main"),
-    composer: freshComposerState(), done: freshDoneState(), place: freshScrollPlace() },
+    composer: freshComposerState(), done: freshDoneState(), place: freshScrollPlace(), gather: freshGatherState() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
     older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
     pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState(), list: freshListState(),
     rows: freshTimelineRows(), selection: freshSelection(), composer: freshComposerState(), done: freshDoneState(),
-    place: freshScrollPlace() },
+    place: freshScrollPlace(), gather: freshGatherState() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -33952,8 +33953,24 @@ const UNGATHER_NAME = "Show replies in time order";
  * (`arrangeChannelRows`), and `column` is the column it was made in.
  *
  * @type {{parent: string, context: string, byReply?: boolean, thread?: string | null, column?: any} | null}
+ *
+ * A column's `gatherState().gathered` (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): its own record, made by `freshGatherState`.
  */
-let gathered = null;
+
+/**
+ * A column's own record of the message whose replies are gathered under it (`gathered`, above).
+ *
+ * @returns {{gathered: {parent: string, context: string, byReply?: boolean, thread?: string | null, column?: any} | null}}
+ */
+function freshGatherState() {
+  return { gathered: null };
+}
+
+/** The column being worked on's record of what is gathered in its list (`freshGatherState`). */
+function gatherState() {
+  return activeColumn.gather;
+}
 
 /**
  * A column's own record of what its list has drawn (`#624 voice-page-modularity`, plan step 15, as
@@ -33980,8 +33997,8 @@ const gatheringView = () => !threadingSupported || selection().view === "flat";
 
 /** The message whose replies are gathered in the list on screen, or null. */
 function gatheredParent() {
-  if (gathered === null || gathered.context !== channelContextKey() || !(gatheringView() || gathered.byReply)) return null;
-  return gathered.parent;
+  if (gatherState().gathered === null || gatherState().gathered.context !== channelContextKey() || !(gatheringView() || gatherState().gathered.byReply)) return null;
+  return gatherState().gathered.parent;
 }
 
 /**
@@ -33989,8 +34006,8 @@ function gatheredParent() {
  * (`#410 inline-reply-editor`), as its choice; null when none is.
  */
 function gatheredThread() {
-  if (gatheredParent() === null || !gathered || !gathered.thread) return null;
-  return knownThreadChoice(String(gathered.thread), null);
+  if (gatheredParent() === null || !gatherState().gathered || !gatherState().gathered.thread) return null;
+  return knownThreadChoice(String(gatherState().gathered.thread), null);
 }
 
 /** Whether `row` holds only replies a gathered thread put in this list, which are not the list's own. */
@@ -34176,7 +34193,7 @@ function arrangeChannelRows() {
   let groups = parent === null ? null : gatheredRows(messages, parent);
   // The parent has left the list — Hide read hides it, or a read no longer holds it — and the
   // stack goes with it.
-  if (groups === null && parent !== null) gathered = null;
+  if (groups === null && parent !== null) gatherState().gathered = null;
   listState().rowsGathered = groups !== null;
   if (groups === null) groups = glom(messages);
   const keyOf = (ids) => ids.join(" ");
@@ -34250,7 +34267,7 @@ function gatherNow(parent, anchor, anchorTop) {
     setStatus(report.hidden > 0 ? "Hide read is hiding its replies." : "No replies to it are loaded.");
     return;
   }
-  gathered = { parent, context: channelContextKey() };
+  gatherState().gathered = { parent, context: channelContextKey() };
   renderChannelRows();
   renderScrollTools();
   keepOnScreen(anchor, anchorTop);
@@ -34299,7 +34316,7 @@ function scatterReplies() {
   const parent = gatheredParent();
   const row = parent === null ? null : rowHolding(parent);
   const top = row ? row.getBoundingClientRect().top : NaN;
-  gathered = null;
+  gatherState().gathered = null;
   renderChannelRows();
   renderScrollTools();
   if (parent !== null) keepOnScreen(parent, top);
@@ -34312,7 +34329,7 @@ function scatterReplies() {
  * or a filter is about to take rows out of it.
  */
 function putRepliesBack() {
-  gathered = null;
+  gatherState().gathered = null;
   if (listState().rowsGathered) renderChannelRows();
 }
 
@@ -46232,7 +46249,7 @@ function gatherForReply(list) {
   const id = String(replyTarget.id);
   // What a sent reply left gathered is put back by the next Reply, as N replies on another message puts
   // the first back: one gathering at a time.
-  if (gathered && gathered.byReply && gathered.parent !== id) inColumn(gathered.column || activeColumn, putRepliesBack);
+  if (gatherState().gathered && gatherState().gathered.byReply && gatherState().gathered.parent !== id) inColumn(gatherState().gathered.column || activeColumn, putRepliesBack);
   if (list !== el("discord-log") || rowsChosen()) return false;
   if (gatheredParent() === id) return false;
   if (rootOfOpenThread(replyTarget)) return false;
@@ -46243,7 +46260,7 @@ function gatherForReply(list) {
   const own = selection().view === "main" && headsAnsweredThread(replyTarget) ? threadOf(replyTarget) : null;
   const thread = own !== null && own !== shownRight ? own : null;
   if (thread === null && gatherReport(id).gathered === 0) return false;
-  gathered = { parent: id, context: channelContextKey(), byReply: true, thread, column: activeColumn };
+  gatherState().gathered = { parent: id, context: channelContextKey(), byReply: true, thread, column: activeColumn };
   renderChannelRows();
   renderScrollTools();
   return true;
@@ -46434,9 +46451,9 @@ function leaveDockedReply(id, how = {}) {
   replyGathered = false;
   undockReply();
   inColumn(column, () => {
-    if (scatter && gathered && gathered.byReply && gathered.parent === id) {
+    if (scatter && gatherState().gathered && gatherState().gathered.byReply && gatherState().gathered.parent === id) {
       if (restore) {
-        gathered = null;
+        gatherState().gathered = null;
         renderChannelRows();
         renderScrollTools();
       } else putRepliesBack();
@@ -47242,7 +47259,6 @@ const sideThreads = new Map();
  * @type {Array<[() => any, (value: any) => void, () => any]>}
  */
 const COLUMN_STATE = [
-  [() => gathered, (value) => { gathered = value; }, () => null],
 ];
 
 /** Work on column `column` from now on: its state into the module's, the other's put aside. */
@@ -49779,7 +49795,7 @@ async function readUnpackThread(id) {
     sideCardsDrawn = "";
     if (sideColumnUp()) renderSideColumn();
     // `#410 inline-reply-editor`. A thread gathered under its root in Main draws what the read brought.
-    const wanting = gathered && gathered.thread === id ? gathered.column : null;
+    const wanting = gatherState().gathered && gatherState().gathered.thread === id ? gatherState().gathered.column : null;
     if (wanting) inColumn(wanting, renderChannelRows);
     pumpUnpackReads();
   }
@@ -50977,7 +50993,7 @@ function resetSideColumn(reopen = false) {
   repliesNote = null;
   inColumn(columns.side, () => {
     dropReplyArrowTap();
-    gathered = null;
+    gatherState().gathered = null;
     listState().rowsGathered = false;
     ++loadState().generation;
   });
@@ -50997,6 +51013,7 @@ function resetSideColumn(reopen = false) {
     columns.side.composer = freshComposerState();
     columns.side.done = freshDoneState();
     columns.side.place = freshScrollPlace();
+    columns.side.gather = freshGatherState();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
@@ -58011,7 +58028,7 @@ function changeSelectedChannel() {
   // `#215 reply-coalesce`. Gathered replies belong to the channel they were gathered in, whose rows
   // are about to go — and so does a tap on an arrow still waiting to jump, which would otherwise walk
   // this channel's history for a message of the last one.
-  gathered = null;
+  gatherState().gathered = null;
   listState().rowsGathered = false;
   dropReplyArrowTap();
   applyChannelProvider();

@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists, rows, selection, boxes, Done marks and scroll places, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists, rows, selection, boxes, Done marks, scroll places and gatherings, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7257,6 +7257,9 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   same("inColumn(columns.side, () => { jumpNewestWanted.discord = 3; inScrollback.discord = true; }); jumpNewestWanted.voice = 2");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.place, jumpNewestWanted.discord, inScrollback.discord, jumpNewestWanted.voice, inColumn(columns.side, () => jumpNewestWanted.voice)])")),
     [{ jumpWanted: 3, inScrollback: true }, false, false, 2, 2]);
+  // And what is gathered in its list; and nothing is swapped through the module any more.
+  assert.equal(same("inColumn(columns.side, () => gatherState()) === columns.side.gather && gatherState() === columns.main.gather"), true);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshGatherState(), COLUMN_STATE.length])")), [{ gathered: null }, 0]);
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
