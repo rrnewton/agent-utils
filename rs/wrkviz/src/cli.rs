@@ -445,9 +445,7 @@ fn run_query_show(output: &str, format: &str, args: &[String]) -> u8 {
                         return argparse_error(
                             QUERY_SHOW_USAGE,
                             "wrkviz query show",
-                            &format!(
-                                "argument --transcript: ignored explicit argument '{value}'"
-                            ),
+                            &format!("argument --transcript: ignored explicit argument '{value}'"),
                         );
                     }
                     transcript = true;

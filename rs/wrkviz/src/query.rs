@@ -1206,9 +1206,11 @@ fn markdown_item(item: &Map<String, Value>) -> Result<String, String> {
     ] {
         match item.get(key) {
             Some(Value::String(text)) => lines.push(format!("- {}: `{text}`", title_case(key))),
-            Some(Value::Number(number)) => {
-                lines.push(format!("- {}: `{}`", title_case(key), py_number_str(number)))
-            }
+            Some(Value::Number(number)) => lines.push(format!(
+                "- {}: `{}`",
+                title_case(key),
+                py_number_str(number)
+            )),
             Some(Value::Bool(flag)) => {
                 let rendered = if *flag { "True" } else { "False" };
                 lines.push(format!("- {}: `{rendered}`", title_case(key)))
@@ -1244,12 +1246,18 @@ fn markdown_item(item: &Map<String, Value>) -> Result<String, String> {
             for (index, raw) in transcript.iter().enumerate() {
                 let where_ = format!("detail.transcript[{index}]");
                 let message = as_object(raw, &where_)?;
-                let role = as_string(message.get("role").unwrap_or(&Value::Null), &format!("{where_}.role"))?;
+                let role = as_string(
+                    message.get("role").unwrap_or(&Value::Null),
+                    &format!("{where_}.role"),
+                )?;
                 let at_ms = as_int(
                     message.get("at_ms").unwrap_or(&Value::Null),
                     &format!("{where_}.at_ms"),
                 )?;
-                let text = as_string(message.get("text").unwrap_or(&Value::Null), &format!("{where_}.text"))?;
+                let text = as_string(
+                    message.get("text").unwrap_or(&Value::Null),
+                    &format!("{where_}.text"),
+                )?;
                 lines.push(format!("#### {role} · {}", timestamp(at_ms)));
                 lines.push(String::new());
                 lines.push(text.trim_end().to_string());
