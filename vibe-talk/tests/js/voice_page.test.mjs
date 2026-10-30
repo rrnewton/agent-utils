@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters and lists, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries, pins, scroll tools, filters, lists and rows, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7243,6 +7243,9 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.list.backlog, listState().backlog])")), [3, 0]);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshListState())")),
     { rowsGathered: false, outgoingKey: "", newestId: null, runRows: 0, backlog: 0 });
+  // And the rows its list was drawn from: a fresh pair of lists for each column.
+  assert.equal(same("columns.side.rows.messages !== columns.main.rows.messages"), true, "the columns shared one list of rows");
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshTimelineRows())")), { messages: [], threads: [] });
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {

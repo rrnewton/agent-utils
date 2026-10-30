@@ -132,13 +132,13 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter` and `list` are the column's own records of its older pages
+ * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter`, `list` and `rows` are the column's own records of its older pages
  * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
  * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`), its Pinned
  * filter (`freshPinsView`, `pinsView`), its scroll tools' pass (`freshScrollTools`, `scrollTools`) and
- * its filters' hold (`freshFilterState`, `filterState`) and what its list has drawn (`freshListState`,
- * `listState`; `#624 voice-page-modularity`, plan step 15): field groups kept on the column rather than
- * in `state`.
+ * its filters' hold (`freshFilterState`, `filterState`), what its list has drawn (`freshListState`,
+ * `listState`) and the rows it was drawn from (`freshTimelineRows`, `timelineRows`; `#624
+ * voice-page-modularity`, plan step 15): field groups kept on the column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
@@ -146,16 +146,18 @@ const COLUMN_IDS = {
  *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
  *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>,
  *   pins: ReturnType<typeof freshPinsView>, tools: ReturnType<typeof freshScrollTools>,
- *   filter: ReturnType<typeof freshFilterState>, list: ReturnType<typeof freshListState>}} ColumnFields
+ *   filter: ReturnType<typeof freshFilterState>, list: ReturnType<typeof freshListState>,
+ *   rows: ReturnType<typeof freshTimelineRows>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
     load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools(),
-    filter: freshFilterState(), list: freshListState() },
+    filter: freshFilterState(), list: freshListState(), rows: freshTimelineRows() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
     older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
-    pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState(), list: freshListState() },
+    pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState(), list: freshListState(),
+    rows: freshTimelineRows() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -2080,7 +2082,7 @@ function redrawMessageLinks() {
   if (threadingSupported) {
     eachColumn(renderCachedTimeline);
     eachColumn(() => {
-      if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineThreads));
+      if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     });
     renderSideColumn();
   } else {
@@ -2877,8 +2879,21 @@ let channelView = "main";
 let selectedThreadId = null;
 let selectedThread = null;
 let threadOrigin = "main";
-let timelineMessages = [];
-let timelineThreads = [];
+/**
+ * A column's own record of the rows its list was last drawn from (`#624 voice-page-modularity`, plan
+ * step 15, as `freshOlderPages`): `messages`, the messages of a Main, All or thread list; `threads`,
+ * the thread summaries of the Threads list.
+ *
+ * @returns {{messages: any[], threads: any[]}}
+ */
+function freshTimelineRows() {
+  return { messages: [], threads: [] };
+}
+
+/** The column being worked on's record of the rows its list was last drawn from (`freshTimelineRows`). */
+function timelineRows() {
+  return activeColumn.rows;
+}
 const channelContexts = new Map();
 const threadColors = new Map();
 /**
@@ -7649,7 +7664,7 @@ function filterHiddenSentence(anchor, walked) {
   if (walked && olderThanLoaded(anchor)) return `Over ${FILTER_WALK_PAGES} pages back — oldest is here.`;
   // Under Hide read a channel without threads reads only what is left, so a message it hides is in
   // no list this page holds; with threads it is held, and drawn in none.
-  if (hidingRead() && (!threadingSupported || timelineMessages.some((message) => anchor.ids.includes(String(message.id))))) {
+  if (hidingRead() && (!threadingSupported || timelineRows().messages.some((message) => anchor.ids.includes(String(message.id))))) {
     return "Hide read hides it — nearest is here.";
   }
   return "Not in this view — nearest is here.";
@@ -7659,7 +7674,7 @@ function filterHiddenSentence(anchor, walked) {
 function olderThanLoaded(anchor) {
   if (sideActive || currentView !== "discord" || pinsView().only || olderPages().moreAbove !== true ||
       !Number.isFinite(anchor.time)) return false;
-  const loaded = threadingSupported ? timelineMessages : [...el("discord-log").children].flatMap(rowMessages);
+  const loaded = threadingSupported ? timelineRows().messages : [...el("discord-log").children].flatMap(rowMessages);
   const times = loaded.map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
   return times.length === 0 || anchor.time < Math.min(...times);
 }
@@ -19144,7 +19159,7 @@ function applyCardMaxLines(value, redraw = true) {
     threadCardsDrawn.clear();
     if (sideColumnUp()) renderSideColumn();
     if (channelView === "thread") renderThreadHeading();
-    if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineThreads));
+    if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
   }
   return n;
 }
@@ -23794,7 +23809,7 @@ function syncCanonDismissed() {
   if (!threadingSupported || channelStore.current().channel !== String(selectedChannelId())) return;
   // `#407 unpack-row-parity`. Over the cards the right column has no rows on screen to speak for.
   if (sideActive && columns.side.mode !== "thread") return;
-  for (const message of timelineMessages) {
+  for (const message of timelineRows().messages) {
     const id = String(message.id);
     if (archivedIds.has(id)) channelStore.current().dismissed.add(id);
     else channelStore.current().dismissed.delete(id);
@@ -23839,8 +23854,8 @@ function drawProjection() {
     dismissed: [...channelStore.current().dismissed],
   };
   try {
-    timelineMessages = [];
-    timelineThreads = [];
+    timelineRows().messages = [];
+    timelineRows().threads = [];
     applyTimelinePage(payload, false, true);
   } catch (_error) {
     // A saved row this version cannot draw is a damaged entry, not a reason to break the page.
@@ -23848,7 +23863,7 @@ function drawProjection() {
     forgetChannelScopes((id) => id === String(channel));
     return false;
   }
-  listState().newestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
+  listState().newestId = timelineRows().messages.length > 0 ? String(timelineRows().messages[timelineRows().messages.length - 1].id) : null;
   loadState().freshAt = cover.at;
   delete cover.landedHidden;
   setChannelFreshness(cover.live ? "fresh" : "saved");
@@ -23931,14 +23946,14 @@ function drawHeldRows(rows, freshAt, freshness) {
     dismissed: [...channelStore.current().dismissed],
   };
   try {
-    timelineMessages = [];
-    timelineThreads = [];
+    timelineRows().messages = [];
+    timelineRows().threads = [];
     applyTimelinePage(payload, false, true, false, rows);
   } catch (_error) {
     // Rows this version cannot draw: the read draws the view instead.
     return false;
   }
-  listState().newestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
+  listState().newestId = timelineRows().messages.length > 0 ? String(timelineRows().messages[timelineRows().messages.length - 1].id) : null;
   loadState().freshAt = freshAt;
   setChannelFreshness(freshness);
   renderOutgoingMessages();
@@ -24073,8 +24088,8 @@ function clearChannelScreen() {
   readingMode = false;
   channelContexts.clear();
   channelStore.open();
-  timelineMessages = [];
-  timelineThreads = [];
+  timelineRows().messages = [];
+  timelineRows().threads = [];
   archivedIds = new Set();
   olderPages().moreAbove = false;
   olderPages().cursor = null;
@@ -25498,8 +25513,8 @@ function restoreChannelComposer() {
 function rememberChannelContext() {
   syncCanonDismissed();
   channelContexts.set(channelContextKey(), {
-    messages: timelineMessages,
-    threads: timelineThreads,
+    messages: timelineRows().messages,
+    threads: timelineRows().threads,
     selected: selectedThread,
     rows: [...el("discord-log").children],
     cards: [...el("thread-list").children],
@@ -25682,8 +25697,8 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   stopReading();
   readingMode = false;
   const held = channelContexts.get(channelContextKey());
-  timelineMessages = held ? held.messages : [];
-  timelineThreads = held ? held.threads : [];
+  timelineRows().messages = held ? held.messages : [];
+  timelineRows().threads = held ? held.threads : [];
   selectedThread = summary || (held && held.selected) || null;
   // `#189 restore-ui-state`. The reader's own choice: it outranks the default from here on, and it
   // is what a reopen comes back to — and, `#205 channel-view-memory`, what this channel opens in
@@ -25915,16 +25930,16 @@ function catchUpHeldView(words = true) {
     loadState().freshness = "fresh";
   }
   const threads = channelView === "threads";
-  const held = threads ? timelineThreads : timelineMessages;
+  const held = threads ? timelineRows().threads : timelineRows().messages;
   const ids = (items) => items.map((item) => String(item.id)).join("\n");
   const unchanged = ids(projected) === ids(held) &&
     (!words || threads || projected.every((item, at) => item === held[at] || sameWords(held[at], item)));
   if (unchanged) return false;
   if (threads) {
-    timelineThreads = projected;
+    timelineRows().threads = projected;
     el("thread-list").replaceChildren(...threadCards(projected));
   } else {
-    timelineMessages = projected;
+    timelineRows().messages = projected;
     renderCachedTimeline();
   }
   return true;
@@ -25955,7 +25970,7 @@ function catchUpFromAll() {
   const position = channelReadPosition(area);
   if (catchUpHeldView()) {
     const keeps = readFilterKeeps();
-    settleAfterRead(timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
+    settleAfterRead(timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
       { keepPosition: true, area, ...position });
   }
   renderChannelFreshness();
@@ -27557,7 +27572,7 @@ function syncUnreadReplies() {
   if (!threadingSupported || channelView !== "main" || channelStore.current().channel !== String(selectedChannelId())) return;
   if (hidingRead()) {
     const keeps = readFilterKeeps();
-    const wanted = timelineMessages.filter((message) => !hiddenEmpty(message) && keeps(message))
+    const wanted = timelineRows().messages.filter((message) => !hiddenEmpty(message) && keeps(message))
       .map((message) => String(message.id)).sort().join(" ");
     // `#410 inline-reply-editor`. Less a gathered thread's replies, which are its thread's, not Main's.
     const drawn = [...el("discord-log").children].filter((row) => !fromGatheredThread(row)).flatMap(idsOf).sort().join(" ");
@@ -28020,14 +28035,14 @@ function rowsAsDrawn(pages) {
  */
 function applyTimelinePage(payload, older = false, saved = false, delta = false, rows = null, held = null) {
   if (!saved) observeOutgoingMessages(payload.messages || []);
-  const previousCount = channelView === "threads" ? timelineThreads.length : timelineMessages.length;
+  const previousCount = channelView === "threads" ? timelineRows().threads.length : timelineRows().messages.length;
   const incoming = channelView === "threads" ? payload.threads || [] : payload.messages || [];
   // Into the channel's store, and this view back out of it: what the reader sees is the store's
   // projection, so a row another view corrected or the stream delivered is here too.
   if (!saved && !delta) foldTimelinePage(payload, older, channelView, selectedThreadId, held);
   const merged = rows || projectView() || [];
-  if (channelView === "threads") timelineThreads = merged;
-  else timelineMessages = merged;
+  if (channelView === "threads") timelineRows().threads = merged;
+  else timelineRows().messages = merged;
   // Retain the oldest cursor when a refresh retained the history already walked back to.
   if (saved) {
     // Saved on the device, a cursor is never kept, so whether older history exists is unknown
@@ -28050,7 +28065,7 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   if (payload.thread) selectedThread = payload.thread;
   noteArchived(payload, !delta && !older && merged.length <= incoming.length);
   const keeps = readFilterKeeps();
-  const shown = timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
+  const shown = timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   if (older) {
     // Keep existing elements attached to the same messages: scroll restoration holds one of
     // those elements as its anchor, and recreating it would throw away the reader's position.
@@ -28059,10 +28074,10 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
     list.replaceChildren(...glom(shown.filter((m) => !heldIds.has(String(m.id)))).map(discordNode), ...list.children);
     const cards = el("thread-list");
     const heldThreads = new Set([...cards.children].map((row) => row.getAttribute("data-context-id")));
-    cards.replaceChildren(...threadCards(timelineThreads.filter((t) => !heldThreads.has(String(t.id)))), ...cards.children);
+    cards.replaceChildren(...threadCards(timelineRows().threads.filter((t) => !heldThreads.has(String(t.id)))), ...cards.children);
   } else {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
-    el("thread-list").replaceChildren(...threadCards(timelineThreads));
+    el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
   }
   // The arrows are measured once, by the pass over the search every caller ends with. `#226`.
   holdingReplyArrows(renderChannelRows);
@@ -28076,11 +28091,11 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   renderTodoControls();
   el("clear-backlog").hidden = true;
   const label = channelView === "threads"
-    ? `${timelineThreads.length} recent thread${timelineThreads.length === 1 ? "" : "s"}`
+    ? `${timelineRows().threads.length} recent thread${timelineRows().threads.length === 1 ? "" : "s"}`
     : channelSummary(shown.length, loadedIsWhole(), channelView === "thread"
       ? openThreadName() : channelName(payload.channel));
   renderChannelSeam(label);
-  return channelView === "threads" ? timelineThreads : shown;
+  return channelView === "threads" ? timelineRows().threads : shown;
 }
 
 /** The words a server's notice that All left some threads' replies out begins with, then and now. */
@@ -28103,7 +28118,7 @@ function allNoticeWords(notice) {
   const tally = replyTally();
   let lacking = 0;
   let unknown = false;
-  for (const message of timelineMessages) {
+  for (const message of timelineRows().messages) {
     const id = threadOf(message);
     if (!id || message.thread.is_root !== true) continue;
     const count = exactReplyCount(id, message, tally);
@@ -28146,7 +28161,7 @@ function holdingMessage(mutate) {
 function renderCachedTimeline() {
   if (!threadingSupported || channelView === "threads") return;
   const keeps = readFilterKeeps();
-  const shown = timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
+  const shown = timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   const redraw = () => {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
     holdingReplyArrows(renderChannelRows);
@@ -28321,7 +28336,7 @@ async function loadTimeline(options) {
   // read behind them (`drawHeldRows`): the newest page replaces them, and the message the reader is
   // on may be older than that page reaches.
   const behindHeld = keepPosition && view !== "threads" && sameStore() && !canon.views.has(viewKey(view, thread)) &&
-    timelineMessages.length > 0;
+    timelineRows().messages.length > 0;
   /** Draw the delta pages folded so far, as the one refresh they are. */
   const drawDeltas = () => {
     renderChannelLoading(false);
@@ -28329,7 +28344,7 @@ async function loadTimeline(options) {
     // would draw: the refresh says how fresh the rows are and draws nothing.
     if (keepPosition && !ownAct && entryState().readOwed !== context &&
         deltas.every((page) => unchangedDeltas.has(page)) && rowsAsDrawn(deltas)) {
-      timelineMessages = projectView() || timelineMessages;
+      timelineRows().messages = projectView() || timelineRows().messages;
       observeOutgoingMessages(deltas.flatMap((page) => page.messages || []));
       noteFreshRead(deltas[deltas.length - 1]);
       saveChannelScope();
@@ -28432,8 +28447,8 @@ async function loadTimeline(options) {
           // Still more after that many pages: read the newest page, AFTER dropping the view's
           // cover, as an explicit refresh does. The store keeps its rows, but the new page starts
           // coverage afresh instead of claiming continuity across what was not read.
-          timelineMessages = [];
-          timelineThreads = [];
+          timelineRows().messages = [];
+          timelineRows().threads = [];
           olderPages().cursor = null;
           discordWalkCursorOwed = false;
           olderPages().moreAbove = false;
@@ -28455,7 +28470,7 @@ async function loadTimeline(options) {
       // message they are on NOW, which the wait for this page gave them time to change. `#277`.
       const reading = behindHeld && current ? channelReadPosition(area) : position;
       const anchored = behindHeld && current && !reading.wasAtNewest && reading.anchorId
-        ? timelineMessages.find((message) => String(message.id) === reading.anchorId) : null;
+        ? timelineRows().messages.find((message) => String(message.id) === reading.anchorId) : null;
       const placeAt = timeOf(anchored, "timestamp");
       steps.pause();
       const older = Number.isFinite(placeAt)
@@ -28480,8 +28495,8 @@ async function loadTimeline(options) {
       if (!keepPosition && loadState().freshness === "fresh" && !refreshFailed(payload)) {
         // An explicit refresh starts a fresh provider snapshot. Retaining old pages here would
         // retain their expiring cursor forever, even though the newest request made a new one.
-        timelineMessages = [];
-        timelineThreads = [];
+        timelineRows().messages = [];
+        timelineRows().threads = [];
         olderPages().cursor = null;
         olderPages().moreAbove = false;
         channelStore.current().views.delete(viewKey());
@@ -29235,7 +29250,7 @@ function renderOutgoingEverywhere() {
   drawnPendingThreads = key;
   eachColumn(() => {
     renderChannelRows();
-    if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineThreads));
+    if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
   });
   if (sideColumnUp() && columns.side.mode !== "thread") renderSideCards();
 }
@@ -29758,7 +29773,7 @@ function followPlacement() {
   eachColumn(() => {
     const projected = channelView === "threads" ? null : projectView();
     if (!projected) return;
-    const drawn = timelineMessages;
+    const drawn = timelineRows().messages;
     if (projected.length === drawn.length && projected.every((message, at) => message === drawn[at])) {
       syncUnreadReplies();
       return;
@@ -29766,10 +29781,10 @@ function followPlacement() {
     const area = el("scroll-area");
     const position = channelReadPosition(area);
     const newestAt = timeOf(drawn[drawn.length - 1], "timestamp");
-    timelineMessages = projected;
+    timelineRows().messages = projected;
     renderCachedTimeline();
     const keeps = readFilterKeeps();
-    const shown = timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
+    const shown = timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
     const newestNow = timeOf(shown[shown.length - 1], "timestamp");
     const newer = newestNow > newestAt;
     settleAfterRead(shown, { keepPosition: true, area, ...position, ownAct: !newer });
@@ -33538,7 +33553,7 @@ async function seekMessage(target, arrive, openAll) {
     // list has just changed, because All, or an older page, may be what brings the message in.
     const hiddenAsRead = () => {
       if (!(hidingRead() && threadingSupported && !rowHolding(target) &&
-          timelineMessages.some((message) => String(message.id) === target))) {
+          timelineRows().messages.some((message) => String(message.id) === target))) {
         return false;
       }
       setStatus("Hide read is hiding that message.");
@@ -33964,7 +33979,7 @@ function replyLinks(messages) {
 function withHeldMessages(messages) {
   if (!threadingSupported) return messages;
   const ids = new Set(messages.map((message) => String(message.id)));
-  return [...messages, ...timelineMessages.filter((message) => !ids.has(String(message.id)))];
+  return [...messages, ...timelineRows().messages.filter((message) => !ids.has(String(message.id)))];
 }
 
 /**
@@ -34193,7 +34208,7 @@ function gatherReport(parent) {
   for (const [thread, head] of group.threads) {
     const said = threadReplies(thread, heldMessage(head) ||
       drawn.find((message) => String(message.id) === head) || null);
-    const loaded = timelineMessages.filter((message) => threadOf(message) === thread &&
+    const loaded = timelineRows().messages.filter((message) => threadOf(message) === thread &&
       String(message.id) !== head).length;
     if (said.exact === true && typeof said.count === "number") missing += Math.max(0, said.count - loaded);
   }
@@ -42956,7 +42971,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
       save();
       return;
     }
-    if (!timelineMessages.some((held) => String(held.id) === String(message.id))) timelineMessages.push(message);
+    if (!timelineRows().messages.some((held) => String(held.id) === String(message.id))) timelineRows().messages.push(message);
   }
   // `#196 auto-read-noise`. A placeholder arriving while Hide read is on is already read: it is
   // held with the rest of the channel, and the list — and its count — are not told about it.
@@ -43891,7 +43906,7 @@ function rowsMissDone() {
   })) return true;
   if (!hidingRead()) return false;
   const keeps = readFilterKeeps();
-  const wanted = new Set(timelineMessages.filter(keeps).map((message) => String(message.id)));
+  const wanted = new Set(timelineRows().messages.filter(keeps).map((message) => String(message.id)));
   const drawn = new Set(rows.flatMap(idsOf));
   return wanted.size !== drawn.size || [...wanted].some((id) => !drawn.has(id));
 }
@@ -44227,7 +44242,7 @@ function pinnedMessages() {
   if (pinStore.channel() !== channel || pinStore.size() === 0) return [];
   const held = new Map();
   const loaded = threadingSupported && channelStore.current().channel === channel
-    ? [...channelStore.current().threads.map((summary) => summary.root).filter(Boolean), ...channelStore.current().messages, ...timelineMessages]
+    ? [...channelStore.current().threads.map((summary) => summary.root).filter(Boolean), ...channelStore.current().messages, ...timelineRows().messages]
     : [...el("discord-log").children].flatMap(rowMessages);
   for (const message of loaded) held.set(String(message.id), message);
   return inTimeOrder(pinStore.entries().map(([id, pin]) => held.get(id) || keptMessage(pin, channel)), "timestamp");
@@ -44452,7 +44467,7 @@ function noiseTally() {
     return { matched: todoView.noise || 0, total: todoView.window || 0 };
   }
   const loaded = threadingSupported
-    ? timelineMessages
+    ? timelineRows().messages
     : [...el("discord-log").children].flatMap(rowMessages);
   return { matched: loaded.filter(isNoise).length, total: loaded.length };
 }
@@ -44524,7 +44539,7 @@ async function markNotNoise(ids) {
   /** @type {any[]} */
   const copies = [...channelStore.current().messages];
   // Every column's copies: the message's verdict is not one column's. `#229 desktop-two-column`.
-  eachColumn(() => copies.push(...timelineMessages, ...[...el("discord-log").children].flatMap(rowMessages)));
+  eachColumn(() => copies.push(...timelineRows().messages, ...[...el("discord-log").children].flatMap(rowMessages)));
   for (const message of copies) {
     if (rescued.has(String(message.id))) message.noise = false;
   }
@@ -47149,8 +47164,6 @@ const COLUMN_STATE = [
   [() => selectedThreadId, (value) => { selectedThreadId = value; }, () => null],
   [() => selectedThread, (value) => { selectedThread = value; }, () => null],
   [() => threadOrigin, (value) => { threadOrigin = value; }, () => "main"],
-  [() => timelineMessages, (value) => { timelineMessages = value; }, () => []],
-  [() => timelineThreads, (value) => { timelineThreads = value; }, () => []],
   [() => activeComposerKey, (value) => { activeComposerKey = value; }, () => ""],
   [() => gathered, (value) => { gathered = value; }, () => null],
   [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
@@ -47263,7 +47276,7 @@ function followInOtherColumn() {
   inOtherColumn(() => {
     if (catchUpHeldView()) {
       const keeps = readFilterKeeps();
-      settleAfterRead(timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
+      settleAfterRead(timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
         { keepPosition: true, area: el("scroll-area"), ...channelReadPosition(el("scroll-area")) });
     } else {
       syncUnreadReplies();
@@ -50905,6 +50918,7 @@ function resetSideColumn(reopen = false) {
     columns.side.tools = freshScrollTools();
     columns.side.filter = freshFilterState();
     columns.side.list = freshListState();
+    columns.side.rows = freshTimelineRows();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
@@ -52116,7 +52130,7 @@ function catchUpHiddenArrivals() {
     const position = channelReadPosition(area);
     if (catchUpHeldView()) {
       const keeps = readFilterKeeps();
-      settleAfterRead(timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
+      settleAfterRead(timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
         { keepPosition: true, area, ...position });
     } else {
       // Nothing of this view's own, but a reply on Main is one more on its root's chip.
@@ -52128,7 +52142,7 @@ function catchUpHiddenArrivals() {
       const place = channelReadPosition(there);
       if (catchUpHeldView()) {
         const keeps = readFilterKeeps();
-        settleAfterRead(timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
+        settleAfterRead(timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
           { keepPosition: true, area: there, ...place });
       }
     });
@@ -57000,7 +57014,7 @@ el("hide-empty-messages").addEventListener("change", () => {
     // ...and the thread cards, whose unread counts it changes: the Threads list's, which that redraw
     // leaves alone, and the right column's.
     eachColumn(() => {
-      if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineThreads));
+      if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     });
     renderSideColumn();
   } else if (hideEmptyMessages && !todoMode) {
@@ -57932,8 +57946,8 @@ function changeSelectedChannel() {
   uiStateSettled = true;
   openChannelView();
   channelHasThreads = false;
-  timelineMessages = [];
-  timelineThreads = [];
+  timelineRows().messages = [];
+  timelineRows().threads = [];
   channelContexts.clear();
   // `#396 thread-color-memory`. The channel's own colours, as this device last drew them.
   restoreThreadHues(selectedChannelId());
