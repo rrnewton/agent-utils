@@ -23498,6 +23498,7 @@ def test_retire_pending_distinguishes_corrupt_state_from_lock_deferral(
         "--coordinator-pid",
         str(os.getpid()),
     ).returncode == 0
+    set_liveness(project, "dead")
 
     def fail_remove(_args: argparse.Namespace, **_kwargs: object) -> int:
         if failure_type == "state":
@@ -23555,6 +23556,7 @@ def test_retire_pending_uses_one_end_to_end_lock_deadline(
             "--coordinator-pid",
             str(os.getpid()),
         ).returncode == 0
+    set_liveness(project, "dead")
     observed: list[tuple[float, float]] = []
 
     def busy_remove(

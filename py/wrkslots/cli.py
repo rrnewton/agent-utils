@@ -28533,6 +28533,19 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
     return 0
 
 
+def _candidate_release_in_effect(candidate: _RetirementCandidate) -> bool:
+    """True when the candidate carries an owner release still in effect.
+
+    A release is the owner's in-band consent for removal to proceed while
+    they live, so it defeats the live-owner block; a void release does not.
+    """
+
+    return (
+        candidate.owner_release is not None
+        and candidate.owner_release.get("state") == "released"
+    )
+
+
 def _current_retirement_candidates(
     config: Config,
     wait_seconds: float,
@@ -28558,7 +28571,9 @@ def _current_retirement_candidates(
     # candidate and the attempt itself classifies it, as today.  The one
     # caller that may retire a live slot opts in with consented_live_owners
     # (retire-pending --include-owner-consented), which leaves it
-    # unblocked.
+    # unblocked.  An owner release still in effect is also consent: the
+    # owner handed the slot over while alive, so those candidates stay
+    # attemptable without any opt-in.
     records = {
         (record.machine, record.slot, record.generation): record
         for record in state.slots
@@ -28580,6 +28595,7 @@ def _current_retirement_candidates(
         dataclasses.replace(candidate, blocked_reason="registered liveness authority reports owner alive")
         if (candidate.machine, candidate.slot, candidate.generation) in live
         and candidate.blocked_reason is None
+        and not _candidate_release_in_effect(candidate)
         else candidate
         for candidate in candidates
     )
