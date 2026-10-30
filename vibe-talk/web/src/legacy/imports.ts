@@ -98,6 +98,7 @@ export {
   TIMELINE_DELTA_PAGES,
   TIMELINE_RECONCILE_MS,
   VISIBLE_REFRESH_MS,
+  createReadOrder,
   createStandInRetries,
   deltaCursor,
   isCursorRefusal,

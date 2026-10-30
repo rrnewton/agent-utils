@@ -14254,10 +14254,14 @@ function setPromptsOpen(open) {
  */
 
 /**
- * How many timeline reads the page has sent, of any view, by any path. `remote-ops-audit` W7: see
- * `apiDecoded` and `abandonedReadStands`.
+ * How many timeline reads the page has sent, of any view, by any path, and where each answer's read
+ * stood among them (web/src/core/sync `createReadOrder`, `#624 voice-page-modularity`).
+ * `remote-ops-audit` W7: see `apiDecoded` and `abandonedReadStands`; `#308 live-reply-in-main`: see
+ * `sentNumberOf`.
+ *
+ * @type {import("./src/core/sync/index.ts").ReadOrder}
  */
-let timelineAnswersAsked = 0;
+const readOrder = createReadOrder();
 
 /**
  * The browser's capabilities as the page's modules take them (web/src/platform/web, `#624
@@ -14334,7 +14338,7 @@ function theServer() {
       // `remote-ops-audit` W7. Every timeline read the page sends passes here, and is counted as it
       // is sent, so a read given up on can tell whether any was sent after it (`abandonedReadStands`).
       asking: (type) => {
-        if (type === "TimelineResponse") timelineAnswersAsked += 1;
+        if (type === "TimelineResponse") readOrder.noteAsked();
       },
       answerer: () => sentenceStart(chatServiceOf(selectedChannelId())),
     });
@@ -23687,7 +23691,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     ledger: copyLedger,
     removals: removalRecord,
     numberOf: () => sentNumberOf(payload),
-    readsSent: () => timelineAnswersAsked,
+    readsSent: () => readOrder.asked(),
     forgetArchived: (id) => archivedIds.delete(id),
     foldReadState: () => foldReadState(payload, view),
     noteReplyGaps: (before) => noteReplyGaps(payload, view, false, true, before),
@@ -27690,21 +27694,12 @@ function sentEpochOf(payload) {
 }
 
 /**
- * By timeline answer, its read's place in the order reads were sent: `timelineAnswersAsked` once it
- * had been sent. `#308 live-reply-in-main`: of two newest pages of a view, the one sent later is the
- * newer, whichever lands first.
- *
- * @type {WeakMap<object, number>}
- */
-const readSentNumbers = new WeakMap();
-
-/**
- * Where `payload`'s read was sent in the order of every timeline read (`readSentNumbers`). Now — after
- * every read sent so far — for a payload no read sent.
+ * Where `payload`'s read was sent in the order of every timeline read (`readOrder`). Now — after every
+ * read sent so far — for a payload no read sent. `#308 live-reply-in-main`: of two newest pages of a
+ * view, the one sent later is the newer, whichever lands first.
  */
 function sentNumberOf(payload) {
-  const number = readSentNumbers.get(payload);
-  return typeof number === "number" ? number : timelineAnswersAsked;
+  return readOrder.sentNumberOf(payload);
 }
 
 /**
@@ -27716,7 +27711,7 @@ function sentNumberOf(payload) {
 const copyLedger = createCopyOrder();
 
 /** Where a message that goes into the store now, other than from a read, stands (`copyLedger`). */
-const orderNow = () => timelineAnswersAsked + 0.5;
+const orderNow = () => readOrder.now();
 
 /** Copy `copy`, the store's, stands at `at`, or later (`CopyOrder.orderCopy`). */
 function orderCopy(copy, at) {
@@ -27750,10 +27745,10 @@ async function readTimeline(path, options) {
   const sent = readLedger.epoch();
   // Counted as it is sent, before the answer is awaited (`apiDecoded`).
   const asked = apiDecoded("TimelineResponse", path, options);
-  const number = timelineAnswersAsked;
+  const number = readOrder.asked();
   const payload = await asked;
   readLedger.noteSent(payload, sent);
-  readSentNumbers.set(payload, number);
+  readOrder.noteSent(payload, number);
   return payload;
 }
 
@@ -28309,7 +28304,7 @@ async function loadTimeline(options) {
           // Once it settles, the placing read that waited for it goes (`placeUnplacedWaits`). `#308`.
           (answer) => abandonRead(answer, abandoned, (late) => landAbandonedTimelineRead(late, abandoned),
             queuePlaceUnplaced));
-        abandoned.number = timelineAnswersAsked;
+        abandoned.number = readOrder.asked();
         payload = await asked;
         steps.resume();
       } catch (error) {
@@ -29451,14 +29446,14 @@ function answerUnplaced(canon, seen) {
 
 /**
  * Message `id` is removed upstream (web/src/core/channels `Removals.noteRemoved`, `#315
- * removed-reply-target`), as of the read sent last (`timelineAnswersAsked`).
+ * removed-reply-target`), as of the read sent last (`readOrder`).
  *
  * @param {any} canon
  * @param {string} id
  * @param {number | null} [observedMs] when the server observed the removal
  */
 function noteRemoved(canon, id, observedMs = null) {
-  removalRecord.noteRemoved(canon, id, timelineAnswersAsked, observedMs);
+  removalRecord.noteRemoved(canon, id, readOrder.asked(), observedMs);
 }
 
 /**
@@ -29509,7 +29504,7 @@ function queuePlaceUnplaced() {
 /**
  * @typedef {AbandonedRead & {sent: string | null, seen: number, number: number, held: Map<string, any>,
  *   removals: number}} PlacingRead A placing read: the position in All it continues, or null for All's
- *   newest page, `unplacedArrivals` and `timelineAnswersAsked` when it was sent, the store's copies of
+ *   newest page, `unplacedArrivals` and `readOrder` when it was sent, the store's copies of
  *   the messages it held then (`heldAsSent`), and `liveRemovalsSeen` for its channel then. Its `key` is
  *   the view on screen in the left column, whose poll waits for it once it is given up on.
  */
@@ -29554,7 +29549,7 @@ async function placeUnplaced() {
             if (unused) placeFromAnswer(unused, read);
             if (landed) queuePlaceUnplaced();
           }));
-        read.number = timelineAnswersAsked;
+        read.number = readOrder.asked();
         payload = await asked;
       } catch (error) {
         if (sent && isCursorRefusal(error)) {
@@ -51770,7 +51765,7 @@ function abandonedReadStands(read) {
   if ((liveEventsSeen.get(read.channel) || 0) !== read.live) return false;
   if (threadingSupported) {
     return read.canon === channelStore.current() && channelStore.current().channel === read.channel &&
-      read.number === timelineAnswersAsked;
+      read.number === readOrder.asked();
   }
   return read.generation === discordLoadGeneration && !todoMode;
 }

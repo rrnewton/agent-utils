@@ -7182,6 +7182,25 @@ test("`#624 voice-page-modularity`: a Server-Sent Events stream read into frames
   assert.deepStrictEqual([stopped.how, stopped.cancelled()], ["ended", 1]);
 });
 
+test("`#624 voice-page-modularity`: the order timeline reads were sent in, from the module alone", () => {
+  const { createReadOrder } = SYNC;
+  const order = createReadOrder();
+  const first = {};
+  const second = {};
+  const unasked = {};
+  assert.deepStrictEqual([order.asked(), order.now()], [0, 0.5]);
+  const firstNumber = order.asked();
+  order.noteAsked();
+  const secondNumber = order.asked();
+  order.noteAsked();
+  // The second read's answer lands first: each still stands where its read was sent.
+  order.noteSent(second, secondNumber);
+  order.noteSent(first, firstNumber);
+  assert.deepStrictEqual([order.sentNumberOf(first), order.sentNumberOf(second)], [0, 1]);
+  assert.equal(order.sentNumberOf(unasked), 2, "a payload no read sent did not stand after every read so far");
+  assert.equal(order.now(), 2.5, "something put in now did not stand between reads");
+});
+
 test("`#624 voice-page-modularity`: the quick retries after a stand-in read, from the module alone", () => {
   const { createStandInRetries, STAND_IN_RETRY_MS, DISCORD_POLL_MS } = SYNC;
   const retries = createStandInRetries();
@@ -75487,9 +75506,9 @@ for (const mode of ["newest", "delta"]) {
     // placing read was sent; or the delta, which no longer continues All, putting back nothing. Either
     // way the placing read is marked as having answered, and the reply is in no column and not held.
     const control = await run(mode === "newest"
-      // `timelineAnswersAsked` is the legacy script's, found in the page's global scope at run time.
+      // `readOrder` is the legacy script's, found in the page's global scope at run time.
       ? await brokenModule([{ file: "src/core/channels/fold.ts", find: "      cover.fullSent = deps.numberOf();\n",
-        replace: "      cover.fullSent = timelineAnswersAsked + 1;\n" }], brokenScriptEach(COUNTS_SPEAK_FOR_ALL))
+        replace: "      cover.fullSent = readOrder.asked() + 1;\n" }], brokenScriptEach(COUNTS_SPEAK_FOR_ALL))
       : await brokenModule([{ file: "src/core/channels/placement.ts", find: "  const back = newerPage(canon, \"flat\", number) ? []",
         replace: "  const back = true ? []" }], brokenScriptEach(COUNTS_SPEAK_FOR_ALL)));
     assert.equal(savedMessage(control.page, "300"), null, "the reply was held anyway, so this test cannot see it");
