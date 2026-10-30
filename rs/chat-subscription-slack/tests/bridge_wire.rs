@@ -473,6 +473,7 @@ fn replay_after_host_eviction_and_emoji_change_keeps_one_slack_rejection() {
 #[test]
 fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
     let configuration = BridgeConfiguration {
+        unknown: Default::default(),
         subscription_plugin: "slack".to_owned(),
         subscription_environment: Vec::new(),
         channel_ids: vec![CHANNEL.to_owned()],
@@ -485,6 +486,7 @@ fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
         receipt_reaction: ReactionSetting::Inherit,
         reject_reaction: ReactionSetting::Inherit,
         backend_configuration: Some(BackendConfigurationDocument {
+            unknown: Default::default(),
             schema: "agentctl.slack.v1".to_owned(),
             data: Map::from_iter([
                 ("cli_path".to_owned(), json!("/opt/slack/bin/slack-cli")),

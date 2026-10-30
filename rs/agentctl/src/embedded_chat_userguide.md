@@ -48,8 +48,23 @@ Create a private owner-only JSON file (normally mode `0600`):
 }
 ```
 
+A top-level key this agentctl does not know (one a newer agentctl reads) is
+named in a warning and otherwise ignored, so a configuration written for a newer
+build still starts an older one; `chat init` does not store it, because its
+value was never checked. The required keys (`subscription_plugin`,
+`channel_ids`, `allowed_senders`, `agent_name`, `agent_label`) stay required,
+and unknown keys inside `outbound_command` and `reply_alias_range` are refused.
+A key beside `backend_configuration`'s `schema` and `data` is treated like an
+unknown top-level key; the keys inside `data` are the plugin's to judge.
+The saved `bridge.json` follows the same rule at its top level and in its
+`config`: a key a newer build saved there is ignored with a warning and kept
+when an older build rewrites the file (`grant-limit`, `repoint`).
+
 The subscription plugin is discovered below `$AGENTCTL_HOME/plugins` (default
-`~/.agentctl/plugins`) using its private manifest. The bridge revalidates and
+`~/.agentctl/plugins`) using its private manifest. A manifest key this agentctl
+does not know is ignored, warned about once, and listed under the plugin's
+`ignored_manifest_keys` in `agentctl capabilities`; the plugin still loads when
+the fields this build needs are valid. The bridge revalidates and
 pins the manifest directory and executable before every generation. Provider
 credentials do not belong in the manifest or saved bridge state. When a plugin
 needs credential paths or tokens from the service environment, list only their
@@ -2444,7 +2459,9 @@ for the client's own):
 
 ### Plugin settings (`backend_configuration`, schema `agentctl.slack.v1`)
 
-Unknown keys are refused.
+A key this plugin does not know (one a newer plugin reads) is ignored, and the
+plugin names it in its diagnostics log each time it starts a subscription; a
+known key with an invalid value is refused.
 
 | Key | Default | Meaning |
 | --- | --- | --- |

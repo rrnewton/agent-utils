@@ -5758,6 +5758,7 @@ mod tests {
                     )
                     .expect("fixture process phase timeouts"),
                 executable_identity: None,
+                ignored_manifest_keys: Vec::new(),
             }],
             refused: vec![crate::plugins::RefusedPlugin {
                 entry: "old-chat".to_owned(),

@@ -179,12 +179,15 @@ Omitting the object preserves the exact default Hello, Start, Commit, Close, and
 shutdown-grace values of 10, 30, 30, 10, and 2 seconds. Required protocol phases
 must be positive and are capped at 30, 180, 60, and 120 seconds respectively;
 shutdown grace may be zero and is capped at 10 seconds. Discovery refuses an
-incomplete object, an unknown member, or a value outside those bounds before it
-spawns the executable.
+incomplete object or a value outside those bounds before it spawns the
+executable. A manifest key this agentctl does not know, at any level (a newer
+plugin's), is ignored, warned about once, and listed under the plugin's
+`ignored_manifest_keys` in `agentctl capabilities`; it can neither select
+environment variables nor claim runtime status.
 
 The home, plugin directory, manifest, and executable must be owned by the
 current account and must not be group/world writable. Symlinks, hard-linked
-files, path traversal, oversized or changing manifests, duplicate capability
+files, path traversal, oversized manifests, manifests whose known fields change after discovery, duplicate capability
 identities, and incompatible protocol ranges are refused. `agentctl
 capabilities` lists safe compatible entries under `discovered` and rejected
 entries under `refused`; it distinguishes these from the built-in subscription

@@ -509,14 +509,18 @@ impl From<SubscriptionError> for ChatRuntimeError {
 
 type Result<T> = std::result::Result<T, ChatRuntimeError>;
 
-/// Operator-controlled, non-secret provider configuration.
+/// Operator-controlled, non-secret provider configuration. A key beside `schema` and `data` that
+/// a newer agentctl added is kept and ignored, as at the top of [`BridgeConfiguration`]; the keys
+/// inside `data` are the plugin's to judge.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BackendConfigurationDocument {
     /// Provider-owned schema identifier for the non-secret object.
     pub schema: String,
     /// Provider-owned non-secret configuration object.
     pub data: Map<String, Value>,
+    /// Keys beside `schema` and `data` this build does not know.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 /// Operator-selected one-shot outbound helper configuration.
@@ -651,8 +655,11 @@ fn selected_slack_format(
 }
 
 /// Authority and routing configuration retained for one bridge state directory.
+///
+/// An unknown top-level key (one a newer agentctl added) is kept, warned about once, and
+/// otherwise ignored, so a forward bump never stops an older bridge reading the same file. The
+/// authority fields stay required, and the nested objects stay strict.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BridgeConfiguration {
     /// Exact discovered process-plugin name.
     pub subscription_plugin: String,
@@ -703,6 +710,31 @@ pub struct BridgeConfiguration {
     /// Per-channel Slack outbound format, overriding `slack_format`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slack_format_by_channel: BTreeMap<String, SlackFormat>,
+    /// Top-level keys this build does not know: kept when the configuration is written back,
+    /// otherwise ignored.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
+}
+
+/// Print, once per process for each document and set of keys, that `path` has top-level keys
+/// this build does not know and ignores.
+fn warn_unknown_keys(path: &Path, unknown: &BTreeMap<String, Value>) {
+    static WARNED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    if unknown.is_empty() {
+        return;
+    }
+    let warning = format!(
+        "agentctl: warning: {} has top-level key(s) this agentctl does not know: {}; ignoring \
+         them (a newer agentctl may use them)",
+        path.display(),
+        crate::plugins::key_list(unknown.keys())
+    );
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.insert(warning.clone()) {
+        eprintln!("{warning}");
+    }
 }
 
 /// The reply alias numbers, `first` to `last` inclusive, that one bridge assigns. Bridges that
@@ -837,10 +869,30 @@ impl BridgeConfiguration {
         Ok(())
     }
 
-    /// Read a strict, bounded, private owner-only configuration document.
+    /// The keys this build does not know, at the top and beside `backend_configuration`'s
+    /// `schema` and `data`, each with `prefix` before its dotted path.
+    fn unknown_keys(&self, prefix: &str) -> BTreeMap<String, Value> {
+        let top = self
+            .unknown
+            .iter()
+            .map(|(key, value)| (format!("{prefix}{key}"), value));
+        let backend = self.backend_configuration.iter().flat_map(|backend| {
+            backend
+                .unknown
+                .iter()
+                .map(move |(key, value)| (format!("{prefix}backend_configuration.{key}"), value))
+        });
+        top.chain(backend)
+            .map(|(key, value)| (key, value.clone()))
+            .collect()
+    }
+
+    /// Read a bounded, private owner-only configuration document, warning once about top-level
+    /// keys this build does not know.
     pub fn load_private(path: &Path) -> Result<Self> {
         let configuration: Self = read_document(path, 1 << 20)?;
         configuration.validate()?;
+        warn_unknown_keys(path, &configuration.unknown_keys(""));
         Ok(configuration)
     }
 
@@ -889,11 +941,14 @@ impl BridgeConfiguration {
     }
 }
 
+/// `bridge.json`. Unknown top-level keys, here and in `config`, are kept when it is rewritten and
+/// otherwise ignored with a warning, as in [`BridgeConfiguration`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ConfigurationEnvelope {
     version: u32,
     config: BridgeConfiguration,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3037,9 +3092,9 @@ fn credential_evidence(
 /// The credential files named by the plugin and helper environment as the running `chat run`
 /// last observed them, saved as `provider-credentials.json` in the state directory so that
 /// `chat status`, which may run without the service's environment, reports them. It holds no
-/// paths; see [`crate::credentials`].
+/// paths; see [`crate::credentials`]. The service and `chat status` can be different builds, so
+/// a field a newer service writes, here or in a file entry, is ignored rather than refused.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CredentialRecord {
     schema: String,
     /// When the service last inspected the files.
@@ -5275,7 +5330,14 @@ pub fn select_plugin(
 
 impl BridgeState {
     /// Create a new private bridge state directory.
-    pub fn initialize(root: &Path, config: BridgeConfiguration) -> Result<Self> {
+    ///
+    /// Top-level keys of `config` this build does not know are not stored: their values were
+    /// never checked, and could hold a secret the state must not keep.
+    pub fn initialize(root: &Path, mut config: BridgeConfiguration) -> Result<Self> {
+        config.unknown.clear();
+        if let Some(backend) = config.backend_configuration.as_mut() {
+            backend.unknown.clear();
+        }
         config.validate()?;
         // The receipt marks a request the agent admitted as input, so a
         // new state does not take it as the acknowledgement as well. A state made before keeps
@@ -5321,6 +5383,7 @@ impl BridgeState {
         let envelope = ConfigurationEnvelope {
             version: STATE_VERSION,
             config: config.clone(),
+            unknown: BTreeMap::new(),
         };
         write_document(&root.join("bridge.json"), &envelope)?;
         write_document(&root.join("checkpoint.json"), &Checkpoint::empty())?;
@@ -5420,6 +5483,9 @@ impl BridgeState {
             )));
         }
         envelope.config.validate()?;
+        let mut unknown = envelope.unknown.clone();
+        unknown.extend(envelope.config.unknown_keys("config."));
+        warn_unknown_keys(&root.join("bridge.json"), &unknown);
         Ok(Self {
             root: root.to_path_buf(),
             config: envelope.config,
@@ -16876,6 +16942,7 @@ mod tests {
 
     fn config() -> BridgeConfiguration {
         BridgeConfiguration {
+            unknown: Default::default(),
             subscription_plugin: "fixture".to_owned(),
             subscription_environment: Vec::new(),
             channel_ids: vec!["spaces/example".to_owned()],
@@ -16926,7 +16993,64 @@ mod tests {
                 "subscription_secret".to_owned(),
                 Value::String("no".to_owned()),
             );
-        assert!(serde_json::from_value::<BridgeConfiguration>(unknown).is_err());
+        // A key this build does not know is accepted and kept in memory, but `initialize` does
+        // not store it: its value was never checked and could be a secret.
+        let accepted: BridgeConfiguration =
+            serde_json::from_value(unknown).expect("unknown top-level key is ignored");
+        assert_eq!(
+            accepted.unknown.keys().collect::<Vec<_>>(),
+            ["subscription_secret"]
+        );
+        let root = temporary("unknown-config-key");
+        let mut accepted = accepted;
+        accepted.backend_configuration = Some(
+            serde_json::from_value(json!({
+                "schema": "provider.example.v1",
+                "data": {},
+                "newer_backend_key": "no"
+            }))
+            .expect("a key beside schema and data is ignored"),
+        );
+        assert_eq!(
+            accepted.unknown_keys("").keys().collect::<Vec<_>>(),
+            [
+                "backend_configuration.newer_backend_key",
+                "subscription_secret"
+            ]
+        );
+        BridgeState::initialize(&root, accepted).expect("initialize with an unknown key");
+        let stored = fs::read_to_string(root.join("bridge.json")).expect("bridge.json");
+        assert!(!stored.contains("subscription_secret"), "{stored}");
+        assert!(!stored.contains("newer_backend_key"), "{stored}");
+        fs::remove_dir_all(&root).expect("cleanup");
+        let mut nested = serde_json::to_value(config()).expect("configuration");
+        nested["outbound_command"] = json!({"executable": "/bin/true", "surprise": 1});
+        assert!(serde_json::from_value::<BridgeConfiguration>(nested).is_err());
+
+        // A bridge.json written by a newer agentctl loads, and an older one rewriting it keeps
+        // the keys it does not know.
+        let root = temporary("unknown-bridge-key");
+        BridgeState::initialize(&root, config()).expect("initialize");
+        let path = root.join("bridge.json");
+        let mut document: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("bridge.json")).expect("JSON");
+        document["future_envelope"] = json!(1);
+        document["config"]["future_setting"] = json!({"on": true});
+        write_document(&path, &document).expect("newer bridge.json");
+        let state = BridgeState::open(&root).expect("open a newer bridge.json");
+        assert_eq!(
+            state.config().unknown.keys().collect::<Vec<_>>(),
+            ["future_setting"]
+        );
+        state
+            .set_max_grant_duration(Duration::from_secs(3_600))
+            .expect("rewrite");
+        let rewritten: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("bridge.json")).expect("JSON");
+        assert_eq!(rewritten["future_envelope"], json!(1));
+        assert_eq!(rewritten["config"]["future_setting"], json!({"on": true}));
+        assert_eq!(rewritten["config"]["max_grant_seconds"], json!(3_600));
+        fs::remove_dir_all(&root).expect("cleanup");
 
         for names in [
             vec!["BAD-NAME".to_owned()],
@@ -32154,6 +32278,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             Value::from(logs.join("plugin.log").display().to_string()),
         );
         configuration.backend_configuration = Some(BackendConfigurationDocument {
+            unknown: Default::default(),
             schema: "fixture.v1".to_owned(),
             data,
         });
@@ -32419,6 +32544,17 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             .write_credential_record(&files, unix_millis() + 3_600_000)
             .expect("save a record from the future");
         let future = evidence(&state);
+        // A record from a newer service, with fields this build does not know, still reads.
+        state
+            .write_credential_record(&files, unix_millis())
+            .expect("save a fresh record");
+        let path = root.join(CREDENTIAL_RECORD_FILE);
+        let mut newer: Value =
+            serde_json::from_slice(&fs::read(&path).expect("record")).expect("JSON");
+        newer["newer_field"] = Value::from(1);
+        newer["files"][0]["newer_file_field"] = Value::from("x");
+        write_document(&path, &newer).expect("save a newer record");
+        let from_newer = evidence(&state);
         fs::write(root.join(CREDENTIAL_RECORD_FILE), b"not json").expect("corrupt the record");
         let unreadable = evidence(&state);
         fs::remove_dir_all(root).expect("cleanup");
@@ -32434,6 +32570,8 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         // A record observed later than now (a clock set back) is not trusted as current.
         assert_eq!(future.0, "untrusted");
         assert_eq!(future.1, "untrusted");
+        assert_eq!(from_newer.0, "current");
+        assert_eq!(from_newer.2[0]["problem"], "missing");
         // A corrupt record is unreadable evidence, not a clean bill.
         assert_eq!(unreadable.0, "unreadable");
         assert_eq!(unreadable.1, "unreadable");

@@ -24,7 +24,10 @@ configuration. The manifest has no environment-selection field.
 
 Every frame is a nonzero four-byte big-endian unsigned payload length followed
 by exactly that many UTF-8 JSON bytes. The payload limit is 1,048,576 bytes.
-Objects reject unknown or duplicate keys. The protocol family is
+Objects reject unknown or duplicate keys, with one exception: the host's
+`backend_configuration` in `start` ignores a key beside `schema` and `data`, so a
+newer host never stops an older plugin (the keys inside `data` are the plugin's
+to judge). The protocol family is
 `agentctl-chat-subscription`; manifests negotiate numeric version `1`.
 
 The host begins with:

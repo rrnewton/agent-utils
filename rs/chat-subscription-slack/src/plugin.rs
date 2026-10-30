@@ -183,6 +183,9 @@ pub struct PluginConfig {
     pub rescan_calls_per_minute: u64,
     /// The name of the host-wide listing budget, by default the user's one (`user`).
     pub rescan_budget_key: String,
+    /// Keys this plugin does not know, sorted: ignored, and named in the diagnostics each time a
+    /// subscription starts.
+    pub ignored_keys: Vec<String>,
 }
 
 fn failure(code: &str, detail: impl Into<String>, retryable: bool) -> BackendFailure {
@@ -231,7 +234,9 @@ fn optional_seconds(
 }
 
 impl PluginConfig {
-    /// Parse and validate the host-supplied configuration. Unknown keys are refused.
+    /// Parse and validate the host-supplied configuration. A key this plugin does not know is
+    /// collected in [`Self::ignored_keys`] rather than refused, so a configuration written for a
+    /// newer plugin still starts this one.
     ///
     /// # Errors
     ///
@@ -269,11 +274,12 @@ impl PluginConfig {
             "rescan_calls_per_minute",
             "rescan_budget_key",
         ];
-        if let Some(unknown) = data.keys().find(|key| !KNOWN.contains(&key.as_str())) {
-            return Err(invalid(format!(
-                "unknown backend_configuration key {unknown:?}"
-            )));
-        }
+        let mut ignored_keys: Vec<String> = data
+            .keys()
+            .filter(|key| !KNOWN.contains(&key.as_str()))
+            .cloned()
+            .collect();
+        ignored_keys.sort();
         let transport = match optional_string(data, "transport")?.as_deref() {
             None | Some("cli") => TransportKind::Cli,
             Some("web_api") => TransportKind::WebApi,
@@ -405,6 +411,7 @@ impl PluginConfig {
                 .unwrap_or(rescan::DEFAULT_CALLS_PER_MINUTE),
             rescan_budget_key: optional_string(data, "rescan_budget_key")?
                 .unwrap_or_else(|| "user".to_owned()),
+            ignored_keys,
         })
     }
 }
@@ -576,6 +583,18 @@ impl ChatSubscriptionBackend for SlackBackend {
         }
         let config = PluginConfig::from_request(request)?;
         let diagnostics = Diagnostics::new(config.diagnostics_log.clone(), "slack-plugin");
+        if !config.ignored_keys.is_empty() {
+            diagnostics.log(&format!(
+                "warning: backend_configuration has key(s) this plugin does not know: {}; \
+                 ignoring them (a newer plugin may use them)",
+                config
+                    .ignored_keys
+                    .iter()
+                    .map(|key| format!("{key:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         let refusals = crate::refusals::RefusalRecorder::beside(config.diagnostics_log.as_deref());
         let channels: BTreeSet<String> = request
             .channel_ids()

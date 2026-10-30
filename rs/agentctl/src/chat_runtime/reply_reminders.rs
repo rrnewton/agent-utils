@@ -644,6 +644,7 @@ mod tests {
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],

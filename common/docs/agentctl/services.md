@@ -220,6 +220,16 @@ once: a transient unit is stopped and made again from its original definition
 contents restored, followed by a reload and a restart. The old service is then
 health-checked the same way.
 
+**A rollback pairs a binary with its state.** Rolling back restores the old
+binary, not the state the old binary last saw. Configuration files
+(`profiles.json`, `restore.json`, the bridge's `chat.json` and `bridge.json`,
+plugin manifests) take a key from a newer build with a warning, but the records
+a service writes as it works (a bridge's request and reply records, the agent
+registry's records, the watcher's state) are read strictly, and a record the
+new build has already written can stop the old binary. Before refreshing a
+service you may need to roll back by hand, copy its state directory (`cp -a`)
+beside the old binary, and roll back to the two together.
+
 **Output** is one line per service, `UNIT (KIND): OLD_COMMIT OLD_BINARY ->
 NEW_COMMIT NEW_BINARY: healthy: DETAIL`, or what failed and how the rollback
 went, then the run directory. `--dry-run` prints the plan and its commands and

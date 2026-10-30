@@ -329,8 +329,14 @@ fn cancellation_wakes_a_blocked_receive() {
 fn configuration_is_validated() {
     let fake = FakeTransport::new();
     let mut backend = make_backend(&fake);
+    // A key this plugin does not know (a newer plugin's) is ignored, not refused.
+    let config = chat_subscription_slack::plugin::PluginConfig::from_request(&request(
+        None,
+        json!({"zz_newer": 1, "a_newer": {"x": true}}),
+    ))
+    .expect("unknown keys are ignored");
+    assert_eq!(config.ignored_keys, ["a_newer", "zz_newer"]);
     for bad in [
-        json!({"unknown_key": 1}),
         json!({"cli_path": "relative/slack"}),
         json!({"transport": "smoke-signals"}),
     ] {

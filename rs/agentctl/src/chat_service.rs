@@ -7272,6 +7272,7 @@ mod tests {
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
@@ -8764,6 +8765,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: vec!["AGENTCTL_TEST_CERT_PATH".to_owned()],
                 channel_ids: vec!["spaces/example".to_owned()],
@@ -9409,6 +9411,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/allowed".to_owned()],
@@ -9479,6 +9482,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/allowed".to_owned()],
@@ -9541,6 +9545,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/allowed".to_owned(), "spaces/other".to_owned()],
@@ -9635,6 +9640,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/allowed".to_owned()],
@@ -10035,6 +10041,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
@@ -11849,6 +11856,7 @@ esac
     #[test]
     fn service_join_ceiling_includes_the_configured_outbound_operation() {
         let configuration = BridgeConfiguration {
+            unknown: Default::default(),
             subscription_plugin: "fixture".to_owned(),
             subscription_environment: Vec::new(),
             channel_ids: vec!["spaces/example".to_owned()],
@@ -12313,6 +12321,7 @@ esac
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
@@ -14084,6 +14093,7 @@ esac
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],

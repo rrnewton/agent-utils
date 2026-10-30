@@ -12,7 +12,7 @@
 //! verification. Those fields therefore remain false until a future runtime probe produces its
 //! own evidence.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -157,6 +157,10 @@ pub struct DiscoveredPlugin {
     /// Exact executable accepted during discovery; omitted from capability JSON.
     #[serde(skip)]
     pub(crate) executable_identity: Option<FileIdentity>,
+    /// Manifest keys this build does not know and ignored, as sorted dotted paths; omitted when
+    /// there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_manifest_keys: Vec<String>,
 }
 
 /// One directory entry refused before execution.
@@ -423,22 +427,29 @@ enum ImplementationState {
     Implemented,
 }
 
+// A manifest key this build does not know, at any level, is collected rather than refused, so
+// an older agentctl still loads a newer plugin whose manifest has the fields it needs; the keys
+// are reported in the inventory and warned about once. A manifest cannot grant authority, so a
+// key ignored here takes nothing away from what this build enforces.
+
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProtocolManifest {
     name: String,
     min: u16,
     max: u16,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct ProcessPhaseTimeoutManifest {
     hello_seconds: u64,
     start_seconds: u64,
     commit_seconds: u64,
     close_seconds: u64,
     shutdown_grace_seconds: u64,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for ProcessPhaseTimeoutManifest {
@@ -449,12 +460,12 @@ impl Default for ProcessPhaseTimeoutManifest {
             commit_seconds: DEFAULT_PLUGIN_COMMIT_TIMEOUT_SECONDS,
             close_seconds: DEFAULT_PLUGIN_CLOSE_TIMEOUT_SECONDS,
             shutdown_grace_seconds: DEFAULT_PLUGIN_SHUTDOWN_GRACE_SECONDS,
+            unknown: BTreeMap::new(),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PluginManifest {
     schema: String,
     name: String,
@@ -464,6 +475,65 @@ struct PluginManifest {
     implementation: ImplementationState,
     #[serde(default)]
     process_phase_timeouts: ProcessPhaseTimeoutManifest,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
+}
+
+impl PluginManifest {
+    /// Every key this build does not know, as a sorted dotted path such as
+    /// `process_phase_timeouts.rescan_seconds`.
+    fn unknown_keys(&self) -> Vec<String> {
+        let nested = |prefix: &str, map: &BTreeMap<String, serde_json::Value>| {
+            map.keys()
+                .map(|key| format!("{prefix}.{key}"))
+                .collect::<Vec<_>>()
+        };
+        let mut keys: Vec<String> = self.unknown.keys().cloned().collect();
+        keys.extend(nested("protocol", &self.protocol.unknown));
+        keys.extend(nested(
+            "process_phase_timeouts",
+            &self.process_phase_timeouts.unknown,
+        ));
+        keys.sort();
+        keys
+    }
+}
+
+/// Keys for a warning: each quoted with control characters escaped, at most 20 named, the list
+/// bounded like any refusal detail.
+pub(crate) fn key_list<'a>(keys: impl IntoIterator<Item = &'a String>) -> String {
+    const MAX_NAMED: usize = 20;
+    let keys: Vec<&String> = keys.into_iter().collect();
+    let mut named = keys
+        .iter()
+        .take(MAX_NAMED)
+        .map(|key| format!("{key:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if keys.len() > MAX_NAMED {
+        named.push_str(&format!(" and {} more", keys.len() - MAX_NAMED));
+    }
+    bounded(named)
+}
+
+/// Print, once per process for each plugin and set of keys, that its manifest has keys this
+/// build ignores.
+fn warn_unknown_manifest_keys(entry: &str, keys: &[String]) {
+    static WARNED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    if keys.is_empty() {
+        return;
+    }
+    let warning = format!(
+        "agentctl: warning: plugin {entry:?} has manifest key(s) this agentctl does not know: \
+         {}; ignoring them (a newer agentctl may use them)",
+        key_list(keys)
+    );
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.insert(warning.clone()) {
+        eprintln!("{warning}");
+    }
 }
 
 fn bounded(value: impl Into<String>) -> String {
@@ -713,6 +783,8 @@ fn inspect_plugin(path: &Path, entry: &str, uid: u32) -> Result<DiscoveredPlugin
     let manifest_bytes = read_manifest(&manifest_path, uid)
         .map_err(|error| refused(entry, "invalid_manifest", error.to_string()))?;
     let (manifest, executable, process_phase_timeouts) = parse_manifest(&manifest_bytes, entry)?;
+    let ignored_manifest_keys = manifest.unknown_keys();
+    warn_unknown_manifest_keys(entry, &ignored_manifest_keys);
     let executable_metadata = validate_executable(&path.join(&executable), uid)
         .map_err(|error| refused(entry, "unsafe_executable", error.to_string()))?;
     Ok(DiscoveredPlugin {
@@ -728,6 +800,7 @@ fn inspect_plugin(path: &Path, entry: &str, uid: u32) -> Result<DiscoveredPlugin
         ),
         process_phase_timeouts,
         executable_identity: Some(FileIdentity::from_metadata(&executable_metadata)),
+        ignored_manifest_keys,
     })
 }
 
@@ -781,7 +854,7 @@ fn parse_manifest(
         ));
     }
     let process_phase_timeouts =
-        validate_process_phase_timeouts(entry, manifest.process_phase_timeouts)?;
+        validate_process_phase_timeouts(entry, manifest.process_phase_timeouts.clone())?;
     let executable = direct_child_name(&manifest.executable).ok_or_else(|| {
         refused(
             entry,
@@ -1276,28 +1349,34 @@ mod tests {
     }
 
     #[test]
-    fn manifest_process_phase_timeout_object_is_strict_and_complete() {
-        for (name, fields) in [
-            (
-                "missing-close",
-                "\"hello_seconds\":10,\"start_seconds\":30,\"commit_seconds\":30,\"shutdown_grace_seconds\":2",
-            ),
-            (
-                "unknown-unit",
-                "\"hello_seconds\":10,\"start_seconds\":30,\"commit_seconds\":30,\"close_seconds\":10,\"shutdown_grace_seconds\":2,\"close_millis\":10000",
-            ),
-        ] {
-            let fixture = Fixture::new();
-            fixture.plugin(
-                name,
-                &format!("chat-subscription.{name}"),
-                &format!(",\"process_phase_timeouts\":{{{fields}}}"),
-            );
-            let inventory = discover_at(fixture.path.clone());
-            assert!(inventory.discovered.is_empty(), "{name} was discovered");
-            assert_eq!(inventory.refused.len(), 1, "{name} refusal count");
-            assert_eq!(inventory.refused[0].code, "invalid_manifest", "{name}");
-        }
+    fn manifest_process_phase_timeout_object_is_complete_and_ignores_newer_keys() {
+        let fixture = Fixture::new();
+        fixture.plugin(
+            "missing-close",
+            "chat-subscription.missing-close",
+            ",\"process_phase_timeouts\":{\"hello_seconds\":10,\"start_seconds\":30,\"commit_seconds\":30,\"shutdown_grace_seconds\":2}",
+        );
+        let inventory = discover_at(fixture.path.clone());
+        assert!(
+            inventory.discovered.is_empty(),
+            "missing-close was discovered"
+        );
+        assert_eq!(inventory.refused.len(), 1);
+        assert_eq!(inventory.refused[0].code, "invalid_manifest");
+
+        // A key a newer agentctl reads is ignored and reported; the known timeouts still apply.
+        let fixture = Fixture::new();
+        fixture.plugin(
+            "newer-unit",
+            "chat-subscription.newer-unit",
+            ",\"process_phase_timeouts\":{\"hello_seconds\":10,\"start_seconds\":30,\"commit_seconds\":30,\"close_seconds\":10,\"shutdown_grace_seconds\":2,\"close_millis\":10000}",
+        );
+        let inventory = discover_at(fixture.path.clone());
+        assert!(inventory.refused.is_empty(), "{:?}", inventory.refused);
+        assert_eq!(
+            inventory.discovered[0].ignored_manifest_keys,
+            ["process_phase_timeouts.close_millis"]
+        );
     }
 
     #[test]
@@ -1374,7 +1453,20 @@ mod tests {
     }
 
     #[test]
+    fn warning_key_lists_are_escaped_and_bounded() {
+        let keys = ["plain".to_owned(), "bell\u{7}\u{1b}[31m".to_owned()];
+        assert_eq!(key_list(&keys), r#""plain", "bell\u{7}\u{1b}[31m""#);
+        let many: Vec<String> = (0..25).map(|index| format!("k{index:02}")).collect();
+        let listed = key_list(&many);
+        assert!(listed.ends_with("\"k19\" and 5 more"), "{listed}");
+        let long = vec!["x".repeat(10_000)];
+        assert!(key_list(&long).len() <= 2_000);
+    }
+
+    #[test]
     fn manifest_cannot_select_environment_variables() {
+        // An `environment` key is not this build's: it is ignored and reported, and selects
+        // nothing.
         let fixture = Fixture::new();
         fixture.plugin(
             "environment-chat",
@@ -1382,10 +1474,15 @@ mod tests {
             ",\"environment\":[\"PROVIDER_CREDENTIAL\"]",
         );
         let inventory = discover_at(fixture.path.clone());
-        assert!(inventory.discovered.is_empty());
-        assert_eq!(inventory.refused.len(), 1);
-        assert_eq!(inventory.refused[0].code, "invalid_manifest");
-        assert!(inventory.refused[0].detail.contains("unknown field"));
+        assert!(inventory.refused.is_empty(), "{:?}", inventory.refused);
+        assert_eq!(
+            inventory.discovered[0].ignored_manifest_keys,
+            ["environment"]
+        );
+        let pinned = inventory
+            .launch_command("environment-chat")
+            .expect("pinned launch");
+        assert!(!format!("{pinned:?}").contains("PROVIDER_CREDENTIAL"));
     }
 
     #[test]
@@ -1397,9 +1494,15 @@ mod tests {
             ",\"connected\":true,\"live_verified\":true",
         );
         let inventory = discover_at(fixture.path.clone());
-        assert!(inventory.discovered.is_empty());
-        assert_eq!(inventory.refused.len(), 1);
-        assert_eq!(inventory.refused[0].code, "invalid_manifest");
+        assert!(inventory.refused.is_empty(), "{:?}", inventory.refused);
+        let plugin = &inventory.discovered[0];
+        assert!(!plugin.status.connected && !plugin.status.live_verified);
+        assert_eq!(plugin.ignored_manifest_keys, ["connected", "live_verified"]);
+        let listed = serde_json::to_value(plugin).expect("capability JSON");
+        assert_eq!(
+            listed["ignored_manifest_keys"],
+            serde_json::json!(["connected", "live_verified"])
+        );
     }
 
     #[test]

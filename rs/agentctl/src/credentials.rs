@@ -26,8 +26,8 @@ pub(crate) const CREDENTIAL_EXPIRY_WARNING: Duration = Duration::from_secs(24 * 
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 1 << 20;
 
 /// One credential file named by the plugin or helper environment, as `chat status` reports it.
+/// A field a newer service writes is ignored, so an older `chat status` still reads the record.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct CredentialFile {
     /// The environment variable that names the file. Its value, the path, is never reported:
     /// the bridge keeps the plugin and helper environment's values out of its state and status.

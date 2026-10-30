@@ -204,6 +204,7 @@ mod tests {
 
     fn configuration(channels: &[&str]) -> BridgeConfiguration {
         BridgeConfiguration {
+            unknown: Default::default(),
             subscription_plugin: "fake".to_owned(),
             subscription_environment: Vec::new(),
             channel_ids: channels

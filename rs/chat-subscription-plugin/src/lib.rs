@@ -666,8 +666,10 @@ struct WireProviderPayload {
     data: serde_json::Map<String, serde_json::Value>,
 }
 
+/// The host's backend configuration in a `start` frame. A key beside `schema` and `data` that a
+/// newer host sends is ignored, so a forward bump of the host never stops an older plugin; the
+/// keys inside `data` are the plugin's to judge.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireBackendConfiguration {
     schema: String,
     data: serde_json::Map<String, serde_json::Value>,
@@ -3588,6 +3590,31 @@ mod tests {
             BackendCapabilities::try_from(wire).expect("validate capability"),
             capabilities,
         );
+    }
+
+    #[test]
+    fn start_frame_ignores_unknown_backend_configuration_keys_from_a_newer_host() {
+        let frame: ClientFrame = serde_json::from_value(serde_json::json!({
+            "type": "start",
+            "channel_ids": ["channels/one"],
+            "allowed_senders": ["users/owner"],
+            "max_uncommitted": 1,
+            "resume_from": null,
+            "backend_configuration": {
+                "schema": "fixture.config.v1",
+                "data": {},
+                "newer_host_key": true
+            }
+        }))
+        .expect("a newer host's backend configuration");
+        let ClientFrame::Start {
+            backend_configuration: Some(configuration),
+            ..
+        } = frame
+        else {
+            panic!("not a start frame");
+        };
+        assert_eq!(configuration.schema, "fixture.config.v1");
     }
 
     #[test]
