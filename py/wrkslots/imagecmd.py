@@ -218,12 +218,21 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "  wrkslots run slot01 --isolation root -- claude\n"
             "  wrkslots run slot01 --home hidden --home-expose .gitconfig -- bash\n"
             "  wrkslots run slot01 --print -- bash\n"
-            "  wrkslots run slot01 --place-only --format json\n\n"
+            "  wrkslots run slot01 --place-only --format json\n"
+            "  wrkslots run slot01 --in-scope run-1.scope --expect-slices "
+            "'{\"enclosing\": null, \"all_slots\": \"wrkslots.slice\", \"slot\": "
+            "\"wrkslots-slot01.slice\"}' --isolation root --closed-set --read-write "
+            "/path/to/target -- make\n\n"
             "Placing your own scope: --place-only is for a caller that creates and owns its own "
             "transient scope instead of letting run create one. Run it BEFORE creating the scope, "
             "from the caller's own cgroup: it reads the caller's slice once, applies the slot "
             "limits to the all-slots and slot slices derived from that one reading, and prints "
-            "the three names. Pass the slot slice to `systemd-run --scope --slice=...`."
+            "the three names. Pass the slot slice to `systemd-run --scope --slice=...`. Then, from "
+            "inside that scope, --in-scope UNIT --expect-slices JSON enters the slot's box in place: "
+            "it checks that this process is in UNIT directly under those slices (it never reads the "
+            "slice again), then runs the ordinary root-isolation steps and execs, creating no "
+            "second scope and applying no limits. --closed-set makes the view's writable set "
+            "exactly what the options name; with --print it prints that complete set as JSON."
         ),
         formatter_class=formatter,
     )
@@ -242,6 +251,37 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         ),
     )
     run.add_argument(
+        "--in-scope",
+        metavar="UNIT",
+        default=None,
+        help=(
+            "enter the box from inside the caller's own scope UNIT (such as run-1.scope) instead "
+            "of creating one: needs --expect-slices and --isolation root, joins no scope, applies "
+            "no limits (run --place-only did that first), and refuses unless this process is in "
+            "UNIT directly under the expected slot slice"
+        ),
+    )
+    run.add_argument(
+        "--expect-slices",
+        metavar="JSON",
+        default=None,
+        help=(
+            "with --in-scope: the object --place-only --format json printed, "
+            '{"enclosing": NAME or null, "all_slots": NAME, "slot": NAME}; it must name this '
+            "slot's slices"
+        ),
+    )
+    run.add_argument(
+        "--closed-set",
+        action="store_true",
+        help=(
+            "with --in-scope: --home-shared, --home-private, --output and --read-write REPLACE the "
+            "configured lists instead of adding to them (absent means none), and the slot, its Git "
+            "directories and other extra roots are read-only. Refuses --no-protect-system. With "
+            "--print, the printed JSON lists the complete writable set"
+        ),
+    )
+    run.add_argument(
         "--format",
         choices=("human", "json"),
         default=None,
@@ -257,7 +297,7 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         default=None,
         metavar="NS",
         help=(
-            "with --place-only: an absolute CLOCK_MONOTONIC time in nanoseconds (the value "
+            "with --place-only or --in-scope: an absolute CLOCK_MONOTONIC time in nanoseconds (the value "
             "time.monotonic_ns() would return then). Every systemd-escape, systemctl and sudo "
             "probe gets only the time left, is killed at the deadline, and the command is "
             "refused; one already past is refused before it starts (default: no deadline)"
@@ -1098,11 +1138,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
     output_format: str | None = getattr(args, "format", None)
     try:
         settings = _override_settings(config.sandbox_settings, args)
+        in_scope: str | None = getattr(args, "in_scope", None)
+        expect_slices: str | None = getattr(args, "expect_slices", None)
+        closed_set = bool(getattr(args, "closed_set", False))
         if getattr(args, "place_only", False):
+            for option, given in (
+                ("--in-scope", in_scope is not None),
+                ("--expect-slices", expect_slices is not None),
+                ("--closed-set", closed_set),
+            ):
+                if given:
+                    raise _refuse(f"--place-only runs nothing and takes no {option}")
             return _place_only(args, view, settings, deadline_ns, output_format or "human")
-        for option, value in (("--deadline-monotonic-ns", deadline_ns), ("--format", output_format)):
-            if value is not None:
-                raise _refuse(f"{option} applies only with --place-only")
+        if output_format is not None:
+            raise _refuse("--format applies only with --place-only")
+        if in_scope is not None or expect_slices is not None:
+            return _in_scope(args, view, settings, in_scope, expect_slices, closed_set, deadline_ns)
+        for option, given in (
+            ("--deadline-monotonic-ns", deadline_ns is not None),
+            ("--closed-set", closed_set),
+        ):
+            if given:
+                raise _refuse(f"{option} applies only with --place-only or --in-scope")
         command = list(args.command)
         if not command:
             command = [os.environ.get("SHELL", "/bin/sh")]
@@ -1145,6 +1202,66 @@ def _place_only(
         print(f"all_slots: {placement.all_slots}")
         print(f"slot: {placement.slot}")
     return 0
+
+
+def _expected_slices(text: str) -> sandbox.SlicePlacement:
+    try:
+        loaded: object = json.loads(text)
+    except ValueError as exc:
+        raise _refuse(f"--expect-slices must be the JSON object --place-only printed: {exc}") from exc
+    keys = {"enclosing", "all_slots", "slot"}
+    if not isinstance(loaded, dict) or set(loaded) != keys:
+        raise _refuse("--expect-slices must be an object with exactly enclosing, all_slots and slot")
+    enclosing, all_slots, slot = loaded["enclosing"], loaded["all_slots"], loaded["slot"]
+    if not (enclosing is None or (isinstance(enclosing, str) and enclosing)):
+        raise _refuse("--expect-slices enclosing must be a slice name or null")
+    if not (isinstance(all_slots, str) and all_slots and isinstance(slot, str) and slot):
+        raise _refuse("--expect-slices all_slots and slot must be slice names")
+    return sandbox.SlicePlacement(enclosing=enclosing, all_slots=all_slots, slot=slot)
+
+
+def _in_scope(
+    args: argparse.Namespace,
+    view: sandbox.SlotView,
+    settings: sandbox.SandboxSettings,
+    unit: str | None,
+    expect_slices: str | None,
+    closed_set: bool,
+    deadline_ns: int | None,
+) -> int:
+    """``run --in-scope``: enter the slot's box from inside the caller's own scope."""
+
+    if unit is None or expect_slices is None:
+        raise _refuse("--in-scope and --expect-slices are given together")
+    if closed_set and args.no_protect_system:
+        raise _refuse("--closed-set refuses --no-protect-system: every other mount must stay read-only")
+    expected = _expected_slices(expect_slices)
+    command = list(args.command)
+    cwd = Path(args.cwd).absolute() if args.cwd else None
+    if args.print_only:
+        plan = sandbox.in_scope_plan(
+            view,
+            settings,
+            command,
+            unit=unit,
+            expected=expected,
+            cwd=cwd,
+            slot_writable=not closed_set,
+            deadline_ns=deadline_ns,
+        )
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return 0
+    sandbox.enter_in_place(
+        view,
+        settings,
+        command,
+        unit=unit,
+        expected=expected,
+        cwd=cwd,
+        slot_writable=not closed_set,
+        deadline_ns=deadline_ns,
+    )
+    raise AssertionError("enter_in_place returns only by raising")
 
 
 def _cmd_sandbox_help(args: argparse.Namespace) -> int:
@@ -1298,6 +1415,10 @@ def _override_settings(settings: sandbox.SandboxSettings, args: argparse.Namespa
     """Apply per-run options on top of the configured settings, then re-validate."""
 
     merged = sandbox.settings_to_obj(settings)
+    if getattr(args, "closed_set", False):
+        # A closed set: the per-run options are the whole list, not additions.
+        for key in ("home_shared", "home_private", "outputs", "read_write"):
+            merged[key] = []
     if getattr(args, "writable", None) is not None:
         merged["coordinator_writable"] = args.writable
     if args.isolation is not None:

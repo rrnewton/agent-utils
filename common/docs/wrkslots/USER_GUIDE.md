@@ -2217,6 +2217,21 @@ second `…-wrkslots-<slot>-wrkslots…` tree. `--deadline-monotonic-ns NS` boun
 `systemd-escape` and `systemctl` call by an absolute `CLOCK_MONOTONIC` time; a call still running
 at the deadline is killed and the command is refused.
 
+From inside that scope, `wrkslots run SLOT --in-scope UNIT --expect-slices JSON --isolation root
+-- COMMAND` enters the slot's box in place. `JSON` is the object `--place-only --format json`
+printed. The command first checks that the three names are this slot's and that this process's
+cgroup below the user manager is exactly the slot slice's path followed by `UNIT`; it never reads
+the slice again. It then runs the ordinary `root` steps (the `sudo -n` probe, the private layer, the
+child environment, the 0600 spec, the root helper) and execs. It creates or joins no scope and
+applies no limits. `--closed-set` makes the per-run `--home-shared`, `--home-private`, `--output`
+and `--read-write` options replace the configured lists (absent means none) and leaves the slot,
+its Git directories and the view's other extra roots read-only, so the writable set is exactly what
+the options name plus the private layer and `/tmp`; it refuses `--no-protect-system`. A closed set
+with `--home-private .cargo` gives COMMAND a private, writable `~/.cargo` in the slot's state
+instead of the real one. Adding `--print` verifies the placement the same way, writes nothing into
+the slot's state, and prints one JSON object with the view, its complete writable set (`writable`)
+and the helper argv.
+
 ### Limits of the box
 
 The box stops accidents, not a process that sets out to leave it:

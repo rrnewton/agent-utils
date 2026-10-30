@@ -961,11 +961,20 @@ def prepare_state(view: SlotView, settings: SandboxSettings, home: Path) -> None
         shutil.rmtree(legacy_tmp, ignore_errors=True)
 
 
-def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path) -> dict[str, object]:
+def build_spec(
+    view: SlotView,
+    settings: SandboxSettings,
+    home: Path,
+    cwd: Path,
+    *,
+    slot_writable: bool = True,
+) -> dict[str, object]:
     """Describe the view the helper must build, as plain JSON.
 
     Pure except for existence checks, so it is shared by the ``userns`` and
-    ``root`` modes and by ``--print``.
+    ``root`` modes and by ``--print``. ``slot_writable=False`` (a closed set)
+    leaves the slot, the Git directories its checkouts commit into, and the
+    view's extra writable roots read-only; only the configured lists remain.
     """
 
     if home == Path("/") or not home.is_absolute():
@@ -987,9 +996,10 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
         if "/" in relative and (settings.home == "hidden" or (home / relative).is_dir()):
             # Top-level private directories are simply part of the layer.
             add(private_home_directory(view, relative), home / relative)
-    add(view.slot_path, view.slot_path)
-    for directory in (*view.git_directories, *view.writable):
-        add(directory, directory)
+    if slot_writable:
+        add(view.slot_path, view.slot_path)
+        for directory in (*view.git_directories, *view.writable):
+            add(directory, directory)
     # A slot's box never writes the wrkslots control directory (registry,
     # journals, other slots, slot images, private HOME layers): registry commands
     # such as heartbeat, finish, and write-handoff run outside it. A coordinator
@@ -1032,6 +1042,33 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
         "protect_system": settings.protect_system,
         "propagate": [str(path) for path in view.propagate],
         "cwd": str(cwd),
+    }
+
+
+def writable_set(spec: Mapping[str, object]) -> dict[str, object]:
+    """Every place a command in the view described by ``spec`` can write.
+
+    Derived from the same spec the helper builds, following :func:`build_view`:
+    the private layer mounted over ``$HOME``, each writable bind (source on the
+    host, target in the view), the fresh ``/tmp`` tmpfs, and, with
+    ``protect_system``, the kernel and runtime trees left writable; without it,
+    every mount (``/``). Bind sources that do not exist are left out, as the
+    helper skips them.
+    """
+
+    raw_binds = spec.get("binds", [])
+    assert isinstance(raw_binds, list)
+    protect = bool(spec.get("protect_system", True))
+    return {
+        "home_layer": {"source": str(spec["home_layer"]), "target": str(spec["home"])},
+        "binds": [
+            {"source": str(pair[0]), "target": str(pair[1])}
+            for pair in raw_binds
+            if isinstance(pair, list) and len(pair) == 2 and os.path.exists(str(pair[0]))
+        ],
+        "tmp": {"target": "/tmp", "size": str(spec.get("tmp_size", DEFAULT_TMP_SIZE))},
+        "protect_system": protect,
+        "always_writable": list(_ALWAYS_WRITABLE_PREFIXES) if protect else ["/"],
     }
 
 
@@ -1850,6 +1887,154 @@ def run(
         *argv,
     ]
     os.execvpe(fallback[0], fallback, environment)
+
+
+def _slice_chain(slice_unit: str) -> list[str]:
+    """``a-b-c.slice`` -> ``[a.slice, a-b.slice, a-b-c.slice]``: its cgroup path below the manager."""
+
+    parts = slice_unit.removesuffix(".slice").split("-")
+    return ["-".join(parts[: index + 1]) + ".slice" for index in range(len(parts))]
+
+
+def verify_in_scope(
+    view: SlotView,
+    unit: str,
+    expected: SlicePlacement,
+    *,
+    deadline_ns: int | None = None,
+    cgroup_file: Path = Path("/proc/self/cgroup"),
+) -> None:
+    """Refuse unless this process is in ``unit`` under exactly the ``expected`` slices.
+
+    The slices are never rediscovered: :func:`parent_slice` is not called. The
+    triple must be this slot's (the names :func:`place_only` derives from its
+    ``enclosing`` value), and the process's cgroup below the user manager must
+    be exactly that slot slice's chain followed by ``unit``.
+    """
+
+    if not unit.endswith(".scope") or "/" in unit or unit == ".scope":
+        raise SandboxError(f"--in-scope needs a scope unit name such as run-1.scope, not {unit!r}")
+    enclosing = expected.enclosing
+    if enclosing is not None and (not enclosing.endswith(".slice") or "/" in enclosing):
+        raise SandboxError(f"the expected enclosing slice {enclosing!r} is not a slice name")
+    parent = NO_ENCLOSING_SLICE if enclosing is None else enclosing
+    derived = (root_slice(parent), slice_name(view.slot_type, view.slot, parent, deadline_ns=deadline_ns))
+    if (expected.all_slots, expected.slot) != derived:
+        raise SandboxError(
+            f"the expected slices {expected.all_slots}, {expected.slot} are not slot {view.slot}'s "
+            f"under {enclosing or 'no enclosing slice'} ({derived[0]}, {derived[1]})"
+        )
+    try:
+        text = cgroup_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SandboxError(f"cannot read {cgroup_file}: {exc}") from exc
+    path = next((line[3:] for line in text.splitlines() if line.startswith("0::")), None)
+    if path is None:
+        raise SandboxError(f"{cgroup_file} has no unified (0::) cgroup line")
+    parts = path.split("/")
+    manager = next((index for index, part in enumerate(parts) if part.startswith("user@")), None)
+    below = [] if manager is None else parts[manager + 1 :]
+    wanted = [*_slice_chain(expected.slot), unit]
+    if manager is None or below != wanted:
+        raise SandboxError(
+            f"this process is in {path}, not in {unit} directly under {expected.slot} "
+            f"({'/'.join(wanted)} below the user manager); refusing to enter the box"
+        )
+
+
+def in_scope_plan(
+    view: SlotView,
+    settings: SandboxSettings,
+    command: Sequence[str],
+    *,
+    unit: str,
+    expected: SlicePlacement,
+    cwd: Path | None = None,
+    slot_writable: bool = True,
+    deadline_ns: int | None = None,
+    cgroup_file: Path = Path("/proc/self/cgroup"),
+) -> dict[str, object]:
+    """What :func:`enter_in_place` would do, writing nothing in the slot's state.
+
+    Verifies the scope and slices exactly as the real entry does, then returns
+    the view spec, its complete writable set, and the helper argv.
+    """
+
+    _check_in_scope_request(view, settings, command)
+    verify_in_scope(view, unit, expected, deadline_ns=deadline_ns, cgroup_file=cgroup_file)
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    spec = build_spec(view, settings, home, cwd or view.slot_path, slot_writable=slot_writable)
+    return {
+        "unit": unit,
+        "slices": expected.to_obj(),
+        "writable": writable_set(spec),
+        "helper": root_helper("SPEC-FILE"),
+        "command": list(command),
+        "view": spec,
+    }
+
+
+def _check_in_scope_request(view: SlotView, settings: SandboxSettings, command: Sequence[str]) -> None:
+    if settings.isolation != "root":
+        raise SandboxError(
+            f"--in-scope builds the view through the root helper and needs isolation root, not "
+            f"{settings.isolation}"
+        )
+    if view.coordinator:
+        raise SandboxError("--in-scope enters one slot's box, not a coordinator box")
+    if not command:
+        raise SandboxError("no command to run")
+
+
+def enter_in_place(
+    view: SlotView,
+    settings: SandboxSettings,
+    command: Sequence[str],
+    *,
+    unit: str,
+    expected: SlicePlacement,
+    cwd: Path | None = None,
+    slot_writable: bool = True,
+    deadline_ns: int | None = None,
+    cgroup_file: Path = Path("/proc/self/cgroup"),
+) -> None:
+    """Enter the slot's box from inside the caller's own scope; never creates or joins a scope.
+
+    For a caller that placed itself in ``unit`` under the slices
+    :func:`place_only` printed. Verifies that placement without rediscovering
+    any slice, then runs the ordinary root-isolation steps in order --
+    :func:`check_sudo`, :func:`prepare_state`, :func:`child_environment`,
+    :func:`write_root_spec`, :func:`root_helper` -- and execs the helper, which
+    (:func:`enter_root`) unshares the mount namespace, drops privilege and
+    execs ``command``. No slice limit is applied here: place_only did that.
+    Returns only by raising.
+    """
+
+    _check_in_scope_request(view, settings, command)
+    if os.environ.get("WRKSLOTS_BOX"):
+        raise SandboxError(
+            f"cannot box a command into slot {view.slot} from inside a coordinator box: the "
+            "coordinator box hides every slot's private state; run it outside the box"
+        )
+    verify_in_scope(view, unit, expected, deadline_ns=deadline_ns, cgroup_file=cgroup_file)
+    check_sudo(deadline_ns=deadline_ns)
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    workdir = cwd or view.slot_path
+    try:
+        prepare_state(view, settings, home)
+    except OSError as exc:
+        raise SandboxError(f"cannot prepare the private state of {view.slot}: {exc}") from exc
+    environment = child_environment(view, settings, os.environ)
+    spec = build_spec(view, settings, home, workdir, slot_writable=slot_writable)
+    spec_file = write_root_spec(spec, command, environment)
+    argv = root_helper(spec_file)
+    try:
+        _timeout(deadline_ns, "entering the box")
+        os.execvpe(argv[0], argv, environment)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(spec_file)
+        raise
 
 
 def _quote(value: str) -> str:

@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
-from wrkslots import cli, sandbox, slotimage
+from wrkslots import cli, imagecmd, sandbox, slotimage
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -613,3 +616,411 @@ def test_run_refuses_place_only_options_it_cannot_honour(
 
     assert message in capsys.readouterr().err
     assert _calls(log) == []
+
+
+# ------------------------------------- run --in-scope (no second scope), closed set
+
+_MANAGER = "0::/user.slice/user-1.slice/user@1.service"
+_APP = sandbox.SlicePlacement("app.slice", "app-wrkslots.slice", "app-wrkslots-s1.slice")
+
+
+def _no_rediscovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(cgroup_file: Path = Path("/proc/self/cgroup")) -> str | None:
+        raise AssertionError("the caller's slice was rediscovered inside the scope")
+
+    monkeypatch.setattr(sandbox, "parent_slice", refuse)
+
+
+@pytest.mark.parametrize(
+    ("placement", "path"),
+    [
+        (_APP, "/app.slice/app-wrkslots.slice/app-wrkslots-s1.slice/run-1.scope"),
+        (
+            sandbox.SlicePlacement("app-jail.slice", "app-jail-wrkslots.slice", "app-jail-wrkslots-s1.slice"),
+            "/app.slice/app-jail.slice/app-jail-wrkslots.slice/app-jail-wrkslots-s1.slice/run-1.scope",
+        ),
+        (
+            sandbox.SlicePlacement(None, "wrkslots.slice", "wrkslots-s1.slice"),
+            "/wrkslots.slice/wrkslots-s1.slice/run-1.scope",
+        ),
+    ],
+)
+def test_in_scope_accepts_exactly_the_placed_scope_without_rediscovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    placement: sandbox.SlicePlacement,
+    path: str,
+) -> None:
+    _fake_systemd_tools(tmp_path, monkeypatch)
+    _no_rediscovery(monkeypatch)
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text(_MANAGER + path + "\n")
+
+    sandbox.verify_in_scope(_slot_view(tmp_path), "run-1.scope", placement, cgroup_file=cgroup)
+
+
+@pytest.mark.parametrize(
+    ("unit", "placement", "path", "message"),
+    [
+        # A second, nested slot tree: what rediscovering the slice inside the scope makes.
+        (
+            "run-1.scope",
+            _APP,
+            "/app.slice/app-wrkslots.slice/app-wrkslots-s1.slice/app-wrkslots-s1-wrkslots.slice/"
+            "app-wrkslots-s1-wrkslots-s1.slice/run-1.scope",
+            "this process is in",
+        ),
+        # Still in the caller's own cgroup: the scope was never joined.
+        ("run-1.scope", _APP, "/app.slice/agent-7.scope", "this process is in"),
+        # Another scope under the right slices.
+        ("run-1.scope", _APP, "/app.slice/app-wrkslots.slice/app-wrkslots-s1.slice/run-2.scope", "this process is in"),
+        # A different enclosing slice than the one captured.
+        ("run-1.scope", _APP, "/wrkslots.slice/wrkslots-s1.slice/run-1.scope", "this process is in"),
+        # Not below a user manager at all.
+        ("run-1.scope", _APP, None, "this process is in"),
+        # The triple names another slot's slices.
+        (
+            "run-1.scope",
+            sandbox.SlicePlacement("app.slice", "app-wrkslots.slice", "app-wrkslots-s2.slice"),
+            "/app.slice/app-wrkslots.slice/app-wrkslots-s2.slice/run-1.scope",
+            "are not slot s1's",
+        ),
+        # The aggregate slice is not the one the enclosing slice implies.
+        (
+            "run-1.scope",
+            sandbox.SlicePlacement("app.slice", "wrkslots.slice", "app-wrkslots-s1.slice"),
+            "/app.slice/app-wrkslots.slice/app-wrkslots-s1.slice/run-1.scope",
+            "are not slot s1's",
+        ),
+        ("run-1.service", _APP, "/app.slice/app-wrkslots.slice/app-wrkslots-s1.slice/run-1.service", "needs a scope unit"),
+    ],
+)
+def test_in_scope_refuses_any_other_placement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unit: str,
+    placement: sandbox.SlicePlacement,
+    path: str | None,
+    message: str,
+) -> None:
+    _fake_systemd_tools(tmp_path, monkeypatch)
+    _no_rediscovery(monkeypatch)
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text(("0::/system.slice/x.scope" if path is None else _MANAGER + path) + "\n")
+
+    with pytest.raises(sandbox.SandboxError, match=re.escape(message)):
+        sandbox.verify_in_scope(_slot_view(tmp_path), unit, placement, cgroup_file=cgroup)
+
+
+class _Execed(Exception):
+    def __init__(self, argv: list[str], spec: dict[str, object]) -> None:
+        super().__init__(argv[0])
+        self.argv = argv
+        self.spec = spec
+
+
+def _in_scope_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path, Path]:
+    """A fake HOME with a host ~/.cargo, a runtime directory, the fake tools, and an exec catcher.
+
+    Returns (home, target, cgroup file, call log).
+    """
+
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    for directory in (".cargo/registry", ".cargo/git", ".cache", ".claude", "work"):
+        (home / directory).mkdir(parents=True)
+    (home / ".cargo/config.toml").write_text("[net]\noffline = true\n")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    target = tmp_path / "slot" / "target"
+    target.mkdir(parents=True)
+    (tmp_path / "control").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    monkeypatch.delenv("WRKSLOTS_BOX", raising=False)
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text(_MANAGER + "/app.slice/app-wrkslots.slice/app-wrkslots-s1.slice/run-1.scope\n")
+
+    def execvpe(file: str, argv: list[str], env: dict[str, str]) -> None:
+        spec = json.loads(Path(argv[-1]).read_text())
+        assert stat.S_IMODE(os.stat(argv[-1]).st_mode) == 0o600
+        raise _Execed(list(argv), spec)
+
+    monkeypatch.setattr(os, "execvpe", execvpe)
+    return home, target, cgroup, log
+
+
+def _closed_settings(target: Path) -> sandbox.SandboxSettings:
+    args = argparse.Namespace(
+        closed_set=True, isolation="root", home=None, home_shared=None,
+        home_private=[".cargo"], home_private_file=None, home_hidden=None, home_expose=None,
+        output=None, read_write=[str(target)], env=None, tmp_size="1G", no_protect_system=False,
+        memory_max=None, memory_high=None, cpu_quota=None, tasks_max=None,
+    )
+    return imagecmd._override_settings(sandbox.SandboxSettings(), args)
+
+
+def test_closed_set_replaces_the_lists_and_open_runs_still_add(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    closed = _closed_settings(target)
+    assert closed.home_shared == ()
+    assert closed.home_private == (".cargo",)
+    assert closed.outputs == ()
+    assert closed.read_write == (str(target),)
+    assert closed.tmp_size == "1G"
+    # Masks and private files are configuration, not writable roots: kept.
+    assert closed.home_hidden == sandbox.DEFAULT_HOME_HIDDEN
+
+    opened = imagecmd._override_settings(
+        sandbox.SandboxSettings(),
+        argparse.Namespace(
+            isolation=None, home=None, home_shared=None, home_private=[".cargo"],
+            home_private_file=None, home_hidden=None, home_expose=None, output=None,
+            read_write=None, env=None, tmp_size=None, no_protect_system=False,
+            memory_max=None, memory_high=None, cpu_quota=None, tasks_max=None,
+        ),
+    )
+    assert opened.home_shared == sandbox.DEFAULT_HOME_SHARED
+    assert opened.home_private == (*sandbox.DEFAULT_HOME_PRIVATE, ".cargo")
+
+
+def test_enter_in_place_runs_the_root_steps_in_the_callers_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, target, cgroup, log = _in_scope_host(tmp_path, monkeypatch)
+    _no_rediscovery(monkeypatch)
+    view = _slot_view(tmp_path)
+    settings = _closed_settings(target)
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    with pytest.raises(_Execed) as caught:
+        sandbox.enter_in_place(
+            view, settings, ["cargo", "build"], unit="run-1.scope", expected=_APP,
+            slot_writable=False, cgroup_file=cgroup,
+            deadline_ns=time.monotonic_ns() + 60 * 10**9,
+        )
+
+    argv, spec = caught.value.argv, caught.value.spec
+    assert argv[:6] == ["sudo", "-n", "--", os.path.realpath(sys.executable), "-I", "-B"]
+    assert argv[6:8] == [str(Path(sandbox.__file__).resolve()), "enter-root"]
+    assert not Path(argv[-1]).exists()  # the spec is removed when the exec does not happen
+    # The slice check (one escape), then the sudo probe; no scope was created or
+    # joined (no busctl, no systemd-run) and no limit was applied (no systemctl).
+    assert _calls(log) == ["systemd-escape -- s1", "sudo -n true"]
+    view_spec = spec["view"]
+    assert isinstance(view_spec, dict)
+    assert view_spec["binds"] == [[str(target), str(target)]]
+    assert view_spec["tmp_size"] == "1G" and view_spec["protect_system"] is True
+    # The payload's ~/.cargo is the slot's private directory, not the host's.
+    assert ".cargo" not in view_spec["home_binds"]
+    assert (tmp_path / "state" / "home" / ".cargo").is_dir()
+    assert spec["command"] == ["cargo", "build"]
+    assert spec["environment"]["WRKSLOTS_SLOT"] == "s1"  # type: ignore[index]
+    writable = sandbox.writable_set(view_spec)
+    assert writable == {
+        "home_layer": {"source": str(tmp_path / "state" / "home"), "target": str(home)},
+        "binds": [{"source": str(target), "target": str(target)}],
+        "tmp": {"target": "/tmp", "size": "1G"},
+        "protect_system": True,
+        "always_writable": ["/proc", "/sys", "/dev", "/run/user"],
+    }
+
+
+def _bind_targets(report: dict[str, object]) -> list[str]:
+    binds = report["binds"]
+    assert isinstance(binds, list)
+    return [str(item["target"]) for item in binds if isinstance(item, dict)]
+
+
+def test_an_open_spec_reports_every_writable_bind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _target, _cgroup, _log = _in_scope_host(tmp_path, monkeypatch)
+    for directory in ("slot", "project/ai_docs"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    view = _slot_view(tmp_path)
+
+    open_spec = sandbox.build_spec(view, sandbox.SandboxSettings(), home, tmp_path / "slot")
+    closed_spec = sandbox.build_spec(
+        view, sandbox.SandboxSettings(), home, tmp_path / "slot", slot_writable=False
+    )
+
+    targets = _bind_targets(sandbox.writable_set(open_spec))
+    assert str(home / ".cargo/registry") in targets and str(home / ".cargo/git") in targets
+    assert str(tmp_path / "slot") in targets and str(tmp_path / "project/ai_docs") in targets
+    closed_targets = _bind_targets(sandbox.writable_set(closed_spec))
+    assert str(tmp_path / "slot") not in closed_targets
+    assert str(home / ".cargo/registry") in closed_targets  # the lists are the caller's to close
+    unprotected = sandbox.writable_set({**open_spec, "protect_system": False})
+    assert unprotected["always_writable"] == ["/"]
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("userns", "needs isolation root, not userns"),
+        ("box", "from inside a coordinator box"),
+        ("cgroup", "this process is in"),
+    ],
+)
+def test_enter_in_place_refuses_before_touching_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str, message: str
+) -> None:
+    _home, target, cgroup, log = _in_scope_host(tmp_path, monkeypatch)
+    settings = _closed_settings(target)
+    if change == "userns":
+        settings = dataclasses.replace(settings, isolation="userns")
+    elif change == "box":
+        monkeypatch.setenv("WRKSLOTS_BOX", "coordinator")
+    else:
+        cgroup.write_text(_MANAGER + "/app.slice/agent-7.scope\n")
+
+    with pytest.raises(sandbox.SandboxError, match=re.escape(message)):
+        sandbox.enter_in_place(
+            _slot_view(tmp_path), settings, ["true"], unit="run-1.scope", expected=_APP,
+            slot_writable=False, cgroup_file=cgroup,
+        )
+
+    assert not (tmp_path / "state").exists()
+    assert not any(line.startswith("sudo") for line in _calls(log))
+    assert list((tmp_path / "runtime").iterdir()) in ([], [tmp_path / "runtime" / "wrkslots"])
+
+
+def test_run_in_scope_print_reports_the_closed_writable_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _registered_slot(tmp_path)
+    home, _target, cgroup, log = _in_scope_host(tmp_path, monkeypatch)
+    slot_path = root / "worktrees" / "slot-b"
+    target = slot_path / "target"
+    target.mkdir()
+    cgroup.write_text(
+        _MANAGER + "/app.slice/app-wrkslots.slice/app-wrkslots-slot\\x2db.slice/run-1.scope\n"
+    )
+    real = sandbox.in_scope_plan
+
+    def plan(*args: object, **kwargs: object) -> dict[str, object]:
+        return real(*args, **kwargs, cgroup_file=cgroup)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sandbox, "in_scope_plan", plan)
+    expected = json.dumps(
+        {"enclosing": "app.slice", "all_slots": "app-wrkslots.slice", "slot": "app-wrkslots-slot\\x2db.slice"}
+    )
+    capsys.readouterr()
+
+    assert cli.main(
+        ["--project-root", str(root), "run", "slot-b", "--in-scope", "run-1.scope",
+         "--expect-slices", expected, "--isolation", "root", "--closed-set",
+         "--home-private", ".cargo", "--read-write", str(target), "--tmp-size", "1G",
+         "--print", "--", "cargo", "build"]
+    ) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["unit"] == "run-1.scope"
+    assert report["writable"]["binds"] == [{"source": str(target), "target": str(target)}]
+    assert report["writable"]["tmp"] == {"target": "/tmp", "size": "1G"}
+    assert report["helper"][4] == "-I"
+    assert ".cargo" not in report["view"]["home_binds"]
+    assert _calls(log) == [line for line in _calls(log) if line.startswith("systemd-escape ")]
+    # --print wrote nothing into the slot's private state.
+    control = cli._load_config(str(root), "node-a").control
+    assert not (control / "slot-state").exists()
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--in-scope", "run-1.scope", "--", "true"], "--in-scope and --expect-slices are given together"),
+        (["--expect-slices", "{}", "--", "true"], "--in-scope and --expect-slices are given together"),
+        (["--in-scope", "run-1.scope", "--expect-slices", "[1]", "--", "true"], "--expect-slices must be an object"),
+        (["--in-scope", "run-1.scope", "--expect-slices", "{", "--", "true"], "--expect-slices must be the JSON object"),
+        (["--closed-set", "--", "true"], "--closed-set applies only with --place-only or --in-scope"),
+        (
+            ["--in-scope", "run-1.scope", "--expect-slices", "{}", "--closed-set", "--no-protect-system", "--", "true"],
+            "--closed-set refuses --no-protect-system",
+        ),
+        (["--place-only", "--in-scope", "run-1.scope"], "--place-only runs nothing and takes no --in-scope"),
+    ],
+)
+def test_run_refuses_in_scope_options_it_cannot_honour(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+    message: str,
+) -> None:
+    root = _registered_slot(tmp_path)
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["--project-root", str(root), "run", "slot-b", *extra]) != 0
+
+    assert message in capsys.readouterr().err
+    assert _calls(log) == []
+
+
+# ------------------------------------------- no bytecode writes from a -B chain
+
+
+def _tree_digest(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _package_copy(base: Path, state: str) -> Path:
+    """A copy of the package as PYTHONPATH: cold (no caches) or stale (caches older than sources)."""
+
+    parent = base / "pythonpath"
+    shutil.copytree(
+        PACKAGE_ROOT, parent / "wrkslots", ignore=shutil.ignore_patterns("__pycache__", "tests")
+    )
+    if state == "stale":
+        compiled = subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", str(parent / "wrkslots")],
+            capture_output=True, text=True, check=False, timeout=300,
+        )
+        assert compiled.returncode == 0, compiled.stderr
+        later = time.time() + 60
+        for source in (parent / "wrkslots").rglob("*.py"):
+            os.utime(source, (later, later))
+        assert list((parent / "wrkslots").rglob("*.pyc"))
+    return parent
+
+
+@pytest.mark.parametrize("state", ["cold", "stale"])
+def test_a_dash_b_placement_and_root_helper_write_no_bytecode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    root = _registered_slot(tmp_path)
+    _fake_systemd_tools(tmp_path, monkeypatch)
+    parent = _package_copy(tmp_path, state)
+    before = _tree_digest(parent)
+    environment = {key: value for key, value in os.environ.items() if key != "PYTHONDONTWRITEBYTECODE"}
+    environment["PYTHONPATH"] = str(parent)
+
+    placed = subprocess.run(
+        [sys.executable, "-B", "-m", "wrkslots", "--project-root", str(root), "run", "slot-b",
+         "--place-only", "--format", "json"],
+        cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=300,
+    )
+    helper = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import json; from wrkslots import sandbox; print(json.dumps(sandbox.root_helper('SPEC')))"],
+        cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=300,
+    )
+
+    assert placed.returncode == 0, placed.stderr
+    assert set(json.loads(placed.stdout)) == {"enclosing", "all_slots", "slot"}
+    assert helper.returncode == 0, helper.stderr
+    assert json.loads(helper.stdout)[4:6] == ["-I", "-B"]
+    assert json.loads(helper.stdout)[6] == str(parent / "wrkslots" / "sandbox.py")
+    assert _tree_digest(parent) == before
+
+    # The probe can see a write: the same import without -B fills the cache.
+    unsuppressed = subprocess.run(
+        [sys.executable, "-c", "from wrkslots import sandbox"],
+        cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=300,
+    )
+    assert unsuppressed.returncode == 0, unsuppressed.stderr
+    assert _tree_digest(parent) != before
