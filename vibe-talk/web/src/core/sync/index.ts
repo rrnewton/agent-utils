@@ -20,3 +20,5 @@ export { createReadOrder } from "./order.ts";
 export type { ReadOrder } from "./order.ts";
 export { createReplayLedger } from "./replays.ts";
 export type { LandedPage, ReplayLedger } from "./replays.ts";
+export { LIVE_RETRY_MS, createStreamGeneration, joinQueuedReads } from "./streams.ts";
+export type { QueuedReadOptions, StreamGeneration } from "./streams.ts";

@@ -7182,6 +7182,21 @@ test("`#624 voice-page-modularity`: a Server-Sent Events stream read into frames
   assert.deepStrictEqual([stopped.how, stopped.cancelled()], ["ended", 1]);
 });
 
+test("`#624 voice-page-modularity`: a read asked for while another is out joins the one queued, and streams' generations, from the module alone", () => {
+  const { joinQueuedReads, createStreamGeneration } = SYNC;
+  assert.deepStrictEqual(joinQueuedReads({ reason: "reset" }, { reason: "live", keepPosition: true }),
+    { reason: ["reset", "live"], keepPosition: true }, "a reason was dropped, or the newest options lost");
+  assert.deepStrictEqual(joinQueuedReads({ reason: ["poll", "live"] }, { reason: "live" }), { reason: ["poll", "live"] });
+  assert.deepStrictEqual(joinQueuedReads({ reason: "poll" }, { reason: "poll" }), { reason: "poll" }, "one reason was not left as one");
+  assert.deepStrictEqual(joinQueuedReads({ reason: "view", quiet: true, readAs: "old" }, { reason: "poll", readAs: "new" }),
+    { reason: ["view", "poll"], readAs: "new", quiet: true }, "quiet was not kept from the read already queued");
+  assert.deepStrictEqual(joinQueuedReads(undefined, undefined), { reason: undefined });
+  const generation = createStreamGeneration();
+  const started = generation.current();
+  generation.bump();
+  assert.deepStrictEqual([started, generation.current()], [0, 1]);
+});
+
 test("`#624 voice-page-modularity`: which replayed events still wait for a read, from the module alone", () => {
   const { createReplayLedger } = SYNC;
   const ledger = createReplayLedger();

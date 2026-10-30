@@ -94,6 +94,7 @@ export { anchorOfMessage, createBookmarks, createPins, createReadLedger, isBookm
 export { createNavigation } from "../core/navigation/index.ts";
 export {
   DISCORD_POLL_MS,
+  LIVE_RETRY_MS,
   STALE_AS_OF_MS,
   TIMELINE_DELTA_PAGES,
   TIMELINE_RECONCILE_MS,
@@ -101,8 +102,10 @@ export {
   createReadOrder,
   createReplayLedger,
   createStandInRetries,
+  createStreamGeneration,
   deltaCursor,
   isCursorRefusal,
+  joinQueuedReads,
   readEventStream as readEventFrames,
   staleAsOf as syncStaleAsOf,
 } from "../core/sync/index.ts";

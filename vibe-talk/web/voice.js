@@ -51858,12 +51858,8 @@ function queueDiscordLoad(options) {
     discordQueuedLoads.set(activeColumn, { options });
     return;
   }
-  /** @param {{reason?: string | (string | undefined)[]} | undefined} opts */
-  const reasons = (opts) => (opts && Array.isArray(opts.reason) ? opts.reason : [opts ? opts.reason : undefined]);
-  const all = [...new Set([...reasons(queued.options), ...reasons(options)])];
-  const quiet = Boolean(queued.options && queued.options.quiet) || Boolean(options && options.quiet);
-  discordQueuedLoads.set(activeColumn,
-    { options: { ...(options || {}), reason: all.length === 1 ? all[0] : all, ...(quiet ? { quiet } : {}) } });
+  // Every reason kept, the newest options otherwise, `quiet` from either (web/src/core/sync `joinQueuedReads`).
+  discordQueuedLoads.set(activeColumn, { options: joinQueuedReads(queued.options, options) });
 }
 
 /**
@@ -52016,12 +52012,12 @@ function letStreamGoWhileHidden() {
   if (!document.hidden || liveChannel === null || session.socket) return;
   const resume = { channel: String(liveChannel), from: liveLastEventId };
   stopChannelStream();
-  liveResumeAfterHidden = { ...resume, generation: liveGeneration };
+  liveResumeAfterHidden = { ...resume, generation: liveGeneration.current() };
 }
 
 /** Follow the stream let go while hidden again, from its last event, unless something else has since. */
 function resumeLiveStream(resume) {
-  if (resume === null || resume.generation !== liveGeneration || liveChannel !== null) return;
+  if (resume === null || resume.generation !== liveGeneration.current() || liveChannel !== null) return;
   if (String(selectedChannelId()) !== resume.channel || !token()) return;
   startChannelStream(resume.channel, resume.from);
 }
@@ -52386,8 +52382,8 @@ async function fetchResume() {
 // URL is logged by every proxy it passes and lands in the browser's own history. So: `fetch`, a
 // reader over the response body, and about thirty lines of SSE parsing.
 
-/** Where the reconnect delay lives, so the suite can walk the page past it. */
-const LIVE_RETRY_MS = 5000;
+// Where the reconnect delay lives (`LIVE_RETRY_MS`), so the suite can walk the page past it, is
+// web/src/core/sync's.
 /**
  * The longest a read waits for the stream to attach (`whenLiveAttached`). The server answers a
  * stream as soon as it has subscribed it, so on an ordinary connection this is one round trip; a
@@ -52482,7 +52478,7 @@ let liveChannel = null;
  * page has moved on. An AbortController would be the other way; this one needs nothing of the
  * browser that a `fetch` polyfill might not have.
  */
-let liveGeneration = 0;
+const liveGeneration = createStreamGeneration();
 /** The last `id:` this page saw, sent back as `Last-Event-ID` so a reconnect does not duplicate. */
 let liveLastEventId = null;
 /** Whether the response body is currently open. */
@@ -52620,7 +52616,7 @@ function renderLiveState() {
 
 /** Stop following whatever is being followed. Idempotent. */
 function stopChannelStream() {
-  liveGeneration += 1;
+  liveGeneration.bump();
   liveChannel = null;
   liveAttached = false;
   liveLastEventId = null;
@@ -52674,7 +52670,7 @@ function startChannelStream(channelId, resumeFrom = null) {
     return;
   }
   liveChannel = channelId;
-  const generation = liveGeneration;
+  const generation = liveGeneration.current();
   guardQuietly(() => followChannel(channelId, generation))();
 }
 
@@ -52686,18 +52682,18 @@ function startChannelStream(channelId, resumeFrom = null) {
  * honesty with it, leaving a list that looks current and is not.
  */
 async function followChannel(channelId, generation) {
-  while (generation === liveGeneration) {
+  while (generation === liveGeneration.current()) {
     try {
       await readChannelStream(channelId, generation);
     } catch (error) {
-      if (generation !== liveGeneration) {
+      if (generation !== liveGeneration.current()) {
         return;
       }
       // Not `showError`: a live feed that dropped is not a reason to put a red panel over a call
       // in progress. It is recorded where connection facts belong.
       addDetail(`live stream dropped: ${error.message}`);
     }
-    if (generation !== liveGeneration) {
+    if (generation !== liveGeneration.current()) {
       return;
     }
     liveAttached = false;
@@ -52714,7 +52710,7 @@ async function followChannel(channelId, generation) {
 /** Wait out the reconnect delay. Answers false if the stream was stopped while waiting. */
 function liveRetryDelay(generation) {
   return new Promise((resolve) => {
-    setTimeout(() => resolve(generation === liveGeneration), LIVE_RETRY_MS);
+    setTimeout(() => resolve(generation === liveGeneration.current()), LIVE_RETRY_MS);
   });
 }
 
@@ -52747,7 +52743,7 @@ async function readChannelStream(channelId, generation) {
   liveAttachResumed = Boolean(headers["Last-Event-ID"]);
   renderLiveState();
   releaseLiveAttachWaiters();
-  await readEventStream(reader, () => generation === liveGeneration, onStreamFrame);
+  await readEventStream(reader, () => generation === liveGeneration.current(), onStreamFrame);
 }
 
 /** Whether the channel stream's attach now open resumed from a cursor. `#337 voice-relay-silent`. */
@@ -53759,7 +53755,7 @@ function endCallRelay() {
 // screen is read out.
 
 /** Bumped on every start and stop of the stream of every channel, as `liveGeneration` is. */
-let watchAllGeneration = 0;
+const watchAllGeneration = createStreamGeneration();
 /** The cursor of the last event it delivered, sent back as `Last-Event-ID` on a reconnect. */
 let watchAllLastEventId = null;
 /** Whether its response body is open now. */
@@ -53781,13 +53777,13 @@ let watchAllAbort = null;
 function startWatchAll() {
   stopWatchAll();
   if (!watchAllSupported || liveDelivery === "off" || !token()) return;
-  const generation = watchAllGeneration;
+  const generation = watchAllGeneration.current();
   guardQuietly(() => followWatchAll(generation))();
 }
 
 /** Stop following every channel. Idempotent. */
 function stopWatchAll() {
-  watchAllGeneration += 1;
+  watchAllGeneration.bump();
   if (watchAllAbort !== null) {
     try {
       watchAllAbort.abort();
@@ -53803,20 +53799,20 @@ function stopWatchAll() {
 
 /** Read the stream of every channel, and keep reading it, as `followChannel` does one channel's. */
 async function followWatchAll(generation) {
-  while (generation === watchAllGeneration) {
+  while (generation === watchAllGeneration.current()) {
     let ended = "dropped";
     try {
       ended = await readWatchAll(generation);
     } catch (error) {
-      if (generation !== watchAllGeneration) return;
+      if (generation !== watchAllGeneration.current()) return;
       addDetail(`the stream of every channel dropped: ${error.message}`);
     }
-    if (generation !== watchAllGeneration || ended === "unsupported") return;
+    if (generation !== watchAllGeneration.current() || ended === "unsupported") return;
     watchAllAttached = false;
     // A reset is answered at once, from now: the gap has been said, and waiting would widen it.
     if (ended === "reset") continue;
     const resumed = await new Promise((resolve) => {
-      setTimeout(() => resolve(generation === watchAllGeneration), LIVE_RETRY_MS);
+      setTimeout(() => resolve(generation === watchAllGeneration.current()), LIVE_RETRY_MS);
     });
     if (!resumed) return;
   }
@@ -53833,7 +53829,7 @@ async function readWatchAll(generation) {
   const abort = typeof AbortController === "function" ? new AbortController() : null;
   watchAllAbort = abort;
   const response = await fetch("/api/v1/live/stream", abort ? { headers, signal: abort.signal } : { headers });
-  if (generation !== watchAllGeneration) return "ended";
+  if (generation !== watchAllGeneration.current()) return "ended";
   if (response.status === 404) {
     watchAllSupported = false;
     addDetail("this server cannot stream every channel at once, so a call reads out new messages only " +
@@ -53849,7 +53845,7 @@ async function readWatchAll(generation) {
   }
   watchAllAttached = true;
   watchAllResumed = resumed;
-  return readEventStream(body.getReader(), () => generation === watchAllGeneration, onWatchAllFrame);
+  return readEventStream(body.getReader(), () => generation === watchAllGeneration.current(), onWatchAllFrame);
 }
 
 /**
