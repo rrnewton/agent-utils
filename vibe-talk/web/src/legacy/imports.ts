@@ -99,10 +99,10 @@ export {
   TIMELINE_RECONCILE_MS,
   VISIBLE_REFRESH_MS,
   createReadOrder,
+  createReplayLedger,
   createStandInRetries,
   deltaCursor,
   isCursorRefusal,
-  isMutationKey,
   readEventStream as readEventFrames,
   staleAsOf as syncStaleAsOf,
 } from "../core/sync/index.ts";

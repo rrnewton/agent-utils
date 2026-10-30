@@ -1937,7 +1937,7 @@ async function applyDeepLink() {
   // reader has navigated for themselves meanwhile: a link opened the page, it does not chase
   // a reader who has already gone somewhere of their own choosing.
   await waitForDeepLink(() => String(selectedChannelId()) !== channel ||
-    (timelineReadsStarted > 0 && channelStore.current().views.has(viewKey())));
+    (replayLedger.started() > 0 && channelStore.current().views.has(viewKey())));
   if (epoch !== deepLinkEpoch || String(selectedChannelId()) !== channel) return;
   const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
   /** @type {ChannelPlace | null} */
@@ -2216,7 +2216,7 @@ function ownLevel(tag) {
 /** Wait for the channel on screen to have read the view it shows, or to be left; false when it was left. */
 async function linkJumpRead(channel, ticket) {
   await waitForDeepLink(() => ticket !== linkJumpTicket || String(selectedChannelId()) !== channel ||
-    (timelineReadsStarted > 0 && channelStore.current().views.has(viewKey()) && !discordFetchInFlight));
+    (replayLedger.started() > 0 && channelStore.current().views.has(viewKey()) && !discordFetchInFlight));
   return ticket === linkJumpTicket && String(selectedChannelId()) === channel;
 }
 
@@ -19932,7 +19932,7 @@ function onVisibility() {
       try {
         if (owed === "mutation") refreshAfterLiveMutation();
         else {
-          const since = timelineReadsStarted;
+          const since = replayLedger.started();
           await loadDiscord({ keepPosition: true, reason: "visible" });
           await readSideColumn("visible", since);
         }
@@ -24733,7 +24733,7 @@ function reopenSavedView() {
     showView("discord");
     returnToSavedPlace();
     holdChannelPlace();
-    reopenReadOwed = { after: timelineReadsStarted };
+    reopenReadOwed = { after: replayLedger.started() };
   }
   saveUiState();
 }
@@ -24767,7 +24767,7 @@ function payReopenRead() {
       reopenReadOwed = reopenReadOwed || owed;
       return;
     }
-    if (currentView !== "discord" || timelineReadsStarted !== owed.after) return;
+    if (currentView !== "discord" || replayLedger.started() !== owed.after) return;
     // Merged into the rows the snapshot drew, keeping the reader's message, as a channel change
     // does; with nothing drawn it is a first visit and settles on the newest.
     readEnteredChannel(channelFreshAt > 0);
@@ -28118,7 +28118,7 @@ function renderCachedTimeline() {
 
 /** Whether an edit or removal from the replay tail is waiting for a read to answer it. */
 function mutationAwaitsRead() {
-  return [...replaysAwaitingRead.keys()].some(isMutationKey);
+  return replayLedger.mutationAwaits();
 }
 
 
@@ -28221,7 +28221,7 @@ async function loadTimeline(options) {
   }
   discordFetchInFlight = true;
   timelineReadContext = context;
-  const read = ++timelineReadsStarted;
+  const read = replayLedger.start();
   const area = el("scroll-area");
   const position = channelReadPosition(area);
   const keepPosition = Boolean(options && options.keepPosition);
@@ -50844,7 +50844,7 @@ function resetSideColumn(reopen = false) {
  * Read the right column's thread behind its rows, or the thread list behind its cards: the poll's
  * second read, and coming back to the page. Nothing while one column is up.
  *
- * `since` is `timelineReadsStarted` as it stood when the refresh asking for this began, before its
+ * `since` is `replayLedger.started()` as it stood when the refresh asking for this began, before its
  * read of Main. `#231 two-column-polish`. A read of the thread on the right that went on the wire
  * after that is this read already: a thread selected while the poll's read of Main was out queued its
  * read behind it, and that read ran before the poll got here. Reading it again brought nothing the
@@ -50865,7 +50865,7 @@ async function readSideColumn(reason, since = null) {
 
 /**
  * The newest timeline read each column sent and that has not failed before landing a page: the view
- * it was for (`channelContextKey`), its number among `timelineReadsStarted`, and whether it read the
+ * it was for (`channelContextKey`), its number among `replayLedger.started()`, and whether it read the
  * view in full rather than as what changed. `#231 two-column-polish`. One still on the wire counts,
  * as the read a refresh would send would only queue behind it; if it then fails, the right column's
  * line says so (`renderSideFreshness`) and the next poll reads the view again. A chain of what
@@ -51826,17 +51826,15 @@ let discordLoadGeneration = 0;
  * @type {Map<typeof activeColumn, {options: any}>}
  */
 const discordQueuedLoads = new Map();
-// How many timeline reads have gone on the wire, the newest of them that landed, that count when
-// the live stream last attached, and the replayed events waiting on a read that may not have seen
-// them, each with the count as it stood when the server had it. A read begun after that answers
-// for it once it lands: one that failed saw nothing. `#43 replay-burst-double-read`.
-let timelineReadsStarted = 0;
-let timelineReadsLanded = 0;
-// The newest of them that could answer an edit or a removal: a newest page or a complete delta.
-// `#203 incremental-refresh`.
-let mutationReadsLanded = 0;
-let liveAttachReads = 0;
-const replaysAwaitingRead = new Map();
+/**
+ * How many timeline reads have gone on the wire, the newest of them that landed (and that could answer
+ * an edit or a removal), that count when the live stream last attached, and the replayed events
+ * waiting on a read that may not have seen them (web/src/core/sync `createReplayLedger`, `#43
+ * replay-burst-double-read`, `#203 incremental-refresh`, `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/sync/index.ts").ReplayLedger}
+ */
+const replayLedger = createReplayLedger();
 
 /**
  * Remember the newest read requested while another channel read is in flight.
@@ -51946,7 +51944,7 @@ function pollDiscord() {
     let refused = false;
     try {
       refused = !clientConfigApplied && !(await signIn());
-      const since = timelineReadsStarted;
+      const since = replayLedger.started();
       if (!refused) await loadDiscord({ keepPosition: true, reason: "poll" });
       // `#229 desktop-two-column`. And the right column's thread, or its list of threads: another
       // view, one delta, never Main's again — nor the thread's again, when it was selected under
@@ -52054,7 +52052,7 @@ function catchUpHiddenArrivals() {
     liveHiddenTimer = null;
   }
   const mutation = mutationArrivedHidden;
-  const arrived = liveArrivedHidden || replaysAwaitingRead.size > 0;
+  const arrived = liveArrivedHidden || replayLedger.waiting() > 0;
   mutationArrivedHidden = false;
   liveArrivedHidden = false;
   if (arrived && currentView === "discord" && threadingSupported &&
@@ -52742,7 +52740,7 @@ async function readChannelStream(channelId, generation) {
   const reader = body.getReader();
   // The server subscribed this stream before it answered, so its replay tail is everything a read
   // begun from here on will see.
-  liveAttachReads = timelineReadsStarted;
+  replayLedger.noteAttached();
   liveAttached = true;
   // `#337 voice-relay-silent`. What a resumed attach replays is what it missed, which a call may
   // not have heard: `relayToAgent` tells that apart from a fresh attach's history.
@@ -52837,7 +52835,7 @@ function onStreamFrame(frame) {
       const message = payload.message || {};
       const id = frame.event === "message_update" ? message.id : payload.message_id;
       const channel = frame.event === "message_update" ? message.channel_id : payload.channel_id;
-      awaitReplayRead(`${frame.event}:${id}`, String(channel), liveAttachReads);
+      awaitReplayRead(`${frame.event}:${id}`, String(channel), replayLedger.attachedAfter());
       return;
     }
     // A fetched row may combine several messages and the update may change whether they still
@@ -52889,7 +52887,7 @@ function refreshAfterLiveMutation() {
         while (discordFetchInFlight) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
-        const since = timelineReadsStarted;
+        const since = replayLedger.started();
         await loadDiscord({ keepPosition: true, reason: "mutation" });
         // An edit may be in the thread on the right. `#229 desktop-two-column`.
         await readSideColumn("mutation", since);
@@ -52992,7 +52990,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
       refreshQuietly(() => inColumn(column, () => loadDiscord({ keepPosition: true, reason: "live" })))();
     } else if (!held) {
       awaitReplayRead(String(message.id), String(message.channel_id),
-        fromTail ? liveAttachReads : timelineReadsStarted);
+        fromTail ? replayLedger.attachedAfter() : replayLedger.started());
     }
     return;
   }
@@ -53163,8 +53161,7 @@ function noteLiveRemoval(channel, id, observedMs = null) {
 function awaitReplayRead(key, channel, arrivedAfter) {
   // `#203 incremental-refresh`. An edit or removal is answered only by a read that carries them:
   // a newest page, or a complete delta. A delta of additions says nothing about either.
-  if ((isMutationKey(key) ? mutationReadsLanded : timelineReadsLanded) > arrivedAfter) return;
-  replaysAwaitingRead.set(key, { channel, arrivedAfter });
+  if (replayLedger.awaitRead(key, channel, arrivedAfter)) return;
   // `#226 page-energy-profile`. A hidden page leaves it waiting for the read coming back makes.
   if (!discordFetchInFlight && currentView === "discord" && !document.hidden) {
     refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "replay" }))();
@@ -53187,24 +53184,9 @@ function awaitReplayRead(key, channel, arrivedAfter) {
  *   and — when every one of them was a delta — whether all of those were complete
  */
 function settleReplays(read, page) {
-  const channel = String(selectedChannelId());
-  // A delta answers for what it carries: creations always, edits and removals only when complete.
-  const answersMutations = Boolean(page) && (!page.delta || page.delta.complete === true);
-  if (page) timelineReadsLanded = Math.max(timelineReadsLanded, read);
-  if (answersMutations) mutationReadsLanded = Math.max(mutationReadsLanded, read);
-  const onPage = new Set([
-    ...((page && page.messages) || []).map((message) => String(message.id)),
-    ...((page && page.threads) || []).map((thread) => String(thread.root && thread.root.id)),
-  ]);
-  for (const [key, waiting] of replaysAwaitingRead) {
-    if (waiting.channel !== channel ||
-        (page && (answersMutations || !isMutationKey(key)) &&
-          (waiting.arrivedAfter < read || onPage.has(key)))) {
-      replaysAwaitingRead.delete(key);
-    }
-  }
+  replayLedger.settle(read, page, String(selectedChannelId()));
   // The stream's replay is answered by a read of the left column's view. `#229 desktop-two-column`.
-  if (page && replaysAwaitingRead.size && currentView === "discord" && !discordQueuedLoads.has(columns.main)) {
+  if (page && replayLedger.waiting() && currentView === "discord" && !discordQueuedLoads.has(columns.main)) {
     inColumn(columns.main, () => queueDiscordLoad({ keepPosition: true, reason: "replay" }));
   }
 }
@@ -57848,7 +57830,7 @@ function readEnteredChannel(keepPosition) {
   return guardQuietly(async () => {
     try {
       // A return finds the channel's store as it was left, so it asks only for what changed.
-      const since = timelineReadsStarted;
+      const since = replayLedger.started();
       await loadDiscord(keepPosition ? { keepPosition: true, reason: "visible" } : { reason: "enter" });
       // ...and the right column's thread, or its list of threads. `#229 desktop-two-column`.
       await readSideColumn(keepPosition ? "visible" : "enter", since);

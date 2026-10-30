@@ -7182,6 +7182,36 @@ test("`#624 voice-page-modularity`: a Server-Sent Events stream read into frames
   assert.deepStrictEqual([stopped.how, stopped.cancelled()], ["ended", 1]);
 });
 
+test("`#624 voice-page-modularity`: which replayed events still wait for a read, from the module alone", () => {
+  const { createReplayLedger } = SYNC;
+  const ledger = createReplayLedger();
+  assert.deepStrictEqual([ledger.started(), ledger.start(), ledger.start(), ledger.started()], [0, 1, 2, 2]);
+  ledger.noteAttached();
+  assert.equal(ledger.attachedAfter(), 2);
+  // Nothing landed yet: both wait.
+  assert.equal(ledger.awaitRead("m1", "c", 2), false);
+  assert.equal(ledger.awaitRead("message_update:m2", "c", 2), false);
+  assert.deepStrictEqual([ledger.waiting(), ledger.mutationAwaits()], [2, true]);
+  // A delta of additions begun after them answers the new message, not the edit.
+  const read = ledger.start();
+  ledger.settle(read, { messages: [], threads: [], delta: { complete: false } }, "c");
+  assert.deepStrictEqual([ledger.waiting(), ledger.mutationAwaits()], [1, true], "an incomplete delta answered an edit");
+  // A failed read answers for nothing; a complete one answers the edit.
+  ledger.settle(ledger.start(), null, "c");
+  assert.equal(ledger.waiting(), 1);
+  ledger.settle(ledger.start(), { messages: [], delta: null }, "c");
+  assert.deepStrictEqual([ledger.waiting(), ledger.mutationAwaits()], [0, false]);
+  // Once a read past an arrival has landed, a later replay of it needs no read; another channel's is forgotten.
+  assert.equal(ledger.awaitRead("m3", "c", 3), true, "a landed read did not answer an event it began after");
+  assert.equal(ledger.awaitRead("m4", "other", 99), false);
+  ledger.settle(ledger.start(), null, "c");
+  assert.equal(ledger.waiting(), 0, "an event of a channel no longer on screen still waited");
+  // A page that holds it answers it, though the read began before it arrived.
+  assert.equal(ledger.awaitRead("m5", "c", 99), false);
+  ledger.settle(4, { messages: [{ id: "m5" }] }, "c");
+  assert.equal(ledger.waiting(), 0);
+});
+
 test("`#624 voice-page-modularity`: the order timeline reads were sent in, from the module alone", () => {
   const { createReadOrder } = SYNC;
   const order = createReadOrder();
