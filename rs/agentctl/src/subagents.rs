@@ -6186,6 +6186,42 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(record)
     }
 
+    /// Does `agent_name`'s directory hold no `agent.json` at all?
+    ///
+    /// A queue can exist without a record: deliveries enqueue by path, and one addressed to an
+    /// agent after it was archived recreates `agents/<name>/queue/` with nothing beside it. Such a
+    /// directory names no pane, session or generation, so it cannot own anything a registry-wide
+    /// scan looks for. Only a missing entry counts: a record that exists but is unreadable,
+    /// unsafe, a link, or invalid is not absent, and the directory itself must still be safe.
+    fn record_absent(&self, agent_name: &str) -> Result<bool> {
+        let directory = self.directory(agent_name)?;
+        if matches!(
+            fs::symlink_metadata(&directory),
+            Err(ref error) if error.kind() == io::ErrorKind::NotFound
+        ) {
+            return Ok(true);
+        }
+        agent::validate_private_directory(&directory, "agent directory", false)?;
+        match fs::symlink_metadata(directory.join("agent.json")) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(fail(format!(
+                "cannot inspect agent record {}: {error}",
+                directory.join("agent.json").display()
+            ))),
+        }
+    }
+
+    /// [`Self::read_record`] for a scan over every registered name: `None` for a directory with
+    /// no record (see [`Self::record_absent`]), which owns nothing and must not stop the scan;
+    /// every other failure still refuses.
+    fn read_record_for_scan(&self, agent_name: &str) -> Result<Option<AgentRecord>> {
+        if self.record_absent(agent_name)? {
+            return Ok(None);
+        }
+        self.read_record(agent_name).map(Some)
+    }
+
     fn legacy_record_snapshot(
         &self,
         pinned: &PinnedAgentDirectory,
@@ -7529,8 +7565,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             let names = agent_queue::registry::names(&self.registry)
                 .map_err(|error| fail(error.to_string()))?;
             for agent_name in names {
-                match self.read_record(&agent_name) {
-                    Ok(record) => records.push(record),
+                match self.read_record_for_scan(&agent_name) {
+                    Ok(Some(record)) => records.push(record),
+                    // A rename journal explains a missing record better than an orphan does.
+                    Ok(None) if !journal_names.contains(agent_name.as_str()) => {
+                        rows.push(json!({
+                            "name": agent_name,
+                            "findings": ["record-absent"],
+                            "detail": "the agent directory holds no agent.json (a delivery \
+                                       addressed to an archived or never-started agent leaves \
+                                       just its queue); no agent drains it, and start refuses \
+                                       this name while the directory exists",
+                        }));
+                    }
+                    Ok(None) => rows.push(json!({
+                        "name": agent_name,
+                        "findings": ["rename-incomplete"],
+                        "detail": "the agent directory holds no agent.json",
+                    })),
                     Err(error) => rows.push(json!({
                         "name": agent_name,
                         "findings": [if journal_names.contains(agent_name.as_str()) {
@@ -7787,7 +7839,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             if Some(existing_name.as_str()) == exclude {
                 continue;
             }
-            let other = self.read_record(&existing_name)?;
+            let Some(other) = self.read_record_for_scan(&existing_name)? else {
+                continue;
+            };
             if (other.session_agent.as_deref().unwrap_or(&other.harness) == session_agent
                 && (other.session_value.as_deref() == Some(session_value)
                     || other.goal_session_id.as_deref() == Some(session_value)
@@ -8412,7 +8466,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         for existing_name in self.registered_names()? {
-            let other = self.read_record(&existing_name)?;
+            let Some(other) = self.read_record_for_scan(&existing_name)? else {
+                continue;
+            };
             let same_session = info.session_value.is_some()
                 && ((other.session_agent.as_deref().unwrap_or(&other.harness)
                     == info.session_agent.as_deref().unwrap_or("")
@@ -19572,6 +19628,8 @@ fi
     mod muse_status;
     /// Nested agentctl-session/v2 and v3 rows: decode, write-back and anchor migration.
     mod nested;
+    /// Registry-wide scans beside a directory that holds a queue but no record.
+    mod orphan_queue;
     /// Turn age and queued input in status and send, urgent delivery, and agents found by their
     /// pinned harness when Herdr misdetects their pane.
     mod progress;

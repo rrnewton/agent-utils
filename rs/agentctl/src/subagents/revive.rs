@@ -2245,8 +2245,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if self.registry.exists() {
             agent::validate_private_directory(&self.registry, "agent registry", false)?;
             for name in self.registered_names()? {
-                let record = self.read_record(&name)?;
-                generations.insert(name, record.token);
+                if let Some(record) = self.read_record_for_scan(&name)? {
+                    generations.insert(name, record.token);
+                }
             }
         }
         for journal in journals(&self.registry)? {
