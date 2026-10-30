@@ -2251,10 +2251,12 @@ difference instead of entering the box.
 `--git-config-policy isolated` (with `--in-scope` only) hides the default Git configuration
 locations from COMMAND: `$HOME/.gitconfig` and `$HOME/.config/git` under `$HOME` and every other
 mount path that exposes it, and `/etc/gitconfig`. The list is fixed; the option takes no path. An
-existing file reads as an empty read-only `/dev/null`, an existing directory as an empty read-only
-directory, and a missing path is left missing: no mount covers it, so the box cannot stop a host
-process from creating it while COMMAND runs. A symbolic link at a location, or a parent directory
-reached through one, is refused rather than followed, and so is any failure. After the view is
+existing file reads as an empty read-only `/dev/null` and an existing directory as an empty
+read-only directory, for COMMAND's whole lifetime. A missing location is refused: a mount needs an
+existing mount point, and wrkslots never creates one at a Git configuration location on the host,
+so nothing could keep out a file created there while COMMAND runs. A symbolic link at a location,
+or a parent directory reached through one, is refused rather than followed, and so is any failure.
+After the view is
 built and before COMMAND starts, the helper checks every location again and refuses unless each
 shows exactly that outcome. The slot's Git lookup that runs before the view also changes: it runs
 `/usr/bin/git` (refused unless root owns it and only root can write it) with a fixed environment

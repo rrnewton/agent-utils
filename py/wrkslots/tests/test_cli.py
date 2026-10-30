@@ -1575,20 +1575,34 @@ def _record_mounts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]:
 
 def test_mask_git_config_masks_the_path_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     mounts = _record_mounts(monkeypatch)
-    file, directory, absent = tmp_path / "gitconfig", tmp_path / "git", tmp_path / "missing" / "gitconfig"
+    file, directory = tmp_path / "gitconfig", tmp_path / "git"
     file.write_text("[core]\n\tfsmonitor = sentinel\n")
     directory.mkdir()
     (directory / "config").write_text("[include]\n\tpath = sentinel\n")
 
     assert sandbox._mask_git_config(str(file)) == "file"
     assert sandbox._mask_git_config(str(directory)) == "directory"
-    assert sandbox._mask_git_config(str(absent)) == "absent"
 
     assert mounts[0][:3] == ("mount", "/dev/null", str(file))
     assert mounts[1] == ("remount-ro", str(file))
     assert mounts[2][1:4] == ("tmpfs", str(directory), "tmpfs")
     assert int(mounts[2][4]) & sandbox._MS_RDONLY  # type: ignore[call-overload]
-    assert len(mounts) == 3  # nothing is mounted for the absent path
+    assert len(mounts) == 3
+
+
+@pytest.mark.parametrize("missing", ["gitconfig", "missing-parent/git"])
+def test_mask_git_config_refuses_a_missing_location_instead_of_leaving_it_unguarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    """No mount can cover a path that does not exist, and none is created on the host: refused."""
+
+    mounts = _record_mounts(monkeypatch)
+    path = tmp_path / missing
+
+    with pytest.raises(sandbox.SandboxError, match="does not exist, so no mount can keep it out"):
+        sandbox._mask_git_config(str(path))
+    assert mounts == []
+    assert not path.exists() and not path.parent.joinpath(path.name).exists()  # nothing was created
 
 
 @pytest.mark.parametrize("kind", ["symlink", "dangling", "parent-symlink", "fifo"])
@@ -1674,11 +1688,12 @@ def test_confirm_git_config_masks_checks_each_outcome_inside_the_view() -> None:
             read_only=lambda path: read_only,
         )
 
-    confirm([("/v/file", "file"), ("/v/dir", "directory"), ("/v/absent", "absent")])
+    confirm([("/v/file", "file"), ("/v/dir", "directory")])
     for outcomes, keywords in (
         ([("/v/absent", "file")], {}),                 # the file mask is not there
+        ([("/v/absent", "absent")], {}),               # "absent" is not an outcome the policy accepts
         ([("/v/dir", "file")], {}),
-        ([("/v/file", "absent")], {}),                 # an absent path appeared before COMMAND
+        ([("/v/file", "absent")], {}),
         ([("/v/dir", "directory")], {"empty": False}),  # the directory still shows its config
         ([("/v/dir", "directory")], {"read_only": False}),
         ([("/v/file", "file")], {"read_only": False}),
@@ -1697,6 +1712,7 @@ def test_build_view_masks_policy_paths_strictly_and_confirms_them(
     """STUB view: every mount step is recorded; the order and the dispatch are what is checked."""
 
     events: list[tuple[object, ...]] = []
+    real_git_mask = sandbox._mask_git_config
     for name in ("_mount", "_bind_fd", "_remount_read_only", "_limit_propagation"):
         monkeypatch.setattr(sandbox, name, lambda *args, name=name: events.append((name, *args)))
     monkeypatch.setattr(sandbox, "_remount_tree_read_only", lambda *args, **kwargs: [])
@@ -1738,6 +1754,18 @@ def test_build_view_masks_policy_paths_strictly_and_confirms_them(
     with pytest.raises(sandbox.SandboxError, match="missing from the view's masks"):
         sandbox.build_view({**spec, "masks": [str(home / ".ssh"), "/etc/gitconfig"]})
     assert not any(event[0] == "confirm" for event in events)
+
+    # A missing policy location refuses the whole view with the real strict mask:
+    # nothing is confirmed and the command never starts, so a file created there
+    # later on the host can never be visible to it.
+    events.clear()
+    monkeypatch.setattr(sandbox, "_mask_git_config", real_git_mask)
+    missing = str(tmp_path / "no-such-gitconfig")
+    with pytest.raises(sandbox.SandboxError, match="does not exist"):
+        sandbox.build_view({**spec, "masks": [str(home / ".ssh"), missing], "git_config_masks": [missing]})
+    assert not any(event[0] == "confirm" for event in events)
+    assert not any(missing in event for event in events)  # nothing was mounted there
+    Path(missing).write_text("[core]\n\tfsmonitor = appeared later\n")  # appears afterwards: no view exists
 
     # Without the policy the view is built as before: no strict mask, no confirmation.
     events.clear()

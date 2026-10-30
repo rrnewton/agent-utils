@@ -1316,10 +1316,12 @@ def _mask_git_config(path: str) -> str:
     dangling) at the path, or a parent directory reached through one, is
     refused rather than followed to mask something else, and any failure
     refuses. A directory is covered by an empty read-only tmpfs ("directory"),
-    a regular file by a read-only bind of /dev/null ("file"). A path that does
-    not exist is "absent": no mount covers it, so the box does not stop a host
-    process from creating it later; :func:`_confirm_git_config_masks` checks
-    it is still absent just before the command starts.
+    a regular file by a read-only bind of /dev/null ("file"); either mount
+    keeps the path's host contents out of the view for the command's whole
+    lifetime. A path that does not exist is REFUSED: a mount needs an existing
+    mount point, and creating one would write a Git configuration location on
+    the host (never done), so nothing could stop a host process from creating
+    the file while the command runs.
     """
 
     parent = os.path.dirname(path)
@@ -1330,8 +1332,12 @@ def _mask_git_config(path: str) -> str:
         )
     try:
         info = os.lstat(path)
-    except FileNotFoundError:
-        return "absent"
+    except FileNotFoundError as exc:
+        raise SandboxError(
+            f"git-config-policy isolated: {path} does not exist, so no mount can keep it out of the "
+            "view for the command's lifetime (a file created there later on the host would be "
+            "visible); refusing"
+        ) from exc
     except OSError as exc:
         raise SandboxError(f"git-config-policy isolated: cannot inspect {path}: {exc}") from exc
     if stat.S_ISLNK(info.st_mode):
@@ -1371,8 +1377,9 @@ def _confirm_git_config_masks(
     """Refuse unless every isolated-policy path shows its outcome inside the finished view.
 
     Called after the whole view is built and before the command starts: a
-    "file" must be the read-only /dev/null character device, a "directory" an
-    empty read-only directory, and an "absent" path must still not exist.
+    "file" must be the read-only /dev/null character device and a "directory"
+    an empty read-only directory; any other outcome, or a path that is missing
+    now, refuses.
     """
 
     null = os.stat("/dev/null")
@@ -1383,9 +1390,7 @@ def _confirm_git_config_masks(
             info = None
         except OSError as exc:
             raise SandboxError(f"git-config-policy isolated: cannot confirm {path}: {exc}") from exc
-        if outcome == "absent":
-            confirmed = info is None
-        elif outcome == "file":
+        if outcome == "file":
             confirmed = (
                 info is not None
                 and stat.S_ISCHR(info.st_mode)
