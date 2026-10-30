@@ -7197,7 +7197,7 @@ test("`#624 voice-page-modularity`: a read asked for while another is out joins 
   assert.deepStrictEqual([started, generation.current()], [0, 1]);
 });
 
-test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads and entries, reached through the column worked on", () => {
+test("`#624 voice-page-modularity`: each column keeps its own records of its older pages, reply arrows, reads, entries and pins, reached through the column worked on", () => {
   const page = newPage();
   const same = (expression) => page.pure(expression);
   assert.equal(same("olderPages() === columns.main.older"), true, "the left column's record was not the one worked on");
@@ -7227,6 +7227,10 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   assert.equal(same("inColumn(columns.side, () => entryState()) === columns.side.entry && entryState() === columns.main.entry"), true);
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshEntryState())")),
     { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null });
+  // And its Pinned filter.
+  same("inColumn(columns.side, () => { pinsView().only = true; })");
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.pins.only, pinsView().only])")), [true, false]);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshPinsView())")), { only: false, drawn: "" });
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {

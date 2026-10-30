@@ -129,23 +129,26 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows`, `load` and `entry` are the column's own records of its older pages
+ * `older`, `arrows`, `load`, `entry` and `pins` are the column's own records of its older pages
  * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
- * state (`freshLoadState`, `loadState`) and entering a view (`freshEntryState`, `entryState`; `#624
- * voice-page-modularity`, plan step 15): field groups kept on the column rather than in `state`.
+ * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`) and its
+ * Pinned filter (`freshPinsView`, `pinsView`; `#624 voice-page-modularity`, plan step 15): field groups
+ * kept on the column rather than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null,
  *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
- *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>}} ColumnFields
+ *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>,
+ *   pins: ReturnType<typeof freshPinsView>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
-    load: freshLoadState(), entry: freshEntryState() },
+    load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
-    older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState() },
+    older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
+    pins: freshPinsView() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -3234,7 +3237,7 @@ let overscrollFootSince = null;
  */
 function overscrollContext() {
   return JSON.stringify([columnsShown, threadListShown, currentScreen, currentView, columns.side.mode,
-    readMode, inColumn(columns.side, () => [channelContextKey(), pinnedOnly, searchKey()])]);
+    readMode, inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()])]);
 }
 
 /** Whether the room may be open: the right column on screen at a desk, where web/voice.css gives it a box. */
@@ -3752,7 +3755,7 @@ function slideIntoPlace(row, was) {
 /** The list the reader is actually looking at. Both panes share one scrolling element. */
 function visibleList() {
   return el(currentView === "discord"
-    ? (channelView === "threads" && !pinnedOnly ? "thread-list" : shownChannelList().id)
+    ? (channelView === "threads" && !pinsView().only ? "thread-list" : shownChannelList().id)
     : "transcript");
 }
 
@@ -3762,7 +3765,7 @@ function visibleList() {
  * see" asks this rather than naming `#discord-log`, which stays the channel's list underneath.
  */
 function shownChannelList() {
-  return el(pinnedOnly ? "pinned-log" : "discord-log");
+  return el(pinsView().only ? "pinned-log" : "discord-log");
 }
 
 /**
@@ -5991,7 +5994,7 @@ function applySearch() {
   // `#215 reply-coalesce`. A filter that takes rows away shows a subset of the channel in time order,
   // and gathered replies go back to theirs before it does: a bridge to rows it hides would be a
   // bridge to nothing. See the section on gathering replies.
-  if (gatheredParent() !== null && (typed || links || pinnedOnly || author !== "everyone")) putRepliesBack();
+  if (gatheredParent() !== null && (typed || links || pinsView().only || author !== "everyone")) putRepliesBack();
   const scope = searchScope();
   let matched = 0;
   let loaded = 0;
@@ -6074,7 +6077,7 @@ function applySearch() {
   // against, and the pass above has just decided that.
   renderReplyLinks();
   // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them.
-  const pinned = pinnedOnly && currentView === "discord";
+  const pinned = pinsView().only && currentView === "discord";
   activeColumn.searched = { matched, loaded, tally, pinned };
   renderSearchCount(typed, links, author !== "everyone");
   // `#262 search-load-older`. The step back offers to search further back while a filter chooses rows,
@@ -7244,7 +7247,7 @@ function endFilterWalk() {
 }
 
 /** Which list a filter's place is in: the view on screen, and whether the Pinned list stands in for it. */
-const filterKey = () => JSON.stringify([filterPlace(), pinnedOnly]);
+const filterKey = () => JSON.stringify([filterPlace(), pinsView().only]);
 
 /** Whether `row` is a message the filters judge: it declares what it is findable by (`searchable`). */
 const isMessageRow = (row) => row.getAttribute("data-search") !== null;
@@ -7611,7 +7614,7 @@ function carrySelection(anchor, row, substituted) {
  * nearest message is in its place: why, in words that fit one line of a 360px phone (`setStatus`).
  */
 function filterHiddenSentence(anchor, walked) {
-  if (pinnedOnly) return "Not pinned — the nearest pin is here.";
+  if (pinsView().only) return "Not pinned — the nearest pin is here.";
   if (anchorHolder(anchor)) return "Filtered out — the nearest is here.";
   if (walked && olderThanLoaded(anchor)) return `Over ${FILTER_WALK_PAGES} pages back — oldest is here.`;
   // Under Hide read a channel without threads reads only what is left, so a message it hides is in
@@ -7624,7 +7627,7 @@ function filterHiddenSentence(anchor, walked) {
 
 /** Whether the anchor's message is older than everything the channel's list has loaded, with more above it. */
 function olderThanLoaded(anchor) {
-  if (sideActive || currentView !== "discord" || pinnedOnly || olderPages().moreAbove !== true ||
+  if (sideActive || currentView !== "discord" || pinsView().only || olderPages().moreAbove !== true ||
       !Number.isFinite(anchor.time)) return false;
   const loaded = threadingSupported ? timelineMessages : [...el("discord-log").children].flatMap(rowMessages);
   const times = loaded.map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
@@ -7644,7 +7647,7 @@ async function walkToFilterAnchor(anchor) {
   const walk = { context: channelContextKey() };
   filterWalk = walk;
   const area = el("scroll-area");
-  const current = () => filterWalk === walk && walk.context === channelContextKey() && !pinnedOnly &&
+  const current = () => filterWalk === walk && walk.context === channelContextKey() && !pinsView().only &&
     currentScreen === "main" && currentView === "discord";
   area.scrollTop = 0;
   renderOlderControl();
@@ -7673,7 +7676,7 @@ async function walkToFilterAnchor(anchor) {
     }
   } finally {
     if (filterWalk === walk) {
-      const place = !scrolled && walk.context === channelContextKey() && !pinnedOnly;
+      const place = !scrolled && walk.context === channelContextKey() && !pinsView().only;
       endFilterWalk();
       if (place) {
         placeFilterAnchor(anchor, false, true);
@@ -11229,7 +11232,7 @@ const channelPane = {
   // None while the thread list is up on its own: the left column is behind it. `#281 view-keys`.
   list: () => inColumn(columns.main, () =>
     (currentScreen === "main" && currentView === "discord" && !threadListShown &&
-      (pinnedOnly || channelView !== "threads") ? shownChannelList() : null)),
+      (pinsView().only || channelView !== "threads") ? shownChannelList() : null)),
   head: () => floatingClearance(leftEl("scroll-area")),
   // The chips float over the foot of the list, the read-aloud strip stands on them while a read
   // plays (`#433 read-strip-low`), and the status line floats over both: a row under any is under
@@ -11240,7 +11243,7 @@ const channelPane = {
       room + (leftEl(id).hidden ? 0 : leftEl(id).getBoundingClientRect().height), 0);
     return area.getBoundingClientRect().top + (area.clientHeight || 0) - over;
   },
-  context: () => inColumn(columns.main, () => JSON.stringify([channelContextKey(), pinnedOnly])),
+  context: () => inColumn(columns.main, () => JSON.stringify([channelContextKey(), pinsView().only])),
   // Session-only and one short entry per list visited, for the reason `expandedIds` gives.
   marks: new Map(),
   row: null,
@@ -12862,7 +12865,7 @@ function filterFromKeyboard(which) {
   // Over the thread list on its own they would filter the column behind it. `#281 view-keys`.
   if (!channelOnScreen() || threadListOnScreen()) return false;
   if (!searchOpen) setSearchOpen(true);
-  if (which === "pinned") setPinnedOnly(!pinnedOnly);
+  if (which === "pinned") setPinnedOnly(!pinsView().only);
   else if (which === "author") cycleAuthorFilter();
   else setLinksOnly(!linksOnly);
   focusList(channelPane);
@@ -25422,9 +25425,9 @@ function renderColumnLists() {
   // All comes back to the thread selected in it, and any other view to none.
   paintAllThreadFocus();
   // `#206 pin-message`. The Pinned filter's list stands in for whichever of these is up.
-  el("thread-list").hidden = channelView !== "threads" || pinnedOnly;
-  el("discord-log").hidden = channelView === "threads" || pinnedOnly;
-  el("pinned-log").hidden = !pinnedOnly;
+  el("thread-list").hidden = channelView !== "threads" || pinsView().only;
+  el("discord-log").hidden = channelView === "threads" || pinsView().only;
+  el("pinned-log").hidden = !pinsView().only;
   // `#216 compose-hint`. Where the message goes, said in the box rather than in a heading line above
   // it, and the same words as the box's name for a screen reader.
   const destination = selectedThreadId ? "Reply in this thread" : "Message the main channel";
@@ -25506,7 +25509,7 @@ function readerPlace() {
   const area = el("scroll-area");
   const top = area.getBoundingClientRect().top;
   const bottom = top + (area.clientHeight || 0);
-  const listed = currentView === "discord" && channelView !== "threads" && !pinnedOnly
+  const listed = currentView === "discord" && channelView !== "threads" && !pinsView().only
     ? [...el("discord-log").children] : [];
   const seen = listed
     .map((row) => ({ row, box: row.getBoundingClientRect() }))
@@ -26192,7 +26195,7 @@ function entryLandingHolds() {
   const landing = entryState().landing;
   if (landing === null) return false;
   const holds = currentScreen === "main" && currentView === "discord" && channelView === "thread" &&
-    !pinnedOnly && landing.key === channelContextKey() && landing.row.parentNode === el("discord-log") &&
+    !pinsView().only && landing.key === channelContextKey() && landing.row.parentNode === el("discord-log") &&
     landing.row.getBoundingClientRect().height > 0 && Math.abs(el("scroll-area").scrollTop - landing.at) <= 1;
   if (!holds) entryState().landing = null;
   return holds;
@@ -27494,7 +27497,7 @@ function toggleAllThreadFocus(id) {
  */
 function clearAllThreadFocus() {
   return inColumn(columns.main, () => {
-    if (!channelOnScreen() || threadListShown || pinnedOnly || channelView !== "flat") return false;
+    if (!channelOnScreen() || threadListShown || pinsView().only || channelView !== "flat") return false;
     const channel = String(selectedChannelId());
     if (!allThreadFocus.has(channel)) return false;
     allThreadFocus.delete(channel);
@@ -27826,7 +27829,7 @@ function markHeldDone(ids, done, settles = false) {
 }
 
 /** Whether Done issued now is issued from Main's list, where roots say they have new replies (`markHeldDone`). */
-const doneSettlesHere = () => threadingSupported && channelView === "main" && !pinnedOnly;
+const doneSettlesHere = () => threadingSupported && channelView === "main" && !pinsView().only;
 
 // `settleUnknownReplies` is web/src/core/channels's (`#624 voice-page-modularity`).
 
@@ -29067,7 +29070,7 @@ function renderOutgoingMessages() {
   const foot = placeOutgoingInPlace(rows);
   host.replaceChildren(...foot);
   // Nor over the Pinned filter, which shows pinned messages and nothing else. `#206 pin-message`.
-  host.hidden = foot.length === 0 || pinnedOnly;
+  host.hidden = foot.length === 0 || pinsView().only;
   // `#228 reply-visible`. A reply of the owner's counts on the Reply of the message it answers from
   // the moment it is queued, and that count changes as it lands, fails or is dismissed: counted
   // again when the outbox's replies have changed since the counts were drawn. Not on a pass over
@@ -29137,7 +29140,7 @@ function placeOutgoingInPlace(rows) {
   }
   // Not under the Pinned filter, which shows pinned messages and nothing else (`#206 pin-message`): the
   // rows go to the foot, which is hidden there.
-  if (pinnedOnly) {
+  if (pinsView().only) {
     outgoingInPlaceDrawn.set(activeColumn, { anchors: [], groups: [] });
     return rows;
   }
@@ -32541,7 +32544,7 @@ function sendBookmark(move, { conditional = false, after = null, quiet = false }
 
 /** Whether the list in the column being worked on draws a bookmark at all, and if not, why not. */
 function bookmarkListRefusal(anchor) {
-  if (pinnedOnly) return "The bookmark is not in Pinned.";
+  if (pinsView().only) return "The bookmark is not in Pinned.";
   if (readRunsSuspended()) return "Close the search to see the bookmark.";
   if (!threadingSupported) return "";
   if (channelView === "main" || channelView === "flat") return "";
@@ -39756,7 +39759,7 @@ function renderOlderControl() {
   if (running && !searchWalkHolds(running, activeColumn)) endSearchWalk(activeColumn);
   const walk = activeColumn.searchWalk;
   // Not over the Pinned filter: its list is every pin already, and older history adds none.
-  const hidden = olderPages().moreAbove !== true || pinnedOnly;
+  const hidden = olderPages().moreAbove !== true || pinsView().only;
   if (button.hidden !== hidden) button.hidden = hidden;
   // `#243 filter-keeps-selection`. A walk back to the message a filter change is keeping says what it
   // is doing, where the reader waits for it.
@@ -39842,7 +39845,7 @@ const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchIdentity
  * empty sentence says how out instead.
  */
 function searchOffered() {
-  return readRunsSuspended() && currentView === "discord" && channelView !== "threads" && !pinnedOnly &&
+  return readRunsSuspended() && currentView === "discord" && channelView !== "threads" && !pinsView().only &&
     olderPages().moreAbove === true && !(todoMode && !threadingSupported) && (!sideActive || sideShowing());
 }
 
@@ -41277,7 +41280,7 @@ function maybeLoadOlder() {
   // Not at the head of the Pinned list, which is every pin already: older history adds none to it, and
   // a step taken behind it reads for a list that is not on screen. A pin older than what is loaded is
   // walked back to when the filter goes (`walkToFilterAnchor`, `#243 filter-keeps-selection`).
-  if (currentView !== "discord" || pinnedOnly || olderPages().moreAbove !== true || olderPages().inFlight) {
+  if (currentView !== "discord" || pinsView().only || olderPages().moreAbove !== true || olderPages().inFlight) {
     return;
   }
   // `#262 search-load-older`. Nor while a filter chooses rows, where the step back offers a bounded walk
@@ -43204,7 +43207,7 @@ async function refreshAfterInboxChange() {
     renderChannelSeam(todoSummary());
     renderTodoControls();
     // The Pinned filter's rows are drawn from the archive too: a pin dealt with there greys there.
-    if (pinnedOnly) renderChannelRows();
+    if (pinsView().only) renderChannelRows();
     // `#240 reading-bookmark`. The line was drawn on a row this took away, and a Done right under it
     // has just moved it: drawn again, with the chips, which no redraw of the rows does here.
     renderScrollTools();
@@ -43993,10 +43996,22 @@ function setReadMode(mode) {
  * where the variables it replaces stood.
  */
 const pinStore = createPins();
-/** Whether the Pinned filter is on. Only while the search bar is open: closing it turns this off. */
-let pinnedOnly = false;
-/** What the filter's list was last drawn from, so it is rebuilt only when that changes. */
-let pinnedListDrawn = "";
+/**
+ * A column's own record of its Pinned filter (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `only`, whether the filter is on (only while the search bar is open: closing it
+ * turns this off); `drawn`, what the filter's list was last drawn from, so it is rebuilt only when
+ * that changes.
+ *
+ * @returns {{only: boolean, drawn: string}}
+ */
+function freshPinsView() {
+  return { only: false, drawn: "" };
+}
+
+/** The column being worked on's record of its Pinned filter (`freshPinsView`). */
+function pinsView() {
+  return activeColumn.pins;
+}
 /** Rows of the filter drawn from what a pin kept, rather than from the message itself. */
 const keptByPin = new WeakSet();
 /**
@@ -44016,7 +44031,7 @@ function isPinnedId(id) {
 /** Forget the held list: another channel, or another credential. */
 function forgetPins(channel = "") {
   pinStore.forget(channel);
-  pinnedListDrawn = "";
+  pinsView().drawn = "";
 }
 
 /**
@@ -44112,7 +44127,7 @@ function renderPins() {
   }
   // Pins landing under a Pinned filter turned on before they had: the pin nearest the message the
   // reader was on is put in its place now. `#243 filter-keeps-selection`.
-  if (pinnedOnly) settlePendingFilterPlace();
+  if (pinsView().only) settlePendingFilterPlace();
 }
 
 /** What a pin keeps of `message`, as this page will show it until the server says what it kept. */
@@ -44188,9 +44203,9 @@ function pinnedMessages() {
  */
 function syncPinnedList() {
   const list = el("pinned-log");
-  if (!pinnedOnly) {
+  if (!pinsView().only) {
     if (list.children.length > 0) list.replaceChildren();
-    pinnedListDrawn = "";
+    pinsView().drawn = "";
     return;
   }
   const messages = pinnedMessages();
@@ -44201,8 +44216,8 @@ function syncPinnedList() {
   const drawn = JSON.stringify([combineMessages, hideEmptyMessages, channelStore.current().scope, threadingSupported,
     ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
       keptByPin.has(m), reactionsDrawn(m), m.heading || null, editedDrawn(m), upstreamUrlOf(m)])]);
-  if (drawn === pinnedListDrawn) return;
-  pinnedListDrawn = drawn;
+  if (drawn === pinsView().drawn) return;
+  pinsView().drawn = drawn;
   drawingPinnedRows = true;
   try {
     list.replaceChildren(...glom(messages).map(discordNode));
@@ -44222,9 +44237,9 @@ function syncPinnedList() {
  * the reader in by its own rules.
  */
 function setPinnedOnly(on, keepPlace = true) {
-  if (on === pinnedOnly) return;
+  if (on === pinsView().only) return;
   const change = () => {
-    pinnedOnly = on;
+    pinsView().only = on;
     el("pinned-filter").setAttribute("aria-pressed", on ? "true" : "false");
     if (on) el("pane-discord").setAttribute("data-pinned-only", "");
     else el("pane-discord").removeAttribute("data-pinned-only");
@@ -46040,7 +46055,7 @@ function replyKeysHere() {
 function replyListOf(from) {
   const list = from && from.parentNode;
   if (list && REPLY_LISTS.includes(String(/** @type {HTMLElement} */ (list).id || ""))) return /** @type {HTMLElement} */ (list);
-  return el(pinnedOnly ? "pinned-log" : "discord-log");
+  return el(pinsView().only ? "pinned-log" : "discord-log");
 }
 
 /** The place in the stream for a reply opened on `list`: #side-reply in the right column, else #column-reply. */
@@ -46315,7 +46330,7 @@ function reopenPendingReply() {
   if (isComposer(held) && held !== leftEl("reply-text")) return;
   const { id, typing } = pendingReply;
   /** @type {Array<{column: any, list: () => HTMLElement}>} */
-  const lists = [{ column: columns.main, list: () => el(pinnedOnly ? "pinned-log" : "discord-log") }];
+  const lists = [{ column: columns.main, list: () => el(pinsView().only ? "pinned-log" : "discord-log") }];
   if (sideColumnUp()) lists.push({ column: columns.side, list: () => leftEl(columns.side.mode === "thread" ? "side-log" : "side-cards") });
   for (const { column, list } of lists) {
     const row = inColumn(column, () => {
@@ -47107,8 +47122,6 @@ const COLUMN_STATE = [
   [() => collapsedRunRows, (value) => { collapsedRunRows = value; }, () => 0],
   [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
   [() => backlogSize, (value) => { backlogSize = value; }, () => 0],
-  [() => pinnedOnly, (value) => { pinnedOnly = value; }, () => false],
-  [() => pinnedListDrawn, (value) => { pinnedListDrawn = value; }, () => ""],
   [() => filterHold, (value) => { filterHold = value; }, () => null],
   [() => scrollToolsHeld, (value) => { scrollToolsHeld = value; }, () => 0],
   [() => scrollToolsOwed, (value) => { scrollToolsOwed = value; }, () => false],
@@ -47660,7 +47673,7 @@ function openThreadFromList(id, summary = null) {
 function showOneColumnView(target, record, place = null) {
   const thread = target.thread === null ? null : String(target.thread);
   const same = target.view === channelView && thread === (selectedThreadId ? String(selectedThreadId) : null);
-  if (same && !(record && pinnedOnly)) {
+  if (same && !(record && pinsView().only)) {
     if (target.origin) threadOrigin = target.origin;
     if (record) recordViewChoice();
     // `#304 back-gesture-in-app`. A thread's way back can be the thread list now, a level more.
@@ -50369,7 +50382,7 @@ function litCardOnRight() {
 function cardsOnScreen() {
   if (!channelOnScreen()) return null;
   if (sideColumnUp()) return columns.side.mode === "list" ? leftEl("side-cards") : null;
-  return inColumn(columns.main, () => (channelView === "threads" && !pinnedOnly ? leftEl("thread-list") : null));
+  return inColumn(columns.main, () => (channelView === "threads" && !pinsView().only ? leftEl("thread-list") : null));
 }
 
 /**
@@ -50860,6 +50873,7 @@ function resetSideColumn(reopen = false) {
     columns.side.arrows = freshReplyArrows();
     columns.side.load = freshLoadState();
     columns.side.entry = freshEntryState();
+    columns.side.pins = freshPinsView();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
@@ -57918,7 +57932,7 @@ function changeSelectedChannel() {
   saveUiState();
   // `#206 pin-message`. Under the Pinned filter the new channel's pins are what the reader is about
   // to look at, so they are read now rather than after its first read reports their revision.
-  if (pinnedOnly) {
+  if (pinsView().only) {
     ensurePins();
     renderChannelRows();
   }
@@ -58046,7 +58060,7 @@ el("jump-newest").addEventListener("click", jumpToNewest);
 // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
 el("search-toggle").addEventListener("click", () => setSearchOpen(!searchOpen));
 // `#206 pin-message`. A toggle, like the glass beside it.
-el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinnedOnly));
+el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinsView().only));
 // `#211 link-filter`. The same, for links.
 el("links-filter").addEventListener("click", () => setLinksOnly(!linksOnly));
 // `#251 author-filter`. Everyone, Mine, Theirs, in turn.
@@ -58381,7 +58395,7 @@ if (typeof window.ResizeObserver === "function") {
   // What the column is showing: a change of it is not the content changing under the reader. Beside Main
   // or on its own as the thread list (`#281 view-keys`), which is a change of what it shows too.
   const contextOf = () => (sideColumnUp()
-    ? `${columnsShown ? "two" : "list"}|${currentScreen}|${currentView}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinnedOnly}`)}`
+    ? `${columnsShown ? "two" : "list"}|${currentScreen}|${currentView}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinsView().only}`)}`
     : "one");
   // On the newest line, and scrolled to it. What the column shows is noted only by this observer's
   // passes, which a change of it always brings: not on every scroll event.
