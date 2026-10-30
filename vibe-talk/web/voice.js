@@ -28594,7 +28594,7 @@ function outgoingStatus(entry) {
     if (progress && progress.parts > 1) {
       return `Posting part ${Math.min(progress.posted + 1, progress.parts)} of ${progress.parts}…`;
     }
-    return entry.confirming ? "Sending… The answer was lost; checking whether it went." : "Sending…";
+    return entry.confirming ? "Sending… Slack is slow to confirm…" : "Sending…";
   }
   if (entry.state === "sent") return "Sent.";
   const prefix = entry.postedCount > 0

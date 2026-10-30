@@ -746,7 +746,7 @@ test("`#448 send-dedupe`: an ask that never answers ends, and the send is left u
   page.el("channel-compose-text").setValue("down a dead connection");
   const sent = page.el("channel-send").click();
   await page.settle();
-  assert.match(outgoingRows(page)[0].text(), /checking whether it went/);
+  assert.match(outgoingRows(page)[0].text(), /Slack is slow to confirm…/);
   page.expireTimers((OUTGOING_OUTCOME_WAIT_S + 10) * 1000);
   await sent;
   await page.settle();
