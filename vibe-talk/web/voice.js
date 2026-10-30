@@ -129,12 +129,13 @@ const COLUMN_IDS = {
  * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
  * out to the cards (`#277 thread-card-focus`, `enterCard`).
  *
- * `older`, `arrows`, `load`, `entry`, `pins`, `tools` and `filter` are the column's own records of its older pages
+ * `older`, `arrows`, `load`, `entry`, `pins`, `tools`, `filter` and `list` are the column's own records of its older pages
  * (`freshOlderPages`, `olderPages`), its reply arrows (`freshReplyArrows`, `replyArrows`), its reads'
  * state (`freshLoadState`, `loadState`), entering a view (`freshEntryState`, `entryState`), its Pinned
  * filter (`freshPinsView`, `pinsView`), its scroll tools' pass (`freshScrollTools`, `scrollTools`) and
- * its filters' hold (`freshFilterState`, `filterState`; `#624 voice-page-modularity`, plan step 15):
- * field groups kept on the column rather than in `state`.
+ * its filters' hold (`freshFilterState`, `filterState`) and what its list has drawn (`freshListState`,
+ * `listState`; `#624 voice-page-modularity`, plan step 15): field groups kept on the column rather than
+ * in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
@@ -142,16 +143,16 @@ const COLUMN_IDS = {
  *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
  *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>,
  *   pins: ReturnType<typeof freshPinsView>, tools: ReturnType<typeof freshScrollTools>,
- *   filter: ReturnType<typeof freshFilterState>}} ColumnFields
+ *   filter: ReturnType<typeof freshFilterState>, list: ReturnType<typeof freshListState>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
     load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools(),
-    filter: freshFilterState() },
+    filter: freshFilterState(), list: freshListState() },
   side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
     older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
-    pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState() },
+    pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState(), list: freshListState() },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -23845,7 +23846,7 @@ function drawProjection() {
     forgetChannelScopes((id) => id === String(channel));
     return false;
   }
-  discordNewestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
+  listState().newestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
   loadState().freshAt = cover.at;
   delete cover.landedHidden;
   setChannelFreshness(cover.live ? "fresh" : "saved");
@@ -23935,7 +23936,7 @@ function drawHeldRows(rows, freshAt, freshness) {
     // Rows this version cannot draw: the read draws the view instead.
     return false;
   }
-  discordNewestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
+  listState().newestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
   loadState().freshAt = freshAt;
   setChannelFreshness(freshness);
   renderOutgoingMessages();
@@ -24024,7 +24025,7 @@ function hydrateChannelScope() {
     return false;
   }
   const rows = entry.messages;
-  discordNewestId = rows.length > 0 ? String(rows[rows.length - 1].id) : null;
+  listState().newestId = rows.length > 0 ? String(rows[rows.length - 1].id) : null;
   loadState().freshAt = entry.savedAt;
   setChannelFreshness("saved");
   renderOutgoingMessages();
@@ -24076,7 +24077,7 @@ function clearChannelScreen() {
   olderPages().moreAbove = false;
   olderPages().cursor = null;
   discordWalkCursorOwed = false;
-  discordNewestId = null;
+  listState().newestId = null;
   el("discord-log").replaceChildren();
   el("thread-list").replaceChildren();
   el("channel-summary").replaceChildren();
@@ -25503,7 +25504,7 @@ function rememberChannelContext() {
     seam: [...el("channel-summary").children],
     more: olderPages().moreAbove,
     cursor: olderPages().cursor,
-    newest: discordNewestId,
+    newest: listState().newestId,
     position: captureScroll(),
     top: el("scroll-area").scrollTop,
     freshness: loadState().freshness,
@@ -25717,7 +25718,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   olderPages().moreAbove = held ? held.more : false;
   olderPages().cursor = held ? held.cursor : null;
   discordWalkCursorOwed = false;
-  discordNewestId = held ? held.newest : null;
+  listState().newestId = held ? held.newest : null;
   // The rows on screen stay until the new view's replace them, unless there is nothing to draw.
   if (held || (!covered && rows.length === 0)) {
     el("discord-log").replaceChildren(...(held ? held.rows : []));
@@ -28071,7 +28072,7 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   el("timeline-notice").textContent = notice;
   el("timeline-notice").hidden = !notice;
   el("inbox-note").textContent = payload.read_state_notice || "";
-  backlogSize = shown.length;
+  listState().backlog = shown.length;
   renderTodoControls();
   el("clear-backlog").hidden = true;
   const label = channelView === "threads"
@@ -28149,7 +28150,7 @@ function renderCachedTimeline() {
   const redraw = () => {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
     holdingReplyArrows(renderChannelRows);
-    backlogSize = shown.length;
+    listState().backlog = shown.length;
     renderTodoControls();
     renderChannelSeam(channelSummary(
       shown.length,
@@ -29102,7 +29103,7 @@ function renderOutgoingMessages() {
   // the moment it is queued, and that count changes as it lands, fails or is dismissed: counted
   // again when the outbox's replies have changed since the counts were drawn. Not on a pass over
   // the rows, which has just counted them.
-  if (outgoingReplyKey() !== countedOutgoingKey) renderReplyCounts();
+  if (outgoingReplyKey() !== listState().outgoingKey) renderReplyCounts();
 }
 
 // --- a reply's row where its box was ----------------------------------------------------------------
@@ -33203,7 +33204,7 @@ let replyJumpTicket = 0;
 /**
  * A column's own record of its reply arrows and jumps (`#624 voice-page-modularity`, plan step 15, as
  * `freshOlderPages`): `back`, `landed`, `tap` and `settling` below; `held` and `owed`, the arrows'
- * measuring held through a redraw (`holdReplyArrows`); `countsDrawn`, whether any Reply says a count.
+ * measuring held through a redraw (`holdingReplyArrows`); `countsDrawn`, whether any Reply says a count.
  *
  * @returns {{back: any, landed: any, tap: any, settling: any, held: number, owed: boolean, countsDrawn: boolean}}
  */
@@ -33874,8 +33875,26 @@ const UNGATHER_NAME = "Show replies in time order";
  */
 let gathered = null;
 
+/**
+ * A column's own record of what its list has drawn (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`), each said where it was declared: `rowsGathered`, whether the channel's rows are
+ * drawn gathered now; `outgoingKey`, `outgoingReplyKey` as it stood when the Reply counts were last
+ * drawn; `newestId`, the id of the newest message the channel list is showing; `runRows`, how many rows
+ * the last pass left in collapsed runs; `backlog`, how many the backlog control is about to clear.
+ *
+ * @returns {{rowsGathered: boolean, outgoingKey: string, newestId: string | null, runRows: number, backlog: number}}
+ */
+function freshListState() {
+  return { rowsGathered: false, outgoingKey: "", newestId: null, runRows: 0, backlog: 0 };
+}
+
+/** The column being worked on's record of what its list has drawn (`freshListState`). */
+function listState() {
+  return activeColumn.list;
+}
+
 /** Whether the channel's rows are drawn gathered now, so putting them back has something to undo. */
-let rowsGathered = false;
+// Kept per column: `listState().rowsGathered` (`freshListState`, `#624 voice-page-modularity`).
 
 /** Whether the list on screen is one replies are gathered in: All, or a provider's only list. */
 const gatheringView = () => !threadingSupported || channelView === "flat";
@@ -34047,7 +34066,7 @@ function gatheredRows(messages, parent) {
 function listedMessages() {
   // `#410 inline-reply-editor`. Less the replies a gathered thread drew in Main, which are its thread's.
   const messages = [...el("discord-log").children].filter((row) => !fromGatheredThread(row)).flatMap(rowMessages);
-  return rowsGathered ? inTimeOrder(messages, "timestamp") : messages;
+  return listState().rowsGathered ? inTimeOrder(messages, "timestamp") : messages;
 }
 
 /**
@@ -34062,7 +34081,7 @@ function listedMessages() {
  */
 function arrangeChannelRows() {
   const parent = gatheredParent();
-  if (parent === null && !rowsGathered) return;
+  if (parent === null && !listState().rowsGathered) return;
   const list = el("discord-log");
   const rows = [...list.children];
   // `#410 inline-reply-editor`. A thread gathered under its root in Main brings its replies, as the
@@ -34079,7 +34098,7 @@ function arrangeChannelRows() {
   // The parent has left the list — Hide read hides it, or a read no longer holds it — and the
   // stack goes with it.
   if (groups === null && parent !== null) gathered = null;
-  rowsGathered = groups !== null;
+  listState().rowsGathered = groups !== null;
   if (groups === null) groups = glom(messages);
   const keyOf = (ids) => ids.join(" ");
   const wanted = groups.map((group) => keyOf(group.map((message) => String(message.id))));
@@ -34215,7 +34234,7 @@ function scatterReplies() {
  */
 function putRepliesBack() {
   gathered = null;
-  if (rowsGathered) renderChannelRows();
+  if (listState().rowsGathered) renderChannelRows();
 }
 
 /**
@@ -34564,7 +34583,7 @@ function outgoingReplyKey() {
 }
 
 /** `outgoingReplyKey` as it stood when the Reply counts were last drawn. */
-let countedOutgoingKey = "";
+// Kept per column: `listState().outgoingKey` (`freshListState`, `#624 voice-page-modularity`).
 
 /** Say on a row's Reply how many replies it has: "Reply (2)", and in words to a screen reader. */
 function labelReplyButton(button, count) {
@@ -34682,7 +34701,7 @@ function quoteLabelFits(button, plain, full) {
  * no layout. See the head of this section.
  */
 function renderReplyCounts() {
-  countedOutgoingKey = outgoingReplyKey();
+  listState().outgoingKey = outgoingReplyKey();
   const rows = /** @type {HTMLLIElement[]} */ ([...el("discord-log").children]);
   const { replies, held } = heldReplies(rows);
   if (replies.size === 0 && !replyArrows().countsDrawn) return;
@@ -41687,7 +41706,7 @@ async function pullEnd() {
   }
   // Held where it armed, rather than snapping back to the edge as the finger lifts.
   renderPull("busy", { travel: PULL_ARM_PX });
-  const before = discordNewestId;
+  const before = listState().newestId;
   try {
     // No `keepPosition`: a user-initiated refresh goes to the newest message. See the note above.
     await loadDiscord({ reason: "pull" });
@@ -41697,7 +41716,7 @@ async function pullEnd() {
   // ...and SAYS what it found. A refresh that finds nothing looks exactly like a refresh that
   // never happened, which is the half of this the issue is most explicit about.
   setStatus(
-    discordNewestId !== null && discordNewestId !== before
+    listState().newestId !== null && listState().newestId !== before
       ? "refreshed — something new had arrived."
       : "refreshed — nothing new since the last read."
   );
@@ -41716,7 +41735,7 @@ async function refreshFromNewest() {
   const asked = {
     context: channelContextKey(),
     at: Date.now(),
-    newest: discordNewestId,
+    newest: listState().newestId,
   };
   let failure = null;
   try {
@@ -41760,7 +41779,7 @@ function showPullResult(threw, asked) {
     renderPull(null);
     return;
   }
-  const arrived = discordNewestId !== null && discordNewestId !== asked.newest;
+  const arrived = listState().newestId !== null && listState().newestId !== asked.newest;
   const label = failed
     ? PULL_LABELS.failed
     : `Updated ${stamp(loadState().freshAt)} · ${arrived ? "new messages" : "nothing new"}`;
@@ -41772,7 +41791,7 @@ function showPullResult(threw, asked) {
 }
 
 /** The id of the newest message the channel list is currently showing, or null. */
-let discordNewestId = null;
+// Kept per column: `listState().newestId` (`freshListState`, `#624 voice-page-modularity`).
 
 /**
  * Settle the reader's position and the jump-newest chip after a read that replaced the list.
@@ -41801,11 +41820,11 @@ let discordNewestId = null;
  *          heldPlaceAt?: number}} how
  */
 function settleAfterRead(messages, how) {
-  const previous = discordNewestId;
+  const previous = listState().newestId;
   const newest = messages.length ? String(messages[messages.length - 1].id) : null;
-  const moved = newest !== null && discordNewestId !== null && newest !== discordNewestId;
+  const moved = newest !== null && listState().newestId !== null && newest !== listState().newestId;
   const arrived = moved && how.ownAct !== true;
-  discordNewestId = newest;
+  listState().newestId = newest;
   // `#243 filter-keeps-selection`. A message a filter change holds in place stays where that change
   // put it, whatever this read measured when it was sent — before the change, perhaps — and whether or
   // not the reader was on the newest line then.
@@ -42215,7 +42234,7 @@ function foldedOneIds(key) {
  * How many rows the last pass left in collapsed runs. At zero, outside Fold read, there is
  * nothing to undo, and a pass — which runs with every redraw and every filter change — is free.
  */
-let collapsedRunRows = 0;
+// Kept per column: `listState().runRows` (`freshListState`, `#624 voice-page-modularity`).
 
 /** The mode a saved UI record holds: its own `read` when it has one, and otherwise its `todo`. */
 function savedReadMode(saved) {
@@ -42401,7 +42420,7 @@ function applyReadRuns() {
   const forced = foldedOneIds(key);
   // `#480 fold-one-message-key`: messages folded away one by one collapse in any read mode.
   const collapsing = (readMode === "fold" || forced.size > 0) && !readRunsSuspended();
-  if (!collapsing && collapsedRunRows === 0) return;
+  if (!collapsing && listState().runRows === 0) return;
   const list = el("discord-log");
   const rows = [...list.children];
   const rootId = collapsing ? openThreadRootId() : null;
@@ -42413,7 +42432,7 @@ function applyReadRuns() {
     !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies") &&
     ((readMode === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))),
     idsOf, forced) : new Map();
-  collapsedRunRows = placed.size;
+  listState().runRows = placed.size;
   const want = (row) => placed.get(row) || { role: null, count: 0 };
   const changed = rows.some((row) => {
     const { role, count } = want(row);
@@ -42738,7 +42757,7 @@ function drawUndoLabel(dismissal) {
 }
 
 /** How many the backlog control is about to clear, so it can say so before it does it. */
-let backlogSize = 0;
+// Kept per column: `listState().backlog` (`freshListState`, `#624 voice-page-modularity`).
 
 function renderTodoControls() {
   // The read mode, said by the button in its word, its icon and its pressed state. `#221
@@ -42748,10 +42767,10 @@ function renderTodoControls() {
   renderReadModeControl();
   el("inbox-note").hidden = !hidingRead();
   const clear = el("clear-backlog");
-  clear.hidden = threadingSupported || !todoMode || backlogSize === 0;
+  clear.hidden = threadingSupported || !todoMode || listState().backlog === 0;
   clear.textContent = backlogIsArmed()
-    ? `Clear ${backlogSize}?`
-    : `Clear the backlog (${backlogSize})`;
+    ? `Clear ${listState().backlog}?`
+    : `Clear the backlog (${listState().backlog})`;
   clear.className = backlogIsArmed() ? "chip armed" : "chip";
   el("undo-dismiss").hidden = lastDismissal === null;
   drawUndoLabel(lastDismissal);
@@ -42840,7 +42859,7 @@ async function loadTodo(options) {
     olderPages().cursor = null;
     discordWalkCursorOwed = false;
     renderOlderControl();
-    backlogSize = messages.length;
+    listState().backlog = messages.length;
     // Quoted, never rewritten: `#61 unread-status` is one posture and it is stated on the server.
     el("inbox-note").textContent = payload.read_state_notice || "";
     noteTodoRead(payload);
@@ -42998,7 +43017,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
     // still.
     window: todoView.window + 1,
   };
-  backlogSize += 1;
+  listState().backlog += 1;
   renderChannelSeam(todoSummary());
   renderTodoControls();
 }
@@ -43227,10 +43246,10 @@ async function refreshAfterInboxChange() {
     // decided again. Gathered replies (`#215 reply-coalesce`) have their stack drawn again, by the
     // whole pass, which puts them back in time order if what went was their parent — before the
     // rows are counted, since that can join two of them.
-    if (rowsGathered) renderChannelRows();
+    if (listState().rowsGathered) renderChannelRows();
     else renderReplyLinks();
-    backlogSize = el("discord-log").children.length;
-    todoView = { ...todoView, left: backlogSize };
+    listState().backlog = el("discord-log").children.length;
+    todoView = { ...todoView, left: listState().backlog };
     renderChannelSeam(todoSummary());
     renderTodoControls();
     // The Pinned filter's rows are drawn from the archive too: a pin dealt with there greys there.
@@ -43965,7 +43984,7 @@ function setReadMode(mode) {
     // collapsing what is read leaves every message in the list, so the undo stays between those two.
     if (todoMode !== wasHiding) lastDismissal = null;
     if (!todoMode) {
-      backlogSize = 0;
+      listState().backlog = 0;
     }
     renderTodoControls();
     if (threadingSupported) {
@@ -47142,13 +47161,8 @@ const COLUMN_STATE = [
   [() => timelineMessages, (value) => { timelineMessages = value; }, () => []],
   [() => timelineThreads, (value) => { timelineThreads = value; }, () => []],
   [() => activeComposerKey, (value) => { activeComposerKey = value; }, () => ""],
-  [() => countedOutgoingKey, (value) => { countedOutgoingKey = value; }, () => ""],
   [() => gathered, (value) => { gathered = value; }, () => null],
-  [() => rowsGathered, (value) => { rowsGathered = value; }, () => false],
-  [() => discordNewestId, (value) => { discordNewestId = value; }, () => null],
-  [() => collapsedRunRows, (value) => { collapsedRunRows = value; }, () => 0],
   [() => archivedIds, (value) => { archivedIds = value; }, () => new Set()],
-  [() => backlogSize, (value) => { backlogSize = value; }, () => 0],
   [() => jumpNewestWanted.discord, (value) => { jumpNewestWanted.discord = value; }, () => false],
   [() => inScrollback.discord, (value) => { inScrollback.discord = value; }, () => false],
 ];
@@ -50886,7 +50900,7 @@ function resetSideColumn(reopen = false) {
   inColumn(columns.side, () => {
     dropReplyArrowTap();
     gathered = null;
-    rowsGathered = false;
+    listState().rowsGathered = false;
     ++loadState().generation;
   });
   columns.side.state = null;
@@ -50899,6 +50913,7 @@ function resetSideColumn(reopen = false) {
     columns.side.pins = freshPinsView();
     columns.side.tools = freshScrollTools();
     columns.side.filter = freshFilterState();
+    columns.side.list = freshListState();
   }
   for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
     leftEl(id).replaceChildren();
@@ -53060,7 +53075,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // `#549 own-read-stored`. One of his is drawn as it starts: read, when he said so.
   if (!replayed) noteStartsRead([message]);
   appendChannelRow(message, true);
-  discordNewestId = id;
+  listState().newestId = id;
   if (wasAtNewest) {
     scrollToNewest();
   } else if (!isNoise(message) && !hiddenEmpty(message)) {
@@ -57914,7 +57929,7 @@ function changeSelectedChannel() {
   // are about to go — and so does a tap on an arrow still waiting to jump, which would otherwise walk
   // this channel's history for a message of the last one.
   gathered = null;
-  rowsGathered = false;
+  listState().rowsGathered = false;
   dropReplyArrowTap();
   applyChannelProvider();
   // This window's, and the one a new window opens on. `#265 window-channel-memory`.
@@ -57939,7 +57954,7 @@ function changeSelectedChannel() {
   olderPages().moreAbove = false;
   olderPages().cursor = null;
   discordWalkCursorOwed = false;
-  discordNewestId = null;
+  listState().newestId = null;
   el("discord-log").replaceChildren();
   // The summary goes with the rows it is about. It is written only inside `loadDiscord`, which
   // THROWS when the read fails — so leaving it standing means a failed change of channel shows
