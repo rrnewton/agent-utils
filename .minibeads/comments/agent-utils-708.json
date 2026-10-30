@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-708-ca26eb42027",
+    "issue_id": "agent-utils-708",
+    "author": "cl-vtpush",
+    "body": "[opus 5.5] Delivered on main: ad46890a (seed re-reads threads the cache is short of; an answer from the server's copy is never presented as complete when messages may be missing), 0207f08e (agentctl chat bridge event sinks), 19d6c70d (vibe-talk applies a bridge's own post and reaction records at once; the records adapter waits for vibe-talk at startup). Gates: validate OK, 118/118 and 138/138.\n\nRoot cause of the partial thread (case study, thread 1793377304.077519 on 2026-10-30): an ingest bug. After a restart, the poller's seed took every thread as read to its root's latest reply without reading any reply. Three bridge replies that rate-limited reads had never fetched were skipped, and the reply posted after the seed reached the page alone.\n\nStill open, for these reasons:\n- Deploy and the live check: vibe-talk and agentctl from 19d6c70d, plus event-sinks.json for each bridge that posts into a vibe-talk channel.\n- Reactions by anyone but a bridge with a sink (the owner's own included) still appear only through the poller. The owner tail's reaction records wake it, but they are not applied directly; no sample of their shape was available to parse.\n- The page shows the server's incomplete mark only when as_of is more than two minutes old. A younger gap needs a page change (page frozen for #624 voice-page-modularity).",
+    "created_at": "2026-10-30T18:25:25.779097806Z",
+    "updated_at": "2026-10-30T18:25:25.779097806Z"
+  }
+]
