@@ -10,6 +10,7 @@ import type {
   HttpRequestInit,
   MicrophonePort,
   SocketPort,
+  SpeechSynthesisPort,
   StoragePort,
   TimerHandle,
 } from "../../ports/index.ts";
@@ -32,12 +33,14 @@ export interface WebPorts {
   readonly audio: AudioPort<typeof AudioContext, HTMLAudioElement>;
   /** `navigator.mediaDevices.getUserMedia`. */
   readonly microphone: MicrophonePort<MediaStreamConstraints, MediaStream>;
+  /** `speechSynthesis` and `SpeechSynthesisUtterance`. */
+  readonly speech: SpeechSynthesisPort<SpeechSynthesis, SpeechSynthesisUtterance>;
 }
 
 /**
  * The browser's ports: `fetch`, `setTimeout`/`clearTimeout`, `AbortController` where there is one,
  * `localStorage` and `sessionStorage`, whose very lookup throws where storage is refused, and the
- * socket, audio and microphone the voice call and reading aloud use.
+ * socket, audio, microphone and device voice the voice call and reading aloud use.
  */
 export function createWebPorts(): WebPorts {
   return {
@@ -63,5 +66,14 @@ export function createWebPorts(): WebPorts {
       element: (url: string) => new Audio(url),
     },
     microphone: { open: (constraints: MediaStreamConstraints) => navigator.mediaDevices.getUserMedia(constraints) },
+    speech: {
+      engine: () => {
+        const engine = window.speechSynthesis;
+        return engine && typeof engine.getVoices === "function" &&
+          typeof engine.speak === "function" && typeof engine.cancel === "function" &&
+          typeof window.SpeechSynthesisUtterance === "function" ? engine : null;
+      },
+      utterance: (text: string) => new window.SpeechSynthesisUtterance(text),
+    },
   };
 }

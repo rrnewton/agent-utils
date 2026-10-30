@@ -35395,11 +35395,9 @@ function setReadAudioSource(source, announce = true) {
   if (announce) setStatus(`Messages will use ${readAloudLabel}.`);
 }
 
+/** The device's speech engine, or null where it has none that can list voices, speak and cancel (`browserPorts`). */
 function browserSpeechEngine() {
-  const engine = window.speechSynthesis;
-  return engine && typeof engine.getVoices === "function" &&
-    typeof engine.speak === "function" && typeof engine.cancel === "function" &&
-    typeof window.SpeechSynthesisUtterance === "function" ? engine : null;
+  return browserPorts().speech.engine();
 }
 
 function browserSpeechVoice() {
@@ -35654,7 +35652,7 @@ function readWithBrowserSpeech(parts, id, ticket) {
     // Where the read is, at chunk granularity: a resume that cannot simply resume the engine
     // speaks this chunk again, and no other (`#434 read-aloud-pause`).
     nowPlaying.chunk = index;
-    const utterance = new window.SpeechSynthesisUtterance(chunks[index]);
+    const utterance = browserPorts().speech.utterance(chunks[index]);
     utterance.voice = voice;
     utterance.lang = voice.lang;
     utterance.rate = readSpeed === null ? 1 : readSpeed / 100;

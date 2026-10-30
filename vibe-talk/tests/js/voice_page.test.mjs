@@ -7149,7 +7149,7 @@ test("`#624 voice-page-modularity`: prepared read-aloud tickets end on either cl
   assert.equal(prepared.size(), 0);
 });
 
-test("`#624 voice-page-modularity`: the browser's socket, audio and microphone ports look each global up when used, not when made", async () => {
+test("`#624 voice-page-modularity`: the browser's socket, audio, microphone and device-voice ports look each global up when used, not when made", async () => {
   const names = ["WebSocket", "Audio", "window", "navigator"];
   const saved = names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
   const put = (name, value) => Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
@@ -7172,6 +7172,18 @@ test("`#624 voice-page-modularity`: the browser's socket, audio and microphone p
     assert.equal(ports.audio.contextClass(), undefined);
     assert.equal(await ports.microphone.open({ audio: true }), "stream");
     assert.deepStrictEqual(asked, [[true, { audio: true }]], "getUserMedia was not called on mediaDevices, with the constraints given");
+    // The device's voice: an engine only where it can list voices, speak and cancel, and utterances exist.
+    const engine = { getVoices() {}, speak() {}, cancel() {} };
+    class Utterance { constructor(text) { this.text = text; } }
+    put("window", { speechSynthesis: engine, SpeechSynthesisUtterance: Utterance });
+    assert.equal(ports.speech.engine(), engine);
+    assert.equal(ports.speech.utterance("hello").text, "hello");
+    put("window", { speechSynthesis: { getVoices() {}, speak() {} }, SpeechSynthesisUtterance: Utterance });
+    assert.equal(ports.speech.engine(), null, "an engine that cannot cancel was used");
+    put("window", { speechSynthesis: engine });
+    assert.equal(ports.speech.engine(), null, "an engine with no utterances was used");
+    put("window", {});
+    assert.equal(ports.speech.engine(), null);
   } finally {
     for (const [name, descriptor] of saved) {
       if (descriptor) Object.defineProperty(globalThis, name, descriptor);

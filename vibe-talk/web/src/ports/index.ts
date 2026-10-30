@@ -83,3 +83,12 @@ export interface AudioPort<ContextClass = unknown, Element = unknown> {
 export interface MicrophonePort<Constraints = unknown, Stream = unknown> {
   open(constraints: Constraints): Promise<Stream>;
 }
+
+/**
+ * The device's own voice, of the platform's own kinds: its speech engine (`Engine`), or null where it
+ * has none that can list voices, speak and cancel; and an utterance (`Utterance`) of one text for it.
+ */
+export interface SpeechSynthesisPort<Engine = unknown, Utterance = unknown> {
+  engine(): Engine | null;
+  utterance(text: string): Utterance;
+}
