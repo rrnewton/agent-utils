@@ -101,13 +101,35 @@ def _built_from(root: Path) -> Path:
     return SOURCE_ROOT
 
 
+ASSEMBLED = {"voice.css": "styles/voice.json"}
+"""The stylesheets kept as ordered parts, by the name the shell links them under, with the manifest
+listing their parts (`#624 voice-page-modularity`, plan step 18; web/page_sources.mjs `ASSEMBLED`)."""
+
+
+def parts_of(sources: Path, name: str) -> list[Path] | None:
+    """The parts of the assembled sheet `name` below `sources`, in order; None for any other file."""
+    manifest = ASSEMBLED.get(name)
+    if manifest is None:
+        return None
+    listed = json.loads((sources / manifest).read_text())
+    if listed.get("assembles") != name or not listed.get("parts"):
+        raise SystemExit(f"{manifest} does not list the parts of {name}")
+    return [(sources / manifest).parent / part for part in listed["parts"]]
+
+
+def _read_source(sources: Path, name: str) -> str:
+    """The text of the page file `name` below `sources`: an assembled sheet's parts joined in order."""
+    parts = parts_of(sources, name)
+    return "".join(part.read_text() for part in parts) if parts is not None else (sources / name).read_text()
+
+
 def source_text(root: Path, name: str) -> str:
     """The source of the page file `name` that the page served from `root` was made from.
 
     A walk that waits out one of the page's own numbers reads it here rather than opening
     `root / name` itself, so that the number comes from source text, not a minified copy.
     """
-    return (_built_from(root) / name).read_text()
+    return _read_source(_built_from(root), name)
 
 
 def variant(root: Path, into: Path, patches: Sequence[tuple[str, str, str]]) -> Path:
@@ -121,9 +143,11 @@ def variant(root: Path, into: Path, patches: Sequence[tuple[str, str, str]]) -> 
     copy = into / "sources"
     shutil.copytree(sources, copy)
     for file, text, replacement in patches:
-        body = (copy / file).read_text()
-        found = body.count(text)
+        # An assembled sheet is patched in the one part holding the text, counted across them all.
+        targets = parts_of(copy, file) or [copy / file]
+        found = sum(target.read_text().count(text) for target in targets)
         if found != 1:
             raise SystemExit(f"the control patches {text!r}, which {sources / file} holds {found} times, not once")
-        (copy / file).write_text(body.replace(text, replacement, 1))
+        target = next(target for target in targets if text in target.read_text())
+        target.write_text(target.read_text().replace(text, replacement, 1))
     return build_page(into / "web", copy).resolve()

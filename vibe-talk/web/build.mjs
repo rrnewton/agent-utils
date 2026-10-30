@@ -48,7 +48,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { SHELL, WEB, shellScripts, shellStyles } from "./page_sources.mjs";
+import { SHELL, WEB, partsOf, readSource, shellScripts, shellStyles } from "./page_sources.mjs";
 
 /** The lockfile-pinned toolchain: contract/package.json, installed by `npm ci --prefix contract`. */
 const TOOLS = join(WEB, "..", "contract");
@@ -342,7 +342,8 @@ export async function moduleForTests(entry, { web = WEB, overlays = [] } = {}) {
 async function minifyAll(esbuild, web, names, loader) {
   const parts = [];
   for (const name of names) {
-    const text = readFileSync(join(web, name), "utf8");
+    // An assembled sheet (`ASSEMBLED`) is minified as the one sheet its parts make, under its own name.
+    const text = readSource(web, name);
     if (loader === "js") requireStrict(name, text);
     const result = await esbuild.transform(text, {
       loader,
@@ -505,7 +506,7 @@ export async function build(out, { web = WEB } = {}) {
     "voice.js": js.bytes,
   };
   for (const name of ["contract.js", "style.css", "voice.css", "manifest.webmanifest"]) {
-    files[name] = readFileSync(join(web, name));
+    files[name] = partsOf(name, web) ? Buffer.from(readSource(web, name), "utf8") : readFileSync(join(web, name));
   }
   const hashed = Object.keys(files).filter((path) => path.startsWith("assets/"));
   if (new Set(hashed.map((path) => basename(path))).size !== hashed.length) throw new Error("two assets share a name");

@@ -87,9 +87,9 @@ fn a_page_from_other_sources_is_refused_naming_what_differs() {
         json["inputs"]
             .as_object_mut()
             .expect("inputs")
-            .remove("vibe-talk/web/voice.css");
+            .remove("vibe-talk/web/style.css");
     });
-    assert!(refused(&dist).contains("vibe-talk/web/voice.css"));
+    assert!(refused(&dist).contains("vibe-talk/web/style.css"));
 
     // And one these sources do not have.
     let dir = TempDir::new("page-prebuilt-extra-input");

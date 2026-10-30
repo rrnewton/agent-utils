@@ -12,14 +12,14 @@ import assert from "node:assert/strict";
 import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { SourceMap } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import vm from "node:vm";
 
 import {
   build, decodeMappings, digest, encodeMappings, joinMaps, linkShell, loadTool, moduleForTests, parseScript, requireOutside,
   requireStrict,
 } from "../../web/build.mjs";
-import { SHELL, WEB, moduleSources, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
+import { ASSEMBLED, SHELL, WEB, moduleSources, partsOf, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
 import { PACKAGES, checkArchitecture } from "../../web/architecture.mjs";
 
 const scratch = mkdtempSync(join(tmpdir(), "vibe-talk-page-build-"));
@@ -81,10 +81,35 @@ test("the shell is the source shell with its script tags made one and its styles
   assert.deepStrictEqual(shellStyles(text(SHELL)), [STYLE_PATH]);
 });
 
+test("`#624 voice-page-modularity`: an assembled sheet's parts are each a run of complete top-level rules, listed once, in order", () => {
+  for (const name of Object.keys(ASSEMBLED)) {
+    const parts = partsOf(name);
+    assert.equal(new Set(parts).size, parts.length, `${name} lists a part twice`);
+    for (const part of parts) {
+      // Comments and strings out, then the braces: never closed before opened, and all closed by the
+      // part's end, so no part begins or ends inside a rule, a media block or a keyframes block.
+      const text = readFileSync(join(WEB, part), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, "");
+      let depth = 0;
+      for (const char of text) {
+        if (char === "{") depth += 1;
+        else if (char === "}") depth -= 1;
+        assert.ok(depth >= 0, `${part} closes a block it never opened`);
+      }
+      assert.equal(depth, 0, `${part} ends inside a block`);
+    }
+    // Every part listed is used, and nothing else under the sheet's directory is left out of it.
+    const directory = dirname(parts[0]);
+    const present = readdirSync(join(WEB, directory)).filter((file) => file.endsWith(".css")).map((file) => `${directory}/${file}`);
+    assert.deepStrictEqual([...present].sort(), [...parts].sort(), `${directory} holds parts ${name} does not list, or lists parts it lacks`);
+  }
+});
+
 test("the plain addresses an older shell names: /voice.js the whole new script, the rest as written", () => {
   assert.deepStrictEqual(read("voice.js"), read(SCRIPT_PATH));
   for (const name of ["contract.js", "style.css", "voice.css", "manifest.webmanifest"]) {
-    assert.deepStrictEqual(read(name), readFileSync(join(WEB, name)), name);
+    // An assembled sheet (`ASSEMBLED`, plan step 18) is served as its parts joined in order.
+    const source = ASSEMBLED[name] ? Buffer.from(readWeb(name), "utf8") : readFileSync(join(WEB, name));
+    assert.deepStrictEqual(read(name), source, name);
   }
   for (const name of readdirSync(join(WEB, "icons"))) {
     assert.deepStrictEqual(read(`icons/${name}`), readFileSync(join(WEB, "icons", name)), name);

@@ -1,0 +1,6 @@
+{
+  "assembles": "voice.css",
+  "parts": [
+    "voice/all.css"
+  ]
+}

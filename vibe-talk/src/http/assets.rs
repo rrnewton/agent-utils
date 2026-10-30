@@ -156,7 +156,10 @@ const SHELL: &str = built::SHELL;
 #[cfg(test)]
 pub(crate) const VOICE_JS: &str = include_str!("../../web/voice.js");
 const CONTRACT_JS: &str = include_str!("../../web/contract.js");
-const VOICE_CSS: &str = include_str!("../../web/voice.css");
+/// `voice.css` as the page build assembled it from its ordered parts (`web/styles/voice.json`, `#624
+/// voice-page-modularity`): the plain file it writes beside the hashed assets, byte for byte the sheet
+/// the parts make.
+const VOICE_CSS: &str = include_str!(concat!(env!("OUT_DIR"), "/web/voice.css"));
 const STYLE_CSS: &str = include_str!("../../web/style.css");
 const MANIFEST: &str = include_str!("../../web/manifest.webmanifest");
 

@@ -19,8 +19,33 @@ export const WEB = dirname(fileURLToPath(import.meta.url));
 /** The page's HTML shell, the app served at `/`. */
 export const SHELL = "voice.html";
 
-/** The text of the page file `name`, relative to `WEB`. */
-export const readWeb = (name) => readFileSync(join(WEB, name), "utf8");
+/**
+ * The stylesheets kept as ordered parts, each a run of complete top-level rules, by the name the shell
+ * links them under, with the manifest listing their parts (`#624 voice-page-modularity`, plan step 18).
+ * Every reader of such a sheet reads it assembled, so the parts joined in order are, byte for byte, the
+ * sheet the page has always had.
+ */
+export const ASSEMBLED = Object.freeze({ "voice.css": "styles/voice.json" });
+
+/** The parts of the assembled sheet `name`, as paths relative to `web`, in order; null for any other file. */
+export function partsOf(name, web = WEB) {
+  const manifest = ASSEMBLED[name];
+  if (!manifest) return null;
+  const listed = JSON.parse(readFileSync(join(web, manifest), "utf8"));
+  if (listed.assembles !== name || !Array.isArray(listed.parts) || listed.parts.length === 0) {
+    throw new Error(`${manifest} does not list the parts of ${name}`);
+  }
+  return listed.parts.map((part) => join(dirname(manifest), part).split("\\").join("/"));
+}
+
+/** The text of the page file `name` below `web`: an assembled sheet's parts joined in order, or the file. */
+export function readSource(web, name) {
+  const parts = partsOf(name, web);
+  return parts ? parts.map((part) => readFileSync(join(web, part), "utf8")).join("") : readFileSync(join(web, name), "utf8");
+}
+
+/** The text of the page file `name`, relative to `WEB` (an assembled sheet assembled). */
+export const readWeb = (name) => readSource(WEB, name);
 
 /** `html` without its comments, which name files they do not load. */
 const markup = (html) => html.replace(/<!--[\s\S]*?-->/g, " ");
