@@ -5,44 +5,20 @@
     {
       "name": "agentctl",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "parity"
-      },
+      "mirror": {"edition": "python", "state": "parity"},
       "parity_check": "cross.agentctl.differential (python3 cross/differential.py --tool agentctl) plus cross.agentctl.herdr-agent-differential",
       "rust_entrypoint": "rs/bin/agentctl",
       "python_entrypoint": "py/bin/agentctl",
       "note": "Rust is primary since the engine-rust-default switch. The subcommands below are the exceptions: they are python-primary with no Rust edition yet, and the Rust edition refuses them by name (rs/agentctl/src/cli.rs PYTHON_ONLY_COMMANDS and PYTHON_ONLY_CHAT_COMMANDS). Fleshing them out is campaign milestone 2: chat history and chat context (adapter transports) moved to Rust in #545 rust-primary-agentctl-chat-readers; chat launch moved to Rust in M2 rust-primary-agentctl-chat-launch (generation B: launches the current Rust bridge; the retired Python polling launcher is archived, not mirrored, and its config/state formats are refused with a pointer to 'chat init').",
       "subcommands": [
-        {
-          "name": "migrate",
-          "primary": "python",
-          "mirror": {
-            "edition": "rust",
-            "state": "absent"
-          },
-          "parity_check": null,
-          "note": "Headless-worker migration; stays python-primary until the herdr-subagents port carries it (coordinator decision, #545)."
-        },
-        {
-          "name": "repair",
-          "primary": "python",
-          "mirror": {
-            "edition": "rust",
-            "state": "absent"
-          },
-          "parity_check": null,
-          "note": "Headless-worker operation; stays python-primary until the herdr-subagents port carries it (coordinator decision, #545)."
-        }
+        {"name": "migrate", "primary": "python", "mirror": {"edition": "rust", "state": "absent"}, "parity_check": null, "note": "Headless-worker migration; stays python-primary until the herdr-subagents port carries it (coordinator decision, #545)."},
+        {"name": "repair", "primary": "python", "mirror": {"edition": "rust", "state": "absent"}, "parity_check": null, "note": "Headless-worker operation; stays python-primary until the herdr-subagents port carries it (coordinator decision, #545)."}
       ]
     },
     {
       "name": "cpuset-alloc",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "parity"
-      },
+      "mirror": {"edition": "python", "state": "parity"},
       "parity_check": "cross.dagrun.cpuset-differential (python3 cross/differential.py --tool cpuset-alloc)",
       "rust_entrypoint": "rs/bin/cpuset-alloc",
       "python_entrypoint": "py/bin/cpuset-alloc"
@@ -50,10 +26,7 @@
     {
       "name": "dagrun",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "parity"
-      },
+      "mirror": {"edition": "python", "state": "parity"},
       "parity_check": "cross.dagrun.differential (python3 cross/differential.py --tool dagrun)",
       "rust_entrypoint": "rs/bin/dagrun",
       "python_entrypoint": "py/bin/dagrun"
@@ -61,10 +34,7 @@
     {
       "name": "herdr-agent",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "parity"
-      },
+      "mirror": {"edition": "python", "state": "parity"},
       "parity_check": "cross.agentctl.herdr-agent-differential (python3 cross/differential.py --tool herdr-agent)",
       "rust_entrypoint": "rs/bin/herdr-agent",
       "python_entrypoint": "py/bin/herdr-agent"
@@ -72,10 +42,7 @@
     {
       "name": "herdr-chat",
       "primary": "python",
-      "mirror": {
-        "edition": "rust",
-        "state": "absent"
-      },
+      "mirror": {"edition": "rust", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/herdr-chat",
@@ -84,10 +51,7 @@
     {
       "name": "herdr-run",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "parity"
-      },
+      "mirror": {"edition": "python", "state": "parity"},
       "parity_check": "cross.herdr-run.differential (python3 cross/differential.py --tool herdr-run)",
       "rust_entrypoint": "rs/bin/herdr-run",
       "python_entrypoint": "py/bin/herdr-run"
@@ -95,10 +59,7 @@
     {
       "name": "herdr-subagents",
       "primary": "python",
-      "mirror": {
-        "edition": "rust",
-        "state": "absent"
-      },
+      "mirror": {"edition": "rust", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/herdr-subagents",
@@ -107,10 +68,7 @@
     {
       "name": "parallel-experiment-runner",
       "primary": "python",
-      "mirror": {
-        "edition": "rust",
-        "state": "absent"
-      },
+      "mirror": {"edition": "rust", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/parallel-experiment-runner",
@@ -119,10 +77,7 @@
     {
       "name": "pr-landing-planner",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "parity"
-      },
+      "mirror": {"edition": "python", "state": "parity"},
       "parity_check": "cross.planner.differential (python3 cross/differential.py --tool pr-landing-planner)",
       "rust_entrypoint": "rs/bin/pr-landing-planner",
       "python_entrypoint": "py/bin/pr-landing-planner"
@@ -130,10 +85,7 @@
     {
       "name": "tick-hub",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "parity"
-      },
+      "mirror": {"edition": "python", "state": "parity"},
       "parity_check": "cross.tick-hub.differential (python3 cross/differential.py --tool tick-hub)",
       "rust_entrypoint": "rs/bin/tick-hub",
       "python_entrypoint": "py/bin/tick-hub"
@@ -141,10 +93,7 @@
     {
       "name": "wrkslots",
       "primary": "python",
-      "mirror": {
-        "edition": "rust",
-        "state": "absent"
-      },
+      "mirror": {"edition": "rust", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/wrkslots",
@@ -153,10 +102,7 @@
     {
       "name": "wrkslotsd",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "absent"
-      },
+      "mirror": {"edition": "python", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": "rs/bin/wrkslotsd",
       "python_entrypoint": null,
@@ -165,10 +111,7 @@
     {
       "name": "wrkviz",
       "primary": "python",
-      "mirror": {
-        "edition": "rust",
-        "state": "absent"
-      },
+      "mirror": {"edition": "rust", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/wrkviz",
@@ -177,10 +120,7 @@
     {
       "name": "agent-teams",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "absent"
-      },
+      "mirror": {"edition": "python", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": null,
@@ -189,10 +129,7 @@
     {
       "name": "agent-usage",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "absent"
-      },
+      "mirror": {"edition": "python", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": null,
@@ -201,217 +138,43 @@
     {
       "name": "gh-paced",
       "primary": "rust",
-      "mirror": {
-        "edition": "python",
-        "state": "absent"
-      },
+      "mirror": {"edition": "python", "state": "absent"},
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": null,
       "note": "Rust-only crate (rs/gh-paced); no Python edition."
-    },
-    {
-      "name": "local-ci-hub",
-      "primary": "python",
-      "mirror": {
-        "edition": "rust",
-        "state": "absent"
-      },
-      "parity_check": null,
-      "rust_entrypoint": null,
-      "python_entrypoint": "py/bin/local-ci-hub",
-      "note": "Python-only in phase 2; ledger canonicalization stays with the originating Rust implementation until a differential port is approved (DESIGN.md section 10)."
     }
   ],
   "formats": [
+    {"name": "agent queue items and cancel tombstones", "schema_id": "directory layout (no schema string)", "rust_definition": "rs/agent-queue/src/queue.rs (MessageState, Lane, QueueDirectories)", "python_definition": "py/agentctl/sessions.py and queue readers hand-build the same paths", "generated_schema": null, "duplicate": "yes: layout defined in Rust types and re-derived in Python", "collapse": "Define queue item JSON in rs/agent-queue with schemars; generate JSON Schema under validation/schemas/; Python validates against it."},
+    {"name": "registry record (agent.json / native session)", "schema_id": "agentctl-native-session/v1", "rust_definition": "rs/agentctl/src/subagents.rs (schema string literal) and rs/agentctl/src/subagents/nested.rs", "python_definition": "py/agentctl/subagents.py (same string literal, hand-built dicts); py/agentctl/sessions.py imports its helpers", "generated_schema": null, "duplicate": "yes: Rust and Python both hand-maintain the record shape", "collapse": "One Rust struct in a shared formats module; generated schema; Python consumes the schema."},
+    {"name": "coordinator designation (coordinator.json)", "schema_id": "agentctl-coordinator/v1", "rust_definition": "rs/agentctl/src/subagents/control.rs DESIGNATION_SCHEMA", "python_definition": "py/agentctl readers use the same literal", "generated_schema": null, "duplicate": "yes: string literal in both editions", "collapse": "Move the constant and record type to the shared formats module; generate schema."},
+    {"name": "coordinator host index", "schema_id": "agentctl-coordinator-index/v1", "rust_definition": "rs/agent-teams/src/hostindex.rs and rs/agentctl/src/subagents/control.rs (two Rust writers)", "python_definition": null, "generated_schema": null, "duplicate": "yes: Rust-vs-Rust, two crates emit the same schema id", "collapse": "Single writer type in the shared formats module; both crates depend on it."},
+    {"name": "landing queue (landing-queue.json)", "schema_id": "agentctl-landing-queue/v1", "rust_definition": "rs/agentctl/src/landing_queue.rs SCHEMA", "python_definition": null, "generated_schema": null, "duplicate": "no second definition found, but the record is built as serde_json values, not a named type", "collapse": "Name the record type in the shared formats module; generate schema."},
+    {"name": "launch spec", "schema_id": "agentctl-launch-spec/v1", "rust_definition": "rs/agentctl/src/subagents/launch_spec.rs SCHEMA", "python_definition": "py/agentctl/launch_spec.py SCHEMA (same literal)", "generated_schema": null, "duplicate": "yes: Rust and Python hand-maintain it", "collapse": "One Rust type; generated schema; Python validates against it."},
+    {"name": "launch and goal journals", "schema_id": "agentctl-launch/v1, agentctl-launch/v2, agentctl-goal/v1", "rust_definition": "rs/agentctl/src/subagents/nested.rs LAUNCH_SCHEMAS", "python_definition": "py/agentctl/subagents.py _NESTED_LAUNCH_SCHEMAS and goal dicts", "generated_schema": null, "duplicate": "yes: accepted-schema lists in both editions", "collapse": "One Rust definition of each version; generated schemas per version."},
+    {"name": "move / rename / revive journals", "schema_id": "agentctl-move/v1, agentctl-rename/v1, agentctl-revive/v1", "rust_definition": "rs/agentctl/src/subagents.rs and revive.rs (string literals)", "python_definition": "py/agentctl/subagents.py and revive.py (same literals)", "generated_schema": null, "duplicate": "yes: Rust and Python hand-maintain them", "collapse": "Shared formats module types; generated schemas."},
+    {"name": "profiles (profiles.json)", "schema_id": "agentctl-profiles/v1", "rust_definition": "rs/agentctl/src/profiles.rs SCHEMA", "python_definition": "py/agentctl/profiles.py SCHEMA (same literal)", "generated_schema": null, "duplicate": "yes: Rust and Python hand-maintain it", "collapse": "One Rust type; generated schema; Python validates against it."},
+    {"name": "restore config and report", "schema_id": "agentctl-restore/v1, agentctl-restore-report/v1", "rust_definition": "rs/agentctl/src/restore.rs CONFIG_SCHEMA / REPORT_SCHEMA", "python_definition": null, "generated_schema": null, "duplicate": "no second definition found; records are serde_json values", "collapse": "Name the types in the shared formats module; generate schemas."},
+    {"name": "agent watch state and health", "schema_id": "agentctl-agent-watch/v1", "rust_definition": "rs/agentctl/src/agent_watch.rs STATE_SCHEMA", "python_definition": null, "generated_schema": null, "duplicate": "no second definition found", "collapse": "Name the type in the shared formats module; generate schema."},
+    {"name": "headless harness and runner records", "schema_id": "agentctl-headless-harness/v1, agentctl-headless-runner/v1", "rust_definition": "rs/agentctl/src/subagents/turn_runner.rs HARNESS_SCHEMA / RUNNER_SCHEMA", "python_definition": "py/agentctl worker runtime writes the same records", "generated_schema": null, "duplicate": "yes: the python-primary headless path and the Rust reader share literals", "collapse": "Define in the shared formats module before the headless Rust port (milestone 2)."},
+    {"name": "chat bridge state (requests, sent replies, alarms, provider health, credentials, refusals)", "schema_id": "agentctl-chat-*/v1 family (see rs/agentctl/src/chat_runtime.rs)", "rust_definition": "rs/agentctl/src/chat_runtime.rs schema constants; rs/chat-subscription-slack re-declares agentctl.allowed-sender-refusals.v1 (REFUSALS_SCHEMA)", "python_definition": "py/agentctl/chat_storage.py and chat.py hand-build the same files", "generated_schema": null, "duplicate": "yes: Rust-vs-Python across the bridge, plus Rust-vs-Rust for allowed-sender-refusals between rs/agentctl and rs/chat-subscription-slack", "collapse": "One Rust type per file in the shared formats module; the Slack plugin and any Python mirror validate against generated schemas."},
+    {"name": "chat plugin manifest and Slack payloads", "schema_id": "agentctl-plugin-manifest/v1alpha1, agentctl.slack.v1, agentctl.slack.message.v1, agentctl.slack.rescan.v1, agentctl.slack-rejection.v1", "rust_definition": "rs/agentctl/src/plugins.rs MANIFEST_SCHEMA; rs/chat-subscription-slack/src/plugin.rs and rescan.rs", "python_definition": null, "generated_schema": null, "duplicate": "no second definition found", "collapse": "Move the manifest type to the shared formats module; generate schemas."},
+    {"name": "agent-teams teams, routes, declarations, message envelope", "schema_id": "agent-teams-teams/v1, agent-teams-routes/v1, agent-teams-declaration/v1, agent-teams-message/v1", "rust_definition": "rs/agent-teams/src/cli.rs, route and envelope.rs (serde_json values checked by jsonfile.rs check_schema)", "python_definition": null, "generated_schema": null, "duplicate": "no second definition; shapes are untyped serde_json values", "collapse": "Name Rust types per file; generate schemas; keep check_schema as the version gate."},
+    {"name": "dagrun profile capture manifest and profile store", "schema_id": "dagrun-profile-capture-v1", "rust_definition": "rs/dagrun/src/profile_capture.rs PROFILE_CAPTURE_MANIFEST_SCHEMA and rs/dagrun/src/profile_report.rs CAPTURE_SCHEMA (same id, two constants)", "python_definition": "py/dagrun/profile_capture.py and py/dagrun/profile_report.py (the same _CAPTURE_SCHEMA literal twice)", "generated_schema": null, "duplicate": "yes: the schema constant is duplicated in two Rust modules and again in two Python modules", "collapse": "One constant and manifest type in rs/dagrun (or the shared formats module); generated schema for the Python mirror."},
+    {"name": "wrkslots slot state, handoffs, validation seals", "schema_id": "integer schemas (config SCHEMA=2, ACTIVE/ARCHIVED state=2, handoff sidecar=2 with legacy=1, slot hold=1, recovery journals=2)", "rust_definition": "rs/wrkslotsd/src/yamlconfig.rs (config document), rs/wrkslotsd/src/config_validate.rs (config), rs/wrkslotsd/src/active_state.rs (ACTIVE shard), rs/wrkslotsd/src/archive_state.rs (ARCHIVED shard), rs/wrkslotsd/src/handoff_state.rs (sidecar), rs/wrkslotsd/src/hold_state.rs (hold), rs/wrkslotsd/src/journal_state.rs (recovery journals), plus the separate derived SQLite index in rs/wrkslotsd/src/index.rs", "python_definition": "py/wrkslots/cli.py SCHEMA and sidecar constants; the Python CLI is the only writer of most state", "generated_schema": null, "duplicate": "partial: each durable file format now has exactly one Rust validation definition in rs/wrkslotsd, held at differential parity with the Python loader by the py/wrkslots/tests/test_*_rust.py corpus, but Python hand-maintains the writer-side shapes and remains the only writer; the Rust SQLite observer index is a separate derived schema, not a second definition of these files", "collapse": "Done for readers in milestone 4 slices 1-15 (#562 rust-primary-wrkslots): config, ACTIVE, ARCHIVED, handoff sidecar, hold, and every recovery-journal kind each have one Rust definition; at writer parity the Rust types become the source from which the schemas are generated and the Python writer validates."},
+    {"name": "wrkviz timeline archive (schema 2 and schema 3)", "schema_id": "archive schema 2 / schema 3 (integer generations)", "rust_definition": "rs/wrkviz/src/inspect.rs (schema-3 bootstrap and shard catalogue records), rs/wrkviz/src/snapshot_store.rs (snapshot pointer)", "python_definition": "py/wrkviz/archive.py, build_store.py, render and query.schema_3_completeness readers", "generated_schema": null, "duplicate": "being collapsed: the schema-3 acceptance rules now live once in Rust and once in Python, held at differential parity by py/tests/test_wrkviz_inspect_rust.py", "collapse": "In progress (#706): define archive records once in Rust and generate the schema the Python mirror validates against, slice by slice with the subcommand ports."},
+    {"name": "validation components manifest", "schema_id": "components schema_version 1", "rust_definition": null, "python_definition": "validation/components.json read by scripts/run_component_tests.py (Manifest) and scripts/validate.py", "generated_schema": null, "duplicate": "no second definition; this file (validation/editions.json) follows the same pattern", "collapse": "Keep as data with a stdlib checker (scripts/check_editions.py is the model); add a JSON Schema when a Rust consumer appears."},
+    {"name": "cross differential coverage records", "schema_id": "unversioned JSON verdict records", "rust_definition": null, "python_definition": "cross/differential.py writes them; scripts/validate.py cross_coverage_report reads them", "generated_schema": null, "duplicate": "no second definition; writer and reader are both Python and agree by convention", "collapse": "Add a schema_id and a generated schema when the Rust-only validation lane (milestone 1) needs a Rust reader."},
+    {"name": "vibe-talk wire contract", "schema_id": "vibe-talk.schema.json (generated)", "rust_definition": "vibe-talk/src/contract.rs is the single source; the schema under vibe-talk/contract is generated from it", "python_definition": null, "generated_schema": "vibe-talk/web/contract.js and contract.d.ts, generated by vibe-talk/contract/generate.mjs", "duplicate": "no: this is the exemplar pattern for the whole inventory", "collapse": "None needed. Every other format converges on this shape: one Rust type, one generated versioned schema, generated consumers."},
     {
-      "name": "agent queue items and cancel tombstones",
-      "schema_id": "directory layout (no schema string)",
-      "rust_definition": "rs/agent-queue/src/queue.rs (MessageState, Lane, QueueDirectories)",
-      "python_definition": "py/agentctl/sessions.py and queue readers hand-build the same paths",
-      "generated_schema": null,
-      "duplicate": "yes: layout defined in Rust types and re-derived in Python",
-      "collapse": "Define queue item JSON in rs/agent-queue with schemars; generate JSON Schema under validation/schemas/; Python validates against it."
-    },
-    {
-      "name": "registry record (agent.json / native session)",
-      "schema_id": "agentctl-native-session/v1",
-      "rust_definition": "rs/agentctl/src/subagents.rs (schema string literal) and rs/agentctl/src/subagents/nested.rs",
-      "python_definition": "py/agentctl/subagents.py (same string literal, hand-built dicts); py/agentctl/sessions.py imports its helpers",
-      "generated_schema": null,
-      "duplicate": "yes: Rust and Python both hand-maintain the record shape",
-      "collapse": "One Rust struct in a shared formats module; generated schema; Python consumes the schema."
-    },
-    {
-      "name": "coordinator designation (coordinator.json)",
-      "schema_id": "agentctl-coordinator/v1",
-      "rust_definition": "rs/agentctl/src/subagents/control.rs DESIGNATION_SCHEMA",
-      "python_definition": "py/agentctl readers use the same literal",
-      "generated_schema": null,
-      "duplicate": "yes: string literal in both editions",
-      "collapse": "Move the constant and record type to the shared formats module; generate schema."
-    },
-    {
-      "name": "coordinator host index",
-      "schema_id": "agentctl-coordinator-index/v1",
-      "rust_definition": "rs/agent-teams/src/hostindex.rs and rs/agentctl/src/subagents/control.rs (two Rust writers)",
-      "python_definition": null,
-      "generated_schema": null,
-      "duplicate": "yes: Rust-vs-Rust, two crates emit the same schema id",
-      "collapse": "Single writer type in the shared formats module; both crates depend on it."
-    },
-    {
-      "name": "landing queue (landing-queue.json)",
-      "schema_id": "agentctl-landing-queue/v1",
-      "rust_definition": "rs/agentctl/src/landing_queue.rs SCHEMA",
-      "python_definition": null,
-      "generated_schema": null,
-      "duplicate": "no second definition found, but the record is built as serde_json values, not a named type",
-      "collapse": "Name the record type in the shared formats module; generate schema."
-    },
-    {
-      "name": "launch spec",
-      "schema_id": "agentctl-launch-spec/v1",
-      "rust_definition": "rs/agentctl/src/subagents/launch_spec.rs SCHEMA",
-      "python_definition": "py/agentctl/launch_spec.py SCHEMA (same literal)",
-      "generated_schema": null,
-      "duplicate": "yes: Rust and Python hand-maintain it",
-      "collapse": "One Rust type; generated schema; Python validates against it."
-    },
-    {
-      "name": "launch and goal journals",
-      "schema_id": "agentctl-launch/v1, agentctl-launch/v2, agentctl-goal/v1",
-      "rust_definition": "rs/agentctl/src/subagents/nested.rs LAUNCH_SCHEMAS",
-      "python_definition": "py/agentctl/subagents.py _NESTED_LAUNCH_SCHEMAS and goal dicts",
-      "generated_schema": null,
-      "duplicate": "yes: accepted-schema lists in both editions",
-      "collapse": "One Rust definition of each version; generated schemas per version."
-    },
-    {
-      "name": "move / rename / revive journals",
-      "schema_id": "agentctl-move/v1, agentctl-rename/v1, agentctl-revive/v1",
-      "rust_definition": "rs/agentctl/src/subagents.rs and revive.rs (string literals)",
-      "python_definition": "py/agentctl/subagents.py and revive.py (same literals)",
-      "generated_schema": null,
-      "duplicate": "yes: Rust and Python hand-maintain them",
-      "collapse": "Shared formats module types; generated schemas."
-    },
-    {
-      "name": "profiles (profiles.json)",
-      "schema_id": "agentctl-profiles/v1",
-      "rust_definition": "rs/agentctl/src/profiles.rs SCHEMA",
-      "python_definition": "py/agentctl/profiles.py SCHEMA (same literal)",
-      "generated_schema": null,
-      "duplicate": "yes: Rust and Python hand-maintain it",
-      "collapse": "One Rust type; generated schema; Python validates against it."
-    },
-    {
-      "name": "restore config and report",
-      "schema_id": "agentctl-restore/v1, agentctl-restore-report/v1",
-      "rust_definition": "rs/agentctl/src/restore.rs CONFIG_SCHEMA / REPORT_SCHEMA",
-      "python_definition": null,
-      "generated_schema": null,
-      "duplicate": "no second definition found; records are serde_json values",
-      "collapse": "Name the types in the shared formats module; generate schemas."
-    },
-    {
-      "name": "agent watch state and health",
-      "schema_id": "agentctl-agent-watch/v1",
-      "rust_definition": "rs/agentctl/src/agent_watch.rs STATE_SCHEMA",
-      "python_definition": null,
-      "generated_schema": null,
-      "duplicate": "no second definition found",
-      "collapse": "Name the type in the shared formats module; generate schema."
-    },
-    {
-      "name": "headless harness and runner records",
-      "schema_id": "agentctl-headless-harness/v1, agentctl-headless-runner/v1",
-      "rust_definition": "rs/agentctl/src/subagents/turn_runner.rs HARNESS_SCHEMA / RUNNER_SCHEMA",
-      "python_definition": "py/agentctl worker runtime writes the same records",
-      "generated_schema": null,
-      "duplicate": "yes: the python-primary headless path and the Rust reader share literals",
-      "collapse": "Define in the shared formats module before the headless Rust port (milestone 2)."
-    },
-    {
-      "name": "chat bridge state (requests, sent replies, alarms, provider health, credentials, refusals)",
-      "schema_id": "agentctl-chat-*/v1 family (see rs/agentctl/src/chat_runtime.rs)",
-      "rust_definition": "rs/agentctl/src/chat_runtime.rs schema constants; rs/chat-subscription-slack re-declares agentctl.allowed-sender-refusals.v1 (REFUSALS_SCHEMA)",
-      "python_definition": "py/agentctl/chat_storage.py and chat.py hand-build the same files",
-      "generated_schema": null,
-      "duplicate": "yes: Rust-vs-Python across the bridge, plus Rust-vs-Rust for allowed-sender-refusals between rs/agentctl and rs/chat-subscription-slack",
-      "collapse": "One Rust type per file in the shared formats module; the Slack plugin and any Python mirror validate against generated schemas."
-    },
-    {
-      "name": "chat plugin manifest and Slack payloads",
-      "schema_id": "agentctl-plugin-manifest/v1alpha1, agentctl.slack.v1, agentctl.slack.message.v1, agentctl.slack.rescan.v1, agentctl.slack-rejection.v1",
-      "rust_definition": "rs/agentctl/src/plugins.rs MANIFEST_SCHEMA; rs/chat-subscription-slack/src/plugin.rs and rescan.rs",
-      "python_definition": null,
-      "generated_schema": null,
-      "duplicate": "no second definition found",
-      "collapse": "Move the manifest type to the shared formats module; generate schemas."
-    },
-    {
-      "name": "agent-teams teams, routes, declarations, message envelope",
-      "schema_id": "agent-teams-teams/v1, agent-teams-routes/v1, agent-teams-declaration/v1, agent-teams-message/v1",
-      "rust_definition": "rs/agent-teams/src/cli.rs, route and envelope.rs (serde_json values checked by jsonfile.rs check_schema)",
-      "python_definition": null,
-      "generated_schema": null,
-      "duplicate": "no second definition; shapes are untyped serde_json values",
-      "collapse": "Name Rust types per file; generate schemas; keep check_schema as the version gate."
-    },
-    {
-      "name": "dagrun profile capture manifest and profile store",
-      "schema_id": "dagrun-profile-capture-v1",
-      "rust_definition": "rs/dagrun/src/profile_capture.rs PROFILE_CAPTURE_MANIFEST_SCHEMA and rs/dagrun/src/profile_report.rs CAPTURE_SCHEMA (same id, two constants)",
-      "python_definition": "py/dagrun/profile_capture.py and py/dagrun/profile_report.py (the same _CAPTURE_SCHEMA literal twice)",
-      "generated_schema": null,
-      "duplicate": "yes: the schema constant is duplicated in two Rust modules and again in two Python modules",
-      "collapse": "One constant and manifest type in rs/dagrun (or the shared formats module); generated schema for the Python mirror."
-    },
-    {
-      "name": "wrkslots slot state, handoffs, validation seals",
-      "schema_id": "integer schemas (config SCHEMA=2, ACTIVE/ARCHIVED state=2, handoff sidecar=2 with legacy=1, slot hold=1, recovery journals=2)",
-      "rust_definition": "rs/wrkslotsd/src/yamlconfig.rs (config document), rs/wrkslotsd/src/config_validate.rs (config), rs/wrkslotsd/src/active_state.rs (ACTIVE shard), rs/wrkslotsd/src/archive_state.rs (ARCHIVED shard), rs/wrkslotsd/src/handoff_state.rs (sidecar), rs/wrkslotsd/src/hold_state.rs (hold), rs/wrkslotsd/src/journal_state.rs (recovery journals), plus the separate derived SQLite index in rs/wrkslotsd/src/index.rs",
-      "python_definition": "py/wrkslots/cli.py SCHEMA and sidecar constants; the Python CLI is the only writer of most state",
-      "generated_schema": null,
-      "duplicate": "partial: each durable file format now has exactly one Rust validation definition in rs/wrkslotsd, held at differential parity with the Python loader by the py/wrkslots/tests/test_*_rust.py corpus, but Python hand-maintains the writer-side shapes and remains the only writer; the Rust SQLite observer index is a separate derived schema, not a second definition of these files",
-      "collapse": "Done for readers in milestone 4 slices 1-15 (#562 rust-primary-wrkslots): config, ACTIVE, ARCHIVED, handoff sidecar, hold, and every recovery-journal kind each have one Rust definition; at writer parity the Rust types become the source from which the schemas are generated and the Python writer validates."
-    },
-    {
-      "name": "wrkviz timeline archive (schema 2 and schema 3)",
-      "schema_id": "archive schema 2 / schema 3 (integer generations)",
-      "rust_definition": "rs/wrkviz/src/inspect.rs (schema-3 bootstrap and shard catalogue records), rs/wrkviz/src/snapshot_store.rs (snapshot pointer)",
-      "python_definition": "py/wrkviz/archive.py, build_store.py, render and query.schema_3_completeness readers",
-      "generated_schema": null,
-      "duplicate": "being collapsed: the schema-3 acceptance rules now live once in Rust and once in Python, held at differential parity by py/tests/test_wrkviz_inspect_rust.py",
-      "collapse": "In progress (#706): define archive records once in Rust and generate the schema the Python mirror validates against, slice by slice with the subcommand ports."
-    },
-    {
-      "name": "validation components manifest",
-      "schema_id": "components schema_version 1",
-      "rust_definition": null,
-      "python_definition": "validation/components.json read by scripts/run_component_tests.py (Manifest) and scripts/validate.py",
-      "generated_schema": null,
-      "duplicate": "no second definition; this file (validation/editions.json) follows the same pattern",
-      "collapse": "Keep as data with a stdlib checker (scripts/check_editions.py is the model); add a JSON Schema when a Rust consumer appears."
-    },
-    {
-      "name": "cross differential coverage records",
-      "schema_id": "unversioned JSON verdict records",
-      "rust_definition": null,
-      "python_definition": "cross/differential.py writes them; scripts/validate.py cross_coverage_report reads them",
-      "generated_schema": null,
-      "duplicate": "no second definition; writer and reader are both Python and agree by convention",
-      "collapse": "Add a schema_id and a generated schema when the Rust-only validation lane (milestone 1) needs a Rust reader."
-    },
-    {
-      "name": "vibe-talk wire contract",
-      "schema_id": "vibe-talk.schema.json (generated)",
-      "rust_definition": "vibe-talk/src/contract.rs is the single source; the schema under vibe-talk/contract is generated from it",
-      "python_definition": null,
-      "generated_schema": "vibe-talk/web/contract.js and contract.d.ts, generated by vibe-talk/contract/generate.mjs",
-      "duplicate": "no: this is the exemplar pattern for the whole inventory",
-      "collapse": "None needed. Every other format converges on this shape: one Rust type, one generated versioned schema, generated consumers."
+      "name": "local-ci-hub",
+      "primary": "python",
+      "mirror": {"edition": "rust", "state": "absent"},
+      "parity_check": null,
+      "rust_entrypoint": null,
+      "python_entrypoint": "py/bin/local-ci-hub",
+      "note": "Python-only; ledger canonicalization delegates to a configured external digest command when present."
     }
-  ]
+]
 }

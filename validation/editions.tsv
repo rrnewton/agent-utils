@@ -14,4 +14,3 @@ wrkviz	python	absent
 agent-teams	rust	absent	
 agent-usage	rust	absent	
 gh-paced	rust	absent	
-local-ci-hub	python	absent	
