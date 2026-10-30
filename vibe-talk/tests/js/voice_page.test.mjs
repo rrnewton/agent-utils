@@ -7259,7 +7259,10 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
     [{ jumpWanted: 3, inScrollback: true }, false, false, 2, 2]);
   // And what is gathered in its list; and nothing is swapped through the module any more.
   assert.equal(same("inColumn(columns.side, () => gatherState()) === columns.side.gather && gatherState() === columns.main.gather"), true);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshGatherState(), COLUMN_STATE.length])")), [{ gathered: null }, 0]);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshGatherState(), typeof COLUMN_STATE])")), [{ gathered: null }, "undefined"]);
+  // A column put aside has been worked on and left; the one taken up has not.
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.left, inColumn(columns.side, () => [columns.side.left, columns.main.left])])")),
+    [true, [false, true]]);
 });
 
 test("`#624 voice-page-modularity`: the live events counted per channel, from the module alone", () => {
@@ -76653,7 +76656,7 @@ test("`#306 done-stale-across-views`: the right column's thread, put away with t
   // THE CONTROLS. Without the right column's copy brought into line while it is put away, or without its
   // rows drawn again as it comes back, the reply shows there as not Done.
   const unfollowed = await run(brokenScript(
-    "  if (!sideShowing() && activeColumn !== columns.side && columns.side.state !== null) {", "  if (false) {"));
+    "  if (!sideShowing() && activeColumn !== columns.side && columns.side.left) {", "  if (false) {"));
   assert.equal(unfollowed.page.el("side-log").children.find((li) => li.getAttribute("data-id") === "202").getAttribute("data-archived"),
     "false", "without the right column's copy brought into line it showed the Done, so this test cannot see it");
   const undrawn = await run(brokenScript("      if (rowsMissDone()) renderCachedTimeline();\n      return undefined;",

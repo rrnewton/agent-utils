@@ -83,11 +83,9 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 // keeps what it is showing in module state and in the elements of one pane. So the right column has
 // elements of its own (each `side-` id standing in for one of the pane's, `COLUMN_IDS`) and state of
 // its own: records on the column object by field group (`olderPages`, `replyArrows`, `loadState`,
-// ...; `#624 voice-page-modularity`, plan step 15) and, until every group has moved, the module
-// variables `COLUMN_STATE` swaps, further down. The code works on one column at a time: the LEFT ONE,
-// except inside `inColumn(columns.side, ...)`, which makes the right column the one worked on (its
-// records, and its swapped variables loaded), runs, and puts the left column's back before it
-// returns. Nothing is left pointing at the right column between
+// ...; `#624 voice-page-modularity`, plan step 15), each reached through the column worked on. The
+// code works on one column at a time: the LEFT ONE, except inside `inColumn(columns.side, ...)`, which
+// makes the right column the one worked on, runs, and puts the left column back before it returns. Nothing is left pointing at the right column between
 // one event and the next, so code that never heard of a second column keeps meaning the left one.
 
 /** The elements of the channel's pane, and the right column's that stand in for each. */
@@ -119,8 +117,8 @@ const COLUMN_IDS = {
 };
 
 /**
- * The two columns. `state` holds a column's share of `COLUMN_STATE` while the other column's is
- * loaded; `mode` is what the right column shows: the list of threads, or one thread.
+ * The two columns. `left` says the column has been worked on and left since it was last made afresh
+ * (`useColumn`, `resetSideColumn`); `mode` is what the right column shows: the list of threads, or one thread.
  *
  * `searched` is what the column's last pass of the search counted (`applySearch`), for the count in
  * the bar, which speaks for every column on screen.
@@ -145,7 +143,7 @@ const COLUMN_IDS = {
  * than in `state`.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
- * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
+ * @typedef {{name: string, left: boolean, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null,
  *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
  *   load: ReturnType<typeof freshLoadState>, entry: ReturnType<typeof freshEntryState>,
@@ -157,11 +155,11 @@ const COLUMN_IDS = {
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
-  main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
+  main: { name: "main", left: false, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
     load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools(),
     filter: freshFilterState(), list: freshListState(), rows: freshTimelineRows(), selection: freshSelection("main"),
     composer: freshComposerState(), done: freshDoneState(), place: freshScrollPlace(), gather: freshGatherState() },
-  side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
+  side: { name: "side", left: false, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
     older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
     pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState(), list: freshListState(),
     rows: freshTimelineRows(), selection: freshSelection(), composer: freshComposerState(), done: freshDoneState(),
@@ -1093,7 +1091,7 @@ function closeOpenMenu(name) {
 
 /**
  * What a Back would close now, the first-opened first: the levels the page keeps an entry for. Read
- * in the left column, whose state is the page's (`COLUMN_STATE`).
+ * in the left column, the one worked on outside `inColumn`.
  *
  * @returns {string[]}
  */
@@ -1104,7 +1102,7 @@ function backLevels() {
 
 /**
  * What is open now, as levels, the first-opened first, without the jumps taken by links. Read in the
- * left column, whose state is the page's (`COLUMN_STATE`).
+ * left column, the one worked on outside `inColumn`.
  *
  * @returns {string[]}
  */
@@ -43960,7 +43958,7 @@ function followDoneEverywhere(ids, madeIn) {
   /** @param {Set<string>} copy */
   const caughtUp = (copy) => caughtUpDone(copy, named);
   for (const held of channelContexts.values()) held.dismissed = caughtUp(held.dismissed);
-  if (!sideShowing() && activeColumn !== columns.side && columns.side.state !== null) {
+  if (!sideShowing() && activeColumn !== columns.side && columns.side.left) {
     inColumn(columns.side, () => {
       doneState().archived = caughtUp(doneState().archived);
     });
@@ -47250,24 +47248,15 @@ let columnsRestoring = false;
 const sideThreads = new Map();
 
 /**
- * What the page keeps about the view a column shows that is not yet a record on the column (the field
- * groups that are: `ColumnFields`), as `[get, set, fresh]`: saved and loaded by `useColumn`, and
- * `fresh()` what the right column starts with. The channel's store, the reads on
- * the wire, the read mode, the filters' settings, pins, summaries and the outbox are the channel's
- * and the page's, shared by both columns, and are not here.
- *
- * @type {Array<[() => any, (value: any) => void, () => any]>}
+ * Work on column `column` from now on: its records (`ColumnFields`) are the ones the accessors reach.
+ * The column put aside has been worked on and `left`, which `followDoneEverywhere` asks of the right
+ * column; the one taken up has not. (`#624 voice-page-modularity`, plan step 15: every field group is
+ * a record on the column now, so nothing is swapped through module variables.)
  */
-const COLUMN_STATE = [
-];
-
-/** Work on column `column` from now on: its state into the module's, the other's put aside. */
 function useColumn(column) {
   if (column === activeColumn) return;
-  activeColumn.state = COLUMN_STATE.map(([get]) => get());
-  const state = column.state || COLUMN_STATE.map(([, , fresh]) => fresh());
-  COLUMN_STATE.forEach(([, set], at) => set(state[at]));
-  column.state = null;
+  activeColumn.left = true;
+  column.left = false;
   activeColumn = column;
   sideActive = column === columns.side;
 }
@@ -50997,9 +50986,10 @@ function resetSideColumn(reopen = false) {
     listState().rowsGathered = false;
     ++loadState().generation;
   });
-  columns.side.state = null;
-  // Its own records start again as its swapped fields do: only while it is not the column worked on.
+  // Made afresh, as when it was first used: only while it is not the column worked on, whose records
+  // are live.
   if (activeColumn !== columns.side) {
+    columns.side.left = false;
     columns.side.older = freshOlderPages();
     columns.side.arrows = freshReplyArrows();
     columns.side.load = freshLoadState();
