@@ -38,8 +38,28 @@ def show(cfg: Config, commit: str, remote: dict | None = None) -> dict:
             return False
         if r.get("commit_anchored") is False:
             return False
-        if cfg.require_full_evidence and not (r.get("commit_anchored") is True and isinstance(r.get("executed_tests"), (int, float)) and not isinstance(r.get("executed_tests"), bool) and r.get("executed_tests", 0) > 0):
-            return False  # full-evidence projects: anchoring and executed tests are mandatory, not optional
+        if cfg.require_full_evidence:
+            # Ported from the canonical qualifying predicate: full profile and
+            # selection, clean tree, no failures, no filtered tests, passed ==
+            # executed, and complete gate accounting (when fields are present).
+            if not (r.get("commit_anchored") is True and isinstance(r.get("executed_tests"), (int, float)) and not isinstance(r.get("executed_tests"), bool) and r.get("executed_tests", 0) > 0):
+                return False
+            if r.get("profile") not in (None, "full") or r.get("selection_mode") not in (None, "full"):
+                return False
+            if r.get("tree_dirty") not in (None, False) or (r.get("failures") or 0) != 0:
+                return False
+            if r.get("passed_tests") is not None and r.get("passed_tests") != r.get("executed_tests"):
+                return False
+            if cfg.release_payload is not None and r.get("release_builder") is not None and r.get("e2e_payload") != cfg.release_payload:
+                return False  # only the configured current release identity qualifies; superseded payloads are supplemental
+            cov = r.get("coverage")
+            if isinstance(cov, dict):
+                planned = cov.get("planned_test_nodes")
+                planned_n = len(planned) if isinstance(planned, list) else planned
+                if not planned_n or cov.get("zero_executed_nodes") not in ([],) or cov.get("absent_nodes") not in ([],):
+                    return False  # per-node coverage must be reported, planned, and clean
+            if r.get("gates_run") is not None and r.get("gates_expected") is not None and r["gates_run"] != r["gates_expected"]:
+                return False
         tests = r.get("executed_tests")
         if tests is not None and not (isinstance(tests, (int, float)) and not isinstance(tests, bool) and tests > 0):
             return False

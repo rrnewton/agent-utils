@@ -13,7 +13,7 @@ from . import receipt as receipt_mod
 from . import remote as remote_mod
 from . import runner
 from .config import ConfigError, load
-from .ledger import Ledger
+from .ledger import Ledger, digest
 
 QUICKSTART = """local-ci-hub quickstart (toy/local-only loop, under 5 minutes)
   1. Write local-ci-hub.toml (see `local-ci-hub userguide`), or rely on local-only defaults.
@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         q = rs.add_parser(op)
         q.add_argument("--wait", action="store_true"); q.add_argument("--commit", default=""); q.add_argument("--cell", default=""); q.add_argument("run_id", nargs="?")
     led = sub.add_parser("ledger"); ls = led.add_subparsers(dest="op", required=True)
-    for op in ("append", "publish", "query", "newest-green", "first-bad", "ingest"):
+    for op in ("append", "publish", "query", "newest-green", "first-bad", "ingest", "digest"):
         q = ls.add_parser(op)
         q.add_argument("--commit", default=""); q.add_argument("--result", default="PASS"); q.add_argument("--cell", default="")
     rec = sub.add_parser("receipt"); rec.add_argument("op", choices=["show", "verify"]); rec.add_argument("commit")
@@ -107,6 +107,9 @@ def main(argv: list[str] | None = None) -> int:
             res = ledger.append_result(commit=args.commit, result=args.result, cell=args.cell)
         elif args.op in ("publish", "ingest"):
             Ledger(cfg).publish(); res = {"rows": len(ledger.rows())}
+        elif args.op == "digest":
+            row = (ledger.for_commit(args.commit) or [{}])[0]
+            res = {"commit": args.commit, "digest": ledger.external_digest(row) or digest(row), "source": "external" if ledger.external_digest(row) else "builtin"}
         elif args.op == "newest-green":
             res = ledger.newest_green(args.cell) or {"result": "none"}
         elif args.op == "first-bad":

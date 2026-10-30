@@ -130,6 +130,22 @@ class Ledger:
             return {}, False
         return row, True
 
+    def external_digest(self, row: dict) -> str | None:
+        """Return the configured external canonical digest for a row, or None.
+
+        When a project configures receipt.digest_command, that command is
+        the one canonical digest: it receives the row JSON on stdin and
+        prints the digest. The built-in digest is only for this tool's
+        own events when no external command is configured.
+        """
+        cmd = self.cfg.digest_command
+        if not cmd:
+            return None
+        proc = subprocess.run(cmd, input=json.dumps(row).encode(), capture_output=True, timeout=60)
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.decode().strip().split()[-1] if proc.stdout.strip() else None
+
     def append_result(self, *, commit: str, result: str, run_id: str | None = None,
                       cell: str = "", command: str = "", host: str | None = None) -> dict:
         """Append one run result to the spool for later publication."""

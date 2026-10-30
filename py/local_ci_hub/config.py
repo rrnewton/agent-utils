@@ -41,6 +41,8 @@ class Config:
     state_dir: Path = Path("ignored/local-ci-hub")
     evidence_root: Path | None = None
     require_full_evidence: bool = True
+    release_payload: dict | None = None
+    digest_command: list[str] | None = None
     repos: list[dict] = field(default_factory=list)
 
     @property
@@ -104,6 +106,8 @@ def load(path: Path | None, root: Path | None = None) -> Config:
         state_dir=_resolve(root, str(data["land"]["state_dir"])) if data.get("land", {}).get("state_dir") else Path.home() / ".local" / "state" / "local-ci-hub",
         evidence_root=_resolve(root, str(led["evidence_root"])) if led.get("evidence_root") else None,
         require_full_evidence=bool(rec.get("require_full_evidence", True)),
+        release_payload=dict(rec["release_payload"]) if rec.get("release_payload") else None,
+        digest_command=list(rec["digest_command"]) if rec.get("digest_command") else None,
     )
     unknown = set(cfg.qualifying) - {"local-ledger-pass", "remote-pass"}
     if unknown:

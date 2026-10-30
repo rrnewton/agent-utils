@@ -35,5 +35,11 @@ workflows = []
 # valid digest where present (enforced in receipt.py).
 qualifying = ["local-ledger-pass"]
 
+[receipt.release_payload]
+path = "target/validate/hermit"
+profile = "validate"
+debug_assertions = true
+overflow_checks = true
+
 [health]
 probes = []
