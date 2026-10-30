@@ -233,7 +233,11 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "slice again), then runs the ordinary root-isolation steps and execs, creating no "
             "second scope and applying no limits. --closed-set makes the view's writable set "
             "exactly what the options name; with --print it prints that complete set as JSON, "
-            "and --expect-writable JSON makes the real entry refuse unless its set is exactly that."
+            "and --expect-writable JSON makes the real entry refuse unless its set is exactly that. "
+            "--git-config-policy isolated masks the fixed default Git configuration locations "
+            "($HOME/.gitconfig and $HOME/.config/git under every path to $HOME, and /etc/gitconfig) "
+            "inside the view; --print reports the complete masks as JSON, and --expect-masks JSON "
+            "makes the real entry refuse unless its masks are exactly that."
         ),
         formatter_class=formatter,
     )
@@ -281,6 +285,34 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "reported; the entry compares its own complete writable set with it, before writing "
             "any private state and again from the view it is about to build, and refuses on any "
             "difference instead of entering the box"
+        ),
+    )
+    run.add_argument(
+        "--git-config-policy",
+        choices=sandbox.GIT_CONFIG_POLICIES,
+        default=None,
+        help=(
+            "with --in-scope: inherit (default) shows the host's Git configuration as it is; "
+            "isolated masks $HOME/.gitconfig and $HOME/.config/git under $HOME and every alias of "
+            "it, and /etc/gitconfig (a fixed list; no path input): an existing file reads as an "
+            "empty read-only /dev/null, an existing directory as an empty read-only directory, a "
+            "missing path is confirmed still missing just before COMMAND starts (no mount covers "
+            "it, so a host process could create it later), and a symbolic link or any failure "
+            "refuses. Each outcome is checked inside the view before COMMAND starts. It also runs "
+            "the slot's Git lookup before the view with /usr/bin/git and a fixed environment. It "
+            "covers the default locations only: GIT_CONFIG_* or XDG_CONFIG_HOME set in COMMAND's "
+            "own environment, and the slot's repositories' own configuration, are not changed"
+        ),
+    )
+    run.add_argument(
+        "--expect-masks",
+        metavar="JSON",
+        default=None,
+        help=(
+            "with --in-scope: the \"masks\" object an earlier --print of the same command reported "
+            "(the complete ordered mask list, the Git configuration policy and its paths); the entry "
+            "compares its own with it, before writing any private state and again from the view it "
+            "is about to build, and refuses on any difference"
         ),
     )
     run.add_argument(
@@ -985,8 +1017,78 @@ def _convert_to_worktree(
     os.rename(staging, slot_path)
 
 
-def slot_view(config: "cli.Config", slot: str, slot_type: str) -> sandbox.SlotView:
-    """Describe a registered slot for the sandbox, whatever its representation."""
+#: The Git executable and the complete environment of the isolated policy's
+#: lookup before the view (:func:`_isolated_common_directory`): nothing comes
+#: from PATH or the caller's environment, and no global or system configuration
+#: is read.
+ISOLATED_GIT_EXECUTABLE = "/usr/bin/git"
+ISOLATED_GIT_ENVIRONMENT = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent",
+    "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
+ISOLATED_GIT_SECONDS = 30.0
+
+
+def _isolated_common_directory(repository: Path) -> Path:
+    """``git rev-parse --git-common-dir`` for the isolated Git configuration policy.
+
+    Runs the fixed :data:`ISOLATED_GIT_EXECUTABLE` (a root-owned regular file no
+    group or other user can write; a link is refused) with exactly
+    :data:`ISOLATED_GIT_ENVIRONMENT`, bounded by :data:`ISOLATED_GIT_SECONDS`.
+    The ordinary lookup keeps its own behaviour.
+    """
+
+    import stat
+    import subprocess
+
+    try:
+        status = os.lstat(ISOLATED_GIT_EXECUTABLE)
+    except OSError as exc:
+        raise _refuse(f"git-config-policy isolated: cannot inspect {ISOLATED_GIT_EXECUTABLE}: {exc}") from exc
+    if not stat.S_ISREG(status.st_mode) or status.st_uid != 0 or status.st_mode & 0o022:
+        raise _refuse(
+            f"git-config-policy isolated: {ISOLATED_GIT_EXECUTABLE} is not a root-owned regular file "
+            "that only root can write; refusing"
+        )
+    command = [
+        ISOLATED_GIT_EXECUTABLE, "--no-replace-objects", "-c", "core.useReplaceRefs=false",
+        "-C", str(repository), "rev-parse", "--path-format=absolute", "--git-common-dir",
+    ]
+    try:
+        completed = subprocess.run(
+            command, env=dict(ISOLATED_GIT_ENVIRONMENT), text=True, capture_output=True,
+            check=False, timeout=ISOLATED_GIT_SECONDS, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _refuse(f"git-config-policy isolated: the Git lookup in {repository} timed out") from exc
+    except OSError as exc:
+        raise _refuse(f"git-config-policy isolated: cannot execute Git: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise _refuse(f"Git refused in {repository}: git rev-parse --git-common-dir" + (f": {detail}" if detail else ""))
+    lines = completed.stdout.splitlines()
+    common = Path(lines[0]).absolute() if len(lines) == 1 else None
+    if common is None or common.is_symlink() or not common.is_dir():
+        raise _refuse(f"Git reported an unsafe common directory: {completed.stdout.strip()}")
+    return common
+
+
+def slot_view(
+    config: "cli.Config", slot: str, slot_type: str, *, isolated_git: bool = False
+) -> sandbox.SlotView:
+    """Describe a registered slot for the sandbox, whatever its representation.
+
+    ``isolated_git`` (the isolated Git configuration policy) finds the Git
+    common directories with :func:`_isolated_common_directory` instead of the
+    ordinary lookup.
+    """
 
     from wrkslots import cli
 
@@ -1005,9 +1107,10 @@ def slot_view(config: "cli.Config", slot: str, slot_type: str) -> sandbox.SlotVi
     else:
         state_directory = config.control / "slot-state" / slot_type / slot
     vcs = cli._GitVcs()
+    common_directory = _isolated_common_directory if isolated_git else vcs.common_directory
     git_directories: list[Path] = []
     for repository, path, _head in _checkout_paths(config, record):
-        common = vcs.common_directory(path if path.exists() else repository)
+        common = common_directory(path if path.exists() else repository)
         if common not in git_directories:
             git_directories.append(common)
     return sandbox.SlotView(
@@ -1145,7 +1248,8 @@ def _cmd_box(args: argparse.Namespace) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     config = _config(args)
-    view = slot_view(config, args.slot, args.slot_type)
+    git_config_policy: str | None = getattr(args, "git_config_policy", None)
+    view = slot_view(config, args.slot, args.slot_type, isolated_git=git_config_policy == "isolated")
     deadline_ns: int | None = getattr(args, "deadline_monotonic_ns", None)
     output_format: str | None = getattr(args, "format", None)
     try:
@@ -1153,12 +1257,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         in_scope: str | None = getattr(args, "in_scope", None)
         expect_slices: str | None = getattr(args, "expect_slices", None)
         expect_writable: str | None = getattr(args, "expect_writable", None)
+        expect_masks: str | None = getattr(args, "expect_masks", None)
         closed_set = bool(getattr(args, "closed_set", False))
         if getattr(args, "place_only", False):
             for option, given in (
                 ("--in-scope", in_scope is not None),
                 ("--expect-slices", expect_slices is not None),
                 ("--expect-writable", expect_writable is not None),
+                ("--git-config-policy", git_config_policy is not None),
+                ("--expect-masks", expect_masks is not None),
                 ("--closed-set", closed_set),
             ):
                 if given:
@@ -1170,6 +1277,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return _in_scope(args, view, settings, in_scope, expect_slices, closed_set, deadline_ns)
         if expect_writable is not None:
             raise _refuse("--expect-writable applies only with --in-scope")
+        for option, given in (
+            ("--git-config-policy", git_config_policy is not None),
+            ("--expect-masks", expect_masks is not None),
+        ):
+            if given:
+                raise _refuse(f"{option} applies only with --in-scope")
         for option, given in (
             ("--deadline-monotonic-ns", deadline_ns is not None),
             ("--closed-set", closed_set),
@@ -1248,6 +1361,18 @@ def _expected_writable(text: str | None) -> dict[str, object] | None:
     return {str(key): value for key, value in loaded.items()}
 
 
+def _expected_masks(text: str | None) -> dict[str, object] | None:
+    if text is None:
+        return None
+    try:
+        loaded: object = json.loads(text)
+    except ValueError as exc:
+        raise _refuse(f"--expect-masks must be the JSON object --print reported as masks: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise _refuse("--expect-masks must be the JSON object --print reported as masks")
+    return {str(key): value for key, value in loaded.items()}
+
+
 def _in_scope(
     args: argparse.Namespace,
     view: sandbox.SlotView,
@@ -1265,6 +1390,8 @@ def _in_scope(
         raise _refuse("--closed-set refuses --no-protect-system: every other mount must stay read-only")
     expected = _expected_slices(expect_slices)
     expected_writable = _expected_writable(getattr(args, "expect_writable", None))
+    expected_masks = _expected_masks(getattr(args, "expect_masks", None))
+    git_config_policy = getattr(args, "git_config_policy", None) or "inherit"
     command = list(args.command)
     cwd = Path(args.cwd).absolute() if args.cwd else None
     if args.print_only:
@@ -1278,6 +1405,8 @@ def _in_scope(
             slot_writable=not closed_set,
             deadline_ns=deadline_ns,
             expected_writable=expected_writable,
+            git_config_policy=git_config_policy,
+            expected_masks=expected_masks,
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0
@@ -1291,6 +1420,8 @@ def _in_scope(
         slot_writable=not closed_set,
         deadline_ns=deadline_ns,
         expected_writable=expected_writable,
+        git_config_policy=git_config_policy,
+        expected_masks=expected_masks,
     )
     raise AssertionError("enter_in_place returns only by raising")
 

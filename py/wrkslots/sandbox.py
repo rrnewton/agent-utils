@@ -56,7 +56,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 ISOLATIONS = ("userns", "cgroup", "root")
 COORDINATOR_SCOPES = ("worktrees", "project")
@@ -107,6 +107,17 @@ DEFAULT_OUTPUTS = ("ai_docs", "experiments")
 DEFAULT_ENV: tuple[tuple[str, str], ...] = ()
 DEFAULT_TMP_SIZE = "16G"
 DEFAULT_TASKS_MAX = 8192
+#: ``run --in-scope --git-config-policy``. inherit (the default): the view shows
+#: whatever Git configuration the host has. isolated: the fixed default Git
+#: configuration locations below are masked (or confirmed absent) inside the view.
+GIT_CONFIG_POLICIES = ("inherit", "isolated")
+#: $HOME-relative locations the isolated policy masks below $HOME and every alias
+#: of it: the global file and the default XDG directory ($HOME/.config/git, the
+#: location used when XDG_CONFIG_HOME is unset).
+GIT_CONFIG_HOME_PATHS = (".gitconfig", ".config/git")
+#: The fixed system file the isolated policy masks: libgit2's POSIX default
+#: system configuration path. Not configurable: the policy takes no path input.
+GIT_CONFIG_SYSTEM_PATHS = ("/etc/gitconfig",)
 _ENV_DENYLIST = frozenset(
     {
         "INVOCATION_ID",
@@ -970,6 +981,7 @@ def build_spec(
     cwd: Path,
     *,
     slot_writable: bool = True,
+    git_config_policy: str = "inherit",
 ) -> dict[str, object]:
     """Describe the view the helper must build, as plain JSON.
 
@@ -977,6 +989,10 @@ def build_spec(
     ``root`` modes and by ``--print``. ``slot_writable=False`` (a closed set)
     leaves the slot, the Git directories its checkouts commit into, and the
     view's extra writable roots read-only; only the configured lists remain.
+    ``git_config_policy="isolated"`` appends the fixed Git configuration
+    locations (:func:`git_config_mask_paths`) to the masks, each once, and
+    names them in ``git_config_masks`` so the helper masks them strictly
+    (:func:`_mask_git_config`); the default ``inherit`` leaves the spec as it was.
     """
 
     if home == Path("/") or not home.is_absolute():
@@ -1031,6 +1047,15 @@ def build_spec(
     # slot-images visible: it creates and removes image slots.
     private_state = ("slot-state", "box-state") if view.coordinator else ("slot-images", "slot-state", "box-state")
     masks += [str(view.control_directory / name) for name in private_state]
+    policy: dict[str, object] = {}
+    if git_config_policy == "isolated":
+        git_masks = git_config_mask_paths(aliases)
+        masks += [path for path in git_masks if path not in masks]
+        policy = {"git_config_policy": "isolated", "git_config_masks": git_masks}
+    elif git_config_policy != "inherit":
+        raise SandboxError(
+            f"--git-config-policy must be one of {', '.join(GIT_CONFIG_POLICIES)}, not {git_config_policy!r}"
+        )
     return {
         "home": str(home),
         "home_aliases": [str(alias) for alias in aliases[1:]],
@@ -1044,6 +1069,38 @@ def build_spec(
         "protect_system": settings.protect_system,
         "propagate": [str(path) for path in view.propagate],
         "cwd": str(cwd),
+        **policy,
+    }
+
+
+def git_config_mask_paths(aliases: Sequence[Path]) -> list[str]:
+    """The isolated policy's fixed locations, in order: each $HOME path's, then the system file.
+
+    ``aliases`` is $HOME followed by the other mount paths that expose it
+    (:func:`path_aliases`); every one gets both $HOME-relative locations.
+    """
+
+    paths = [str(base / relative) for base in aliases for relative in GIT_CONFIG_HOME_PATHS]
+    paths += list(GIT_CONFIG_SYSTEM_PATHS)
+    return [os.path.normpath(path) for path in dict.fromkeys(paths)]
+
+
+def mask_report(spec: Mapping[str, object]) -> dict[str, object]:
+    """The masks a view described by ``spec`` applies, as ``--print`` reports them.
+
+    ``masks`` is the complete ordered list the helper applies (credentials,
+    private state, and any policy paths); ``git_config_policy`` and
+    ``git_config_masks`` say which of them the isolated Git configuration
+    policy masks strictly. ``--expect-masks`` compares this whole object.
+    """
+
+    masks = spec.get("masks", [])
+    git_masks = spec.get("git_config_masks", [])
+    assert isinstance(masks, list) and isinstance(git_masks, list)
+    return {
+        "masks": [str(path) for path in masks],
+        "git_config_policy": str(spec.get("git_config_policy", "inherit")),
+        "git_config_masks": [str(path) for path in git_masks],
     }
 
 
@@ -1252,6 +1309,100 @@ def _mask(path: str) -> None:
         _remount_read_only(path)
 
 
+def _mask_git_config(path: str) -> str:
+    """Mask one isolated-policy Git configuration path; return its outcome.
+
+    Unlike :func:`_mask`, nothing is resolved: a symbolic link (valid or
+    dangling) at the path, or a parent directory reached through one, is
+    refused rather than followed to mask something else, and any failure
+    refuses. A directory is covered by an empty read-only tmpfs ("directory"),
+    a regular file by a read-only bind of /dev/null ("file"). A path that does
+    not exist is "absent": no mount covers it, so the box does not stop a host
+    process from creating it later; :func:`_confirm_git_config_masks` checks
+    it is still absent just before the command starts.
+    """
+
+    parent = os.path.dirname(path)
+    if not os.path.isabs(path) or os.path.normpath(path) != path or os.path.realpath(parent) != parent:
+        raise SandboxError(
+            f"git-config-policy isolated: {path} is reached through a symbolic link or is not a "
+            "normalized absolute path; refusing to mask what it points at"
+        )
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        raise SandboxError(f"git-config-policy isolated: cannot inspect {path}: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise SandboxError(
+            f"git-config-policy isolated: {path} is a symbolic link; it is not followed, refusing"
+        )
+    try:
+        if stat.S_ISDIR(info.st_mode):
+            _mount(
+                "tmpfs",
+                path,
+                "tmpfs",
+                _MS_NOSUID | _MS_NODEV | _MS_NOEXEC | _MS_RDONLY,
+                f"mode=0700,uid={os.getuid()},gid={os.getgid()},size=4k",
+            )
+            return "directory"
+        if stat.S_ISREG(info.st_mode):
+            _mount("/dev/null", path, None, _MS_BIND)
+            _remount_read_only(path)
+            return "file"
+    except MountError as exc:
+        raise SandboxError(f"git-config-policy isolated: cannot mask {path}: {exc}") from exc
+    raise SandboxError(f"git-config-policy isolated: {path} is neither a regular file nor a directory, refusing")
+
+
+def _read_only(path: str) -> bool:
+    return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+
+
+def _confirm_git_config_masks(
+    outcomes: Sequence[tuple[str, str]],
+    *,
+    lstat: Callable[[str], os.stat_result] = os.lstat,
+    listdir: Callable[[str], list[str]] = os.listdir,
+    read_only: Callable[[str], bool] = _read_only,
+) -> None:
+    """Refuse unless every isolated-policy path shows its outcome inside the finished view.
+
+    Called after the whole view is built and before the command starts: a
+    "file" must be the read-only /dev/null character device, a "directory" an
+    empty read-only directory, and an "absent" path must still not exist.
+    """
+
+    null = os.stat("/dev/null")
+    for path, outcome in outcomes:
+        try:
+            info: os.stat_result | None = lstat(path)
+        except FileNotFoundError:
+            info = None
+        except OSError as exc:
+            raise SandboxError(f"git-config-policy isolated: cannot confirm {path}: {exc}") from exc
+        if outcome == "absent":
+            confirmed = info is None
+        elif outcome == "file":
+            confirmed = (
+                info is not None
+                and stat.S_ISCHR(info.st_mode)
+                and info.st_rdev == null.st_rdev
+                and read_only(path)
+            )
+        elif outcome == "directory":
+            confirmed = info is not None and stat.S_ISDIR(info.st_mode) and not listdir(path) and read_only(path)
+        else:
+            confirmed = False
+        if not confirmed:
+            raise SandboxError(
+                f"git-config-policy isolated: {path} is not {outcome} inside the view; refusing to "
+                "run the command"
+            )
+
+
 def _same_kind(real: str, placeholder: str) -> bool:
     """A real entry can be bound on its placeholder: both exist, both dirs or both not."""
 
@@ -1349,9 +1500,18 @@ def build_view(spec: Mapping[str, object]) -> None:
     for source, target in binds:
         _bind_fd(pinned[source], target)
 
-    # 5. Masks last, so they win over anything bound above.
+    # 5. Masks last, so they win over anything bound above. The isolated Git
+    # configuration policy's paths are masked strictly (no link followed,
+    # failures refuse) and their outcomes are confirmed once the view is done.
+    git_config_masks = strings("git_config_masks")
+    git_config_outcomes: list[tuple[str, str]] = []
     for path in strings("masks"):
-        _mask(path)
+        if path in git_config_masks:
+            git_config_outcomes.append((path, _mask_git_config(path)))
+        else:
+            _mask(path)
+    if sorted(path for path, _outcome in git_config_outcomes) != sorted(git_config_masks):
+        raise SandboxError("git-config-policy isolated: a policy path is missing from the view's masks")
     if mode == "hidden":
         for alias in aliases:
             _remount_read_only(alias)
@@ -1368,6 +1528,8 @@ def build_view(spec: Mapping[str, object]) -> None:
             )
     if propagate:
         _limit_propagation(propagate)
+    if git_config_masks:
+        _confirm_git_config_masks(git_config_outcomes)
     for descriptor in pinned.values():
         os.close(descriptor)
     os.chdir(str(spec.get("cwd", "/")))
@@ -1971,27 +2133,37 @@ def in_scope_plan(
     slot_writable: bool = True,
     deadline_ns: int | None = None,
     expected_writable: Mapping[str, object] | None = None,
+    git_config_policy: str = "inherit",
+    expected_masks: Mapping[str, object] | None = None,
     cgroup_file: Path = Path("/proc/self/cgroup"),
 ) -> dict[str, object]:
     """What :func:`enter_in_place` would do, writing nothing in the slot's state.
 
     Verifies the scope and slices exactly as the real entry does, then returns
-    the view spec, its complete writable set, and the helper argv. With
-    ``expected_writable``, refuses unless that writable set is exactly it.
+    the view spec, its complete writable set, its complete masks
+    (:func:`mask_report`), and the helper argv. With ``expected_writable``,
+    refuses unless that writable set is exactly it; with ``expected_masks``,
+    refuses unless the mask report is exactly it.
     """
 
     _check_in_scope_request(view, settings, command)
     verify_in_scope(view, unit, expected, deadline_ns=deadline_ns, cgroup_file=cgroup_file)
     home = Path(os.environ.get("HOME", str(Path.home())))
-    spec = build_spec(view, settings, home, cwd or view.slot_path, slot_writable=slot_writable)
+    spec = build_spec(
+        view, settings, home, cwd or view.slot_path, slot_writable=slot_writable,
+        git_config_policy=git_config_policy,
+    )
     # Nothing is prepared here; the real entry creates the private
     # directories first, and their binds are part of its writable set.
     writable = writable_set(spec, created_sources=planned_private_sources(view, settings))
     _check_expected_writable(writable, expected_writable)
+    masks = mask_report(spec)
+    _check_expected_masks(masks, expected_masks)
     return {
         "unit": unit,
         "slices": expected.to_obj(),
         "writable": writable,
+        "masks": masks,
         "helper": root_helper("SPEC-FILE"),
         "command": list(command),
         "view": spec,
@@ -2009,6 +2181,22 @@ def _check_expected_writable(actual: Mapping[str, object], expected: Mapping[str
     if expected is not None and dict(actual) != dict(expected):
         raise SandboxError(
             "the writable set this entry would have differs from the expected one: "
+            f"{json.dumps(actual, sort_keys=True)} is not {json.dumps(expected, sort_keys=True)}; "
+            "refusing to enter the box"
+        )
+
+
+def _check_expected_masks(actual: Mapping[str, object], expected: Mapping[str, object] | None) -> None:
+    """Refuse unless the masks about to be applied are exactly the ones the caller accepted.
+
+    ``expected`` is the ``masks`` object an earlier ``--print`` reported: the
+    complete ordered mask list, the Git configuration policy, and its paths,
+    compared whole, separately from the writable set. None means no expectation.
+    """
+
+    if expected is not None and dict(actual) != dict(expected):
+        raise SandboxError(
+            "the masks this entry would apply differ from the expected ones: "
             f"{json.dumps(actual, sort_keys=True)} is not {json.dumps(expected, sort_keys=True)}; "
             "refusing to enter the box"
         )
@@ -2037,6 +2225,8 @@ def enter_in_place(
     slot_writable: bool = True,
     deadline_ns: int | None = None,
     expected_writable: Mapping[str, object] | None = None,
+    git_config_policy: str = "inherit",
+    expected_masks: Mapping[str, object] | None = None,
     cgroup_file: Path = Path("/proc/self/cgroup"),
 ) -> None:
     """Enter the slot's box from inside the caller's own scope; never creates or joins a scope.
@@ -2051,7 +2241,11 @@ def enter_in_place(
     With ``expected_writable`` (the ``writable`` object a ``--print`` reported),
     the writable set is compared whole before the private state is prepared
     and again from the spec about to be written; any difference refuses and
-    nothing is executed. Returns only by raising.
+    nothing is executed. ``expected_masks`` (the ``masks`` object a ``--print``
+    reported) is compared the same way, at the same two points, separately.
+    With ``git_config_policy="isolated"`` the helper masks the fixed Git
+    configuration locations strictly and confirms them inside the view before
+    the command starts. Returns only by raising.
     """
 
     _check_in_scope_request(view, settings, command)
@@ -2067,9 +2261,16 @@ def enter_in_place(
     if expected_writable is not None:
         # Before anything is written: the same set the --print report derived.
         _check_expected_writable(
-            writable_set(build_spec(view, settings, home, workdir, slot_writable=slot_writable),
+            writable_set(build_spec(view, settings, home, workdir, slot_writable=slot_writable,
+                                    git_config_policy=git_config_policy),
                          created_sources=planned),
             expected_writable,
+        )
+    if expected_masks is not None:
+        _check_expected_masks(
+            mask_report(build_spec(view, settings, home, workdir, slot_writable=slot_writable,
+                                   git_config_policy=git_config_policy)),
+            expected_masks,
         )
     check_sudo(deadline_ns=deadline_ns)
     try:
@@ -2077,9 +2278,11 @@ def enter_in_place(
     except OSError as exc:
         raise SandboxError(f"cannot prepare the private state of {view.slot}: {exc}") from exc
     environment = child_environment(view, settings, os.environ)
-    spec = build_spec(view, settings, home, workdir, slot_writable=slot_writable)
+    spec = build_spec(view, settings, home, workdir, slot_writable=slot_writable,
+                      git_config_policy=git_config_policy)
     # And from the spec the helper will actually build.
     _check_expected_writable(writable_set(spec, created_sources=planned), expected_writable)
+    _check_expected_masks(mask_report(spec), expected_masks)
     spec_file = write_root_spec(spec, command, environment)
     argv = root_helper(spec_file)
     try:

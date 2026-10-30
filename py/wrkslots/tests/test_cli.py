@@ -1314,3 +1314,498 @@ def test_run_in_scope_print_with_a_different_expected_set_refuses(
     narrowed = {**writable, "binds": []}
     assert cli.main([*base, "--expect-writable", json.dumps(narrowed), "--print", "--", "true"]) != 0
     assert "differs from the expected one" in capsys.readouterr().err
+
+
+# ------------------- --git-config-policy isolated and --expect-masks (in-scope entry)
+#
+# Real namespaces and mounts are NOT exercised here: the mount calls, the
+# view-building steps around them, sudo and the root helper are stubs or
+# recorders, as in the in-scope tests above. These tests bind the spec, the
+# report, the comparisons, the per-path decisions and the in-view checks; they
+# are not a host acceptance of the mounted view.
+
+
+def _policy_request(cgroup: Path) -> dict[str, object]:
+    return dict(unit="run-1.scope", expected=_APP, slot_writable=False, cgroup_file=cgroup)
+
+
+def _git_masks(home: Path) -> list[str]:
+    return [str(home / ".gitconfig"), str(home / ".config/git"), "/etc/gitconfig"]
+
+
+def test_isolated_policy_reports_its_masks_and_the_entry_carries_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, target, cgroup, _log = _in_scope_host(tmp_path, monkeypatch)
+    monkeypatch.setattr(sandbox, "path_aliases", lambda path: [path])
+    view = _slot_view(tmp_path)
+    settings = _closed_settings(target)
+    request = _policy_request(cgroup)
+
+    inherited = sandbox.in_scope_plan(view, settings, ["true"], **request)  # type: ignore[arg-type]
+    isolated = sandbox.in_scope_plan(
+        view, settings, ["true"], git_config_policy="isolated", **request  # type: ignore[arg-type]
+    )
+
+    # The default spec is unchanged: no policy keys, the configured masks only.
+    assert "git_config_masks" not in inherited["view"] and "git_config_policy" not in inherited["view"]  # type: ignore[operator]
+    assert inherited["masks"] == {
+        "masks": inherited["view"]["masks"],  # type: ignore[index]
+        "git_config_policy": "inherit",
+        "git_config_masks": [],
+    }
+    base = list(inherited["masks"]["masks"])  # type: ignore[index]
+    assert str(home / ".ssh") in base and str(home / ".gitconfig") not in base
+    # Isolated: the same list, then each fixed Git location once, in order.
+    assert isolated["masks"] == {
+        "masks": [*base, *_git_masks(home)],
+        "git_config_policy": "isolated",
+        "git_config_masks": _git_masks(home),
+    }
+    assert isolated["view"]["git_config_masks"] == _git_masks(home)  # type: ignore[index]
+    # The writable set is a separate member and is not changed by the policy.
+    assert isolated["writable"] == inherited["writable"]
+
+    with pytest.raises(_Execed) as caught:
+        sandbox.enter_in_place(
+            view, settings, ["true"], git_config_policy="isolated",
+            expected_masks=isolated["masks"], expected_writable=isolated["writable"],  # type: ignore[arg-type]
+            **request,  # type: ignore[arg-type]
+        )
+    actual = caught.value.spec["view"]
+    assert isinstance(actual, dict)
+    assert sandbox.mask_report(actual) == isolated["masks"]
+    assert actual["git_config_policy"] == "isolated"
+
+
+def test_isolated_policy_masks_every_home_alias_and_a_path_already_hidden_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, target, _cgroup, _log = _in_scope_host(tmp_path, monkeypatch)
+    alias = tmp_path / "alias-home"
+    monkeypatch.setattr(sandbox, "path_aliases", lambda path: [path, alias])
+    settings = dataclasses.replace(
+        _closed_settings(target), home_hidden=(*sandbox.DEFAULT_HOME_HIDDEN, ".gitconfig")
+    )
+
+    spec = sandbox.build_spec(_slot_view(tmp_path), settings, home, tmp_path, git_config_policy="isolated")
+
+    git_masks = [str(home / ".gitconfig"), str(home / ".config/git"),
+                 str(alias / ".gitconfig"), str(alias / ".config/git"), "/etc/gitconfig"]
+    assert spec["git_config_masks"] == git_masks
+    masks = spec["masks"]
+    assert isinstance(masks, list)
+    assert len(masks) == len(set(masks))  # each path once, even when also in home_hidden
+    assert all(path in masks for path in git_masks)
+    with pytest.raises(sandbox.SandboxError, match="--git-config-policy must be one of"):
+        sandbox.build_spec(_slot_view(tmp_path), settings, home, tmp_path, git_config_policy="arbitrary")
+
+
+def test_entry_refuses_masks_other_than_the_reported_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Predicted masks must equal actual masks, before any state write and again at the spec."""
+
+    home, target, cgroup, log = _in_scope_host(tmp_path, monkeypatch)
+    monkeypatch.setattr(sandbox, "path_aliases", lambda path: [path])
+    view = _slot_view(tmp_path)
+    settings = _closed_settings(target)
+    request = _policy_request(cgroup)
+    reported = sandbox.in_scope_plan(
+        view, settings, ["true"], git_config_policy="isolated", **request  # type: ignore[arg-type]
+    )["masks"]
+    assert isinstance(reported, dict)
+
+    # The policy dropped between --print and the entry: refused before anything is written.
+    with pytest.raises(sandbox.SandboxError, match="masks this entry would apply differ"):
+        sandbox.enter_in_place(
+            view, settings, ["true"], expected_masks=reported, **request  # type: ignore[arg-type]
+        )
+    assert not (tmp_path / "state").exists()
+    assert not any(line.startswith("sudo") for line in _calls(log))
+
+    # Every member is compared: each policy path omitted, the list reordered,
+    # an extra mask, another policy name, an unknown member.
+    masks = list(reported["masks"])
+    variants = [
+        {**reported, "masks": [path for path in masks if path != omitted]}
+        for omitted in _git_masks(home)
+    ]
+    variants += [
+        {**reported, "git_config_masks": _git_masks(home)[:-1]},
+        {**reported, "masks": list(reversed(masks))},
+        {**reported, "masks": [*masks, "/etc/other"]},
+        {**reported, "git_config_policy": "inherit"},
+        {**reported, "extra": 1},
+    ]
+    for changed in variants:
+        with pytest.raises(sandbox.SandboxError, match="masks this entry would apply differ"):
+            sandbox.in_scope_plan(
+                view, settings, ["true"], git_config_policy="isolated", expected_masks=changed,
+                **request,  # type: ignore[arg-type]
+            )
+
+
+def test_entry_compares_the_masks_again_from_the_spec_it_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mask list that changes after the first comparison is refused before the spec is written."""
+
+    home, target, cgroup, _log = _in_scope_host(tmp_path, monkeypatch)
+    alias = tmp_path / "late-alias"
+    calls: list[int] = []
+
+    def aliases(path: Path) -> list[Path]:
+        calls.append(1)
+        return [path] if len(calls) <= 2 else [path, alias]  # print, first check; then drift
+
+    monkeypatch.setattr(sandbox, "path_aliases", aliases)
+    view = _slot_view(tmp_path)
+    settings = _closed_settings(target)
+    request = _policy_request(cgroup)
+    reported = sandbox.in_scope_plan(
+        view, settings, ["true"], git_config_policy="isolated", **request  # type: ignore[arg-type]
+    )["masks"]
+    written: list[object] = []
+
+    def write_root_spec(*args: object) -> str:
+        written.append(args)
+        return "/nonexistent"
+
+    monkeypatch.setattr(sandbox, "write_root_spec", write_root_spec)
+
+    with pytest.raises(sandbox.SandboxError, match="masks this entry would apply differ"):
+        sandbox.enter_in_place(
+            view, settings, ["true"], git_config_policy="isolated",
+            expected_masks=reported, **request,  # type: ignore[arg-type]
+        )
+    assert written == []
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--git-config-policy", "isolated", "--", "true"], "--git-config-policy applies only with --in-scope"),
+        (["--expect-masks", "{}", "--", "true"], "--expect-masks applies only with --in-scope"),
+        (["--place-only", "--git-config-policy", "isolated"],
+         "--place-only runs nothing and takes no --git-config-policy"),
+        (["--place-only", "--expect-masks", "{}"], "--place-only runs nothing and takes no --expect-masks"),
+        (
+            ["--in-scope", "run-1.scope", "--expect-slices",
+             json.dumps({"enclosing": None, "all_slots": "wrkslots.slice", "slot": "wrkslots-slot\\x2db.slice"}),
+             "--expect-masks", "[1]", "--", "true"],
+            "--expect-masks must be the JSON object --print reported as masks",
+        ),
+    ],
+)
+def test_run_refuses_policy_options_where_they_cannot_apply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+    message: str,
+) -> None:
+    root = _registered_slot(tmp_path)
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+
+    def must_not_run(*args: object, **kwargs: object) -> None:
+        # A request that is not refused must not reach a real scope, namespace or exec.
+        raise AssertionError("a request that must be refused reached the box")
+
+    monkeypatch.setattr(sandbox, "run", must_not_run)
+    monkeypatch.setattr(sandbox, "enter_in_place", must_not_run)
+    monkeypatch.setattr(os, "execvpe", must_not_run)
+    capsys.readouterr()
+
+    assert cli.main(["--project-root", str(root), "run", "slot-b", *extra]) != 0
+
+    assert message in capsys.readouterr().err
+    assert _calls(log) == []
+
+
+def test_run_in_scope_print_reports_masks_and_expect_masks_binds_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _registered_slot(tmp_path)
+    home, _target, cgroup, _log = _in_scope_host(tmp_path, monkeypatch)
+    target = root / "worktrees" / "slot-b" / "target"
+    target.mkdir()
+    cgroup.write_text(
+        _MANAGER + "/app.slice/app-wrkslots.slice/app-wrkslots-slot\\x2db.slice/run-1.scope\n"
+    )
+    real = sandbox.in_scope_plan
+
+    def plan(*args: object, **kwargs: object) -> dict[str, object]:
+        return real(*args, **kwargs, cgroup_file=cgroup)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sandbox, "in_scope_plan", plan)
+    slices = json.dumps(
+        {"enclosing": "app.slice", "all_slots": "app-wrkslots.slice", "slot": "app-wrkslots-slot\\x2db.slice"}
+    )
+    base = ["--project-root", str(root), "run", "slot-b", "--in-scope", "run-1.scope",
+            "--expect-slices", slices, "--isolation", "root", "--closed-set",
+            "--home-private", ".cargo", "--read-write", str(target), "--tmp-size", "1G",
+            "--git-config-policy", "isolated"]
+    capsys.readouterr()
+    assert cli.main([*base, "--print", "--", "true"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    masks = report["masks"]
+    assert masks["git_config_policy"] == "isolated"
+    assert masks["git_config_masks"][:2] == [str(home / ".gitconfig"), str(home / ".config/git")]
+    assert masks["git_config_masks"][-1] == "/etc/gitconfig"
+    assert masks["masks"] == report["view"]["masks"]
+
+    assert cli.main([*base, "--expect-masks", json.dumps(masks), "--print", "--", "true"]) == 0
+    capsys.readouterr()
+    narrowed = {**masks, "masks": [path for path in masks["masks"] if path != "/etc/gitconfig"]}
+    assert cli.main([*base, "--expect-masks", json.dumps(narrowed), "--print", "--", "true"]) != 0
+    assert "masks this entry would apply differ" in capsys.readouterr().err
+
+
+# ---- per-path decisions inside the view (STUB: mount calls are recorded, not made)
+
+
+def _record_mounts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]:
+    mounts: list[tuple[object, ...]] = []
+    monkeypatch.setattr(sandbox, "_mount", lambda *args: mounts.append(("mount", *args)))
+    monkeypatch.setattr(sandbox, "_remount_read_only", lambda *args: mounts.append(("remount-ro", *args)))
+    return mounts
+
+
+def test_mask_git_config_masks_the_path_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mounts = _record_mounts(monkeypatch)
+    file, directory, absent = tmp_path / "gitconfig", tmp_path / "git", tmp_path / "missing" / "gitconfig"
+    file.write_text("[core]\n\tfsmonitor = sentinel\n")
+    directory.mkdir()
+    (directory / "config").write_text("[include]\n\tpath = sentinel\n")
+
+    assert sandbox._mask_git_config(str(file)) == "file"
+    assert sandbox._mask_git_config(str(directory)) == "directory"
+    assert sandbox._mask_git_config(str(absent)) == "absent"
+
+    assert mounts[0][:3] == ("mount", "/dev/null", str(file))
+    assert mounts[1] == ("remount-ro", str(file))
+    assert mounts[2][1:4] == ("tmpfs", str(directory), "tmpfs")
+    assert int(mounts[2][4]) & sandbox._MS_RDONLY  # type: ignore[call-overload]
+    assert len(mounts) == 3  # nothing is mounted for the absent path
+
+
+@pytest.mark.parametrize("kind", ["symlink", "dangling", "parent-symlink", "fifo"])
+def test_mask_git_config_refuses_links_and_specials_without_following(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    mounts = _record_mounts(monkeypatch)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "gitconfig").write_text("[user]\n\tname = not git config at all\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    if kind == "symlink":
+        path = home / ".gitconfig"
+        path.symlink_to(elsewhere / "gitconfig")
+    elif kind == "dangling":
+        path = home / ".gitconfig"
+        path.symlink_to(tmp_path / "nowhere")
+    elif kind == "parent-symlink":
+        (home / ".config").symlink_to(elsewhere)
+        (elsewhere / "git").mkdir()
+        path = home / ".config" / "git"
+    else:
+        path = home / ".gitconfig"
+        os.mkfifo(path)
+
+    with pytest.raises(sandbox.SandboxError, match="git-config-policy isolated"):
+        sandbox._mask_git_config(str(path))
+    assert mounts == []  # in particular, nothing was mounted on the link's target
+
+    # The ordinary mask, by contrast, follows the link (unchanged behaviour).
+    if kind == "symlink":
+        sandbox._mask(str(path))
+        assert mounts[0][:3] == ("mount", "/dev/null", str(elsewhere / "gitconfig"))
+
+
+def test_mask_git_config_refuses_every_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file = tmp_path / "gitconfig"
+    file.write_text("x")
+
+    def failing(*args: object) -> None:
+        raise sandbox.MountError("mount /dev/null on gitconfig: Operation not permitted", 1)
+
+    monkeypatch.setattr(sandbox, "_mount", failing)
+    with pytest.raises(sandbox.SandboxError, match="cannot mask"):
+        sandbox._mask_git_config(str(file))
+
+    real_lstat = os.lstat
+
+    def denied(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if str(path) == str(file):
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "lstat", denied)
+    with pytest.raises(sandbox.SandboxError, match="cannot inspect"):
+        sandbox._mask_git_config(str(file))
+    with pytest.raises(sandbox.SandboxError, match="normalized absolute path"):
+        sandbox._mask_git_config("relative/gitconfig")
+
+
+def _Status(mode: int, rdev: int) -> os.stat_result:
+    return os.stat_result((mode, 0, 0, 0, 0, 0, 0, 0, 0, 0), {"st_rdev": rdev})
+
+
+def test_confirm_git_config_masks_checks_each_outcome_inside_the_view() -> None:
+    """STUB observations: what the finished view must show for each outcome."""
+
+    null_rdev = os.stat("/dev/null").st_rdev
+    seen = {
+        "/v/file": _Status(stat.S_IFCHR | 0o666, null_rdev),
+        "/v/dir": _Status(stat.S_IFDIR | 0o700, 0),
+    }
+
+    def lstat(path: str) -> os.stat_result:
+        if path in seen:
+            return seen[path]
+        raise FileNotFoundError(2, "No such file or directory", path)
+
+    def confirm(outcomes: list[tuple[str, str]], *, empty: bool = True, read_only: bool = True) -> None:
+        sandbox._confirm_git_config_masks(
+            outcomes, lstat=lstat, listdir=lambda path: [] if empty else ["config"],
+            read_only=lambda path: read_only,
+        )
+
+    confirm([("/v/file", "file"), ("/v/dir", "directory"), ("/v/absent", "absent")])
+    for outcomes, keywords in (
+        ([("/v/absent", "file")], {}),                 # the file mask is not there
+        ([("/v/dir", "file")], {}),
+        ([("/v/file", "absent")], {}),                 # an absent path appeared before COMMAND
+        ([("/v/dir", "directory")], {"empty": False}),  # the directory still shows its config
+        ([("/v/dir", "directory")], {"read_only": False}),
+        ([("/v/file", "file")], {"read_only": False}),
+        ([("/v/file", "unknown")], {}),
+    ):
+        with pytest.raises(sandbox.SandboxError, match="is not .* inside the view"):
+            confirm(outcomes, **keywords)
+    seen["/v/file"] = _Status(stat.S_IFREG | 0o644, 0)  # an unmasked regular file
+    with pytest.raises(sandbox.SandboxError, match="is not file inside the view"):
+        confirm([("/v/file", "file")])
+
+
+def test_build_view_masks_policy_paths_strictly_and_confirms_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """STUB view: every mount step is recorded; the order and the dispatch are what is checked."""
+
+    events: list[tuple[object, ...]] = []
+    for name in ("_mount", "_bind_fd", "_remount_read_only", "_limit_propagation"):
+        monkeypatch.setattr(sandbox, name, lambda *args, name=name: events.append((name, *args)))
+    monkeypatch.setattr(sandbox, "_remount_tree_read_only", lambda *args, **kwargs: [])
+    monkeypatch.setattr(sandbox, "_mask", lambda path: events.append(("mask", path)))
+
+    def git_mask(path: str) -> str:
+        events.append(("git-mask", path))
+        return "file"
+
+    monkeypatch.setattr(sandbox, "_mask_git_config", git_mask)
+    monkeypatch.setattr(
+        sandbox, "_confirm_git_config_masks", lambda outcomes: events.append(("confirm", list(outcomes)))
+    )
+    monkeypatch.setattr(os, "chdir", lambda path: None)
+    home, layer = tmp_path / "home", tmp_path / "layer"
+    home.mkdir()
+    layer.mkdir()
+    spec: dict[str, object] = {
+        "home": str(home), "home_layer": str(layer), "home_mode": "ro", "home_aliases": [],
+        "home_binds": [], "read_only": [], "binds": [], "tmp_size": "1G", "protect_system": True,
+        "propagate": [], "cwd": str(tmp_path),
+        "masks": [str(home / ".ssh"), "/etc/gitconfig", str(home / ".gitconfig")],
+        "git_config_policy": "isolated",
+        "git_config_masks": [str(home / ".gitconfig"), "/etc/gitconfig"],
+    }
+
+    sandbox.build_view(spec)
+
+    masking = [event for event in events if event[0] in ("mask", "git-mask", "confirm")]
+    assert masking == [
+        ("mask", str(home / ".ssh")),
+        ("git-mask", "/etc/gitconfig"),
+        ("git-mask", str(home / ".gitconfig")),
+        ("confirm", [("/etc/gitconfig", "file"), (str(home / ".gitconfig"), "file")]),
+    ]
+
+    # A policy path the masks do not carry is refused, not skipped.
+    events.clear()
+    with pytest.raises(sandbox.SandboxError, match="missing from the view's masks"):
+        sandbox.build_view({**spec, "masks": [str(home / ".ssh"), "/etc/gitconfig"]})
+    assert not any(event[0] == "confirm" for event in events)
+
+    # Without the policy the view is built as before: no strict mask, no confirmation.
+    events.clear()
+    plain = {key: value for key, value in spec.items() if not key.startswith("git_config")}
+    sandbox.build_view(plain)
+    assert [event for event in events if event[0] in ("mask", "git-mask", "confirm")] == [
+        ("mask", str(home / ".ssh")), ("mask", "/etc/gitconfig"), ("mask", str(home / ".gitconfig")),
+    ]
+
+
+# ---- the Git lookup before the view (real git; hostile caller environment)
+
+
+def _hostile_git_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A `git` first on PATH that records each call, plus hostile GIT_* and loader variables."""
+
+    tools = tmp_path / "hostile-bin"
+    tools.mkdir()
+    log = tmp_path / "hostile-git.log"
+    (tools / "git").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {log}\nexec /usr/bin/git "$@"\n')
+    (tools / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "not-a-repository"))
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=/bin/false'")
+    monkeypatch.setenv("GIT_EXEC_PATH", str(tools))
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(tmp_path / "hostile-lib"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "hostile-xdg"))
+    return log
+
+
+def test_isolated_lookup_before_the_view_inherits_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _registered_slot(tmp_path)
+    config = cli._load_config(str(root), "node-a")
+    ordinary = imagecmd.slot_view(config, "slot-b", "agent")
+    log = _hostile_git_environment(tmp_path, monkeypatch)
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    real_run = subprocess.run
+
+    def recording(command: list[str], *args: object, **kwargs: object) -> object:
+        calls.append((list(command), dict(kwargs.get("env") or {})))  # type: ignore[call-overload]
+        return real_run(command, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(subprocess, "run", recording)
+
+    isolated = imagecmd.slot_view(config, "slot-b", "agent", isolated_git=True)
+
+    assert isolated.git_directories == ordinary.git_directories != ()
+    assert not log.exists()  # the `git` on PATH was never run
+    assert calls and all(command[0] == "/usr/bin/git" for command, _env in calls)
+    assert all(env == imagecmd.ISOLATED_GIT_ENVIRONMENT for _command, env in calls)
+
+    # The ordinary lookup is unchanged: it still runs `git` from PATH.
+    monkeypatch.setattr(subprocess, "run", real_run)
+    imagecmd.slot_view(config, "slot-b", "agent")
+    assert log.exists() and "rev-parse" in log.read_text()
+
+
+def test_isolated_lookup_refuses_an_unverified_git_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _registered_slot(tmp_path)
+    config = cli._load_config(str(root), "node-a")
+    mine = tmp_path / "git"
+    mine.write_text("#!/bin/sh\nexit 0\n")
+    mine.chmod(0o755)
+    for candidate in (str(mine), str(tmp_path / "absent-git")):
+        monkeypatch.setattr(imagecmd, "ISOLATED_GIT_EXECUTABLE", candidate)
+        with pytest.raises(cli.Refusal, match="git-config-policy isolated"):
+            imagecmd.slot_view(config, "slot-b", "agent", isolated_git=True)

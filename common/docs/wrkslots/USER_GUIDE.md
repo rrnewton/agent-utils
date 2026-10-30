@@ -2248,6 +2248,22 @@ entry as `--expect-writable JSON`, and the entry compares its own complete writa
 before writing any private state and again from the view it is about to build, and refuses on any
 difference instead of entering the box.
 
+`--git-config-policy isolated` (with `--in-scope` only) hides the default Git configuration
+locations from COMMAND: `$HOME/.gitconfig` and `$HOME/.config/git` under `$HOME` and every other
+mount path that exposes it, and `/etc/gitconfig`. The list is fixed; the option takes no path. An
+existing file reads as an empty read-only `/dev/null`, an existing directory as an empty read-only
+directory, and a missing path is left missing: no mount covers it, so the box cannot stop a host
+process from creating it while COMMAND runs. A symbolic link at a location, or a parent directory
+reached through one, is refused rather than followed, and so is any failure. After the view is
+built and before COMMAND starts, the helper checks every location again and refuses unless each
+shows exactly that outcome. The slot's Git lookup that runs before the view also changes: it runs
+`/usr/bin/git` (refused unless root owns it and only root can write it) with a fixed environment
+instead of `git` from `PATH` with yours. The policy covers the default locations only; a
+`GIT_CONFIG_*` or `XDG_CONFIG_HOME` variable in COMMAND's own environment, and each repository's
+own configuration, are not changed. `--print` reports the masks as one `masks` object (the complete
+ordered list, the policy and its locations), separately from `writable`; pass it to the real entry
+as `--expect-masks JSON`, which is compared whole, at the same two points as `--expect-writable`.
+
 ### Limits of the box
 
 The box stops accidents, not a process that sets out to leave it:
