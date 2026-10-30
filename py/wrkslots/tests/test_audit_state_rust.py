@@ -166,11 +166,13 @@ def _python(
     *,
     work_limit: int = 100000,
     state_name: str = "census-state.json",
+    wall_seconds: float = 60.0,
 ) -> dict[str, object]:
     args = argparse.Namespace(
         project_root=str(root), machine=None, format="json", gate=False,
         cache_census_state=str(tmp_path / state_name),
-        cache_work_limit=work_limit, cache_wall_seconds=60.0, wait_lock=0.0,
+        cache_work_limit=work_limit, cache_wall_seconds=wall_seconds,
+        wait_lock=0.0,
     )
     stream = io.StringIO()
     with contextlib.redirect_stdout(stream):
@@ -184,13 +186,17 @@ def _rust(
     *,
     census_state: Path | None = None,
     work_limit: int | None = None,
+    wall_seconds: float = 60.0,
 ) -> subprocess.CompletedProcess[str]:
     command = ["cargo", "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
                "-p", "wrkslotsd", "--", "parse-audit", "--root", str(root)]
     if census_state is not None:
         command += ["--cache-census-state", str(census_state)]
     if work_limit is not None:
-        command += ["--cache-work-limit", str(work_limit), "--cache-wall-seconds", "60"]
+        command += [
+            "--cache-work-limit", str(work_limit),
+            "--cache-wall-seconds", str(wall_seconds),
+        ]
     return subprocess.run(
         command,
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
@@ -493,6 +499,126 @@ def test_audit_census_partial_then_complete_matches_python(tmp_path: Path) -> No
     assert isinstance(rust_bytes, int) and isinstance(python_bytes, int)
     assert rust_bytes > 30 * 1024
     assert abs(rust_bytes - python_bytes) <= 4096
+
+
+def _state_without_mac(path: Path) -> dict[str, object]:
+    payload = json.loads(path.read_text())
+    assert isinstance(payload, dict)
+    mac = payload.pop("hmac_sha256", None)
+    assert isinstance(mac, str) and len(mac) == 64
+    return payload
+
+
+def test_audit_census_resume_state_matches_python(tmp_path: Path) -> None:
+    root = _cache_fixture(tmp_path)
+    shared = tmp_path / "shared-census.json"
+    python_first = _python(root, tmp_path, work_limit=10, state_name=shared.name)
+    python_state = _state_without_mac(shared)
+    shared.unlink()
+    rust_first = _rust(root, census_state=shared, work_limit=10)
+    assert rust_first.returncode == 0, rust_first.stderr
+    assert _scrub(json.loads(rust_first.stdout)) == _scrub(python_first)
+    assert _rows(python_first)[0]["cache_status"] == "partial"
+    # The persisted progress is byte-identical apart from the MAC:
+    # same root key, phase, cursors, and counters.
+    assert _state_without_mac(shared) == python_state
+    roots = python_state["roots"]
+    assert isinstance(roots, dict) and len(roots) == 1
+    record = next(iter(roots.values()))
+    assert isinstance(record, dict)
+    assert record["phase"] == "measure"
+    assert isinstance(record["entries_visited"], int)
+    assert record["entries_visited"] > 0
+
+    # A second small-limit run resumes instead of restarting:
+    # progress accumulates beyond the first run's counters.
+    python_second = _python(root, tmp_path, work_limit=10, state_name=shared.name)
+    assert _rows(python_second)[0]["cache_status"] == "partial"
+    rust_second = _rust(root, census_state=shared, work_limit=10)
+    assert rust_second.returncode == 0, rust_second.stderr
+    assert _scrub(json.loads(rust_second.stdout)) == _scrub(python_second)
+    state_after = _state_without_mac(shared)
+    roots_after = state_after["roots"]
+    assert isinstance(roots_after, dict)
+    record_after = next(iter(roots_after.values()))
+    assert isinstance(record_after, dict)
+    total_after = int(record_after["entries_visited"]) + int(
+        record_after["entries_verified"]
+    )
+    total_before = int(record["entries_visited"]) + int(record["entries_verified"])
+    assert total_after > total_before
+
+    # Either edition can finish what the other started.
+    rust_third = _rust(root, census_state=shared)
+    assert rust_third.returncode == 0, rust_third.stderr
+    assert _rows(json.loads(rust_third.stdout))[0]["cache_status"] == "complete"
+    python_third = _python(root, tmp_path, state_name=shared.name)
+    assert _scrub(json.loads(rust_third.stdout)) == _scrub(python_third)
+    assert _rows(python_third)[0]["cache_status"] == "complete"
+
+
+def test_audit_census_finalize_reserve_matches_python(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    config = root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "cache_globs:\n  - cache\n")
+    cache = root / "worktrees" / "slot-a" / "repo" / "cache"
+    cache.mkdir(parents=True)
+    files = 20
+    for index in range(files):
+        (cache / f"f{index}.bin").write_bytes(b"x" * 64)
+    # Measure plus verify of the flat cache costs exactly
+    # 2 * (files + dot entries); stage finalize with nothing left.
+    staged_limit = 2 * (files + 2)
+    python_first = _python(root, tmp_path, work_limit=staged_limit)
+    rust_first = _rust(
+        root, census_state=tmp_path / "rust-census.json", work_limit=staged_limit
+    )
+    assert rust_first.returncode == 0, rust_first.stderr
+    assert _scrub(json.loads(rust_first.stdout)) == _scrub(python_first)
+    assert _rows(python_first)[0]["cache_status"] == "partial"
+
+    python_second = _python(root, tmp_path, work_limit=1)
+    rust_second = _rust(root, census_state=tmp_path / "rust-census.json", work_limit=1)
+    assert rust_second.returncode == 0, rust_second.stderr
+    assert _scrub(json.loads(rust_second.stdout)) == _scrub(python_second)
+    row = _rows(python_second)[0]
+    assert row["cache_status"] == "error"
+    assert "fresh cache finalization requires" in str(row["cache_error"])
+
+
+def test_audit_census_corrupt_state_is_ignored(tmp_path: Path) -> None:
+    root = _cache_fixture(tmp_path)
+    python_first = _python(root, tmp_path, work_limit=10)
+    assert _rows(python_first)[0]["cache_status"] == "partial"
+    state = tmp_path / "rust-census.json"
+    rust_first = _rust(root, census_state=state, work_limit=10)
+    assert rust_first.returncode == 0, rust_first.stderr
+    assert _rows(json.loads(rust_first.stdout))[0]["cache_status"] == "partial"
+    # Corrupting either edition's state makes the next run start
+    # fresh: partial again under the same small limit, never an
+    # audit failure.
+    state.write_bytes(b"{not json")
+    rust_second = _rust(root, census_state=state, work_limit=10)
+    assert rust_second.returncode == 0, rust_second.stderr
+    assert _rows(json.loads(rust_second.stdout))[0]["cache_status"] == "partial"
+    python_state = tmp_path / "census-state.json"
+    python_state.write_bytes(b"{not json")
+    python_second = _python(root, tmp_path, work_limit=10)
+    assert _rows(python_second)[0]["cache_status"] == "partial"
+
+
+def test_audit_census_wall_timeout_matches_python(tmp_path: Path) -> None:
+    root = _cache_fixture(tmp_path)
+    python_payload = _python(root, tmp_path, wall_seconds=0.000001)
+    rust_result = _rust(
+        root, census_state=tmp_path / "rust-census.json", work_limit=100000,
+        wall_seconds=0.000001,
+    )
+    assert rust_result.returncode == 0, rust_result.stderr
+    assert _scrub(json.loads(rust_result.stdout)) == _scrub(python_payload)
+    row = _rows(python_payload)[0]
+    assert row["cache_status"] == "error"
+    assert "fixed wall allowance" in str(row["cache_error"])
 
 
 def test_audit_census_flat_cache_small_limit_matches_python(tmp_path: Path) -> None:

@@ -309,7 +309,55 @@ pub struct CensusRequest {
     pub wall_seconds: f64,
 }
 
-type CensusSubject = (Vec<(PathBuf, PathBuf, u64)>, Option<String>, bool);
+/// One planned cache directory, mirroring the Python
+/// `CacheDirectory`: the directory, its checkout, the checkout
+/// identity bound at planning, and how a nested `.git` inside it
+/// is treated (`validation_complete` judges nested repositories
+/// as completed validation removal judges them).
+#[derive(Clone)]
+struct CacheRoot {
+    path: PathBuf,
+    checkout_root: PathBuf,
+    checkout_dev: u64,
+    checkout_ino: u64,
+    checkout_mount: i64,
+    validation_complete: bool,
+}
+
+/// One census subject, keyed as the Python audit keys it:
+/// `record:{machine}:{slot}:{generation}` or
+/// `unregistered:{slot_type}:{slot}`.
+struct CensusSubject {
+    key: String,
+    caches: Vec<CacheRoot>,
+    error: Option<String>,
+}
+
+/// A planned cache root for one checkout candidate, binding the
+/// checkout identity the census later re-checks.
+fn planned_cache_root(
+    path: PathBuf,
+    checkout_root: &Path,
+    validation_complete: bool,
+    mounts: &PlanMounts,
+) -> CacheRoot {
+    use std::os::unix::fs::MetadataExt as _;
+    let mounts_vec: Vec<(i64, PathBuf)> = match mounts {
+        Ok(list) => list.clone(),
+        Err(_) => Vec::new(),
+    };
+    let (dev, ino) = std::fs::metadata(checkout_root)
+        .map(|meta| (meta.dev(), meta.ino()))
+        .unwrap_or((0, 0));
+    CacheRoot {
+        path,
+        checkout_root: checkout_root.to_path_buf(),
+        checkout_dev: dev,
+        checkout_ino: ino,
+        checkout_mount: mount_id_of(checkout_root, &mounts_vec).unwrap_or(0),
+        validation_complete,
+    }
+}
 
 #[derive(Clone)]
 struct CacheMeasurement {
@@ -770,13 +818,13 @@ fn plan_one_checkout(
 
 /// Overlapping globs must not count one directory twice: a
 /// candidate inside an already-selected candidate is dropped.
-fn dedup_cache_roots(mut roots: Vec<(PathBuf, PathBuf, u64)>) -> Vec<(PathBuf, PathBuf, u64)> {
-    roots.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut deduped: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+fn dedup_cache_roots(mut roots: Vec<CacheRoot>) -> Vec<CacheRoot> {
+    roots.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut deduped: Vec<CacheRoot> = Vec::new();
     for root in roots {
         if deduped
             .iter()
-            .any(|(selected, _, _)| root.0 != *selected && root.0.starts_with(selected))
+            .any(|selected| root.path != selected.path && root.path.starts_with(&selected.path))
         {
             continue;
         }
@@ -786,21 +834,21 @@ fn dedup_cache_roots(mut roots: Vec<(PathBuf, PathBuf, u64)>) -> Vec<(PathBuf, P
 }
 
 /// Every cache directory the configured globs name inside one
-/// record's checkouts: (root, checkout, checkout device).
+/// record's checkouts.
 fn cache_roots(
     cfg: &Cfg,
     config: &Value,
     record: &Value,
     budget: &mut PlanBudget,
     mounts: &PlanMounts,
-) -> (Vec<(PathBuf, PathBuf, u64)>, Option<String>) {
-    use std::os::unix::fs::MetadataExt as _;
+) -> (Vec<CacheRoot>, Option<String>) {
+    let validation_complete = record.get("slot_type").and_then(Value::as_str) == Some("validate");
     let checkouts = record
         .get("checkouts")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut roots: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    let mut roots: Vec<CacheRoot> = Vec::new();
     for checkout in &checkouts {
         let name = checkout
             .get("name")
@@ -834,11 +882,13 @@ fn cache_roots(
         if let Some(error) = error {
             return (Vec::new(), Some(error));
         }
-        let checkout_device = std::fs::metadata(&checkout_path)
-            .map(|meta| meta.dev())
-            .unwrap_or(0);
         for candidate in candidates {
-            roots.push((candidate, checkout_path.clone(), checkout_device));
+            roots.push(planned_cache_root(
+                candidate,
+                &checkout_path,
+                validation_complete,
+                mounts,
+            ));
         }
     }
     (dedup_cache_roots(roots), None)
@@ -926,17 +976,22 @@ fn unregistered_cache_roots(cfg: &Cfg, slot: &str) -> Result<Vec<PathBuf>> {
 fn unregistered_cache_subject(
     cfg: &Cfg,
     config: &Value,
+    subject_key: &str,
     slot: &str,
     budget: &mut PlanBudget,
     mounts: &PlanMounts,
 ) -> CensusSubject {
-    use std::os::unix::fs::MetadataExt as _;
+    let subject = |caches: Vec<CacheRoot>, error: Option<String>| CensusSubject {
+        key: subject_key.to_string(),
+        caches,
+        error,
+    };
     if let Err(error) = budget.check(0.0) {
-        return (Vec::new(), Some(error), false);
+        return subject(Vec::new(), Some(error));
     }
     let roots = match unregistered_cache_roots(cfg, slot) {
         Ok(roots) => roots,
-        Err(error) => return (Vec::new(), Some(error), false),
+        Err(error) => return subject(Vec::new(), Some(error)),
     };
     let global_globs: Vec<String> = config
         .get("cache_globs")
@@ -953,29 +1008,27 @@ fn unregistered_cache_subject(
         .and_then(Value::as_array)
         .is_some_and(|groups| !groups.is_empty());
     if repo_globs_configured && global_globs.is_empty() {
-        return (
+        return subject(
             Vec::new(),
             Some(format!(
                 "unregistered slot {slot} has no trusted repository-name mapping; \
                  import it or configure a global cache_globs policy before cleanup"
             )),
-            false,
         );
     }
-    let mut planned: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    let mut planned: Vec<CacheRoot> = Vec::new();
     for (index, root) in roots.iter().enumerate() {
         let label = format!("unregistered-{}", index + 1);
         let (candidates, error) =
             plan_one_checkout(root, &global_globs, &label, None, budget, mounts);
         if let Some(error) = error {
-            return (Vec::new(), Some(error), false);
+            return subject(Vec::new(), Some(error));
         }
-        let device = std::fs::metadata(root).map(|meta| meta.dev()).unwrap_or(0);
         for candidate in candidates {
-            planned.push((candidate, root.clone(), device));
+            planned.push(planned_cache_root(candidate, root, false, mounts));
         }
     }
-    (dedup_cache_roots(planned), None, false)
+    subject(dedup_cache_roots(planned), None)
 }
 
 /// One journaled checkout that exists and may be planned.
@@ -1144,15 +1197,20 @@ fn journal_cache_checkouts(cfg: &Cfg, journal: &ValidatedJournal) -> Result<Vec<
 fn journal_cache_subject(
     cfg: &Cfg,
     config: &Value,
+    subject_key: &str,
     checkouts: &[JournalCheckout],
     budget: &mut PlanBudget,
     mounts: &PlanMounts,
 ) -> CensusSubject {
-    use std::os::unix::fs::MetadataExt as _;
+    let subject = |caches: Vec<CacheRoot>, error: Option<String>| CensusSubject {
+        key: subject_key.to_string(),
+        caches,
+        error,
+    };
     if let Err(error) = budget.check(0.0) {
-        return (Vec::new(), Some(error), false);
+        return subject(Vec::new(), Some(error));
     }
-    let mut roots: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    let mut roots: Vec<CacheRoot> = Vec::new();
     for checkout in checkouts {
         let globs = cache_globs_for(config, &checkout.name);
         let (candidates, error) = plan_one_checkout(
@@ -1164,17 +1222,19 @@ fn journal_cache_subject(
             mounts,
         );
         if let Some(error) = error {
-            return (Vec::new(), Some(error), false);
+            return subject(Vec::new(), Some(error));
         }
-        let device = std::fs::metadata(&checkout.destination)
-            .map(|meta| meta.dev())
-            .unwrap_or(0);
         for candidate in candidates {
-            roots.push((candidate, checkout.destination.clone(), device));
+            roots.push(planned_cache_root(
+                candidate,
+                &checkout.destination,
+                false,
+                mounts,
+            ));
         }
     }
     let _ = cfg;
-    (dedup_cache_roots(roots), None, false)
+    subject(dedup_cache_roots(roots), None)
 }
 
 /// Mount identity of one path from /proc/self/mountinfo: the id of
@@ -1207,132 +1267,6 @@ fn census_mounts() -> Result<Vec<(i64, PathBuf)>> {
         mounts.push((id, PathBuf::from(audit_unescape_mount(fields[4]))));
     }
     Ok(mounts)
-}
-
-type CacheIdentity = (u64, u64, i64, i64);
-
-/// One bounded walk over a cache root: allocated bytes plus the
-/// identity of every directory and entry seen. Work is debited
-/// per directory opened and per entry from the shared invocation
-/// budget; budget exhaustion leaves the root partial, while wall
-/// expiry is the oracle's traversal-timeout error.
-fn walk_cache_root(
-    root: &Path,
-    device: u64,
-    mounts: &[(i64, PathBuf)],
-    budget: &mut i64,
-    deadline: std::time::Instant,
-    validation_complete: bool,
-) -> std::result::Result<(i64, BTreeMap<PathBuf, CacheIdentity>), CacheMeasurement> {
-    use std::os::unix::fs::MetadataExt as _;
-    let timeout = || {
-        CacheMeasurement::error(
-            "cache census traversal exhausted the fixed wall allowance".to_string(),
-        )
-    };
-    let root_mount = mount_id_of(root, mounts);
-    let mut total: i64 = 0;
-    let mut seen: BTreeMap<PathBuf, CacheIdentity> = BTreeMap::new();
-    let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        if std::time::Instant::now() >= deadline {
-            return Err(timeout());
-        }
-        if *budget <= 0 {
-            return Err(CacheMeasurement::partial());
-        }
-        *budget -= 1;
-        let meta = std::fs::symlink_metadata(&directory).map_err(|error| {
-            CacheMeasurement::error(format!(
-                "cannot inspect cache entry {}: {error}",
-                directory.display()
-            ))
-        })?;
-        if meta.dev() != device {
-            return Err(CacheMeasurement::error(format!(
-                "cache path crossed onto another filesystem: {}",
-                directory.display()
-            )));
-        }
-        if mount_id_of(&directory, mounts) != root_mount {
-            return Err(CacheMeasurement::error(format!(
-                "cache path crossed a mount point: {}",
-                directory.display()
-            )));
-        }
-        total += (meta.blocks() * 512) as i64;
-        seen.insert(
-            directory.clone(),
-            (
-                meta.dev(),
-                meta.ino(),
-                meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
-                meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
-            ),
-        );
-        let entries = std::fs::read_dir(&directory).map_err(|error| {
-            CacheMeasurement::error(format!(
-                "cannot inspect cache entry {}: {error}",
-                directory.display()
-            ))
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                CacheMeasurement::error(format!("cannot inspect cache entry: {error}"))
-            })?;
-            if std::time::Instant::now() >= deadline {
-                return Err(timeout());
-            }
-            if *budget <= 0 {
-                return Err(CacheMeasurement::partial());
-            }
-            *budget -= 1;
-            let path = entry.path();
-            if entry.file_name() == ".git" && !validation_complete {
-                return Err(CacheMeasurement::error(format!(
-                    "cache directory contains nested Git metadata: {}",
-                    path.display()
-                )));
-            }
-            let child = match std::fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(CacheMeasurement::error(format!(
-                        "cannot inspect cache entry {}: {error}",
-                        path.display()
-                    )))
-                }
-            };
-            if child.dev() != device {
-                return Err(CacheMeasurement::error(format!(
-                    "cache path crossed onto another filesystem: {}",
-                    path.display()
-                )));
-            }
-            seen.insert(
-                path.clone(),
-                (
-                    child.dev(),
-                    child.ino(),
-                    child.mtime() * 1_000_000_000 + child.mtime_nsec(),
-                    child.ctime() * 1_000_000_000 + child.ctime_nsec(),
-                ),
-            );
-            let kind = entry.file_type().map_err(|error| {
-                CacheMeasurement::error(format!(
-                    "cannot inspect cache entry {}: {error}",
-                    path.display()
-                ))
-            })?;
-            if kind.is_dir() && !kind.is_symlink() {
-                pending.push(path);
-            } else {
-                total += (child.blocks() * 512) as i64;
-            }
-        }
-    }
-    Ok((total, seen))
 }
 
 /// The nested-Git judgment's allowance: 900 seconds per cache
@@ -1671,18 +1605,23 @@ enum NestedJudgment {
 }
 
 /// Judge every nested repository a completed validation cache
-/// contains, in the oracle's order; the first refusal wins.
+/// contains, in the oracle's order; the first refusal wins. The
+/// candidates are the root's verified relative paths, minus the
+/// root itself, in path-part order.
 fn judge_audited_nested(
     root: &Path,
-    seen: &BTreeMap<PathBuf, CacheIdentity>,
+    relatives: &[String],
     deadline: std::time::Instant,
 ) -> NestedJudgment {
-    let mut dotgits: Vec<PathBuf> = seen
-        .keys()
-        .filter(|path| {
-            path.as_path() != root && path.file_name().is_some_and(|name| name == ".git")
+    let mut dotgits: Vec<PathBuf> = relatives
+        .iter()
+        .filter(|relative| {
+            relative.as_str() != "."
+                && Path::new(relative)
+                    .file_name()
+                    .is_some_and(|name| name == ".git")
         })
-        .cloned()
+        .map(|relative| root.join(relative))
         .collect();
     dotgits.sort_by(|a, b| {
         let a_parts: Vec<String> = a
@@ -1721,88 +1660,6 @@ fn judge_audited_nested(
         }
     }
     NestedJudgment::Clean
-}
-
-/// One cache root's bounded census: measure, re-verify the same
-/// identities and bytes, then re-stat every recorded identity
-/// before a total may publish as complete.
-fn traverse_cache_root(
-    root: &Path,
-    device: u64,
-    mounts: &[(i64, PathBuf)],
-    budget: &mut i64,
-    deadline: std::time::Instant,
-    validation_complete: bool,
-) -> CacheMeasurement {
-    use std::os::unix::fs::MetadataExt as _;
-    let (measured, seen) =
-        match walk_cache_root(root, device, mounts, budget, deadline, validation_complete) {
-            Ok(result) => result,
-            Err(measurement) => return measurement,
-        };
-    let (verified, seen_again) =
-        match walk_cache_root(root, device, mounts, budget, deadline, validation_complete) {
-            Ok(result) => result,
-            Err(measurement) => return measurement,
-        };
-    if verified != measured || seen_again != seen {
-        let changed = seen
-            .iter()
-            .find(|(path, identity)| seen_again.get(*path) != Some(*identity))
-            .map(|(path, _)| path.clone())
-            .unwrap_or_else(|| root.to_path_buf());
-        return CacheMeasurement::error(format!(
-            "cache census directory changed before final publication: {}",
-            changed.display()
-        ));
-    }
-    for (path, identity) in &seen {
-        if std::time::Instant::now() >= deadline {
-            return CacheMeasurement::error(
-                "cache census traversal exhausted the fixed wall allowance".to_string(),
-            );
-        }
-        if *budget <= 0 {
-            return CacheMeasurement::partial();
-        }
-        *budget -= 1;
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) => {
-                let actual = (
-                    meta.dev(),
-                    meta.ino(),
-                    meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
-                    meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
-                );
-                if actual != *identity {
-                    return CacheMeasurement::error(format!(
-                        "cache census directory changed before final publication: {}",
-                        path.display()
-                    ));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return CacheMeasurement::error(format!(
-                    "cache census directory changed before final publication: {}",
-                    path.display()
-                ));
-            }
-            Err(error) => {
-                return CacheMeasurement::error(format!(
-                    "cannot inspect cache entry {}: {error}",
-                    path.display()
-                ))
-            }
-        }
-    }
-    if validation_complete {
-        match judge_audited_nested(root, &seen, deadline) {
-            NestedJudgment::Clean => {}
-            NestedJudgment::Refused(error) => return CacheMeasurement::error(error),
-            NestedJudgment::TimedOut => return CacheMeasurement::partial(),
-        }
-    }
-    CacheMeasurement::complete(measured)
 }
 
 /// Whether `path` equals or lies inside `root` (lexically).
@@ -2043,12 +1900,9 @@ fn establish_census_key(state_path: &Path) -> Result<Vec<u8>> {
     read_key(&key_path)
 }
 
-/// Run the bounded census over every registered subject. State
-/// establishment follows the oracle (an unavailable store makes
-/// accounting unavailable, never invented); traversal restarts
-/// each invocation rather than resuming persisted progress, so
-/// measurements for stable caches match while resume-state reuse
-/// stays with the Python edition.
+/// The census state envelope's HMAC-SHA256 over the canonical
+/// (sorted, compact, ASCII) encoding of the payload without the
+/// `hmac_sha256` member: the Python `_audit_cache_state_mac`.
 fn cache_state_mac(key: &[u8], payload: &Value) -> String {
     use sha2::Digest as _;
     let mut block = [0u8; 64];
@@ -2057,7 +1911,7 @@ fn cache_state_mac(key: &[u8], payload: &Value) -> String {
     } else {
         block[..key.len()].copy_from_slice(key);
     }
-    let text = serde_json::to_string(payload).unwrap_or_default();
+    let text = crate::canonical::canonical_json(payload).unwrap_or_default();
     let inner: Vec<u8> = block
         .iter()
         .map(|byte| byte ^ 0x36)
@@ -2075,23 +1929,89 @@ fn cache_state_mac(key: &[u8], payload: &Value) -> String {
         .collect()
 }
 
-/// Persist the census state envelope (fresh roots; resuming
-/// persisted progress stays with the Python edition) and report
-/// failure exactly as the oracle's census does.
-fn write_census_state(state_path: &Path, key: &[u8], registry_revision: &str) -> Result<()> {
+const CENSUS_STATE_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Read and authenticate persisted census state, exactly as
+/// `_read_audit_cache_state`: anything malformed is simply
+/// absent, never an audit failure.
+fn read_census_state(state_path: &Path, key: &[u8], registry_revision: &str) -> Option<Value> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = options.open(state_path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > CENSUS_STATE_LIMIT as u64 {
+        return None;
+    }
+    use std::io::Read as _;
+    let mut contents = Vec::new();
+    file.take((CENSUS_STATE_LIMIT + 1) as u64)
+        .read_to_end(&mut contents)
+        .ok()?;
+    if contents.len() > CENSUS_STATE_LIMIT {
+        return None;
+    }
+    let decoded: Value = serde_json::from_slice(&contents).ok()?;
+    let mut envelope = decoded.as_object()?.clone();
+    let mac = envelope.remove("hmac_sha256")?;
+    let mac = mac.as_str()?;
+    if mac.len() != 64
+        || !mac
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let keys: BTreeSet<&str> = envelope.keys().map(String::as_str).collect();
+    if keys != BTreeSet::from(["schema", "registry_revision", "roots", "next_subject"]) {
+        return None;
+    }
+    if envelope.get("schema").and_then(Value::as_str) != Some("wrkslots-audit-cache-census/v6")
+        || envelope.get("registry_revision").and_then(Value::as_str) != Some(registry_revision)
+        || !envelope.get("roots").is_some_and(Value::is_object)
+        || !(envelope
+            .get("next_subject")
+            .is_some_and(|value| value.is_null() || value.is_string()))
+    {
+        return None;
+    }
+    if cache_state_mac(key, &Value::Object(envelope.clone())) != mac {
+        return None;
+    }
+    Some(Value::Object(envelope))
+}
+
+/// Persist the census state envelope and report failure exactly
+/// as the oracle's census does.
+fn write_census_state(state_path: &Path, key: &[u8], payload: &Value) -> Result<()> {
     use std::io::Write as _;
-    let stored = json!({
-        "schema": "wrkslots-audit-cache-census/v6",
-        "registry_revision": registry_revision,
-        "roots": {},
-        "next_subject": Value::Null,
-    });
-    let mut envelope = stored.clone();
-    envelope.as_object_mut().expect("state object").insert(
+    fn depth(value: &Value) -> usize {
+        match value {
+            Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+            Value::Object(items) => 1 + items.values().map(depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    if depth(payload) > 32 {
+        return Err("audit cache census state exceeds its nesting bound".to_string());
+    }
+    let mut envelope = payload
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "audit cache census state cannot be safely encoded".to_string())?;
+    envelope.insert(
         "hmac_sha256".to_string(),
-        json!(cache_state_mac(key, &stored)),
+        Value::String(cache_state_mac(key, payload)),
     );
-    let encoded = serde_json::to_string(&envelope).unwrap_or_default();
+    let encoded = crate::canonical::canonical_json(&Value::Object(envelope))
+        .map_err(|_| "audit cache census state cannot be safely encoded".to_string())?;
+    if encoded.len() > CENSUS_STATE_LIMIT {
+        return Err(format!(
+            "audit cache census state exceeds its {CENSUS_STATE_LIMIT}-byte safety bound"
+        ));
+    }
     let parent = state_path.parent().unwrap_or(Path::new("/"));
     let name = state_path
         .file_name()
@@ -2102,8 +2022,8 @@ fn write_census_state(state_path: &Path, key: &[u8], registry_revision: &str) ->
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
+            .map(|duration| format!("{:032x}", duration.as_nanos()))
+            .unwrap_or_default()
     ));
     let write = (|| -> std::io::Result<()> {
         let mut options = std::fs::OpenOptions::new();
@@ -2112,6 +2032,7 @@ fn write_census_state(state_path: &Path, key: &[u8], registry_revision: &str) ->
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
+            options.custom_flags(libc::O_CLOEXEC);
         }
         let mut file = options.open(&temporary)?;
         file.write_all(encoded.as_bytes())?;
@@ -2126,9 +2047,1164 @@ fn write_census_state(state_path: &Path, key: &[u8], registry_revision: &str) ->
     if write.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-    write.map_err(|error| format!("cannot persist audit cache census: {error}"))
+    write.map_err(|error| error.to_string())
 }
 
+/// The mount identity of an open directory descriptor, from
+/// /proc/self/fdinfo (`_fd_mount_id`).
+fn fd_mount_id(fd: std::os::unix::io::RawFd) -> Option<i64> {
+    let contents = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
+    for line in contents.lines() {
+        let (name, raw) = line.split_once(':')?;
+        if name == "mnt_id" {
+            return raw.trim().parse::<i64>().ok().filter(|value| *value > 0);
+        }
+    }
+    None
+}
+
+/// Open one directory component without following a symlink
+/// (`O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW`).
+fn open_dir_component(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{openat, OFlags};
+    let fd = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// (device, inode, mount id, mtime ns, ctime ns) of an open
+/// directory.
+fn dir_file_identity(file: &std::fs::File) -> Result<(i64, i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    let meta = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect cache directory: {error}"))?;
+    let mount = fd_mount_id(file.as_raw_fd())
+        .ok_or_else(|| "cannot determine mount identity for cache directory".to_string())?;
+    Ok((
+        meta.dev() as i64,
+        meta.ino() as i64,
+        mount,
+        meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+        meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+    ))
+}
+
+/// Open an absolute directory through symlink-free components.
+fn open_absolute_dir(path: &Path, label: &str) -> Result<std::fs::File> {
+    use rustix::fs::{openat, OFlags, CWD};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let fd = openat(CWD, "/", flags, rustix::fs::Mode::empty())
+        .map_err(|error| format!("cannot open {label}: {error}"))?;
+    let mut current = std::fs::File::from(fd);
+    for part in path.components() {
+        if let std::path::Component::Normal(name) = part {
+            current = open_dir_component(&current, name)
+                .map_err(|error| format!("cannot open {label}: {error}"))?;
+        }
+    }
+    Ok(current)
+}
+
+/// A census failure: refusal text, or the wall allowance expired.
+enum CensusFault {
+    Refuse(String),
+    Timeout,
+}
+
+fn check_deadline(deadline: std::time::Instant) -> std::result::Result<(), CensusFault> {
+    if std::time::Instant::now() >= deadline {
+        return Err(CensusFault::Timeout);
+    }
+    Ok(())
+}
+
+/// The shared census work budget, debited where work occurs.
+struct WorkBudget {
+    limit: i64,
+    consumed: i64,
+}
+
+impl WorkBudget {
+    fn remaining(&self) -> i64 {
+        self.limit - self.consumed
+    }
+    fn debit(&mut self) -> std::result::Result<(), CensusFault> {
+        if self.remaining() <= 0 {
+            return Err(CensusFault::Refuse(
+                "cache census attempted work after exhausting its budget".to_string(),
+            ));
+        }
+        self.consumed += 1;
+        Ok(())
+    }
+}
+
+/// Open a cache-root-relative directory through the checkout and
+/// cache-root identities, as `_open_audit_cache_relative` opens
+/// it, and return its descriptor, metadata, and mount identity.
+fn open_cache_relative(
+    cache: &CacheRoot,
+    root_identity: &[i64; 5],
+    relative: &str,
+    deadline: std::time::Instant,
+) -> std::result::Result<(std::fs::File, std::fs::Metadata, i64), CensusFault> {
+    use std::os::unix::fs::MetadataExt as _;
+    let relative_path = Path::new(relative);
+    let cache_parts: Vec<std::ffi::OsString> = match cache.path.strip_prefix(&cache.checkout_root) {
+        Ok(rest) => rest
+            .components()
+            .map(|part| part.as_os_str().to_os_string())
+            .collect(),
+        Err(_) => {
+            return Err(CensusFault::Refuse(format!(
+                "cache census root escapes its checkout: {}",
+                cache.path.display()
+            )))
+        }
+    };
+    if cache_parts.is_empty() {
+        return Err(CensusFault::Refuse(
+            "cache census root must be below its checkout".to_string(),
+        ));
+    }
+    let mut current =
+        open_absolute_dir(&cache.checkout_root, "cache census checkout").map_err(|error| {
+            CensusFault::Refuse(format!(
+                "cannot bind cache census checkout {}: {error}",
+                cache.checkout_root.display()
+            ))
+        })?;
+    check_deadline(deadline)?;
+    let checkout = dir_file_identity(&current).map_err(CensusFault::Refuse)?;
+    if (checkout.0, checkout.1, checkout.2)
+        != (
+            cache.checkout_dev as i64,
+            cache.checkout_ino as i64,
+            cache.checkout_mount,
+        )
+    {
+        return Err(CensusFault::Refuse(format!(
+            "cache census checkout identity changed: {}",
+            cache.checkout_root.display()
+        )));
+    }
+    let mut current_path = cache.checkout_root.clone();
+    let mut meta = current
+        .metadata()
+        .map_err(|error| CensusFault::Refuse(format!("cannot inspect cache entry: {error}")))?;
+    let mut mount = checkout.2;
+    let mut at_root = false;
+    let parts: Vec<std::ffi::OsString> = cache_parts
+        .iter()
+        .cloned()
+        .chain(
+            relative_path
+                .components()
+                .map(|part| part.as_os_str().to_os_string()),
+        )
+        .collect();
+    for (index, part) in parts.iter().enumerate() {
+        current_path.push(part);
+        check_deadline(deadline)?;
+        let child = open_dir_component(&current, part).map_err(|error| {
+            CensusFault::Refuse(if at_root {
+                format!(
+                    "cannot inspect cache entry {}: {error}",
+                    current_path.display()
+                )
+            } else {
+                error.to_string()
+            })
+        })?;
+        let child_meta = child
+            .metadata()
+            .map_err(|error| CensusFault::Refuse(error.to_string()))?;
+        let child_mount = fd_mount_id(child.as_raw_fd())
+            .ok_or_else(|| CensusFault::Refuse("cannot determine mount identity".to_string()))?;
+        if child_meta.dev() as i64 != cache.checkout_dev as i64
+            || child_mount != cache.checkout_mount
+        {
+            return Err(CensusFault::Refuse(format!(
+                "cache census crossed a filesystem boundary: {}",
+                current_path.display()
+            )));
+        }
+        current = child;
+        meta = child_meta;
+        mount = child_mount;
+        if index + 1 == cache_parts.len() {
+            let actual = (
+                meta.dev() as i64,
+                meta.ino() as i64,
+                mount,
+                meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+            );
+            if [actual.0, actual.1, actual.2, actual.3, actual.4] != *root_identity {
+                return Err(CensusFault::Refuse(format!(
+                    "cache census root identity changed: {}",
+                    cache.path.display()
+                )));
+            }
+            at_root = true;
+        }
+    }
+    let _ = meta.mode();
+    Ok((current, meta, mount))
+}
+
+use std::os::unix::io::AsRawFd as _;
+
+/// A seekable directory stream positioned at a telldir cookie,
+/// as `_audit_directory_stream` provides.
+struct DirStream {
+    dir: rustix::fs::Dir,
+    label: String,
+}
+
+impl DirStream {
+    fn open(
+        dir: &std::fs::File,
+        cursor: i64,
+        label: String,
+    ) -> std::result::Result<Self, CensusFault> {
+        // The stream needs its own duplicated descriptor, like
+        // the oracle's os.dup before fdopendir.
+        let duplicate = rustix::io::dup(dir).map_err(|error| {
+            CensusFault::Refuse(format!(
+                "cannot open cache census cursor for {label}: {error}"
+            ))
+        })?;
+        let mut stream = rustix::fs::Dir::new(duplicate).map_err(|error| {
+            CensusFault::Refuse(format!(
+                "cannot open cache census cursor for {label}: {error}"
+            ))
+        })?;
+        if cursor != 0 {
+            // Python's seekdir has no error channel; rustix's seek
+            // is likewise infallible for a live directory stream.
+            let _ = stream.seek(cursor);
+        }
+        Ok(Self { dir: stream, label })
+    }
+
+    /// The next (name bytes, telldir cursor) pair, or None at the
+    /// end of the directory. The cursor is the offset of the
+    /// following entry, so seekdir resumes there exactly.
+    fn next_entry(&mut self) -> std::result::Result<Option<(Vec<u8>, i64)>, CensusFault> {
+        match self.dir.read() {
+            None => Ok(None),
+            Some(Err(error)) => Err(CensusFault::Refuse(format!(
+                "cannot read cache census directory {}: {error}",
+                self.label
+            ))),
+            Some(Ok(entry)) => Ok(Some((
+                entry.file_name().to_bytes().to_vec(),
+                entry.offset(),
+            ))),
+        }
+    }
+}
+
+/// A stored root record field read as a non-negative integer
+/// (in-memory records are always well-typed; persisted ones are
+/// validated before use).
+fn root_int(root: &serde_json::Map<String, Value>, field: &str) -> i64 {
+    root.get(field).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn set_root_int(root: &mut serde_json::Map<String, Value>, field: &str, value: i64) {
+    root.insert(field.to_string(), Value::from(value));
+}
+
+/// The fresh root record `_new_audit_cache_root` stores.
+fn new_root_record(cache: &CacheRoot, identity: &[i64; 5]) -> serde_json::Map<String, Value> {
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "path".to_string(),
+        Value::String(cache.path.to_string_lossy().into_owned()),
+    );
+    root.insert(
+        "identity".to_string(),
+        Value::Array(identity.iter().map(|value| Value::from(*value)).collect()),
+    );
+    root.insert("phase".to_string(), Value::String("measure".to_string()));
+    root.insert("bytes".to_string(), Value::from(0));
+    root.insert("verify_bytes".to_string(), Value::from(0));
+    root.insert(
+        "pending".to_string(),
+        Value::Array(vec![Value::String(".".to_string())]),
+    );
+    root.insert("current".to_string(), Value::Null);
+    root.insert("status".to_string(), Value::String("partial".to_string()));
+    for field in [
+        "entries_visited",
+        "directories_visited",
+        "entries_verified",
+        "directories_verified",
+        "finalize_index",
+        "finalize_entry_index",
+        "directories_finalized",
+        "entries_finalized",
+    ] {
+        root.insert(field.to_string(), Value::from(0));
+    }
+    root.insert("verified_directories".to_string(), Value::Array(Vec::new()));
+    root.insert("verified_entries".to_string(), Value::Array(Vec::new()));
+    root
+}
+
+/// The root key `_audit_cache_root_key` derives: sha256 of the
+/// canonical encoding of path, checkout root, identity, and the
+/// nested-Git policy when it is not plain refusal.
+fn root_key(cache: &CacheRoot, identity: &[i64; 5]) -> String {
+    use sha2::Digest as _;
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "path".to_string(),
+        Value::String(cache.path.to_string_lossy().into_owned()),
+    );
+    value.insert(
+        "checkout_root".to_string(),
+        Value::String(cache.checkout_root.to_string_lossy().into_owned()),
+    );
+    value.insert(
+        "identity".to_string(),
+        Value::Array(identity.iter().map(|item| Value::from(*item)).collect()),
+    );
+    if cache.validation_complete {
+        value.insert(
+            "nested_git".to_string(),
+            Value::String("validation-complete".to_string()),
+        );
+    }
+    let digest = sha2::Sha256::digest(
+        crate::canonical::canonical_json(&Value::Object(value))
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Whether a stored value is an integer (booleans are not).
+fn is_int(value: &Value) -> bool {
+    value.as_i64().is_some() || value.as_u64().is_some()
+}
+
+/// Whether a stored value is a non-negative integer.
+fn is_nonneg_int(value: &Value) -> bool {
+    value.as_i64().is_some_and(|n| n >= 0) || value.as_u64().is_some()
+}
+
+/// A canonical cache-relative path (`.` or a clean relative
+/// path), as `_audit_cache_relative` accepts it.
+fn audit_relative(value: &Value) -> Option<String> {
+    let relative = value.as_str()?;
+    if relative == "." {
+        return Some(relative.to_string());
+    }
+    let path = Path::new(relative);
+    if path.is_absolute() || relative.is_empty() {
+        return None;
+    }
+    let mut rebuilt = String::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::Normal(name) => {
+                if !rebuilt.is_empty() {
+                    rebuilt.push('/');
+                }
+                rebuilt.push_str(&name.to_string_lossy());
+            }
+            _ => return None,
+        }
+    }
+    if rebuilt != relative {
+        return None;
+    }
+    Some(relative.to_string())
+}
+
+/// Why a stored root record cannot be reused: structurally
+/// invalid (start fresh) or the validation allowance expired
+/// (a subject error).
+enum StoredRoot {
+    Fresh,
+    Refuse(String),
+}
+
+/// Validate one persisted root record as
+/// `_validated_audit_cache_root` validates it.
+fn validate_root_record(
+    value: &serde_json::Map<String, Value>,
+    cache: &CacheRoot,
+    identity: &[i64; 5],
+    deadline: std::time::Instant,
+) -> std::result::Result<serde_json::Map<String, Value>, StoredRoot> {
+    let refuse_deadline = || -> std::result::Result<(), StoredRoot> {
+        if std::time::Instant::now() >= deadline {
+            return Err(StoredRoot::Refuse(
+                "cache census root validation exhausted the fixed wall allowance".to_string(),
+            ));
+        }
+        Ok(())
+    };
+    refuse_deadline()?;
+    let required: BTreeSet<&str> = [
+        "path",
+        "identity",
+        "phase",
+        "bytes",
+        "verify_bytes",
+        "pending",
+        "current",
+        "status",
+        "entries_visited",
+        "directories_visited",
+        "entries_verified",
+        "directories_verified",
+        "verified_directories",
+        "verified_entries",
+        "finalize_index",
+        "finalize_entry_index",
+        "directories_finalized",
+        "entries_finalized",
+    ]
+    .into_iter()
+    .collect();
+    let keys: BTreeSet<&str> = value.keys().map(String::as_str).collect();
+    if keys != required {
+        return Err(StoredRoot::Fresh);
+    }
+    if value.get("path").and_then(Value::as_str) != Some(cache.path.to_string_lossy().as_ref())
+        || value
+            .get("identity")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+            != Some(identity.to_vec())
+    {
+        return Err(StoredRoot::Fresh);
+    }
+    let phase = value.get("phase").and_then(Value::as_str).unwrap_or("");
+    let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+    if !["measure", "verify", "finalize"].contains(&phase)
+        || !["partial", "complete"].contains(&status)
+    {
+        return Err(StoredRoot::Fresh);
+    }
+    let int_fields = [
+        "bytes",
+        "verify_bytes",
+        "entries_visited",
+        "directories_visited",
+        "entries_verified",
+        "directories_verified",
+        "finalize_index",
+        "finalize_entry_index",
+        "directories_finalized",
+        "entries_finalized",
+    ];
+    for field in int_fields {
+        match value.get(field) {
+            Some(item)
+                if is_int(item) && item.as_i64().is_none_or(|n| n >= 0)
+                    || matches!(item, Value::Number(n) if n.as_u64().is_some()) => {}
+            _ => return Err(StoredRoot::Fresh),
+        }
+        if let Some(item) = value.get(field) {
+            if !is_int(item) {
+                return Err(StoredRoot::Fresh);
+            }
+        }
+    }
+    let get = |field: &str| value.get(field).and_then(Value::as_i64).unwrap_or(0);
+    let mut pending: Vec<Value> = Vec::new();
+    let mut pending_seen: BTreeSet<String> = BTreeSet::new();
+    let pending_raw = value
+        .get("pending")
+        .and_then(Value::as_array)
+        .ok_or(StoredRoot::Fresh)?;
+    for item in pending_raw {
+        refuse_deadline()?;
+        let relative = audit_relative(item).ok_or(StoredRoot::Fresh)?;
+        if !pending_seen.insert(relative.clone()) {
+            return Err(StoredRoot::Fresh);
+        }
+        pending.push(Value::String(relative));
+    }
+    let current: Value = match value.get("current") {
+        Some(Value::Null) | None => Value::Null,
+        Some(raw) => {
+            let current = raw.as_object().ok_or(StoredRoot::Fresh)?;
+            let keys: BTreeSet<&str> = current.keys().map(String::as_str).collect();
+            if keys != BTreeSet::from(["path", "cursor", "identity"]) {
+                return Err(StoredRoot::Fresh);
+            }
+            if audit_relative(current.get("path").unwrap_or(&Value::Null)).is_none() {
+                return Err(StoredRoot::Fresh);
+            }
+            match current.get("cursor") {
+                Some(item) if is_nonneg_int(item) => {}
+                _ => return Err(StoredRoot::Fresh),
+            }
+            let items = current
+                .get("identity")
+                .and_then(Value::as_array)
+                .ok_or(StoredRoot::Fresh)?;
+            if items.len() != 4 || !items.iter().all(is_nonneg_int) {
+                return Err(StoredRoot::Fresh);
+            }
+            Value::Object(current.clone())
+        }
+    };
+    if phase == "measure"
+        && (get("verify_bytes") != 0
+            || get("entries_verified") != 0
+            || get("directories_verified") != 0
+            || value
+                .get("verified_directories")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            || value
+                .get("verified_entries")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            || get("finalize_index") != 0
+            || get("finalize_entry_index") != 0
+            || get("directories_finalized") != 0
+            || get("entries_finalized") != 0)
+    {
+        return Err(StoredRoot::Fresh);
+    }
+    if phase == "verify" && get("directories_visited") < 1 {
+        return Err(StoredRoot::Fresh);
+    }
+    let read_verified =
+        |field: &str, identity_len: usize| -> std::result::Result<Vec<Value>, StoredRoot> {
+            let mut entries = Vec::new();
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            for item in value
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or(StoredRoot::Fresh)?
+            {
+                refuse_deadline()?;
+                let entry = item.as_object().ok_or(StoredRoot::Fresh)?;
+                let keys: BTreeSet<&str> = entry.keys().map(String::as_str).collect();
+                if keys != BTreeSet::from(["path", "identity"]) {
+                    return Err(StoredRoot::Fresh);
+                }
+                let relative = audit_relative(entry.get("path").unwrap_or(&Value::Null))
+                    .ok_or(StoredRoot::Fresh)?;
+                if !seen.insert(relative) {
+                    return Err(StoredRoot::Fresh);
+                }
+                let items = entry
+                    .get("identity")
+                    .and_then(Value::as_array)
+                    .ok_or(StoredRoot::Fresh)?;
+                if items.len() != identity_len || !items.iter().all(is_int) {
+                    return Err(StoredRoot::Fresh);
+                }
+                entries.push(item.clone());
+            }
+            Ok(entries)
+        };
+    let verified_directories = read_verified("verified_directories", 4)?;
+    if verified_directories.len() as i64 != get("directories_verified") {
+        return Err(StoredRoot::Fresh);
+    }
+    let verified_entries = read_verified("verified_entries", 7)?;
+    if finalize_of(value, "finalize_index") > verified_directories.len() as i64
+        || finalize_of(value, "finalize_entry_index") > verified_entries.len() as i64
+    {
+        return Err(StoredRoot::Fresh);
+    }
+    if phase != "finalize"
+        && (get("finalize_index") != 0
+            || get("finalize_entry_index") != 0
+            || get("directories_finalized") != 0
+            || get("entries_finalized") != 0)
+    {
+        return Err(StoredRoot::Fresh);
+    }
+    if phase == "finalize"
+        && (!matches!(current, Value::Null)
+            || !pending.is_empty()
+            || value.get("bytes") != value.get("verify_bytes")
+            || verified_directories.is_empty()
+            || get("directories_finalized") != get("finalize_index")
+            || get("entries_finalized") != get("finalize_entry_index"))
+    {
+        return Err(StoredRoot::Fresh);
+    }
+    if status == "complete"
+        && (phase != "finalize"
+            || !matches!(current, Value::Null)
+            || !pending.is_empty()
+            || value.get("bytes") != value.get("verify_bytes")
+            || get("finalize_index") != verified_directories.len() as i64
+            || get("directories_finalized") != verified_directories.len() as i64
+            || get("finalize_entry_index") != verified_entries.len() as i64
+            || get("entries_finalized") != verified_entries.len() as i64
+            || verified_directories.is_empty())
+    {
+        return Err(StoredRoot::Fresh);
+    }
+    refuse_deadline()?;
+    let mut root = value.clone();
+    root.insert("pending".to_string(), Value::Array(pending));
+    root.insert("current".to_string(), current);
+    root.insert(
+        "verified_directories".to_string(),
+        Value::Array(verified_directories),
+    );
+    root.insert(
+        "verified_entries".to_string(),
+        Value::Array(verified_entries),
+    );
+    Ok(root)
+}
+
+fn join_relative(root: &Path, relative: &str) -> PathBuf {
+    if relative == "." {
+        root.to_path_buf()
+    } else {
+        root.join(relative)
+    }
+}
+
+fn finalize_of(root: &serde_json::Map<String, Value>, field: &str) -> i64 {
+    root.get(field).and_then(Value::as_i64).unwrap_or(0)
+}
+
+/// Judge a verified validation cache's nested repositories from
+/// its verified paths, as `_judge_audited_nested_repositories`
+/// judges them; Ok(None) when every one is disposable.
+fn judge_verified_nested(
+    cache: &CacheRoot,
+    root: &serde_json::Map<String, Value>,
+    deadline: std::time::Instant,
+) -> std::result::Result<Option<String>, CensusFault> {
+    if !cache.validation_complete {
+        return Ok(None);
+    }
+    let mut relatives: Vec<String> = Vec::new();
+    for field in ["verified_directories", "verified_entries"] {
+        if let Some(items) = root.get(field).and_then(Value::as_array) {
+            for item in items {
+                if let Some(path) = item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .and_then(|path| audit_relative(&Value::String(path.to_string())))
+                {
+                    if path != "." && !relatives.contains(&path) {
+                        relatives.push(path);
+                    }
+                }
+            }
+        }
+    }
+    match judge_audited_nested(&cache.path, &relatives, deadline) {
+        NestedJudgment::Clean => Ok(None),
+        NestedJudgment::Refused(error) => Ok(Some(error)),
+        NestedJudgment::TimedOut => Err(CensusFault::Timeout),
+    }
+}
+
+/// One bound root: its planned cache, exact identity, and the
+/// working root record (which survives a persistence drop, as
+/// the oracle's `root_items` entry does).
+type BoundRoot = (CacheRoot, [i64; 5], serde_json::Map<String, Value>);
+
+/// One bound census over every subject, resuming persisted
+/// progress: the Rust `_audit_cache_census` (with its
+/// `_audit_cache_census_bound` driver). Returns one measurement
+/// per subject, in subject order.
+fn census_bound(
+    subjects: &[CensusSubject],
+    request: &CensusRequest,
+    registry_revision: &str,
+    state_path: &Path,
+    census_key: &[u8],
+    mounts: &[(i64, PathBuf)],
+) -> Vec<CacheMeasurement> {
+    let stored = read_census_state(state_path, census_key, registry_revision);
+    let stored_map = stored.as_ref().and_then(Value::as_object);
+    let previous_roots: serde_json::Map<String, Value> = stored_map
+        .and_then(|map| map.get("roots"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let planned_paths: BTreeSet<String> = subjects
+        .iter()
+        .flat_map(|subject| {
+            subject
+                .caches
+                .iter()
+                .map(|cache| cache.path.to_string_lossy().into_owned())
+        })
+        .collect();
+    // Authenticated progress retained for subjects whose turn may
+    // be deferred; retention is not validation evidence.
+    let mut roots: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut previous_keys_by_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, value) in &previous_roots {
+        if let Some(path) = value.get("path").and_then(Value::as_str) {
+            if planned_paths.contains(path) {
+                roots.insert(key.clone(), value.clone());
+                previous_keys_by_path
+                    .entry(path.to_string())
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs_f64(request.wall_seconds);
+    let mut budget = WorkBudget {
+        limit: request.work_limit,
+        consumed: 0,
+    };
+    let wall = request.wall_seconds;
+    let binding_expired = format!(
+        "cache census root binding exhausted the fixed wall allowance of {} seconds; \
+         no cache total can be published within this allowance",
+        fmt_g(wall)
+    );
+    let mut subject_errors: BTreeMap<String, String> = subjects
+        .iter()
+        .filter_map(|subject| {
+            subject
+                .error
+                .clone()
+                .map(|error| (subject.key.clone(), error))
+        })
+        .collect();
+    // (subject key -> root keys), root records, and root results.
+    let mut root_keys: BTreeMap<String, Vec<String>> = subjects
+        .iter()
+        .map(|subject| (subject.key.clone(), Vec::new()))
+        .collect();
+    let mut root_items: BTreeMap<String, BoundRoot> = BTreeMap::new();
+    let mut root_results: BTreeMap<String, CacheMeasurement> = BTreeMap::new();
+    let subject_caches: BTreeMap<String, Vec<CacheRoot>> = subjects
+        .iter()
+        .map(|subject| (subject.key.clone(), subject.caches.clone()))
+        .collect();
+
+    let bind_subject = |subject_key: &str,
+                        roots: &mut serde_json::Map<String, Value>,
+                        previous_keys_by_path: &mut BTreeMap<String, Vec<String>>,
+                        root_keys: &mut BTreeMap<String, Vec<String>>,
+                        root_items: &mut BTreeMap<String, BoundRoot>,
+                        root_results: &mut BTreeMap<String, CacheMeasurement>,
+                        subject_errors: &mut BTreeMap<String, String>| {
+        let caches = subject_caches.get(subject_key).cloned().unwrap_or_default();
+        let mut sorted = caches;
+        sorted.sort_by(|a, b| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()));
+        let keys = root_keys.entry(subject_key.to_string()).or_default();
+        for cache in &sorted {
+            if std::time::Instant::now() >= deadline {
+                subject_errors
+                    .entry(subject_key.to_string())
+                    .or_insert_with(|| binding_expired.clone());
+                break;
+            }
+            let identity = match bind_root_identity(cache, mounts, deadline) {
+                Ok(identity) => identity,
+                Err(CensusFault::Timeout) => {
+                    subject_errors
+                        .entry(subject_key.to_string())
+                        .or_insert_with(|| {
+                            "cache census root binding exceeded the fixed wall allowance"
+                                .to_string()
+                        });
+                    break;
+                }
+                Err(CensusFault::Refuse(error)) => {
+                    subject_errors
+                        .entry(subject_key.to_string())
+                        .or_insert(error);
+                    continue;
+                }
+            };
+            if std::time::Instant::now() >= deadline {
+                subject_errors
+                    .entry(subject_key.to_string())
+                    .or_insert_with(|| binding_expired.clone());
+                break;
+            }
+            if let Some(obsolete) =
+                previous_keys_by_path.remove(&cache.path.to_string_lossy().into_owned())
+            {
+                for key in obsolete {
+                    roots.remove(&key);
+                }
+            }
+            let Some(identity) = identity else { continue };
+            let key = root_key(cache, &identity);
+            if root_items.contains_key(&key) {
+                keys.push(key);
+                continue;
+            }
+            let raw = previous_roots.get(&key).and_then(Value::as_object);
+            let record = match raw {
+                Some(raw) => match validate_root_record(raw, cache, &identity, deadline) {
+                    Ok(record) => record,
+                    Err(StoredRoot::Fresh) => new_root_record(cache, &identity),
+                    Err(StoredRoot::Refuse(error)) => {
+                        subject_errors
+                            .entry(subject_key.to_string())
+                            .or_insert(error);
+                        break;
+                    }
+                },
+                None => new_root_record(cache, &identity),
+            };
+            if std::time::Instant::now() >= deadline {
+                subject_errors
+                    .entry(subject_key.to_string())
+                    .or_insert_with(|| binding_expired.clone());
+                break;
+            }
+            keys.push(key.clone());
+            let mut record = record;
+            if record.get("phase").and_then(Value::as_str) == Some("finalize")
+                && record.get("status").and_then(Value::as_str) != Some("complete")
+            {
+                // The final identity sweep must occur wholly in the
+                // invocation that publishes completion.
+                set_root_int(&mut record, "finalize_index", 0);
+                set_root_int(&mut record, "finalize_entry_index", 0);
+                set_root_int(&mut record, "directories_finalized", 0);
+                set_root_int(&mut record, "entries_finalized", 0);
+            }
+            if record.get("status").and_then(Value::as_str) == Some("complete") {
+                // Persisted completion never establishes current
+                // deletion evidence by itself: re-verify first.
+                record.insert("status".to_string(), Value::String("partial".to_string()));
+                record.insert("phase".to_string(), Value::String("verify".to_string()));
+                set_root_int(&mut record, "verify_bytes", 0);
+                set_root_int(&mut record, "entries_verified", 0);
+                set_root_int(&mut record, "directories_verified", 0);
+                record.insert("verified_directories".to_string(), Value::Array(Vec::new()));
+                record.insert("verified_entries".to_string(), Value::Array(Vec::new()));
+                set_root_int(&mut record, "finalize_index", 0);
+                set_root_int(&mut record, "finalize_entry_index", 0);
+                set_root_int(&mut record, "directories_finalized", 0);
+                set_root_int(&mut record, "entries_finalized", 0);
+                record.insert(
+                    "pending".to_string(),
+                    Value::Array(vec![Value::String(".".to_string())]),
+                );
+                record.insert("current".to_string(), Value::Null);
+            }
+            roots.insert(key.clone(), Value::Object(record.clone()));
+            root_results.insert(key.clone(), CacheMeasurement::partial());
+            root_items.insert(key.clone(), (cache.clone(), identity, record));
+        }
+    };
+
+    let advance = |key: &str,
+                   finalize: bool,
+                   budget: &mut WorkBudget,
+                   roots: &mut serde_json::Map<String, Value>,
+                   root_results: &mut BTreeMap<String, CacheMeasurement>,
+                   root_items: &mut BTreeMap<String, BoundRoot>| {
+        let (cache, identity, mut record) = root_items.get(key).cloned().expect("bound root");
+        let outcome: std::result::Result<(), CensusFault> = (|| {
+            let mut work = record.clone();
+            if work.get("status").and_then(Value::as_str) != Some("complete") {
+                resume_root(&cache, &identity, &mut work, budget, deadline, finalize)?;
+            }
+            if work.get("status").and_then(Value::as_str) == Some("complete") {
+                if let Some(refusal) = judge_verified_nested(&cache, &work, deadline)? {
+                    // The verified root stays staged; only its
+                    // publication refuses.
+                    root_results.insert(key.to_string(), CacheMeasurement::error(refusal));
+                    record = work;
+                    roots.insert(key.to_string(), Value::Object(record.clone()));
+                    return Ok(());
+                }
+                root_results.insert(
+                    key.to_string(),
+                    CacheMeasurement::complete(root_int(&work, "bytes")),
+                );
+            } else {
+                root_results.insert(key.to_string(), CacheMeasurement::partial());
+            }
+            record = work;
+            roots.insert(key.to_string(), Value::Object(record.clone()));
+            Ok(())
+        })();
+        if let Some(item) = root_items.get_mut(key) {
+            item.2 = record.clone();
+        }
+        match outcome {
+            Ok(()) => {}
+            Err(CensusFault::Timeout) => {
+                if finalize {
+                    record.insert("status".to_string(), Value::String("partial".to_string()));
+                    if let Some(item) = root_items.get_mut(key) {
+                        item.2 = record.clone();
+                    }
+                    roots.insert(key.to_string(), Value::Object(record));
+                    root_results.insert(key.to_string(), CacheMeasurement::partial());
+                } else {
+                    roots.remove(key);
+                    root_results.insert(
+                        key.to_string(),
+                        CacheMeasurement::error(format!(
+                            "cache census traversal exhausted the fixed wall allowance of {} seconds; \
+                             no cache total can be published within this allowance",
+                            fmt_g(wall)
+                        )),
+                    );
+                }
+            }
+            Err(CensusFault::Refuse(error)) => {
+                roots.remove(key);
+                root_results.insert(key.to_string(), CacheMeasurement::error(error));
+            }
+        }
+    };
+
+    // Subject scheduling: sorted order, rotated to the persisted
+    // next subject, each staged before one final publication sweep.
+    let mut ordered: Vec<String> = subjects.iter().map(|subject| subject.key.clone()).collect();
+    ordered.sort();
+    if let Some(next) = stored_map
+        .and_then(|map| map.get("next_subject"))
+        .and_then(Value::as_str)
+    {
+        if let Some(start) = ordered.iter().position(|key| key == next) {
+            ordered.rotate_left(start);
+        }
+    }
+    let mut next_subject: Option<String> = ordered.first().cloned();
+    let mut attempted: BTreeSet<String> = BTreeSet::new();
+    for (index, subject_key) in ordered.iter().enumerate() {
+        if budget.remaining() <= 0 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        next_subject = Some(ordered[(index + 1) % ordered.len()].clone());
+        if subject_errors.contains_key(subject_key)
+            || subject_caches
+                .get(subject_key)
+                .is_some_and(|caches| caches.is_empty())
+        {
+            continue;
+        }
+        attempted.insert(subject_key.clone());
+        bind_subject(
+            subject_key,
+            &mut roots,
+            &mut previous_keys_by_path,
+            &mut root_keys,
+            &mut root_items,
+            &mut root_results,
+            &mut subject_errors,
+        );
+        let keys = root_keys.get(subject_key).cloned().unwrap_or_default();
+        if subject_errors.contains_key(subject_key) || keys.is_empty() {
+            continue;
+        }
+        for key in &keys {
+            let phase = roots
+                .get(key)
+                .and_then(|root| root.get("phase"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if phase != "finalize" {
+                advance(
+                    key,
+                    false,
+                    &mut budget,
+                    &mut roots,
+                    &mut root_results,
+                    &mut root_items,
+                );
+            }
+            if root_results
+                .get(key)
+                .is_some_and(|result| result.error.is_some())
+            {
+                break;
+            }
+        }
+        if keys.iter().any(|key| {
+            root_results
+                .get(key)
+                .is_some_and(|result| result.error.is_some())
+        }) {
+            continue;
+        }
+        if keys.iter().any(|key| {
+            root_items
+                .get(key)
+                .and_then(|item| item.2.get("phase"))
+                .and_then(Value::as_str)
+                != Some("finalize")
+        }) {
+            continue;
+        }
+        let required_work: i64 = keys
+            .iter()
+            .map(|key| {
+                let root = root_items.get(key).map(|item| &item.2);
+                let count = |field: &str| {
+                    root.and_then(|root| root.get(field))
+                        .and_then(Value::as_array)
+                        .map(|items| items.len() as i64)
+                        .unwrap_or(0)
+                };
+                count("verified_directories") + count("verified_entries")
+            })
+            .sum();
+        if required_work > request.work_limit {
+            subject_errors.insert(
+                subject_key.clone(),
+                format!(
+                    "fresh cache finalization requires {required_work} work units for this subject, \
+                     exceeding the fixed allowance of {}; no cache total can be published within this allowance",
+                    request.work_limit
+                ),
+            );
+            continue;
+        }
+        if required_work > budget.remaining() {
+            // Reserve a full turn rather than retrying behind
+            // other subjects.
+            next_subject = Some(subject_key.clone());
+            break;
+        }
+        let full_attempt = budget.consumed == 0;
+        for key in &keys {
+            advance(
+                key,
+                true,
+                &mut budget,
+                &mut roots,
+                &mut root_results,
+                &mut root_items,
+            );
+            if root_results
+                .get(key)
+                .is_some_and(|result| result.status != "complete")
+            {
+                break;
+            }
+        }
+        let completed = keys.iter().all(|key| {
+            root_results
+                .get(key)
+                .is_some_and(|result| result.status == "complete")
+        }) && std::time::Instant::now() < deadline;
+        if !completed {
+            // Even roots which passed are only staged until this
+            // subject's whole sweep passes together.
+            for key in &keys {
+                if let Some(item) = root_items.get_mut(key) {
+                    item.2
+                        .insert("status".to_string(), Value::String("partial".to_string()));
+                }
+                if let Some(root) = roots.get_mut(key).and_then(Value::as_object_mut) {
+                    root.insert("status".to_string(), Value::String("partial".to_string()));
+                }
+                if root_results
+                    .get(key)
+                    .is_some_and(|result| result.error.is_none())
+                {
+                    root_results.insert(key.clone(), CacheMeasurement::partial());
+                }
+            }
+            if keys.iter().any(|key| {
+                root_results
+                    .get(key)
+                    .is_some_and(|result| result.error.is_some())
+            }) {
+                continue;
+            }
+            if full_attempt {
+                subject_errors.insert(
+                    subject_key.clone(),
+                    format!(
+                        "fresh cache finalization exceeded the fixed wall allowance of {} seconds; \
+                         no cache total can be published within this allowance",
+                        fmt_g(wall)
+                    ),
+                );
+            } else {
+                next_subject = Some(subject_key.clone());
+                break;
+            }
+        }
+    }
+
+    let payload = json!({
+        "schema": "wrkslots-audit-cache-census/v6",
+        "registry_revision": registry_revision,
+        "roots": roots,
+        "next_subject": next_subject,
+    });
+    if let Err(error) = write_census_state(state_path, census_key, &payload) {
+        let error = if error.starts_with("cannot persist audit cache census:") {
+            error
+        } else {
+            format!("cannot persist audit cache census: {error}")
+        };
+        for subject in subjects {
+            if !subject.caches.is_empty() {
+                subject_errors
+                    .entry(subject.key.clone())
+                    .or_insert_with(|| error.clone());
+            }
+        }
+    }
+    subjects
+        .iter()
+        .map(|subject| {
+            if let Some(error) = subject_errors.get(&subject.key) {
+                return CacheMeasurement::error(error.clone());
+            }
+            if !subject.caches.is_empty() && !attempted.contains(&subject.key) {
+                return CacheMeasurement::partial();
+            }
+            let keys = root_keys.get(&subject.key).cloned().unwrap_or_default();
+            let measurements: Vec<&CacheMeasurement> = keys
+                .iter()
+                .filter_map(|key| root_results.get(key))
+                .collect();
+            if let Some(item) = measurements.iter().find(|item| item.error.is_some()) {
+                return CacheMeasurement::error(item.error.clone().unwrap_or_default());
+            }
+            if measurements.iter().any(|item| item.status != "complete") {
+                return CacheMeasurement::partial();
+            }
+            CacheMeasurement::complete(
+                measurements
+                    .iter()
+                    .map(|item| item.bytes.unwrap_or(0))
+                    .sum(),
+            )
+        })
+        .collect()
+}
+
+/// Run the census: establish the state store exactly as the
+/// oracle establishes it (an unavailable store makes accounting
+/// unavailable, never invented), then run the bound driver.
 fn cache_census(
     cfg: &Cfg,
     subjects: &[CensusSubject],
@@ -2144,10 +3220,10 @@ fn cache_census(
     let unavailable = |detail: String| -> Vec<CacheMeasurement> {
         subjects
             .iter()
-            .map(|(roots, error, _validation)| {
-                if let Some(error) = error {
+            .map(|subject| {
+                if let Some(error) = &subject.error {
                     CacheMeasurement::error(error.clone())
-                } else if roots.is_empty() {
+                } else if subject.caches.is_empty() {
                     CacheMeasurement::complete(0)
                 } else {
                     CacheMeasurement::error(detail.clone())
@@ -2155,19 +3231,19 @@ fn cache_census(
             })
             .collect()
     };
-    if !subjects.iter().any(|(roots, _, _)| !roots.is_empty()) {
+    if !subjects.iter().any(|subject| !subject.caches.is_empty()) {
         return Ok(subjects
             .iter()
-            .map(|(_, error, _)| match error {
+            .map(|subject| match &subject.error {
                 Some(error) => CacheMeasurement::error(error.clone()),
                 None => CacheMeasurement::complete(0),
             })
             .collect());
     }
     let state_path = match &request.state {
-        Some(raw) => Some(census_state_path(cfg, Some(raw))?),
+        Some(raw) => census_state_path(cfg, Some(raw))?,
         None => match default_census_state_path(cfg) {
-            Ok(path) => Some(path),
+            Ok(path) => path,
             Err(error) => {
                 return Ok(unavailable(format!(
                     "default audit cache storage is unavailable: {error}"
@@ -2175,9 +3251,6 @@ fn cache_census(
             }
         },
     };
-    let state_path = state_path.expect("census state path");
-    // The state store must be establishable exactly as the oracle
-    // establishes it; its progress contents are not consumed here.
     let parent = state_path.parent().unwrap_or(Path::new("/"));
     let parent_ok = std::fs::canonicalize(parent)
         .is_ok_and(|resolved| resolved == parent && !path_within(&resolved, &cfg.root));
@@ -2199,54 +3272,580 @@ fn cache_census(
         Ok(mounts) => mounts,
         Err(error) => return Ok(unavailable(error)),
     };
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs_f64(request.wall_seconds);
-    let mut budget: i64 = request.work_limit;
-    let mut measurements = Vec::new();
-    for (roots, error, validation_complete) in subjects {
-        if let Some(error) = error {
-            measurements.push(CacheMeasurement::error(error.clone()));
-            continue;
-        }
-        if roots.is_empty() {
-            measurements.push(CacheMeasurement::complete(0));
-            continue;
-        }
-        let mut total: i64 = 0;
-        let mut outcome: Option<CacheMeasurement> = None;
-        for (root, _checkout, device) in roots {
-            let measured = traverse_cache_root(
-                root,
-                *device,
-                &mounts,
-                &mut budget,
-                deadline,
-                *validation_complete,
-            );
-            match measured.status {
-                "complete" => total += measured.bytes.unwrap_or(0),
-                "partial" => {
-                    outcome = Some(CacheMeasurement::partial());
-                    break;
-                }
-                _ => {
-                    outcome = Some(measured);
-                    break;
-                }
-            }
-        }
-        measurements.push(outcome.unwrap_or_else(|| CacheMeasurement::complete(total)));
-    }
-    if let Err(error) = write_census_state(&state_path, &census_key, registry_revision) {
-        for (index, measurement) in measurements.iter_mut().enumerate() {
-            if !subjects[index].0.is_empty() && measurement.status != "error" {
-                *measurement = CacheMeasurement::error(error.clone());
-            }
-        }
-    }
-    Ok(measurements)
+    Ok(census_bound(
+        subjects,
+        request,
+        registry_revision,
+        &state_path,
+        &census_key,
+        &mounts,
+    ))
 }
 
+fn bind_root_identity(
+    cache: &CacheRoot,
+    mounts: &[(i64, PathBuf)],
+    deadline: std::time::Instant,
+) -> std::result::Result<Option<[i64; 5]>, CensusFault> {
+    check_deadline(deadline)?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let cache = cache.clone();
+    let mounts = mounts.to_vec();
+    std::thread::spawn(move || {
+        let _ = sender.send(bind_root_identity_direct(&cache, &mounts));
+    });
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(Ok(identity)) => {
+            check_deadline(deadline)?;
+            Ok(identity)
+        }
+        Ok(Err(error)) => Err(CensusFault::Refuse(error)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CensusFault::Timeout),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CensusFault::Refuse(
+            "cache census root-binding worker failed".to_string(),
+        )),
+    }
+}
+
+fn bind_root_identity_direct(
+    cache: &CacheRoot,
+    mounts: &[(i64, PathBuf)],
+) -> std::result::Result<Option<[i64; 5]>, String> {
+    // No symlink component below the checkout.
+    if let Ok(relative) = cache.path.strip_prefix(&cache.checkout_root) {
+        let mut current = cache.checkout_root.clone();
+        for part in relative.components() {
+            current.push(part.as_os_str());
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "cache path crosses a symlink: {}",
+                            current.display()
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect cache path path {}: {error}",
+                        current.display()
+                    ))
+                }
+            }
+            if mounts.iter().any(|(_, point)| point == &current) {
+                return Err(format!(
+                    "cache path crosses a mount point: {}",
+                    current.display()
+                ));
+            }
+        }
+        for (_, point) in mounts {
+            if point != &cache.checkout_root
+                && point.starts_with(&cache.checkout_root)
+                && (cache.path.starts_with(point) || point.starts_with(&cache.path))
+            {
+                return Err(format!(
+                    "cache path crosses or contains a mount point: {}",
+                    point.display()
+                ));
+            }
+        }
+    }
+    let checkout = open_absolute_dir(&cache.checkout_root, "managed root").map_err(|error| {
+        format!(
+            "cannot open managed root {}: {error}",
+            cache.checkout_root.display()
+        )
+    })?;
+    let checkout_id = dir_file_identity(&checkout).map_err(|error| {
+        format!(
+            "cannot open managed root {}: {error}",
+            cache.checkout_root.display()
+        )
+    })?;
+    if (checkout_id.0, checkout_id.1, checkout_id.2)
+        != (
+            cache.checkout_dev as i64,
+            cache.checkout_ino as i64,
+            cache.checkout_mount,
+        )
+    {
+        return Err(format!(
+            "cache path checkout identity changed before cleanup: {}",
+            cache.checkout_root.display()
+        ));
+    }
+    let relative = cache.path.strip_prefix(&cache.checkout_root).map_err(|_| {
+        format!(
+            "cache path escapes its managed root: {}",
+            cache.path.display()
+        )
+    })?;
+    let parts: Vec<std::ffi::OsString> = relative
+        .components()
+        .map(|part| part.as_os_str().to_os_string())
+        .collect();
+    if parts.is_empty() {
+        return Err("cache path must not be the managed root".to_string());
+    }
+    let mut current = checkout;
+    let mut current_path = cache.checkout_root.clone();
+    for part in &parts[..parts.len() - 1] {
+        current_path.push(part);
+        let child = open_dir_component(&current, part).map_err(|error| {
+            format!(
+                "cannot safely open cache path parent for {}: {error}",
+                cache.path.display()
+            )
+        })?;
+        let child_mount = fd_mount_id(child.as_raw_fd())
+            .ok_or_else(|| "cannot determine mount identity".to_string())?;
+        if child_mount != checkout_id.2 {
+            return Err(format!(
+                "cache path crossed a mount point while opening {}",
+                cache.path.display()
+            ));
+        }
+        current = child;
+    }
+    let last = &parts[parts.len() - 1];
+    let child = match open_dir_component(&current, last) {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot safely open cache directory {}: {error}",
+                cache.path.display()
+            ))
+        }
+    };
+    let child_mount = fd_mount_id(child.as_raw_fd())
+        .ok_or_else(|| "cannot determine mount identity".to_string())?;
+    if child_mount != checkout_id.2 {
+        return Err(format!(
+            "cache path crossed a mount point while opening {}",
+            cache.path.display()
+        ));
+    }
+    let identity = dir_file_identity(&child)?;
+    Ok(Some([
+        identity.0, identity.1, identity.2, identity.3, identity.4,
+    ]))
+}
+
+/// fstatat without following a symlink.
+fn stat_at(dir: &std::fs::File, name: &[u8]) -> std::io::Result<rustix::fs::Stat> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    rustix::fs::statat(
+        dir,
+        OsStr::from_bytes(name),
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(std::io::Error::from)
+}
+
+/// Advance one root record through its phases, as
+/// `_resume_audit_cache_root_unbounded` advances it; Ok(true)
+/// when the root is complete.
+fn resume_root(
+    cache: &CacheRoot,
+    identity: &[i64; 5],
+    root: &mut serde_json::Map<String, Value>,
+    budget: &mut WorkBudget,
+    deadline: std::time::Instant,
+    finalize: bool,
+) -> std::result::Result<bool, CensusFault> {
+    use std::os::unix::ffi::OsStrExt as _;
+    check_deadline(deadline)?;
+    while budget.remaining() > 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err(CensusFault::Timeout);
+        }
+        let phase = root
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        match phase.as_str() {
+            "finalize" => {
+                if !finalize {
+                    return Ok(false);
+                }
+                let directories = root
+                    .get("verified_directories")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let finalize_index = root_int(root, "finalize_index");
+                if finalize_index < directories.len() as i64 {
+                    let entry = &directories[finalize_index as usize];
+                    let relative = audit_relative(entry.get("path").unwrap_or(&Value::Null))
+                        .ok_or_else(|| {
+                            CensusFault::Refuse(
+                                "cache census verified directory path is not canonical".to_string(),
+                            )
+                        })?;
+                    let expected: Vec<i64> = entry
+                        .get("identity")
+                        .and_then(Value::as_array)
+                        .map(|items| items.iter().filter_map(Value::as_i64).collect())
+                        .unwrap_or_default();
+                    budget.debit()?;
+                    let (dir, _meta, _mount) =
+                        open_cache_relative(cache, identity, &relative, deadline)?;
+                    let actual = dir_file_identity(&dir).map_err(CensusFault::Refuse)?;
+                    if expected != vec![actual.0, actual.1, actual.3, actual.4] {
+                        return Err(CensusFault::Refuse(format!(
+                            "cache census directory changed before final publication: {}",
+                            join_relative(&cache.path, &relative).display()
+                        )));
+                    }
+                    set_root_int(root, "finalize_index", finalize_index + 1);
+                    set_root_int(
+                        root,
+                        "directories_finalized",
+                        root_int(root, "directories_finalized") + 1,
+                    );
+                    let entries_empty = root
+                        .get("verified_entries")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| items.is_empty());
+                    if finalize_index + 1 == directories.len() as i64 && entries_empty {
+                        root.insert("status".to_string(), Value::String("complete".to_string()));
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                let entries = root
+                    .get("verified_entries")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let entry_index = root_int(root, "finalize_entry_index");
+                if entry_index >= entries.len() as i64 {
+                    if directories.is_empty() {
+                        return Err(CensusFault::Refuse(
+                            "cache census finalization has no directories".to_string(),
+                        ));
+                    }
+                    root.insert("status".to_string(), Value::String("complete".to_string()));
+                    return Ok(true);
+                }
+                let entry = &entries[entry_index as usize];
+                let relative = audit_relative(entry.get("path").unwrap_or(&Value::Null))
+                    .ok_or_else(|| {
+                        CensusFault::Refuse(
+                            "cache census verified entry path is not canonical".to_string(),
+                        )
+                    })?;
+                let candidate = join_relative(&cache.path, &relative);
+                let relative_path = Path::new(&relative);
+                let parent_relative = relative_path
+                    .parent()
+                    .map(|parent| {
+                        if parent.as_os_str().is_empty() {
+                            ".".to_string()
+                        } else {
+                            parent.to_string_lossy().into_owned()
+                        }
+                    })
+                    .unwrap_or_else(|| ".".to_string());
+                let name = relative_path
+                    .file_name()
+                    .map(|name| name.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let expected: Vec<i64> = entry
+                    .get("identity")
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().filter_map(Value::as_i64).collect())
+                    .unwrap_or_default();
+                budget.debit()?;
+                let (parent_dir, _meta, _mount) =
+                    open_cache_relative(cache, identity, &parent_relative, deadline)?;
+                check_deadline(deadline)?;
+                let stat = stat_at(&parent_dir, &name).map_err(|error| {
+                    CensusFault::Refuse(format!(
+                        "cache census entry changed before final publication: {}: {error}",
+                        candidate.display()
+                    ))
+                })?;
+                let actual = vec![
+                    stat.st_dev as i64,
+                    stat.st_ino as i64,
+                    stat.st_mode as i64,
+                    stat.st_size as i64,
+                    stat.st_blocks as i64,
+                    stat.st_mtime * 1_000_000_000 + stat.st_mtime_nsec as i64,
+                    stat.st_ctime * 1_000_000_000 + stat.st_ctime_nsec as i64,
+                ];
+                if expected != actual {
+                    return Err(CensusFault::Refuse(format!(
+                        "cache census entry changed before final publication: {}",
+                        candidate.display()
+                    )));
+                }
+                set_root_int(root, "finalize_entry_index", entry_index + 1);
+                set_root_int(
+                    root,
+                    "entries_finalized",
+                    root_int(root, "entries_finalized") + 1,
+                );
+                if entry_index + 1 == entries.len() as i64 {
+                    root.insert("status".to_string(), Value::String("complete".to_string()));
+                    return Ok(true);
+                }
+            }
+            "measure" | "verify" => {
+                let verify = phase == "verify";
+                let bytes_field = if verify { "verify_bytes" } else { "bytes" };
+                let entries_field = if verify {
+                    "entries_verified"
+                } else {
+                    "entries_visited"
+                };
+                let directories_field = if verify {
+                    "directories_verified"
+                } else {
+                    "directories_visited"
+                };
+                if root.get("current").is_none_or(Value::is_null) {
+                    let mut pending: Vec<String> = root
+                        .get("pending")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if pending.is_empty() {
+                        if !verify {
+                            root.insert("phase".to_string(), Value::String("verify".to_string()));
+                            set_root_int(root, "verify_bytes", 0);
+                            set_root_int(root, "entries_verified", 0);
+                            set_root_int(root, "directories_verified", 0);
+                            root.insert(
+                                "verified_directories".to_string(),
+                                Value::Array(Vec::new()),
+                            );
+                            root.insert("verified_entries".to_string(), Value::Array(Vec::new()));
+                            set_root_int(root, "finalize_index", 0);
+                            set_root_int(root, "finalize_entry_index", 0);
+                            set_root_int(root, "directories_finalized", 0);
+                            set_root_int(root, "entries_finalized", 0);
+                            root.insert(
+                                "pending".to_string(),
+                                Value::Array(vec![Value::String(".".to_string())]),
+                            );
+                            continue;
+                        }
+                        if root_int(root, "directories_verified") < 1 {
+                            return Err(CensusFault::Refuse(
+                                "cache census verification omitted its root directory".to_string(),
+                            ));
+                        }
+                        let measured = root_int(root, "bytes");
+                        let verified = root_int(root, "verify_bytes");
+                        if measured != verified {
+                            set_root_int(root, "bytes", verified);
+                        }
+                        root.insert("phase".to_string(), Value::String("finalize".to_string()));
+                        set_root_int(root, "finalize_index", 0);
+                        set_root_int(root, "finalize_entry_index", 0);
+                        set_root_int(root, "directories_finalized", 0);
+                        set_root_int(root, "entries_finalized", 0);
+                        continue;
+                    }
+                    let relative = pending.pop().expect("pending checked non-empty");
+                    root.insert(
+                        "pending".to_string(),
+                        Value::Array(
+                            pending
+                                .iter()
+                                .map(|item| Value::String(item.clone()))
+                                .collect(),
+                        ),
+                    );
+                    let (dir, meta, _mount) =
+                        open_cache_relative(cache, identity, &relative, deadline)?;
+                    drop(dir);
+                    use std::os::unix::fs::MetadataExt as _;
+                    let current_bytes = root_int(root, bytes_field);
+                    set_root_int(
+                        root,
+                        bytes_field,
+                        current_bytes + (meta.blocks() * 512) as i64,
+                    );
+                    set_root_int(
+                        root,
+                        directories_field,
+                        root_int(root, directories_field) + 1,
+                    );
+                    let dir_identity = [
+                        meta.dev() as i64,
+                        meta.ino() as i64,
+                        meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                        meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                    ];
+                    if verify {
+                        let mut directories = root
+                            .get("verified_directories")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        directories.push(json!({
+                            "path": relative,
+                            "identity": dir_identity,
+                        }));
+                        root.insert(
+                            "verified_directories".to_string(),
+                            Value::Array(directories),
+                        );
+                    }
+                    root.insert(
+                        "current".to_string(),
+                        json!({
+                            "path": relative,
+                            "cursor": 0,
+                            "identity": dir_identity,
+                        }),
+                    );
+                }
+                // Stream the current directory from its cursor.
+                let current = root
+                    .get("current")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let relative = current
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or(".")
+                    .to_string();
+                let mut cursor = current.get("cursor").and_then(Value::as_i64).unwrap_or(0);
+                if cursor < 0 {
+                    return Err(CensusFault::Refuse(
+                        "cache census current.cursor must be non-negative".to_string(),
+                    ));
+                }
+                let expected: Vec<i64> = current
+                    .get("identity")
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().filter_map(Value::as_i64).collect())
+                    .unwrap_or_default();
+                let (dir, _meta, _mount) =
+                    open_cache_relative(cache, identity, &relative, deadline)?;
+                let actual_dir = dir_file_identity(&dir).map_err(CensusFault::Refuse)?;
+                if expected != vec![actual_dir.0, actual_dir.1, actual_dir.3, actual_dir.4] {
+                    return Err(CensusFault::Refuse(format!(
+                        "cache census directory changed while resuming: {}",
+                        join_relative(&cache.path, &relative).display()
+                    )));
+                }
+                let label = join_relative(&cache.path, &relative)
+                    .to_string_lossy()
+                    .into_owned();
+                let mut stream = DirStream::open(&dir, cursor, label)?;
+                let mut complete = false;
+                while budget.remaining() > 0 {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(CensusFault::Timeout);
+                    }
+                    let Some((name, next_cursor)) = stream.next_entry()? else {
+                        complete = true;
+                        break;
+                    };
+                    cursor = next_cursor;
+                    budget.debit()?;
+                    if name == b"." || name == b".." {
+                        continue;
+                    }
+                    let name_text = String::from_utf8_lossy(&name).into_owned();
+                    if name_text == ".git" && !cache.validation_complete {
+                        return Err(CensusFault::Refuse(format!(
+                            "cache directory contains nested Git metadata: {}",
+                            join_relative(&cache.path, &relative)
+                                .join(&name_text)
+                                .display()
+                        )));
+                    }
+                    check_deadline(deadline)?;
+                    let stat = match stat_at(&dir, &name) {
+                        Ok(stat) => stat,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(CensusFault::Refuse(format!(
+                                "cannot inspect cache entry {}: {error}",
+                                join_relative(&cache.path, &relative)
+                                    .join(&name_text)
+                                    .display()
+                            )))
+                        }
+                    };
+                    set_root_int(root, entries_field, root_int(root, entries_field) + 1);
+                    let child_relative = if relative == "." {
+                        name_text.clone()
+                    } else {
+                        format!("{relative}/{name_text}")
+                    };
+                    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                        let mut pending: Vec<Value> = root
+                            .get("pending")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        pending.push(Value::String(child_relative));
+                        root.insert("pending".to_string(), Value::Array(pending));
+                    } else {
+                        let current_bytes = root_int(root, bytes_field);
+                        set_root_int(
+                            root,
+                            bytes_field,
+                            current_bytes + stat.st_blocks as i64 * 512,
+                        );
+                        if verify {
+                            let mut entries = root
+                                .get("verified_entries")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            entries.push(json!({
+                                "path": child_relative,
+                                "identity": [
+                                    stat.st_dev as i64,
+                                    stat.st_ino as i64,
+                                    stat.st_mode as i64,
+                                    stat.st_size as i64,
+                                    stat.st_blocks as i64,
+                                    stat.st_mtime * 1_000_000_000 + stat.st_mtime_nsec as i64,
+                                    stat.st_ctime * 1_000_000_000 + stat.st_ctime_nsec as i64,
+                                ],
+                            }));
+                            root.insert("verified_entries".to_string(), Value::Array(entries));
+                        }
+                    }
+                }
+                if !complete {
+                    let mut current = current;
+                    current.insert("cursor".to_string(), Value::from(cursor));
+                    root.insert("current".to_string(), Value::Object(current));
+                    return Ok(false);
+                }
+                root.insert("current".to_string(), Value::Null);
+            }
+            _ => {
+                return Err(CensusFault::Refuse(format!(
+                    "cache census has invalid phase {phase:?}"
+                )))
+            }
+        }
+    }
+    Ok(false)
+}
 /// The record digest the oracle publishes: `_event_digest` of
 /// `_record_to_obj` (the stored object, with `slot_type` defaulted).
 fn record_digest(record: &Value) -> Result<String> {
@@ -4409,16 +6008,38 @@ pub(crate) fn parse_audit(
         let (roots, error) = cache_roots(&cfg, &config, record, &mut budget, &plan_mounts);
         plan_work_consumed += budget.work_consumed;
         plan_seconds = (plan_seconds - budget.spent).max(0.0);
-        let validation = record.get("slot_type").and_then(Value::as_str) == Some("validate");
-        census_subjects.push((roots, error, validation));
+        let machine = record
+            .get("machine")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let slot = record
+            .get("slot")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let generation = record
+            .get("generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        census_subjects.push(CensusSubject {
+            key: format!("record:{machine}:{slot}:{generation}"),
+            caches: roots,
+            error,
+        });
     }
     for (offset, action) in target_actions.iter().enumerate() {
         let position = records.len() + offset;
         let mut budget = make_budget(position, plan_work_consumed, plan_seconds);
         match action {
             TargetAction::Unregistered(slot_type, slot) => {
-                let subject =
-                    unregistered_cache_subject(&cfg, &config, slot, &mut budget, &plan_mounts);
+                let subject_key = format!("unregistered:{slot_type}:{slot}");
+                let subject = unregistered_cache_subject(
+                    &cfg,
+                    &config,
+                    &subject_key,
+                    slot,
+                    &mut budget,
+                    &plan_mounts,
+                );
                 plan_work_consumed += budget.work_consumed;
                 plan_seconds = (plan_seconds - budget.spent).max(0.0);
                 unregistered_subjects
@@ -4427,8 +6048,15 @@ pub(crate) fn parse_audit(
             }
             TargetAction::Journal(slot) => {
                 let checkouts = journal_checkouts.get(slot).cloned().unwrap_or_default();
-                let subject =
-                    journal_cache_subject(&cfg, &config, &checkouts, &mut budget, &plan_mounts);
+                let subject_key = format!("unregistered:agent:{slot}");
+                let subject = journal_cache_subject(
+                    &cfg,
+                    &config,
+                    &subject_key,
+                    &checkouts,
+                    &mut budget,
+                    &plan_mounts,
+                );
                 plan_work_consumed += budget.work_consumed;
                 plan_seconds = (plan_seconds - budget.spent).max(0.0);
                 journal_subjects.insert(slot.clone(), census_subjects.len());
