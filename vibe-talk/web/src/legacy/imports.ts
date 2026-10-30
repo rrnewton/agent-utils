@@ -93,10 +93,12 @@ export {
 export { anchorOfMessage, createBookmarks, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
 export { createNavigation } from "../core/navigation/index.ts";
 export {
+  DISCORD_POLL_MS,
   STALE_AS_OF_MS,
   TIMELINE_DELTA_PAGES,
   TIMELINE_RECONCILE_MS,
   VISIBLE_REFRESH_MS,
+  createStandInRetries,
   deltaCursor,
   isCursorRefusal,
   isMutationKey,

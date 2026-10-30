@@ -7182,6 +7182,25 @@ test("`#624 voice-page-modularity`: a Server-Sent Events stream read into frames
   assert.deepStrictEqual([stopped.how, stopped.cancelled()], ["ended", 1]);
 });
 
+test("`#624 voice-page-modularity`: the quick retries after a stand-in read, from the module alone", () => {
+  const { createStandInRetries, STAND_IN_RETRY_MS, DISCORD_POLL_MS } = SYNC;
+  const retries = createStandInRetries();
+  assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS, "a poll came early with no stand-in read before it");
+  // Each stand-in read wants the next quick retry, until they are spent.
+  const waits = [];
+  for (let read = 0; read <= STAND_IN_RETRY_MS.length; read += 1) {
+    const wanted = retries.noteRead(true);
+    waits.push([wanted, retries.take(DISCORD_POLL_MS)]);
+  }
+  assert.deepStrictEqual(waits, [...STAND_IN_RETRY_MS.map((ms) => [true, ms]), [false, DISCORD_POLL_MS]]);
+  // A shorter wait already armed is kept; a current read starts the retries again.
+  retries.noteRead(false);
+  assert.equal(retries.noteRead(true), true, "a current read did not start the quick retries again");
+  assert.equal(retries.take(1000), 1000);
+  assert.equal(retries.noteRead(false), false);
+  assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS, "a retry wanted before a current read was still taken");
+});
+
 test("`#624 voice-page-modularity`: which read a refresh makes, and how fresh it is, from the module alone", () => {
   const { deltaCursor, isCursorRefusal, isMutationKey, staleAsOf, STALE_AS_OF_MS, TIMELINE_RECONCILE_MS } = SYNC;
   let now = 10 * TIMELINE_RECONCILE_MS;

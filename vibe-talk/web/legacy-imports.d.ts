@@ -38,6 +38,8 @@ declare const STALE_AS_OF_MS: LegacyImports["STALE_AS_OF_MS"];
 declare const TIMELINE_DELTA_PAGES: LegacyImports["TIMELINE_DELTA_PAGES"];
 declare const TIMELINE_RECONCILE_MS: LegacyImports["TIMELINE_RECONCILE_MS"];
 declare const VISIBLE_REFRESH_MS: LegacyImports["VISIBLE_REFRESH_MS"];
+declare const DISCORD_POLL_MS: LegacyImports["DISCORD_POLL_MS"];
+declare const createStandInRetries: LegacyImports["createStandInRetries"];
 declare const deltaCursor: LegacyImports["deltaCursor"];
 declare const isCursorRefusal: LegacyImports["isCursorRefusal"];
 declare const isMutationKey: LegacyImports["isMutationKey"];

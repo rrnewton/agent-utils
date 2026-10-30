@@ -28151,14 +28151,13 @@ function forwardCursor(reason) {
 
 /**
  * `#617 cold-load-first-paint`. After a page the server answered from its own copy, the next reads
- * come this soon, one after the other, rather than at the next poll, forty-five seconds on: the read
- * upstream it stood in for runs on, and has usually landed by then.
+ * come soon, one after the other, rather than at the next poll (`STAND_IN_RETRY_MS`): how many have
+ * been spent, and whether the next poll should be one, are web/src/core/sync's (`createStandInRetries`,
+ * `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/sync/index.ts").StandInRetries}
  */
-const STAND_IN_RETRY_MS = [3000, 10000];
-/** How many of `STAND_IN_RETRY_MS` the reads since the last current one have taken. */
-let standInRetries = 0;
-/** Whether the next poll armed should come after the next of `STAND_IN_RETRY_MS`. */
-let standInRetryWanted = false;
+const standInRetries = createStandInRetries();
 
 /**
  * A read landed: say how fresh the rows are — now, or as of what the server could vouch for.
@@ -28171,15 +28170,10 @@ function noteFreshRead(payload) {
   const asOf = staleAsOf(payload);
   channelFreshAt = asOf === null ? Date.now() : asOf;
   const failed = refreshFailed(payload);
-  if (failed) {
-    standInRetryWanted = standInRetries < STAND_IN_RETRY_MS.length;
-    // A poll already armed comes forward; one armed after this read takes it up as it is armed.
-    if (standInRetryWanted && discordPollTimer !== null) {
-      scheduleDiscordPoll(Math.max(0, discordPollDueAt - Date.now()));
-    }
-  } else {
-    standInRetries = 0;
-    standInRetryWanted = false;
+  const retryWanted = standInRetries.noteRead(failed);
+  // A poll already armed comes forward; one armed after this read takes it up as it is armed.
+  if (failed && retryWanted && discordPollTimer !== null) {
+    scheduleDiscordPoll(Math.max(0, discordPollDueAt - Date.now()));
   }
   const old = Date.now() - channelFreshAt > STALE_AS_OF_MS;
   setChannelFreshness(failed ? (old ? "failed" : "fresh") : asOf === null ? "fresh" : "slow");
@@ -51587,9 +51581,9 @@ function glideBehavior() {
 // The first visit to each Main / Threads / All context fetches its projection, then tab switches
 // restore that page's in-memory snapshot. The active context still refreshes on a timer. A
 // configured adapter may additionally PUSH changes into the server; the timer is the authoritative
-// fallback if that adapter or the browser's stream is interrupted.
+// fallback if that adapter or the browser's stream is interrupted. How long between those reads
+// (`DISCORD_POLL_MS`) is web/src/core/sync's.
 
-const DISCORD_POLL_MS = 45000;
 // `#195 send-resilience`. How long a read of the newest messages may take before the page stops
 // waiting and says the refresh failed. Above what a slow service ordinarily takes — ten to twelve
 // seconds, in the incident this was written for — and well inside the server's own fifty.
@@ -51931,11 +51925,7 @@ function stopDiscordPolling() {
  */
 function scheduleDiscordPoll(delay = DISCORD_POLL_MS) {
   stopDiscordPolling();
-  if (standInRetryWanted) {
-    delay = Math.min(delay, STAND_IN_RETRY_MS[standInRetries]);
-    standInRetries += 1;
-    standInRetryWanted = false;
-  }
+  delay = standInRetries.take(delay);
   discordPollDueAt = Date.now() + delay;
   if (document.hidden) {
     discordPollPaused = true;

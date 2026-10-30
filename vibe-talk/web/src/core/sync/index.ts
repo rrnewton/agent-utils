@@ -14,3 +14,5 @@ export {
 export type { CursorCover, CursorFacts } from "./freshness.ts";
 export { parseEventFrame, readEventStream } from "./events.ts";
 export type { ByteReader, EventFrame, TextChunkDecoder } from "./events.ts";
+export { DISCORD_POLL_MS, STAND_IN_RETRY_MS, createStandInRetries } from "./poll.ts";
+export type { StandInRetries } from "./poll.ts";
