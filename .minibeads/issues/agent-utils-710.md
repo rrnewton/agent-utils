@@ -1,13 +1,14 @@
 ---
 title: 'chat-transcript-extraction: read agent replies from the harness transcript, not the screen'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 - wrkviz
 created_at: 2026-10-30T20:38:09.342031375+00:00
-updated_at: 2026-10-30T20:38:09.342031375+00:00
+updated_at: 2026-10-30T22:04:23.345316796+00:00
+closed_at: 2026-10-30T22:04:23.345316646+00:00
 ---
 
 # Description
