@@ -15,6 +15,7 @@ version, license, README, and embedded user guide.
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |
 | `herdr-run` | `herdr-run` | Execute policy-admitted shell commands through Herdr panes. |
 | `agent-queue` | library | Share one durable prompt-queue format and process-identity proof between agent tools. |
+| `agent-harness` | library | Find and read the session transcripts coding-agent harnesses write as they run. |
 | `agentctl` | `agentctl`, `herdr-agent` | Control persistent interactive Herdr agents through one session registry. |
 
 Install one published command with Cargo:

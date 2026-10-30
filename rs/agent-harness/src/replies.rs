@@ -1,0 +1,327 @@
+//! Reply blocks, and whether a block read from a screen renders one read from a transcript.
+//!
+//! An agent answering a chat writes each reply between a line `<CHAT_REPLY_ID>` and a line
+//! `</CHAT_REPLY_ID>`. In a transcript those lines appear exactly as written. A terminal draws
+//! the same block with Markdown markers turned into styles (`**bold**` as bold, `` `code` `` as
+//! code, `# Heading` as a styled line), tables as box drawing, links as their text, and every
+//! long line wrapped at the terminal's width. [`rendered_equivalent`] tells whether a screen
+//! block is such a rendering of a transcript block, so the transcript's text can stand in for it.
+
+/// One complete reply block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplyBlock {
+    /// The ID between `<CHAT_REPLY_` and `>`.
+    pub identifier: String,
+    /// The lines between the two marker lines, without the blank lines at either end and
+    /// without the indentation every line shares.
+    pub body: String,
+}
+
+/// The ID of a marker line `<CHAT_REPLY_ID>` (or `</CHAT_REPLY_ID>` when `closing`), alone on
+/// its line apart from surrounding whitespace.
+fn marker(line: &str, closing: bool) -> Option<&str> {
+    let prefix = if closing {
+        "</CHAT_REPLY_"
+    } else {
+        "<CHAT_REPLY_"
+    };
+    let identifier = line.trim().strip_prefix(prefix)?.strip_suffix('>')?;
+    (!identifier.is_empty()
+        && identifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    .then_some(identifier)
+}
+
+/// The code-fence run a line opens or closes: its character (`` ` `` or `~`) and length, when
+/// the line starts one of at least three.
+fn fence(line: &str) -> Option<(char, usize)> {
+    let line = line.trim_start();
+    let character = line.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let length = line.chars().take_while(|c| *c == character).count();
+    let info = &line[length..];
+    (length >= 3 && !(character == '`' && info.contains('`'))).then_some((character, length))
+}
+
+/// Whether `line` closes the fence `open`.
+fn closes(line: &str, open: (char, usize)) -> bool {
+    let line = line.trim();
+    let length = line.chars().take_while(|c| *c == open.0).count();
+    length >= open.1 && line.chars().all(|c| c == open.0)
+}
+
+/// A reply block being read: its ID, its lines so far, and a code fence open inside it.
+type OpenBlock<'a> = (&'a str, Vec<&'a str>, Option<(char, usize)>);
+
+/// Every complete reply block in `text`, in order.
+///
+/// A block opens at a marker line outside any code fence and closes at the closing marker line
+/// of the same ID; it needs at least one nonblank line between them. Inside a block, code fences
+/// are part of the reply, and a closing marker inside one of them does not close the block. An
+/// opening marker inside an open block starts a new block in its place. A block with no closing
+/// marker is not complete and is left out.
+#[must_use]
+pub fn complete_blocks(text: &str) -> Vec<ReplyBlock> {
+    let mut blocks = Vec::new();
+    let mut outside_fence: Option<(char, usize)> = None;
+    // The open block's ID, its lines, and a code fence open inside it.
+    let mut open: Option<OpenBlock<'_>> = None;
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some((identifier, lines, inner)) = open.as_mut() {
+            if let Some(run) = *inner {
+                if closes(line, run) {
+                    *inner = None;
+                }
+                lines.push(line);
+                continue;
+            }
+            if marker(line, true) == Some(*identifier) {
+                let body = dedent(lines);
+                if !body.trim().is_empty() {
+                    blocks.push(ReplyBlock {
+                        identifier: (*identifier).to_owned(),
+                        body,
+                    });
+                }
+                open = None;
+                continue;
+            }
+            if let Some(next) = marker(line, false) {
+                open = Some((next, Vec::new(), None));
+                continue;
+            }
+            *inner = fence(line);
+            lines.push(line);
+            continue;
+        }
+        if let Some(run) = outside_fence {
+            if closes(line, run) {
+                outside_fence = None;
+            }
+            continue;
+        }
+        if let Some(identifier) = marker(line, false) {
+            open = Some((identifier, Vec::new(), None));
+        } else if let Some(run) = fence(line) {
+            outside_fence = Some(run);
+        }
+    }
+    blocks
+}
+
+/// `lines` without the blank lines at either end and without their shared indentation.
+fn dedent(lines: &[&str]) -> String {
+    let first = lines.iter().position(|line| !line.trim().is_empty());
+    let last = lines.iter().rposition(|line| !line.trim().is_empty());
+    let (Some(first), Some(last)) = (first, last) else {
+        return String::new();
+    };
+    let lines = &lines[first..=last];
+    let indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|line| {
+            if line.len() >= indent && line.is_char_boundary(indent) {
+                line[indent..].trim_end()
+            } else {
+                line.trim()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Characters a terminal draws as style or layout rather than as text: Markdown's emphasis, code,
+/// heading, quote, strike-through, table and link punctuation, and list bullets in either form.
+const MARKUP: &[char] = &[
+    '*', '_', '`', '#', '>', '~', '|', '[', ']', '(', ')', '-', '+', '•', '·', '●', '◦', '▪',
+];
+
+/// Whether `line` is a Markdown table's delimiter row, such as `|---|:---:|`, which a terminal
+/// draws as a rule.
+fn table_delimiter(line: &str) -> bool {
+    let line = line.trim();
+    line.contains("---")
+        && line
+            .chars()
+            .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+/// What survives every way a terminal renders `text`: its characters in order, without
+/// whitespace, box drawing (U+2500 to U+257F), Markdown markup and list bullets, or table
+/// delimiter rows. Letters, digits, other punctuation and symbols such as a progress bar's `█`
+/// and `░` stay.
+#[must_use]
+pub fn rendered_key(text: &str) -> String {
+    text.lines()
+        .filter(|line| !table_delimiter(line))
+        .flat_map(str::chars)
+        .filter(|c| {
+            !c.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(c) && !MARKUP.contains(c)
+        })
+        .collect()
+}
+
+/// [`rendered_key`] of `text` with its Markdown link targets left out: the same for the text as
+/// written and as a terminal draws it when it shows each link's label only.
+#[must_use]
+pub fn label_key(text: &str) -> String {
+    rendered_key(&without_link_targets(text))
+}
+
+/// `text` with the targets of Markdown links, `[label](target)`, removed, as a terminal that
+/// shows only a link's label draws it.
+fn without_link_targets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find("](") {
+        let (before, after) = rest.split_at(index + 1);
+        out.push_str(before);
+        match after[1..].find(')') {
+            Some(end) if !after[1..=end].contains('\n') => rest = &after[end + 2..],
+            _ => {
+                out.push('(');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn sorted(key: &str) -> Vec<char> {
+    let mut chars: Vec<char> = key.chars().collect();
+    chars.sort_unstable();
+    chars
+}
+
+/// Whether `screen`, a reply block's text as read from a terminal, is a rendering of `source`,
+/// the same block's text from a transcript.
+///
+/// They are when their [`rendered_key`]s are the same (Markdown markers, bullets, box drawing and
+/// wrapping differ), with or without the source's link targets, or hold the same characters in
+/// another order, as when a table's cells wrap across rows. Text with nothing but markup and
+/// whitespace is never judged a rendering.
+#[must_use]
+pub fn rendered_equivalent(screen: &str, source: &str) -> bool {
+    let shown = rendered_key(screen);
+    if shown.is_empty() {
+        return false;
+    }
+    let candidates = [
+        rendered_key(source),
+        rendered_key(&without_link_targets(source)),
+    ];
+    if candidates.contains(&shown) {
+        return true;
+    }
+    let shown = sorted(&shown);
+    candidates.iter().any(|key| sorted(key) == shown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(identifier: &str, body: &str) -> ReplyBlock {
+        ReplyBlock {
+            identifier: identifier.into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn complete_blocks_are_found_with_their_markdown_intact() {
+        let text = "Intro.\n<CHAT_REPLY_007>\n\n**Done.** See `x`:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n</CHAT_REPLY_007>\nAfter.\n  <CHAT_REPLY_abc_2>  \n    indented\n      more\n  </CHAT_REPLY_abc_2>\n";
+        assert_eq!(
+            complete_blocks(text),
+            [
+                block(
+                    "007",
+                    "**Done.** See `x`:\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+                ),
+                block("abc_2", "indented\n  more"),
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_partial_empty_and_inline_blocks_are_left_out() {
+        let text = [
+            "```text",
+            "<CHAT_REPLY_001>",
+            "quoted in a fence",
+            "</CHAT_REPLY_001>",
+            "```",
+            "<CHAT_REPLY_002>",
+            "   ",
+            "</CHAT_REPLY_002>",
+            "<CHAT_REPLY_003>Inline</CHAT_REPLY_003>",
+            "<CHAT_REPLY_004>",
+            "replaced by the next opening",
+            "<CHAT_REPLY_005>",
+            "kept",
+            "</CHAT_REPLY_004>",
+            "</CHAT_REPLY_005>",
+            "<CHAT_REPLY_006>",
+            "never closed",
+        ]
+        .join("\n");
+        assert_eq!(
+            complete_blocks(&text),
+            [block("005", "kept\n</CHAT_REPLY_004>")]
+        );
+    }
+
+    #[test]
+    fn a_code_fence_inside_a_block_belongs_to_the_reply() {
+        let text = "<CHAT_REPLY_009>\nRun:\n```sh\necho '</CHAT_REPLY_009>'\n</CHAT_REPLY_009>\n```\nThat's it.\n</CHAT_REPLY_009>\r\n";
+        assert_eq!(
+            complete_blocks(text),
+            [block(
+                "009",
+                "Run:\n```sh\necho '</CHAT_REPLY_009>'\n</CHAT_REPLY_009>\n```\nThat's it."
+            )]
+        );
+    }
+
+    #[test]
+    fn a_screen_rendering_matches_its_source_and_other_text_does_not() {
+        let source = "**Mitigated; please reload.** See `vibe-talk`'s [status page](https://example.com/s).\n\n| Leg | This test |\n|---|---:|\n| admitted → delivered | 5.6s |\n\n## Next\n- one\n- two";
+        // Wrapped at the terminal's width, styles drawn, the table boxed, the link shown as its
+        // label only.
+        let wrapped = "Mitigated; please reload. See vibe-talk's status\npage.\n\n┌──────────────────────┬───────────┐\n│ Leg                  │ This test │\n├──────────────────────┼───────────┤\n│ admitted → delivered │      5.6s │\n└──────────────────────┴───────────┘\n\nNext\n• one\n• two";
+        assert!(rendered_equivalent(wrapped, source));
+        // A table whose cells wrapped across rows reads its letters in another order.
+        let cells = "│ admitted → │ 5.6s │\n│ delivered  │      │";
+        assert!(rendered_equivalent(
+            cells,
+            "| admitted → delivered | 5.6s |"
+        ));
+        // With the link target shown, it still matches.
+        assert!(rendered_equivalent(
+            "status page (https://example.com/s)",
+            "[status page](https://example.com/s)"
+        ));
+        assert!(!rendered_equivalent("Mitigated; please reload.", source));
+        assert!(!rendered_equivalent("- **`#`** -", "---"));
+        assert_eq!(
+            label_key("See [the page](https://x.test/p)."),
+            "Seethepage."
+        );
+        // Symbols that are text stay: progress bars that differ are different text.
+        assert!(!rendered_equivalent(
+            "Rollout: ███░░░░░░░",
+            "Rollout: ████████░░"
+        ));
+        assert_eq!(rendered_key("| a | b |\n|---|:--:|\n| 1 | 2 |"), "ab12");
+        assert_eq!(without_link_targets("a](b"), "a](b");
+        assert_eq!(without_link_targets("[x](y)\n[z](w\n)"), "[x]\n[z](w\n)");
+    }
+}
