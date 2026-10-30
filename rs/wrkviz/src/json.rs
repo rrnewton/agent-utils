@@ -190,17 +190,28 @@ pub fn py_float_repr(value: f64) -> String {
 /// indent, keys sorted, ASCII-only string escapes.
 pub fn dump_pretty(value: &Value) -> String {
     let mut out = String::new();
-    write_value(value, 0, &mut out);
+    write_value(value, 0, &mut out, true);
     out
 }
 
-fn write_indent(out: &mut String, depth: usize) {
-    for _ in 0..depth {
-        out.push_str("  ");
-    }
+/// `json.dumps(value, ensure_ascii=False, indent=2,
+/// sort_keys=True)`: the query envelope's shape.
+pub fn dump_canonical(value: &Value) -> String {
+    let mut out = String::new();
+    write_value(value, 0, &mut out, false);
+    out.push('\n');
+    out
 }
 
-fn write_value(value: &Value, depth: usize, out: &mut String) {
+/// `json.dumps(value, ensure_ascii=False, sort_keys=True)`:
+/// one line, `, ` and `: ` separators.
+pub fn dump_oneline(value: &Value) -> String {
+    let mut out = String::new();
+    write_oneline(value, &mut out);
+    out
+}
+
+fn write_oneline(value: &Value, out: &mut String) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
@@ -213,7 +224,54 @@ fn write_value(value: &Value, depth: usize, out: &mut String) {
             }
             out.push_str(&number.to_string())
         }
-        Value::String(text) => write_json_string(text, out),
+        Value::String(text) => write_json_string_as(text, out, false),
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_oneline(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_json_string_as(key, out, false);
+                out.push_str(": ");
+                write_oneline(&map[*key], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+fn write_value(value: &Value, depth: usize, out: &mut String, ascii_only: bool) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(number) => {
+            if let Some(float) = number.as_f64() {
+                if number.as_i64().is_none() && number.as_u64().is_none() {
+                    out.push_str(&py_float_repr(float));
+                    return;
+                }
+            }
+            out.push_str(&number.to_string())
+        }
+        Value::String(text) => write_json_string_as(text, out, ascii_only),
         Value::Array(items) => {
             if items.is_empty() {
                 out.push_str("[]");
@@ -222,7 +280,7 @@ fn write_value(value: &Value, depth: usize, out: &mut String) {
             out.push_str("[\n");
             for (index, item) in items.iter().enumerate() {
                 write_indent(out, depth + 1);
-                write_value(item, depth + 1, out);
+                write_value(item, depth + 1, out, ascii_only);
                 if index + 1 < items.len() {
                     out.push(',');
                 }
@@ -241,9 +299,9 @@ fn write_value(value: &Value, depth: usize, out: &mut String) {
             out.push_str("{\n");
             for (index, key) in keys.iter().enumerate() {
                 write_indent(out, depth + 1);
-                write_json_string(key, out);
+                write_json_string_as(key, out, ascii_only);
                 out.push_str(": ");
-                write_value(&map[*key], depth + 1, out);
+                write_value(&map[*key], depth + 1, out, ascii_only);
                 if index + 1 < keys.len() {
                     out.push(',');
                 }
@@ -255,9 +313,10 @@ fn write_value(value: &Value, depth: usize, out: &mut String) {
     }
 }
 
-/// A JSON string literal escaped the way CPython's
-/// `ensure_ascii=True` escapes it.
-fn write_json_string(text: &str, out: &mut String) {
+/// A JSON string literal; with `ascii_only`, escaped the way
+/// CPython's `ensure_ascii=True` escapes it, otherwise the way
+/// `ensure_ascii=False` leaves non-ASCII text in place.
+fn write_json_string_as(text: &str, out: &mut String, ascii_only: bool) {
     out.push('"');
     for ch in text.chars() {
         match ch {
@@ -268,9 +327,10 @@ fn write_json_string(text: &str, out: &mut String) {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
-            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+            ch if (ch as u32) < 0x20 || (ascii_only && (ch as u32) == 0x7f) => {
                 out.push_str(&format!("\\u{:04x}", ch as u32))
             }
+            ch if !ascii_only && (ch as u32) >= 0x80 => out.push(ch),
             ch if (ch as u32) < 0x80 => out.push(ch),
             ch => {
                 let code = ch as u32;

@@ -24,6 +24,9 @@ pub mod inspect;
 /// The archive JSON value domain and the Python-shaped readers
 /// over it.
 pub mod json;
+/// The `query list` subcommand over schema-3 and schema-1
+/// timelines.
+pub mod query;
 /// The snapshot pointer (`snapshot-root.json`) and the legacy
 /// in-archive snapshot layout.
 pub mod snapshot_store;

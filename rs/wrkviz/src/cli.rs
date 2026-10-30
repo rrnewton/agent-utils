@@ -77,6 +77,57 @@ options:
   --output OUTPUT
 "#;
 
+/// The Python edition's query help, verbatim.
+pub const QUERY_HELP: &str = r#"usage: wrkviz query [-h] --output OUTPUT [--format {json,jsonl,markdown,text}]
+                    {list,show,search,prompts,messages,stats} ...
+
+navigate a built timeline without starting the website
+
+positional arguments:
+  {list,show,search,prompts,messages,stats}
+    list                list concise records and stable references
+    show                resolve one stable reference
+    search              search prompts, responses, full transcript text, and
+                        summaries
+    prompts             list verbatim human-authored prompts in global
+                        timestamp order
+    messages            list prompts and their mechanically associated
+                        responses
+    stats               count prompt, response, and generated-summary text
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       built single- or multi-team archive
+  --format {json,jsonl,markdown,text}
+                        response format (default: json)
+"#;
+
+/// The Python edition's query-list help, verbatim.
+pub const QUERY_LIST_HELP: &str = r#"usage: wrkviz query list [-h] [--team TEAM] [--start-time START_TIME]
+                         [--end-time END_TIME]
+                         [--kind {hourly,daily,weekly,monthly,quarterly}]
+                         [--agent AGENT]
+                         {teams,agents,phases,rollups}
+
+list concise records and stable references
+
+positional arguments:
+  {teams,agents,phases,rollups}
+
+options:
+  -h, --help            show this help message and exit
+  --team TEAM           team slug to include; repeat to select multiple teams
+  --start-time START_TIME
+                        first RFC3339 instant to overlap (inclusive)
+  --end-time END_TIME   exclusive RFC3339 overlap boundary
+  --kind {hourly,daily,weekly,monthly,quarterly}
+                        rollup kind to include; repeat as needed
+  --agent AGENT         canonical agent:TEAM::ID reference to select
+"#;
+
+const QUERY_USAGE: &str = "usage: wrkviz query [-h] --output OUTPUT [--format {json,jsonl,markdown,text}]\n                    {list,show,search,prompts,messages,stats} ...";
+const QUERY_LIST_USAGE: &str = "usage: wrkviz query list [-h] [--team TEAM] [--start-time START_TIME]\n                         [--end-time END_TIME]\n                         [--kind {hourly,daily,weekly,monthly,quarterly}]\n                         [--agent AGENT]\n                         {teams,agents,phases,rollups}";
+
 const VERSION: &str = "wrkviz 0.1.0";
 
 /// Expand a leading `~` the way `Path.expanduser` does (the
@@ -166,10 +217,274 @@ pub fn run(args: &[String]) -> u8 {
             2
         }
         "inspect" => run_inspect(&args[1..]),
+        "query" => run_query(&args[1..]),
         other => {
             eprintln!(
                 "wrkviz: the Rust edition has not ported '{other}' yet; the Python edition remains the oracle for it"
             );
+            2
+        }
+    }
+}
+
+fn argparse_error(usage: &str, prog: &str, message: &str) -> u8 {
+    eprintln!("{usage}\n{prog}: error: {message}");
+    2
+}
+
+fn named_value(
+    args: &[String],
+    index: &mut usize,
+    name: &str,
+) -> Result<Option<String>, (String, String)> {
+    let arg = &args[*index];
+    if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
+        return Ok(Some(value.to_string()));
+    }
+    // argparse also accepts an unambiguous prefix of a long option.
+    if arg == name || (arg.len() > 2 && arg.starts_with("--") && name.starts_with(arg.as_str())) {
+        *index += 1;
+        return match args.get(*index) {
+            Some(value) => Ok(Some(value.clone())),
+            None => Err((
+                name.to_string(),
+                format!("argument {name}: expected one argument"),
+            )),
+        };
+    }
+    Ok(None)
+}
+
+fn is_option_token(arg: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        arg == *name
+            || arg.starts_with(&format!("{name}="))
+            || (arg.len() > 2 && arg.starts_with("--") && name.starts_with(arg))
+    })
+}
+
+fn run_query(args: &[String]) -> u8 {
+    let mut output: Option<String> = None;
+    let mut format = "json".to_string();
+    let mut action: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--help" || arg == "-h" {
+            match action.as_deref() {
+                None => {
+                    print!("{QUERY_HELP}");
+                    return 0;
+                }
+                Some("list") => {
+                    print!("{QUERY_LIST_HELP}");
+                    return 0;
+                }
+                Some(other) => {
+                    eprintln!(
+                        "wrkviz: the Rust edition has not ported 'query {other}' yet; the Python edition remains the oracle for it"
+                    );
+                    return 2;
+                }
+            }
+        }
+        if action.is_some() {
+            rest.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        match named_value(args, &mut index, "--output") {
+            Ok(Some(value)) => output = Some(value),
+            Ok(None) => match named_value(args, &mut index, "--format") {
+                Ok(Some(value)) => {
+                    if !["json", "jsonl", "markdown", "text"].contains(&value.as_str()) {
+                        return argparse_error(
+                            QUERY_USAGE,
+                            "wrkviz query",
+                            &format!(
+                                "argument --format: invalid choice: '{}' (choose from json, jsonl, markdown, text)",
+                                value
+                            ),
+                        );
+                    }
+                    format = value;
+                }
+                Ok(None) => {
+                    if arg.starts_with("--") {
+                        return argparse_error(
+                            QUERY_USAGE,
+                            "wrkviz query",
+                            &format!("unrecognized arguments: {arg}"),
+                        );
+                    }
+                    if !["list", "show", "search", "prompts", "messages", "stats"]
+                        .contains(&arg.as_str())
+                    {
+                        return argparse_error(
+                            QUERY_USAGE,
+                            "wrkviz query",
+                            &format!(
+                                "argument query_action: invalid choice: '{arg}' (choose from list, show, search, prompts, messages, stats)"
+                            ),
+                        );
+                    }
+                    action = Some(arg.clone());
+                }
+                Err((_, message)) => return argparse_error(QUERY_USAGE, "wrkviz query", &message),
+            },
+            Err((_, message)) => return argparse_error(QUERY_USAGE, "wrkviz query", &message),
+        }
+        index += 1;
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    if output.is_none() {
+        missing.push("--output");
+    }
+    if action.is_none() {
+        missing.push("query_action");
+    }
+    if !missing.is_empty() {
+        return argparse_error(
+            QUERY_USAGE,
+            "wrkviz query",
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    let output = output.unwrap_or_default();
+    match action.as_deref() {
+        Some("list") => run_query_list(&output, &format, &rest),
+        Some(other) => {
+            eprintln!(
+                "wrkviz: the Rust edition has not ported 'query {other}' yet; the Python edition remains the oracle for it"
+            );
+            2
+        }
+        None => 2,
+    }
+}
+
+fn run_query_list(output: &str, format: &str, args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{QUERY_LIST_HELP}");
+        return 0;
+    }
+    let mut resource: Option<String> = None;
+    let mut filters = crate::query::Filters {
+        teams: Vec::new(),
+        start_time: None,
+        end_time: None,
+        kinds: Vec::new(),
+        agent: None,
+    };
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let mut handled = true;
+        for (name, target) in [
+            ("--team", 0),
+            ("--start-time", 1),
+            ("--end-time", 2),
+            ("--kind", 3),
+            ("--agent", 4),
+        ] {
+            match named_value(args, &mut index, name) {
+                Ok(Some(value)) => {
+                    match target {
+                        0 => filters.teams.push(value),
+                        1 => filters.start_time = Some(value),
+                        2 => filters.end_time = Some(value),
+                        3 => {
+                            if !["hourly", "daily", "weekly", "monthly", "quarterly"]
+                                .contains(&value.as_str())
+                            {
+                                return argparse_error(
+                                    QUERY_LIST_USAGE,
+                                    "wrkviz query list",
+                                    &format!(
+                                        "argument --kind: invalid choice: '{value}' (choose from hourly, daily, weekly, monthly, quarterly)"
+                                    ),
+                                );
+                            }
+                            filters.kinds.push(value);
+                        }
+                        _ => filters.agent = Some(value),
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err((_, message)) => {
+                    return argparse_error(QUERY_LIST_USAGE, "wrkviz query list", &message)
+                }
+            }
+            let _ = target;
+        }
+        if !is_option_token(
+            arg,
+            &["--team", "--start-time", "--end-time", "--kind", "--agent"],
+        ) {
+            handled = false;
+        }
+        if !handled {
+            if arg.starts_with("--") {
+                return argparse_error(
+                    QUERY_LIST_USAGE,
+                    "wrkviz query list",
+                    &format!("unrecognized arguments: {arg}"),
+                );
+            }
+            if resource.is_some() {
+                return argparse_error(
+                    QUERY_LIST_USAGE,
+                    "wrkviz query list",
+                    &format!("unrecognized arguments: {arg}"),
+                );
+            }
+            if !["teams", "agents", "phases", "rollups"].contains(&arg.as_str()) {
+                return argparse_error(
+                    QUERY_LIST_USAGE,
+                    "wrkviz query list",
+                    &format!(
+                        "argument resource: invalid choice: '{arg}' (choose from teams, agents, phases, rollups)"
+                    ),
+                );
+            }
+            resource = Some(arg.clone());
+        }
+        index += 1;
+    }
+    let Some(resource) = resource else {
+        return argparse_error(
+            QUERY_LIST_USAGE,
+            "wrkviz query list",
+            "the following arguments are required: resource",
+        );
+    };
+    let timeline = match crate::query::Timeline::open(&cli_path(output)) {
+        Ok(timeline) => timeline,
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            return 2;
+        }
+    };
+    match timeline.list_records(&resource, &filters) {
+        Ok(items) => {
+            match crate::query::format_query(&format!("list {resource}"), &items, format) {
+                Ok(text) => {
+                    print!("{text}");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("wrkviz: {error}");
+                    2
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
             2
         }
     }

@@ -24,16 +24,19 @@ const SEARCH_STREAMS: [&str; 3] = ["search", "search_bloom", "search_links"];
 /// record type is the milestone's single source of truth for
 /// the shard catalogue; the Python mirror validates against it.
 #[derive(Clone)]
-#[allow(dead_code)]
-struct ShardEntry {
-    stream: String,
-    team: Option<String>,
-    day: Option<String>,
-    path: String,
-    index_path: String,
-    records: i64,
-    c_bytes: i64,
-    line_ranges: BTreeMap<String, (i64, i64)>,
+pub(crate) struct ShardEntry {
+    pub(crate) stream: String,
+    pub(crate) team: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) day: Option<String>,
+    pub(crate) path: String,
+    #[allow(dead_code)]
+    pub(crate) index_path: String,
+    #[allow(dead_code)]
+    pub(crate) records: i64,
+    #[allow(dead_code)]
+    pub(crate) c_bytes: i64,
+    pub(crate) line_ranges: BTreeMap<String, (i64, i64)>,
 }
 
 /// A declined generation (fall back), as opposed to an
@@ -123,7 +126,7 @@ fn shard(raw: &Value, stream: &str, where_: &str) -> Result<ShardEntry, OpenErro
 /// Resolve an archive-relative schema-3 path to an openable
 /// regular file, or None (symlinked components or leaf, or
 /// missing): `_schema_3_file`.
-fn schema_file(root: &Path, relative: &str) -> Option<PathBuf> {
+pub(crate) fn schema_file(root: &Path, relative: &str) -> Option<PathBuf> {
     if relative.starts_with('/') {
         return None;
     }
@@ -384,12 +387,12 @@ fn check_nothing_unnamed(root: &Path, shards: &[ShardEntry]) -> Result<(), OpenE
 }
 
 /// An accepted schema-3 generation: its bootstrap and catalogue.
-struct SchemaThree {
-    bootstrap: Map<String, Value>,
-    shards: Vec<ShardEntry>,
+pub(crate) struct SchemaThree {
+    pub(crate) bootstrap: Map<String, Value>,
+    pub(crate) shards: Vec<ShardEntry>,
 }
 
-fn open_schema_3(root: &Path) -> Result<SchemaThree, String> {
+pub(crate) fn open_schema_3(root: &Path) -> Result<SchemaThree, String> {
     match open_inner(root) {
         Ok(opened) => Ok(opened),
         Err(OpenError::Declined(message)) => Err(message),

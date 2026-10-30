@@ -10,6 +10,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 
 [[bin]]
